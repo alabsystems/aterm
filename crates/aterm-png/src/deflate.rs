@@ -6,7 +6,7 @@
 use crate::checksum::Adler32;
 
 /// LSB-first bit sink for DEFLATE ([`BitWriter::huffman`], [`BitWriter::bits`]).
-struct BitWriter {
+pub(crate) struct BitWriter {
     out: Vec<u8>,
     /// Bits not yet flushed, LSB-first: bit 0 is the next bit to emit.
     acc: u32,
@@ -16,7 +16,7 @@ struct BitWriter {
 
 impl BitWriter {
     #[inline]
-    fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             out: Vec::with_capacity(capacity),
             acc: 0,
@@ -26,7 +26,7 @@ impl BitWriter {
 
     /// Emit `count` bits of `value`, least-significant bit first.
     #[inline]
-    fn bits(&mut self, value: u32, count: u32) {
+    pub(crate) fn bits(&mut self, value: u32, count: u32) {
         debug_assert!(count <= 24, "bit runs stay inside the accumulator");
         self.acc |= (value & ((1u32 << count) - 1)) << self.n;
         self.n += count;
@@ -39,7 +39,7 @@ impl BitWriter {
 
     /// Emit a Huffman code: the same bits, but most-significant FIRST.
     #[inline]
-    fn huffman(&mut self, code: u16, len: u32) {
+    pub(crate) fn huffman(&mut self, code: u16, len: u32) {
         let mut reversed = 0u32;
         for i in 0..len {
             reversed |= ((u32::from(code) >> i) & 1) << (len - 1 - i);
@@ -47,9 +47,33 @@ impl BitWriter {
         self.bits(reversed, len);
     }
 
+    /// Pad the partial byte with zeroes, so the next bit starts a byte (a stored block's
+    /// `LEN`).
+    #[inline]
+    pub(crate) fn align(&mut self) {
+        if self.n > 0 {
+            self.out.push(self.acc as u8);
+            self.acc = 0;
+            self.n = 0;
+        }
+    }
+
+    /// Append whole bytes; the writer must be [`BitWriter::align`]ed.
+    #[inline]
+    pub(crate) fn bytes(&mut self, bytes: &[u8]) {
+        debug_assert_eq!(self.n, 0, "bytes go out on a byte boundary");
+        self.out.extend_from_slice(bytes);
+    }
+
+    /// How many bits are pending past the last whole byte.
+    #[inline]
+    pub(crate) const fn pending(&self) -> u32 {
+        self.n
+    }
+
     /// Pad the final partial byte with zeroes and take the buffer.
     #[inline]
-    fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         if self.n > 0 {
             self.out.push(self.acc as u8);
         }
@@ -63,7 +87,7 @@ const LENGTH_BASE: [u16; 29] = [
     163, 195, 227, 258,
 ];
 /// Extra bits carried after each length code.
-const LENGTH_EXTRA: [u32; 29] = [
+pub(crate) const LENGTH_EXTRA: [u32; 29] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
 /// Smallest distance each distance code 0..29 stands for.
@@ -72,14 +96,14 @@ const DIST_BASE: [u16; 30] = [
     2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
 ];
 /// Extra bits carried after each distance code.
-const DIST_EXTRA: [u32; 30] = [
+pub(crate) const DIST_EXTRA: [u32; 30] = [
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
     13,
 ];
 
 /// The fixed literal/length code for `symbol` as `(code, bit length)`.
 #[inline]
-const fn fixed_litlen(symbol: u16) -> (u16, u32) {
+pub(crate) const fn fixed_litlen(symbol: u16) -> (u16, u32) {
     match symbol {
         0..=143 => (0x30 + symbol, 8),
         144..=255 => (0x190 + (symbol - 144), 9),
@@ -90,7 +114,7 @@ const fn fixed_litlen(symbol: u16) -> (u16, u32) {
 
 /// The length code (257..=285) and extra-bit payload for a match length.
 #[inline]
-const fn length_code(len: u16) -> (u16, u32, u32) {
+pub(crate) const fn length_code(len: u16) -> (u16, u32, u32) {
     debug_assert!(len >= 3 && len <= 258);
     let mut i = LENGTH_BASE.len() - 1;
     while i > 0 && LENGTH_BASE[i] > len {
@@ -105,7 +129,7 @@ const fn length_code(len: u16) -> (u16, u32, u32) {
 
 /// The distance code (0..=29) and extra-bit payload for a match distance.
 #[inline]
-const fn distance_code(dist: u16) -> (u16, u32, u32) {
+pub(crate) const fn distance_code(dist: u16) -> (u16, u32, u32) {
     debug_assert!(dist >= 1 && dist <= 32768);
     let mut i = DIST_BASE.len() - 1;
     while i > 0 && DIST_BASE[i] > dist {
@@ -115,15 +139,15 @@ const fn distance_code(dist: u16) -> (u16, u32, u32) {
 }
 
 /// DEFLATE's window: a match may reach at most this far back.
-const WINDOW: usize = 32768;
+pub(crate) const WINDOW: usize = 32768;
 const _: () = assert!(WINDOW.is_power_of_two());
 /// DEFLATE's longest expressible match.
-const MAX_MATCH: usize = 258;
+pub(crate) const MAX_MATCH: usize = 258;
 /// Shortest match worth emitting.
-const MIN_MATCH: usize = 3;
+pub(crate) const MIN_MATCH: usize = 3;
 /// Hash table size (a power of two, so the mask is the modulus).
 const HASH_BITS: usize = 15;
-const HASH_SIZE: usize = 1 << HASH_BITS;
+pub(crate) const HASH_SIZE: usize = 1 << HASH_BITS;
 /// How many candidates a single position will try before settling.
 const MAX_CHAIN: usize = 32;
 /// A match at least this long ends the search immediately.
@@ -131,7 +155,7 @@ const GOOD_ENOUGH: usize = 32;
 
 /// Hash the three bytes at `data[i..]` into a bucket index.
 #[inline]
-const fn hash3(data: &[u8], i: usize) -> usize {
+pub(crate) const fn hash3(data: &[u8], i: usize) -> usize {
     let h = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
     ((h.wrapping_mul(2_654_435_761)) >> (32 - HASH_BITS)) as usize & (HASH_SIZE - 1)
 }

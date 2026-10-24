@@ -937,7 +937,7 @@ impl App {
             .zip(metadata.iter_mut())
             .enumerate()
         {
-            item.load = self.chip_load(tab_count, tab.focus);
+            item.load = self.chip_load(tab_count, tab);
             let mut level = item.attention;
             tab.root.any_leaf(&mut |view| {
                 if let Some(session) = self

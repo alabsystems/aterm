@@ -731,7 +731,10 @@ impl JobFeed {
         };
         let defer = |newest: Option<Instant>, owed: &mut Option<Instant>| match at_ms {
             Some(a) if newest.is_some_and(|s| ms(s) > a) => std::mem::replace(owed, newest),
-            _ => newest,
+            _ => {
+                *owed = None;
+                newest
+            }
         };
         let mut fed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let fed = &mut *fed;
@@ -821,6 +824,7 @@ fn sweep_proc(p: &ProcessReading) -> SweepProc {
         state: state(p.state),
         session_leader: p.session_leader,
         has_tty: p.has_tty,
+        exec: p.exec,
     }
 }
 
@@ -1265,31 +1269,45 @@ pub(crate) mod tests {
     fn a_line_fed_past_a_passs_clock_is_the_next_passs() {
         const LINE: &[u8] = b"GET /healthz 200\r\n";
         let epoch = Instant::now();
-        let feed = JobFeed::default();
         let term = aterm_core::terminal::Terminal::new(24, 80);
         let at = |us: u64| epoch + Duration::from_micros(us);
-        let line = |us| {
-            feed.read(LINE);
-            feed.fed(&term, LINE, true, || at(us));
-        };
-        let pass = |ms| {
-            let f = feed.at_pass(epoch, Some(ms));
-            (f.line_output_ms, f.output_ms)
-        };
-        // Each fed in its pass's own millisecond, before its clock: stamped past the pass.
-        line(1_000_100);
-        let first = pass(1_000);
-        line(2_000_100);
-        line(2_000_900);
-        let second = pass(2_000);
-        let third = pass(4_000);
-        assert_eq!(first, (None, None));
-        assert_eq!(second, (Some(1_001), Some(1_001)));
-        assert_eq!(third, (Some(2_001), Some(2_001)));
+        for offset in [100, 900] {
+            let feed = JobFeed::default();
+            let line = |us| {
+                feed.read(LINE);
+                feed.fed(&term, LINE, true, || at(us));
+            };
+            let pass = |ms| {
+                let f = feed.at_pass(epoch, Some(ms));
+                (f.line_output_ms, f.output_ms)
+            };
+            // The newest line and output round past the pass's millisecond.
+            line(1_000_000 + offset);
+            assert_eq!(pass(1_000), (None, None), "offset {offset}");
+            line(2_000_000 + offset);
+            assert_eq!(pass(2_000), (Some(1_001), Some(1_001)), "offset {offset}");
+            assert_eq!(pass(4_000), (Some(2_001), Some(2_001)), "offset {offset}");
+            line(5_000_000 + offset);
+            assert_eq!(pass(5_000), (None, None), "consumed stamp, offset {offset}");
+        }
+        for before in [0, 1] {
+            let feed = JobFeed::default();
+            let line = |us| {
+                feed.read(LINE);
+                feed.fed(&term, LINE, true, || at(us));
+            };
+            line(1_000_000 - before);
+            let f = feed.at_pass(epoch, Some(1_000));
+            assert_eq!((f.line_output_ms, f.output_ms), (Some(1_000), Some(1_000)));
+            line(2_000_100);
+            let f = feed.at_pass(epoch, Some(2_000));
+            assert_eq!((f.line_output_ms, f.output_ms), (None, None));
+        }
     }
 
     /// A PASS THAT FINDS KEYS DRIVEN SINCE THE LAST STAMPS ITS CLOCK: the first
     /// pass only notes the sink's count, and the stamp stays until keys move it.
+    #[cfg(unix)]
     #[test]
     fn a_pass_that_finds_keys_driven_since_the_last_stamps_its_clock() {
         let mut fds = [0; 2];

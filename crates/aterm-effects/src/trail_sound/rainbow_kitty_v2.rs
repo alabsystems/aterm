@@ -2440,18 +2440,24 @@ impl TrailSynth {
         self.v2.graft = None;
         let blooms =
             stops.bloom && plan.lit && plan.touch == Touch::Step && !plan.mallet_only && !plucked;
-        let (air, spread) = if stops.hue {
-            (hue_air(ev.hue), BLOOM_SPREAD * (arc - 0.5))
+        let clouds = stops.room && plan.rest && !plan.mallet_only;
+        let bloom_gain = if blooms || clouds {
+            let (air, spread) = if stops.hue {
+                (hue_air(ev.hue), BLOOM_SPREAD * (arc - 0.5))
+            } else {
+                (hue_air(0.25), 0.0)
+            };
+            let bloom_gain =
+                ev.gain * KEY_TINE_TRIM * plan.level * g * vel * BLOOM_LEVEL * air * aside_gain;
+            if blooms {
+                let mut halo = bloom(deg, roof, tau);
+                halo.lp_cut = shifted_roof(halo.lp_cut, ev.shifted);
+                self.v2_spawn(halo, bloom_gain, pan + spread);
+            }
+            bloom_gain
         } else {
-            (hue_air(0.25), 0.0)
+            0.0
         };
-        let bloom_gain =
-            ev.gain * KEY_TINE_TRIM * plan.level * g * vel * BLOOM_LEVEL * air * aside_gain;
-        if blooms {
-            let mut halo = bloom(deg, roof, tau);
-            halo.lp_cut = shifted_roof(halo.lp_cut, ev.shifted);
-            self.v2_spawn(halo, bloom_gain, pan + spread);
-        }
 
         if stops.bloom && plan.touch == Touch::Step && !plan.mallet_only {
             if classed && class == DIGIT {
@@ -2616,7 +2622,7 @@ impl TrailSynth {
                     pan,
                 );
             }
-            if plan.rest && !plan.mallet_only {
+            if clouds {
                 self.v2_air_cloud(deg, roof, bloom_gain, pan, 0.0, ev.shifted);
             }
         }
@@ -3258,10 +3264,10 @@ impl TrailSynth {
         }
         let detune = b.sky_detune;
         let tone = |ph: f32| -> f32 {
-            let x = super::sin01(ph.fract())
-                + super::sin01((ph * 2.0).fract()) * 0.5
-                + super::sin01((ph * 3.0).fract()) / 3.0
-                + super::sin01((ph * 4.0).fract()) * 0.25;
+            let x = super::sin01(ph)
+                + super::sin01(ph * 2.0) * 0.5
+                + super::sin01(ph * 3.0) / 3.0
+                + super::sin01(ph * 4.0) * 0.25;
             x * BED_PARTIAL_NORM
         };
         let mut m = 0.0;
@@ -3282,7 +3288,7 @@ impl TrailSynth {
         let k = (cut * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
         b.lp1 += k * (m - b.lp1);
         b.ph3 = (b.ph3 + BED_BREATH_HZ * dt).fract();
-        let breath = 1.0 - BED_BREATH_DEPTH * (0.5 - 0.5 * super::sin01((b.ph3 + 0.25).fract()));
+        let breath = 1.0 - BED_BREATH_DEPTH * (0.5 - 0.5 * super::sin01(b.ph3 + 0.25));
         (b.lp1 * breath * lvl * BED_LEVEL, 0.0)
     }
 }

@@ -14,6 +14,8 @@ pub fn atpkg_session_index_eligibility_model() -> Model {
             const Buggy = 0;
             const Interval = 6;
             const MaxAge = 7;
+            // Ages count five-second runner parks. No network probe has run,
+            // so the network age starts past its completed-probe cooldown.
             var local_age = 1;
             var network_age = 6;
             var eligible = 0;
@@ -45,7 +47,7 @@ pub fn atpkg_session_index_eligibility_model() -> Model {
     }
 }
 
-/// One published build.
+/// One published build, one session seat and a window which can arrive after the HEAD starts.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_session_index_handoff_model() -> Model {

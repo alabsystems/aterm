@@ -3498,8 +3498,9 @@ pub(crate) fn occupancy_ready_idle_entry(
 /// A TAB'S DECLARED WAKE STOOD K LOOKS READY AND UNTOLD, under `prompt` (the slice-2 plan's
 /// 2.5, the wake K): on the same key as a hold rule's ([`occupancy_ready_idle_key`]), which the
 /// exceptions host gives the rule's first. Every word it fills in is the tab's sid, the wake's
-/// ordinal, the closed guard list's (or `no-loop`, where no loop told the window a word) or a span
-/// the window's clock measured; no word of the agent's declaration.
+/// ordinal, the closed guard list's (or `no-loop`, where no loop told the window a word, or
+/// `none`, where no guard held it) or a span the window's clock measured; no word of the agent's
+/// declaration.
 pub(crate) fn occupancy_wake_idle_entry(
     sid: &str,
     idle: &crate::occupancy_wakes::WakeIdle,
@@ -3531,7 +3532,7 @@ pub(crate) fn occupancy_wake_idle_entry(
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)
     .more(format!(
-        "The tab's agent declared wake #{ord}; its condition held {span} ago and nothing told it: {held}."
+        "The tab's agent declared wake #{ord}; its condition had held {span} when aterm raised this: {held}."
     ))
     .log_line(format!(
         "occupancy ready-idle sid={sid} wake=#{ord} guard={guard} due_ms={}",

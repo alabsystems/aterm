@@ -236,6 +236,13 @@ pub struct Accounts {
     pub walls: Walls,
     /// Words in the sender of the vendor's sign-in mail, for the mailbox reader.
     pub mail_senders: &'static [&'static str],
+    /// The vendor's own sign-in page, where `accounts browser` opens a row's browser profile for
+    /// a person to sign in once.
+    pub sign_in_page: SignInPage,
+    /// The `localStorage` key under which the vendor's web app keeps its session on its sign-in
+    /// page's origin, as its own script reads it; `None` where no lab pass read where it keeps
+    /// one. `accounts browser` asks only whether the key is there, never its value.
+    pub web_session_key: Option<&'static str>,
     /// Whether a lab pass measured [`Accounts::seam`] (and its shared set) against a real
     /// install; until one has, moves between its logins are not advised.
     pub measured: bool,
@@ -249,6 +256,35 @@ pub struct Accounts {
     /// How the harness signs one of its logins in by itself; `None` for Claude Code, whose
     /// renewal is its own (`claude auth login` through the argv0 opener).
     pub signin: Option<SignIn>,
+}
+
+/// The vendor's sign-in page ([`Accounts::sign_in_page`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInPage {
+    /// This page, for every row.
+    Fixed(&'static str),
+    /// Per Kimi account system ([`Region`]).
+    ByRegion {
+        /// kimi.ai.
+        global: &'static str,
+        /// kimi.com.
+        mainland_cn: &'static str,
+    },
+}
+
+impl SignInPage {
+    /// The page for a row of `region`; `None` for a region-keyed page and a row naming none.
+    #[must_use]
+    pub const fn of(self, region: Option<Region>) -> Option<&'static str> {
+        match (self, region) {
+            (SignInPage::Fixed(page), _) => Some(page),
+            (SignInPage::ByRegion { global, .. }, Some(Region::Global)) => Some(global),
+            (SignInPage::ByRegion { mainland_cn, .. }, Some(Region::MainlandCn)) => {
+                Some(mainland_cn)
+            }
+            (SignInPage::ByRegion { .. }, None) => None,
+        }
+    }
 }
 
 /// How a session is pointed at one login of a pool (design §3). A default row (no `dir`)
@@ -424,19 +460,17 @@ pub struct SignIn {
     pub no_opener: bool,
     /// The operating systems (`std::env::consts::OS`) on which the CLI opens its page in the
     /// default browser through the OS itself, whatever its `PATH` (Grok Build on macOS): there
-    /// its sign-in runs only when a person asked for it, never in the background
-    /// ([`SignIn::opens_browser_here`]).
-    pub opens_browser_on: &'static [&'static str],
+    /// its sign-in child runs under [`crate::harness::login_drive::NO_DESK`], and nothing runs
+    /// where that sandbox is missing.
+    pub no_desk: &'static [&'static str],
+    /// Whether the headless approver may type the row's email into the vendor's sign-in page and
+    /// read the row's mailbox for the code it mails: `false` where that one form signs a new
+    /// account up as readily as it signs one in, and says which only once it is submitted
+    /// (Kimi's, design §5 (f)), so the page waits for a person.
+    pub types_email: bool,
 }
 
 impl SignIn {
-    /// Whether the CLI opens the default browser on this machine whatever its `PATH`
-    /// ([`SignIn::opens_browser_on`]).
-    #[must_use]
-    pub fn opens_browser_here(&self) -> bool {
-        self.opens_browser_on.contains(&std::env::consts::OS)
-    }
-
     /// The route for `flow`, or the first one where the row names none or the CLI takes none.
     #[must_use]
     pub fn route(&self, flow: Option<Flow>) -> Option<&'static Route> {
@@ -561,6 +595,8 @@ pub const CLAUDE_ACCOUNTS: Accounts = Accounts {
         transient: &[],
     },
     mail_senders: &["anthropic"],
+    sign_in_page: SignInPage::Fixed("https://claude.ai/login"),
+    web_session_key: None,
     measured: true,
     measured_on: None,
     walls_measured_on: Some("Claude Code's anchored wall rows"),
@@ -601,18 +637,23 @@ pub const CODEX_SIGNIN: SignIn = SignIn {
     ],
     env: &[],
     no_opener: true,
-    opens_browser_on: &[],
+    no_desk: &[],
+    types_email: true,
 };
 
 /// The hosts every Grok Build sign-in page is on: xAI's issuer and its accounts app, which
 /// serves the consent page.
 const GROK_HOSTS: &[&str] = &["auth.x.ai", "accounts.x.ai"];
 
-/// Grok Build's sign-in, its lines as 1.0.67's source prints them (not recorded: on macOS its
-/// login opens the default browser through the OS, which nothing suppresses): the device flow
-/// by default, its complete URL (the code filled in) and the code to confirm each on the line
-/// after its lead, and `✓ Signed in as <email>` once approved; `flow = "browser"` takes its
-/// loopback flow.
+/// Grok Build's sign-in, recorded on 1.0.70 under the no-desk sandbox (design §5 (g); 1.0.67's
+/// source prints the same lines): the device flow by default, its complete URL (the code filled
+/// in) and the code to confirm each on the line after its lead, and `✓ Signed in as <email>`
+/// once approved; `flow = "browser"` takes its loopback flow. Its standard error runs: the URL's
+/// lead, the URL, an `ERROR … falling back to Safari` line and "(Could not open browser
+/// automatically …)" (the browser open the sandbox stopped), the code's lead, the code, then
+/// `Waiting for authorization...`. The grammar is unchanged, since the ERROR line comes after
+/// the URL value. On macOS it opens the default browser through the OS whatever its `PATH`, so
+/// there its child runs under [`crate::harness::login_drive::NO_DESK`] (`no_desk`).
 pub const GROK_SIGNIN: SignIn = SignIn {
     routes: &[
         Route {
@@ -651,7 +692,8 @@ pub const GROK_SIGNIN: SignIn = SignIn {
     ],
     env: &[],
     no_opener: true,
-    opens_browser_on: &["macos"],
+    no_desk: &["macos"],
+    types_email: true,
 };
 
 /// Kimi Code's sign-in, its device flow, recorded on 2.3.1 (lab gate (c): with no `open` on
@@ -683,7 +725,8 @@ pub const KIMI_SIGNIN: SignIn = SignIn {
         ("KIMI_CODE_NO_AUTO_UPDATE", "1"),
     ],
     no_opener: true,
-    opens_browser_on: &[],
+    no_desk: &[],
+    types_email: false,
 };
 
 const CODEX_AUTH_WORDS: &[&str] = &[
@@ -739,6 +782,9 @@ pub const CODEX_ACCOUNTS: Accounts = Accounts {
         transient: &[],
     },
     mail_senders: &["openai", "chatgpt"],
+    // Not yet opened by a lab pass.
+    sign_in_page: SignInPage::Fixed("https://auth.openai.com/log-in"),
+    web_session_key: None,
     measured: true,
     measured_on: Some("codex-old 0.164.0"),
     walls_measured_on: Some("codex rollouts' rate_limits"),
@@ -777,6 +823,8 @@ pub const GROK_ACCOUNTS: Accounts = Accounts {
         transient: &[],
     },
     mail_senders: &["x.ai", "xai", "grok"],
+    sign_in_page: SignInPage::Fixed("https://accounts.x.ai/sign-in"),
+    web_session_key: None,
     measured: true,
     measured_on: Some("grok 1.0.67"),
     walls_measured_on: None,
@@ -833,6 +881,13 @@ pub const KIMI_ACCOUNTS: Accounts = Accounts {
         transient: &["concurrent request limit"],
     },
     mail_senders: &["kimi", "moonshot"],
+    sign_in_page: SignInPage::ByRegion {
+        global: "https://www.kimi.ai/",
+        mainland_cn: "https://www.kimi.com/",
+    },
+    // Both sites' script bundles keep `access_token` and `refresh_token` in `localStorage`
+    // (design §5 (f)).
+    web_session_key: Some("access_token"),
     measured: false,
     measured_on: None,
     walls_measured_on: None,

@@ -210,6 +210,15 @@ impl TextInputState {
         self.replace_selection("");
     }
 
+    /// Delete the whitespace-delimited word after the caret (an active selection is deleted
+    /// as-is) as one undo frame (⌥⌦).
+    pub(crate) fn delete_word_forward(&mut self) {
+        if self.selection.is_caret() {
+            self.selection.head = next_word_boundary(&self.value, self.selection.head);
+        }
+        self.replace_selection("");
+    }
+
     #[cfg(any(a11y_tree, test))]
     pub(crate) fn insert(&mut self, text: &str) {
         self.replace_selection(text);
@@ -537,6 +546,31 @@ mod tests {
         let mut input = TextInputState::new("cat 👩‍💻e\u{301}".into());
         input.delete_word_backward();
         assert_eq!(input.value(), "cat ");
+    }
+
+    #[test]
+    fn option_delete_deletes_the_next_word_and_keeps_clusters_whole() {
+        let mut input = TextInputState::new("one two  three".into());
+        input.set_selection(3, 3);
+        input.delete_word_forward();
+        assert_eq!(input.value(), "one  three");
+        assert_eq!(input.selection(), &TextSelection::caret(3));
+        input.delete_word_forward();
+        assert_eq!(input.value(), "one");
+        input.delete_word_forward();
+        assert_eq!(input.value(), "one");
+
+        let mut input = TextInputState::new("alpha beta".into());
+        input.set_selection(2, 4);
+        input.delete_word_forward();
+        assert_eq!(input.value(), "ala beta");
+
+        let mut input = TextInputState::new("👩‍💻e\u{301} cat".into());
+        input.set_selection(0, 0);
+        input.delete_word_forward();
+        assert_eq!(input.value(), " cat");
+        assert!(input.undo());
+        assert_eq!(input.value(), "👩‍💻e\u{301} cat");
     }
 
     #[test]

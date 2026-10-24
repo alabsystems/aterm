@@ -162,28 +162,13 @@ Columns: `id`, `kind`, `functions` (paths under `crates/aterm-agent/src`, module
 ```tsv
 id	kind	functions	statement	blocking_gaps	subsumes
 drive-parse-sub-positionals	contract	drive_cli::{parse_sub,no_positionals}	parse_sub(verb,args)=Ok(sub) ⇒ sub.sid = the first `@` word before `--` (classify: None, and every word from the first non-flag word on goes to rest verbatim); `--` ends flag parsing and appends the rest verbatim; rest = positionals in order. no_positionals(v,sub)=Ok ⇔ rest=[], else Err naming the unexpected words.	1,3,7	2/2
-drive-flag-ownership	table-property	drive_cli::parse_sub	∀ verb, recognised flag f: (verb,f)∉Own ⇒ Err starting "{verb}: {f} is " naming the owners; (verb,f)∈Own ⇒ no ownership error; an unrecognised `--w` ⇒ Err("{verb}: unknown option '{w}'; run `aterm drive --help`"). Decidable over the finite verbs × flags table.	1,3,5,7	6/6
-drive-flag-values	contract	drive_cli::parse_sub, Mark::parse, parse_since, QuestionPriority::parse, LedgerFormat::parse	Each valued flag reads only its own field: u64 flags Err "{verb}: {f} needs …" on a missing/non-u64 value; --context-warn needs n ≤ 100; --max-rows n>0; --approve ∈ {safe,none}; --question-priority ∈ WORDS; --inbox starts '@'; --allow-python repeats in order; --since is Mark::parse (parse_since for ledger); --format ∈ {text,md,markdown,html}; --final/--messages refuse the other view; presence flags set true.	1,3,5,7,13	5/5
-drive-supervise-opts-only-limit	contract	drive_cli::{supervise_opts,max_budget,mail_needs_sid}	supervise_opts(verb,sub,p).policy = p ⊓ sub (no flag raises a power: approve' = approve.at_most(sub.approve), each bool' ⇒ p's bool); max = max_budget (Some(0)/None-for-watch ↦ UNBOUNDED, None ↦ DEFAULT_MAX_S otherwise); context_warn defaults 10; mail = sub.mail.then(MailOpts{inbox, window, grace} with defaults); mail_needs_sid Err iff mail ∧ no sid.	1,3	0/0
-drive-task-report-opts	contract	drive_cli::{task_opts,report_opts,manager_sid}	task_opts Err "task needs the worker" iff no sid, else Err "task needs the text" iff join(rest).trim()="", else Ok{worker, inbox default @self, text, deadline, wait, reconnect default}. report_opts = {since, max_rows default 8000, view}. manager_sid = --inbox, else '@'+trim(ATERM_PARENT_SESSION_ID) when set and non-blank, else None.	1,3,8	0/0
-drive-top-parse-help-routing	contract	drive_cli::{parse,resolve_ready,run}	Global flags are consumed until the first other word; --ready takes the next word verbatim ("" included) and a missing value Errs "--ready needs a REGEX". cmd=[help] iff the first word is -h|--help|help or cmd[1] is exactly -h/--help; run(help) = Ok(DRIVE_HELP) with no I/O. resolve_ready(f) = f or the default pattern.	1,3,7	3/3
+drive-flag-ownership	table-property	drive_cli::parse_sub	A word is read as a flag iff it comes before the first `--`, is not the value a valued flag took, and, for classify, comes before its first positional. ∀ verb, recognised flag f read as a flag: (verb,f)∉Own ⇒ Err starting "{verb}: {f} is " naming the owner (`ledger's (…)`, `answer's (question box token)`; --source=… is named --source), before f's value is read; (verb,f)∈Own ⇒ no ownership error; Own = {(v,--allow-python) | every v} ∪ {(ledger,f) | f ∈ {--since, --source (or --source=…), --journal, --format, --out}} ∪ {(answer,--box)}. Any other word w starting `--` read as a flag ⇒ Err("{verb}: unknown option '{w}'; run `aterm drive --help`"). Decidable over the finite verbs × flags table.	1,3,5,7	1/1
+drive-flag-values	contract	drive_cli::parse_sub, parse_since, LedgerFormat::parse	Each valued flag reads only its own field, its value the next word verbatim (for --source=v the rest of its word); a missing value Errs "{verb}: {f} needs {what}"; --allow-python repeats in order; --since = parse_since(v, tz_offset_s()), Err "{verb}: --since needs a time: …" where that is None; --source v (or --source=v) accepts only `log`, which sets no field, refuses `anchor` naming ANCHOR_REMOVED and Errs "{verb}: --source needs log, the one source" for any other v; --journal and --out take v as a path; --format = LedgerFormat::parse(v), so v ∈ {text,md,markdown,html}, else Err "{verb}: --format needs text, md or html"; --box takes v as the box token.	1,3,5,7,13	1/2
+drive-top-parse-help-routing	contract	drive_cli::{parse,run}	Global flags are consumed until the first other word: --socket/--sock is the one, taking the next word verbatim ("" included) and Erring "--socket needs a PATH" when there is none; any other `--` word there but --help Errs starting "unknown option '{w}'" (--dial/--remote naming `aterm ctl --host`, the rest "(only --socket PATH)"), so a removed global flag such as --ready, --timeout or --idle is refused. cmd=[help] iff the first other word is -h|--help|help or cmd[1] is exactly -h/--help; run with cmd [] or [help] = Ok(Reply{DRIVE_HELP ++ "\n", 0}) with no I/O.	1,3,7	1/1
 drive-classify-verb	contract	drive_cli::{classify_verb,classify_verb_at,python_allow,run}, policy::approval::command_reads_no_secret	classify_verb Errs "classify needs a shell command line" iff the joined rest is blank; else classify_verb_at(args, HOME) replies {"read-only",0} iff classify_command_with(cmd, python_allow(sub)).read_only and command_reads_no_secret(cmd, home) (secrets_free over default_secrets(home), each ~ resolved to home; with no HOME the rules rooted at the home drop out), else {"not-read-only <reason>",1}, the classifier's refusal named before the secret check's; touches no host. Since classifier audit 3 (2026-10-23) the verb is what an agent asks before it runs a line, so it refuses a read of a secret as every box rule does; it does not run the box-only checks (proof gaps, blanks, zsh, git configuration).	1,3,4	1/1
-drive-phase-reply	contract	drive_cli::phase_reply, supervise::render_phase_and_survey, Session::{phase_now,await_phase,program_reader}	phase_reply(turn, reader, allow) = Reply{render_phase_and_survey(turn, reader, allow), 124 if timed_out else 0}: the phase line, then `survey 0` iff reader.survey_block is open (`survey withheld (<why>)` for a card the loop would not press), then `context {n}%` iff reader.context is Some. The turn and every line are read by the worker's own program's reader: `phase` reads through phase_now (program_reader: `status program=`, else the screen; then turn_of), `await-turn` through await_phase (the program named before the wait, so the first wait is for that program's busy guard).	1,3,7	2/3
-drive-endpoint-route	contract	drive_cli::{resolve_configured_local_endpoint_with,local_prompt_route}	flag ∈ {None,"","0","off"} ⇒ Ok(None) without calling read; otherwise read is called once with token_path_for_sock(sock): Ok ⇒ Ok(Some(sock)), Err(e) ⇒ Err naming the path and e. local_prompt_route(Ok(Some(s))) = Persistent{s}; otherwise ShellDiscovery.	1,3,13	4/4
-drive-prompt-turn-protocol	refinement	drive_cli::{run_persistent_local_prompt,prompt_turn,run_relay_prompt_turn}, RelayClient::connect_local_beside	A persistent prompt turn writes exactly [AUTH tok, send -- T, key enter, await idle I timeout D, text] on one connection (no preflight), tok read beside the socket after connecting; returns the `text` body. A resolved endpoint with no listener is Err "cannot connect to the aterm at" (never a discovery retarget).	1,8,11,13	3/3
-drive-prompt-cut-is-75	contract	drive_cli::{run_relay_prompt_turn,connection_broke,run}, Unfinished::into_reply	An I/O error connection_broke accepts during a turn ⇒ Err(Cut) naming the peer and "never retry it blind (exit 75)", and run maps Cut to code 75; a server ERR line ⇒ Err(Failed(line)), not Cut.	1,8,11	2/2
-drive-preloop-exit-journal	contract	drive_cli::{journal_arg,watch_sid_arg,watch_exit_line,main_entry}, Journal::{open,record}, read_journal	journal_arg = the word after the first --journal; watch_sid_arg = the first '@' word of cmd[1..]; watch_exit_line = Some("EXIT "+exit_reason(err line 1)) iff cmd[0]=watch. Round trip: the recorded line reads back as one record {kind exit, sid without '@', line}, file mode 0600.	1,3,7,8	1/1
+drive-phase-reply	contract	drive_cli::phase_reply, supervise::render_phase_and_survey, Session::{phase_now,await_phase,program_reader}	phase_reply(turn, reader, allow) = Reply{render_phase_and_survey(turn, reader, allow), 124 if timed_out else 0}: the phase line, then `survey 0` iff reader.survey_block is open (`survey withheld (<why>)` for a card the loop would not press), then `context {n}%` iff reader.context is Some. The turn and every line are read by the worker's own program's reader: `phase` reads through phase_now (program_reader: `status program=`, else the screen; then turn_of), `await-turn` through await_phase (the program named before the wait, so the first wait is for that program's busy guard).	1,3,7	1/1
 drive-journal-sid	contract	drive_cli::{journal_sid,ledger_verb}	journal_sid(p)=Some(x) iff the journal reads and its records name exactly one sid x; ledger_verb with no sid and no journal sid Errs "ledger needs the worker:" before any ctl call.	1,7,8	1/1
 drive-own-ctl	contract	own_exe, CtlClient::{own_at,new,run}	own_exe() = canonicalize(current_exe()) (current_exe() itself where it cannot be canonicalized); CtlClient::own_at(exe, sock).run(args) execs exe with argv ["ctl", "--sock", sock] ++ args; CtlClient::new(exe, sock) puts nothing before --sock.	8	1/1
-fleet-dispatch-argv	contract	fleet_cli::dispatch_argv	Split line into an optional leading '@' selector, verb and rest at the first spaces; result = (selector without '@' or "-", [sel]? ++ [verb|≠""] ++ [rest|≠""]), rest a byte-for-byte suffix of line.	1,3	3/3
-fleet-dispatch-lines	refinement	fleet_cli::{dispatch_lines,write_dispatch_record,dispatch_io_error,batch_error_record}	For each non-blank non-'#' line in order, run is called with its argv and exactly one result record (ok=false, code=None, stderr "dispatch failed: e" on a launch error) is written and flushed. The first unreadable line writes one batch_error_record and returns Err naming input_line and dispatched; the first failed write returns Err with no further run; else Ok(∧ successes), Ok(true) for an empty batch.	1,3,7,8,11,13	5/5
-fleet-records-format	contract	fleet_cli::{event_record,result_record,err_record,json_escape}	result_record is the exact JSON object {subject,sid,ok,reply,exit_code|null,stdout,stderr}; every string in these records is json_escape'd and round-trips, including event addressing fields supplied by a subscription peer.	1,3,12	3/3
-fleet-json-escape	round-trip	fleet_cli::json_escape, aterm_codec::json::escape	∀ s: json_parse("\""+json_escape(s)+"\"") = s, and the escape holds no byte < 0x20 unescaped.	1,7,12	1/1
-fleet-federated-sid	contract	fleet_cli::resolve_federated_sid	Returns channels[local] or local; removes local from channels iff body is `exited` or starts `exited `. Hence |channels| ≤ live channels.	1,2	1/1
-fleet-line-bound	contract	fleet_cli::read_federated_line	Reads at most MAX_FEDERATED_LINE_BYTES+1 bytes; Ok(n ≤ MAX) when the line fits, else Err(InvalidData); line grows by ≤ MAX+1.	1,2,8,11	1/1
-fleet-sessions-from	contract	fleet_cli::sessions_from, FleetSession::sid	sessions_from(rows) = [(pid, sid) | row with Some(sid)] in order; sid is the second whitespace column of the row.	1,3,7,12	1/1
-fleet-list-diagnostics-automaton	invariant	fleet_cli::ListDiagnostics::observe	Mealy machine on failing: Option<(reason,n)>: Ok after failing says recovered once; Err increments n for the same reason (else n=1) and speaks iff n=1 ∨ n mod LIST_REPEAT_EVERY=0, as "nothing to federate" for an empty fleet else "cannot list the fleet", always naming the reason; a healthy loop is silent.	1,2,3	3/3
-fleet-stream-child-cleanup	contract	fleet_cli::{terminate_stream_child,stream_targets}	terminate_stream_child SIGKILLs a live child and returns only once it is reaped; stream_targets returns false at stdout EOF/rejection and kills and reaps the child, never waiting on it.	8,13	2/2
 align-capture-bounded	contract	harness::align::{capture_bounded,capture_bounded_impl,kill_capture_child,read_capture_pipe}	A child that exits and closes stdout before the deadline gives Ok{first min(cap,|out|) bytes, code}; otherwise Err naming the deadline within a bounded grace, its whole process group killed; an escaped descendant holding stdout cannot delay the return.	8,13	4/4
 align-capture-lifecycle-refines-model	refinement	harness::align::capture_bounded_impl, aterm_models_harness::harness_capture_worker_lifecycle_model	Every return is a Return step of the model: child reaped and reader thread joined (never detached), also when an escaped descendant holds stdout.	8,10,13	1/1
 upgrade-summary-complete	contract	harness::upgrade_drive::bounded_output	Some(text) requires complete UTF-8 stdout, a successful exit within the shared capture deadline, and at most cap bytes. An oversized valid prefix, read failure, invalid UTF-8 or nonzero exit returns None; process/reader cleanup follows align-capture-bounded.	1,3,8,13	1/1
@@ -544,15 +529,12 @@ rfc3339-utc-civil	equivalence	usage::rfc3339_utc	Total over i64 and equal to the
 usage-panel-windows	contract	usage::{usage_panel_windows,panel_title,panel_key_slug,pct_used,reset_after,is_bar_glyph}, harness::cli::limits_view	One window per titled meter block with its N% used and reset text, in every measured layout; unmeasured titles get no key; non-panels give nothing.	1,3,7,13	5/5
 usage-panel-read-phase	contract	usage::usage_panel_read, aterm_observe::row_matcher	Classifies Inline, NotUsage, Fold, Unsettled or Settled (whole tab, both windows, hint last, nothing unsettled); the header guard matches only the header row.	1,3,7,12	9/9
 usage-panel-sample	contract	usage::panel_sample	Some iff both windows were read; figures are their pcts; resets placed in the panel's zone, None past their window's bound (figure kept).	1,3,7,12	3/3
-governor-token-bucket	invariant	SelfGovernor::{disabled,enable_self_write,allow_self_write,note_self_output,tick,tripped,reset}	tokens ≤ capacity is preserved; allow_self_write = enabled ∧ ¬tripped ∧ tokens>0, spending one; churn saturates and the breaker latches until reset; tick refills saturating and never panics.	1,2,3	3/3
 ready-fd-signal	contract	ready::{Ready::open,Ready::hand,Ready::wait}	open leaves no name in its directory and both FIFO ends close-on-exec; hand clears close-on-exec on exactly the write end's number in the child. wait(bound) = Ready iff one byte is read, Closed iff end-of-file with nothing written (every write end closed), TimedOut iff neither within bound; a wait that timed out may be made again, and once one answered Ready or Closed every later wait answers Closed.	8,13	1/1
-turn-run-protocol	contract	Turn::run, row_matcher, ControlClient::{send,key_enter,await_idle_and_ready}	A bad pattern is BadPattern with no transport use; a governed turn is Governed with none; otherwise exactly send, key_enter, await (each after the earlier Ok), one token spent.	1,2,4,11,12	3/3
-relay-wire-equals-ctl	equivalence	RelayClient::{send,key_enter,await_idle_and_ready,read_text}, CtlClient::await_idle_and_ready, unsettled	RelayClient's wire bytes equal CtlClient's request lines for the same Turn; the `await match` reply is consumed; an unsettled await (OK timeout / exit 124) is Err(unsettled), never settled.	1,2,7,8,11	3/3
 relay-read-only-connection	contract	RelayClient::{reads_only,may_send,request_line,request_frame}, is_read_request, READ_VERBS	A connection made reads_only() writes request line l iff is_read_request(l): the first word of l after its @-selectors ∈ READ_VERBS, and for `meta` no `set`/`unset` follows. Every other request line, and every length-framed write, returns Err(PermissionDenied) with nothing written. A connection never made reads_only writes every request.	1,8	1/1
 relay-framing-one-line	contract	RelayClient::{write_line,send,request_frame}	A line or head with CR/LF is InvalidInput with nothing written; otherwise exactly line+LF, or head SP len LF payload.	1,2,8,11	3/3
 relay-read-bounds	contract	RelayClient::{read_line,read_body_lines,request_bytes}	read_line enforces MAX_LINE_BYTES however reads chunk; read_body_lines checks the count and one aggregate allowance, consuming nothing past a failure; request_bytes reads exactly its count.	1,2,5,7,8	2/2
 reply-count-grammar	contract	reply_count, RelayClient::{request_counted,read_text}	Ok(Some(n)) for `OK n…` with n fitting usize, InvalidData for an overflowing digit token, Ok(None) otherwise; read_text refuses a header without a count.	1,3,5,7	2/2
-relay-reply-classification	contract	RelayClient::{read_reply,request_status,help_counted}, is_ok_reply, control_verbs::host_gone	A first line that is host_gone is UnexpectedEof naming the pid; otherwise verbatim. Success is exactly OK or OK SP …, including memoized help; body lines are never classified.	1,3,12	2/2
+relay-reply-classification	contract	RelayClient::{read_reply,request_status,help_counted}, is_ok_reply, control_verbs::host_gone	A first line that is host_gone is UnexpectedEof naming the pid; otherwise verbatim. Success is exactly OK or OK SP …, including memoized help; body lines are never classified.	1,3,12	1/1
 ctl-failure-words	contract	failure_words, unsettled	failure_words is the trimmed stderr, else `aterm-ctl exited {code}[: stdout]`, never empty; unsettled names min(ms, cap) and which bound applied.	1,3	1/1
 answer-plan-contract	contract	answer::{plan,plan_by_role,option_named,names_no_option,policy_refusal}, QuestionPriority::parse, recommended_set, answer_question	A dialog read whole (Claude Code's): human ⇒ Human; recommended ⇒ the decider's keys; a single-select answer names one option by number or label, else Err; a multi-select toggles what differs then presses the button (refusing a dirty free-text row); review takes `submit`. A question read by its answers' roles (no dialog: Codex's) ⇒ plan_by_role: human ⇒ Human; no Answer-role option ⇒ Err; recommended ⇒ the decider's Digit(n, guard) or Err; `<n>` or an option's exact label (case folded) naming an Answer-role option ⇒ Digit(n, row_guard(the title row)); the last row (`None of the above`, Role::Other) ⇒ Err (a person's own words); a head off the rows read ⇒ Err; anything else ⇒ names_no_option's Err (a text priority's refusal names `meta set questions <word>`).	1,3,5,7,12	6/6
 answer-box-token	contract	question_box_token, role_box_token, prompt_box_token, token_of	question_box_token = 8 lowercase hex chars of a folded FNV-1a of (form, headers, question); role_box_token = the same over (title, description, option labels); prompt_box_token(p) = the dialog's question_box_token, else role_box_token for a Question with an Answer-role option, else None; deterministic in exactly those inputs (distinctness is not claimed).	1,3,7,12	2/2
@@ -599,9 +581,7 @@ ledger-render-escapes	contract	render_md, render (Html)	Markdown escapes | in ce
 limit-zone-and-reset-grammar	contract	limit::{parse_reset,parse_clock,resumes_by_itself,one_line,zone_offset_at}	parse_reset accepts the span, clock and date shapes with zones and refuses out-of-range parts; resumes_by_itself by its phrases; one_line joins words; zone_offset_at is None for a name no zone has.	1,3,5,7	8/8
 limit-reset-placement	refinement	limit::{reset_at,civil,days_from_civil}	reset_at equals the reference placement (spans from now, dated in the nearest year, bare clocks today unless passed beyond SAME_DAY); civil and days_from_civil are inverse bijections.	1,3,5,7,13	3/3
 limit-wall-placement	contract	limit::{reset_in_zone,reset_at_with,place_reset,place_reset_with,within_a_session_window,offset_at,zone_offset_at}, Session::{reset_unix_for,reset_unix}	reset_in_zone finds the wall-clock instant after now in that zone's offset at that instant (DST-correct); place_reset puts a weekly/spend wall's bare clock after its print, a session wall's within 5 h of the print, else the session rule; an undated cancelled limit is clamped to a session window; zone lookups refuse non-zone names.	1,3,5,7,8,13	7/7
-mail-row-and-principal	round-trip	mail::{MailRow::parse,line,is_report_from,is_from_session,newest_id,body_rows}	parse reads exactly the msg row grammar; line prints the MAIL line; is_from_session matches whole principals; body_rows skips the report stamp line.	1,3,5,7	2/2
-mail-task-protocol	refinement	mail::{task_with_clock,composer_guard,worker_phase,secs}	Baseline before the post; exactly one post (never re-posted); a guarded nudge only to an idle worker; the wait accepts only the worker's reply to the offset with a monotone watermark rebased after handoffs; total timeouts = the bound; outages ridden out; escaped output.	1,2,4,7,10,13	13/13
-mail-lane-exactly-once	refinement	mail lane (first delivery / resync)	Across handoffs every worker report is delivered exactly once by its bus offset, re-armed from the successor's newest id.	1,2,7,10,13	4/4
+mail-row-and-principal	contract	ledger::is_from_session	is_from_session(from, worker) ⇔ from splits at its first '@' into (s, n) with n starting `n-`, and, for w = worker less one leading '@', either w holds no '@' and s = w, or w splits at its first '@' into exactly (s, n): the whole principal, never the sid alone, so a from with no '@' or a node not `n-…` never matches and a worker that names a node matches that node only.	1,3,5,7	0/0
 memory-ceiling-formula	contract	memory::MemoryCeiling::ceiling_mib	Off ⇒ None; Gib(n) ⇒ 1024n; Auto ⇒ clamp(p/BASE + min(a,p)/AVAILABLE, floor, max(p/2, floor)) (UNKNOWN_MACHINE_MIB without p); monotone in available.	1,3	1/1
 memory-judgement	contract	memory::{AgentMemory::strain,dominant,judge,MemoryOver::acts,episode_over,MemoryOver::verdict}	strain at Critical or Warn-with-swap; dominant = largest and ≥ 1/5 of use; judge Some iff past the ceiling; acts ⇔ strain ∧ dominant; the episode ends an eighth under; verdict depends only on (strain, dominant, restarts).	1,2,3,4	5/5
 memory-ceiling-order	contract	memory::MemoryCeiling::no_more_than	A partial order with Off at the bottom, higher Gib limiting, Auto incomparable to Gib.	1,3	1/1
@@ -690,7 +670,7 @@ json-reader-grammar	contract	screen::{Json::parse,parse_value,parse_string,hex4,
 screen-cursor-index	contract	screen::Screen::cursor_index	Some(cursor_row - first) iff it lies in rows, else None.	1,2	1/1
 stall-status-read	contract	stall::{worker_stall,publishes_input}, escalate::status_field	worker_stall = Some iff input= is stalled or stopped, with bytes, wait and rss parsed; publishes_input ⇔ an input= field.	1,3,7	1/1
 wait-text-format	contract	stall::{wait_text,rss_text}	wait_text in s / m ss s / h mm m / d h; rss_text in MB below 1024 else one-decimal GB (needs an overflow bound on mb).	1,3,6	1/1
-frozen-text	contract	stall::{frozen_mail_text,frozen_warning_text,stall_facts}, resume::{restart_command,shorter}	The mail names the program, the wait, backlog and size, then the remedy by AfterRestart; the warning is two lines, its command line the first fitting candidate within NOTE_LINE_CHARS.	1,3,4,7	1/1
+frozen-text	contract	stall::{frozen_warning_text,stall_facts}, resume::{restart_command,shorter}	The warning names the program, the wait, backlog and size, then the remedy by AfterRestart: it is the two lines "{program} frozen: not reading input" ++ stall_facts(stall) and the remedy, joined by "\n". stall_facts = " for {wait_text(wait_ms)}" iff the wait was measured, then " ({n} B queued, {rss_text(mb)})" of the parts measured, in that order, with no parentheses when neither was. The remedy starts "aterm leaves it running — ": Relaunch ⇒ "`{restart_command(Some(sid or <sid>), pid)}` ends it, and {RELAUNCH_WORDS}"; Act ⇒ "`{that command}` restarts it"; Unknown ⇒ "`aterm ctl @{sid without its leading '@'s, or <sid>} signal term` ends it (`signal kill` if it survives)"; Command(line) ⇒ that, then ", then `{l}` resumes it" for the first l of [line] ++ shorter(line) whose clause keeps the remedy within NOTE_LINE_CHARS characters, or nothing when none fits.	1,3,4,7	1/3
 relay-render	contract	transport::{render,is_timeout,lossy,client_failure}	render reproduces aterm-ctl's printing (ERR to stderr code 1; timeouts 124; framing-specific stdout/stderr notes, `search`'s ` incomplete` note by aterm_ctl::search_incomplete_note), so every CtlReply reader returns the same verdict.	1,3,7,11,12	1/1
 relay-connection	contract	transport::{RelayCtl::call,call_at_host_of,preferring,exchange,conn_for,endpoint_conn,endpoint_sock,dial,hold,drop_conn,connect,io_words}	A connection carries only requests one instance answers: a request naming a session (aterm_ctl::target_sid) rides the connection of the instance its graph entry names (aterm_ctl::hosting_sock), dialled with the token beside that socket; when no entry names one or its connect finds nothing listening (ENOENT, ECONNREFUSED), the endpoint's connection of that session's own; a request aimed at a session's host (call_at_host_of) rides the host's connection, else that session's relayed one, else the endpoint's; every other request rides the endpoint's own connection, the only one the given token is presented on. A session's route stands while its connection lives. A mid-call I/O error is a lost reply that drops that connection and its routes, and the next call dials again (re-reading the graph entry); connect failures are lost; unsupported framings fail without I/O. A transport built by preferring(endpoint, token) presents that token on the endpoint's socket; a reply `ERR auth` on a connection that presented it drops the connection and the token for good, and the request is sent once more on a connection dialled with the token beside the socket, which every later request uses, so at most one request per transport is sent twice. A refusal on any other connection, or on a transport built by new, is the reply.	2,8,13	6/6
 relay-interrupter	contract	transport::RelayCtl::{interrupter,call,exchange}, hangup::hang_up	After the cut every call Errs; a parked read returns early; every connection held is hung up, both halves each, so a half-closed peer sees EOF.	8,13	3/3
@@ -698,8 +678,6 @@ reply-wait	contract	transport::reply_wait	The first `timeout N` / `timeout=N` in
 ctl-reply-readers	contract	run::CtlReply::{ok,timed_out,err_text,bare_err,usage_error,unknown_form,is_err,seq,skipped,turn_verdict,submitted,warned_input_unread}	Each reader is the stated projection of code, stderr and stdout (seq digits after seq=, skipped on OK skipped, the verdict line carrying submitted=, warn=input-unread off that line).	1,2,3,7	2/2
 ctl-reply-lost	contract	run::{CtlReply::lost,unserved,client_lines,turned_away,unsent,cut}, Session::unserved	lost ⇔ not ok and (exit 75, or the first ERR line turned away by a whole phrase, or no ERR and a client unsent/cut line); unserved adds `no such session` during an outage; server ERRs are never lost.	1,3,5,7,12	2/2
 line-clip-and-exit-reason	contract	run::{clip,exit_reason,one_line}, Session::ride_out	clip = the first 160 chars with controls spaced; exit_reason wraps exited/no-such-session as `session gone (…)`; RECONNECT lines are clipped.	1,3,7	2/2
-story-of	table-property	run::story_of	Maps journal lines to the closed story verbs with ≤ 96-byte texts and never a command, question or answer; every other line None.	1,3,7	1/1
-story-teller-lane	equivalence	Session::watch_with, run::story_of	With a teller the printed lines and main requests are unchanged; the teller gets exactly the story requests of story_of over the printed lines.	1,2,4,7,11	1/1
 approval-line-cells	contract	run::{approval_line,cut_cells}, breaks_a_line, char_width, prompt_box_first_row	cut_cells spaces line breakers, trims, and keeps the longest prefix within cap cells; approval_line applies it to the box's first row at APPROVAL_LINE_CELLS.	1,3,7,12	1/1
 typed-draft	contract	run::{typed_draft,typed_draft_in,stray_digit}, ScreenReader::composer	A draft is any later composer line, or a non-empty first line unless it is the homed placeholder on the caret row; stray_digit ⇔ no prompt and the composer holds exactly the digit.	1,3,7,11,12	1/1
 busy-up	contract	Session::busy_up, row_matcher, RowMatch::clears	busy_up ⇔ some row is not cleared by the guard's matcher (an exhausted scan counts as up); false for an invalid guard; cached consistently.	1,2,12,13	1/1
@@ -717,15 +695,13 @@ survey-zero-timing	invariant	Session::{survey,set_survey_settle,set_survey_land}
 parked-card-keeps-busy	contract	aterm_phase::worker_phase, parked_span, Session::drive	Any card parked above a busy composer leaves the phase Busy; with dismissal off no EVENT idle or key.	1,3,5,7,12	1/1
 review-point-once	invariant	Session::{drive,look,wait_for_next}, Looking, Saw	An EVENT is printed exactly when the point's id differs from the last handed one, a busy read came since, or an unserved outage intervened; at most one per point; the next wait is seq- or gone-based.	1,2,3,5,7,8,11,12	7/7
 outage-ride-out	invariant	Session::{ride_out,note_exchange,metadata_authority,unserved,set_reconnect}, Outage, CtlClient::call	An unserved reply or proof-read transport loss begins one outage (one RECONNECT line), probed by reads on a doubling pause until served (RECONNECTED) or the window lapses (EXIT, code 1; badge cleanup still requires custody proof). Relapses share the window until a non-probing served request of the failed kind or a successful await seq ends it. Raw metadata proofs use the same canonical meta kind and bookkeeping without claim renewal, so successful proof reads close their outage even when no await seq succeeds, and a later loss receives a new recovery window. Nontransport refusals follow their caller's handling and do not create an outage.	1,2,4,7,8,11,13	10/10
-watch-report	contract	Session::report_brief, run::{reported,reported_event_line}, report::*	With --report, idle/question/limited points read history and offscreen (or the old-host fallback) and print complete= rows= on the EVENT; a failed report says so and still prints; prompts read none; supervise never reads one.	1,2,3,7,8,11	3/3
 supervise-result-and-log-split	contract	Session::supervise_to, render_result	supervise returns the rendered point (or TIMEOUT) with no event lines, which go to the log; it never badges, posts, types or reads a report.	1,2,7,11	3/3
-journal-mirrors-output	invariant	journal::{Journal::open,append,read_journal}, Session::{watch_to,supervise_to}	The journal (append, 0600) holds exactly the printed lines plus journal-only kinds, in order; supervise journals what watch would have printed; a failing journal warns once and changes nothing else.	1,2,7,8,11	4/4
-mail-report-fold	invariant	Session::{watch_mail,supervise_with,hold_for_report}, mail::*	Each delivered row prints one MAIL line; a report folds into the idle point of its turn (EVENT turn report=…); idle points without a report are held for the grace then said; without mail or a lane nothing changes; supervise interrupts the lane before returning.	1,2,7,8,11,13	11/11
-escalation-badge	invariant	Session::{escalate,write_attention_target,unset_if_ours,retry_supervisor_attention,finish_supervisor_attention,waits_out,wait_for_next}, escalate::refused_cap, run::fit_bytes	Each logical escalation is journaled ESCALATED with its words and published as `meta set attention owner=supervisor`; a tighter cap permits one recut per attempt. Only final OK acknowledges publication or cleanup; refused or lost replies retain intent after box, limit or turn-end flags are consumed. A future metadata deadline retries without policy, model, input or claim actions, while existing policy and look deadlines win; fresh Off converts publication to cleanup. Owner-scoped cleanup is requested when the box goes, the episode closes, Off parks or the watcher exits, subject to custody and kind checks. A limit's badge names its kind after the owner: `kind=wait` exactly when the limit is waited out with no one's act — Claude Code continues by itself (`limit::resumes_by_itself`, whatever `resume_limits` says), or `resume_limits` is on and the notice names a reset the loop read within RESET_HORIZON — and `kind=ask` otherwise, decided (Session::waits_out) before the badge goes up; a box's, a question's and a turn end's badge names none (an ask to every reader).	1,2,3,4,7,8,11,12	8/8
+journal-mirrors-output	invariant	journal::{Journal::open,append,read_journal}, Session::{watch_to,supervise_to}	The journal (append, 0600) holds exactly the printed lines plus journal-only kinds, in order; supervise journals what watch would have printed; a failing journal warns once and changes nothing else.	1,2,7,8,11	3/3
+escalation-badge	invariant	Session::{escalate,write_attention_target,unset_if_ours,retry_supervisor_attention,finish_supervisor_attention,waits_out,wait_for_next}, escalate::refused_cap, run::fit_bytes	Each logical escalation is journaled ESCALATED with its words and published as `meta set attention owner=supervisor`; a tighter cap permits one recut per attempt. Only final OK acknowledges publication or cleanup; refused or lost replies retain intent after box, limit or turn-end flags are consumed. A future metadata deadline retries without policy, model, input or claim actions, while existing policy and look deadlines win; fresh Off converts publication to cleanup. Owner-scoped cleanup is requested when the box goes, the episode closes, Off parks or the watcher exits, subject to custody and kind checks. A limit's badge names its kind after the owner: `kind=wait` exactly when the limit is waited out with no one's act — Claude Code continues by itself (`limit::resumes_by_itself`, whatever `resume_limits` says), or `resume_limits` is on and the notice names a reset the loop read within RESET_HORIZON — and `kind=ask` otherwise, decided (Session::waits_out) before the badge goes up; a box's, a question's and a turn end's badge names none (an ask to every reader).	1,2,3,4,7,8,11,12	7/7
 limit-extend	contract	Session::extend_for_limit, limit::{parse_reset,reset_instant}	One EXTEND per episode moves the deadline to reset + 600 s iff the reset is ahead, within a week and later than the deadline.	1,3,4,7,8	2/2
-limit-episode	invariant	turn_end_loop::*, Session::look, limit::*, composer_guard, TurnEndTiming	Limited points form episodes closed by work, an answered continuation or (self-resuming) a busy read; each escalated at most once unless handled; exactly one guarded continuation per look when the reset passed or the notice left, with a frame, no draft, status first and the backoff run.	1,2,3,4,7,8,10,11,12	13/13
+limit-episode	invariant	turn_end_loop::*, Session::look, limit::*, composer_guard, TurnEndTiming	Limited points form episodes closed by work, an answered continuation or (self-resuming) a busy read; each escalated at most once unless handled; exactly one guarded continuation per look when the reset passed or the notice left, with a frame, no draft, status first and the backoff run.	1,2,3,4,7,8,10,11,12	12/12
 host-look-wake	invariant	Session::wait_for_next, IdleHost::{wants_at,wants,at_idle}	Idle waits never outlast the host's wants_at; past it the loop steps the host; the run's writes equal those with no host.	2,7,8,11,13	2/2
-stall-hold	invariant	stall::Session::{note_status,stall_in_hand,stall_before_wait,withhold_badge,stall_probe,hold_for_stall,thaw,stall_step,stall_look}	While a stall is in hand no write or new badge goes; holding it withdraws our badge, mails one frozen notice (fabric connected) and journals FROZEN once; thawing journals THAWED and decides the point again; input-unread warnings read status before the next act.	1,2,4,7,8,11,13	13/13
+stall-hold	invariant	stall::Session::{note_status,stall_in_hand,stall_before_wait,withhold_badge,stall_probe,hold_for_stall,thaw,stall_step,stall_look}	While a stall is in hand no write or new badge goes; holding it withdraws our badge, journals FROZEN once and tells a host it holds the stall; thawing journals THAWED, tells the host the stall lifted and decides the point again; input-unread warnings read status before the next act.	1,2,4,7,8,11,13	8/8
 stall-probe-cost	invariant	stall::Session::{stall_step,withhold_badge,note_status}, Caps::input	On a host that never measures input the requests are those without stall handling plus at most one status per connection; unknown measuring probes once after a wait runs out.	1,2,5,7,8,11	3/3
 stall-remedy-refines-model	refinement	stall::Session::{stall_remedy,warn_stall,stall_signal_term,after_restart}, stall::refusal_lifts, beside::Session::beside_self_claim	Under stall_term the restart request is sent iff supervisor_stall_remedy_model enables Term (once per episode, never under another's hand, beside a proven self-claim on the stall alone, the agent's record never read for its rest); otherwise one STALL-WARNED and inform, under the same gate; refusals decide as stated (restart unavailable: halted|driver-lease|driver-turn uncounted); never signal kill.	2,4,7,8,10,11	4/4
 beside-memory-remedy	contract	beside::Session::beside_memory_remedy, run::Session::memory_edge, harness::self_claimed::{idle_point,read_idle}	Beside a proven self-claim the loop decides no point at a memory measure: a measure that MemoryOver::acts, with relaunch on, a host that relaunches, unattended, no stall in hand and IdleHost::beside_idle true at this step and at the step before it on the same screen seq (the idle point stood), sends exactly `restart pid=<leader> quiet=<grace>` once per agent process; anything else sends nothing and asks again at the next step; a refusal for another hand (busy, halted, restart unavailable: halted|driver-lease|driver-turn) is uncounted; a measure no longer acted on ends the count. idle_point = status idle ∧ draftEmpty true ∧ no exit; read_idle is false unless the identity is live before and after the read and the record names that pid.	2,4,7	3/3
@@ -877,43 +853,13 @@ te-renewable-login	5
 
 ```tsv
 file	test	primary	also
-src/drive_cli.rs	a_broken_relay_connection_names_its_peer	drive-prompt-cut-is-75	
 src/drive_cli.rs	a_removed_source_is_a_usage_error_naming_its_date	drive-flag-values	
-src/drive_cli.rs	a_listener_replaced_after_the_route_is_picked_is_sent_its_own_token	drive-prompt-turn-protocol	
-src/drive_cli.rs	a_prompt_cut_by_its_servers_exit_is_75_never_a_retryable_1	drive-prompt-cut-is-75	
 src/drive_cli.rs	a_verb_followed_by_help_asks_for_help_and_never_acts	drive-top-parse-help-routing	
-src/drive_cli.rs	a_watch_that_dies_before_its_loop_still_journals_its_exit	drive-preloop-exit-journal	
-src/drive_cli.rs	absent_or_disabled_endpoint_preserves_shell_discovery_fallback	drive-endpoint-route	
 src/drive_cli.rs	classify_parses_the_command_and_exits_on_the_verdict	drive-parse-sub-positionals	
 src/drive_cli.rs	classify_refuses_a_read_of_a_secret_under_the_default_list	drive-classify-verb	
-src/drive_cli.rs	configured_prompt_uses_one_connection_and_no_cursor_preflight	drive-prompt-turn-protocol	
-src/drive_cli.rs	context_warn_is_watchs_and_supervises_a_percentage	drive-flag-values	
-src/drive_cli.rs	mail_flags_are_the_loops_and_need_the_worker	drive-flag-ownership	
-src/drive_cli.rs	phase_and_await_turn_end_with_the_context_left	drive-phase-reply	
-src/drive_cli.rs	question_priority_is_watchs_and_supervises_and_answers_nothing_the_policy_does_not	drive-flag-ownership	
-src/drive_cli.rs	ready_flag_parses_and_requires_a_value	drive-top-parse-help-routing	
-src/drive_cli.rs	report_parses_since_and_max_rows	drive-flag-values	
-src/drive_cli.rs	resolved_but_unreachable_endpoint_surfaces_connect_error_without_retargeting	drive-prompt-turn-protocol	
-src/drive_cli.rs	task_parses_the_worker_its_flags_and_the_text	drive-flag-values	
+src/drive_cli.rs	phase_ends_with_the_context_left	drive-phase-reply	
 src/drive_cli.rs	the_ledger_takes_its_worker_from_the_journal_when_none_is_named	drive-journal-sid	
-src/drive_cli.rs	the_loops_flags_only_limit_the_policy	drive-flag-ownership	
-src/drive_cli.rs	the_round_11_flags_belong_to_their_verbs	drive-flag-ownership	
-src/drive_cli.rs	watch_parses_supervises_flags_into_the_same_options	drive-flag-ownership	
-src/fleet_cli.rs	a_failed_listing_is_reported_and_never_read_as_an_empty_fleet	fleet-list-diagnostics-automaton	
-src/fleet_cli.rs	a_live_listing_maps_to_the_same_pid_and_sid_columns_as_the_ls_parse	fleet-sessions-from	
-src/fleet_cli.rs	a_recovered_listing_says_so_once_and_a_healthy_loop_stays_silent	fleet-list-diagnostics-automaton	
-src/fleet_cli.rs	a_repeated_failure_speaks_once_per_distinct_reason_then_periodically	fleet-list-diagnostics-automaton	
-src/fleet_cli.rs	dispatch_broken_output_reports_possible_effects_without_retrying	fleet-dispatch-lines	
-src/fleet_cli.rs	dispatch_input_failure_is_not_silently_a_successful_empty_batch	fleet-dispatch-lines	
-src/fleet_cli.rs	dispatch_invalid_input_reports_the_executed_prefix_and_stops	fleet-dispatch-lines	
-src/fleet_cli.rs	dispatch_launch_failure_has_no_fabricated_exit_code	fleet-dispatch-lines	
-src/fleet_cli.rs	dispatch_reports_child_failure_and_still_processes_the_remaining_batch	fleet-dispatch-lines	
-src/fleet_cli.rs	event_record_is_astream_addressed_and_valid_json_shape	fleet-records-format	
-src/fleet_cli.rs	exited_channels_do_not_accumulate_for_the_stream_lifetime	fleet-federated-sid	
-src/fleet_cli.rs	federated_line_reader_caps_accumulation	fleet-line-bound	
-src/fleet_cli.rs	rejected_stream_child_is_killed_and_reaped_promptly	fleet-stream-child-cleanup	
-src/fleet_cli.rs	result_record_preserves_turn_screen_verdict_and_exit_status	fleet-records-format	
-src/fleet_cli.rs	subscriber_that_closes_stdout_is_terminated_promptly	fleet-stream-child-cleanup	
+src/drive_cli.rs	the_ledgers_flags_belong_to_it	drive-flag-ownership	drive-flag-values
 src/harness/accounts_tests.rs	a_candidate_struck_past_an_unanswered_account_leaves_that_account_as_it_was	acc-strike-undo-exact	
 src/harness/accounts_tests.rs	a_dir_is_used_verbatim_and_two_spellings_of_one_place_are_two_logins	acc-append-row-roundtrip	
 src/harness/accounts_tests.rs	a_held_sessions_wait_ends_at_the_rosters_next_opening_when_that_comes_first	acc-next-usable-opening-hold	
@@ -1856,21 +1802,13 @@ src/harness/usage.rs	usage_json_is_schema_1_and_round_trips_through_the_parser	u
 src/harness/usage.rs	view_shown_is_the_first_active_account_else_the_first	usage-view-shown	
 src/harness/usage.rs	working_time_is_the_union_of_the_main_chains_turns	working-time-union	
 src/lib.rs	a_read_only_connection_sends_the_read_verbs_alone	relay-read-only-connection	
-src/lib.rs	a_relay_turn_that_does_not_settle_names_the_timeout	relay-wire-equals-ctl	
 src/lib.rs	a_silent_ctl_failure_still_says_something	ctl-failure-words	
-src/lib.rs	a_turn_that_does_not_settle_names_the_timeout	relay-wire-equals-ctl	
-src/lib.rs	governor_is_off_by_default_fail_closed	governor-token-bucket	
-src/lib.rs	governor_rate_limits_and_breaker_latches_fail_closed	governor-token-bucket	
 src/lib.rs	relay_client_bounds_a_line_even_when_the_last_read_contains_its_newline	relay-read-bounds	
 src/lib.rs	relay_client_counted_body_has_one_aggregate_allowance	relay-read-bounds	
 src/lib.rs	relay_client_frames_a_payload_byte_for_byte	relay-framing-one-line	
-src/lib.rs	relay_client_maps_err_reply_to_error	relay-reply-classification	
 src/lib.rs	relay_client_reads_the_host_gone_line_as_the_connection_closing	relay-reply-classification	
 src/lib.rs	relay_client_refuses_overflowing_counts_instead_of_reading_them_as_status	reply-count-grammar	
-src/lib.rs	run_rejects_a_bad_ready_pattern_before_touching_the_transport	turn-run-protocol	
 src/lib.rs	the_own_client_runs_the_ctl_verb_first	drive-own-ctl	
-src/lib.rs	tick_saturates_when_capacity_plus_refill_overflows_u32	governor-token-bucket	
-src/lib.rs	turn_is_governed_when_self_write_disabled	turn-run-protocol	
 src/ready.rs	the_byte_is_ready_a_bare_close_is_closed_and_a_held_end_is_a_hang	ready-fd-signal	
 src/supervise/answer.rs	a_roles_question_has_a_box_token_and_another_box_none	answer-box-token	
 src/supervise/answer.rs	a_multi_select_toggles_what_differs_then_presses_the_button	answer-plan-contract	
@@ -2061,25 +1999,6 @@ src/supervise/limit.rs	a_zones_offset_is_read_at_the_instant	limit-wall-placemen
 src/supervise/limit.rs	both_spellings_parse_with_the_zone	limit-zone-and-reset-grammar	
 src/supervise/limit.rs	the_auto_continue_shapes_are_a_time_today_or_tomorrow_or_a_minute	limit-zone-and-reset-grammar	
 src/supervise/limit.rs	the_local_zone_is_the_c_librarys_and_no_zone_is_made_up	limit-zone-and-reset-grammar	
-src/supervise/mail.rs	a_busy_worker_is_not_nudged	mail-task-protocol	
-src/supervise/mail.rs	a_nudge_never_lands_in_a_live_box	mail-task-protocol	
-src/supervise/mail.rs	a_post_that_did_not_land_is_the_servers_words	mail-task-protocol	
-src/supervise/mail.rs	a_resync_listing_that_took_a_retry_is_taken_up_not_thrown_away	mail-lane-exactly-once	
-src/supervise/mail.rs	a_resync_rides_out_a_successor_that_does_not_host_the_session_yet	mail-lane-exactly-once	
-src/supervise/mail.rs	a_row_parses_and_prints_as_the_mail_line	mail-row-and-principal	
-src/supervise/mail.rs	a_task_without_a_deadline_carries_no_dl	mail-task-protocol	
-src/supervise/mail.rs	a_wait_re_arms_on_the_hosts_own_timeout_while_time_is_left	mail-task-protocol	
-src/supervise/mail.rs	a_wait_that_runs_out_is_the_timeout	mail-task-protocol	
-src/supervise/mail.rs	a_wait_the_update_cut_finds_the_answer_that_landed_meanwhile	mail-task-protocol	
-src/supervise/mail.rs	a_wait_the_update_cut_is_re_armed_on_the_successors_ids	mail-task-protocol	
-src/supervise/mail.rs	an_outage_past_reconnect_s_is_the_error	mail-task-protocol	
-src/supervise/mail.rs	an_outage_rides_out_a_successor_that_does_not_host_the_inbox_yet	mail-task-protocol	
-src/supervise/mail.rs	body_rows_does_not_count_the_report_stamp	mail-row-and-principal	
-src/supervise/mail.rs	only_the_workers_own_reply_answers_the_task_and_a_terminal_sees_it_escaped	mail-task-protocol	
-src/supervise/mail.rs	task_posts_by_mail_and_nudges_an_idle_worker	mail-task-protocol	
-src/supervise/mail.rs	the_lane_hears_the_successors_rows_after_a_handoff	mail-lane-exactly-once	
-src/supervise/mail.rs	the_lane_rides_out_an_await_inbox_the_update_cut_with_exit_75	mail-lane-exactly-once	
-src/supervise/mail.rs	wait_parks_for_the_answer_that_names_the_offset	mail-task-protocol	
 src/supervise/memory.rs	a_higher_ceiling_or_off_is_the_limit	memory-ceiling-order	
 src/supervise/memory.rs	a_measure_past_the_ceiling_warns_and_acts_only_in_trouble_on_the_dominant_agent	memory-judgement	
 src/supervise/memory.rs	a_warning_episode_ends_an_eighth_under_the_ceiling	memory-judgement	
@@ -2771,7 +2690,6 @@ src/supervise/run_question_text_tests.rs	tier1_a_tab_that_falls_back_goes_only_w
 src/supervise/run_question_text_tests.rs	tier1_the_policy_text_goes_only_where_the_model_allows	question-text-refines-model	
 src/supervise/run_question_text_tests.rs	two_questions_and_their_review_are_answered_by_text_then_submitted	question-text-safety	
 src/supervise/run_tests.rs	a_0_that_landed_in_the_composer_is_backspaced_not_dismissed	stray-digit-cleanup	
-src/supervise/run_tests.rs	a_box_ask_never_waits_and_a_queued_post_is_journaled_as_queued	escalation-badge	
 src/supervise/run_tests.rs	a_box_the_loop_does_not_approve_is_escalated_once_and_cleared_when_it_goes	escalation-badge	
 src/supervise/run_tests.rs	a_box_under_a_dead_footer_is_read_again_at_once	await-turn-wait-protocol	
 src/supervise/run_tests.rs	a_budget_spent_in_an_outage_is_the_timeout	budget-bound	
@@ -2790,32 +2708,24 @@ src/supervise/run_tests.rs	a_guard_that_matches_no_row_of_the_parsed_box_is_hand
 src/supervise/run_tests.rs	a_headerless_box_under_a_tall_transcript_is_named_by_its_own_first_row	escalation-badge	
 src/supervise/run_tests.rs	a_journal_that_fails_is_said_once_and_stops_nothing	journal-mirrors-output	
 src/supervise/run_tests.rs	a_jump_of_30_points_is_a_compaction_and_a_box_is_not	context-watch	
-src/supervise/run_tests.rs	a_lane_that_cannot_start_says_so_once_and_the_loop_goes_on	mail-report-fold	
 src/supervise/run_tests.rs	a_late_vendor_timer_takes_the_0_inside_the_landing_time_and_is_never_backspaced	§4	
 src/supervise/run_tests.rs	a_later_outage_is_a_new_one_with_its_own_window	outage-ride-out	
 src/supervise/run_tests.rs	a_limit_escalates_once_and_extends_the_budget_once	limit-episode	
 src/supervise/run_tests.rs	a_look_the_host_scheduled_ends_the_idle_wait_step_at_its_instant	host-look-wake	
 src/supervise/run_tests.rs	a_loop_that_sees_no_survey_tells_the_host_once	survey-host-told	
-src/supervise/run_tests.rs	a_mid_turn_report_older_than_the_window_is_still_its_turns	mail-report-fold	
 src/supervise/run_tests.rs	a_narrowed_pane_is_not_a_compaction	context-watch	
 src/supervise/run_tests.rs	a_new_point_that_looks_like_the_last_one_is_still_reported	review-point-once	
 src/supervise/run_tests.rs	a_persons_grace_holds_the_0_on_busy_reads_and_says_so_once	survey-press-gate	
 src/supervise/run_tests.rs	a_point_is_new_when_its_transcript_moved_whatever_the_loop_saw	review-point-once	
 src/supervise/run_tests.rs	a_press_in_flight_is_decided_again_from_a_fresh_read	approval-press-safety	
-src/supervise/run_tests.rs	a_prompt_after_an_idle_is_seen_within_a_hold_step	mail-report-fold	
-src/supervise/run_tests.rs	a_question_turns_report_is_not_the_next_turns	mail-report-fold	
 src/supervise/run_tests.rs	a_read_that_keeps_coming_back_is_approved_twice_then_handed_over	approval-press-safety	
 src/supervise/run_tests.rs	a_refusal_naming_a_tighter_cap_is_sent_again_cut_to_it	escalation-badge	
 src/supervise/run_tests.rs	a_refused_backspace_keeps_the_0_owed_until_the_server_takes_it	§4	
 src/supervise/run_tests.rs	a_refused_escalation_is_journaled_and_the_loop_goes_on	escalation-badge	
-src/supervise/run_tests.rs	a_report_that_came_first_folds_into_the_idle_that_follows	mail-report-fold	
-src/supervise/run_tests.rs	a_report_that_fails_still_reports_the_point	watch-report	
-src/supervise/run_tests.rs	a_reported_point_journals_its_report_and_its_turn	journal-mirrors-output	
 src/supervise/run_tests.rs	a_request_not_served_is_told_from_a_server_answer	ctl-reply-lost	
 src/supervise/run_tests.rs	a_reset_further_off_than_a_week_extends_nothing	limit-extend	
-src/supervise/run_tests.rs	a_retry_that_hits_the_wall_again_is_the_same_episode_and_mails_once	limit-episode	
+src/supervise/run_tests.rs	a_retry_that_hits_the_wall_again_is_the_same_episode	limit-episode	
 src/supervise/run_tests.rs	a_screen_without_a_composer_gets_no_continuation	limit-episode	
-src/supervise/run_tests.rs	a_second_report_of_a_turn_is_not_the_next_turns	mail-report-fold	
 src/supervise/run_tests.rs	a_skipped_0_on_a_survey_still_open_is_handed_over	survey-press-gate	
 src/supervise/run_tests.rs	a_skipped_guard_is_not_an_approval	approval-press-safety	
 src/supervise/run_tests.rs	a_skipped_survey_press_says_nothing	survey-press-gate	
@@ -2851,12 +2761,9 @@ src/supervise/run_tests.rs	render_prompt_prints_the_notes_after_the_description_
 src/supervise/run_tests.rs	a_bash_box_not_read_whole_is_never_called_read_only	render-phase-grammar	
 src/supervise/run_tests.rs	reply_readers_match_the_wire	ctl-reply-readers	
 src/supervise/run_tests.rs	resume_never_continues_what_the_policy_limited	limit-episode	
-src/supervise/run_tests.rs	story_of_maps_the_journal_lines_onto_the_closed_verb_set_without_the_command	story-of	
 src/supervise/run_tests.rs	supervise_auto_approves_reads_guarded_and_hands_over_writes	approval-press-safety	
 src/supervise/run_tests.rs	supervise_hands_a_limit_notice_over_like_idle	supervise-result-and-log-split	
 src/supervise/run_tests.rs	supervise_journals_what_watch_would_have_printed	journal-mirrors-output	
-src/supervise/run_tests.rs	supervise_mail_holds_the_idle_and_names_the_report	mail-report-fold	
-src/supervise/run_tests.rs	supervise_mails_result_does_not_wait_for_the_lanes_parked_step	mail-report-fold	
 src/supervise/run_tests.rs	supervise_watches_one_run	context-watch	
 src/supervise/run_tests.rs	the_approval_line_is_sanitized_and_cut_by_cells	approval-line-cells	
 src/supervise/run_tests.rs	the_context_watch_is_inclusive_and_needs_the_frame	context-watch	
@@ -2870,14 +2777,9 @@ src/supervise/run_tests.rs	the_wake_at_a_host_look_steps_the_host_and_decides_no
 src/supervise/run_tests.rs	under_approve_none_every_prompt_is_handed_over	approval-press-safety	
 src/supervise/run_tests.rs	watch_journals_every_line_it_prints	journal-mirrors-output	
 src/supervise/run_tests.rs	watch_lines_are_cut_at_160_characters	line-clip-and-exit-reason	
-src/supervise/run_tests.rs	watch_mail_folds_the_workers_report_into_its_turn	mail-report-fold	
-src/supervise/run_tests.rs	watch_report_counts_the_report_into_the_events_that_end_on_words	watch-report	
-src/supervise/run_tests.rs	watch_report_on_an_old_host_reads_the_screen_alone	watch-report	
 src/supervise/run_tests.rs	watch_rides_out_a_lost_connection_to_the_next_event	outage-ride-out	
 src/supervise/run_tests.rs	watch_says_a_descent_once_and_the_compaction_once	context-watch	
 src/supervise/run_tests.rs	watch_says_a_survey_once_when_it_appears	survey-report-once	
-src/supervise/run_tests.rs	watch_tells_the_window_its_story_through_the_teller_and_prints_the_same_lines	story-teller-lane	
-src/supervise/run_tests.rs	without_mail_every_line_is_as_before	mail-report-fold	
 src/supervise/screen.rs	a_status_stamp_reads_as_the_one_person_fact	human-input-stamp	
 src/supervise/screen.rs	a_tail_reads_first_row_places_the_cursor	screen-cursor-index	
 src/supervise/screen.rs	json_reader_handles_the_value_vocabulary	json-reader-grammar	
@@ -2887,20 +2789,18 @@ src/supervise/screen.rs	rejects_what_is_not_a_screen	parse-text-json
 src/supervise/screen.rs	the_persons_stamp_is_read_and_its_absence_is_unknown	parse-text-json	
 src/supervise/screen.rs	the_screen_generation_is_read_and_a_malformed_one_is_none	parse-text-json	
 src/supervise/stall.rs	a_stalled_or_stopped_input_is_a_stall_and_every_other_word_is_not	stall-status-read	
+src/supervise/stall.rs	the_stall_facts_name_the_wait_the_backlog_and_the_size	frozen-text	
 src/supervise/stall_tests.rs	a_continuation_over_a_worker_already_stalled_types_nothing	stall-hold	
 src/supervise/stall_tests.rs	a_continuation_warned_input_unread_reads_status_at_the_next_look	stall-hold	
-src/supervise/stall_tests.rs	a_frozen_worker_is_held_its_badge_withdrawn_and_the_manager_told_once	stall-hold	
-src/supervise/stall_tests.rs	a_frozen_worker_with_no_fabric_is_told_to_no_one_by_mail	stall-hold	
-src/supervise/stall_tests.rs	a_stall_the_escalations_own_read_reports_withholds_the_ask_and_holds_at_once	stall-hold	
+src/supervise/stall_tests.rs	a_frozen_worker_is_held_and_its_badge_withdrawn	stall-hold	
 src/supervise/stall_tests.rs	a_thawed_worker_has_its_point_decided_again	stall-hold	
 src/supervise/stall_tests.rs	a_wait_that_never_read_status_probes_and_holds	stall-probe-cost	
 src/supervise/stall_tests.rs	a_warning_is_read_off_the_first_line_the_server_wrote	ctl-reply-readers	
 src/supervise/stall_tests.rs	a_worker_already_stalled_when_the_loop_looks_is_neither_pressed_nor_badged	stall-hold	
 src/supervise/stall_tests.rs	a_worker_frozen_past_the_bound_is_ended_for_its_relaunch	stall-remedy-refines-model	
-src/supervise/stall_tests.rs	a_worker_frozen_past_the_bound_is_warned_about_and_left_running	stall-remedy-refines-model	
-src/supervise/stall_tests.rs	the_frozen_mail_names_the_workers_own_conversation_or_the_hosts_relaunch	§4	
+src/supervise/stall_tests.rs	a_worker_frozen_past_the_bound_is_warned_about_and_left_running	stall-remedy-refines-model	frozen-text
 src/supervise/stall_tests.rs	the_host_is_told_the_stall_it_holds_and_that_it_lifted	stall-hold	
-src/supervise/stall_tests.rs	the_remedy_is_the_servers_restart_and_its_refusals_decide	stall-remedy-refines-model	
+src/supervise/stall_tests.rs	the_remedy_is_the_servers_restart_and_its_refusals_decide	stall-remedy-refines-model	frozen-text
 src/supervise/stall_tests.rs	the_windows_host_asks_a_host_that_does_not_measure_input_once	stall-probe-cost	
 src/supervise/stall_tests.rs	the_windows_host_raises_no_badge_over_a_worker_frozen_under_its_point	stall-hold	
 src/supervise/stall_tests.rs	the_windows_host_withdraws_the_badge_of_a_worker_that_freezes_under_it	stall-hold	
@@ -3157,7 +3057,7 @@ tests/vendor_corpus.rs	the_painted_usage_panel_yields_its_windows	usage-panel-wi
 - Many loop-level specs (`no-act-without-ownership-proofs`, `visit-shell-refines-pure-reducer`,
   `codex-visit-exit-gate`, the reset and turn-end loop specs) retire dozens of end-to-end tests each, but only once
   their pure kernels below them are proved and gap 8 (effects) and gap 10 (model→code refinement) close.
-- Specs with an empty test count (for example `drive-supervise-opts-only-limit`, `prelex`, `numeric-format`)
+- Specs with an empty test count (for example `prelex`, `numeric-format`)
   are implied by tests another spec retires; they are lemmas of those specs.
 
 ### Gap histogram (audit §7 row → number of the 624 specs it blocks)
@@ -3220,7 +3120,6 @@ Status 2026-10-17: the rows of those six are gone, and so is the **move-to-bench
 | `src/harness/upgrade_drive_tests.rs::park_when_asked` | Not a test: the parked stand-in agent's body, re-executed under PARK_ENV. | **move-to-bench** |
 | `src/supervise/policy/claude_settings_tests.rs::provider_home_stage` | Chunk 6 grouping marked it non-spec (a fixture stage); reason not delivered. | **re-check (chunk 6)** |
 | `src/supervise/run_engine_tests.rs::park_as_worker` | Not a test: the StandIn subprocess body. | **move-to-bench** |
-| `src/supervise/stall_tests.rs::the_frozen_mail_names_the_workers_own_conversation_or_the_hosts_relaunch` | Samples frozen-text but pins an unrunnable mail (`restart it: restart if-stalled`) when the loop has no sid. | **becomes-spec-after-fix** |
 | `src/supervise/run_tests.rs::a_span_is_read_once_and_the_continuations_back_off_ten_then_thirty` | Samples limit-episode but carries a 500 ms real-clock latency budget. | **becomes-spec-after-fix** |
 | `src/supervise/run_tests.rs::a_late_vendor_timer_takes_the_0_inside_the_landing_time_and_is_never_backspaced` | Outcome depends on real-time scale; restate on a clock model (survey-zero-timing). | **becomes-spec-after-fix** |
 | `src/supervise/run_tests.rs::a_refused_backspace_keeps_the_0_owed_until_the_server_takes_it` | Its busy-sink row is vacuous (OR'ed assertion); fix the row, then stray-digit-cleanup covers it. | **becomes-spec-after-fix** |
@@ -3229,8 +3128,6 @@ Status 2026-10-17: the rows of those six are gone, and so is the **move-to-bench
 ## 5. Implied specs that look wrong, or disagree with the code
 
 1. Fixed 2026-10-16: `event_record`/`err_record` escape addressing fields as well as bodies; `federated_addresses_cannot_break_ndjson` covers peer-provided channel identities.
-2. `src/drive_cli.rs::a_listener_replaced_after_the_route_is_picked_is_sent_its_own_token`: the assert message names the token the route was picked by, but the asserted value is the successor's token.
-4. `src/drive_cli.rs::the_round_11_flags_belong_to_their_verbs`: the name is a review-round label, not a property; rename on migration.
 5. Fixed 2026-10-22: `src/harness/accounts_tests.rs::the_signed_out_labels_are_the_enrolled_ones_in_roster_order` samples `signed_out` excluding rows with an email.
 6. Several cli and disk tests date fixtures against the real wall clock (`now_after_write`, `idle_now`), contrary to the module docs' clock-independence claim.
 7. Fixed 2026-10-22: `src/harness/disk_target_tests.rs::Parked` forks directly via `libc::fork` + `libc::_exit` without a bare `std::process::Command` or `pre_exec` error pipe.
@@ -3267,7 +3164,6 @@ Status 2026-10-17: the rows of those six are gone, and so is the **move-to-bench
 47. Several run_box_key tests replay scripts the tier1 bind already walks; they add only badge/escalated/cleared counts.
 48. The reset successor tests assert ≥ 1 s real-time graces; not flaky, but tie the spec to real sleeps instead of an injected clock.
 49. `src/supervise/run_engine_tests.rs::a_question_asked_a_third_time_is_answered_again_after_a_pause` mixes a loop scenario with a pure reask_pause check that belongs on doubling-backoff.
-50. `src/supervise/stall.rs::frozen_mail_text` with sid=None names `restart [pid=N ]if-stalled` without `aterm ctl`, an unrunnable command; the warning text uses `<sid>` instead.
 51. `src/supervise/stall.rs::rss_text` computes `(mb*10+512)/1024` on a server-supplied u64: it overflows for huge mb; a no-panic spec fails until it saturates or widens.
 52. `src/supervise/run_tests.rs::guard_errors_are_retried_or_surfaced_never_approved`: `(2..=4).contains(&presses)` under a 1.2 s budget is timing-dependent; so are the survey settle/landing tests.
 53. `src/supervise/run_tests.rs::a_box_the_loop_does_not_approve_is_escalated_once_and_cleared_when_it_goes` says the badge is read before unset; a_standing_approval_attention_survives_the_episode_close asserts nothing is read first; the first doc looks stale.
@@ -3318,8 +3214,8 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1** (4): `acc-words-table`, `acc-wakes-table`, `disk-free-warn`, `disk-class-table`
 - **3** (6): `acc-wall-stands-until`, `acc-sample-windows`, `acc-probe-interval`, `footer-floor-of`, `relaunch-held-wait-table`, `harness-timings-orders`
 - **8** (7): `drive-own-ctl`, `open-regular-nonblocking`, `kernel-start-spelling`, `awake-clock-probe`, `queue-lock-and-epoch-fence`, `queue-fs-hardening`, `upgrade-dry-run-no-hands`
-- **1,2** (4): `fleet-federated-sid`, `acc-probe-claim-spacing`, `acc-canary-hold-take`, `screen-cursor-index`
-- **1,3** (36): `drive-supervise-opts-only-limit`, `fleet-dispatch-argv`, `acc-condition-table`, `acc-advise-rule1-guards`, `acc-advise-resume`, `acc-judged-and-footer-label`, `cli-parse-defer`, `disk-human-bytes`, `relaunch-resumed-prompt-one-line`, `relaunch-quiet-outcome`, `relaunch-account-login`, `relaunch-cause-classes`, `relaunch-carried-word`, `usage-tokens-short`, `move-why-from-ids`, `ride-bar`, `live-model-at-launch-until-answer`, `session-file-parse`, `quiet-step-contract`, `harness-prompts-shape`, `owner-words-roundtrip`, `wait-class-total-and-stable`, `row-of-record`, `person-hold-footer-note`, `proc-stat-exited`, `json-number-readers`, `usage-view-shown`, `ctl-failure-words`, `ladder-clamp`, `doubling-backoff`, `ledger-clock-words`, `memory-ceiling-formula`, `memory-ceiling-order`, `approval-breaker-naming`, `transcript-confirms-class`, `transcript-lagging`
+- **1,2** (3): `acc-probe-claim-spacing`, `acc-canary-hold-take`, `screen-cursor-index`
+- **1,3** (34): `acc-condition-table`, `acc-advise-rule1-guards`, `acc-advise-resume`, `acc-judged-and-footer-label`, `cli-parse-defer`, `disk-human-bytes`, `relaunch-resumed-prompt-one-line`, `relaunch-quiet-outcome`, `relaunch-account-login`, `relaunch-cause-classes`, `relaunch-carried-word`, `usage-tokens-short`, `move-why-from-ids`, `ride-bar`, `live-model-at-launch-until-answer`, `session-file-parse`, `quiet-step-contract`, `harness-prompts-shape`, `owner-words-roundtrip`, `wait-class-total-and-stable`, `row-of-record`, `person-hold-footer-note`, `proc-stat-exited`, `json-number-readers`, `usage-view-shown`, `ctl-failure-words`, `ladder-clamp`, `doubling-backoff`, `ledger-clock-words`, `memory-ceiling-formula`, `memory-ceiling-order`, `approval-breaker-naming`, `transcript-confirms-class`, `transcript-lagging`
 - **1,4** (1): `continuation-words-and-mode`
 - **1,5** (1): `ledger-html-assets`
 - **1,7** (2): `acc-label-grammar`, `acc-row-for-login-exact`
@@ -3332,24 +3228,24 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **3,10** (1): `upgrade-model-ladder-refines-model`
 - **3,12** (1): `lanes-table`
 - **7,8** (2): `disk-tree-nofollow`, `disk-target-reclaim-only-incremental`
-- **8,13** (13): `fleet-stream-child-cleanup`, `align-capture-bounded`, `acc-store-lock`, `cli-login-runners`, `disk-target-reclaim-locking`, `disk-target-reclaim-lru-whole`, `disk-whole-guards-at-removal`, `restart-stamp-take-if`, `sweep-lock-exclusive`, `wait-exit`, `bounded-child-output`, `relay-interrupter`, `ready-fd-signal`
-- **1,2,3** (12): `fleet-list-diagnostics-automaton`, `acc-note-wall-episode`, `acc-pin-unpin`, `acc-note-observations`, `acc-note-reading-max`, `acc-reset-claim`, `settle-ask-takeback`, `release-ownership`, `retarget-in-place`, `served-at`, `last-model`, `governor-token-bucket`
+- **8,13** (12): `align-capture-bounded`, `acc-store-lock`, `cli-login-runners`, `disk-target-reclaim-locking`, `disk-target-reclaim-lru-whole`, `disk-whole-guards-at-removal`, `restart-stamp-take-if`, `sweep-lock-exclusive`, `wait-exit`, `bounded-child-output`, `relay-interrupter`, `ready-fd-signal`
+- **1,2,3** (10): `acc-note-wall-episode`, `acc-pin-unpin`, `acc-note-observations`, `acc-note-reading-max`, `acc-reset-claim`, `settle-ask-takeback`, `release-ownership`, `retarget-in-place`, `served-at`, `last-model`
 - **1,2,5** (2): `netstate-leases-bounded`, `session-roster-cache`
 - **1,2,8** (7): `acc-record-gone`, `acc-drop-stale-sessions`, `footer-path-branch-follow`, `usage-read-cost`, `left-typed-never-erased`, `queue-manage-with-baseline-atomic`, `usage-probe-memory-neutral`
 - **1,3,4** (4): `drive-classify-verb`, `acc-advise-rule2-follow-and-canary`, `acc-advise-rule4-early`, `tap-gate`
 - **1,3,5** (16): `relaunch-cold-login`, `step-word-classification`, `turn-end-ownership`, `release-is-next`, `model-due-rule`, `next-step-safety`, `deadline-totality`, `attention-horizons`, `interrupt-only-for-an-ended-agent`, `aterms-own-fault`, `stall-mark-and-remedy`, `claim-verb-classes`, `zsh-hazard-tables`, `config-retired-and-agent-keys`, `mode-word-parsers`, `approval-footer-mode`
 - **1,3,6** (1): `wait-text-format`
-- **1,3,7** (67): `drive-parse-sub-positionals`, `drive-top-parse-help-routing`, `drive-phase-reply`, `acc-stamp-cap`, `acc-signed-out-list`, `acc-next-usable-opening-hold`, `acc-rotation-breaker`, `acc-reset-allowed`, `cli-grammar`, `cli-upgrade-lines`, `disk-report-json-headline`, `disk-parse-df`, `footer-model-display`, `footer-model-name`, `footer-project-slug`, `footer-branch-of-head`, `footer-home-and-elide-path`, `footer-segments-order`, `footer-set-facts-typesetting`, `truncate-bytes`, `one-line-shortcut-equivalence`, `netwatch-route-of`, `relaunch-program-identity`, `relaunch-one-shot`, `relaunch-target-build`, `relaunch-permission-mode`, `relaunch-line-drop-order`, `tap-value-ours`, `catalog-parse-window`, `catalog-twin-binary`, `codex-rewrite-argv`, `codex-is-tui-argv`, `codex-thread-ids`, `pick-tab-word`, `model-family-version`, `model-availability-decision`, `claude-json-model-facts-only`, `live-model-reader`, `family-successor-newest-strictly-newer`, `offered-set-and-list-target`, `model-record-roundtrip`, `hand-chosen-model`, `user-model-settings-parse`, `version-order`, `choose-target-newest-managed-tie`, `launch-model-and-resume-by-the-rewrites-parse`, `running-clause-held-list`, `composer-empty`, `upgrade-clocks`, `model-outcome-reader`, `transcript-tasked`, `notice-fate-and-queue`, `reset-dialog-line`, `status-line-and-json-fields`, `need-and-mark-text-bounds`, `working-time-union`, `limit-notice-rows`, `hud-line`, `usage-json-schema-1`, `queue-codec-round-trip`, `strip-quotes-shape`, `approval-decline-text`, `stall-status-read`, `line-clip-and-exit-reason`, `story-of`, `resume-jitter`, `transcript-ends-on`
-- **1,3,8** (4): `drive-task-report-opts`, `drive-dial-guard`, `row-vetting`, `clock-unix-roundtrip`
-- **1,3,12** (13): `fleet-records-format`, `acc-state-unread-classification`, `acc-process-login-only-weakens`, `footer-lstart-utc`, `footer-card-fill`, `lights-read-screen`, `netwatch-settings-of`, `transcript-conversation-quota`, `catalog-build-facts-roundtrip`, `screen-limit-recogniser`, `relay-reply-classification`, `memory-fact-banner`, `approval-trace-names-decider`
-- **1,3,13** (4): `drive-endpoint-route`, `cli-auth-check-env`, `claude-dir-of`, `resume-never-cut`
+- **1,3,7** (66): `drive-parse-sub-positionals`, `drive-top-parse-help-routing`, `drive-phase-reply`, `acc-stamp-cap`, `acc-signed-out-list`, `acc-next-usable-opening-hold`, `acc-rotation-breaker`, `acc-reset-allowed`, `cli-grammar`, `cli-upgrade-lines`, `disk-report-json-headline`, `disk-parse-df`, `footer-model-display`, `footer-model-name`, `footer-project-slug`, `footer-branch-of-head`, `footer-home-and-elide-path`, `footer-segments-order`, `footer-set-facts-typesetting`, `truncate-bytes`, `one-line-shortcut-equivalence`, `netwatch-route-of`, `relaunch-program-identity`, `relaunch-one-shot`, `relaunch-target-build`, `relaunch-permission-mode`, `relaunch-line-drop-order`, `tap-value-ours`, `catalog-parse-window`, `catalog-twin-binary`, `codex-rewrite-argv`, `codex-is-tui-argv`, `codex-thread-ids`, `pick-tab-word`, `model-family-version`, `model-availability-decision`, `claude-json-model-facts-only`, `live-model-reader`, `family-successor-newest-strictly-newer`, `offered-set-and-list-target`, `model-record-roundtrip`, `hand-chosen-model`, `user-model-settings-parse`, `version-order`, `choose-target-newest-managed-tie`, `launch-model-and-resume-by-the-rewrites-parse`, `running-clause-held-list`, `composer-empty`, `upgrade-clocks`, `model-outcome-reader`, `transcript-tasked`, `notice-fate-and-queue`, `reset-dialog-line`, `status-line-and-json-fields`, `need-and-mark-text-bounds`, `working-time-union`, `limit-notice-rows`, `hud-line`, `usage-json-schema-1`, `queue-codec-round-trip`, `strip-quotes-shape`, `approval-decline-text`, `stall-status-read`, `line-clip-and-exit-reason`, `resume-jitter`, `transcript-ends-on`
+- **1,3,8** (3): `drive-dial-guard`, `row-vetting`, `clock-unix-roundtrip`
+- **1,3,12** (12): `acc-state-unread-classification`, `acc-process-login-only-weakens`, `footer-lstart-utc`, `footer-card-fill`, `lights-read-screen`, `netwatch-settings-of`, `transcript-conversation-quota`, `catalog-build-facts-roundtrip`, `screen-limit-recogniser`, `relay-reply-classification`, `memory-fact-banner`, `approval-trace-names-decider`
+- **1,3,13** (3): `cli-auth-check-env`, `claude-dir-of`, `resume-never-cut`
 - **1,4,5** (1): `model-way-back`
 - **1,4,8** (10): `cli-usage-account-attribution`, `cli-disk-verb-report`, `cli-accounts-add`, `cli-login-secrecy`, `cli-accounts-use`, `cli-accounts-schema-refusal`, `relaunch-line-dialect-and-rekey`, `carry-restart-outcome`, `restart-carries-login-and-tap`, `quiet-flow`
 - **1,4,11** (1): `cli-limits-read-once`
 - **1,5,7** (1): `footer-rule-run`
 - **1,7,8** (14): `drive-journal-sid`, `acc-ledger-file`, `cli-usage-transcript-pick`, `cli-ledger-verb`, `disk-discover-roots`, `disk-discover-xpy-rule`, `disk-discover-budget-and-confinement`, `footer-rows-back-window-invariance`, `footer-git-head-resolution`, `footer-shell-cwds`, `tap-sweep`, `session-roster-integrity`, `wait-log-ledger-and-prune-bounds`, `footer-window-allocation`
-- **1,7,12** (2): `fleet-json-escape`, `cli-harness-switch-misplaced-off`
-- **1,8,11** (2): `drive-prompt-cut-is-75`, `cli-retired-verbs`
+- **1,7,12** (1): `cli-harness-switch-misplaced-off`
+- **1,8,11** (1): `cli-retired-verbs`
 - **1,8,13** (4): `cli-disk-write-ahead-journal`, `cli-upgrade-owner-status`, `disk-session-gone`, `relaunch-ended-verdict`
 - **1,8,16** (1): `tap-noninterference`
 - **2,3,5** (3): `netstate-schedule`, `netstate-reach-freshness`, `tap-silence-machine`
@@ -3368,7 +3264,7 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,2,7,8** (2): `usage-moved`, `task-detection-and-fresh-restart`
 - **1,2,7,11** (1): `supervise-result-and-log-split`
 - **1,2,8,10** (1): `codex-restart-record-closure`
-- **1,2,8,11** (3): `fleet-line-bound`, `relay-framing-one-line`, `exception-lifecycle`
+- **1,2,8,11** (2): `relay-framing-one-line`, `exception-lifecycle`
 - **1,2,8,12** (1): `relaunch-snapshot-follow`
 - **1,2,8,13** (4): `hand-lease-bracket`, `in-flight-orphan-pass`, `activation-wake`, `stop-and-handover`
 - **1,2,12,13** (1): `busy-up`
@@ -3381,10 +3277,10 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,3,5,10** (4): `reducer-refines-drain-bound-model`, `reducer-refines-work-end-model`, `reducer-refines-progress-machine`, `classifier-refines-progress-machine`
 - **1,3,5,12** (6): `footer-session-entry-parse`, `tap-row-safe`, `screen-reply-parse`, `escalate-kind-and-subject`, `approval-amend-input`, `approval-limit-dialog`
 - **1,3,5,13** (1): `usage-wall-of`
-- **1,3,7,8** (9): `drive-preloop-exit-journal`, `disk-report-classification`, `disk-target-assess-witness`, `disk-hogs`, `ancestry-guard`, `queue-recovery-is-replay`, `ledger-paths-and-bound`, `typing-budget`, `credits-billed-model-target`
+- **1,3,7,8** (8): `disk-report-classification`, `disk-target-assess-witness`, `disk-hogs`, `ancestry-guard`, `queue-recovery-is-replay`, `ledger-paths-and-bound`, `typing-budget`, `credits-billed-model-target`
 - **1,3,7,10** (1): `upgrade-model-priority-refines-model`
 - **1,3,7,11** (2): `acc-process-login-of-env`, `standing-quota-wall`
-- **1,3,7,12** (10): `fleet-sessions-from`, `cli-disk-config-fail-closed`, `footer-last-cwd`, `busy-footer-live-zone`, `utc-and-lstart-parse`, `usage-panel-read-phase`, `usage-panel-sample`, `answer-box-token`, `approval-line-cells`, `render-phase-grammar`
+- **1,3,7,12** (9): `cli-disk-config-fail-closed`, `footer-last-cwd`, `busy-footer-live-zone`, `utc-and-lstart-parse`, `usage-panel-read-phase`, `usage-panel-sample`, `answer-box-token`, `approval-line-cells`, `render-phase-grammar`
 - **1,3,7,13** (1): `usage-panel-windows`
 - **1,3,8,10** (1): `watch-refines-progress-look`
 - **1,3,8,13** (1): `cli-disk-tick`
@@ -3398,7 +3294,6 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,7,10,12** (1): `ladder-refinement`
 - **1,8,10,12** (1): `exit-record-refinement`
 - **1,8,11,12** (2): `ledger-one-row-per-decision`, `reader-by-program`
-- **1,8,11,13** (1): `drive-prompt-turn-protocol`
 - **2,3,5,7** (1): `relaunch-ended-at-once-shell-look`
 - **2,3,5,10** (1): `relaunch-on-exit-refines-model`
 - **3,5,7,13** (1): `relaunch-exit-record-look`
@@ -3411,15 +3306,12 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,2,3,7,10** (6): `turn-end-refines-SupervisorTurnEnd`, `turn-end-refines-SupervisorCruise`, `turn-end-refines-SupervisorLand`, `turn-end-refines-SupervisorNetworkWall`, `turn-end-refines-SupervisorUsageWall`, `turn-end-refines-SupervisorCreditsHold`
 - **1,2,3,8,11** (2): `wait-told`, `sleep-wake-settle`
 - **1,2,3,8,13** (1): `view-host-protocol`
-- **1,2,4,7,11** (1): `story-teller-lane`
 - **1,2,4,8,11** (2): `relaunch-adoption`, `report-gather-protocol`
 - **1,2,4,8,13** (1): `last-look-before-signal`
-- **1,2,4,11,12** (1): `turn-run-protocol`
 - **1,2,5,7,8** (4): `footer-tail-cache-equals-fresh-read`, `usage-incremental-fold-equals-one-pass`, `usage-session-aggregate`, `relay-read-bounds`
 - **1,2,5,8,13** (1): `version-cache-backoff`
 - **1,2,5,10,12** (1): `age-is-one-process`
-- **1,2,7,8,11** (3): `relay-wire-equals-ctl`, `hold-and-refusal-parking`, `journal-mirrors-output`
-- **1,2,7,10,13** (1): `mail-lane-exactly-once`
+- **1,2,7,8,11** (2): `hold-and-refusal-parking`, `journal-mirrors-output`
 - **1,2,7,11,12** (1): `survey-report-once`
 - **1,2,7,11,13** (1): `survey-host-told`
 - **1,2,8,10,11** (2): `reset-books`, `attention-ownership`
@@ -3451,13 +3343,12 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,2,3,5,7,13** (2): `priority-admit-monotone`, `reset-place`
 - **1,2,3,5,8,11** (1): `limit-notice-reset-placement`
 - **1,2,3,7,8,10** (2): `model-switch-carry`, `login-wall-refines-HarnessLoginWall`
-- **1,2,3,7,8,11** (6): `stray-digit-cleanup`, `watch-report`, `stall-ladder`, `account-advice-asks`, `login-lifecycle-accounts`, `account-move-answer`
+- **1,2,3,7,8,11** (5): `stray-digit-cleanup`, `stall-ladder`, `account-advice-asks`, `login-lifecycle-accounts`, `account-move-answer`
 - **1,2,3,7,8,13** (1): `refused-write-retried`
 - **1,2,3,7,12,13** (1): `context-watch`
 - **1,2,4,5,8,13** (1): `release-owed-is-paid-once`
 - **1,2,4,7,8,11** (2): `controller-answer`, `model-bucket-and-fallback-timing`
 - **1,2,4,7,8,13** (2): `no-act-without-ownership-proofs`, `ledger-gather`
-- **1,2,4,7,10,13** (1): `mail-task-protocol`
 - **1,2,4,8,10,11** (2): `limit-dialog-wait-row`, `memory-ceiling-decision`
 - **1,2,4,8,10,12** (1): `notice-owner-refinement`
 - **1,2,5,7,8,10** (1): `footer-process-session-switch-model`
@@ -3465,7 +3356,6 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,2,5,7,8,13** (1): `footer-fold-is-one-session`
 - **1,2,5,8,10,11** (3): `reset-successor-escape-only`, `reset-gates-equivalence`, `told-choice`
 - **1,2,7,8,10,11** (6): `wake-protocol`, `focus-choice-refines-model`, `press-landing-and-retry`, `claim-refines-model`, `decline-keys-refines-model`, `usage-probe-refines-model`
-- **1,2,7,8,11,13** (1): `mail-report-fold`
 - **1,3,4,5,7,8** (1): `relaunch-line-construction`
 - **1,3,4,5,7,12** (2): `approval-never-spends`, `approval-safe-bash-sound`
 - **1,3,4,5,7,13** (1): `host-candidates-read-order`
@@ -3475,7 +3365,6 @@ the turn-end, rm-breaker and git-read specs in §1 and are likely high value.
 - **1,3,5,7,10,14** (2): `classify-sound`, `classify-precise-on-read-grammar`
 - **1,3,5,7,11,12** (1): `box-key-normal-form`
 - **1,3,5,7,12,13** (2): `footer-fit-rule-ladder`, `report-join`
-- **1,3,7,8,11,13** (1): `fleet-dispatch-lines`
 - **2,4,7,8,10,11** (1): `stall-remedy-refines-model`
 - **2,7,8,10,11,13** (1): `survey-zero-timing`
 - **1,2,3,5,7,8,10** (1): `login-wall-acts`

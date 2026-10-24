@@ -94,7 +94,7 @@ HASH-FX-2 (`multiply_mix`, then the read helpers) → HASH-FX-3. HASH-FX-1 depen
 only through its u128 path. HASH-FX-1 and HASH-FX-3 compose for `FxHasher::write`. On the FNV side,
 HASH-FNV-1 → HASH-FNV-2 → HASH-FNV-3.
 
-## 2. Test → spec map (TSV; the 6 spec samples)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

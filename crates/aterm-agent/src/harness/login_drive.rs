@@ -496,6 +496,10 @@ pub enum Approval {
     /// It stopped where only the person can go on (an identity provider, a sign-up page, no
     /// mailbox): why, without the URL or code.
     NeedsYou(String),
+    /// It stopped on the vendor's own sign-in (a page that waits on a person, another identity
+    /// provider, a password): the row's browser profile is signed out of the vendor's site, so a
+    /// person signs it in once (`accounts browser`): why, without the URL or code.
+    NeedsSignIn(String),
     /// It refused the page (another code, another account): why.
     Refused(String),
 }
@@ -525,6 +529,9 @@ pub enum Outcome {
     Refused(String),
     /// The approver stopped where only the person can go on, and it was ended.
     NeedsYou(String),
+    /// The approver stopped on the vendor's sign-in page, which the row's browser profile is
+    /// signed out of, and it was ended.
+    NeedsSignIn(String),
     /// The CLI said its sign-in failed (Codex's `account/login/completed` without success).
     Failed,
     /// [`HANG`] ran out, and it was ended.
@@ -544,6 +551,7 @@ impl Outcome {
             Outcome::OffPin => "off-pin".to_owned(),
             Outcome::Refused(_) => "refused".to_owned(),
             Outcome::NeedsYou(_) => "needs-you".to_owned(),
+            Outcome::NeedsSignIn(_) => "needs-sign-in".to_owned(),
             Outcome::Failed => "failed".to_owned(),
             Outcome::Hung => "hung".to_owned(),
             Outcome::NotRun(_) => "not-run".to_owned(),
@@ -726,6 +734,13 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
                         host,
                     };
                 }
+                Approval::NeedsSignIn(why) => {
+                    end(&mut child);
+                    return Drove {
+                        outcome: Outcome::NeedsSignIn(why),
+                        host,
+                    };
+                }
                 Approval::Refused(why) => {
                     end(&mut child);
                     return Drove {
@@ -796,13 +811,105 @@ impl Request<'_> {
 /// How long a Codex app server is waited for to exit once its standard input closed.
 const APP_SERVER_GRACE: Duration = Duration::from_secs(5);
 
+/// The macOS sandbox a [`SignIn::no_desk`] CLI's sign-in child runs under ([`NO_DESK`]).
+pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// The [`SANDBOX_EXEC`] profile that keeps a sign-in child off this machine's desk, as the lab
+/// measured it on Grok Build 1.0.70 (design §5 (g)): LaunchServices, Apple events, the
+/// pasteboard, `open`, `osascript` and the launch of an installed app denied, everything else
+/// allowed, so the CLI's own browser open fails and it still prints its URL and code.
+pub const NO_DESK: &str = concat!(
+    r##"(version 1)(allow default)(deny lsopen)(deny appleevent-send)"##,
+    r##"(deny mach-lookup (global-name-regex #"launchservices") "##,
+    r##"(global-name-regex #"^com\.apple\.lsd\.") (global-name-regex #"appleevents") "##,
+    r##"(global-name-regex #"^com\.apple\.coreservices\.") "##,
+    r##"(global-name-regex #"CoreServicesUIAgent") (global-name-regex #"pasteboard"))"##,
+    r##"(deny process-exec (literal "/usr/bin/open") (literal "/usr/bin/osascript") "##,
+    r##"(subpath "/Applications") (subpath "/System/Applications") "##,
+    r##"(subpath "/System/Cryptexes") (subpath "/System/Volumes/Preboot/Cryptexes"))"##,
+);
+
+/// The program a sandbox is tried on before a sign-in runs under it ([`sandbox_refusal`]).
+const SANDBOX_PROBE: &str = "/usr/bin/true";
+
+/// How long that try may take.
+const SANDBOX_PROBE_WAIT: Duration = Duration::from_secs(20);
+
+/// Why `sandbox` cannot run a child under [`NO_DESK`] here: it is tried on [`SANDBOX_PROBE`],
+/// and anything but its exit 0 within [`SANDBOX_PROBE_WAIT`] is a refusal. `sandbox-exec` exits
+/// 71 before its child starts where this process already runs under another sandbox, which
+/// macOS does not let it nest.
+#[must_use]
+pub fn sandbox_refusal(sandbox: &Path) -> Option<String> {
+    use aterm_uds::spawnfd::Stdio;
+    let mut cmd = aterm_uds::spawnfd::command(sandbox);
+    cmd.args(no_desk_argv(Path::new(SANDBOX_PROBE), &[]))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return Some(format!("{} did not start ({e})", sandbox.display())),
+    };
+    let until = Instant::now() + SANDBOX_PROBE_WAIT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some(format!(
+                    "{} did not finish a try within {} s",
+                    sandbox.display(),
+                    SANDBOX_PROBE_WAIT.as_secs()
+                ));
+            }
+            Err(e) => {
+                return Some(format!(
+                    "{} could not be waited for ({e})",
+                    sandbox.display()
+                ));
+            }
+        }
+    };
+    match status.code() {
+        Some(0) => None,
+        Some(code) => Some(format!(
+            "{} exited {code} on a try, so it cannot apply its sandbox here (it cannot where \
+             this process already runs under another sandbox)",
+            sandbox.display()
+        )),
+        None => Some(format!(
+            "{} was ended by a signal on a try",
+            sandbox.display()
+        )),
+    }
+}
+
+/// The arguments [`SANDBOX_EXEC`] takes to run `program` (after `lead`) under [`NO_DESK`].
+#[must_use]
+pub fn no_desk_argv(program: &Path, lead: &[OsString]) -> Vec<OsString> {
+    let mut argv = vec![
+        OsString::from("-p"),
+        OsString::from(NO_DESK),
+        program.as_os_str().to_os_string(),
+    ];
+    argv.extend(lead.iter().cloned());
+    argv
+}
+
 /// `req`'s sign-in run as `program` (after `lead`), its `PATH` `path` (else the opener-free
 /// one, where the CLI's [`SignIn::no_opener`]), its other variables from `var`
-/// ([`child_env`]), its page handed to `approver`, within `hang`.
+/// ([`child_env`]), its page handed to `approver`, within `hang`. Where the CLI's
+/// [`SignIn::no_desk`] names this system, the child runs under the sandbox `no_desk` names
+/// ([`no_desk_argv`]), and nothing runs where that is not a file, cannot apply its sandbox here
+/// ([`sandbox_refusal`]), or the program is not installed.
 pub fn sign_in_with(
     req: &Request<'_>,
     (program, lead): (&Path, &[OsString]),
     path: Option<&OsStr>,
+    no_desk: Option<&Path>,
     var: &dyn Fn(&str) -> Option<OsString>,
     approver: &mut dyn Approver,
     hang: Duration,
@@ -814,12 +921,46 @@ pub fn sign_in_with(
     let Some(signin) = req.signin() else {
         return not_run("this CLI has no sign-in in this build".to_owned());
     };
+    let sandbox = if signin.no_desk.contains(&std::env::consts::OS) {
+        let Some(sandbox) = no_desk.filter(|sandbox| sandbox.is_file()) else {
+            return not_run(format!(
+                "{} opens this machine's default browser through the OS, and the sandbox that \
+                 stops it ({}) is not here; nothing was run",
+                req.cli.connector().product,
+                no_desk.unwrap_or(Path::new(SANDBOX_EXEC)).display()
+            ));
+        };
+        if let Some(why) = sandbox_refusal(sandbox) {
+            return not_run(format!(
+                "{} opens this machine's default browser through the OS, and the sandbox that \
+                 stops it cannot run here: {why}; run it from a terminal that is not sandboxed; \
+                 nothing was run",
+                req.cli.connector().product
+            ));
+        }
+        Some(sandbox)
+    } else {
+        None
+    };
     let (program, path, _opener_free) =
         match child_program(program, path, signin.no_opener, &req.store.dir, var) {
             Ok(child) => child,
             Err(e) => return not_run(format!("no private PATH could be made: {e}")),
         };
-    let program = program.as_path();
+    if sandbox.is_some() && !program.is_file() {
+        return not_run(format!(
+            "`{}` is not installed here (found neither at that path nor on `PATH`)",
+            program.display()
+        ));
+    }
+    let sandboxed: Vec<OsString>;
+    let (program, lead) = match sandbox {
+        Some(sandbox) => {
+            sandboxed = no_desk_argv(&program, lead);
+            (sandbox, sandboxed.as_slice())
+        }
+        None => (program.as_path(), lead),
+    };
     let env = child_env(req.cli, signin, req.staging, &path, var);
     let email = req.row.email.as_deref();
     match &req.route.drive {
@@ -894,8 +1035,9 @@ pub fn sign_in_with(
     }
 }
 
-/// `req`'s sign-in on this machine: the CLI's own binary ([`program_of`]), the headless
-/// browser approving its page ([`super::headless_oauth::VendorApprover`]), within [`HANG`].
+/// `req`'s sign-in on this machine: the CLI's own binary ([`program_of`]), under
+/// [`SANDBOX_EXEC`] where its [`SignIn::no_desk`] names this system, the headless browser
+/// approving its page ([`super::headless_oauth::VendorApprover`]), within [`HANG`].
 pub fn sign_in_live(
     req: &Request<'_>,
     home: &Path,
@@ -909,29 +1051,79 @@ pub fn sign_in_live(
         &req.store.shared_dir(),
         Some(home),
     );
-    sign_in_with(req, (&program, &[]), None, var, &mut approver, HANG)
+    sign_in_with(
+        req,
+        (&program, &[]),
+        None,
+        Some(Path::new(SANDBOX_EXEC)),
+        var,
+        &mut approver,
+        HANG,
+    )
 }
 
+/// The private `PATH` directory a [`login_command`] holds, removed when it drops.
+pub type LoginPath = Option<aterm_tempfile::TempDir>;
+
 /// `accounts login <label> --cli <id>`'s command: `req`'s sign-in on this terminal, where the
-/// CLI shows its own URL and code and may open the person's browser. Its environment is
-/// [`child_env`]'s with this process's `PATH`; a Codex browser route runs `codex login`, the
-/// app server being the harness's alone.
-#[must_use]
+/// CLI shows its own URL and code. At the desk it may open the person's browser, and its
+/// environment is [`child_env`]'s with this process's `PATH`. Over SSH (`over_ssh`) a browser
+/// it opened would be this machine's, not the person's, so there a [`SignIn::no_opener`] CLI gets
+/// the opener-free `PATH` ([`child_program`], whose directory the [`LoginPath`] holds) and a
+/// [`SignIn::no_desk`] one runs under `no_desk` ([`NO_DESK`]), and it prints its URL for the
+/// person to open where they are. A Codex browser route runs `codex login`, the app server
+/// being the harness's alone.
+/// # Errors
+/// Over SSH, no private `PATH` could be made, or a no-desk CLI's sandbox is missing or cannot
+/// run here ([`sandbox_refusal`]).
 pub fn login_command(
     req: &Request<'_>,
     home: &Path,
     var: &dyn Fn(&str) -> Option<OsString>,
-) -> aterm_uds::spawnfd::Command {
+    (over_ssh, no_desk): (bool, Option<&Path>),
+) -> Result<(aterm_uds::spawnfd::Command, LoginPath), String> {
     let program = program_of(req.cli, home);
-    let path = var("PATH").unwrap_or_default();
-    let env = req
-        .signin()
+    let signin = req.signin();
+    let opener_free = over_ssh && signin.is_some_and(|s| s.no_opener);
+    let (program, path, held) = if opener_free {
+        child_program(&program, None, true, &req.store.dir, var)
+            .map_err(|e| format!("no private PATH could be made: {e}"))?
+    } else {
+        (program, var("PATH").unwrap_or_default(), None)
+    };
+    let env = signin
         .map(|signin| child_env(req.cli, signin, req.staging, &path, var))
         .unwrap_or_default();
-    let args = match req.route.drive {
+    let mut args = match req.route.drive {
         Drive::AppServer => vec!["login".to_owned()],
         Drive::Lines { .. } => child_args(req.route, req.row.vendor.region),
     };
+    let mut program = program;
+    if over_ssh && signin.is_some_and(|s| s.no_desk.contains(&std::env::consts::OS)) {
+        let product = req.cli.connector().product;
+        let Some(sandbox) = no_desk.filter(|sandbox| sandbox.is_file()) else {
+            return Err(format!(
+                "over SSH, {product} would open this machine's default browser, and the sandbox \
+                 that stops it ({}) is not here",
+                no_desk.unwrap_or(Path::new(SANDBOX_EXEC)).display()
+            ));
+        };
+        if let Some(why) = sandbox_refusal(sandbox) {
+            return Err(format!(
+                "over SSH, {product} would open this machine's default browser, and the sandbox \
+                 that stops it cannot run here: {why}"
+            ));
+        }
+        let parent = var("PATH").unwrap_or_default();
+        let resolved = on_path(&program, &parent).unwrap_or(program);
+        let mut wrapped: Vec<String> = no_desk_argv(&resolved, &[])
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        wrapped.append(&mut args);
+        args = wrapped;
+        program = sandbox.to_path_buf();
+    }
     let mut cmd = aterm_uds::spawnfd::command(&program);
     cmd.args(&args)
         .env_clear()
@@ -944,7 +1136,7 @@ pub fn login_command(
     if let Some(term) = var("TERM") {
         cmd.env("TERM", term);
     }
-    cmd
+    Ok((cmd, held))
 }
 
 #[cfg(test)]

@@ -346,6 +346,14 @@ impl Cadence {
         self.tail(at.saturating_duration_since(self.now).as_secs_f32());
     }
 
+    /// True once [`Self::best`] is at or before `now + TAIL_FLOOR`, so no further
+    /// [`Self::tail`] or [`Self::tail_at`] can move it earlier.
+    #[inline]
+    #[must_use]
+    pub(crate) fn at_tail_floor(&self) -> bool {
+        self.best.is_some_and(|b| b <= self.now + TAIL_FLOOR)
+    }
+
     /// The fold: the next frame when brisk, else the earliest offer.
     #[inline]
     #[must_use]
@@ -871,7 +879,7 @@ impl Engine {
             self.revive = None;
             return;
         }
-        let tail_start = self.events.len() - self.unechoed_tail().len();
+        let tail_start = self.unechoed_tail_start();
         let soft = self.soft_wrap.take().and_then(|(sw, key_at)| {
             let at_move = self.events.iter().position(|(e, _)| {
                 matches!(*e, Event::Move { from, to, .. } if from == sw.origin && to == sw.landing)
@@ -974,13 +982,16 @@ impl Engine {
     }
 
     #[inline]
-    fn unechoed_tail(&self) -> &[(Event, Instant)] {
-        let start = self
-            .events
+    fn unechoed_tail_start(&self) -> usize {
+        self.events
             .iter()
             .rposition(|(ev, _)| matches!(ev, Event::Move { .. } | Event::Rewrite { .. }))
-            .map_or(0, |i| i + 1);
-        &self.events[start..]
+            .map_or(0, |i| i + 1)
+    }
+
+    #[inline]
+    fn unechoed_tail(&self) -> &[(Event, Instant)] {
+        &self.events[self.unechoed_tail_start()..]
     }
 
     #[inline]
@@ -1197,8 +1208,8 @@ impl Engine {
             .filter(|&d| d.unsigned_abs() > 2 && d != i32::from(carry));
         let ahead = |row: u16| lead.and_then(|d| u16::try_from(i32::from(row) + d).ok());
         if let Some(focus) = focus {
-            add(out, &mut n, focus);
             for row in [
+                Some(focus),
                 focus.checked_sub(1),
                 focus.checked_add(1),
                 back(focus),
@@ -1738,7 +1749,7 @@ impl Engine {
             birth_disp: self.spine.birth_disp(),
             phase: self.spine.phase(),
             caret: self.caret,
-            caret_t: self.ribbon.field_at_caret(),
+            caret_t: 0.0,
             caret_walk: None,
             mend,
             surge: self.spine.surge(),
@@ -2046,14 +2057,20 @@ impl Engine {
         for d in [
             self.meteor.next_change_deadline(now),
             self.ribbon.next_change_deadline(now),
-            self.stardust.next_change_deadline(now),
         ]
         .into_iter()
         .flatten()
         {
             cad.edge(d);
         }
-        if let Some(step) = self.ribbon.settle_step_s(self.spine.disp()) {
+        if !cad.best.is_some_and(|b| b <= now + FRAME_CADENCE)
+            && let Some(d) = self.stardust.next_change_deadline(now)
+        {
+            cad.edge(d);
+        }
+        if !cad.at_tail_floor()
+            && let Some(step) = self.ribbon.settle_step_s(self.spine.disp())
+        {
             cad.tail(step);
         }
         cad.take().map(|at| at.max(now + ARM_MIN))
@@ -2102,7 +2119,8 @@ impl Engine {
         let mote_t = u16::try_from(mote_cell)
             .ok()
             .and_then(|col| self.ribbon.field_at(pet.row, col));
-        let catch = (pet.contented() && self.stardust.live() > 0)
+        let catch = pet
+            .contented()
             .then(|| {
                 self.stardust
                     .live_iter()

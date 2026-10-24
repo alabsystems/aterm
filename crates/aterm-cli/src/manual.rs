@@ -125,14 +125,18 @@ turns sync on; with sync turned off since, the join lands once you turn it on ag
 changing anything when the tab is shown, after each step and on Check again; GitHub
 repositories is read only while it is set up, or on Check again. Completed setup
 preserves later local changes: a group turned to Set up later sets only its own
-preferences, and one turned to Leave as is changes nothing. Rust in Spotlight keeps
-aterm's own build caches out; your projects' build folders Spotlight indexes are
-yours, counted in the row's note and never moved.
+preferences, and a Join or a group turned to Leave as is sets none. Rust in Spotlight
+keeps aterm's own build caches out, and aterm keeps its own Rust toolchain out by
+itself (the toolchain it is using moves at its next update, which the row notes);
+your projects' build folders Spotlight indexes are yours, counted in the row's note
+and never moved.
 
 Only changed preference keys are backed up (no credentials). Restore preferences puts
 them back and stops automatic setup, leaving cloned repos, credentials and sign-outs
-in place; without Full Disk Access it leaves Notification Center's widget list alone
-and keeps its original in the backup (run Restore again from an app with the grant).
+in place; a choice after it sets only the groups it turns to Set up, a Join or a
+group turned to Leave as is sets none, and Set up now sets them all again. Without
+Full Disk Access it leaves Notification Center's widget list alone and keeps its
+original in the backup (run Restore again from an app with the grant).
 `doctor --apply` applies the preference and account profile and adds aterm's
 permissions to the plan, unless setup was cancelled or restored; System State also
 does Spotlight, the vault and repositories. The Messages and FaceTime sign-outs run
@@ -459,6 +463,10 @@ THE DOCTOR
   `aterm harness accounts renew <label> --cli <cli>` where this machine keeps that
   CLI's roster (`accounts-<cli>.toml`). Where it does not, codex runs its own login,
   and grok and kimi (no rows of `aterm ai` yet) say how to add a row and run nothing.
+  A renewal whose page waits on a person stops `needs-sign-in` and prints
+  `NEEDS YOU: sign <label> in once…`. `aterm harness accounts browser <label> --cli
+  <cli>` opens that row's own browser profile in a window at the vendor's sign-in page.
+  Once a person signs in there, later renewals approve the CLI's page in it headlessly.
 
   States: `ok` (used within 6h), `idle` (signed in), `limited` (at a usage limit),
   `due` (renew by a time it names), `unproven`, `signed-out`, `not-installed`, `off`.
@@ -1956,8 +1964,10 @@ PROVISION — make this machine able to publish
       rustup, Apple's packaging tools, the Developer ID identity, a live-tested
       notary credential, the channel token, and the layers a release host stands
       on (the base layer, `targo --unverified verify provision`, the publication
-      engine, the site checkout, node and firebase-tools). It names every gap with
-      its fix and exits non-zero while one is open.
+      engine, the site checkout and its firebase.json, and a readable deployer key
+      for the site, which deploys over Firebase Hosting's REST API with no node or
+      firebase-tools). It names every gap with its fix and exits non-zero while
+      one is open.
   aterm ship provision --id <machine-id>
       The same checks, acquiring what `--check` only reports: it runs `targo
       --unverified verify provision`, lays rustup's `trust` link, asks before

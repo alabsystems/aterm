@@ -238,8 +238,8 @@ pub fn pool_sign_in(h: &Host<'_>, c: PoolCli<'_>, pool: &super::facts::CliAccoun
     }
     let Some(label) = &pool.next else {
         return Done::Refused(format!(
-            "{roster} has no row with an email to sign in: add one with `aterm harness accounts \
-             add <label> --cli {} --email <email>`",
+            "{roster} lists no email: run `aterm harness accounts add <label> --cli {} --email \
+             <e>` (kimi also `--region <r>`)",
             c.id
         ));
     };

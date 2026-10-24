@@ -21,7 +21,7 @@ pub struct ProcessReading {
     pub footprint: Option<u64>,
     /// Bytes it has read from disk since it started (macOS `ri_diskio_bytesread`: storage reads, not page-cache hits); `None` where refused, and on Linux.
     pub disk_read: Option<u64>,
-    /// Bytes it has written to disk since it started (macOS `ri_diskio_byteswritten`: what reached storage, not every `write(2)`); `None` where refused, and on Linux.
+    /// Bytes it has written to disk since it started (macOS `ri_diskio_byteswritten`: what reached storage, not every `write(2)`); `None` where refused, and on Linux. An unreaped zombie keeps its final count, its start and its `disk_read` (macOS), though not its CPU time or footprint.
     pub disk_written: Option<u64>,
     /// Its short name (`p_comm`, 16 bytes at most on macOS; Linux `comm`; Windows the image name less `.exe`).
     pub name: String,
@@ -35,6 +35,9 @@ pub struct ProcessReading {
     pub session_leader: Option<bool>,
     /// Whether it has a controlling terminal; `None` where unread.
     pub has_tty: Option<bool>,
+    /// Whether it ran a program since its fork (macOS `P_EXEC`, Linux `PF_FORKNOEXEC` clear): a
+    /// fork that kept its parent's program did not; `None` where unread, and on Windows.
+    pub exec: Option<bool>,
     /// Time its threads spent runnable (running or waiting for a core) since it started, nanoseconds (macOS `ri_runnable_time`); `None` where refused or not read.
     pub runnable_ns: Option<u64>,
     /// The largest footprint it has had (macOS `ri_lifetime_max_phys_footprint`); `None` where refused or not read.
@@ -158,7 +161,7 @@ pub(crate) mod imp {
 
     use super::{MAX_PROCESSES, ProcessReading, Sweep, SweepOpts, ticks_to_ns};
     use crate::jobs::RunState;
-    use crate::jobs::darwin::PROC_FLAG_CONTROLT;
+    use crate::jobs::darwin::{PROC_FLAG_CONTROLT, PROC_FLAG_EXEC};
 
     /// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`), as the crate's macOS arm declares it (the reference `libc` does not export it).
     const PROC_PIDT_SHORTBSDINFO: c_int = 13;
@@ -277,22 +280,29 @@ pub(crate) mod imp {
             }
             let before = rusage(pid);
             let Some(info) = short_info(pid) else {
-                // A zombie answers no `proc_pidinfo` flavor; the sysctl does.
+                // A zombie answers no `proc_pidinfo` flavor; the sysctl does, and
+                // `proc_pid_rusage` its final usage, kept only when a second read names the
+                // same start, so a pid reused between the reads lends none of it.
                 if let Some(k) = crate::jobs::macos_kinfo(pid) {
+                    let last = before.filter(|b| {
+                        rusage(pid)
+                            .is_some_and(|a| a.ri_proc_start_abstime == b.ri_proc_start_abstime)
+                    });
                     procs.push(ProcessReading {
                         pid: pid as u32,
-                        start: None,
+                        start: last.map(|u| u.ri_proc_start_abstime),
                         ppid: k.ppid,
                         cpu_ns: None,
                         footprint: None,
-                        disk_read: None,
-                        disk_written: None,
+                        disk_read: last.map(|u| u.ri_diskio_bytesread),
+                        disk_written: last.map(|u| u.ri_diskio_byteswritten),
                         name: k.comm,
                         pgid: k.pgid,
                         uid: Some(k.uid),
                         state: RunState::from_bsd(k.stat),
                         session_leader: Some(k.session_leader),
                         has_tty: Some(k.tty.is_some()),
+                        exec: Some(k.exec),
                         ..ProcessReading::default()
                     });
                 }
@@ -341,6 +351,7 @@ pub(crate) mod imp {
                 state: RunState::from_bsd(info.status),
                 session_leader: (sid > 0).then_some(sid == pid),
                 has_tty: Some(info.flags & PROC_FLAG_CONTROLT != 0),
+                exec: Some(info.flags & PROC_FLAG_EXEC != 0),
                 runnable_ns: usage.map(|u| ticks_to_ns(u.ri_runnable_time, numer, denom)),
                 peak_footprint: usage.map(|u| u.ri_lifetime_max_phys_footprint),
                 read_at,
@@ -629,26 +640,25 @@ mod tests {
         }
     }
 
-    /// AN EXEC MOVES THE PID VERSION, SO A KEPT COALITION IS READ AGAIN (macOS, live): a child
-    /// that execs keeps its pid, its kernel start and its coalition (its new task inherits the
-    /// old one's) while its pid version moves, and the version is what [`processes_keeping`]
-    /// keeps a coalition under. NEGATIVE CONTROL: across two sweeps with no exec between, the
-    /// version stays and the coalition is kept.
+    /// Start this test binary as the stand-in `test` (as `--exact` names it) with `var` set and
+    /// its stdin and stdout piped; the second half waits for one of its lines (the hang detector).
     #[cfg(target_os = "macos")]
-    #[test]
-    fn an_exec_moves_the_pid_version_and_keeps_the_coalition() {
+    fn stand_in(
+        test: &str,
+        var: (&str, &std::ffi::OsStr),
+    ) -> (aterm_uds::spawnfd::Child, impl Fn(&str)) {
         use aterm_uds::spawnfd::Stdio;
-        use std::io::{BufRead as _, Write as _};
+        use std::io::BufRead as _;
         let mut child =
             aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
                 .args([
                     "--exact",
-                    EXEC_STAND_IN,
+                    test,
                     "--ignored",
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env(EXEC_STAGE, "before")
+                .env(var.0, var.1)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
@@ -662,13 +672,26 @@ mod tests {
                 }
             }
         });
-        let saw = |word: &str| loop {
+        let saw = move |word: &str| loop {
             match lines.recv_timeout(HANG) {
                 Ok(line) if line == word => break,
                 Ok(_) => {}
                 Err(e) => panic!("hang detector: the stand-in never wrote {word:?} ({e})"),
             }
         };
+        (child, saw)
+    }
+
+    /// AN EXEC MOVES THE PID VERSION, SO A KEPT COALITION IS READ AGAIN (macOS, live): a child
+    /// that execs keeps its pid, its kernel start and its coalition (its new task inherits the
+    /// old one's) while its pid version moves, and the version is what [`processes_keeping`]
+    /// keeps a coalition under. NEGATIVE CONTROL: across two sweeps with no exec between, the
+    /// version stays and the coalition is kept.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_exec_moves_the_pid_version_and_keeps_the_coalition() {
+        use std::io::Write as _;
+        let (mut child, saw) = stand_in(EXEC_STAND_IN, (EXEC_STAGE, "before".as_ref()));
         saw("before");
         let pid = child.id();
         let mut ids = crate::coalitions::CoalitionIds::default();
@@ -705,6 +728,89 @@ mod tests {
         );
         drop(stdin);
         aterm_uds::deadline::kill_within(&mut child, HANG);
+    }
+
+    /// The write stand-in's scratch directory: [`write_stand_in`] writes [`WRITE_BYTES`] there on a byte.
+    #[cfg(target_os = "macos")]
+    const WRITE_DIR: &str = "ATERM_SYSPROBE_WRITE_DIR";
+
+    /// [`write_stand_in`], as `--exact` names it.
+    #[cfg(target_os = "macos")]
+    const WRITE_STAND_IN: &str = "procs::tests::write_stand_in";
+
+    /// What [`write_stand_in`] writes and syncs: 8 MiB.
+    #[cfg(target_os = "macos")]
+    const WRITE_BYTES: u64 = 8 << 20;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "the child the zombie-write test starts; alone it returns"]
+    fn write_stand_in() {
+        use std::io::{Read as _, Write as _};
+        let Some(dir) = std::env::var_os(WRITE_DIR) else {
+            return;
+        };
+        println!("\nready");
+        std::io::stdout().flush().expect("the ready proof");
+        let mut byte = [0; 1];
+        if !matches!(std::io::stdin().read(&mut byte), Ok(1)) {
+            aterm_uds::process::kill_self_now();
+        }
+        let mut file = std::fs::File::create(std::path::Path::new(&dir).join("written"))
+            .expect("the scratch file");
+        let block: Vec<u8> = (0..1usize << 20).map(|i| (i * 31 % 251) as u8).collect();
+        for _ in 0..WRITE_BYTES >> 20 {
+            file.write_all(&block).expect("a block");
+        }
+        aterm_durable::durable(&file).expect("to storage");
+        println!("wrote");
+        std::io::stdout().flush().expect("the wrote proof");
+    }
+
+    /// A ZOMBIE KEEPS WHAT IT WROTE (macOS, live): a child that writes 8 MiB to storage and exits
+    /// unreaped reads, as a zombie, at least those bytes under the start it had alive, where the
+    /// sweep once gave a zombie no counters, so the writes after its last live sweep were lost.
+    /// NEGATIVE CONTROL: its row read before it wrote reads under 8 MiB.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_zombie_keeps_the_bytes_it_wrote_and_its_start() {
+        use std::io::Write as _;
+        let dir = aterm_tempfile::tempdir().expect("a scratch directory");
+        let (mut child, saw) = stand_in(WRITE_STAND_IN, (WRITE_DIR, dir.path().as_os_str()));
+        saw("ready");
+        let pid = child.id();
+        let row = || {
+            processes()
+                .expect("a sweep")
+                .procs
+                .into_iter()
+                .find(|p| p.pid == pid)
+        };
+        let alive = row().expect("the stand-in swept");
+        assert!(
+            alive.disk_written.is_some_and(|w| w < WRITE_BYTES) && alive.start.is_some(),
+            "{alive:?}"
+        );
+        let mut stdin = child.stdin.take().expect("its stdin");
+        stdin
+            .write_all(b"x")
+            .expect("the byte that starts the write");
+        saw("wrote");
+        let mut exit = aterm_uds::deadline::ExitWait::new(&child);
+        let by = std::time::Instant::now() + HANG;
+        while !child.exited().expect("whether it exited") {
+            let left = by.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "hang detector: the stand-in never exited");
+            exit.wait(left);
+        }
+        let zombie = row().expect("the zombie swept");
+        assert_eq!(zombie.state, crate::jobs::RunState::Zombie, "{zombie:?}");
+        assert_eq!(zombie.start, alive.start, "the same process");
+        assert!(
+            zombie.disk_written.is_some_and(|w| w >= WRITE_BYTES),
+            "{zombie:?}"
+        );
+        child.wait().expect("reaped");
     }
 
     #[cfg(any(

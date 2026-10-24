@@ -41,6 +41,9 @@ pub use format_plan::{
     hdr_reconfigure_plan, hdr_screen_upgrade_decision, hdr_screen_upgrade_wants_f16,
     hdr_swapchain_wants_f16, hdr_swapchain_wants_f16_on_screen,
 };
+/// Finite integer compute jobs on Metal shared buffers (`compute`).
+#[cfg(all(target_os = "macos", any(test, feature = "compute")))]
+pub mod compute;
 #[cfg(gl_arm)]
 mod gl;
 #[cfg(all(test, target_os = "macos", not(gl_arm)))]
@@ -50,7 +53,7 @@ mod gl_shaders;
 mod metal;
 /// Launch Metal warm types (`metal/warm.rs`).
 #[cfg(target_os = "macos")]
-pub use metal::warm::{FirstFrameKnobs, FirstFrameWarm, PresentKnobs, ShaderCacheWarm};
+pub use metal::warm::{FirstFrameKnobs, FirstFrameWarm};
 /// First-frame compile benchmark entry points (`benches/first_frame_compile.rs`).
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
@@ -338,28 +341,12 @@ pub fn begin_first_frame_warm() -> Option<FirstFrameWarm> {
     metal::warm::FIRST_FRAME.begin()
 }
 
-/// Claims the process-once headless launch warm for background execution: the first frames' compiles, and under [`PresentKnobs`] the rest a frame can bind, made before a deferred renderer's first pixel demand and awaited by nothing ([`ShaderCacheWarm::run`]).
-#[cfg(target_os = "macos")]
-#[must_use]
-#[inline]
-pub fn begin_shader_cache_warm() -> Option<ShaderCacheWarm> {
-    ShaderCacheWarm::begin()
-}
-
 /// Whether [`begin_first_frame_warm`] has been claimed in this process.
 #[cfg(target_os = "macos")]
 #[must_use]
 #[inline]
 pub fn first_frame_warm_began() -> bool {
     metal::warm::FIRST_FRAME.began()
-}
-
-/// Whether [`begin_shader_cache_warm`] has been claimed in this process.
-#[cfg(target_os = "macos")]
-#[must_use]
-#[inline]
-pub fn shader_cache_warm_began() -> bool {
-    ShaderCacheWarm::began()
 }
 
 /// The `ATERM_GPU_POWER` seam, parsed.

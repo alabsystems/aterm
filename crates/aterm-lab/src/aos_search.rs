@@ -764,10 +764,30 @@ fn how<'p>(pool: &'p mut Option<Pool>, args: &Args) -> How<'p> {
     }
 }
 
+fn remove_void_bundles(files: &[PathBuf]) -> Result<Vec<PathBuf>, Fail> {
+    let mut removed = Vec::new();
+    let mut failed = Vec::new();
+    for file in files {
+        match std::fs::remove_file(file) {
+            Ok(()) => removed.push(file.clone()),
+            Err(e) => failed.push(format!("{}: {e}", file.display())),
+        }
+    }
+    if failed.is_empty() {
+        Ok(removed)
+    } else {
+        Err(Fail::die(format!(
+            "aos-search: the command is void, but these bundles could not be removed: {}",
+            failed.join("; ")
+        )))
+    }
+}
+
 /// The searches `args` names.
 /// # Errors
 /// This lab's build names no commit (exit 1, before any evaluator is built), the pinned policy
-/// refused (exit 1), a worker could not be spawned, or the summary could not be written.
+/// refused (exit 1), a worker could not be spawned, a void bundle could not be removed, or the
+/// summary could not be written.
 pub fn run(args: &Args, plans_text: Option<&str>, out: &Path) -> Result<(i32, String), Fail> {
     run_in(args, plans_text, out, LAB_BUILD)
 }
@@ -833,11 +853,10 @@ fn run_in(
         .or_else(|| searched.iter().find_map(|s| s.void.clone()));
     let mut removed = Vec::new();
     if refusal.is_some() {
+        let files: Vec<PathBuf> = searched.iter().filter_map(|s| s.bundle.clone()).collect();
+        removed = remove_void_bundles(&files)?;
         for s in &mut searched {
-            if let Some(file) = s.bundle.take() {
-                let _ = std::fs::remove_file(&file);
-                removed.push(file);
-            }
+            s.bundle = None;
         }
     }
     let mut summary = String::new();
@@ -2290,5 +2309,34 @@ not a plan
                     .contains("milliseconds")
             );
         }
+    }
+
+    #[test]
+    fn a_void_reports_failed_bundle_removal_and_attempts_the_rest() {
+        let dir = aterm_tempfile::tempdir().expect("private output directory");
+        let blocked = dir.path().join("grid.bundle");
+        let file = dir.path().join("plans.bundle");
+        std::fs::create_dir(&blocked).expect("deterministic removal obstruction");
+        std::fs::write(&file, b"only fixture bytes").expect("private bundle");
+        let failed = remove_void_bundles(&[blocked.clone(), file.clone()])
+            .expect_err("must not report every bundle removed");
+        assert_eq!(failed.code, 1);
+        assert!(
+            failed
+                .msg
+                .as_deref()
+                .is_some_and(|s| s.contains("grid.bundle"))
+        );
+        assert!(blocked.is_dir());
+        assert!(!file.exists(), "a failure does not skip later removals");
+        std::fs::remove_dir(&blocked).expect("remove only our empty obstruction");
+        std::fs::write(&blocked, b"only fixture bytes").expect("private bundle");
+        assert_eq!(
+            remove_void_bundles(std::slice::from_ref(&blocked))
+                .expect("actual removal")
+                .as_slice(),
+            std::slice::from_ref(&blocked)
+        );
+        assert!(!blocked.exists());
     }
 }

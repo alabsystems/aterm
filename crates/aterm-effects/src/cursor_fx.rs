@@ -334,24 +334,33 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
         (lum_ink.max(lb) + 0.05) / (lum_ink.min(lb) + 0.05)
     };
     let target = BED_INK_FLOOR.min(contrast_ink(ground));
-    let holds = |alpha: u8| {
-        let lb = crate::color_math::relative_luminance_with(
-            table,
-            aterm_render::blend_rgb(ground, color, alpha),
-        );
+    let holds_bg = |bg: u32| {
+        let lb = crate::color_math::relative_luminance_with(table, bg);
         lum_ink.max(lb) + 0.05 >= target * (lum_ink.min(lb) + 0.05)
     };
     let peak = crate::cursor_trail::BED_PEAK_ALPHA;
-    if holds(peak) {
+    let peak_bg = aterm_render::blend_rgb(ground, color, peak);
+    if holds_bg(peak_bg) {
         return 1.0;
     }
     let (mut lo, mut hi) = (0u8, peak);
+    let (mut lo_bg, mut hi_bg) = (ground, peak_bg);
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
-        if holds(mid) {
+        let mid_bg = aterm_render::blend_rgb(ground, color, mid);
+        let ok = if mid_bg == hi_bg {
+            false
+        } else if lo > 0 && mid_bg == lo_bg {
+            true
+        } else {
+            holds_bg(mid_bg)
+        };
+        if ok {
             lo = mid;
+            lo_bg = mid_bg;
         } else {
             hi = mid;
+            hi_bg = mid_bg;
         }
     }
     ((f32::from(lo) - 0.5).max(0.0) / f32::from(peak)).clamp(0.0, 1.0)

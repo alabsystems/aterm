@@ -58,6 +58,7 @@ fn no_roster() -> Option<aterm_agent::harness::accounts::Roster> {
 }
 
 const ASKS: Asks = Asks {
+    files: |_| None,
     tap: NO_TAP,
     args: args_of,
     roster: no_roster,

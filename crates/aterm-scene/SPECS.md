@@ -81,7 +81,7 @@ fill-path-coverage-geometry	other (geometric meaning)	vector::fill_path, flatten
 parse-path-roundtrip	round-trip	vector::parse_path	∀ cmds: Vec<PathCmd> whose coordinates are all finite: parse_path(Render(cmds)) = Some(cmds), using PathCmd's PartialEq. This relies on f32 Display being shortest-round-trip with no exponent, and on "-0" parsing to −0.0. Conversely, ∀ d with parse_path(d) = Some(v): parse_path(Render(v)) = Some(v), so Render∘parse is idempotent on the accepted language.	(none; the property the asset-grammar test is named for, §5.2)	HARD: everything in parse-path-language, plus a model of f32 Display/FromStr round-trip (Ryu-style shortest representation) and String building in the spec-side Render.	0,1,3,5,7,13,14
 ```
 
-## 2. Test → spec map (TSV; all 7)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 A test is deleted only when its primary spec and every spec under `also` are proved.

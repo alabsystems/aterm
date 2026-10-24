@@ -58,7 +58,7 @@ getrandom-uninit-refines-getrandom	refinement	getrandom::getrandom_uninit	∀ de
 os-fill-writes-every-byte	contract	aterm_uds::rand::fill (unix), aterm_uds::rand::fill_from, aterm_uds::rand::fill (windows)	∀ buf: &mut [u8]: if aterm_uds::rand::fill(buf) = Ok(()), then Written(buf, i) holds for every i < buf.len(), under PlatformSpec. Unix: buf.chunks_mut(256) splits [0, len) into consecutive chunks of at most 256 bytes. Either the entropy closure returned true for every chunk, and getentropy(chunk) = 0 means every chunk was written, or the read_exact(buf) fallback over the whole buffer returned Ok. Windows: every chunks_mut(u32::MAX) chunk got BCryptGenRandom status 0. If any OS step fails without a successful fallback, the result is Err. Composed with getrandom-forwards, this gives getrandom(dest) = Ok ⇒ every byte of dest is OS CSPRNG output, at every length (fill.rs samples lengths 0 to 4096). That two fills differ is the CSPRNG assumption and is not part of the proof.	tests/fill.rs::getrandom_writes_every_byte_of_every_length	XL: the chunks_mut iterator plus Iterator::all with an FnMut closure (a loop with a coverage invariant over the chunk partition), unsafe extern "C" getentropy and BCryptGenRandom FFI, std::fs::File::open and read_exact (fs effects), an atomic once-flag and poll(2) on Linux, &mut [u8]. fill_from is trust::skip today.	1, 2, 7, 8, 12, 13
 ```
 
-## 2. Test → spec map (TSV; all 9)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 A test is deleted only when its primary and every `also` spec are proved.

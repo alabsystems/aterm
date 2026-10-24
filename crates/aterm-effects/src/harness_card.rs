@@ -2351,7 +2351,6 @@ impl HarnessCard {
                 .map_while(|i| Some((i, at.col.checked_add(i)?)))
                 .map(|(i, c)| {
                     let x = f32::from(i) / span;
-                    let place = tri(x + phi);
                     let sweep = if env == 0.0 {
                         0.0
                     } else {
@@ -2378,17 +2377,24 @@ impl HarnessCard {
                                 crest * LINE_SWEEP_GAIN_LIGHT,
                             )
                         }
-                    } else if dark {
-                        line_floor(
-                            mix_rgb(palette.letter(place, true), WHITE, crest * LINE_SWEEP_GAIN),
-                            ground,
-                        )
                     } else {
-                        mix_rgb(
-                            inks.at(palette, ground, place),
-                            0,
-                            crest * LINE_SWEEP_GAIN_LIGHT,
-                        )
+                        let place = tri(x + phi);
+                        if dark {
+                            line_floor(
+                                mix_rgb(
+                                    palette.letter(place, true),
+                                    WHITE,
+                                    crest * LINE_SWEEP_GAIN,
+                                ),
+                                ground,
+                            )
+                        } else {
+                            mix_rgb(
+                                inks.at(palette, ground, place),
+                                0,
+                                crest * LINE_SWEEP_GAIN_LIGHT,
+                            )
+                        }
                     };
                     InkCell {
                         row: at.row,

@@ -106,7 +106,7 @@ budgeted-refines-one-shot	equivalence	budgeted::BudgetedSearch::{new,with_max_ca
 budgeted-progressive	contract	budgeted::BudgetedSearch::{feed_row_cow,rows_fed,total_rows,is_complete,results,results_range,result_count}	rows_fed grows by exactly 1 per feed while rows_fed < total_rows; a feed when rows_fed ≥ total_rows changes nothing. is_complete() ⇔ rows_fed ≥ total_rows. results().lowest_retained_line is the final watermark fixed at construction (base + total − max(cap,1) when total > max(cap,1), else 0), and no emitted match lies below it. results().matches after k feeds is a prefix of results().matches after k+1 feeds. results_range(s,l) = results() with matches[min(s,n) .. min(s+l,n)] (n = result_count()) and the same incomplete/lowest/cut_short_lines.	src/budgeted.rs::partial_results_are_a_prefix_and_overfeed_is_a_noop, src/budgeted.rs::result_ranges_are_bounded_and_stable_past_the_cap	0,1,2,3,5	Vec slice/clone, saturating min arithmetic
 ```
 
-## 2. Test → spec map (TSV; all 340)
+## 2. Test → spec map (TSV)
 
 `spec` is the spec that retires the test. A test in §4 has `-` here and its §4 action in
 `action`. Rows are grouped by file.

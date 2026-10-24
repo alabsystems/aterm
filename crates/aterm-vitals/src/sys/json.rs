@@ -162,7 +162,7 @@ fn write_str(out: &mut String, s: &str) {
     out.push('"');
 }
 
-/// Required keys of a split object.
+/// The keys a split object holds, and nothing else.
 pub const SPLIT_PARTS: [&str; 5] = ["tab", "aterm_rest", "others", "services", "unaccounted"];
 
 /// Every way `v` breaks the shape contract, as `path: what` lines; empty when it holds.

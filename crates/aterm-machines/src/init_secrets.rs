@@ -1100,20 +1100,25 @@ fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool, of
         to: SUBSCRIBED.into(),
     };
     let watched = unsynced.is_none();
-    let kept = if off {
-        SYNC_OFF
-    } else {
-        "kept in sync by the subscriber"
-    };
+    let kept = "kept in sync by the subscriber";
     let unwritten = |now: String| Probe::Change {
         from: format!("{now}, but a file it wrote failed, is missing or was changed"),
         to: WRITTEN.into(),
     };
     match &status.membership {
-        Membership::In { seq, .. } if watched && !synced && !off => {
+        // Off is the person's choice even when a file is missing or changed. Neither
+        // setup path repairs those files or installs the subscriber without a new join.
+        // Say the membership and that choice, not that the files are materialized.
+        Membership::In { seq, .. } if off => Probe::Ok {
+            now: format!("in vault {name} (seq {seq}); {SYNC_OFF}"),
+        },
+        Membership::Plain if off => Probe::Ok {
+            now: format!("reading the plain text file {}; {SYNC_OFF}", shown(source)),
+        },
+        Membership::In { seq, .. } if watched && !synced => {
             unwritten(format!("in vault {name} (seq {seq})"))
         }
-        Membership::Plain if watched && !synced && !off => {
+        Membership::Plain if watched && !synced => {
             unwritten(format!("reading the plain text file {}", shown(source)))
         }
         Membership::In { seq, .. } if watched => Probe::Ok {
@@ -1257,6 +1262,8 @@ impl Item for Vault {
                     kept: None,
                     key: status.machine.is_none(),
                 },
+                // Sync off never reaches this plan: `judge` reads it as the person's
+                // choice (no change), so nothing installs or rewrites over it.
                 Origin::Configured | Origin::Selected => Planned {
                     subscribe: self.origin == Origin::Configured || unsynced.is_some(),
                     files: !synced,
@@ -3527,34 +3534,54 @@ mod tests {
         }
     }
 
-    /// `aterm init` keeps the person's Sync off too: a member Mac (`Origin::Configured`)
-    /// whose subscriber they turned off reads as their choice, with the command that turns
-    /// it on, and nothing is installed over the record. NEGATIVE CONTROL: with no record,
-    /// `aterm init` installs it.
+    /// `aterm init` and System State keep Sync off for a member or plain source even when
+    /// its files are unwritten. Neither installs the subscriber nor repairs the files or
+    /// clears Off. NEGATIVE CONTROL: without Off both paths install and repair as needed.
     #[test]
     fn aterm_init_keeps_the_persons_sync_off() {
-        for off in [true, false] {
-            let ops = Scripted::new(vec![
-                Ok(configured(Membership::In { seq: 7, heard: 0 })),
-                Ok(configured(Membership::In { seq: 7, heard: 0 })),
-                Ok(configured(Membership::In { seq: 7, heard: 0 })),
-                Ok(configured(Membership::In { seq: 7, heard: 0 })),
-            ]);
-            ops.subscribed(Ok(State::Absent));
-            *ops.turned_off.lock().unwrap() = off;
-            let rows = run(&fake(), &ops, Mode::Apply);
-            let installed = ops.changes().iter().any(|change| change == "install");
-            assert_eq!(installed, !off, "{:?} {:?}", ops.changes(), rows[0]);
-            if off {
-                assert_eq!(rows[0].outcome, Outcome::Ok, "{:?}", rows[0]);
-                assert!(
-                    rows[0]
-                        .to
-                        .as_deref()
-                        .is_some_and(|to| to.ends_with(SYNC_OFF)),
-                    "{:?}",
-                    rows[0]
-                );
+        for membership in [Membership::In { seq: 7, heard: 0 }, Membership::Plain] {
+            for selected in [false, true] {
+                for off in [true, false] {
+                    for unwritten in [true, false] {
+                        let ops = Scripted::new(
+                            (0..4).map(|_| Ok(configured(membership.clone()))).collect(),
+                        );
+                        ops.subscribed(Ok(State::Absent));
+                        *ops.turned_off.lock().unwrap() = off;
+                        *ops.unwritten.lock().unwrap() = unwritten;
+                        let row = if selected {
+                            setup_pass(&ops, aterm_secrets::ALAB_DEFAULT_URL, &mut None, false)
+                        } else {
+                            run(&fake(), &ops, Mode::Apply).remove(0)
+                        };
+                        let case = format!(
+                            "{membership:?} selected={selected} off={off} unwritten={unwritten}"
+                        );
+                        assert_eq!(
+                            ops.installs() > 0,
+                            !off,
+                            "{case}: {:?} {row:?}",
+                            ops.changes()
+                        );
+                        assert_eq!(
+                            *ops.syncs.lock().unwrap(),
+                            u32::from(!off && unwritten),
+                            "{case}"
+                        );
+                        assert_eq!(ops.turned_off(), off, "{case}");
+                        assert_eq!(*ops.unwritten.lock().unwrap(), off && unwritten, "{case}");
+                        if off {
+                            assert_eq!(row.outcome, Outcome::Ok, "{case}: {row:?}");
+                            let to = row.to.as_deref().expect("Sync off value");
+                            assert!(to.ends_with(SYNC_OFF), "{case}: {row:?}");
+                            assert!(
+                                !to.contains(" in ~/.secrets") && !to.contains("kept in sync"),
+                                "{case}: no materialization claim: {row:?}"
+                            );
+                            assert!(ops.changes().is_empty(), "{case}: {:?}", ops.changes());
+                        }
+                    }
+                }
             }
         }
     }

@@ -112,7 +112,10 @@ impl<L: crate::site::Launch + Send + Sync> Spawn for Launched<L> {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let (mut child, guard) = self.0.spawn(command)?;
+        let (mut child, guard) = self
+            .0
+            .spawn(command)
+            .map_err(aterm_update_core::github_rest::unstarted)?;
         if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
             let _ = pipe.write_all(bytes);
         }

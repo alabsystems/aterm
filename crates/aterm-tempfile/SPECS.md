@@ -98,7 +98,7 @@ the naming half of `tempdir-creates-fresh-private-dir-under-parent` (plus `prefi
 `SingleNormal` lemma) → the pure `keep`/`path` half of `tempdir-drop-removes-keep-transfers` →
 the fs halves of both (gap 8) → `fnv1a` → `stand-in-read-only-shared-inode`.
 
-## 2. Test → spec map (TSV; all 7)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

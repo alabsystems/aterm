@@ -63,22 +63,46 @@ const AWAIT_USAGE: &str = "ERR usage: await wake [timeout=<ms>]\n";
 
 /// The kernel's process records as a proof walks them ([`Kernel`], or a test's arm).
 pub(crate) trait ProcTree: Send + Sync {
-    /// `pid`'s link (its birth and its parent); `None` where no live process has it (gone, or a
-    /// zombie: exited).
-    fn link(&self, pid: u32) -> Option<ProcLink>;
+    /// A live link, a definite exit, or a record that could not be read.
+    fn read(&self, pid: u32) -> ProcRead;
+
+    /// The positive identity evidence a proof may walk; unread records prove no link.
+    fn link(&self, pid: u32) -> Option<ProcLink> {
+        match self.read(pid) {
+            ProcRead::Alive(link) => Some(link),
+            ProcRead::Exited | ProcRead::Unread => None,
+        }
+    }
+}
+
+/// One process read: unknown evidence is never a positive exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcRead {
+    Alive(ProcLink),
+    Exited,
+    Unread,
+}
+
+impl ProcRead {
+    fn from_record(read: std::io::Result<Option<aterm_sysprobe::kproc::Record>>) -> Self {
+        match read {
+            Ok(Some(record)) if !record.zombie => Self::Alive(ProcLink {
+                pid: record.pid,
+                birth_us: birth_us(record.start_s, record.start_us),
+                ppid: record.ppid,
+            }),
+            Ok(_) => Self::Exited,
+            Err(_) => Self::Unread,
+        }
+    }
 }
 
 /// The product's [`ProcTree`]: `kproc::record`.
 pub(crate) struct Kernel;
 
 impl ProcTree for Kernel {
-    fn link(&self, pid: u32) -> Option<ProcLink> {
-        let record = aterm_sysprobe::kproc::record(pid)?;
-        (!record.zombie).then(|| ProcLink {
-            pid,
-            birth_us: birth_us(record.start_s, record.start_us),
-            ppid: record.ppid,
-        })
+    fn read(&self, pid: u32) -> ProcRead {
+        ProcRead::from_record(aterm_sysprobe::kproc::record_read(pid))
     }
 }
 
@@ -115,16 +139,25 @@ pub(crate) struct Seat {
     pub(crate) sid: String,
     /// Its local id.
     pub(crate) local: u64,
-    /// The tab's PTY child, the root of the session's tree; `None` where it is not known.
-    pub(crate) pty_child: Option<u32>,
+    /// The tab's PTY child as its session took it, pid and birth: the root of the session's tree;
+    /// `None` where it is not known.
+    pub(crate) pty_child: Option<AgentId>,
     /// The hosted agent's pid and kernel start (unix seconds), where the harness's snapshot names
     /// one: the proof narrows to it.
     pub(crate) agent: Option<(u32, i64)>,
 }
 
+/// `seat`'s root where its pid still names the process its session took: a root gone, or its pid
+/// another process's since, is no root.
+fn live_root(tree: &dyn ProcTree, seat: &Seat) -> Option<AgentId> {
+    seat.pty_child
+        .filter(|root| tree.link(root.pid).is_some_and(|live| live.id() == *root))
+}
+
 /// THE PROOF that `peer` is of `seat`'s tree: the agent process its wakes are declared for.
 /// # Errors
-/// [`DeclarerRefusal`]; a tab whose PTY child is not known proves nothing (`NotInTree`).
+/// [`DeclarerRefusal`]; a tab whose PTY child is not known, gone or reused proves nothing
+/// (`NotInTree`).
 pub(crate) fn proved(
     tree: &dyn ProcTree,
     seat: &Seat,
@@ -133,22 +166,27 @@ pub(crate) fn proved(
     let Some(peer) = peer else {
         return Err(DeclarerRefusal::NoPeer);
     };
-    let Some(root) = seat.pty_child.and_then(|pid| tree.link(pid)) else {
+    let Some(root) = live_root(tree, seat) else {
         return Err(DeclarerRefusal::NotInTree);
     };
-    let agent = seat.agent.and_then(|(pid, start_s)| {
-        tree.link(pid)
-            .filter(|link| link.birth_us.div_euclid(1_000_000) == start_s)
-            .map(ProcLink::id)
-    });
-    declarer::prove(&chain(tree, peer, root.pid), root.id(), agent)
+    let agent = match seat.agent {
+        Some((pid, start_s)) => match tree.read(pid) {
+            ProcRead::Unread => return Err(DeclarerRefusal::NotInTree),
+            ProcRead::Alive(link) if link.birth_us.div_euclid(1_000_000) == start_s => {
+                Some(link.id())
+            }
+            ProcRead::Alive(_) | ProcRead::Exited => None,
+        },
+        None => None,
+    };
+    declarer::prove(&chain(tree, peer, root.pid), root, agent)
 }
 
 /// Whether `pid` is of `seat`'s tree (a `pid:<n> exited` atom's own process).
 fn of_tree(tree: &dyn ProcTree, seat: &Seat, pid: u32) -> Option<ProcLink> {
-    let root = seat.pty_child.and_then(|p| tree.link(p))?;
+    let root = live_root(tree, seat)?;
     let links = chain(tree, pid, root.pid);
-    declarer::prove(&links, root.id(), None).ok()?;
+    declarer::prove(&links, root, None).ok()?;
     links.first().copied()
 }
 
@@ -200,7 +238,8 @@ pub(crate) struct WakeIdle {
     pub(crate) looped: bool,
     /// When it was first seen due, unix ms.
     pub(crate) since_ms: i64,
-    /// The look that raised or last kept it, unix ms.
+    /// The look that raised it or last changed it, unix ms: a look that only keeps it standing
+    /// does not move this.
     pub(crate) at_ms: i64,
 }
 
@@ -353,11 +392,11 @@ impl Levels for ShelfLevels<'_> {
         match atom {
             SourceAtom::Pid { pid } => {
                 let birth = self.pids.get(pid)?;
-                Some(
-                    self.tree
-                        .link(*pid)
-                        .is_none_or(|link| link.birth_us != *birth),
-                )
+                match self.tree.read(*pid) {
+                    ProcRead::Alive(link) => Some(link.birth_us != *birth),
+                    ProcRead::Exited => Some(true),
+                    ProcRead::Unread => None,
+                }
             }
             SourceAtom::File { .. } | SourceAtom::Gone { .. } => None,
         }
@@ -368,9 +407,12 @@ impl Levels for ShelfLevels<'_> {
     }
 
     fn agent_alive(&self, agent: AgentId) -> bool {
-        self.tree
-            .link(agent.pid)
-            .is_some_and(|link| link.birth_us == agent.birth_us)
+        match self.tree.read(agent.pid) {
+            ProcRead::Alive(link) => link.birth_us == agent.birth_us,
+            ProcRead::Exited => false,
+            // A failed read does not prove death: retain the declaration for a later look.
+            ProcRead::Unread => true,
+        }
     }
 }
 
@@ -1341,16 +1383,27 @@ fn deliver_to(wiring: &Wiring, outs: Vec<Out>) {
 /// events` pushes it as `EVENT <sid> wake #<n> ready` (`subscribe::timeline_wire_kind`).
 pub(crate) const WAKE_READY: &str = "wake-ready";
 
+/// The root a session's shell identity pins: its pid and the birth the session read as it took
+/// the shell (unix µs on macOS, the kernel's `p_start` a [`ProcLink`] reads); `None` with no shell
+/// or no birth read, so a bare pid roots no tree.
+fn root_of(shell: aterm_pty::ShellIdentity) -> Option<AgentId> {
+    Some(AgentId {
+        pid: u32::try_from(shell.pid).ok().filter(|&pid| pid != 0)?,
+        birth_us: i64::try_from(shell.birth?).ok()?,
+    })
+}
+
 /// The product's [`Seat`] of local session `session`: its PTY child as its handle was registered
-/// at spawn (a machine snapshot names a new tab only at its next pass), its hosted agent from the
-/// harness's published snapshot.
+/// at spawn, pinned by its birth (a machine snapshot names a new tab only at its next pass, and
+/// the pid may be another process's by the verb), its hosted agent from the harness's published
+/// snapshot.
 fn seat_of(store: &crate::session_store::Store, session: u64) -> Option<Seat> {
-    let (sid, pid) = {
+    let (sid, shell) = {
         let store = store.read().unwrap_or_else(PoisonError::into_inner);
         let handle = store.by_local(session)?;
-        (handle.sid.as_str().to_string(), handle.pid)
+        (handle.sid.as_str().to_string(), handle.shell_identity)
     };
-    let pty_child = u32::try_from(pid).ok().filter(|&pid| pid != 0);
+    let pty_child = root_of(shell);
     let agent = crate::harness_host::published_snapshot(&sid).and_then(|snap| {
         let start = aterm_agent::harness::upgrade_models::parse_lstart(&snap.start)?;
         Some((snap.pid, i64::try_from(start).ok()?))

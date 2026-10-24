@@ -349,7 +349,8 @@ const fn apply_csi_ignore_transitions(table: &mut [[Transition; 256]; State::COU
     table[State::CsiIgnore as usize][0x7F] = Transition::new(State::CsiIgnore, ActionType::Ignore);
 }
 
-/// Build the 14 x 256 table (~7 KB) mapping (state, byte) to (next state, action).
+/// Build the 14 x 256 table (~7 KB) mapping (state, byte) to (next state, action):
+/// the "anywhere" entries first, then each state's own over them.
 pub(crate) const fn generate_table() -> [[Transition; 256]; State::COUNT] {
     let mut table = [[Transition::new(State::Ground, ActionType::None); 256]; State::COUNT];
 

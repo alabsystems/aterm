@@ -316,6 +316,7 @@ fn the_band_is_due_at_most_once_per_frame_whatever_wakes_the_loop() {
         }
         t += Duration::from_millis(7);
     }
+    // The first prepared frame may sit up to one grid step before `t0`.
     let first = *frames.first().expect("the band animates");
     let span = (t0 + Duration::from_secs(3)).saturating_duration_since(first);
     let cap = (span.as_millis() / ANIM_FRAME.as_millis()) as usize + 1;
@@ -526,6 +527,7 @@ fn a_headless_capture_is_still_and_a_pure_function_of_its_instant() {
             .unwrap_or_else(|| panic!("the elapsed words in {row:?}"));
         words[at + 1].parse().unwrap()
     };
+    // Sample 500 ms past each second boundary to avoid 33 ms frame-floor rounding.
     let at20 = text(&shoot(&mut app, now + Duration::from_millis(20_500)));
     let at21 = text(&shoot(&mut app, now + Duration::from_millis(21_500)));
     assert_eq!(clock(&at20), 20, "{at20:?}");

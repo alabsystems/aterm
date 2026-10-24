@@ -1220,3 +1220,48 @@ fn the_statistics_are_the_median_and_the_range() {
     assert_eq!(stat(&[1.0, 2.0], 1), "median=1.5 range=1.0..2.0 n=2");
     assert_eq!(stat(&[], 1), "none");
 }
+
+#[test]
+fn evidence_write_failures_refuse_the_record_and_raw_streams() {
+    let dir = aterm_tempfile::tempdir().expect("private evidence directory");
+    let bench = Bench {
+        lab: PathBuf::from("/not-executed/aterm-lab"),
+        plans: PathBuf::from("/not-read/plans.txt"),
+        out: dir.path().to_path_buf(),
+        header: header(1, FaultPlan::NotAsked),
+        runs: session(1, |_| {}),
+        bundles: Vec::new(),
+    };
+    let record = dir.path().join("record.txt");
+    let (text, code) = bench.write(State::Done).expect("retained record");
+    assert_eq!(code, 0);
+    assert_eq!(
+        std::fs::read_to_string(&record).expect("actual bytes"),
+        text
+    );
+    std::fs::remove_file(&record).expect("replace only our fixture");
+    std::fs::create_dir(&record).expect("deterministic write obstruction");
+    let failed = bench.write(State::Done).expect_err("no successful record");
+    assert_eq!(failed.code, 1);
+    assert!(
+        failed
+            .msg
+            .as_deref()
+            .is_some_and(|s| s.contains("record.txt"))
+    );
+    assert!(record.is_dir(), "failed write preserves the obstruction");
+
+    for name in ["run.stdout", "run.stderr"] {
+        let path = dir.path().join(name);
+        std::fs::create_dir(&path).expect("private stream obstruction");
+        let failed = write_evidence(&path, b"retained stream").expect_err("stream not retained");
+        assert_eq!(failed.code, 1);
+        assert!(failed.msg.as_deref().is_some_and(|s| s.contains(name)));
+        std::fs::remove_dir(&path).expect("remove only our empty fixture");
+        write_evidence(&path, b"retained stream").expect("actual stream write");
+        assert_eq!(
+            std::fs::read(&path).expect("actual bytes"),
+            b"retained stream"
+        );
+    }
+}

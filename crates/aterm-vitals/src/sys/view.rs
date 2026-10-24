@@ -10,8 +10,9 @@ use super::query::{ScopeArg, SysQuery, View};
 use super::why;
 use super::{Ctx, Freshness, clock_ms, exe_word, pct};
 use crate::events::{EventKind, LoadScope, millicores};
-use crate::model::{ProcView, RowScope, ScopeView, Snapshot};
+use crate::model::{ProcScope, ProcView, RowScope, ScopeView, Snapshot};
 use crate::words;
+use crate::writes::ProgramHour;
 
 /// One body line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1773,6 +1774,69 @@ fn disk_writers<'a>(ctx: &Ctx<'_>, s: &'a Snapshot, scope: ScopeArg) -> (Vec<&'a
     (writers, withheld)
 }
 
+/// The scope's programs of the last hour of writes, busiest first, and how many outside the
+/// caller's tab were withheld from a caller that is not the owner (as [`disk_writers`]). The
+/// hour is kept per tab (`ProcScope::Tab` is a tab's key, its least pane's), so a pane's scope
+/// reads its tab's programs.
+fn disk_programs<'a>(
+    ctx: &Ctx<'_>,
+    s: &'a Snapshot,
+    scope: ScopeArg,
+) -> (Vec<&'a ProgramHour>, usize) {
+    let keys = scope_keys(
+        ctx,
+        if scope == ScopeArg::Pane {
+            ScopeArg::Tab
+        } else {
+            scope
+        },
+    );
+    let mine = scope_keys(ctx, ScopeArg::Tab);
+    let mut withheld = 0usize;
+    let programs = s
+        .facts
+        .hour_writers
+        .iter()
+        .filter(|p| match scope {
+            ScopeArg::Global => true,
+            ScopeArg::Aterm => p.scope != ProcScope::Other,
+            _ => matches!(p.scope, ProcScope::Tab(k) if keys.contains(&k)),
+        })
+        .filter(|p| {
+            let own = matches!(p.scope, ProcScope::Tab(k) if mine.contains(&k));
+            if own || ctx.owner_class {
+                true
+            } else {
+                withheld += 1;
+                false
+            }
+        })
+        .collect();
+    (programs, withheld)
+}
+
+/// A program's `scope=` word: `tab`, `aterm` (aterm and its helpers, and tabs since closed) or
+/// `others` (the user's other processes).
+fn program_scope_word(scope: ProcScope) -> &'static str {
+    match scope {
+        ProcScope::Tab(_) => "tab",
+        ProcScope::Aterm => "aterm",
+        ProcScope::Other => "others",
+    }
+}
+
+/// A program's bytes per hour over the hour's covered time; `None` under a minute of it
+/// ([`ProgramHour::per_hour`]).
+fn program_per_hour(p: &ProgramHour, covered_s: f64) -> Option<u64> {
+    p.per_hour(covered_s).map(|b| b.round() as u64)
+}
+
+/// The hour's covered time in whole seconds, rounded down, so `covered_s=60` never stands
+/// beside a figure still warming toward its minute.
+fn covered_whole_s(covered_s: f64) -> u64 {
+    covered_s.floor() as u64
+}
+
 fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     let scope = q.effective_scope().unwrap_or(ScopeArg::Tab);
     let keys = scope_keys(ctx, scope);
@@ -1891,6 +1955,33 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         lines.push(note(
             "withheld",
             format!("withheld={withheld} (writer rows outside this tab are the owner's)"),
+        ));
+    }
+    let covered_s = s.facts.writes_covered_s;
+    let (programs, withheld) = disk_programs(ctx, s, scope);
+    for (rank, p) in programs.iter().take(q.top).enumerate() {
+        let scope = match p.scope {
+            ProcScope::Tab(k) => ctx.tab_number(k).map_or_else(
+                || format!("scope=tab local={k}"),
+                |n| format!("scope=tab tab={n}"),
+            ),
+            other => format!("scope={}", program_scope_word(other)),
+        };
+        lines.push(line(
+            format!("program {}", rank + 1),
+            format!(
+                "program exe={} n={} {scope} write_bytes_per_h={} covered_s={}",
+                exe_word(&p.name),
+                p.n_max,
+                rec(program_per_hour(p, covered_s), "warming"),
+                covered_whole_s(covered_s)
+            ),
+        ));
+    }
+    if withheld > 0 {
+        lines.push(note(
+            "programs withheld",
+            format!("withheld={withheld} (program rows outside this tab are the owner's)"),
         ));
     }
     match ctx.volume {
@@ -3204,6 +3295,35 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
     o.set("writers", Jv::Arr(writers));
     if withheld > 0 {
         o.set("withheld", Jv::u(withheld as u64));
+    }
+    let covered_s = s.facts.writes_covered_s;
+    let (programs, withheld) = disk_programs(ctx, s, scope);
+    let programs = programs
+        .iter()
+        .take(q.top)
+        .map(|p| {
+            let mut row = Jv::obj([
+                ("exe", Jv::s(exe_word(&p.name))),
+                ("n", Jv::u(u64::from(p.n_max))),
+                ("scope", Jv::s(program_scope_word(p.scope))),
+            ]);
+            if let ProcScope::Tab(k) = p.scope {
+                row.set("local", Jv::u(k));
+                if let Some(n) = ctx.tab_number(k) {
+                    row.set("tab", Jv::u(n as u64));
+                }
+            }
+            row.set(
+                "write_bytes_per_h",
+                Jv::known_or(program_per_hour(p, covered_s), "warming"),
+            );
+            row.set("covered_s", Jv::u(covered_whole_s(covered_s)));
+            row
+        })
+        .collect();
+    o.set("programs", Jv::Arr(programs));
+    if withheld > 0 {
+        o.set("programs_withheld", Jv::u(withheld as u64));
     }
     o.set("volume", volume);
     o

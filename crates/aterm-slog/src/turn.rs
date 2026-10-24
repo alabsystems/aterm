@@ -4,6 +4,7 @@
 //! The turn tracker (design §2.4): at most one open turn per agent run, driven by the screen verdict word.
 
 use crate::field::{BoundedText, BoundedToken, Fields, Key, Val};
+use crate::fold::NodeFields;
 use crate::log::{Amend, Close, Log, Mark, Open};
 use crate::rec::Stamp;
 use crate::vocab::{Actor, CLS_WORDS, Conf, Kind, Lvl, Node, Op, ShortId, Src, lookup};
@@ -1744,22 +1745,43 @@ impl TurnTracker {
         }
     }
 
-    /// The turn the open turn `node` continues (`cont=`, §2.3) on behalf of vendor turn `v`, and
-    /// `node`'s open time: `node` holds no vendor turn of its own and `v`'s prompt is dated no
-    /// later than `node` opened, so `v` is the vendor turn the screen carried into `node` from the
-    /// turn it names. `None` for any other turn.
-    fn continued_from(log: &Log, node: Node, v: VTurn) -> Option<(Node, u64)> {
-        let opened = log.open_entry(node)?.t;
-        let open = log
-            .state()
-            .turn()
-            .filter(|o| o.node == node && o.f.get(Key::Vref).is_none())?;
-        let Some(Val::Id(cont)) = open.f.get(Key::Cont) else {
+    /// A turn's open time and fields, including an older continuation when all its records
+    /// remain available. A gap after its open could hide a field amendment, so it is unknown.
+    fn turn_segment(log: &Log, node: Node) -> Option<(u64, NodeFields)> {
+        if let Some(open) = log.state().turn().filter(|o| o.node == node) {
+            return Some((open.t, open.f.clone()));
+        }
+        if let Some(closed) = log.state().last[1].as_ref().filter(|c| c.node == node) {
+            return Some((closed.opened_t?, closed.f.clone()));
+        }
+        let open = log.window().find(|r| r.node == node && r.op == Op::Open)?;
+        if open.seq < log.complete_from() {
             return None;
-        };
-        Node::parse(cont.as_str())
-            .filter(|p| p.lvl == Lvl::Turn && *p != node && v.at_ms <= opened)
-            .map(|p| (p, opened))
+        }
+        let mut fields = NodeFields::default();
+        for rec in log.window().filter(|r| {
+            r.node == node && r.seq >= open.seq && matches!(r.op, Op::Open | Op::Close | Op::Amend)
+        }) {
+            for (key, value) in rec.f.iter() {
+                fields.offer(*key, value.clone(), rec.conf, rec.seq);
+            }
+        }
+        Some((open.t, fields))
+    }
+
+    /// Follow each screen continuation that opened after this vendor end. The end can belong
+    /// to an intermediate segment; unknown ancestry never gives a newer turn its numbers.
+    fn tx_end_node(log: &Log, mut node: Node, v: VTurn, ended: u64) -> Option<Node> {
+        loop {
+            let (opened, fields) = Self::turn_segment(log, node)?;
+            if ended >= opened || v.at_ms > opened || fields.get(Key::Vref).is_some() {
+                return Some(node);
+            }
+            let Some(Val::Id(cont)) = fields.get(Key::Cont) else {
+                return Some(node);
+            };
+            node = Node::parse(cont.as_str()).filter(|p| p.lvl == Lvl::Turn && p.n < node.n)?;
+        }
     }
 
     fn amend_vref(log: &mut Log, node: Node, vref: ShortId, conf: Conf, at: Stamp) {
@@ -1946,21 +1968,17 @@ impl TurnTracker {
         let Some(node) = v.node else {
             return;
         };
-        // AN END DATED BEFORE THE TURN ITS VENDOR TURN WAS CONTINUED INTO OPENED is that
-        // vendor turn's own (§2.3): the screen closed its turn at the rest and opened the next
-        // before the tap read the end row, so the next carries `cont=`. The end amends the
-        // turn it continues and never closes the one the screen opened after it.
-        let node = match Self::continued_from(log, node, v) {
-            Some((prev, opened)) if row.wall_ms < opened => {
-                self.tx.cur = Some(VTurn {
-                    node: Some(prev),
-                    end_ms: Some(row.wall_ms),
-                    ..v
-                });
-                prev
-            }
-            _ => node,
+        // The screen can close and continue the same vendor turn more than once before its
+        // end row arrives. Follow the dated end through every later continuation (§2.3).
+        let Some(node) = Self::tx_end_node(log, node, v, row.wall_ms) else {
+            self.tx.lose(1);
+            return;
         };
+        self.tx.cur = Some(VTurn {
+            node: Some(node),
+            end_ms: Some(row.wall_ms),
+            ..v
+        });
         let mut at = row;
         let open = Some(node) == self.turn && log.is_open(node);
         let screen_held = self.step.as_ref().is_some_and(|h| h.under_turn);

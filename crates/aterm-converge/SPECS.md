@@ -57,7 +57,7 @@ FJ-DURABLE	contract	FileJournal::append	Each line's data is flushed durable (ate
 FJ-LOCK	invariant	Held::take, FileJournal::append	Appends are serialized by journal.lock (flock): a writer waits at most `wait` for another holder, then refuses ("another run held the journal for more than …s") and its change is not made; once released the next line takes it. Writers that cross the bound together each rotate only a journal one more line would carry past the bound: no line is torn or lost and none is refused.	J::a_line_waits_for_another_writers_lock_and_a_hold_past_the_wait_refuses_its_change; J::writers_that_cross_the_bound_together_rotate_once_and_none_is_refused	flock, threads	1,8,13
 ```
 
-## 2. Test → spec map (TSV; every test)
+## 2. Test → spec map (TSV)
 
 ```tsv
 file	test	primary	also

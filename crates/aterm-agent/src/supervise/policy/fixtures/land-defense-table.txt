@@ -1976,6 +1976,16 @@ Nothing left: the lab's work is committed and pushed to origin/main.
 Nothing left: w1.out holds its token, checked with wc; this folder is no repository.
 Nothing left: w2.out is written and the task's bytes arrived whole; this folder is no repository.
 Nothing left:\n- w3.out is written\n- this folder is no repository
+# A real model's defenses of files no git repository holds (2026-10-24):
+# a live `spawn agent=codex` worker's two reports, a fresh session's
+# first-turn defense, and three sessions' replies to Land's words with the
+# no-repository sentence.
+Nothing left: `fib.txt` contains the first 12 Fibonacci numbers, from 0 and 1 through 89, one per line. Verified with `cat fib.txt`. This folder has no Git repository, so the verified file counts as landed under your instructions.
+Nothing left: Created `fib.txt` and verified all 12 Fibonacci numbers, one per line, starting with 0 and 1. This folder has no Git repository; per your instruction, the verified file counts as landed. No open work remains.
+Nothing left: Created `fib.txt` with the first 12 Fibonacci numbers, from 0 through 89, one per line, and verified its contents using `cat fib.txt`. This folder is not a Git repository, so there is no remote main branch to update.
+Nothing left: Created `fib.txt` and verified it contains exactly the first 12 Fibonacci numbers, one per line, starting with 0 and 1. This folder is outside Git, so the verified file is landed in place under the stated rule.
+Nothing left: `fib.txt` contains exactly the first 12 Fibonacci numbers, one per line, verified by a shell command. This folder has no Git repository, so the file is landed in place as instructed.
+Nothing left: `fib.txt` is saved in this folder and verified to contain the first 12 Fibonacci numbers, one per line, starting with 0 and 1. No Git repository holds this folder, so the verified file is landed where it is under your instructions.
 Nothing left: read-only summary, nothing to land.
 **Nothing left:** all of it is on main.
 NEEDS YOU: nothing\nNothing left: all of it is on origin/main.

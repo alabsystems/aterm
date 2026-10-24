@@ -2030,6 +2030,238 @@ fn the_host_sends_its_tabs_rows_only_when_they_change() {
 }
 
 #[test]
+fn special_and_oversized_records_keep_the_tab_without_blocking_the_reader() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-bounded-records-")
+        .tempdir()
+        .expect("private record directory");
+    let o = opts(dir.path());
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let st = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        home: Some(o.home.to_string_lossy().into_owned()),
+        moved_at: NOW,
+        pending_since: NOW - STALLED_AFTER_S - 60,
+        ..St::default()
+    };
+    save(&o, "aaa", &st);
+    let record = state_dir(&o).join("aaa.json");
+    let moved = state_dir(&o).join("aaa.move");
+    let claude = o.home.join(".claude");
+    std::fs::create_dir_all(claude.join("sessions")).expect("private session records");
+    let roster = claude.join(format!("sessions/{}.json", std::process::id()));
+    let ignored = state_dir(&o).join("a-directory.json");
+    std::fs::create_dir(&ignored).expect("a directory is not a record");
+    let saved = st.to_json();
+
+    for fault in ["oversized", "fifo", "linked-fifo", "dangling"] {
+        std::fs::write(&record, &saved).expect("the readable record");
+        let mut view = View::default();
+        view.refresh_with(&o, &tabs, NOW, &behind_in(TAB), &mut |rows| {
+            assert_eq!(
+                rows.len(),
+                1,
+                "a readable record beside an ignored directory"
+            );
+        });
+        let (rows, whole) = read_rows(&o, NOW);
+        assert_eq!(rows.len(), 1);
+        assert!(whole);
+
+        let target = dir.path().join("fifo-target");
+        let fifo = |path: &Path| {
+            let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("path");
+            // SAFETY: the private NUL-terminated path outlives this call.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+        };
+        if fault == "linked-fifo" {
+            fifo(&target);
+        }
+        let mut oversized = saved.as_bytes().to_vec();
+        oversized.resize(2 * 1024 * 1024 + 1, b' ');
+        let paths = [&record, &moved, &roster];
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+            match fault {
+                "oversized" => std::fs::write(path, &oversized).expect("oversized valid JSON"),
+                "fifo" => fifo(path),
+                _ => std::os::unix::fs::symlink(&target, path).expect("linked record"),
+            }
+        }
+        let identities: Vec<_> = paths
+            .iter()
+            .map(|p| {
+                let m = std::fs::symlink_metadata(p).expect("record identity");
+                (m.dev(), m.ino())
+            })
+            .collect();
+        let read_opts = o.clone();
+        let read_tabs = tabs.clone();
+        let write = st.clone();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let (rows, whole) = read_rows(&read_opts, NOW);
+            assert!(rows.is_empty());
+            assert!(
+                !whole,
+                "a listed record that cannot be read is not an all-clear"
+            );
+            view.refresh_with_keeping(
+                &read_opts,
+                &read_tabs,
+                NOW,
+                &behind_in(TAB),
+                &mut |rows, kept| {
+                    assert!(rows.is_empty());
+                    assert_eq!(kept, [TAB]);
+                },
+            );
+            assert_eq!(view.unreadable(), [state_dir(&read_opts).join("aaa.json")]);
+            assert!(load(&read_opts, "aaa").is_none());
+            assert!(super::super::kept_move(&read_opts, "aaa").is_none());
+            assert!(super::super::recorded_homes(&read_opts).is_empty());
+            assert!(!super::super::confirming(&read_opts));
+            assert!(
+                super::super::session_file_in(&read_opts.home.join(".claude"), std::process::id())
+                    .is_none()
+            );
+            assert!(super::super::session_files_in(&read_opts.home.join(".claude")).is_none());
+            assert!(super::super::save_checked(&read_opts, "aaa", &write).is_err());
+            send.send(view).expect("reader result");
+        });
+        let mut view = receive
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the record reader must not block");
+        reader.join().expect("reader");
+        for (path, before) in paths.into_iter().zip(identities) {
+            let after = std::fs::symlink_metadata(path).expect("record remains");
+            assert_eq!(
+                (after.dev(), after.ino()),
+                before,
+                "unread state was not replaced"
+            );
+            if fault == "oversized" {
+                assert_eq!(std::fs::read(path).expect("preserved bytes"), oversized);
+            }
+            std::fs::remove_file(path).expect("private record");
+        }
+        if fault == "linked-fifo" {
+            std::fs::remove_file(&target).expect("private FIFO target");
+        }
+        std::fs::write(&record, &saved).expect("repair the record");
+        view.refresh_with_keeping(&o, &tabs, NOW, &behind_in(TAB), &mut |rows, kept| {
+            assert_eq!(rows.len(), 1, "{fault}: repair restores the row");
+            assert!(kept.is_empty());
+        });
+        assert!(view.unreadable().is_empty());
+        super::super::save_checked(&o, "aaa", &st).expect("a readable state can be saved");
+    }
+}
+
+#[test]
+fn planted_temporary_records_do_not_block_or_redirect_a_save() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-record-temp-")
+        .tempdir()
+        .expect("private record directory");
+    let o = opts(dir.path());
+    let record = state_dir(&o).join("aaa.json");
+    let moved = state_dir(&o).join("aaa.move");
+    let temps = [
+        record.with_extension("json.tmp"),
+        moved.with_extension("move.tmp"),
+    ];
+    let sentinel = dir.path().join("elsewhere");
+    let sentinel_bytes = b"a private sentinel\n";
+    std::fs::write(&sentinel, sentinel_bytes).expect("sentinel");
+    let st = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        moved_at: NOW,
+        moved_login: Some("kept-login".to_string()),
+        ..St::default()
+    };
+
+    for (round, poison) in ["fifo", "symlink"].into_iter().enumerate() {
+        if round != 0 {
+            std::fs::remove_file(&moved).expect("previous move record");
+        }
+        save(&o, "aaa", &st);
+        assert!(load(&o, "aaa").is_some(), "seed record");
+        for path in &temps {
+            if poison == "fifo" {
+                let name =
+                    std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("path");
+                // SAFETY: the private NUL-terminated path outlives this call.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+            } else {
+                std::os::unix::fs::symlink(&sentinel, path).expect("planted link");
+            }
+        }
+        let identities: Vec<_> = temps
+            .iter()
+            .map(|path| {
+                let m = std::fs::symlink_metadata(path).expect("temporary identity");
+                (m.dev(), m.ino())
+            })
+            .collect();
+        let read_opts = o.clone();
+        let write = st.clone();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let mut ordinary = write.clone();
+            ordinary.wait = "ordinary-save".to_string();
+            save(&read_opts, "aaa", &ordinary);
+            assert_eq!(
+                load(&read_opts, "aaa").expect("saved record").wait,
+                "ordinary-save"
+            );
+
+            let mut restored = write;
+            restored.wait = "restored".to_string();
+            super::super::restore(&read_opts, "aaa", Some(&restored));
+            assert_eq!(
+                load(&read_opts, "aaa").expect("restored record").wait,
+                "restored"
+            );
+
+            super::super::remove(&read_opts, "aaa");
+            assert!(load(&read_opts, "aaa").is_none(), "current record removed");
+            let kept = super::super::kept_move(&read_opts, "aaa").expect("move retained");
+            assert_eq!(kept.moved_at, NOW);
+            assert_eq!(kept.moved_login.as_deref(), Some("kept-login"));
+            send.send(()).expect("writer result");
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("record replacements must not open a planted temporary");
+        writer.join().expect("writer");
+        assert_eq!(std::fs::read(&sentinel).expect("sentinel"), sentinel_bytes);
+        for (path, before) in temps.iter().zip(identities) {
+            let after = std::fs::symlink_metadata(path).expect("temporary remains");
+            assert_eq!(
+                (after.dev(), after.ino()),
+                before,
+                "planted temporary untouched"
+            );
+            std::fs::remove_file(path).expect("private temporary");
+        }
+    }
+}
+
+#[test]
 fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("aterm-upgrade-unreadable-records-")

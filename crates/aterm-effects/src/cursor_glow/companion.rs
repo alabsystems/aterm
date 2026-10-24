@@ -154,18 +154,25 @@ impl CursorGlow {
             if Some(row) == caret_row {
                 continue;
             }
+            let y0 = oy + row * ch;
+            let row_pairs = ft
+                .pairs
+                .get(i * ft.cols..(i + 1) * ft.cols)
+                .unwrap_or_default();
             let mut run: Option<i32> = None;
             let mut span: Option<(i32, i32)> = None;
             let end = ft.col0 + ft.cols as i32;
             for col in ft.col0..=end {
-                let held = col < end
-                    && ft.pair(row, col).is_some_and(|(ink, ground)| {
+                let held = row_pairs
+                    .get((col - ft.col0) as usize)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|(ink, ground)| {
                         ink.is_some() || !super::emit::reads_as_page(ground & 0x00FF_FFFF, page)
                     });
                 match (held, run) {
                     (true, None) => run = Some(col),
                     (false, Some(c0)) => {
-                        let y0 = oy + row * ch;
                         boxes.push((ox + c0 * cw, ox + col * cw, y0, y0 + ch));
                         span = Some(span.map_or((c0, col), |(a, _)| (a, col)));
                         run = None;
@@ -178,7 +185,6 @@ impl CursorGlow {
             // and cut at the letters its root stood alone after the line as
             // a brown stub (looks6 round 3).
             if let Some((c0, c1)) = span {
-                let y0 = oy + row * ch;
                 rows.push((ox + c0 * cw, ox + (c1 + 1) * cw, y0, y0 + ch));
             }
         }

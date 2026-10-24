@@ -617,7 +617,12 @@ impl CursorCat {
                 self.run_keys = self.run_keys.saturating_sub(lost);
             }
             self.stride_advance(now);
-            self.stride = (self.stride + STRIDE_PER_KEY).rem_euclid(1024.0);
+            let next_stride = self.stride + STRIDE_PER_KEY;
+            self.stride = if next_stride < 1024.0 {
+                next_stride
+            } else {
+                next_stride.rem_euclid(1024.0)
+            };
             self.momentum.advance(now);
             if let State::FadeOut(t0) = self.state
                 && !self.collection_hello
@@ -943,15 +948,22 @@ impl CursorCat {
             .min(0.10);
         self.stride_at = Some(now);
         if dt > 0.0 {
-            self.stride = (self.stride + dt * STRIDE_IDLE_HZ).rem_euclid(1024.0);
-            let mut gap = (self.stride - self.stride_shown + 512.0).rem_euclid(1024.0) - 512.0;
+            let wrap = |x: f32| {
+                if (0.0..1024.0).contains(&x) {
+                    x
+                } else {
+                    x.rem_euclid(1024.0)
+                }
+            };
+            self.stride = wrap(self.stride + dt * STRIDE_IDLE_HZ);
+            let mut gap = wrap(self.stride - self.stride_shown + 512.0) - 512.0;
             if gap >= 1.0 {
-                self.stride_shown = (self.stride_shown + gap.floor()).rem_euclid(1024.0);
+                self.stride_shown = wrap(self.stride_shown + gap.floor());
                 gap = gap.fract();
             }
             let k = 1.0 - (-dt / STRIDE_TAU).exp();
             let step = (gap * k).clamp(-STRIDE_RATE_MAX * dt, STRIDE_RATE_MAX * dt);
-            self.stride_shown = (self.stride_shown + step).rem_euclid(1024.0);
+            self.stride_shown = wrap(self.stride_shown + step);
         }
     }
 
@@ -1093,8 +1105,9 @@ impl CursorCat {
                         * f32::from(chain).sqrt()
                         * elapsed)
                         .sin();
-                lead += WINCE_TUMBLE * swing * attack * settle;
-                let wobble = 0.05 * swing * attack * settle;
+                let swing_env = swing * attack * settle;
+                lead += WINCE_TUMBLE * swing_env;
+                let wobble = 0.05 * swing_env;
                 scale_x *= 1.0 + wobble;
                 scale_y *= 1.0 - wobble;
             }
@@ -1341,15 +1354,6 @@ impl CursorCat {
         }
         let s = self.decayed(now);
         self.stride_advance(now);
-        let bob = {
-            let cruise = self.bob();
-            if self.sing > 0.0 {
-                let dance = (std::f32::consts::TAU * self.sing_beat).sin() * BOB_AMP;
-                cruise + (dance - cruise) * self.sing
-            } else {
-                cruise
-            }
-        };
         let grounded = s < LOW || (self.collection_hello && s < REVIVE_GATE);
         match self.state {
             State::Hidden => hidden_frame(look),
@@ -1361,6 +1365,7 @@ impl CursorCat {
                 if t >= 1.0 {
                     self.state = State::Shown;
                 }
+                let bob = self.frame_bob();
                 let pose = self.resolve_pose(now, s, reaction, CatExit::Plain);
                 CatFrame {
                     alpha: (t * 255.0) as u8,
@@ -1379,6 +1384,7 @@ impl CursorCat {
                 if !discovery && grounded {
                     return self.grounded_exit(discovery_until, now);
                 }
+                let bob = self.frame_bob();
                 let pose = self.resolve_pose(now, s, reaction, CatExit::Plain);
                 CatFrame {
                     alpha: 255,
@@ -1400,6 +1406,7 @@ impl CursorCat {
                     self.settle_hidden();
                     return hidden_frame(self.look);
                 }
+                let bob = self.frame_bob();
                 let pose = self.resolve_pose(now, s, reaction, self.exit);
                 CatFrame {
                     alpha: ((1.0 - t) * 255.0) as u8,
@@ -1414,6 +1421,17 @@ impl CursorCat {
                     pose,
                 }
             }
+        }
+    }
+
+    #[inline]
+    fn frame_bob(&self) -> f32 {
+        let cruise = self.bob();
+        if self.sing > 0.0 {
+            let dance = (std::f32::consts::TAU * self.sing_beat).sin() * BOB_AMP;
+            cruise + (dance - cruise) * self.sing
+        } else {
+            cruise
         }
     }
 

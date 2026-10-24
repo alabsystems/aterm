@@ -58,7 +58,7 @@ There is one spec and it has no dependencies inside the crate. It depends on bri
 (`Literal::string`, `From<TokenTree> for TokenStream`) that any proc-macro crate's specs would
 share.
 
-## 2. Test → spec map (TSV; all 1)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

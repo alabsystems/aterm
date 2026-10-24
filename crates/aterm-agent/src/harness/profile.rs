@@ -1184,25 +1184,32 @@ where
     F: Fn(&[u8]) -> Option<T>,
 {
     let mut log_arg = None;
-    let mut i = 0;
+    let mut i = 1;
     while let Some(arg) = argv.get(i) {
         if arg == "--" {
             break;
         }
-        if arg == "--log-file" {
+        if matches!(arg.as_str(), "--log-file" | "-log-file") {
             log_arg = argv.get(i + 1).cloned();
             i += 2;
             continue;
         }
-        if let Some(v) = arg.strip_prefix("--log-file=") {
+        if let Some(v) = arg
+            .strip_prefix("--log-file=")
+            .or_else(|| arg.strip_prefix("-log-file="))
+        {
             log_arg = Some(v.to_owned());
         }
         i += 1;
     }
     let read_log = |path: &Path| -> Option<T> {
         const WINDOW: u64 = 128 * 1024;
-        let mut f = std::fs::File::open(path).ok()?;
-        let len = f.metadata().ok().map_or(0, |m| m.len());
+        let mut f = open_nonblocking(path).ok()?;
+        let meta = f.metadata().ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let len = meta.len();
         if len > WINDOW {
             use std::io::{Seek, SeekFrom};
             let mut tail = Vec::new();
@@ -1240,7 +1247,11 @@ where
             {
                 return None;
             }
-            Some((e.metadata().ok()?.modified().ok()?, p))
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            Some((meta.modified().ok()?, p))
         })
         .collect();
     logs.sort_by_key(|a| std::cmp::Reverse(a.0));
@@ -1370,9 +1381,10 @@ fn non_claude_argv_model_effort(argv: &[String]) -> (Option<String>, Option<Stri
 }
 
 fn settings_model_effort(path: &Path) -> (Option<String>, Option<String>) {
-    let Some(s) = std::fs::read(path)
+    let Some(s) = super::accounts::read_bounded(path, 64 * 1024)
         .ok()
-        .and_then(|b| aterm_json::from_slice::<aterm_json::Value>(&b).ok())
+        .flatten()
+        .and_then(|t| aterm_json::from_str::<aterm_json::Value>(&t).ok())
     else {
         return (None, None);
     };
@@ -1463,17 +1475,21 @@ pub fn muse_model_effort_for(
     )
 }
 
+// Start with the requested window, then widen for a complete record up to 4 MiB.
 fn read_jsonl_tail(path: &Path, window: u64) -> Option<(Vec<u8>, u64)> {
     use std::io::{Seek, SeekFrom};
     const MAX_WINDOW: u64 = 4 * 1024 * 1024;
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let mut cur = window.max(1024);
+    let mut f = open_nonblocking(path).ok()?;
+    let metadata = f.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let len = metadata.len();
+    let mut cur = window.clamp(1024, MAX_WINDOW);
     loop {
         let mut buf = Vec::new();
         if len > cur {
-            let offset = i64::try_from(cur).unwrap_or(65_536);
-            f.seek(SeekFrom::End(-offset)).ok()?;
+            f.seek(SeekFrom::Start(len - cur)).ok()?;
             (&mut f).take(cur).read_to_end(&mut buf).ok()?;
             if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                 if !buf[pos + 1..].iter().all(u8::is_ascii_whitespace) || cur >= MAX_WINDOW {
@@ -1481,9 +1497,10 @@ fn read_jsonl_tail(path: &Path, window: u64) -> Option<(Vec<u8>, u64)> {
                     return Some((buf, len));
                 }
             } else if cur >= MAX_WINDOW {
-                return Some((buf, len));
+                // A fragment of an oversized line cannot prove a complete record.
+                return None;
             }
-            cur = (cur.saturating_mul(2)).min(MAX_WINDOW);
+            cur = cur.saturating_mul(2).min(MAX_WINDOW);
         } else {
             f.seek(SeekFrom::Start(0)).ok()?;
             (&mut f).take(len).read_to_end(&mut buf).ok()?;
@@ -1507,142 +1524,46 @@ fn agy_db_conversation(config: &Path, file: &Path) -> Option<String> {
     .then(|| conversation.to_owned())
 }
 
-fn agy_held_conversation(
-    config: &Path,
-    files: &[PathBuf],
-    has_conversation: impl Fn(&str) -> bool,
-) -> Option<String> {
-    let canon = std::fs::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
-    let mut locks: Vec<String> = files
-        .iter()
-        .filter_map(|f| {
-            super::upgrade_agy::lock_conversation(&canon, f)
-                .or_else(|| super::upgrade_agy::lock_conversation(config, f))
-        })
-        .filter(|cid| has_conversation(cid))
-        .collect();
-    locks.sort();
-    locks.dedup();
-    if let [cid] = locks.as_slice() {
-        return Some(cid.clone());
-    }
-    let mut dbs: Vec<String> = files
-        .iter()
-        .filter_map(|f| agy_db_conversation(&canon, f).or_else(|| agy_db_conversation(config, f)))
-        .filter(|cid| has_conversation(cid))
-        .collect();
-    dbs.sort();
-    dbs.dedup();
-    match dbs.as_slice() {
-        [cid] => Some(cid.clone()),
-        _ => None,
-    }
-}
-
+/// Prefer an observed unique presence lock, then a unique held conversation database.
+/// The launch argument is only a fallback without either observation; it cannot prove a
+/// conversation switched after launch. History, cwd and file existence do not identify it.
 fn agy_active_conversation(
-    pid: u32,
     argv: &[String],
     config: &Path,
-    cwd: Option<&Path>,
-    history_tail: Option<&[u8]>,
-    require_transcript: bool,
+    files: Option<&[PathBuf]>,
 ) -> Option<String> {
-    let has_conversation = |cid: &str| {
-        if !super::upgrade_agy::is_conversation_uuid(cid) {
-            return false;
-        }
-        let transcript = config
-            .join("brain")
-            .join(cid)
-            .join(".system_generated/logs/transcript.jsonl")
-            .is_file();
-        if require_transcript {
-            transcript
-        } else {
-            transcript
-                || super::upgrade_agy::conversation_db(config, cid).is_file()
-                || super::upgrade_agy::presence_lock(config, cid).is_file()
-        }
-    };
-    if pid > 0
-        && let Ok(files) = aterm_uds::holders::open_files(pid)
-        && let Some(cid) = agy_held_conversation(config, &files, has_conversation)
-    {
-        return Some(cid);
-    }
-    if let Some(cid) = super::upgrade_agy::resumed_conversation(argv)
-        && ((!require_transcript && super::upgrade_agy::is_conversation_uuid(&cid))
-            || has_conversation(&cid))
-    {
-        return Some(cid);
-    }
-    if let Some(history_bytes) = history_tail {
-        let text = String::from_utf8_lossy(history_bytes);
-        let mut fallback_locked = None;
-        let mut fallback_any = None;
-        let mut cwd_unlocked = None;
-        for line in text.lines().rev() {
-            let Ok(row) = aterm_json::from_str::<aterm_json::Value>(line) else {
-                continue;
-            };
-            let Some(cid) = row
-                .get("conversationId")
-                .and_then(aterm_json::Value::as_str)
-            else {
-                continue;
-            };
-            if !has_conversation(cid) {
-                continue;
-            }
-            let locked = super::upgrade_agy::presence_lock(config, cid).is_file();
-            if let Some(dir) = cwd
-                && row
-                    .get("workspace")
-                    .and_then(aterm_json::Value::as_str)
-                    .is_some_and(|w| Path::new(w) == dir)
-            {
-                if locked {
-                    return Some(cid.to_owned());
-                }
-                if cwd_unlocked.is_none() {
-                    cwd_unlocked = Some(cid.to_owned());
-                }
-            }
-            if locked && fallback_locked.is_none() {
-                fallback_locked = Some(cid.to_owned());
-            }
-            if fallback_any.is_none() {
-                fallback_any = Some(cid.to_owned());
-            }
-        }
-        if let Some(cid) = cwd_unlocked.or(fallback_locked).or(fallback_any) {
-            return Some(cid);
-        }
-    }
-    let mut locks: Vec<(std::time::SystemTime, String)> =
-        std::fs::read_dir(config.join(super::upgrade_agy::PRESENCE))
-            .ok()?
+    let readers: [fn(&Path, &Path) -> Option<String>; 2] =
+        [super::upgrade_agy::lock_conversation, agy_db_conversation];
+    for identify in readers {
+        let mut held = None;
+        for cid in files
+            .into_iter()
             .flatten()
-            .filter_map(|e| {
-                let p = e.path();
-                let cid = super::upgrade_agy::lock_conversation(config, &p)?;
-                has_conversation(&cid).then_some((e.metadata().ok()?.modified().ok()?, cid))
-            })
-            .collect();
-    locks.sort_by_key(|a| std::cmp::Reverse(a.0));
-    locks.into_iter().next().map(|(_, cid)| cid)
+            .filter_map(|path| identify(config, path))
+        {
+            if held.as_ref().is_some_and(|previous| *previous != cid) {
+                return None;
+            }
+            held = Some(cid);
+        }
+        if held.is_some() {
+            return held;
+        }
+    }
+    super::upgrade_agy::resumed_conversation(argv)
+        .filter(|cid| super::upgrade_agy::is_conversation_uuid(cid))
 }
 
-/// Formats the manual `agy --conversation=<uuid>` resume line for an active `agy` session.
+/// Formats the manual `agy --conversation=<uuid>` resume line using the same observed
+/// process-held paths and explicit-launch fallback as [`agy_excerpts_for`], without
+/// requiring a transcript file.
 #[must_use]
 pub fn agy_resume_for(
-    pid: u32,
     argv: &[String],
     env: &[String],
     user_home: &Path,
-    cwd: Option<&Path>,
+    files: Option<&[PathBuf]>,
 ) -> Option<String> {
-    const WINDOW: u64 = 64 * 1024;
     let var = |key: &str| {
         env.iter()
             .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
@@ -1653,15 +1574,8 @@ pub fn agy_resume_for(
         Some(dir) if dir.is_absolute() => dir,
         _ => default_config.clone()?,
     };
-    let history = read_jsonl_tail(&config.join("history.jsonl"), WINDOW);
-    let conversation = agy_active_conversation(
-        pid,
-        argv,
-        &config,
-        cwd,
-        history.as_ref().map(|(b, _)| b.as_slice()),
-        false,
-    )?;
+    let config = std::fs::canonicalize(&config).unwrap_or(config);
+    let conversation = agy_active_conversation(argv, &config, files)?;
     let mut relaunch_env = Vec::new();
     if let Some(cfg) = var("AGY_CLI_CONFIG_DIR")
         && Path::new(cfg).is_absolute()
@@ -1676,14 +1590,16 @@ pub fn agy_resume_for(
 /// Reads the survey [`super::excerpt::Excerpts`] (`prompts`, `said`, `said_end`,
 /// `doing`) and `transcript_len` for an active `agy` session from
 /// `<config>/brain/<cid>/.system_generated/logs/transcript.jsonl` and
-/// `<config>/history.jsonl`.
+/// `<config>/history.jsonl`. `files` is the current process's observed open-file paths,
+/// as [`super::upgrade_agy::lock_conversation`] consumes them. A unique held presence lock
+/// wins over a unique held database, then the launch's `--conversation`. Ambiguous held
+/// conversations at either evidence level are unknown; launch identity is the final fallback.
 #[must_use]
 pub fn agy_excerpts_for(
-    pid: u32,
     argv: &[String],
     env: &[String],
     user_home: &Path,
-    cwd: Option<&Path>,
+    files: Option<&[PathBuf]>,
 ) -> Option<(super::excerpt::Excerpts, u64)> {
     const WINDOW: u64 = 64 * 1024;
     let var = |key: &str| {
@@ -1695,15 +1611,10 @@ pub fn agy_excerpts_for(
         Some(dir) if dir.is_absolute() => dir,
         _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home)?,
     };
+    // The descriptor reader names canonical paths, as the relaunch witness does.
+    let config = std::fs::canonicalize(config).ok()?;
+    let conversation = agy_active_conversation(argv, &config, files)?;
     let history = read_jsonl_tail(&config.join("history.jsonl"), WINDOW);
-    let conversation = agy_active_conversation(
-        pid,
-        argv,
-        &config,
-        cwd,
-        history.as_ref().map(|(b, _)| b.as_slice()),
-        true,
-    )?;
     let transcript_path = config
         .join("brain")
         .join(&conversation)
@@ -1722,6 +1633,7 @@ fn muse_active_session_lock(
     argv: &[String],
     env: &[String],
     user_home: &Path,
+    files: Option<&[PathBuf]>,
 ) -> Option<(String, Option<PathBuf>)> {
     let var = |key: &str| {
         env.iter()
@@ -1734,6 +1646,35 @@ fn muse_active_session_lock(
         user_home,
     )?;
     let root = super::upgrade_muse::sessions_root(&data);
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    let mut held: Option<(String, PathBuf)> = None;
+    for lock in files.into_iter().flatten() {
+        let Some(session) = super::upgrade_muse::session_of_lock(&root, lock) else {
+            continue;
+        };
+        if let Some((_, previous)) = held.as_ref() {
+            if previous == lock {
+                continue;
+            }
+            return None;
+        }
+        // A held path and a complete PID record agree; neither a saved PID alone nor a
+        // truncated prefix identifies this process. The shared reader rejects special files.
+        let body = super::accounts::read_bounded(lock, 64 * 1024)
+            .ok()
+            .flatten()?;
+        if super::upgrade_muse::lock_pid(&body) != Some(pid) {
+            return None;
+        }
+        held = Some((session, lock.clone()));
+    }
+    if let Some((session, lock)) = held {
+        return Some((session, Some(lock)));
+    }
+    // Only the explicit launch identity is available without an observed lock. Searching
+    // for that UUID's log locates data; it does not infer identity from saved PID or time.
+    let session = super::upgrade_muse::resumed_ref(argv)
+        .filter(|s| super::upgrade_muse::is_session_uuid(s))?;
     let dirs = |p: &Path| -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = std::fs::read_dir(p)
             .into_iter()
@@ -1746,78 +1687,35 @@ fn muse_active_session_lock(
         out.reverse();
         out
     };
-    if pid > 0 {
-        if let Ok(files) = aterm_uds::holders::open_files(pid) {
-            let canon = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-            let mut held: Vec<(String, PathBuf)> = files
-                .iter()
-                .filter_map(|lock| {
-                    let session = super::upgrade_muse::session_of_lock(&canon, lock)
-                        .or_else(|| super::upgrade_muse::session_of_lock(&root, lock))?;
-                    let body = std::fs::read_to_string(lock).ok()?;
-                    (super::upgrade_muse::lock_pid(&body) == Some(pid))
-                        .then(|| (session, lock.clone()))
-                })
-                .collect();
-            held.sort();
-            held.dedup();
-            if let [(session, lock)] = held.as_slice() {
-                return Some((session.clone(), Some(lock.clone())));
-            }
-        }
-        let mut matches: Vec<(Option<std::time::SystemTime>, String, PathBuf)> = dirs(&root)
-            .into_iter()
-            .flat_map(|y| dirs(&y))
-            .flat_map(|m| dirs(&m))
-            .flat_map(|d| dirs(&d))
-            .map(|s| s.join(super::upgrade_muse::LOCK))
-            .filter_map(|lock| {
-                let session = super::upgrade_muse::session_of_lock(&root, &lock)?;
-                let body = std::fs::read_to_string(&lock).ok()?;
-                (super::upgrade_muse::lock_pid(&body) == Some(pid)).then(|| {
-                    let mtime = std::fs::metadata(&lock)
-                        .ok()
-                        .and_then(|m| m.modified().ok());
-                    (mtime, session, lock)
-                })
-            })
-            .collect();
-        matches.sort_by_key(|a| std::cmp::Reverse(a.0));
-        if let Some((_, session, lock)) = matches.into_iter().next() {
-            return Some((session, Some(lock)));
-        }
-    }
-    if let Some(session) =
-        super::upgrade_muse::resumed_ref(argv).filter(|s| super::upgrade_muse::is_session_uuid(s))
-    {
-        let found = dirs(&root)
-            .into_iter()
-            .flat_map(|y| dirs(&y))
-            .flat_map(|m| dirs(&m))
-            .map(|d| d.join(&session).join(super::upgrade_muse::LOCK))
-            .find(|lock| {
-                super::upgrade_muse::session_of_lock(&root, lock).is_some()
-                    && (lock.is_file() || lock.with_file_name(super::upgrade_muse::LOG).is_file())
-            });
-        return Some((session, found));
-    }
-    None
+    let found = dirs(&root)
+        .into_iter()
+        .flat_map(|y| dirs(&y))
+        .flat_map(|m| dirs(&m))
+        .map(|d| d.join(&session).join(super::upgrade_muse::LOCK))
+        .find(|lock| {
+            super::upgrade_muse::session_of_lock(&root, lock).is_some()
+                && (lock.is_file() || lock.with_file_name(super::upgrade_muse::LOG).is_file())
+        });
+    Some((session, found))
 }
 
-/// Formats the manual `muse resume <uuid>` command line for an active `muse` session.
+/// Formats the manual `muse resume <uuid>` line from the process's observed session lock,
+/// or its explicit launch UUID when no lock is observed. Launch identity alone cannot
+/// prove a session switched after launch.
 #[must_use]
 pub fn muse_resume_for(
     pid: u32,
     argv: &[String],
     env: &[String],
     user_home: &Path,
+    files: Option<&[PathBuf]>,
 ) -> Option<String> {
     let var = |key: &str| {
         env.iter()
             .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
             .filter(|value| !value.is_empty())
     };
-    let (session, _) = muse_active_session_lock(pid, argv, env, user_home)?;
+    let (session, _) = muse_active_session_lock(pid, argv, env, user_home, files)?;
     let relaunch_env = super::upgrade_muse::relaunch_env(var, user_home);
     super::upgrade_muse::told_line(&session, &relaunch_env)
 }
@@ -1831,9 +1729,10 @@ pub fn muse_excerpts_for(
     argv: &[String],
     env: &[String],
     user_home: &Path,
+    files: Option<&[PathBuf]>,
 ) -> Option<(super::excerpt::Excerpts, u64)> {
     const WINDOW: u64 = 64 * 1024;
-    let (_, lock) = muse_active_session_lock(pid, argv, env, user_home)?;
+    let (_, lock) = muse_active_session_lock(pid, argv, env, user_home, files)?;
     let log_path = lock?.with_file_name(super::upgrade_muse::LOG);
     let (tail, len) = read_jsonl_tail(&log_path, WINDOW)?;
     Some((super::excerpt::muse_excerpts_from(&tail), len))
@@ -1963,9 +1862,11 @@ fn agy_subscription_with_store(
         Some(dir) if dir.is_absolute() => dir,
         _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home)?,
     };
-    let settings: Option<aterm_json::Value> = std::fs::read(config.join("settings.json"))
-        .ok()
-        .and_then(|b| aterm_json::from_slice(&b).ok());
+    let settings: Option<aterm_json::Value> =
+        super::accounts::read_bounded(&config.join("settings.json"), 64 * 1024)
+            .ok()
+            .flatten()
+            .and_then(|t| aterm_json::from_str(&t).ok());
     if settings
         .as_ref()
         .and_then(|s| s.get("auth_method").and_then(aterm_json::Value::as_str))

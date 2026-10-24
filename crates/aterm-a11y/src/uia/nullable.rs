@@ -2,6 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! Nullable interface results over the existing generated COM vtables.
+//!
+//! The generated traits' `Err(Error::empty())` convention returns S_OK without
+//! writing the output, so these wrappers null each nullable slot before
+//! delegating to the original thunk.
 
 use super::*;
 use std::ffi::c_void;

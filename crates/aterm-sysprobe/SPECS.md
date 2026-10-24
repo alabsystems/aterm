@@ -105,6 +105,11 @@
 > a terminal (aterm-uds' `procfs::lineage`, the sweep's `has_tty`) took for none
 > (`jobs::tests::a_stat_line_gives_every_field_past_any_command_name`). Its spec is not recovered
 > here yet.
+>
+> On 2026-10-24 `gpu_driver` joined (`GpuDriver`: the accelerator entry's `CFBundleIdentifier` and
+> `IOSourceVersion`, read afresh per call; `None` off macOS), for Aos M5a's session record and its G3
+> driver check. Its live test is `tests::the_gpu_driver_names_itself_on_this_host` (macOS on Apple
+> silicon). Its spec is not recovered here yet.
 
 Source: `crates/aterm-sysprobe`. Every `#[test]` is in `crates/aterm-sysprobe/src/tests.rs` (16 tests: 9 run
 on every host, 1 needs `unix`, 1 needs `macos` or `linux`, 5 need `macos`). Each was read together with the
@@ -217,7 +222,7 @@ gap 14 (Clean elaborator coverage) apply to every spec, depending on which lane 
 (soundness) applies to every proof. No spec here cites another crate's types any more, so gap 12 blocks
 none.
 
-## 2. Test → spec map (TSV; all 16)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

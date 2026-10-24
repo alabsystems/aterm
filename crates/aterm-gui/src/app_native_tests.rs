@@ -7781,6 +7781,71 @@ fn settings_search_field_honors_readline_control_keys() {
     assert_eq!(search(&app).0, "");
 }
 
+/// A Settings field edits by the keymap the find bar, the rename field and the palette
+/// share: ⌥⌫ and ⌥⌦ by word, ⌘⌫ and ⌘←/→ to its edges and ^H back a character, where each
+/// moved or deleted one character and ^H did nothing.
+#[test]
+fn settings_search_field_takes_the_find_bar_keys() {
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
+    app.dispatch_native_event(
+        wid,
+        AppEvent::Action(crate::native_app::ActionInvocation {
+            id: crate::native_ui::ActionId::new("settings/search"),
+            value: None,
+        }),
+    )
+    .unwrap();
+    app.dispatch_native_event(
+        wid,
+        AppEvent::TextInput(TextInputEvent::Commit("cursor trail beam".to_string())),
+    )
+    .unwrap();
+
+    let chord = |key, mods| crate::input::InputEvent::Key {
+        key,
+        mods,
+        base_layout: None,
+        layout_text: None,
+        event_type: KeyEventType::Press,
+    };
+    let named = |key, mods| chord(Key::Named(key), mods);
+    let (_, view) = app.active_native_view(wid).unwrap();
+    let search = |app: &App| match app.native_runtime.view_state(view) {
+        Some(crate::native_app::AppViewState::Settings(state)) => (
+            state.search_input.value().to_string(),
+            state.search_input.selection().range(),
+        ),
+        _ => panic!("Settings view"),
+    };
+
+    assert!(app.native_input_event(wid, &named(NamedKey::Backspace, Modifiers::ALT)));
+    assert_eq!(search(&app).0, "cursor trail ", "⌥⌫ deletes a word");
+    assert!(app.native_input_event(wid, &chord(Key::Character('h'), Modifiers::CTRL)));
+    assert_eq!(search(&app), ("cursor trail".to_string(), 12..12), "^H");
+    assert!(app.native_input_event(wid, &named(NamedKey::ArrowLeft, Modifiers::SUPER)));
+    assert_eq!(search(&app).1, 0..0, "⌘← to the start");
+    assert!(app.native_input_event(
+        wid,
+        &named(NamedKey::ArrowRight, Modifiers::SUPER | Modifiers::SHIFT)
+    ));
+    assert_eq!(search(&app).1, 0..12, "⌘⇧→ selects to the end");
+    assert!(app.native_input_event(wid, &named(NamedKey::ArrowLeft, Modifiers::SUPER)));
+    assert!(app.native_input_event(wid, &named(NamedKey::Delete, Modifiers::ALT)));
+    assert_eq!(
+        search(&app),
+        (" trail".to_string(), 0..0),
+        "⌥⌦ deletes a word"
+    );
+    assert!(app.native_input_event(wid, &named(NamedKey::ArrowRight, Modifiers::SUPER)));
+    assert_eq!(search(&app).1, 6..6, "⌘→ to the end");
+    assert!(app.native_input_event(wid, &named(NamedKey::Backspace, Modifiers::SUPER)));
+    assert_eq!(search(&app).0, "", "⌘⌫ deletes to the start");
+}
+
 /// Off macOS, Ctrl+←/→ and Ctrl+⌫ are word operations in Settings text fields (the cfg'd
 /// `alt_word || readline` term); the Ctrl-letter readline arms stay by-character because they
 /// match first.

@@ -22,7 +22,7 @@ const B: &str = "s-0000000000000000000b";
 const C: &str = "s-0000000000000000000c";
 
 /// A process tree the test edits: pid → (birth s, parent).
-struct Tree(Mutex<BTreeMap<u32, ProcLink>>);
+struct Tree(Mutex<BTreeMap<u32, ProcRead>>);
 
 impl Tree {
     /// launchd, a login, and three tabs: each a shell (the PTY child), its agent and an `aterm
@@ -48,23 +48,41 @@ impl Tree {
         Self(Mutex::new(
             links
                 .into_iter()
-                .map(|(pid, birth_s, ppid)| (pid, link(pid, birth_s, ppid)))
+                .map(|(pid, birth_s, ppid)| (pid, ProcRead::Alive(link(pid, birth_s, ppid))))
                 .collect(),
         ))
     }
 
     fn kill(&self, pid: u32) {
-        self.0.lock().unwrap().remove(&pid);
+        self.0
+            .lock()
+            .unwrap()
+            .insert(pid, ProcRead::from_record(Ok(None)));
     }
 
     fn reborn(&self, pid: u32, birth_s: i64, ppid: u32) {
-        self.0.lock().unwrap().insert(pid, link(pid, birth_s, ppid));
+        self.0
+            .lock()
+            .unwrap()
+            .insert(pid, ProcRead::Alive(link(pid, birth_s, ppid)));
+    }
+
+    fn unread(&self, pid: u32) {
+        self.0.lock().unwrap().insert(
+            pid,
+            ProcRead::from_record(Err(std::io::ErrorKind::PermissionDenied.into())),
+        );
     }
 }
 
 impl ProcTree for Tree {
-    fn link(&self, pid: u32) -> Option<ProcLink> {
-        self.0.lock().unwrap().get(&pid).copied()
+    fn read(&self, pid: u32) -> ProcRead {
+        self.0
+            .lock()
+            .unwrap()
+            .get(&pid)
+            .copied()
+            .unwrap_or(ProcRead::Exited)
     }
 }
 
@@ -197,28 +215,29 @@ impl Env for Rig {
     }
 }
 
-fn seat(sid: &str, local: u64, shell: u32, agent: (u32, i64)) -> Seat {
+/// A seat whose shell and agent are each a pid and a birth, seconds.
+fn seat(sid: &str, local: u64, shell: (u32, i64), agent: (u32, i64)) -> Seat {
     Seat {
         sid: sid.to_string(),
         local,
-        pty_child: Some(shell),
+        pty_child: Some(link(shell.0, shell.1, 0).id()),
         agent: Some(agent),
     }
 }
 
 /// Tab A: shell 200, agent 300; its `aterm ctl` is 400.
 fn seat_a() -> Seat {
-    seat(A, 1, 200, (300, 30))
+    seat(A, 1, (200, 20), (300, 30))
 }
 
 /// Tab B: shell 600, agent 700; its `aterm ctl` is 800.
 fn seat_b() -> Seat {
-    seat(B, 2, 600, (700, 70))
+    seat(B, 2, (600, 60), (700, 70))
 }
 
 /// Tab C: shell 900, agent 910; its `aterm ctl` is 920.
 fn seat_c() -> Seat {
-    seat(C, 3, 900, (910, 91))
+    seat(C, 3, (900, 90), (910, 91))
 }
 
 fn state(host: &WakeHost, sid: &str, ord: u16) -> Option<WakeState> {
@@ -803,7 +822,8 @@ fn a_restore_re_admits_under_the_current_rules_and_reads_leniently() {
 }
 
 /// A PID ATOM READS ITS OWN PROCESS'S EXIT: a real stand-in of the session's tree (the test
-/// process stands for its PTY child), ended by SIGKILL, reads exited at the next tick.
+/// process stands for its PTY child, pinned by the birth a spawn reads, which the kernel record a
+/// proof walks meets), ended by SIGKILL, reads exited at the next tick.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_pid_atom_reads_a_real_stand_ins_exit() {
@@ -818,10 +838,16 @@ fn a_pid_atom_reads_a_real_stand_ins_exit() {
     let pid = child.id();
     let me = std::process::id();
     let rig = Rig::kernel(Occupancy::Observe);
+    let shell = aterm_pty::record_spawned_shell(i32::try_from(me).expect("a pid"));
+    let root = root_of(shell);
+    assert!(
+        root.is_some(),
+        "PRECONDITION: the test process's birth reads"
+    );
     let seat = Seat {
         sid: A.to_string(),
         local: 1,
-        pty_child: Some(me),
+        pty_child: root,
         agent: None,
     };
     let host = WakeHost::default();
@@ -854,6 +880,116 @@ fn a_reused_pid_reads_exited_by_its_birth() {
     rig.tree.reborn(500, 99, 300);
     host.tick(&rig, false);
     assert_eq!(state(&host, A, 1), Some(WakeState::Ready));
+}
+
+/// A TAB'S ROOT IS THE SHELL ITS SESSION TOOK, NOT WHATEVER HOLDS ITS PID NOW: tab A's shell (200,
+/// born 20 s) ends, a stranger (born 99 s) takes its pid and the stranger's child asks; the live
+/// root's birth is not the pinned one, so it books nothing, reads the book redacted, parks
+/// nothing, and its pids are not the tab's. A root gone is no root either. NEGATIVE CONTROL: a
+/// child of the pinned shell is admitted, and in the reused tree the same peer proves for a seat
+/// pinned to the stranger.
+#[test]
+fn a_reused_root_pid_proves_nothing() {
+    let rig = Rig::new(Occupancy::Observe);
+    let host = WakeHost::default();
+    let tab = Seat {
+        agent: None,
+        ..seat_a()
+    };
+    let refused = denied_words(DeclarerRefusal::NotInTree);
+    assert_eq!(
+        host.wake(&rig, &tab, Some(450), "label=t when=in:1h"),
+        "OK wake #1 await_only=1\n",
+        "NEGATIVE CONTROL: a child of the pinned shell"
+    );
+    assert!(of_tree(&rig.tree, &tab, 450).is_some());
+
+    rig.tree.kill(200);
+    assert_eq!(
+        host.wake(&rig, &tab, Some(450), "label=u when=in:1h"),
+        refused,
+        "a root gone"
+    );
+
+    rig.tree.reborn(200, 99, 1);
+    rig.tree.reborn(210, 100, 200);
+    assert_eq!(
+        host.wake(&rig, &tab, Some(210), "label=u when=in:1h"),
+        refused
+    );
+    let waits = host.waits(&rig, &tab, Some(210), "");
+    assert!(
+        waits.starts_with("OK 1\n") && !waits.contains("label="),
+        "{waits}"
+    );
+    assert_eq!(host.park(&rig, &tab, Some(210), 1), Err(refused));
+    assert_eq!(of_tree(&rig.tree, &tab, 210), None);
+    assert_eq!(host.counts(A), (1, 0), "nothing booked past the first");
+
+    let stranger = Seat {
+        sid: B.to_string(),
+        local: 2,
+        pty_child: Some(link(200, 99, 1).id()),
+        agent: None,
+    };
+    assert_eq!(
+        host.wake(&rig, &stranger, Some(210), "label=u when=in:1h"),
+        "OK wake #1 await_only=1\n",
+        "NEGATIVE CONTROL: pinned to the process its pid names now, the same peer proves"
+    );
+}
+
+/// A failed process read is neither a job's exit nor the declaring agent's death.
+#[test]
+fn an_unread_process_neither_readies_its_exit_nor_expires_its_agents_wakes() {
+    let a = seat_a();
+    let decl = "label=job when=pid:500 exited";
+    let rig = Rig::new(Occupancy::Observe);
+    let host = WakeHost::default();
+    assert_eq!(host.wake(&rig, &a, Some(400), decl), "OK wake #1\n");
+    rig.tree.unread(500);
+    host.tick(&rig, false);
+    assert_eq!(state(&host, A, 1), Some(WakeState::Pending));
+    host.park(&rig, &a, Some(400), 1).expect("parks");
+    assert_eq!(host.pass(&rig, A, 1), Pass::Wait);
+    rig.tree.reborn(500, 50, 300);
+    host.tick(&rig, false);
+    assert_eq!(state(&host, A, 1), Some(WakeState::Pending));
+    rig.tree.kill(500);
+    assert!(matches!(
+        host.pass(&rig, A, 1),
+        Pass::Reply { ord: Some(1), .. }
+    ));
+
+    let rig = Rig::new(Occupancy::Observe);
+    let host = WakeHost::default();
+    assert_eq!(host.wake(&rig, &a, Some(400), decl), "OK wake #1\n");
+    rig.tree.unread(300);
+    host.tick(&rig, false);
+    assert_eq!(state(&host, A, 1), Some(WakeState::Pending));
+    let refused = host.wake(&rig, &a, Some(400), "label=unproved when=in:1h");
+    assert!(
+        refused.starts_with("ERR denied wake:"),
+        "unread ancestry admits no new declaration: {refused}"
+    );
+    assert_eq!(
+        host.wake(&rig, &a, Some(450), "label=sibling when=in:1h"),
+        "ERR denied wake: not in this session's tree\n",
+        "a readable sibling cannot bypass the unread hosted agent"
+    );
+    assert_eq!(host.counts(A), (1, 0));
+    rig.tree.reborn(300, 30, 200);
+    host.tick(&rig, false);
+    assert_eq!(state(&host, A, 1), Some(WakeState::Pending));
+    rig.tree.reborn(300, 99, 200);
+    host.tick(&rig, false);
+    assert_eq!(
+        state(&host, A, 1),
+        Some(WakeState::Expired {
+            why: ExpireWhy::Agent
+        }),
+        "a known different birth still proves the declaring agent gone"
+    );
 }
 
 /// The outs and the await's reply of one T-obs2 run under `mode`: a time wake awaited, and a job's
@@ -1270,7 +1406,7 @@ fn a_published_agent_pid_another_process_holds_narrows_nothing() {
     let host = WakeHost::default();
     let decl = "label=t when=in:1h";
     assert_eq!(
-        host.wake(&rig, &seat(A, 1, 200, (500, 99)), Some(450), decl),
+        host.wake(&rig, &seat(A, 1, (200, 20), (500, 99)), Some(450), decl),
         "OK wake #1 await_only=1\n"
     );
     assert_eq!(
@@ -1281,7 +1417,7 @@ fn a_published_agent_pid_another_process_holds_narrows_nothing() {
         }
     );
     assert_eq!(
-        host.wake(&rig, &seat(A, 1, 200, (500, 50)), Some(450), decl),
+        host.wake(&rig, &seat(A, 1, (200, 20), (500, 50)), Some(450), decl),
         "ERR denied wake: not in this session's tree\n",
         "NEGATIVE CONTROL: the snapshot's own agent narrows the proof"
     );
@@ -1464,25 +1600,30 @@ fn the_handoff_manifest_carries_each_sessions_book() {
 }
 
 /// A NEW TAB'S SEAT NAMES ITS SHELL AT ONCE: the root a wake is proved under is the PTY child the
-/// session was registered with, so a tab no machine snapshot names yet still has a tree (a process
-/// of it proves, an outside client is refused as another session's); a session with no child has
-/// none.
+/// session was registered with, pinned by the birth its session read, so a tab no machine
+/// snapshot names yet still has a tree (a process of it proves, an outside client is refused as
+/// another session's); a session with no child, or whose shell's birth was never read, has none.
 #[test]
 fn a_seat_names_its_shell_before_any_machine_snapshot_names_the_tab() {
     let store = crate::session_store::new_store();
     let mut spawned = crate::session_store::test_handle(0x5ea7);
-    spawned.pid = 4242;
+    spawned.shell_identity = aterm_pty::ShellIdentity::from_parts(4242, Some(42_000_000), true);
     let sid = spawned.sid.as_str().to_string();
     let childless = crate::session_store::test_handle(0x5ea8);
+    let mut unread = crate::session_store::test_handle(0x5ea9);
+    unread.shell_identity = aterm_pty::ShellIdentity::from_parts(4243, None, true);
     let mut book = store.write().unwrap_or_else(PoisonError::into_inner);
     book.register(spawned);
     book.register(childless);
+    book.register(unread);
     drop(book);
     let seat = seat_of(&store, 0x5ea7).expect("a registered session's seat");
     assert_eq!(
         (seat.sid.as_str(), seat.pty_child),
-        (sid.as_str(), Some(4242))
+        (sid.as_str(), Some(link(4242, 42, 0).id()))
     );
     let seat = seat_of(&store, 0x5ea8).expect("a registered session's seat");
     assert_eq!(seat.pty_child, None);
+    let seat = seat_of(&store, 0x5ea9).expect("a registered session's seat");
+    assert_eq!(seat.pty_child, None, "a bare pid pins nothing");
 }

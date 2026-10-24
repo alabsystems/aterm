@@ -143,7 +143,7 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
         title: format!("tab-{local_id}"),
         term: term.clone(),
         master: -1,
-        pid: 0,
+        shell_identity: aterm_pty::ShellIdentity::unproven(0),
         ctx,
     }
 }

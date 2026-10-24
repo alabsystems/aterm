@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Derived from x11rb 0.13.2 src/properties.rs (MIT OR Apache-2.0, used under Apache-2.0).
+// Derived from x11rb 0.13.2 src/properties.rs (MIT OR Apache-2.0, used under Apache-2.0),
+// rewritten by the aterm project in 2026 over this crate's codec: property bytes, no connection.
 
 //! ICCCM `WM_CLASS`, `WM_NORMAL_HINTS`, and `WM_HINTS` properties.
 

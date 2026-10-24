@@ -3,7 +3,8 @@
 
 //! Text from a host or the LAN, made safe to print on the owner's terminal ([`shown`]).
 
-/// `text` safe to print to a terminal.
+/// `text` safe to print to a terminal: each control character and each bidirectional
+/// formatting character is shown as its `\u{…}` escape rather than sent.
 #[must_use]
 pub fn shown(text: &str) -> String {
     let inert = |c: char| {

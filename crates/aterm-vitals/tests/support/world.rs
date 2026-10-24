@@ -62,6 +62,8 @@ pub struct Proc {
     pub wait: aterm_vitals::jobs::StartWait,
     /// Which program the pid runs (the host reads its pid version, which moves on exec).
     pub exec: u64,
+    /// A fork that never ran a program of its own (zsh's `zpty` worker).
+    pub forked: bool,
     /// Started under aterm though no tab's tree holds it (its resource coalition).
     pub aterm: bool,
 }
@@ -106,6 +108,7 @@ impl Proc {
             held: false,
             wait: aterm_vitals::jobs::StartWait::ProgramCheck,
             exec: 1,
+            forked: false,
             aterm: false,
         }
     }
@@ -656,6 +659,7 @@ fn sweep_of(p: &Proc) -> SweepProc {
         },
         session_leader: (!zombie).then_some(p.sid == p.pid),
         has_tty: (!zombie).then_some(p.tty),
+        exec: (!zombie).then_some(!p.forked),
     }
 }
 

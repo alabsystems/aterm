@@ -80,7 +80,7 @@ part (a) of `libm-atanh-odd-and-boundaries` (it uses abs and copysign) → platf
 std's transcendentals → parts (b)–(d) of atanh and `libm-forward-refines-std`. `libm-fdim` depends on
 nothing but float carriers and IEEE subtraction.
 
-## 2. Test → spec map (TSV; all 3)
+## 2. Test → spec map (TSV)
 
 ```tsv
 test	specs	residue

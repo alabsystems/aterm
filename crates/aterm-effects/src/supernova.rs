@@ -491,20 +491,23 @@ fn emit_crown_quads(sink: &mut QuadSink<'_>, env: &SuperEnv, env_a: f32) {
     let ch = env.cell_h;
     sink.push(env.cx - ch, env.cy - ch / 2, 2 * ch, ch, core);
     sink.push(env.cx - ch / 2, env.cy - ch, ch, 2 * ch, core);
+    let segs: [(f32, i32, i32, u32); 3] = std::array::from_fn(|seg| {
+        let f0 = 0.15 + 0.28 * seg as f32;
+        let d = reach * f0;
+        let sz = ((1.0 - f0) * ch as f32 * 0.6).max(2.0) as i32;
+        let tone = mix_rgb(WASH_CORE, 0x00FF_FFFF, 1.0 - f0);
+        (d, sz, sz / 2, premul(tone, env_a * (1.0 - 0.55 * f0)))
+    });
     for point in 0..8 {
         let ang = core::f32::consts::TAU * point as f32 / 8.0;
         let (dx, dy) = (ang.cos(), ang.sin() * 0.75);
-        for seg in 0..3 {
-            let f0 = 0.15 + 0.28 * seg as f32;
-            let d = reach * f0;
-            let sz = ((1.0 - f0) * ch as f32 * 0.6).max(2.0) as i32;
-            let tone = mix_rgb(WASH_CORE, 0x00FF_FFFF, 1.0 - f0);
+        for &(d, sz, half_sz, color) in &segs {
             sink.push(
-                env.cx + (dx * d) as i32 - sz / 2,
-                env.cy + (dy * d) as i32 - sz / 2,
+                env.cx + (dx * d) as i32 - half_sz,
+                env.cy + (dy * d) as i32 - half_sz,
                 sz,
                 sz,
-                premul(tone, env_a * (1.0 - 0.55 * f0)),
+                color,
             );
         }
     }
@@ -543,31 +546,20 @@ fn emit_ring_chords(sink: &mut QuadSink<'_>, env: &SuperEnv, r: f32, thick: f32,
         } else {
             0.0
         };
-        let (y0i, y1i) = (
-            y0.round() as i32,
-            (y1.round() as i32).max(y0.round() as i32 + 1),
-        );
+        let y0i = y0.round() as i32;
+        let y1i = (y1.round() as i32).max(y0i + 1);
+        let h = y1i - y0i;
+        let xoi = xo.round() as i32;
         if xi > 1.0 {
-            sink.push(
-                env.cx - xo.round() as i32,
-                y0i,
-                (xo - xi).round().max(1.0) as i32,
-                y1i - y0i,
-                premul,
-            );
-            sink.push(
-                env.cx + xi.round() as i32,
-                y0i,
-                (xo - xi).round().max(1.0) as i32,
-                y1i - y0i,
-                premul,
-            );
+            let w = (xo - xi).round().max(1.0) as i32;
+            sink.push(env.cx - xoi, y0i, w, h, premul);
+            sink.push(env.cx + xi.round() as i32, y0i, w, h, premul);
         } else {
             sink.push(
-                env.cx - xo.round() as i32,
+                env.cx - xoi,
                 y0i,
                 (2.0 * xo).round().max(1.0) as i32,
-                y1i - y0i,
+                h,
                 premul,
             );
         }
@@ -577,6 +569,7 @@ fn emit_ring_chords(sink: &mut QuadSink<'_>, env: &SuperEnv, r: f32, thick: f32,
 /// Emit one supernova frame's `WordDecoration` stream within `cap`.
 pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>, cap: usize) {
     let out_start = out.len();
+    let (cw, ch) = (env.cell_w.max(1), env.cell_h.max(1));
     if env.light && t_ms < CHARGE_END_MS {
         let p = t_ms as f32 / CHARGE_END_MS as f32;
         for k in 0..CHARGE_MOTES {
@@ -587,14 +580,14 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
             if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
                 continue;
             }
-            let (row, col) = (y / env.cell_h.max(1), x / env.cell_w.max(1));
+            let (row, col) = (y / ch, x / cw);
             let hue = (env.base_hue + k as f32 * 30.0).rem_euclid(360.0);
             let cov = env.intensity * (0.25 + 0.75 * p);
             out.push(WordDecoration {
                 row: row as u16,
                 col: col as u16,
-                dx: ((x % env.cell_w.max(1)) - env.cell_w / 2).clamp(-6, 6) as i8,
-                dy: ((y % env.cell_h.max(1)) - env.cell_h / 2).clamp(-6, 6) as i8,
+                dx: ((x % cw) - env.cell_w / 2).clamp(-6, 6) as i8,
+                dy: ((y % ch) - env.cell_h / 2).clamp(-6, 6) as i8,
                 glyph: DecoGlyph::Dot,
                 blend: DecoBlend::Over,
                 color: hsv2rgb(hue, 1.0, 0.62),
@@ -646,23 +639,29 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 stamped += 1;
             }
         }
+        let crown_segs: [(f32, u8); 3] = std::array::from_fn(|i| {
+            let seg = (i + 1) as f32;
+            (
+                env.r_max * 0.3 * seg,
+                (230.0 * env_a * (1.0 - 0.2 * seg)) as u8,
+            )
+        });
         for point in 0..8 {
             if out.len() >= cap {
                 break;
             }
             let ang = core::f32::consts::TAU * point as f32 / 8.0;
             let (cos_a, sin_a) = (ang.cos(), ang.sin());
-            for seg in 1..=3 {
+            for &(d, alpha) in &crown_segs {
                 if out.len() >= cap {
                     break;
                 }
-                let d = env.r_max * 0.3 * seg as f32;
                 let x = env.cx + (cos_a * d) as i32;
                 let y = env.cy + (sin_a * d * 0.75) as i32;
                 if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
                     continue;
                 }
-                let (row, col) = (y / env.cell_h.max(1), x / env.cell_w.max(1));
+                let (row, col) = (y / ch, x / cw);
                 out.push(WordDecoration {
                     row: row as u16,
                     col: col as u16,
@@ -671,7 +670,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                     glyph: DecoGlyph::Shade,
                     blend: DecoBlend::Over,
                     color: VEIL_TONE,
-                    alpha: (230.0 * env_a * (1.0 - 0.2 * seg as f32)) as u8,
+                    alpha,
                 });
             }
         }
@@ -692,7 +691,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
             if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
                 continue;
             }
-            let (row, col) = (y / env.cell_h.max(1), x / env.cell_w.max(1));
+            let (row, col) = (y / ch, x / cw);
             out.push(WordDecoration {
                 row: row as u16,
                 col: col as u16,
@@ -710,7 +709,6 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         let p = (t_ms - DEBRIS_START_MS) as f32 / (SUPER_TOTAL_MS - DEBRIS_START_MS) as f32;
         let base_r = env.r_max * (0.3 + 1.1 * p);
         let grav_y = (p * p * env.cell_h as f32) as i32;
-        let (cw, ch) = (env.cell_w.max(1), env.cell_h.max(1));
         let grid_tick = t_ms / crate::nova::TWINKLE_GRID_MS;
         let fade_p = 1.0 - p * p;
         for k in 0..n {

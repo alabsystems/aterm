@@ -477,18 +477,41 @@ impl LetterGuard {
             (ch(16, 0) << 16) | (ch(8, 1) << 8) | ch(0, 2)
         };
         let ratio = |a: f32, b: f32| (a.max(b) + 0.05) / (a.min(b) + 0.05);
+        let has_over = self.cell.iter().any(|&(stream, _)| stream != Stream::Under);
         let mut holds = true;
         let mut last_g: Option<(u32, f32)> = None;
         let mut last_ink: Option<(u32, f32)> = None;
         'rows: for gy in 0..h {
             let row = gy * w;
             for x in 0..w {
+                let k = row + x;
                 let lg = if additive {
-                    let (a, b) = (self.lift_under[row + x], self.lift_over[row + x]);
+                    let (a, b) = (self.lift_under[k], self.lift_over[k]);
                     if a == [0; 3] && b == [0; 3] {
                         j.l_ground
                     } else {
                         let g = lift(j.ground, a, b);
+                        if g == j.ground {
+                            j.l_ground
+                        } else {
+                            match last_g {
+                                Some((prev_g, prev_lum)) if prev_g == g => prev_lum,
+                                _ => {
+                                    let l = crate::color_math::relative_luminance_with(table, g);
+                                    last_g = Some((g, l));
+                                    l
+                                }
+                            }
+                        }
+                    }
+                } else if self.px_at[k] == self.px_at[k + 1] {
+                    j.l_ground
+                } else {
+                    let at = (j.x0 + x as i32, j.y0 + gy as i32, k);
+                    let g = self.composite(j.ground, at, true, s, streams);
+                    if g == j.ground {
+                        j.l_ground
+                    } else {
                         match last_g {
                             Some((prev_g, prev_lum)) if prev_g == g => prev_lum,
                             _ => {
@@ -498,19 +521,8 @@ impl LetterGuard {
                             }
                         }
                     }
-                } else {
-                    let at = (j.x0 + x as i32, j.y0 + gy as i32, row + x);
-                    let g = self.composite(j.ground, at, true, s, streams);
-                    match last_g {
-                        Some((prev_g, prev_lum)) if prev_g == g => prev_lum,
-                        _ => {
-                            let l = crate::color_math::relative_luminance_with(table, g);
-                            last_g = Some((g, l));
-                            l
-                        }
-                    }
                 };
-                lum[row + x] = lg;
+                lum[k] = lg;
             }
             for x in r..w - r {
                 let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -525,13 +537,38 @@ impl LetterGuard {
                 continue;
             };
             let y = y + r;
+            let irow = y * w;
             for x in r..w - r {
-                let li = if additive {
-                    let b = self.lift_over[y * w + x];
+                let k = irow + x;
+                let li = if !has_over {
+                    j.l_ink
+                } else if additive {
+                    let b = self.lift_over[k];
                     if b == [0; 3] {
                         j.l_ink
                     } else {
                         let ink = lift(j.ink, [0; 3], b);
+                        if ink == j.ink {
+                            j.l_ink
+                        } else {
+                            match last_ink {
+                                Some((prev_ink, prev_lum)) if prev_ink == ink => prev_lum,
+                                _ => {
+                                    let l = crate::color_math::relative_luminance_with(table, ink);
+                                    last_ink = Some((ink, l));
+                                    l
+                                }
+                            }
+                        }
+                    }
+                } else if self.px_at[k] == self.px_at[k + 1] {
+                    j.l_ink
+                } else {
+                    let at = (j.x0 + x as i32, j.y0 + y as i32, k);
+                    let ink = self.composite(j.ink, at, false, s, streams);
+                    if ink == j.ink {
+                        j.l_ink
+                    } else {
                         match last_ink {
                             Some((prev_ink, prev_lum)) if prev_ink == ink => prev_lum,
                             _ => {
@@ -539,17 +576,6 @@ impl LetterGuard {
                                 last_ink = Some((ink, l));
                                 l
                             }
-                        }
-                    }
-                } else {
-                    let at = (j.x0 + x as i32, j.y0 + y as i32, y * w + x);
-                    let ink = self.composite(j.ink, at, false, s, streams);
-                    match last_ink {
-                        Some((prev_ink, prev_lum)) if prev_ink == ink => prev_lum,
-                        _ => {
-                            let l = crate::color_math::relative_luminance_with(table, ink);
-                            last_ink = Some((ink, l));
-                            l
                         }
                     }
                 };

@@ -909,7 +909,8 @@ trait Stream: Read + Write + Send + Sized + ConnShutdown + 'static {
     fn set_nonblocking(&self, on: bool) -> io::Result<()>;
     /// A second handle to the same socket, so the read half (draining requests) and
     /// the ack-writer half (streaming acks back) run concurrently — single-connection
-    /// pipelining. Read and write are independent directions on the same fd.
+    /// pipelining. Read and write are independent directions on the same fd. Kept out
+    /// of every child, as the first handle is (`astream_sys::close_on_fork`).
     fn try_clone(&self) -> io::Result<Self>;
 }
 #[cfg(unix)]
@@ -924,7 +925,9 @@ impl Stream for UnixStream {
         UnixStream::set_nonblocking(self, on)
     }
     fn try_clone(&self) -> io::Result<Self> {
-        UnixStream::try_clone(self)
+        let clone = UnixStream::try_clone(self)?;
+        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&clone))?;
+        Ok(clone)
     }
 }
 impl Stream for TcpStream {
@@ -938,7 +941,9 @@ impl Stream for TcpStream {
         TcpStream::set_nonblocking(self, on)
     }
     fn try_clone(&self) -> io::Result<Self> {
-        TcpStream::try_clone(self)
+        let clone = TcpStream::try_clone(self)?;
+        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&clone))?;
+        Ok(clone)
     }
 }
 
@@ -4274,6 +4279,9 @@ impl Broker {
             }
         }
         let listener = UnixListener::bind(&socket_path)?;
+        // Out of every child this process spawns: a child's exec-time close of its copy,
+        // under a descriptor scan, drains the listener and every connection it accepts.
+        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&listener))?;
         // The wake name first: without one, shutdown could not reach a blocking
         // acceptor once the embedder unlinked `socket_path`, so the listener polls.
         let node = node_at(&socket_path);
@@ -4313,6 +4321,8 @@ impl Broker {
                     if polls {
                         let _ = s.set_nonblocking(false);
                     }
+                    // Out of every child, as the listener is (`astream_sys::close_on_fork`).
+                    let _ = astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&s));
                     let sh = shared.clone();
                     // Detached per-connection thread; ends when its socket ends.
                     // A spawn that fails (thread exhaustion) drops this socket and
@@ -4486,6 +4496,8 @@ impl Broker {
         const MAX_PREAUTH_CONNS: usize = 64;
 
         let listener = TcpListener::bind(addr)?;
+        // Out of every child, as a Unix listener is (`astream_sys::close_on_fork`).
+        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&listener))?;
         // Report a *connectable* address: a wildcard bind (0.0.0.0 / ::) is not a valid
         // destination for a client, so map an unspecified host to loopback (keeping
         // the port) for `tcp_addr`. It is also what shutdown dials to get the
@@ -4516,6 +4528,7 @@ impl Broker {
                 || listener.accept().map(|(s, _)| s),
                 |s| {
                     let _ = s.set_nodelay(true);
+                    let _ = astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&s));
                     if preauth.load(Ordering::Acquire) >= MAX_PREAUTH_CONNS {
                         return; // dropped: beyond the pre-authentication cap
                     }

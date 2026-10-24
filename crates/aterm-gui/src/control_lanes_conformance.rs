@@ -345,7 +345,7 @@ fn count(n: usize) -> i64 {
     i64::try_from(n).expect("small counts fit i64")
 }
 
-/// Project `census`, `flight`, and `facts` onto a model [`State`].
+/// Project `census`, `flight`, and `facts` onto a model [`State`] at a quiescent point.
 fn project(census: Census, flight: (usize, usize), facts: Facts) -> State {
     assert_eq!(
         census.waits, flight.1,

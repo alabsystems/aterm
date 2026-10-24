@@ -438,7 +438,7 @@ impl TrickFlash {
         let time_deg = 360.0 * (t as f32 / FLASH_MS as f32);
         let mut search_from = 0usize;
         for i in 0..n {
-            let hue = (hue0 + (i as f32 / denom) * span + time_deg).rem_euclid(360.0);
+            let hue = hue0 + (i as f32 / denom) * span + time_deg;
             let target = hsv2rgb(hue, loc.sat, loc.val);
             let col = loc.cols[i];
             let cell = if ink.last().is_none_or(|c| (c.row, c.col) < (loc.row, col)) {
@@ -612,7 +612,7 @@ fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
         for corner in corners {
             let lum =
                 crate::color_math::relative_luminance_with(table, mix_rgb(fg, corner, strength));
-            if contrast(lum) < floor || (lum >= lum_bg) != text_is_lighter {
+            if (lum >= lum_bg) != text_is_lighter || contrast(lum) < floor {
                 strength = (strength - step).max(0.0);
                 continue 'guard;
             }

@@ -1,6 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0 AND MIT
-// Derived from upstream `lz4_flex` (https://github.com/pseitz/lz4_flex, MIT; see LICENSE-MIT).
+// Derived from upstream `lz4_flex` (https://github.com/pseitz/lz4_flex, MIT; see LICENSE-MIT),
+// modified to a block-mode-only subset.
 
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]

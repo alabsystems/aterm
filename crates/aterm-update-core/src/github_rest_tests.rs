@@ -561,3 +561,27 @@ fn a_spawn_that_refuses_once_interrupted_is_a_refusal_made_here() {
     assert!(matches!(failed, RestError::Transport(_)), "{failed:?}");
     assert!(fake.seen().is_empty(), "nothing was sent");
 }
+
+/// A child [`Direct`] could not start is marked so: [`never_started`] knows nothing it would
+/// have sent went out, and the error keeps its kind and its words. NEGATIVE CONTROL: a child
+/// that started and failed is not marked, and neither is an error raised anywhere else.
+#[test]
+fn a_child_that_never_started_is_marked_so() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no-such-curl");
+    let failed = Direct
+        .run(&mut aterm_uds::spawnfd::command(&missing), Some(b"secret"))
+        .unwrap_err();
+    assert!(never_started(&failed), "{failed:?}");
+    assert_eq!(failed.kind(), std::io::ErrorKind::NotFound);
+    let plain = std::io::Error::new(std::io::ErrorKind::NotFound, "elsewhere");
+    assert_eq!(unstarted(plain).to_string(), "elsewhere");
+    assert!(!never_started(&std::io::Error::other("waiting failed")));
+    let mut curl = aterm_uds::spawnfd::command(crate::http::CURL_BIN);
+    curl.arg("--no-such-option");
+    let ran = Direct.run(&mut curl, None).unwrap();
+    assert!(
+        !ran.status.success(),
+        "it started, and failed by its own exit"
+    );
+}

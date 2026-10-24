@@ -64,6 +64,7 @@ impl Default for TypedStamps {
 pub const TYPED_STAMP_DEPTH: usize = 128;
 const STAMP_RING_MASK: usize = TYPED_STAMP_DEPTH - 1;
 const _: () = assert!(TYPED_STAMP_DEPTH.is_power_of_two());
+const _: () = assert!(TYPED_STAMP_DEPTH == u128::BITS as usize);
 
 /// The in-flight patience (seconds).
 pub(crate) const IN_FLIGHT_PATIENCE_S: f32 = 10.0;
@@ -268,6 +269,8 @@ pub(super) type OrphanExactPressRun = [Option<(Instant, char)>; ORPHAN_EXACT_KEY
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PressCredits {
     pub(super) slots: [Option<(Instant, u8, Option<char>)>; TYPED_STAMP_DEPTH],
+    /// Bitmask of occupied slots (`bit i == 1` iff `slots[i].is_some()`).
+    pub(super) occupied: u128,
     /// The next slot to write.
     pub(super) head: usize,
     /// The held presses: every unpaid press banked at or before this instant.
@@ -280,6 +283,7 @@ impl Default for PressCredits {
     fn default() -> Self {
         Self {
             slots: [None; TYPED_STAMP_DEPTH],
+            occupied: 0,
             head: 0,
             held_through: None,
             admit_held: false,
@@ -292,6 +296,7 @@ impl PressCredits {
     #[inline]
     pub(super) const fn bank(&mut self, now: Instant, credits: u8, glyph: Option<char>) {
         self.slots[self.head] = Some((now, credits, glyph));
+        self.occupied |= 1u128 << self.head;
         self.head = (self.head + 1) & STAMP_RING_MASK;
     }
 
@@ -321,11 +326,19 @@ impl PressCredits {
         &self,
         now: Instant,
     ) -> impl Iterator<Item = (Instant, u8, Option<char>)> + '_ {
-        self.slots
-            .iter()
-            .flatten()
-            .copied()
-            .filter(move |(t, c, _)| self.payable(*t, *c, now))
+        let mut mask = self.occupied;
+        std::iter::from_fn(move || {
+            while mask != 0 {
+                let i = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if let Some((t, c, g)) = self.slots[i]
+                    && self.payable(t, c, now)
+                {
+                    return Some((t, c, g));
+                }
+            }
+            None
+        })
     }
 
     /// Unpaid cells of the live presses whose instant `keep` admits.
@@ -383,7 +396,10 @@ impl PressCredits {
         now: Instant,
         freshness_s: f32,
     ) -> Option<(usize, char)> {
-        for k in 0..TYPED_STAMP_DEPTH {
+        let mut mask = self.occupied.rotate_right(self.head as u32);
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
             let i = (self.head + k) & STAMP_RING_MASK;
             if let Some((at, credits, glyph)) = self.slots[i]
                 && self.payable(at, credits, now)
@@ -431,14 +447,17 @@ impl PressCredits {
         glyphs: &[char],
         tail_window_s: f32,
     ) -> Option<usize> {
-        if glyphs.is_empty() || glyphs.len() > EXACT_COALESCED_PREFIX_MAX {
+        if self.occupied == 0 || glyphs.is_empty() || glyphs.len() > EXACT_COALESCED_PREFIX_MAX {
             return None;
         }
         let mut live: [Option<LiveUnpaidPress>;
             EXACT_COALESCED_PREFIX_MAX + EXACT_COALESCED_STALE_PREFIX_MAX] =
             [None; EXACT_COALESCED_PREFIX_MAX + EXACT_COALESCED_STALE_PREFIX_MAX];
         let mut n = 0;
-        for k in 0..TYPED_STAMP_DEPTH {
+        let mut mask = self.occupied.rotate_right(self.head as u32);
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
             let i = (self.head + k) & STAMP_RING_MASK;
             let Some((at, credits, glyph)) = self.slots[i] else {
                 continue;
@@ -486,10 +505,13 @@ impl PressCredits {
     ) -> Option<usize> {
         let mut first = None;
         let mut n = 0;
-        for k in 0..TYPED_STAMP_DEPTH {
+        let mut mask = self.occupied.rotate_right(self.head as u32);
+        while mask != 0 {
             if n == glyphs.len() {
                 break;
             }
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
             let i = (self.head + k) & STAMP_RING_MASK;
             let Some((at, credits, glyph)) = self.slots[i] else {
                 continue;
@@ -514,19 +536,29 @@ impl PressCredits {
             if i == selected {
                 return;
             }
-            self.slots[i] = None;
+            let bit = 1u128 << i;
+            if self.occupied & bit != 0 {
+                self.slots[i] = None;
+                self.occupied &= !bit;
+            }
             k += 1;
         }
     }
 
     /// Spend `cells` oldest-first, so one pool of typing never funds a second echo.
     pub(super) fn spend_counting(&mut self, now: Instant, mut cells: usize) -> usize {
+        if cells == 0 || self.occupied == 0 {
+            return 0;
+        }
         let mut drained = 0;
         for held in [false, true] {
-            for k in 0..TYPED_STAMP_DEPTH {
+            let mut mask = self.occupied.rotate_right(self.head as u32);
+            while mask != 0 {
                 if cells == 0 {
                     return drained;
                 }
+                let k = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
                 let i = (self.head + k) & STAMP_RING_MASK;
                 let Some((t, c, _)) = self.slots[i] else {
                     continue;
@@ -538,6 +570,7 @@ impl PressCredits {
                 cells -= take;
                 if usize::from(c) == take {
                     self.slots[i] = None;
+                    self.occupied &= !(1u128 << i);
                     drained += 1;
                 } else if let Some((_, left, _)) = &mut self.slots[i] {
                     *left -= take as u8;
@@ -549,9 +582,13 @@ impl PressCredits {
 
     /// Blank every slot whose press instant `pred` admits, in place.
     pub(super) fn blank_where(&mut self, pred: impl Fn(Instant) -> bool) {
-        for slot in &mut self.slots {
-            if slot.is_some_and(|(t, _, _)| pred(t)) {
-                *slot = None;
+        let mut mask = self.occupied;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if self.slots[i].is_some_and(|(t, _, _)| pred(t)) {
+                self.slots[i] = None;
+                self.occupied &= !(1u128 << i);
             }
         }
     }
@@ -569,7 +606,10 @@ impl PressCredits {
     /// Forget every press.
     #[inline]
     pub(super) const fn forget(&mut self) {
-        self.slots = [None; TYPED_STAMP_DEPTH];
+        if self.occupied != 0 {
+            self.slots = [None; TYPED_STAMP_DEPTH];
+            self.occupied = 0;
+        }
         self.head = 0;
         self.held_through = None;
     }
@@ -588,7 +628,10 @@ impl PressCredits {
     ) -> Option<(OrphanExactPressRun, usize)> {
         let mut keys = [None; ORPHAN_EXACT_KEYS_MAX];
         let mut n = 0;
-        for k in 0..TYPED_STAMP_DEPTH {
+        let mut mask = self.occupied.rotate_right(self.head as u32);
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
             let i = (self.head + k) & STAMP_RING_MASK;
             let Some((at, credits, glyph)) = self.slots[i] else {
                 continue;
@@ -615,9 +658,15 @@ impl PressCredits {
             head: self.head,
             ..Self::default()
         };
-        for (i, slot) in self.slots.iter_mut().enumerate() {
-            if slot.is_some_and(|(t, _, _)| t > at) {
-                later.slots[i] = slot.take();
+        let mut mask = self.occupied;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if self.slots[i].is_some_and(|(t, _, _)| t > at) {
+                later.slots[i] = self.slots[i].take();
+                let bit = 1u128 << i;
+                self.occupied &= !bit;
+                later.occupied |= bit;
             }
         }
         later
@@ -625,8 +674,14 @@ impl PressCredits {
 
     /// Put back what [`Self::split_off_after`] took.
     pub(super) fn merge(&mut self, later: Self) {
-        if self.head == 0 && self.slots.iter().all(Option::is_none) {
-            for k in 0..TYPED_STAMP_DEPTH {
+        if later.occupied == 0 {
+            return;
+        }
+        if self.head == 0 && self.occupied == 0 {
+            let mut mask = later.occupied.rotate_right(later.head as u32);
+            while mask != 0 {
+                let k = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
                 let i = (later.head + k) & STAMP_RING_MASK;
                 if let Some((t, c, glyph)) = later.slots[i] {
                     self.bank(t, c, glyph);
@@ -634,9 +689,13 @@ impl PressCredits {
             }
             return;
         }
-        for (i, slot) in later.slots.into_iter().enumerate() {
-            if slot.is_some() {
-                self.slots[i] = slot;
+        let mut mask = later.occupied;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if later.slots[i].is_some() {
+                self.slots[i] = later.slots[i];
+                self.occupied |= 1u128 << i;
             }
         }
     }
@@ -644,12 +703,18 @@ impl PressCredits {
     /// The slot of the newest press.
     #[inline]
     pub(super) fn newest(&self) -> Option<usize> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, slot)| slot.map(|(t, _, _)| (i, t)))
-            .max_by_key(|&(_, t)| t)
-            .map(|(i, _)| i)
+        let mut mask = self.occupied;
+        let mut best: Option<(usize, Instant)> = None;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Some((t, _, _)) = self.slots[i]
+                && best.is_none_or(|(_, bt)| t >= bt)
+            {
+                best = Some((i, t));
+            }
+        }
+        best.map(|(i, _)| i)
     }
 
     /// Retire the newest press (the key a Backspace erases), whole.
@@ -657,6 +722,7 @@ impl PressCredits {
     pub(super) fn retire_newest(&mut self) {
         if let Some(i) = self.newest() {
             self.slots[i] = None;
+            self.occupied &= !(1u128 << i);
         }
     }
 
@@ -672,6 +738,7 @@ impl PressCredits {
             *c = c.saturating_sub(cells);
             if *c == 0 {
                 self.slots[i] = None;
+                self.occupied &= !(1u128 << i);
             }
         }
     }
@@ -679,14 +746,7 @@ impl PressCredits {
     /// Whether no press is banked at all.
     #[inline]
     pub(super) const fn is_empty(&self) -> bool {
-        let mut i = 0;
-        while i < self.slots.len() {
-            if self.slots[i].is_some() {
-                return false;
-            }
-            i += 1;
-        }
-        true
+        self.occupied == 0
     }
 }
 

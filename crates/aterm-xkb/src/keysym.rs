@@ -2,7 +2,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Derived from xkeysym 0.2.1 (MIT OR Apache-2.0 OR Zlib, used under Apache-2.0).
+// Derived from xkeysym 0.2.1 src/automatically_generated.rs (MIT OR Apache-2.0 OR Zlib, used
+// under Apache-2.0): the keysyms aterm's key handling names, each with its C name added by the
+// aterm project in 2026.
 
 //! X11 keysym constants and [`NAMES`] lookup table.
 

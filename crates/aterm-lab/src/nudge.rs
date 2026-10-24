@@ -17,8 +17,10 @@ use crate::stop;
 use crate::util::{now, scratch_text};
 use crate::{Fail, Res};
 
+/// Any output between the halves of a flap ends the engine's undo (which would hand the rows back).
 const MODE_SET: &[u8] = b"\x1b[?1004h";
 const SLACK: usize = 1;
+/// Seconds between two flaps of a lab whose nudge acts: 3 tries per session-hour, a 60 s cooldown.
 const SPACING: f64 = 62.0;
 const OBSERVE: f64 = 8.0;
 const OBSERVE_CAP: f64 = 30.0;

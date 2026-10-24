@@ -106,6 +106,10 @@ mod imp {
         }
     }
 
+    /// Sends `sig` to every member of `group` but a trustd and its descendants
+    /// ([`super::group_members`]); SIGKILL is sent twice, the group listed again between, for
+    /// what forked meanwhile. A listing that cannot be read signals the group's leader alone:
+    /// never a trustd.
     fn signal_group(group: i32, sig: i32) {
         let passes = if sig == SIGKILL { 2 } else { 1 };
         for _ in 0..passes {

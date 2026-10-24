@@ -1278,6 +1278,7 @@ impl Root {
                 pid,
                 start: u64::try_from(u128::from(stat.start) * 1_000_000_000 / u128::from(hz)).ok(),
                 ppid: stat.ppid,
+                exec: Some(stat.exec()),
                 cpu_ns: Some(u64::try_from(ns).unwrap_or(u64::MAX)),
                 footprint,
                 disk_read: None,

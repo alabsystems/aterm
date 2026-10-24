@@ -238,14 +238,18 @@ impl KittyTenure {
 /// only.
 #[inline]
 fn insert_lru(roster: &mut [Option<Homecoming>; HOMECOMING_SLOTS], id: &str, now: Instant) -> bool {
-    let slot = roster.iter().position(|s| s.is_none()).or_else(|| {
-        roster
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.as_ref().is_some_and(|h| h.greeted))
-            .min_by_key(|(_, s)| s.as_ref().map(|h| h.at))
-            .map(|(i, _)| i)
-    });
+    let mut slot = None;
+    let mut oldest_at = None;
+    for (i, entry) in roster.iter().enumerate() {
+        let Some(h) = entry else {
+            slot = Some(i);
+            break;
+        };
+        if h.greeted && oldest_at.is_none_or(|oldest| h.at < oldest) {
+            oldest_at = Some(h.at);
+            slot = Some(i);
+        }
+    }
     match slot {
         Some(i) => {
             roster[i] = Some(Homecoming {

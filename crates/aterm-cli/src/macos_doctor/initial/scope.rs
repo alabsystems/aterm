@@ -578,6 +578,7 @@ mod tests {
             plan: Some((narrow.clone(), true)),
             progress: None,
             decision,
+            restored: false,
             provisional,
             stop_request: None,
         };

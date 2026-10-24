@@ -211,11 +211,9 @@ fn paint_eye_dots(
     let bounds = &eye_meta.bounds[..eye_meta.paths.len()];
     let max_w = eye_meta.max_w;
     let near_cx = eye_meta.near_cx;
-    let width = |b: &Option<(f32, f32, f32, f32)>| b.map_or(0.0, |(x0, _, x1, _)| x1 - x0);
-    let ratio = |b: &Option<(f32, f32, f32, f32)>| {
-        if max_w > 0.0 { width(b) / max_w } else { 1.0 }
+    let ratio = |x0: f32, x1: f32| {
+        if max_w > 0.0 { (x1 - x0) / max_w } else { 1.0 }
     };
-    let occluded = |b: &Option<(f32, f32, f32, f32)>| ratio(b) < EYE_DOT_FAR_OCCLUDED_RATIO;
     let min_gap = EYE_DOT_GAP_PX / xform.scale_x.max(1.0);
     let core_min_w_px = EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y;
     let sx_eps = xform.scale_x.max(f32::EPSILON);
@@ -224,7 +222,7 @@ fn paint_eye_dots(
         let Some((x0, y0, x1, y1)) = bounds[i] else {
             continue;
         };
-        let r_i = ratio(&bounds[i]);
+        let r_i = ratio(x0, x1);
         if r_i < EYE_DOT_FAR_OCCLUDED_RATIO {
             continue;
         }
@@ -253,7 +251,7 @@ fn paint_eye_dots(
             let Some(&(ox0, _, ox1, _)) = other.as_ref() else {
                 continue;
             };
-            if j == i || occluded(other) {
+            if j == i || ratio(ox0, ox1) < EYE_DOT_FAR_OCCLUDED_RATIO {
                 continue;
             }
             let gap = (ox0 - x1).max(x0 - ox1);
@@ -621,7 +619,7 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
         if want > MAX_ATLAS_BYTES {
             return None;
         }
-        if let Some(i) = self.slots.iter().position(|s| s.key == *key) {
+        if let Some(i) = self.slots.iter().rposition(|s| s.key == *key) {
             self.slots[i].last_used = self.clock;
             return Some(self.slots[i].tile.pixels());
         }

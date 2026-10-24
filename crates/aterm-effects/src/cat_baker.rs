@@ -109,13 +109,13 @@ impl CatBaker {
     pub fn clear(&mut self) {
         self.scratch = None;
         self.eye_mask_scratch = None;
-        if self.slots.iter().all(Option::is_none) {
-            return;
-        }
+        let mut cleared_any = false;
         for s in &mut self.slots {
-            *s = None;
+            cleared_any |= s.take().is_some();
         }
-        self.version = self.version.wrapping_add(1);
+        if cleared_any {
+            self.version = self.version.wrapping_add(1);
+        }
     }
 
     /// Monotonic cache version (folded into the frame fingerprint — a rebake must repaint).
@@ -211,14 +211,18 @@ impl CatBaker {
             return None;
         }
         self.bakes_left -= 1;
-        self.slots.iter().position(Option::is_none).or_else(|| {
-            self.slots
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.as_ref().is_none_or(|s| s.last_used != self.clock))
-                .min_by_key(|(idx, s)| (s.as_ref().map_or(0, |s| s.last_used), *idx))
-                .map(|(idx, _)| idx)
-        })
+        let mut victim: Option<(usize, u64)> = None;
+        for (idx, slot) in self.slots.iter().enumerate() {
+            let Some(s) = slot.as_ref() else {
+                return Some(idx);
+            };
+            if s.last_used != self.clock
+                && victim.is_none_or(|(_, best_used)| s.last_used < best_used)
+            {
+                victim = Some((idx, s.last_used));
+            }
+        }
+        victim.map(|(idx, _)| idx)
     }
 
     /// Intern the `w × h` top-left of the `tw`-wide straight RGBA `src` as
@@ -695,22 +699,27 @@ const fn mix3(a: (f32, f32, f32), b: (f32, f32, f32), t: f32) -> (f32, f32, f32)
 
 fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f32) {
     let table = crate::color_math::relative_luminance_table();
-    let lum = |c: (f32, f32, f32)| crate::color_math::relative_luminance_with(table, packed_rgb(c));
-    if lum(coat) >= floor {
+    let lum_rgb = |rgb: u32| crate::color_math::relative_luminance_with(table, rgb);
+    let mut lo_rgb = packed_rgb(coat);
+    if lum_rgb(lo_rgb) >= floor {
         return coat;
     }
-    let (h, s, _v) = rgb2hsv(packed_rgb(coat));
+    let (h, s, _v) = rgb2hsv(lo_rgb);
     let pale = rgb(hsv2rgb(h, s * 0.55, 0.78));
-    if lum(pale) <= floor {
+    let mut hi_rgb = packed_rgb(pale);
+    if lum_rgb(hi_rgb) <= floor {
         return pale;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     for _ in 0..6 {
         let mid = 0.5 * (lo + hi);
-        if lum(mix3(coat, pale, mid)) < floor {
+        let mid_rgb = packed_rgb(mix3(coat, pale, mid));
+        if mid_rgb == lo_rgb || (mid_rgb != hi_rgb && lum_rgb(mid_rgb) < floor) {
             lo = mid;
+            lo_rgb = mid_rgb;
         } else {
             hi = mid;
+            hi_rgb = mid_rgb;
         }
     }
     mix3(coat, pale, hi)
@@ -755,18 +764,17 @@ fn resolve_glyph_layer(
     fills: &ResolvedFills,
     coat_lum: Option<(&crate::color_math::RelativeLuminanceTable, f32)>,
 ) -> ((f32, f32, f32), f32) {
-    let resolved = resolve_layer(layer, fills);
-    if let Some((table, coat_lum)) = coat_lum
-        && layer.role == GlyphRole::Eye
+    if layer.role == GlyphRole::Eye
         && layer.recolor == Recolor::Fixed
+        && let Some((table, coat_lum)) = coat_lum
     {
         let eye_lum = crate::color_math::relative_luminance_with(table, layer.fill);
         let contrast = (eye_lum.max(coat_lum) + 0.05) / (eye_lum.min(coat_lum) + 0.05);
         if contrast < MIN_EYE_CONTRAST {
-            return (fills.eye_ink, resolved.1);
+            return (fills.eye_ink, 1.0);
         }
     }
-    resolved
+    resolve_layer(layer, fills)
 }
 
 /// The mixed-background keyline under an outline layer.
@@ -1218,10 +1226,17 @@ fn paint_glyph(
             crate::color_math::relative_luminance_with(table, packed_rgb(fills.coat)),
         )
     });
-    let eye_line = (!matches!(eyes, EyesFrame::Open))
+    let eye_xform = (!matches!(eyes, EyesFrame::Open))
         .then_some(meta.eye_line)
-        .flatten();
-    let openness = eyes.openness();
+        .flatten()
+        .map_or(xform, |yc| {
+            let openness = eyes.openness();
+            PathTransform {
+                scale_y: openness * xform.scale_y,
+                dy: xform.dy + yc * (1.0 - openness) * xform.scale_y,
+                ..xform
+            }
+        });
     for layer in def.layers {
         // A shut eye shows no iris or catch-light.
         if matches!(eyes, EyesFrame::Blink)
@@ -1229,20 +1244,13 @@ fn paint_glyph(
         {
             continue;
         }
-        let lxform = match eye_line {
-            Some(yc)
-                if matches!(
-                    layer.role,
-                    GlyphRole::Eye | GlyphRole::Iris | GlyphRole::CatchLight
-                ) =>
-            {
-                PathTransform {
-                    scale_y: openness * xform.scale_y,
-                    dy: xform.dy + yc * (1.0 - openness) * xform.scale_y,
-                    ..xform
-                }
-            }
-            _ => xform,
+        let lxform = if matches!(
+            layer.role,
+            GlyphRole::Eye | GlyphRole::Iris | GlyphRole::CatchLight
+        ) {
+            eye_xform
+        } else {
+            xform
         };
         let (col, alpha) = resolve_glyph_layer(layer, fills, coat_lum);
         if matches!(layer.role, GlyphRole::Outline | GlyphRole::Whisker) {

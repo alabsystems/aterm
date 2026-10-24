@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — the portable control-socket stream: pure type aliases to std Unix-domain sockets on Unix, AF_UNIX over winsock (afunix.sys) on Windows, plus the latest-alias, CSPRNG, pid-liveness, SCM_RIGHTS descriptor-passing and shared-memory region helpers the control channel and the PTY keeper need. Std-only but for aterm-libc's declarations and astream-sys's owner-only file rule on Unix; the Windows side is direct ws2_32/kernel32/bcrypt FFI."
+description = "aterm — the portable control-socket stream: pure type aliases to std Unix-domain sockets on Unix, AF_UNIX over winsock (afunix.sys) on Windows, plus the latest-alias, CSPRNG, pid-liveness, SCM_RIGHTS descriptor-passing and shared-memory region helpers the control channel and the PTY keeper need. Std-only but for aterm-libc's declarations and astream-sys's owner-only file rule and close-on-fork mark on Unix; the Windows side is direct ws2_32/kernel32/bcrypt FFI."
 
 # Dependency-free on every platform (the Windows side is raw FFI) so the
 # whole transport stays auditable in one small crate, but for one first-party
@@ -49,8 +49,9 @@ libc = { workspace = true }
 # file and directory it admits to astream's one owner-only rule
 # (`open_nonblocking`, `owner_private`, `owner_private_dir`: the kind, the owner,
 # the macOS access list, the mode), so the ACL FFI it needs lives there, not here;
-# and this boot's id (`process::kin::boot_id`, which a verify run's record names)
-# is its one reader's (`boot_session`: the all-zero id refused).
+# this boot's id (`process::kin::boot_id`, which a verify run's record names)
+# is its one reader's (`boot_session`: the all-zero id refused); and
+# `keep_out_of_children` is its `close_on_fork` (`FD_CLOFORK`).
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 
 [dev-dependencies]

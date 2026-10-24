@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// The `link!` macro is derived from windows-link 0.2.1 src/lib.rs (`unsafe extern`
-// for edition 2024). See ../LICENSE-MIT and ../LICENSE-APACHE for upstream licenses.
+// The `link!` macro is derived from windows-link 0.2.1 src/lib.rs and modified by the aterm
+// project in 2026 (`unsafe extern`, as edition 2024 requires). See ../LICENSE-MIT and
+// ../LICENSE-APACHE for upstream licenses.
 
 //! Win32, COM, and DXGI declarations for aterm's Windows targets ([`com`], [`dxgi`]).
 

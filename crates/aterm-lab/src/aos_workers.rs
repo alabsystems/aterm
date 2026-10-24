@@ -52,8 +52,8 @@ const POLL: Duration = Duration::from_millis(100);
 /// How long shutdown waits for a worker whose pipe has closed to become reapable.
 const REAP_WAIT: Duration = Duration::from_secs(1);
 
-/// How long `post-lie` waits between its result and its lie: longer than a search's last result
-/// takes to reach its step 5, shorter than step 5, the held-out read and the bundle's write.
+/// A debug fault's delay between result and lie. Which search phase sees it depends on the
+/// workload; this delay is not a causal shutdown barrier.
 const POST_LIE_DELAY: Duration = Duration::from_millis(500);
 
 /// The shell's clock is `Instant`'s, measured from one origin, so the core is never handed an
@@ -225,8 +225,7 @@ pub enum FaultKind {
     Dup,
     /// The result, then a different one.
     DupLie,
-    /// The result, then a different one [`POST_LIE_DELAY`] later: for a search's last job, after
-    /// the search has ended, so the shutdown drain is what reads it.
+    /// The result, then a different one [`POST_LIE_DELAY`] later.
     PostLie,
     /// An admitted plan claimed refused at item 0.
     LieRefusal,

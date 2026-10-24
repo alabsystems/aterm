@@ -332,6 +332,17 @@ fn a_session_with_another_agent_replaces_the_vm() {
     rig.ended();
 }
 
+/// A connection the helper closed before the lab set its span (the helper's exit, with the
+/// lab's `connect` already through) is a closed session, which every verb reads as the
+/// helper's end, never the "Invalid argument" XNU answers the span with on such a socket.
+#[test]
+fn a_connection_the_helper_closed_before_its_span_is_a_closed_session() {
+    let (lab, helper) = UnixStream::pair().unwrap();
+    drop(helper);
+    let e = Session::attach(lab, &attach(&helper_a(), AGENT, false), SPAN).unwrap_err();
+    assert_eq!(e, ClientError::Closed);
+}
+
 #[test]
 fn the_same_agent_with_other_shares_swaps_the_share_with_no_reboot() {
     let mut rig = Rig::new();

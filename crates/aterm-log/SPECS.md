@@ -65,7 +65,7 @@ env-mutators	contract	env::{take,unset,set,env_lock,remove_locked,set_locked}	Se
 env-scoped-restore	contract	env::{scoped,scoped_unset,scoped_opt}, Restore::drop	∀ k, v: Option<OsStr>, body: let E0 be the environment on entry. body runs under E0[k:=v], or under E0\k when v = None. If body returns x, scoped_opt returns x. If body panics, the panic propagates unchanged. In both cases, on exit E'(k) = E0(k): a present value is set back, and an absent key is removed, never set to an empty value. Keys other than k are left as body left them. ENV_LOCK is held from before the override until after the restore, so no other env:: call can observe the override.	scoped_restores_the_previous_value_and_the_previous_absence, scoped_unset_hides_a_set_key_for_exactly_the_body, scoped_restores_even_when_the_body_panics	VERY HARD: an FnOnce closure (a higher-order spec), unwinding with Drop of a local guard struct (Option::take), a MutexGuard moved into a struct, generics T and impl AsRef<OsStr>, unsafe process-environment effects	1, 8, 11, 13
 ```
 
-## 2. Test → spec map (TSV; all 23)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

@@ -1060,8 +1060,8 @@ fn read_session(sid: u64, stream: UnixStream, inputs: &Sender<Input>) {
 
 /// Serve `listener` (bound at `socket`) with `core` until it exits, and say why. `inputs`
 /// and `rx` are the two ends of the channel `core` was built with. The core comes back with
-/// its sessions still open, so the caller removes the record and the socket before any lab
-/// sees its session end.
+/// its sessions still open, a connection accepted as it exited among them, so the caller
+/// removes the record and the socket before any lab sees its session end.
 pub fn serve<M: Machine>(
     listener: UnixListener,
     socket: &Path,
@@ -1071,7 +1071,7 @@ pub fn serve<M: Machine>(
 ) -> (String, Core<M>) {
     let start = Instant::now();
     let done = Arc::new(AtomicBool::new(false));
-    {
+    let accept = {
         let inputs = inputs.clone();
         let done = Arc::clone(&done);
         let accepted = std::thread::Builder::new()
@@ -1100,10 +1100,11 @@ pub fn serve<M: Machine>(
                         .spawn(move || read_session(sid, stream, &inputs));
                 }
             });
-        if let Err(e) = accepted {
-            return (format!("the accept thread: {e}"), core);
+        match accepted {
+            Ok(handle) => handle,
+            Err(e) => return (format!("the accept thread: {e}"), core),
         }
-    }
+    };
     {
         let inputs = inputs.clone();
         let done = Arc::clone(&done);
@@ -1128,8 +1129,18 @@ pub fn serve<M: Machine>(
     };
     done.store(true, Ordering::SeqCst);
     // Wake the accept thread so it sees `done` (a helper's process ends anyway; the Fake
-    // helper's thread must not outlive its test).
-    let _ = UnixStream::connect(socket);
+    // helper's thread must not outlive its test). Once it has ended, a connection it opened
+    // behind the input the core exited on (a `down`'s `Stop` as the last session closed)
+    // becomes a session, so it ends with the others: its reader thread holds a duplicate,
+    // and only a session's shutdown gives its lab EOF.
+    if UnixStream::connect(socket).is_ok() {
+        let _ = accept.join();
+        while let Ok(input) = rx.try_recv() {
+            if matches!(input, Input::Opened(..)) {
+                let _ = core.handle(input, start.elapsed());
+            }
+        }
+    }
     (why, core)
 }
 

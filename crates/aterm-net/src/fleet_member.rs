@@ -55,25 +55,16 @@ const PEERS_FILE_MAX: usize = 256 * 1024;
 
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 
-use aterm_uds::private_file::{PrivateDir, check_private_dir, judge_private_dir};
-pub use aterm_uds::private_file::{
-    PrivateFileError, ensure_private_dir, read_private, remove_private, write_private,
+use aterm_uds::private_file::{
+    PrivateDir, check_private_dir, judge_private_dir, remove_private, write_private,
 };
+pub use aterm_uds::private_file::{PrivateFileError, ensure_private_dir, read_private};
 
 /// A new fleet secret, [`SECRET_LEN`] bytes from the OS CSPRNG.
 pub fn mint_secret() -> io::Result<[u8; SECRET_LEN]> {
     let mut secret = [0u8; SECRET_LEN];
     aterm_uds::rand::fill(&mut secret)?;
     Ok(secret)
-}
-
-/// Write `secret` as this machine's [`KEY_FILE`] in the private state directory `dir`, in the one spelling `fleet::read_key_file` reads (lowercase hex and a newline), whole: the listener reads the key every 2 s, and never sees half of one.
-pub fn write_key_file(dir: &Path, secret: &[u8]) -> io::Result<()> {
-    FleetSecret::new(secret)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-    let mut text = aterm_codec::hex::encode_lower(secret);
-    text.push('\n');
-    write_private(dir, KEY_FILE, text.as_bytes())
 }
 
 /// Whether `word` is a node id: 32 lowercase hex digits.
@@ -891,40 +882,23 @@ pub fn read_issuer_book(dir: &Path, issuer: &str) -> Vec<Peer> {
     copies
 }
 
-/// Write `copies` as the member's copy of the book of its issuer `issuer` (a node id) in `dir`, whole ([`write_private`]): what [`copies_of`] made of that issuer's answer.
-pub fn write_issuer_book(dir: &Path, issuer: &str, copies: &[Peer]) -> io::Result<()> {
-    let mut text = format!(
-        "# A copy of this machine's fleet issuer's book: written by aterm at each read of that \
-         book (`aterm fleet peers`, `aterm ctl survey --fleet`, a drive's check of an old copy), \
-         never by hand.\n\
-         {ISSUER_BOOK_HEAD}{issuer}\n"
-    );
-    for copy in copies.iter().filter(|copy| copy.via == Via::IssuerBook) {
-        text.push_str(&copy.line());
-        text.push('\n');
-    }
-    write_private(dir, ISSUER_BOOK_FILE, text.as_bytes())
-}
-
-/// Keep what a read of the issuer's book under `secret` made of it as the copy in `dir` — `copies` of the book of `issuer` ([`write_issuer_book`]), or no copy for `None` — under the book's lock and only while `dir` holds `secret`'s key still, so a read that ends after `aterm fleet leave`, or after a join moved this machine to another fleet, keeps nothing of the fleet it read: whether it kept it.
+/// Keep what a read of the issuer's book under `secret` made of it as the copy in `dir` ([`HeldBook::keep_issuer_book`]) by [`write_held`], while that fleet is held: whether it kept it.
 /// # Errors
-/// The lock cannot be taken, or the copy cannot be written or removed.
+/// The book's lock cannot be taken, or the copy cannot be written or removed.
 pub fn keep_issuer_book(
     dir: &Path,
     secret: &FleetSecret,
     copy: Option<(&str, &[Peer])>,
-) -> io::Result<bool> {
-    let _lock = BookLock::take(dir, LOCK_WAIT)?;
-    if crate::fleet::read_key_file(dir).ok().as_ref() != Some(secret) {
-        return Ok(false);
+) -> Result<bool, String> {
+    match write_held(dir, Began::Under(&Held::Key(secret.clone())), |book| {
+        book.keep_issuer_book(copy)
+    }) {
+        Ok(kept) => kept
+            .map(|()| true)
+            .map_err(|e| format!("{ISSUER_BOOK_FILE}: {e}")),
+        Err(Unwritten::Moved) => Ok(false),
+        Err(Unwritten::Lock(why)) => Err(why),
     }
-    match copy {
-        Some((issuer, copies)) => write_issuer_book(dir, issuer, copies)?,
-        None => {
-            remove_private(dir, ISSUER_BOOK_FILE)?;
-        }
-    }
-    Ok(true)
 }
 
 fn book_text(book: &[Peer]) -> String {
@@ -938,30 +912,202 @@ fn book_text(book: &[Peer]) -> String {
     text
 }
 
-/// Edit the book in `dir` under its lock: read it ([`read_peers`]), run `edit`, and write it back whole when `edit` changed it or a key is held beside entries of another fleet, those entries kept while no key is held and dropped while one is (by an `edit` that changes nothing too), so an older aterm, which reads no [`Peer::fleet`], never reads the old issuer as the new key's.
+/// Edit the book in `dir` ([`HeldBook::update`]) as a verb's first write ([`write_held`]).
+/// # Errors
+/// The lock cannot be taken, the book cannot be read or written, or `edit` refuses.
 pub fn update_peers<R>(
     dir: &Path,
     edit: impl FnOnce(&mut Vec<Peer>) -> Result<R, String>,
 ) -> Result<R, String> {
-    hold_book(dir)?.update(edit)
+    write_held(dir, Began::Here, |book| book.update(edit)).map_err(|e| e.to_string())?
 }
 
-/// The book's lock in a state directory, held while this lives ([`hold_book`]): no other edit of the book, an older aterm's included, comes between the edits made under it.
+/// The fleet a state directory holds, as [`write_held`] compares it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// No key: no fleet.
+    Nothing,
+    /// The fleet of this secret.
+    Key(FleetSecret),
+    /// A key file that breaks the key file's rules.
+    Unreadable,
+}
+
+impl Held {
+    /// The fleet `dir` holds now.
+    #[must_use]
+    pub fn read(dir: &Path) -> Self {
+        match crate::fleet::read_key_file(dir) {
+            Ok(secret) => Self::Key(secret),
+            Err(crate::fleet::KeyFileError::Missing) => Self::Nothing,
+            Err(_) => Self::Unreadable,
+        }
+    }
+
+    /// Its secret, when it is a fleet's.
+    #[must_use]
+    pub const fn secret(&self) -> Option<&FleetSecret> {
+        match self {
+            Self::Key(secret) => Some(secret),
+            Self::Nothing | Self::Unreadable => None,
+        }
+    }
+}
+
+/// What a write of fleet state is made under ([`write_held`]).
+#[derive(Clone, Copy, Debug)]
+pub enum Began<'a> {
+    /// A verb's first write: it reads again under the lock whatever it read before, and the fleet it finds there ([`HeldBook::held`]) is the one its later writes are made under.
+    Here,
+    /// A later write, or one a read or a served connection makes under a fleet's key: only while the state holds that fleet still.
+    Under(&'a Held),
+}
+
+/// Why [`write_held`] wrote nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unwritten {
+    /// The book's lock was not taken, for this reason.
+    Lock(String),
+    /// The state holds another fleet than the write was made under.
+    Moved,
+}
+
+impl fmt::Display for Unwritten {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lock(why) => f.write_str(why),
+            Self::Moved => f.write_str(
+                "this machine holds another fleet than the one this began under: an `aterm fleet \
+                 leave`, or a join of another code, came between",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Unwritten {}
+
+/// THE WRITE RULE (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): every write of fleet state — [`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`] and aterm.toml's `[fleet]` — is made in `write`, under the book's lock in `dir` and only while `dir` holds the fleet `began` names, from what `write` reads under it; a leave's is [`leave_held`]'s, and a level's swaps aterm.toml alone. The files are written by the [`HeldBook`] `write` is handed, and aterm.toml's `[fleet]` beside it, by convention. The lock is taken once per call, never inside another, for at most two seconds; aterm.toml's write lock, where `write` takes it, comes after it.
+/// # Errors
+/// [`Unwritten::Lock`]: another writer holds the lock past its wait, or it cannot be taken; [`Unwritten::Moved`]: `dir` holds another fleet than `began`.
+pub fn write_held<R>(
+    dir: &Path,
+    began: Began<'_>,
+    write: impl FnOnce(&HeldBook<'_>) -> R,
+) -> Result<R, Unwritten> {
+    let lock = BookLock::take(dir, LOCK_WAIT)
+        .map_err(|e| Unwritten::Lock(format!("{PEERS_FILE}'s lock: {e}")))?;
+    let book = HeldBook {
+        dir,
+        held: Held::read(dir),
+        _lock: lock,
+    };
+    if let Began::Under(began) = began
+        && *began != book.held
+    {
+        return Err(Unwritten::Moved);
+    }
+    Ok(write(&book))
+}
+
+/// A leave's write, a first write of its own ([`write_held`]): the directory made private first, as an init or a join makes it (made where there is none, narrowed where it is open to others: [`Leaving::narrowed`]), then the book's lock taken, and gone on without the lock only where no writer could make the directory or take the lock either ([`stops_every_edit`]), so no odd state directory keeps a machine in a fleet. `remove` is handed a [`Leaving`], which removes the fleet's files and writes none.
+/// # Errors
+/// [`Unwritten::Lock`]: the directory cannot be narrowed, or made where another writer could make it, or another writer holds the lock past its wait, or it cannot be taken where another writer could take it (the directory removed under it among them).
+pub fn leave_held<R>(dir: &Path, remove: impl FnOnce(&Leaving<'_>) -> R) -> Result<R, Unwritten> {
+    let narrowed = match judge_private_dir(dir) {
+        Ok(PrivateDir::Missing | PrivateDir::Open(_)) => match ensure_private_dir(dir) {
+            Ok(narrowed) => narrowed,
+            // None to make, by any writer: none to lock either.
+            Err(e)
+                if stops_every_edit(&e)
+                    && matches!(judge_private_dir(dir), Ok(PrivateDir::Missing)) =>
+            {
+                return Ok(remove(&Leaving {
+                    dir,
+                    narrowed: None,
+                    _lock: None,
+                }));
+            }
+            Err(e) => return Err(Unwritten::Lock(format!("{}: {e}", dir.display()))),
+        },
+        _ => None,
+    };
+    let lock = match BookLock::take(dir, LOCK_WAIT) {
+        Ok(lock) => Some(lock),
+        Err(e) if stops_every_edit(&e) => None,
+        Err(e) => {
+            return Err(Unwritten::Lock(match narrowed {
+                Some(was) => format!(
+                    "{PEERS_FILE}'s lock: {e}; {} was open to other users ({was:o}), and is 0700 now",
+                    dir.display()
+                ),
+                None => format!("{PEERS_FILE}'s lock: {e}"),
+            }));
+        }
+    };
+    Ok(remove(&Leaving {
+        dir,
+        narrowed,
+        _lock: lock,
+    }))
+}
+
+/// The book's lock in a state directory, held while this lives ([`write_held`]): no other writer, an older aterm's edit of the book included, comes between the writes made under it. Through this API it alone writes the fleet's files ([`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`]), so none is written without the lock; a leave removes them by a [`Leaving`].
 pub struct HeldBook<'a> {
     dir: &'a Path,
+    held: Held,
     _lock: BookLock,
 }
 
-/// Take the book's lock in `dir`, as [`update_peers`] does.
+/// A leave's hold on a state directory ([`leave_held`]): the book's lock, or none where no writer could take it either. It removes the fleet's files and writes none.
+pub struct Leaving<'a> {
+    dir: &'a Path,
+    narrowed: Option<u32>,
+    _lock: Option<BookLock>,
+}
+
+impl Leaving<'_> {
+    /// The mode the state directory had before it was narrowed, where it was open to others.
+    #[must_use]
+    pub const fn narrowed(&self) -> Option<u32> {
+        self.narrowed
+    }
+
+    /// Remove the state directory's file `name`: whether it was there.
+    /// # Errors
+    /// `name` is no one file name, or the file is there and cannot be removed.
+    pub fn remove(&self, name: &str) -> io::Result<bool> {
+        remove_private(self.dir, name)
+    }
+}
+
+/// The book's lock alone, as another aterm's edit holds it: a test's stand-in for that edit and its writes, which no verb takes.
 /// # Errors
 /// Another edit holds it past the lock's wait, or it cannot be taken.
+#[cfg(any(test, debug_assertions))]
 pub fn hold_book(dir: &Path) -> Result<HeldBook<'_>, String> {
     let lock = BookLock::take(dir, LOCK_WAIT).map_err(|e| format!("{PEERS_FILE}'s lock: {e}"))?;
-    Ok(HeldBook { dir, _lock: lock })
+    Ok(HeldBook {
+        dir,
+        held: Held::read(dir),
+        _lock: lock,
+    })
+}
+
+/// Whether another take holds the book's lock in `dir` now: a test's look at whether a step runs under it.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn book_held(dir: &Path) -> bool {
+    matches!(BookLock::take(dir, Duration::ZERO), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
 }
 
 impl HeldBook<'_> {
-    /// [`update_peers`]'s edit, under this lock.
+    /// The fleet the state held as the lock was taken.
+    #[must_use]
+    pub const fn held(&self) -> &Held {
+        &self.held
+    }
+
+    /// Edit the book: read it ([`read_peers`]), run `edit`, and write it back whole when `edit` changed it or a key is held beside entries of another fleet, those entries kept while no key is held and dropped while one is (by an `edit` that changes nothing too), so an older aterm, which reads no [`Peer::fleet`], never reads the old issuer as the new key's.
     /// # Errors
     /// The book cannot be read or written, or `edit` refuses.
     pub fn update<R>(
@@ -982,38 +1128,61 @@ impl HeldBook<'_> {
         }
         Ok(out)
     }
+
+    /// Keep `copy` as the copy of the issuer's book ([`ISSUER_BOOK_FILE`]), whole: the copies [`copies_of`] made of the answer of the issuer `issuer` (a node id), or none for `None`.
+    /// # Errors
+    /// The copy cannot be written or removed.
+    pub fn keep_issuer_book(&self, copy: Option<(&str, &[Peer])>) -> io::Result<()> {
+        let Some((issuer, copies)) = copy else {
+            return self.remove(ISSUER_BOOK_FILE).map(|_| ());
+        };
+        let mut text = format!(
+            "# A copy of this machine's fleet issuer's book: written by aterm at each read of \
+             that book (`aterm fleet peers`, `aterm ctl survey --fleet`, a drive's check of an \
+             old copy), never by hand.\n\
+             {ISSUER_BOOK_HEAD}{issuer}\n"
+        );
+        for copy in copies.iter().filter(|copy| copy.via == Via::IssuerBook) {
+            text.push_str(&copy.line());
+            text.push('\n');
+        }
+        write_private(self.dir, ISSUER_BOOK_FILE, text.as_bytes())
+    }
+
+    /// Write `secret` as this machine's [`KEY_FILE`], in the one spelling `fleet::read_key_file` reads (lowercase hex and a newline), whole: the listener reads the key every 2 s, and never sees half of one.
+    /// # Errors
+    /// `secret` is no fleet secret, or the key cannot be written.
+    pub fn write_key(&self, secret: &[u8]) -> io::Result<()> {
+        FleetSecret::new(secret)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        let mut text = aterm_codec::hex::encode_lower(secret);
+        text.push('\n');
+        write_private(self.dir, KEY_FILE, text.as_bytes())
+    }
+
+    /// Write `code` as the join code this machine issues ([`CODE_FILE`]), whole.
+    /// # Errors
+    /// The code cannot be written.
+    pub fn write_code(&self, code: &JoinCode) -> io::Result<()> {
+        write_private(self.dir, CODE_FILE, format!("{}\n", code.text()).as_bytes())
+    }
+
+    /// Remove the state directory's file `name`: whether it was there.
+    /// # Errors
+    /// `name` is no one file name, or the file is there and cannot be removed.
+    pub fn remove(&self, name: &str) -> io::Result<bool> {
+        remove_private(self.dir, name)
+    }
 }
 
-/// `act` under the book's lock in `dir`, so no edit of the book in progress writes it after `act` removed it (`aterm fleet leave`): `dir` narrowed first where it is open to others, as `join` and `peers add` narrow it before their edits (`act` is given the mode it had, and a refusal names it), and without the lock only where no edit could take it either ([`stops_every_edit`]).
-pub fn with_book_held<R>(dir: &Path, act: impl FnOnce(Option<u32>) -> R) -> Result<R, String> {
-    let narrowed = match judge_private_dir(dir) {
-        Ok(PrivateDir::Open(_)) => {
-            ensure_private_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?
-        }
-        _ => None,
-    };
-    let _lock = match BookLock::take(dir, LOCK_WAIT) {
-        Ok(lock) => Some(lock),
-        Err(e) if stops_every_edit(&e) => None,
-        Err(e) => {
-            return Err(match narrowed {
-                Some(was) => format!(
-                    "{PEERS_FILE}'s lock: {e}; {} was open to other users ({was:o}), and is 0700 now",
-                    dir.display()
-                ),
-                None => format!("{PEERS_FILE}'s lock: {e}"),
-            });
-        }
-    };
-    Ok(act(narrowed))
-}
-
-/// Whether `e`, why the book's lock was not taken, stops every edit of the book too: the directory is one no edit narrows (a symlink, another user's, one an access list opens) or none, which holds no book, or the lock is no file this user can lock — never another edit holding it, nor a failure of the moment (no descriptor free, an interrupted call).
+/// Whether `e`, why the state directory was not made or the book's lock not taken, stops every edit of the book too: the directory is one no edit narrows (a symlink, a file, another user's, one an access list opens) or makes (beneath a file or a link to nothing, in a directory or on a volume this user cannot write), or the lock is no file this user can lock — never another edit holding it, nor a directory gone (an init or a join makes one, and takes the lock there), nor a failure of the moment (no descriptor or space free, an interrupted call).
 fn stops_every_edit(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::PermissionDenied
-            | io::ErrorKind::NotFound
+            | io::ErrorKind::AlreadyExists
+            | io::ErrorKind::NotADirectory
+            | io::ErrorKind::ReadOnlyFilesystem
             | io::ErrorKind::InvalidData
             | io::ErrorKind::Unsupported
     ) || matches!(e.raw_os_error(), Some(libc::ELOOP | libc::EISDIR))
@@ -1671,11 +1840,15 @@ pub const NOT_THE_ISSUER: &str = "this machine is no fleet's issuer: it holds no
                                   it records no members (join at the machine whose `aterm fleet \
                                   init` wrote the code)";
 
-/// The issuer's end of a join, on a stream the handshake proved for op `join`: read the member's [`Registration`], record it in the book in `state_dir` with the address `from` it came from and the key it names — which `proof`, the node the connection's dialer proved ([`Served::peer_node`]), must be: that node and that key, or the record is refused — and answer — `OK` naming the issuer `issuer` gives and the book's size, or `ERR <why>` (a malformed record, a key the connection did not prove, a known node's registration that proves another key than the book binds or none ([`record`]), the issuer's own node id, a full or unreadable book, an issuer that cannot name itself — no node id, or a host that is no [`is_host`], which the member's [`register`] would refuse after the book recorded it — or a machine that is no fleet's issuer: one whose `state_dir` holds no [`CODE_FILE`], so that a member's book holds only what its own `join` and `peers add` put there).
+/// The refusal of a join whose connection was proved under a fleet this machine left, or rotated away from, before it recorded it ([`serve_join`]).
+pub const MOVED_ON: &str = "this machine left the fleet, or rotated its secret, while the join was \
+                            served, so nothing was recorded: join with the code it issues now";
+
+/// The issuer's end of a join, on a stream the handshake proved for op `join` under `secret`: read the member's [`Registration`], record it in the book in `state_dir` with the address `from` it came from and the key it names — which `proof`, the node the connection's dialer proved ([`Served::peer_node`]), must be: that node and that key, or the record is refused — while that fleet is held ([`write_held`]), and answer — `OK` naming the issuer `issuer` gives and the book's size, or `ERR <why>` (a malformed record, a key the connection did not prove, a known node's registration that proves another key than the book binds or none ([`record`]), the issuer's own node id, a full or unreadable book, a fleet left or rotated meanwhile ([`MOVED_ON`]), an issuer that cannot name itself — no node id, or a host that is no [`is_host`], which the member's [`register`] would refuse after the book recorded it — or a machine that is no fleet's issuer: one whose `state_dir` holds no [`CODE_FILE`], so that a member's book holds only what its own `join` and `peers add` put there).
 pub fn serve_join<S: Read + Write>(
     stream: &mut S,
     (from, proof): (IpAddr, Option<&NodeProof>),
-    state_dir: &Path,
+    (state_dir, secret): (&Path, &FleetSecret),
     issuer: impl FnOnce() -> Result<Issuer, String>,
     now_ms: u64,
 ) -> io::Result<Result<(Recorded, Peer), String>> {
@@ -1729,13 +1902,23 @@ pub fn serve_join<S: Read + Write>(
                     fleet: None,
                 };
                 let recorded_as = peer.clone();
-                update_peers(state_dir, |book| {
-                    // Under the book's lock: a `leave` that took the code meanwhile left no fleet to record in.
-                    if !issues() {
-                        return Err(NOT_THE_ISSUER.to_owned());
-                    }
-                    record(book, peer).map(|recorded| (recorded, book.len()))
-                })
+                // While the fleet the connection was proved under is held, and this machine issues it still.
+                match write_held(
+                    state_dir,
+                    Began::Under(&Held::Key(secret.clone())),
+                    |book| {
+                        if !issues() {
+                            return Err(NOT_THE_ISSUER.to_owned());
+                        }
+                        book.update(|book| {
+                            record(book, peer).map(|recorded| (recorded, book.len()))
+                        })
+                    },
+                ) {
+                    Ok(recorded) => recorded,
+                    Err(Unwritten::Moved) => Err(MOVED_ON.to_owned()),
+                    Err(Unwritten::Lock(why)) => Err(why),
+                }
                 .map(|(recorded, peers)| (recorded, peers, issuer, recorded_as))
             }),
     };

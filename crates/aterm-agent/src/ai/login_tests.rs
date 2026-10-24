@@ -510,7 +510,7 @@ fn a_cli_with_its_own_roster_signs_in_through_its_renewal_and_one_without_runs_i
     let runner = FakeRunner::quiet();
     let done = rig.sign_in(&runner, &store, &empty, &row(&KIMI, State::SignedOut), &[]);
     assert!(
-        matches!(done, Done::Refused(ref why) if why.contains("no row with an email")),
+        matches!(done, Done::Refused(ref why) if why.contains("lists no email")),
         "{done:?}"
     );
     assert!(runner.calls().is_empty());

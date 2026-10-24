@@ -5,14 +5,14 @@
 //! shared channel's back-pressure (plan §8's queue saturation).
 
 use std::io::Write as _;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use aterm_effects::aos_momentum::dist::{FrameFault, MAX_FRAME, Msg, Sender};
 use aterm_effects::aos_momentum::lease::{LIMITS_V1, Token, WorkerId};
 use aterm_effects::aos_momentum::m4::Spread;
+use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
 use super::{
     Fault, FaultKind, PoolArgs, STDERR_TAIL, Tail, Threads, Timed, frame_bytes, percentiles,
@@ -211,6 +211,24 @@ fn pool_limits_are_v1_but_the_window_and_the_size() {
     assert_eq!(none.limits().window_ns, LIMITS_V1.window_ns);
 }
 
+/// Dropping the receiver releases blocked sends, closes each reader's pipe and releases any
+/// writer blocked in that pipe. Keep both sets of handles on assertion failures as well.
+#[derive(Default)]
+struct Readers {
+    rx: Option<mpsc::Receiver<(WorkerId, aterm_effects::aos_momentum::dist::Event)>>,
+    readers: Vec<std::thread::JoinHandle<()>>,
+    writers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Readers {
+    fn drop(&mut self) {
+        drop(self.rx.take());
+        for h in self.readers.drain(..).chain(self.writers.drain(..)) {
+            let _ = h.join();
+        }
+    }
+}
+
 /// Plan §8's queue saturation: three readers into one channel of capacity 2 × 3. While the
 /// coordinator reads nothing, the readers block, so at most capacity + one in hand per reader are
 /// ever counted queued; once it reads, every frame arrives, in order per worker, and nothing is
@@ -222,13 +240,18 @@ fn a_full_channel_blocks_its_readers_and_loses_nothing() {
     let cap = 2 * usize::try_from(READERS).expect("small");
     let (tx, rx) = mpsc::sync_channel(cap);
     let queued = Arc::new(AtomicUsize::new(0));
-    let peak = Arc::new(Mutex::new(0usize));
-    let mut writers = Vec::new();
+    let mut owned = Readers {
+        rx: Some(rx),
+        readers: Vec::new(),
+        writers: Vec::new(),
+    };
     for w in 0..READERS {
         let (reader, mut writer) = std::io::pipe().expect("a pipe");
         let (tx, queued) = (tx.clone(), Arc::clone(&queued));
-        std::thread::spawn(move || read_worker(WorkerId(w), reader, tx, queued));
-        writers.push(std::thread::spawn(move || {
+        owned.readers.push(std::thread::spawn(move || {
+            read_worker(WorkerId(w), reader, tx, queued)
+        }));
+        owned.writers.push(std::thread::spawn(move || {
             for k in 0..FRAMES {
                 let bytes = frame_bytes(&progress(k)).expect("small");
                 writer.write_all(&bytes).expect("the reader is alive");
@@ -236,21 +259,14 @@ fn a_full_channel_blocks_its_readers_and_loses_nothing() {
         }));
     }
     drop(tx);
-    // Let every reader fill the channel and block.
-    for _ in 0..50 {
-        std::thread::sleep(Duration::from_millis(10));
-        let mut p = peak.lock().expect("unpoisoned");
-        *p = (*p).max(queued.load(Ordering::SeqCst));
-    }
     let bound = cap + usize::try_from(READERS).expect("small");
-    let seen = *peak.lock().expect("unpoisoned");
-    assert!(
-        (cap..=bound).contains(&seen),
-        "queued {seen}, capacity {cap}"
-    );
+    until_within(MUST_HAPPEN, "all readers behind a full channel", || {
+        (queued.load(Ordering::SeqCst) == bound).then_some(())
+    });
+    let rx = owned.rx.as_ref().expect("held until cleanup");
     let mut next = [0u16; 3];
     let mut eofs = 0;
-    while let Ok((w, ev)) = rx.recv_timeout(Duration::from_secs(10)) {
+    while let Ok((w, ev)) = rx.recv_timeout(MUST_HAPPEN) {
         queued.fetch_sub(1, Ordering::SeqCst);
         let i = usize::try_from(w.0).expect("small");
         match ev {
@@ -265,9 +281,11 @@ fn a_full_channel_blocks_its_readers_and_loses_nothing() {
             break;
         }
     }
-    for h in writers {
-        h.join().expect("a writer");
-    }
     assert_eq!(next, [FRAMES; 3]);
     assert_eq!(eofs, READERS);
+    let mut panicked = false;
+    for h in owned.readers.drain(..).chain(owned.writers.drain(..)) {
+        panicked |= h.join().is_err();
+    }
+    assert!(!panicked, "a reader or writer panicked");
 }

@@ -1545,8 +1545,8 @@ impl MatrixRain {
         }
         if let Some(wr) = ctx.wave_row
             && wr < rows
-            && trail_level(&cp, cv.eff_tick, cv.k, wr).is_none()
             && self.cell_eligible(wr, col, ctx.input)
+            && trail_level(&cp, cv.eff_tick, cv.k, wr).is_none()
         {
             let lvl = 15u32.saturating_sub(ctx.pen);
             if quads.len() >= ctx.cap {

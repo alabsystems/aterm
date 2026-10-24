@@ -118,6 +118,20 @@ fn read_error(e: ProtoError, what: &str, span: Duration) -> ClientError {
     }
 }
 
+/// A fresh control connection's refused read span. A helper that closed the connection
+/// before the span was set (its exit drops the connection its accept thread took, and its
+/// listener aborts the ones still queued) has ended the session, and XNU refuses every
+/// option on a socket that can neither send nor receive (`sosetopt`: EINVAL): that is
+/// `Closed`, as a refused `connect` is. The span is never zero (std refuses one itself,
+/// with no errno) and a bad `timeval` is EDOM, so no other refusal reads as EINVAL here.
+fn span_error(e: std::io::Error) -> ClientError {
+    if e.raw_os_error() == Some(libc::EINVAL) {
+        ClientError::Closed
+    } else {
+        ClientError::Io(e.to_string())
+    }
+}
+
 /// A helper a [`Lab`] found dead or stopped before it started its own: what a start that
 /// meets the framework's storage refusal names (§5.1, fact 44).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,8 +205,7 @@ impl Session {
         span: Duration,
     ) -> Result<Self, ClientError> {
         let chan = Channel::new(stream);
-        chan.set_span(Some(span))
-            .map_err(|e| ClientError::Io(e.to_string()))?;
+        chan.set_span(Some(span)).map_err(span_error)?;
         let mut session = Self {
             chan,
             span,
@@ -770,8 +783,7 @@ fn connect(paths: &Paths, span: Duration) -> Result<Channel, ClientError> {
         _ => ClientError::Io(format!("{}: {e}", socket.display())),
     })?;
     let chan = Channel::new(stream);
-    chan.set_span(Some(span))
-        .map_err(|e| ClientError::Io(e.to_string()))?;
+    chan.set_span(Some(span)).map_err(span_error)?;
     Ok(chan)
 }
 

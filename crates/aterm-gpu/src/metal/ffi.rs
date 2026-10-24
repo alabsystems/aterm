@@ -444,7 +444,7 @@ mod window_server_door {
             Self::system_default_asks_window_server()
         }
 
-        /// [`Self::preferred`] where the device listing decides it, `None` where only the window server could: what code that renders nothing (a headless launch's warm) may ask for.
+        /// [`Self::preferred`] where the device listing decides it, `None` where only the window server could.
         pub(crate) fn preferred_listed() -> Option<Self> {
             let want_high = aterm_types::dev_seam!("ATERM_GPU_POWER")
                 .is_some_and(|v| v.eq_ignore_ascii_case("high"));
@@ -466,7 +466,7 @@ mod window_server_door {
 }
 
 impl Device {
-    fn listed(want_high: bool) -> Option<Self> {
+    pub(crate) fn listed(want_high: bool) -> Option<Self> {
         static SAID: std::sync::Once = std::sync::Once::new();
         let _pool = AutoreleasePool::new();
         let (all, gpus) = Self::listing()?;
@@ -679,7 +679,7 @@ impl Device {
     }
 
     /// `-[MTLDevice maxBufferLength]`, the Metal equivalent of wgpu's `limits().max_buffer_size`.
-    #[cfg(wgpu_arm)]
+    #[cfg(any(test, wgpu_arm, feature = "compute"))]
     pub(crate) fn max_buffer_length(&self) -> usize {
         // SAFETY: `-maxBufferLength` is an `NSUInteger` getter on a live `MTLDevice`.
         unsafe {
@@ -883,7 +883,7 @@ unsafe impl Encode for MtlSize {
 
 impl Device {
     /// Build an `MTLComputePipelineState` from a kernel function.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "compute"))]
     pub(crate) fn new_compute_pipeline(&self, f: &Obj) -> Result<Obj, String> {
         let _pool = AutoreleasePool::new();
         let mut err: Id = Id::NIL;
@@ -900,6 +900,303 @@ impl Device {
         // SAFETY: `pso` is the +1 return described above.
         unsafe { Obj::from_owned(pso) }.ok_or_else(|| ns_error_string(err))
     }
+}
+
+/// `MTLDataTypeUInt`, the type of every function constant the compute kernels declare.
+#[cfg(any(test, feature = "compute"))]
+const DATA_TYPE_UINT: usize = 33;
+
+/// An `MTLFunctionConstantValues`: the values a specialised function is built with.
+#[cfg(any(test, feature = "compute"))]
+pub(crate) struct FunctionConstants(Obj);
+
+#[cfg(any(test, feature = "compute"))]
+impl FunctionConstants {
+    /// An empty set of values.
+    pub(crate) fn new() -> Option<Self> {
+        // SAFETY: alloc/init is +1 (nil passes through `init` as nil); `Obj` releases it exactly once on drop.
+        unsafe {
+            let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
+            let raw = alloc(class(c"MTLFunctionConstantValues"), sel(c"alloc"));
+            let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+            Obj::from_owned(init(raw, sel(c"init"))).map(Self)
+        }
+    }
+
+    /// Set the `uint` function constant at `index` to `value`.
+    pub(crate) fn set_u32(&self, value: u32, index: usize) {
+        // SAFETY: `-setConstantValue:type:atIndex:` copies the 4 bytes `MTLDataTypeUInt` names from the pointer during the call, and the pointer is a live local `u32`; the receiver is a live `MTLFunctionConstantValues`.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel, *const c_void, usize, usize) =
+                checked_msg();
+            f(
+                self.0.id(),
+                sel(c"setConstantValue:type:atIndex:"),
+                ptr::from_ref(&value).cast(),
+                DATA_TYPE_UINT,
+                index,
+            );
+        }
+    }
+}
+
+#[cfg(any(test, feature = "compute"))]
+impl Library {
+    /// Specialise the entry point `name` with `constants` (`newFunctionWithName:constantValues:error:`).
+    pub(crate) fn specialized_function(
+        &self,
+        name: &str,
+        constants: &FunctionConstants,
+    ) -> Result<Obj, String> {
+        let _pool = AutoreleasePool::new();
+        let n = ns_string(name).ok_or_else(|| "NSString allocation failed".to_owned())?;
+        let mut err: Id = Id::NIL;
+        // SAFETY: `new*` family, +1 or nil with `err` set to an NSError autoreleased into the pool above, which outlives its read below; the name and the constant values are only read during the call.
+        let f = unsafe {
+            let m: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, *mut Id) -> Id = checked_msg();
+            m(
+                self.0.id(),
+                sel(c"newFunctionWithName:constantValues:error:"),
+                n.id(),
+                constants.0.id(),
+                &raw mut err,
+            )
+        };
+        // SAFETY: `f` is the +1 return described above.
+        unsafe { Obj::from_owned(f) }.ok_or_else(|| ns_error_string(err))
+    }
+}
+
+#[cfg(any(test, feature = "compute"))]
+impl Device {
+    /// `-[MTLDevice hasUnifiedMemory]`: whether shared storage is the memory the CPU writes.
+    pub(crate) fn has_unified_memory(&self) -> bool {
+        // SAFETY: `-hasUnifiedMemory` is a `BOOL` getter on a live `MTLDevice`, read through [`ObjcBool`].
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> ObjcBool = checked_msg();
+            f(self.id(), sel(c"hasUnifiedMemory")).as_bool()
+        }
+    }
+
+    /// `-[MTLDevice currentAllocatedSize]`: the bytes this process's Metal objects hold on the device.
+    pub(crate) fn current_allocated_size(&self) -> usize {
+        // SAFETY: `-currentAllocatedSize` is an `NSUInteger` getter on a live `MTLDevice`.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
+            f(self.id(), sel(c"currentAllocatedSize"))
+        }
+    }
+
+    /// `-[MTLDevice recommendedMaxWorkingSetSize]`, in bytes.
+    pub(crate) fn recommended_max_working_set_size(&self) -> u64 {
+        // SAFETY: `-recommendedMaxWorkingSetSize` is a `uint64_t` getter on a live `MTLDevice`.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> u64 = checked_msg();
+            f(self.id(), sel(c"recommendedMaxWorkingSetSize"))
+        }
+    }
+}
+
+/// `-[MTLComputePipelineState maxTotalThreadsPerThreadgroup]` of `pso`, a live compute pipeline state.
+#[cfg(any(test, feature = "compute"))]
+pub(crate) fn max_total_threads_per_threadgroup(pso: &Obj) -> usize {
+    // SAFETY: `-maxTotalThreadsPerThreadgroup` is an `NSUInteger` getter, and every caller passes the live `MTLComputePipelineState` `new_compute_pipeline` returned.
+    unsafe {
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
+        f(pso.id(), sel(c"maxTotalThreadsPerThreadgroup"))
+    }
+}
+
+/// `-[MTLComputePipelineState threadExecutionWidth]` of `pso`, a live compute pipeline state.
+#[cfg(any(test, feature = "compute"))]
+pub(crate) fn thread_execution_width(pso: &Obj) -> usize {
+    // SAFETY: `-threadExecutionWidth` is an `NSUInteger` getter, and every caller passes the live `MTLComputePipelineState` `new_compute_pipeline` returned.
+    unsafe {
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
+        f(pso.id(), sel(c"threadExecutionWidth"))
+    }
+}
+
+/// A +1 `MTLCommandBuffer` from `queue`'s `-commandBuffer`, which retains every resource it references until it completes.
+#[cfg(any(test, feature = "compute"))]
+pub(crate) fn command_buffer(queue: &Obj) -> Option<Obj> {
+    let _pool = AutoreleasePool::new();
+    // SAFETY: `-commandBuffer` on a live `MTLCommandQueue` returns a +0 buffer owned by the pool above, retained to +1 before the pool pops.
+    unsafe {
+        let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+        Obj::retain(get(queue.id(), sel(c"commandBuffer")))
+    }
+}
+
+/// Which `MTLCommandBuffer` event a handler block runs on.
+#[cfg(any(test, feature = "compute"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CbEvent {
+    /// `addScheduledHandler:`.
+    Scheduled,
+    /// `addCompletedHandler:`.
+    Completed,
+}
+
+/// Hang `block` on `cb`'s `event`; Metal copies (retains) the block, so the caller's reference is released independently.
+///
+/// # Safety
+/// `cb` must be a live `MTLCommandBuffer` that is not yet committed, and `block` must have the prototype `void (^)(id<MTLCommandBuffer>)`, which Metal invokes it with.
+#[cfg(any(test, feature = "compute"))]
+pub(crate) unsafe fn add_handler(cb: &Obj, event: CbEvent, block: &aterm_objc::RcBlock) {
+    let name = match event {
+        CbEvent::Scheduled => sel(c"addScheduledHandler:"),
+        CbEvent::Completed => sel(c"addCompletedHandler:"),
+    };
+    // SAFETY: the caller pins `cb` live and uncommitted and the block's prototype; both selectors take one `MTLCommandBufferHandler` and copy it.
+    unsafe {
+        let add: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::BlockPtr) = checked_msg();
+        add(cb.id(), name, block.as_block_ptr());
+    }
+}
+
+/// `-commit` on `cb`, a live `MTLCommandBuffer` whose encoders have all ended.
+#[cfg(any(test, feature = "compute"))]
+pub(crate) fn commit(cb: &Obj) {
+    // SAFETY: `commit` is a void message on a live command buffer; every caller ends its one encoder (`ComputeEncoder` ends on drop) before committing.
+    unsafe {
+        let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
+        f(cb.id(), sel(c"commit"));
+    }
+}
+
+/// `GPUStartTime` and `GPUEndTime` of `cb`, a live `MTLCommandBuffer`, in seconds on `mach_absolute_time`'s base (0 until it ran).
+#[cfg(any(test, feature = "compute"))]
+pub(crate) fn gpu_times(cb: Id) -> (f64, f64) {
+    // SAFETY: `GPUStartTime` and `GPUEndTime` are `CFTimeInterval` (double) getters on a live command buffer, which every caller holds (Metal passes it to the handler).
+    unsafe {
+        let get: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = checked_msg();
+        (get(cb, sel(c"GPUStartTime")), get(cb, sel(c"GPUEndTime")))
+    }
+}
+
+/// An open `MTLComputeCommandEncoder`, ended when dropped.
+#[cfg(any(test, feature = "compute"))]
+pub(crate) struct ComputeEncoder(Obj);
+
+#[cfg(any(test, feature = "compute"))]
+impl ComputeEncoder {
+    /// Open a compute encoder on `cb`.
+    ///
+    /// # Safety
+    /// `cb` must be a live `MTLCommandBuffer` that is not committed and has no other open encoder.
+    pub(crate) unsafe fn open(cb: Id) -> Option<Self> {
+        let _pool = AutoreleasePool::new();
+        // SAFETY: the caller pins `cb` live, uncommitted and with no open encoder; `-computeCommandEncoder` returns a +0 encoder owned by the pool above, retained to +1 before it pops.
+        unsafe {
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+            Obj::retain(get(cb, sel(c"computeCommandEncoder"))).map(Self)
+        }
+    }
+
+    /// `-setComputePipelineState:`.
+    pub(crate) fn set_pipeline(&self, pso: &Obj) {
+        // SAFETY: a void message on this open encoder; `pso` is a live compute pipeline state, retained by the command buffer.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+            f(self.0.id(), sel(c"setComputePipelineState:"), pso.id());
+        }
+    }
+
+    /// `-setBuffer:offset:atIndex:` at offset 0.
+    pub(crate) fn set_buffer(&self, buf: &Obj, index: usize) {
+        // SAFETY: a void message on this open encoder; `buf` is a live `MTLBuffer`, retained by the command buffer.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, usize, usize) = checked_msg();
+            f(
+                self.0.id(),
+                sel(c"setBuffer:offset:atIndex:"),
+                buf.id(),
+                0,
+                index,
+            );
+        }
+    }
+
+    /// `-dispatchThreadgroups:threadsPerThreadgroup:`, which needs no non-uniform threadgroup support.
+    pub(crate) fn dispatch_threadgroups(&self, groups: MtlSize, per_group: MtlSize) {
+        // SAFETY: a void message on this open encoder taking two `MTLSize` by value; the pipeline and buffers are set by the caller.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel, MtlSize, MtlSize) = checked_msg();
+            f(
+                self.0.id(),
+                sel(c"dispatchThreadgroups:threadsPerThreadgroup:"),
+                groups,
+                per_group,
+            );
+        }
+    }
+
+    /// `-dispatchThreads:threadsPerThreadgroup:`.
+    #[cfg(test)]
+    pub(crate) fn dispatch_threads(&self, grid: MtlSize, per_group: MtlSize) {
+        // SAFETY: a void message on this open encoder taking two `MTLSize` by value; the pipeline and buffers are set by the caller.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel, MtlSize, MtlSize) = checked_msg();
+            f(
+                self.0.id(),
+                sel(c"dispatchThreads:threadsPerThreadgroup:"),
+                grid,
+                per_group,
+            );
+        }
+    }
+
+    /// `-endEncoding`.
+    pub(crate) fn end(self) {
+        drop(self);
+    }
+}
+
+#[cfg(any(test, feature = "compute"))]
+impl Drop for ComputeEncoder {
+    fn drop(&mut self) {
+        // SAFETY: `-endEncoding` is a void message on this encoder, sent once, here; the +1 `Obj` keeps it live until after it.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
+            f(self.0.id(), sel(c"endEncoding"));
+        }
+    }
+}
+
+/// `-[MTLBuffer contents]`, the CPU address of the shared-storage buffer `buf`, or null.
+#[cfg(any(test, feature = "compute"))]
+pub(crate) fn buffer_contents(buf: &Obj) -> *mut u8 {
+    // SAFETY: `-contents` is a pointer getter on a live `MTLBuffer`; it dereferences nothing.
+    unsafe {
+        let c: unsafe extern "C-unwind" fn(Id, Sel) -> *mut u8 = checked_msg();
+        c(buf.id(), sel(c"contents"))
+    }
+}
+
+/// `mach_timebase_info_data_t`: ticks × `numer` / `denom` is nanoseconds.
+#[cfg(any(test, feature = "compute"))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MachTimebase {
+    pub(crate) numer: u32,
+    pub(crate) denom: u32,
+}
+
+#[cfg(any(test, feature = "compute"))]
+unsafe extern "C" {
+    /// The monotonic tick counter that `GPUStartTime` and `GPUEndTime` count on.
+    pub(crate) safe fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebase) -> i32;
+}
+
+/// `mach_timebase_info`, or `None` when it fails or reads a zero denominator.
+#[cfg(any(test, feature = "compute"))]
+pub(crate) fn mach_timebase() -> Option<MachTimebase> {
+    let mut tb = MachTimebase::default();
+    // SAFETY: `tb` is one writable `mach_timebase_info_data_t` (two `uint32_t`, `repr(C)`) that outlives the call, which only fills it.
+    let rc = unsafe { mach_timebase_info(&raw mut tb) };
+    (rc == 0 && tb.denom != 0).then_some(tb)
 }
 
 /// Read a shared-storage buffer's mapped bytes as `u32`s.
@@ -944,37 +1241,27 @@ pub(crate) fn dispatch_compute(
     grid: MtlSize,
 ) -> Result<(), String> {
     let _pool = AutoreleasePool::new();
-    // SAFETY: `commandBuffer` and `computeCommandEncoder` return autoreleased objects owned by the pool, not released here and alive until `waitUntilCompleted` returns. Every setter is a void message on live objects.
+    // SAFETY: `commandBuffer` returns an autoreleased object owned by the pool, not released here and alive until `waitUntilCompleted` returns, and uncommitted with no open encoder when `ComputeEncoder::open` receives it. `commit` is a void message on it after the encoder ended.
     unsafe {
         let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
         let cb = get(queue.id(), sel(c"commandBuffer"));
         if cb.is_null() {
             return Err("MTLCommandQueue returned no command buffer".to_owned());
         }
-        let enc = get(cb, sel(c"computeCommandEncoder"));
-        if enc.is_null() {
-            return Err("MTLCommandBuffer returned no compute encoder".to_owned());
-        }
-        let set_pso: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
-        set_pso(enc, sel(c"setComputePipelineState:"), pso.id());
-        let set_buf: unsafe extern "C-unwind" fn(Id, Sel, Id, usize, usize) = checked_msg();
+        let enc = ComputeEncoder::open(cb)
+            .ok_or_else(|| "MTLCommandBuffer returned no compute encoder".to_owned())?;
+        enc.set_pipeline(pso);
         for (i, b) in buffers.iter().enumerate() {
-            set_buf(enc, sel(c"setBuffer:offset:atIndex:"), b.id(), 0, i);
+            enc.set_buffer(b, i);
         }
         let tg = MtlSize {
             width: 8,
             height: 8,
             depth: 1,
         };
-        let disp: unsafe extern "C-unwind" fn(Id, Sel, MtlSize, MtlSize) = checked_msg();
-        disp(
-            enc,
-            sel(c"dispatchThreads:threadsPerThreadgroup:"),
-            grid,
-            tg,
-        );
+        enc.dispatch_threads(grid, tg);
+        enc.end();
         let void_msg: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
-        void_msg(enc, sel(c"endEncoding"));
         void_msg(cb, sel(c"commit"));
         wait_for_command_buffer(cb)?;
     }

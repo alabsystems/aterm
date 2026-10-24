@@ -2,6 +2,10 @@
 // Copyright 2018 The kurbo Authors.
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
+//
+// Derived from accesskit 0.24.1 (MIT OR Apache-2.0, used under Apache-2.0)
+// src/geometry.rs, itself derived from kurbo (Apache-2.0 OR MIT), and cut by
+// the aterm project in 2026 to the operations aterm's tree and publisher use.
 
 //! Accessibility tree points, sizes, rectangles, and 2D affine transforms.
 

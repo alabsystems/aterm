@@ -186,22 +186,29 @@ impl App {
         let Some(entry) = self.pool.get(session) else {
             return;
         };
-        let (holds, busy_entries, mark) = {
+        let (held, busy_entries, mark) = {
             let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
                 timeline
                     .task_face()
-                    .is_some_and(|(f, _)| holds_until_another_turn(f)),
+                    .map(|(f, _)| f)
+                    .filter(|f| holds_until_another_turn(*f)),
                 timeline.agent().busy_entries,
                 timeline.landing_mark().unwrap_or_default(),
             )
         };
-        if !holds {
+        let Some(held) = held else {
             return;
-        }
-        let begun = self.session_status.program_turns(session) > mark.program_turns
-            || busy_entries > mark.busy_entries;
+        };
+        let program_turns = self.session_status.program_turns(session);
+        let begun = program_turns > mark.program_turns || busy_entries > mark.busy_entries;
         if begun && self.beside_proven_self_claim(session) {
+            aterm_log::info!(
+                "task: @{}: a turn begun past its {held:?} face's mark reopens it (program turns {program_turns}, marked {}; busy entries {busy_entries}, marked {})",
+                entry.ctx.self_id.as_str(),
+                mark.program_turns,
+                mark.busy_entries
+            );
             self.apply_task_face(session, Some(TaskFace::Open), None, None);
         }
     }

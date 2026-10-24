@@ -3,6 +3,10 @@
 
 # aterm-effects: spec recovery from its 3027 unit tests
 
+> 2026-10-24: §8 adds the seven specs of Aos M5a's aterm-effects half (`int_bag_mlp`, `tone_int`)
+> with their 50 tests. `tone-asset-decoder-fail-closed` (§1) now also names `tone::raw`, the verified
+> raw view `ToneModel::from_bytes` is rebuilt on. §3's counts were taken before §7 and §8.
+
 > 2026-10-23: `aos-lease-refines-model` (§1) is the M5b worker-lease ledger's refinement of
 > `aterm_models_aos::aos_worker_lease_model`, with its eight Tier-1 tests in
 > `src/aos_momentum/lease_conformance_tests.rs` (§2). The counts elsewhere in this file were taken
@@ -662,7 +666,7 @@ impact-curve	contract	rainbow_kitty::timing::impact	impact(c) = 1 for non-finite
 phrase-rest-and-tempo	contract	timing::{phrase_rest_ms,phrase_rest_reached,ioi_next}	phrase_rest_ms(ioi) = max(2.5 clamp(ioi,30,600), 900) (the 250 ms value for non-finite input), in [900,1500]; phrase_rest_reached compares the gap to it; ioi_next resets to 250 on a first key or a gap >= 2 s, keeps ioi at a rest, else averages with the clamped gap.	0,3,6	1
 shed-and-rain-counts	contract	timing::{shed_n,rain_spacing_ms}	shed_n(c) = clamp(c/12, 3, 6) (3 for bad input); rain_spacing_ms(T) = clamp(T/5, 18, 24) (18 for non-finite), so over every flight the spacing is in [18,24].	0,3,4,6	2
 named-easing-curves	contract	timing::{clamp01,smoothstep01,edge_in,enter_at_speed,suck_in,spend,half_life,half_life_life_s,spring_snap,spring_whip}	Each curve has its stated closed form, endpoints and monotonicity; half_life halves each tau past its hold and half_life_life_s reaches STAR_CULL_ALPHA; spring_snap stays in [0,1]; spring_whip overshoots within its exponential envelope.	0,3,5,6,14	1
-tone-asset-decoder-fail-closed	contract	tone::{ToneModel::from_bytes,fnv1a32}	from_bytes returns Truncated, BadLength, BadMagic, BadChecksum, DimensionMismatch or BadScale in that order of checks and never panics; otherwise it dequantizes the weights. Any payload byte flip gives BadChecksum and any magic flip BadMagic (FNV-1a steps are bijections).	0,1,3,5,7,13	1
+tone-asset-decoder-fail-closed	contract	tone::{raw,ToneModel::from_bytes,fnv1a32}	from_bytes returns Truncated, BadLength, BadMagic, BadChecksum, DimensionMismatch or BadScale in that order of checks and never panics; otherwise it dequantizes the weights. Any payload byte flip gives BadChecksum and any magic flip BadMagic (FNV-1a steps are bijections).	0,1,3,5,7,13	1
 tone-encode-decode-round-trip	round-trip	tone::{encode_model,ToneModel::from_bytes}	Decoding an encoded model of the compiled shape is Ok, has ASSET_LEN bytes, recovers each quantized tensor within half its scale step and the biases bit for bit.	0,1,3,5,7	1
 tone-shipped-asset-valid	table-property	tone::{ToneModel::from_bytes,builtin}	The embedded tone asset decodes, so builtin() is always Some.	0,1,7,13	1
 tone-ngram-featurization	contract	tone::for_each_ngram_bucket	With whitespace runs collapsed and ASCII lowercased into k chars, it reports 0, 1 or 3k - 3 n-grams, every bucket < BUCKETS, invariant under case and whitespace length, whatever the script.	0,1,5,7,13	1
@@ -1071,7 +1075,7 @@ src/cursor_droplet.rs	surge_swells_and_brightens	cursor-body-energy-monotone
 src/cursor_fx.rs	every_effect_body_fades_to_the_terminal_cursor_through_one_seam	project-block-fill	
 src/cursor_fx.rs	the_caret_style_law_is_one_truth_table	caret-style-law	
 src/cursor_fx.rs	the_momentum_engine_yields_the_caret_cell_to_the_rainbow	momentum-glow-allowed	
-src/cursor_fx.rs	the_momentum_glow_obeys_the_effects_master	momentum-master-gate	
+src/cursor_fx.rs	the_momentum_glow_obeys_its_own_switch	momentum-master-gate	
 src/cursor_glow/tests/band_move.rs	a_backspace_echo_that_lands_after_a_band_move_is_still_licensed	glow-band-move	
 src/cursor_glow/tests/band_move.rs	a_cold_band_move_under_a_resting_caret_spawns_nothing	glow-no-licence-no-light	
 src/cursor_glow/tests/band_move.rs	codex_streaming_keeps_the_ribbon_glued_to_the_sliding_composer	glow-band-move	
@@ -1084,7 +1088,7 @@ src/cursor_glow/tests/cold_motion.rs	cold_program_motion_emits_no_rainbow_light	
 src/cursor_glow/tests/cold_motion.rs	every_style_keeps_a_timestamp_only_relayout_dark	glow-no-licence-no-light	
 src/cursor_glow/tests/cold_motion.rs	rainbow_ribbon_vanishes_without_a_visible_step	glow-idle-to-zero	
 src/cursor_glow/tests/cold_motion.rs	synthetic_rainbow_moves_are_visible_and_cold_output_stays_dark	glow-licence-grant	
-src/cursor_glow/tests/comet.rs	beam_stardust_strewn_along_window_absolute_leap	glow-window-absolute	
+src/cursor_glow/tests/comet.rs	leap_dust_strewn_along_window_absolute_leap	glow-window-absolute	
 src/cursor_glow/tests/comet.rs	comet_bridge_attaches_window_absolute	glow-window-absolute	
 src/cursor_glow/tests/comet.rs	comet_debris_born_window_absolute_with_chrome_origin	glow-window-absolute	
 src/cursor_glow/tests/comet.rs	comet_light_respects_invariants_and_decays	glow-quad-invariants	
@@ -1110,7 +1114,7 @@ src/cursor_glow/tests/erase.rs	the_shipping_default_puffs_a_cloud_on_every_delet
 src/cursor_glow/tests/fire.rs	emberforge_real_thermal_conforms_to_model	fire-thermal-refines-model	
 src/cursor_glow/tests/fire.rs	emberforge_thermal_model_proves_and_catches_heating_quench	fire-thermal-refines-model	
 src/cursor_glow/tests/fire.rs	fire_backspace_quenches_and_navigation_never_heats	fire-thermal-refines-model	
-src/cursor_glow/tests/fire.rs	fire_embers_dim_over_probed_glyph_cells	fire-no-recolor	
+src/cursor_glow/tests/fire.rs	fire_embers_keep_off_probed_glyph_cells	fire-no-recolor	
 src/cursor_glow/tests/fire.rs	fire_field_full_blaze_respects_quad_budget_with_head_band	glow-quad-invariants	
 src/cursor_glow/tests/fire.rs	fire_forge_cursor_heats_holds_and_cools_to_ember	fire-forge-and-vapor	
 src/cursor_glow/tests/fire.rs	fire_identity_at_origin_without_head	glow-quad-invariants	
@@ -1124,7 +1128,7 @@ src/cursor_glow/tests/fire.rs	frame_fingerprint_preserves_private_stream_identit
 src/cursor_glow/tests/fire.rs	halo_changes_change_the_fingerprint	frame-fingerprint	
 src/cursor_glow/tests/fire.rs	hot_blaze_emits_halo_strengths_rising_toward_the_head_and_never_recolors	fire-no-recolor	
 src/cursor_glow/tests/fire.rs	hot_cursor_smokes_and_cool_cursor_stops	fire-forge-and-vapor	
-src/cursor_glow/tests/fire.rs	light_theme_fire_is_ink_over_mode	fire-no-recolor	
+src/cursor_glow/tests/fire.rs	light_theme_fire_is_ink_tongues_beneath_the_letters	fire-no-recolor	
 src/cursor_glow/tests/fire.rs	towering_blaze_chars_the_engulfed_rows_and_decays	fire-no-recolor	
 src/cursor_glow/tests/fire.rs	typing_wrap_no_meteor_deliberate_enter_still_meteors	jump-morphology	
 src/cursor_glow/tests/heat_and_laser.rs	heat_cools_after_a_pause	glow-heat-momentum	
@@ -1257,7 +1261,7 @@ src/cursor_glow/tests/review.rs	the_coalesced_fold_on_the_alt_screen_is_admitted
 src/cursor_glow/tests/rings.rs	classic_landing_ring_expands_wider_with_the_jump	glow-landing-ring-raster	
 src/cursor_glow/tests/rings.rs	cold_navigation_timestamp_scatters_nothing	glow-no-licence-no-light	
 src/cursor_glow/tests/rings.rs	halo_centres_past_the_box_stay_true_and_negative_centres_cull	glow-landing-ring-raster	
-src/cursor_glow/tests/rings.rs	landing_ring_bars_partition_the_square_outline	glow-landing-ring-raster	
+src/cursor_glow/tests/rings.rs	the_dark_landing_ring_is_a_soft_bloom_in_its_row	glow-landing-ring-raster	
 src/cursor_glow/tests/rings.rs	rainbow_landing_ring_light_theme_forks_to_source_over	glow-landing-ring-raster	
 src/cursor_glow/tests/seam_laws.rs	a_classic_erase_key_leaves_no_standing_wake	glow-idle-to-zero	
 src/cursor_glow/tests/seam_laws.rs	a_composer_newline_starts_the_walk_again_however_soon_the_next_glyph_follows	glow-typed-cell-lit	
@@ -1594,7 +1598,7 @@ src/kitty_pet.rs	a_nearby_peek_gets_batted	bat-and-look
 src/kitty_pet.rs	a_new_line_costs_one_flight_and_no_gallop	new-line-law	
 src/kitty_pet.rs	a_one_frame_caret_hide_never_teleports_a_visible_cat	no-teleport-law	
 src/kitty_pet.rs	a_parked_pointer_over_the_body_never_farms_affection_or_frames	pet-idle-to-zero	
-src/kitty_pet.rs	a_pause_eases_the_lead_back_to_the_base_station	keep-ahead-lead	
+src/kitty_pet.rs	a_pause_leaves_the_cat_where_it_stopped	keep-ahead-lead	
 src/kitty_pet.rs	a_pet_during_flight_waits_for_the_ground	petting-affection	
 src/kitty_pet.rs	a_pet_on_the_head_makes_a_heart	petting-affection	
 src/kitty_pet.rs	a_pet_only_submit_forgives_the_fast_failure_that_follows	command-verdict-ledger	
@@ -3400,4 +3404,83 @@ src/aos_momentum/dist_tests.rs	select_spread_equals_select	aos-dist-equals-local
 src/aos_momentum/dist_tests.rs	finish_with_a_skipping_spread_equals_serial	aos-dist-equals-local	
 src/aos_momentum/dist_tests.rs	completion_order_never_reaches_the_proposer	aos-dist-equals-local	
 src/aos_momentum/dist_tests.rs	an_honest_pool_gives_the_local_selection	aos-dist-equals-local	aos-dist-outcome-local
+```
+
+## 8. Added 2026-10-24: shared-buffer inference (aos M5a)
+
+`int_bag_mlp` (the `int32-exact/v1` job kind: its layout, params builder and checker, packer and
+CPU reference) and `tone_int` (tone-int v1, derived from the shipped tone asset) are new since the
+recovery, and their tests are read the same way as §1. Design of record:
+`docs/DESIGN-aos-hosted-execution-2026-10-21.md` §12. Both modules are gated `any(test,
+debug_assertions, feature = "int-bag-mlp")`, so no release binary compiles them. aterm-gpu's Metal job
+reads the same bytes; its rows (`int-bag-mlp-equals-cpu-reference` and the job typestate's) belong to
+aterm-gpu's SPECS (design §12.7) and cite `int-bag-mlp-forward-bounds`, so no row here waits on gap 8.
+*Accepted* means `check` or `Batch::pack` returned Ok.
+
+7 specs, 51 primary tests. Gap histogram: 0 → 7, 1 → 7, 2 → 1, 3 → 5, 5 → 5, 6 → 2, 7 → 6, 11 → 1, 12 → 3, 13 → 2.
+
+```tsv
+id	kind	functions	statement	blocking_gaps	primary_tests
+int-bag-mlp-layout	table-property	int_bag_mlp::{LAYOUT,JOB_FIELDS,PARAMS_FIELDS,Layout::fields,job,params,Batch::header,build,out_digest}	JOB_FIELDS and PARAMS_FIELDS are the one source of every header index: each entry is (its prefix and the index constant's own name, that constant), made by one macro list, so a name cannot drift from its index; in each table the indices are 0..n in word order (JOB_WORDS = 5, PARAMS_WORDS = 23), and the 28 names are unique across both tables, as one kernel prelude needs. Batch::header writes JOB_MAGIC_VALUE, LAYOUT_VERSION, ROWS, TOTAL_IDS and C + 1 at job's indices; build writes every params word at params's indices, little-endian, then each tensor at the next 16-byte-aligned offset in Tensor::ALL order, each *_OFF a byte offset and each *_LEN an element count. out holds per row L[0..C] as i32 bits then the class, and out_digest(w) = Digest::of(OUT_DOMAIN, [w little-endian]).	0,1,5,12	4
+int-bag-mlp-params-checker	contract	int_bag_mlp::{check,build,qmax,ParamsView::{dims,min_ids,mult,qmax,g,t,m,max_abs_b1,header,emb,w1,w2,lut,b1,b2}}	check(bytes) is Ok only when all of the following hold, and otherwise returns the first that fails, in this order, by its ParamsError, never panicking: len ≤ PARAMS_BYTES_MAX (TooLarge); a whole header (Truncated); PARAMS_MAGIC_VALUE and LAYOUT_VERSION (BadMagic, BadVersion); 1 ≤ B ≤ 65,536, 1 ≤ E ≤ 32, 1 ≤ H ≤ 128, 1 ≤ C ≤ 16 (DimOutOfBounds, by Dim); MIN_IDS ≥ 1 (MinIdsZero); 1 ≤ G ≤ 31 (ShiftOutOfRange); T ≥ 0 (NegativeT); 1 ≤ MULT < 2³¹ (MultOutOfRange); the stored QMAX = ⌊(2³¹ − 1)/MULT⌋, recomputed (QmaxMismatch); per tensor in blob order, its length is its dimensions' product, B·E, E·H, H·C, 2T + 1, H or C (BadLength), it ends inside the blob (OutsideBlob) and its offset is 16-byte aligned (Unaligned); no tensor overlaps the header or another (Overlap) and no byte follows the last (Trailing); no element of emb, w1, w2 or lut is −128 (Int8Min, its first index); M − max|b1| ≥ T with M = ⌊QMAX·MULT/2^G⌋, computed in i64 (Lossy); every |b2[c]| < 2²⁹ (B2OutOfRange). check(build(s)) reads back s's dimensions, constants and tensors.	0,1,3,5,7	19
+int-bag-mlp-batch-refusals	contract	int_bag_mlp::{Batch::{pack,dims,rows,total_ids,offsets,ids,row,out_stride,out_words,bytes,into_parts},JobBytes::{of,total}}	Batch::pack(p, offsets, ids) is Ok only when ROWS = len(offsets) − 1 ≥ 1 (Empty), ROWS ≤ 2²⁰ (TooManyRows), JobBytes::of(ROWS, len(ids), C).total() ≤ JOB_BYTES_MAX (TooLarge), offsets[0] = 0 and offsets[ROWS] = len(ids) (BadTotal), offsets never decrease (NotMonotone, the first row), no row holds more than MAX_ROW_IDS ids (RowTooLong) and every id is below B (IdOutOfRange, the first index), checked in that order, never panicking and making no buffer; a row of zero ids is valid. JobBytes::of counts the job header at 20 bytes, offsets at 4(ROWS + 1), ids at 2·TOTAL_IDS rounded up to 4 and out at 4·ROWS·(C + 1), each at least 4. An accepted batch keeps p's Dims, row(r) is None past the last row, and into_parts gives its vectors back with their capacity.	0,1,3,5,7	9
+int-bag-mlp-forward-bounds	contract	int_bag_mlp::{forward,forward_fast,forward_fast_rows,trace,run,pre_activations,finish,Arith::*,seeded,interior_params_for,interior_rows}	For every view check accepts and every batch Batch::pack accepts against it, forward never panics, so no checked i32 add, mul, neg or abs and no u32 div, mul (kept ≤ 2³¹ − 1) or shr overflows, and forward_fast and forward_fast_rows (whose row ranges compose) write the same words. Each row is design §12.2's steps 1–8: fewer than MIN_IDS ids abstains (class C, logits 0); S = Σ emb[x·E + j], A = Σ S·w1, q = sgn(A)(|A|/n), p = sgn(q)((min(|q|, QMAX)·MULT) ≫ G) + b1, h = lut[clamp(p, −T, T) + T], L = b2 + Σ h·w2, and the class is the lowest c of the largest L. The bounds that make it so: 127²·32·4,096 < 2³¹, QMAX·MULT < 2³¹, |p| ≤ M + max|b1| ≤ 2M − T and 127²·128 + 2²⁹ < 2³¹. forward refuses a batch of other Dims (DimsMismatch), rows outside it (RowsOutOfRange) and an out of the wrong length (OutLength) before computing; trace gives each p before step 6, how many units steps 5 and 6 clamp and how many are interior (0 < q ≤ QMAX and |p| ≤ T). The 64 seeded blobs draw QMAX log-uniformly (MULT = ⌊(2³¹ − 1)/2^r⌋, r in 0..=20), so they hold at least 10,000 interior units under tables that are not the sign function; interior_params_for and interior_rows reach neither clamp at any shape.	0,1,3,5,7,11	8
+tone-int-derive-pure	contract	tone::raw; tone_int::{derive,v1,id,tanh,round_half_away}	derive(asset) is a function of the asset's bytes alone. It reads them through tone::raw, so the shipped checks apply (Asset(e)), and refuses −128 in emb, w1 or w2 by name (Int8Min). It uses only binary64 +, −, ×, ÷ and round_half_away (a truncating cast and an exact subtraction), and no libm: MULT = rha(s_e·s_1·2²⁸), b1 = rha(b1·2⁸), b2 = rha(b2·127/s_2), lut[i] = rha(127·tanh((i − T)/2⁸)) for i ≤ 2T with tanh Lambert's fraction from t = 47, the i8 tensors verbatim, F = 8, G = 20, T = 1,024 and MIN_IDS = 6; its blob passes check (else Params(e)). On the shipped asset s_e, s_1 and s_2 are 0.0238046, 0.0124373 and 0.0209753, MULT 79,474, QMAX 27,021, M 2,047, max|b1| 98 and b2 (−1,402, −10,745, 12,343, −3,793, 3,599), and id = Digest::of(TONE_INT_DOMAIN, [LAYOUT_VERSION, int32-exact/v1, B, E, H, C, the params bytes]) = V1_ID. No table entry lies within 3.9·10⁻⁴ of a rounding boundary, and Lambert's fraction is within 8·2⁻⁵² of the system libm's tanh on the table's grid, a pin of aarch64-apple-darwin macOS 26A434's libm that fails there and is COULD NOT RUN on any other host where it differs.	0,1,3,6,7,12	6
+tone-int-featurization	contract	tone_int::{featurize,pack,pack_into}; tone::for_each_ngram_bucket	pack(p, texts) has one row per text, in order, whose ids are exactly for_each_ngram_bucket(text) as u16 (each below 2,048), and pack_into(p, texts, offsets, ids) packs the same batch into the vectors it is given, keeping their capacity.	0,1,5,7,13	2
+tone-int-workload-pins	table-property	tone_int::{workload,texts,workload_digest,class_code,F_ARGMAX_371,B371_OUT_DIGEST,WORKLOAD_DIGEST}; tone::ToneModel::{classify_opt,classify}	Over the 371 workload lines (the corpus's 300 then the held-out set's 71, in file order; B1 is ok sounds good to me; 25,368 ids; longest rows 147 and 120): workload_digest is WORKLOAD_DIGEST and forward's B371 words digest to B371_OUT_DIGEST; tone-int v1 clears the shipped held-out floors exactly as holdout_sanity_set_clears_documented_floors defines them, ABSTAIN scored as Technical, with 61 of 71 right; against the f32 path the largest pre-activation error is 1.542 steps of 2⁻⁸ and the smallest top-2 integer margin 676, and no line reaches either clamp (largest |p| 670 < T); B16384 holds 1,119,606 ids in 2,697,988 job bytes. The figures the shipped f32 path computes through the system libm's tanhf are pins of aarch64-apple-darwin macOS build 26A434 (kern.osversion): tone-int's argmax equals classify_opt's on 300 of 300 corpus and 71 of 71 held-out lines, classify_opt's is F_ARGMAX_371, the shipped classifier has 61 of 71 held-out lines right, and the largest logit error is 0.1814; each is computed first, and one that differs fails on that host and is COULD NOT RUN on any other, while the libm-free pins above hold on every host.	0,1,2,3,6,7,12,13	3
+```
+
+```tsv
+file	test	primary	also
+src/int_bag_mlp/tests.rs	layout_tables_have_unique_names_and_dense_indices	int-bag-mlp-layout	
+src/int_bag_mlp/tests.rs	a_batch_reads_back_its_header	int-bag-mlp-layout	int-bag-mlp-batch-refusals
+src/int_bag_mlp/tests.rs	out_digest_covers_every_word	int-bag-mlp-layout	
+src/tone_int/tests.rs	a_three_row_batch_and_the_params_bytes_match_their_goldens	int-bag-mlp-layout	tone-int-derive-pure
+src/int_bag_mlp/tests.rs	build_then_check_reads_back_the_spec	int-bag-mlp-params-checker	int-bag-mlp-layout
+src/int_bag_mlp/tests.rs	refuses_a_blob_too_large	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_a_truncated_header	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_bad_magic	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_another_layout_version	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_dimensions_outside_their_bounds	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_min_ids_zero	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_a_shift_outside_its_range	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_a_negative_t	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_mult_outside_its_range	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_a_stored_qmax_that_is_not_recomputed	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_a_tensor_of_the_wrong_length	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_a_tensor_outside_the_blob	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_an_unaligned_tensor	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_overlapping_tensors	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_trailing_bytes	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_minus_128_in_each_i8_tensor	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_a_lossy_clamp	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	refuses_b2_at_two_to_the_29	int-bag-mlp-params-checker	
+src/int_bag_mlp/tests.rs	an_all_abstain_batch_with_no_ids_is_valid	int-bag-mlp-batch-refusals	int-bag-mlp-forward-bounds
+src/int_bag_mlp/tests.rs	job_bytes_count_each_buffer_as_it_is_made	int-bag-mlp-batch-refusals	
+src/int_bag_mlp/tests.rs	refuses_an_empty_batch	int-bag-mlp-batch-refusals	
+src/int_bag_mlp/tests.rs	refuses_offsets_that_decrease	int-bag-mlp-batch-refusals	
+src/int_bag_mlp/tests.rs	refuses_offsets_that_do_not_span_the_ids	int-bag-mlp-batch-refusals	
+src/int_bag_mlp/tests.rs	refuses_an_id_out_of_range	int-bag-mlp-batch-refusals	
+src/int_bag_mlp/tests.rs	refuses_a_row_too_long	int-bag-mlp-batch-refusals	
+src/int_bag_mlp/tests.rs	refuses_too_many_rows	int-bag-mlp-batch-refusals	
+src/int_bag_mlp/tests.rs	refuses_a_batch_too_large	int-bag-mlp-batch-refusals	
+src/int_bag_mlp/tests.rs	the_bounds_are_the_designs	int-bag-mlp-forward-bounds	int-bag-mlp-params-checker
+src/int_bag_mlp/tests.rs	the_steps_follow_the_design_by_hand	int-bag-mlp-forward-bounds	
+src/int_bag_mlp/tests.rs	ties_go_to_the_lowest_class	int-bag-mlp-forward-bounds	
+src/int_bag_mlp/tests.rs	forward_refuses_its_arguments_by_name	int-bag-mlp-forward-bounds	
+src/int_bag_mlp/tests.rs	checked_forward_holds_at_the_extremes	int-bag-mlp-forward-bounds	
+src/int_bag_mlp/tests.rs	forward_fast_equals_forward_on_seeded_blobs	int-bag-mlp-forward-bounds	
+src/int_bag_mlp/tests.rs	the_interior_blob_stays_unclamped_at_every_shape	int-bag-mlp-forward-bounds	
+src/tone_int/tests.rs	forward_fast_equals_forward_on_the_workload	int-bag-mlp-forward-bounds	tone-int-workload-pins
+src/tone_int/tests.rs	the_derivation_figures_and_id_are_pinned	tone-int-derive-pure	
+src/tone_int/tests.rs	the_fixed_point_constants_are_the_designs	tone-int-derive-pure	
+src/tone_int/tests.rs	derive_is_pure_and_names_no_libm	tone-int-derive-pure	
+src/tone_int/tests.rs	the_table_is_exact_and_its_rounding_is_half_away	tone-int-derive-pure	
+src/tone_int/tests.rs	derive_refuses_a_bad_asset_and_minus_128	tone-int-derive-pure	tone-asset-decoder-fail-closed
+src/tone_int/tests.rs	the_id_covers_its_descriptor	tone-int-derive-pure	
+src/tone_int/tests.rs	packed_ids_are_the_shipped_buckets	tone-int-featurization	tone-ngram-featurization
+src/tone_int/tests.rs	pack_into_reuses_the_batchs_vectors	tone-int-featurization	int-bag-mlp-batch-refusals
+src/tone_int/tests.rs	tone_int_clears_the_shipped_floors_and_agrees_with_the_shipped_classifier	tone-int-workload-pins	
+src/tone_int/tests.rs	fidelity_to_the_f32_path_is_pinned	tone-int-workload-pins	
+src/tone_int/tests.rs	the_session_pins_reproduce	tone-int-workload-pins	
 ```

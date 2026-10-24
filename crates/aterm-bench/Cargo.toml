@@ -31,6 +31,10 @@ libc = { workspace = true }
 # momentum glow, beside aterm-effects' `MomentumHost`.
 aterm-aos = { workspace = true }
 
+# `aos_gpu` drains the autorelease pool its Metal jobs ran in before its last footprint read.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+aterm-objc = { workspace = true }
+
 [features]
 # The effects harness's pass-economy ablation (`GpuRenderer::set_unorm_ablation`) is a
 # development seam: the `effects` lane names this on its command line for its `--release` run
@@ -39,6 +43,9 @@ dev-seams = ["aterm-gpu/dev-seams"]
 # On macOS, the effects harness's `--wgpu` record: the wgpu arm (the Windows and BSD presenter
 # and its timestamp-query clock) beside Metal. The lane never names it.
 wgpu-oracle = ["aterm-gpu/wgpu-oracle"]
+# Aos M5a's measured child `examples/aos_gpu.rs` (design §12.9); int-bag-mlp is named too, as
+# aterm-gpu's edge to aterm-effects (which `compute` turns it on through) is macOS-only.
+aos-gpu = ["aterm-gpu/compute", "aterm-effects/int-bag-mlp"]
 
 [lints]
 workspace = true
@@ -46,3 +53,9 @@ workspace = true
 [lib]
 # No unit tests in src/; doctests still run.
 test = false
+
+[[example]]
+name = "aos_gpu"
+required-features = ["aos-gpu"]
+# Its unit tests (the record's shaping and C0's poison) run in `targo --unverified test -p aterm-bench --features aos-gpu --example aos_gpu`, and the gated required-features lint compiles them.
+test = true

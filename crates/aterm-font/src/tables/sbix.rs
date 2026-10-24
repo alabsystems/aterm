@@ -1,5 +1,9 @@
 // Copyright (c) 2018 Yevhenii Reizner and the ttf-parser authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// Derived from ttf-parser 0.25.1 src/tables/sbix.rs and modified by the aterm
+// project in 2026.
+// See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
 //! A [Standard Bitmap Graphics Table](
 //! https://docs.microsoft.com/en-us/typography/opentype/spec/sbix) implementation.
@@ -170,7 +174,8 @@ impl<'a> Iterator for StrikesIter<'a> {
     }
 }
 
-/// A [Standard Bitmap Graphics Table].
+/// A [Standard Bitmap Graphics Table](
+/// https://docs.microsoft.com/en-us/typography/opentype/spec/sbix).
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// A list of [`Strike`]s.

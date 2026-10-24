@@ -874,6 +874,47 @@ impl ScopeView {
         let demand = wait + self.cores.raw.max(0.0);
         (demand > 1e-3).then(|| (wait / demand).clamp(0.0, 1.0))
     }
+
+    /// This scope and `other`, a disjoint one read in the same sweeps (two panes of one tab), as
+    /// one: counts, figures and their averages add, a figure only one of them read is that
+    /// one's, and the busier top process is the pair's. The variance (`mad`) adds too, a bound
+    /// on the sum's own.
+    #[must_use]
+    pub fn sum(&self, other: &Self) -> Self {
+        let trend = |a: TrendView, b: TrendView| TrendView {
+            raw: a.raw + b.raw,
+            level: a.level + b.level,
+            slow: a.slow + b.slow,
+            mad: a.mad + b.mad,
+        };
+        let n = self.history.len().max(other.history.len());
+        let at = |h: &[Option<f32>], i: usize| (i + h.len()).checked_sub(n).and_then(|j| h[j]);
+        Self {
+            cores: trend(self.cores, other.cores),
+            footprint: plus(self.footprint, other.footprint, u64::saturating_add),
+            footprint_gib: trend(self.footprint_gib, other.footprint_gib),
+            procs: self.procs.saturating_add(other.procs),
+            history: (0..n)
+                .map(|i| plus(at(&self.history, i), at(&other.history, i), |a, b| a + b))
+                .collect(),
+            top: match (&self.top, &other.top) {
+                (Some(a), Some(b)) if b.1 > a.1 => Some(b.clone()),
+                (a, b) => a.clone().or_else(|| b.clone()),
+            },
+            wait: plus(self.wait, other.wait, |a, b| a + b),
+            write_bps: plus(self.write_bps, other.write_bps, |a, b| a + b),
+            refused: self.refused.saturating_add(other.refused),
+            gpu: plus(self.gpu, other.gpu, |a, b| a + b),
+        }
+    }
+}
+
+/// `a` and `b` combined by `f`, or whichever was read.
+fn plus<T>(a: Option<T>, b: Option<T>, f: impl FnOnce(T, T) -> T) -> Option<T> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(f(a, b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Innermost attribution scope for a process row.
@@ -980,7 +1021,8 @@ pub struct TabView {
 /// Which scope a busy process is attributed to ([`Snapshot::top`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcScope {
-    /// One of this instance's tabs, by its key.
+    /// One of this instance's tabs, by its key ([`TabRoot::tab`]): a process in any pane of a
+    /// split tab is that tab's, so its rows group and its busiest program stays named as one.
     Tab(u64),
     /// aterm itself (or a child that belongs to no tab).
     Aterm,
@@ -1033,7 +1075,7 @@ pub const TOKENS_CAP_PER_S: f64 = 5_000.0;
 pub const TOKENS_WINDOW_MS: i64 = 60_000;
 /// Duration (ms) a session's last folded token rate is held without a new fold.
 pub const TOKENS_HOLD_MS: i64 = 60_000;
-/// Writers [`RowFacts::writers`] keeps.
+/// Programs [`RowFacts::writers`] and [`RowFacts::hour_writers`] keep in each scope.
 pub const TOP_WRITERS: usize = 4;
 /// Consecutive readings a busier network link must lead before becoming the reference link.
 pub const LINK_LEAD_READINGS: u32 = 5;
@@ -1189,6 +1231,63 @@ impl ScopeFig {
     #[must_use]
     pub fn columns(&self, per_s: u32, ncols: usize, now_unix_ms: i64) -> Vec<Cell> {
         columns_of(&self.run, self.run_k, per_s, ncols, now_unix_ms)
+    }
+
+    /// One tab's figure from its panes' `figs`, each a scope inside `within` (all tabs): `now`
+    /// and each run cell's mean add over the panes that read them, so a bucket no pane read
+    /// stays hollow and a pane opened mid-run counts only where it read. A cell's max adds
+    /// too, an upper bound where the panes peaked at different readings. Each figure is held
+    /// at `within`'s, so this tab stays inside all tabs; that binds only on GPU, whose scope
+    /// figures are each held at the Mac's and so can sum past it. One pane's is its own.
+    fn sum(figs: &[&Self], within: &Self) -> Self {
+        if let [one] = figs {
+            return (*one).clone();
+        }
+        let add = |a: Option<f64>, b: Option<f64>| plus(a, b, |a, b| a + b);
+        let held = |v: Option<f64>, all: Option<f64>| v.map(|v| all.map_or(v, |a| v.min(a)));
+        let read: Vec<&Self> = figs.iter().copied().filter(|f| !f.run.is_empty()).collect();
+        let run_k = read.iter().map(|f| f.run_k).max().unwrap_or(0);
+        let first = read
+            .iter()
+            .map(|f| f.run_start())
+            .min()
+            .map_or(run_k + 1, |k| k.max(run_k + 1 - SCOPE_RUN_BUCKETS as i64));
+        let run = (first..=run_k)
+            .map(|k| {
+                let mut cell = Cell::default();
+                for c in read.iter().filter_map(|f| f.run_cell(k)) {
+                    cell.mean = add(cell.mean, c.mean);
+                    cell.max = add(cell.max, c.max);
+                    cell.over |= c.over;
+                }
+                let all = within.run_cell(k);
+                Cell {
+                    mean: held(cell.mean, all.and_then(|c| c.mean)),
+                    max: held(cell.max, all.and_then(|c| c.max)),
+                    over: cell.over,
+                }
+            })
+            .collect();
+        Self {
+            now: held(figs.iter().fold(None, |sum, f| add(sum, f.now)), within.now),
+            missing: figs
+                .iter()
+                .map(|f| f.missing)
+                .reduce(|a, b| if a == b { a } else { None })
+                .flatten(),
+            run,
+            run_k,
+        }
+    }
+
+    /// Bucket index of the run's first cell.
+    fn run_start(&self) -> i64 {
+        self.run_k + 1 - self.run.len() as i64
+    }
+
+    /// The run's cell for bucket `k`, while the run holds it.
+    fn run_cell(&self, k: i64) -> Option<&Cell> {
+        self.run.get(usize::try_from(k - self.run_start()).ok()?)
     }
 }
 
@@ -1346,15 +1445,20 @@ fn larger(a: Option<f32>, b: Option<f32>) -> Option<f32> {
     }
 }
 
-/// A process writing to storage this sweep ([`RowFacts::writers`]).
+/// A program writing to storage this sweep ([`RowFacts::writers`]): the processes of one
+/// name in one scope that wrote, summed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Writer {
-    /// Its name.
+    /// The name they share.
     pub name: String,
-    /// Bytes written per second over the sweep interval.
+    /// Bytes they wrote per second over the sweep interval.
     pub bytes_per_s: f64,
-    /// Whose it is.
+    /// Whose they are.
     pub scope: ProcScope,
+    /// How many of its processes wrote.
+    pub n: u32,
+    /// Bytes they wrote over the sweep interval.
+    pub bytes: u64,
 }
 
 /// Per-resource auxiliary metrics for the deck's details and lens views.
@@ -1376,8 +1480,15 @@ pub struct RowFacts {
     pub disk_rates: Rates,
     /// Disk: the filling clause, when it applies.
     pub filling: Option<Filling>,
-    /// Disk: top storage writers owned by this user (at most [`TOP_WRITERS`]).
+    /// Disk: the programs owned by this user that wrote most this sweep, busiest first, at most
+    /// [`TOP_WRITERS`] in each scope: aterm, each tab, and the rest of the Mac.
     pub writers: Vec<Writer>,
+    /// Disk: the programs owned by this user that wrote most in the last hour, busiest first, at
+    /// most [`TOP_WRITERS`] in each scope ([`crate::writes::WriteHour`]).
+    pub hour_writers: Vec<crate::writes::ProgramHour>,
+    /// Disk: seconds of the last hour the readings behind [`Self::hour_writers`] covered (no
+    /// sweep runs while no deck is shown); 0 where no process's writes are read.
+    pub writes_covered_s: f64,
     /// Network: active reference link selected by `Rows::pick_link`.
     pub link: Option<LinkSample>,
     /// Network: seconds of readings toward learning its peak.
@@ -1542,12 +1653,36 @@ impl Snapshot {
         self.tabs.iter().find(|t| t.key == key)
     }
 
-    /// Return [`ResourceView`] for `res` with `tab`'s [`ScopeFig`] attached.
+    /// The tab of the sessions `panes` (its split panes, focused first, as [`TabRoot::tab`]
+    /// groups them): the first pane this sweep read names it, and its scope is every read
+    /// pane's summed ([`ScopeView::sum`]); `None` where no pane was read.
     #[must_use]
-    pub fn resource(&self, res: Resource, tab: Option<u64>) -> ResourceView {
+    pub fn tab_of(&self, panes: &[u64]) -> Option<TabView> {
+        let lead = panes.iter().find_map(|&k| self.tab(k))?;
+        let scope = self
+            .tabs
+            .iter()
+            .filter(|t| t.key != lead.key && panes.contains(&t.key))
+            .fold(lead.scope.clone(), |sum, t| sum.sum(&t.scope));
+        Some(TabView {
+            scope,
+            ..lead.clone()
+        })
+    }
+
+    /// Return [`ResourceView`] for `res` with the [`ScopeFig`] of the tab whose panes are the
+    /// sessions `panes` attached ([`ScopeFig::sum`] over the ones the row holds).
+    #[must_use]
+    pub fn resource(&self, res: Resource, panes: &[u64]) -> ResourceView {
         let mut v = self.resources[res.index()].clone();
-        if let Some(fig) = tab.and_then(|key| v.tabs.iter().find(|(k, _)| *k == key)) {
-            v.tab = fig.1.clone();
+        let figs: Vec<&ScopeFig> = self.resources[res.index()]
+            .tabs
+            .iter()
+            .filter(|(k, _)| panes.contains(k))
+            .map(|(_, f)| f)
+            .collect();
+        if !figs.is_empty() {
+            v.tab = ScopeFig::sum(&figs, &v.aterm);
         }
         v
     }
@@ -1777,6 +1912,7 @@ struct SweepFigs {
     tabs: Vec<ScopeAcc>,
     /// Whether any process's write counter was read.
     writes_read: bool,
+    /// Every program that wrote, busiest first.
     writers: Vec<Writer>,
     busiest: Option<Busiest>,
 }
@@ -1822,8 +1958,12 @@ struct Rows {
     free: FreeHistory,
     cores_at: Option<Stamp>,
     sweep_at: Option<Stamp>,
-    /// Each process's cumulative bytes written at the last sweep.
-    written: HashMap<u32, u64>,
+    /// Each process of the last sweep: its start and cumulative bytes written (`None` unread).
+    written: HashMap<u32, (Option<u64>, Option<u64>)>,
+    /// Whether the last sweep read the whole process table (not stopped at its cap).
+    sweep_whole: bool,
+    /// The last hour of writes per program.
+    write_hour: crate::writes::WriteHour,
     links_at: Option<Stamp>,
     /// Each link's counters at the last reading, by name.
     links: HashMap<String, LinkSample>,
@@ -2169,18 +2309,13 @@ impl Vitals {
         global: &mut ScopeView,
         sweep_dt: Option<f64>,
     ) -> ProcPass {
-        let mut written = HashMap::with_capacity(procs.len());
-        let mut writes = HashMap::new();
-        for p in procs {
-            if let Some(w) = p.disk_written {
-                written.insert(p.pid, w);
-                if let (Some(dt), Some(&before)) = (sweep_dt, self.rows.written.get(&p.pid)) {
-                    writes.insert(p.pid, w.saturating_sub(before) as f64 / dt);
-                }
-            }
-        }
-        let writes_read = !written.is_empty();
-        self.rows.written = written;
+        let writes = window_writes(&self.rows.written, self.rows.sweep_whole, procs, sweep_dt);
+        let writes_read = procs.iter().any(|p| p.disk_written.is_some());
+        self.rows.written = procs
+            .iter()
+            .map(|p| (p.pid, (p.start, p.disk_written)))
+            .collect();
+        self.rows.sweep_whole = !s.procs_truncated;
 
         let wall_ns = self
             .last_sweep_at
@@ -2193,7 +2328,9 @@ impl Vitals {
         let mut rates: Vec<ProcRates> = Vec::with_capacity(procs.len());
         for p in procs {
             let mut r = ProcRates {
-                write_bps: writes.get(&p.pid).copied(),
+                write_bps: sweep_dt
+                    .zip(writes.get(&p.pid))
+                    .map(|(dt, &bytes)| bytes as f64 / dt),
                 gpu: self.rows.gpu_clients.share(p.pid, &p.name),
                 ..ProcRates::default()
             };
@@ -2269,7 +2406,7 @@ impl Vitals {
                 (Some(t), _) => s
                     .tabs
                     .get(t)
-                    .map_or(ProcScope::Aterm, |r| ProcScope::Tab(r.key)),
+                    .map_or(ProcScope::Aterm, |r| ProcScope::Tab(r.tab)),
                 (None, true) => ProcScope::Aterm,
                 (None, false) => ProcScope::Other,
             };
@@ -2288,14 +2425,28 @@ impl Vitals {
                 );
                 top.truncate(TOP_PROCS);
             }
-            if let Some(w) = wrote.filter(|w| *w > 0.0)
+            if let (Some(w), Some(&bytes)) = (wrote, writes.get(&p.pid))
+                && bytes > 0
                 && s.self_uid.is_none_or(|u| p.uid == Some(u))
             {
-                writers.push(Writer {
-                    name: p.name.clone(),
-                    bytes_per_s: w,
-                    scope: scope(),
-                });
+                let scope = scope();
+                match writers
+                    .iter_mut()
+                    .find(|g| g.scope == scope && g.name == p.name)
+                {
+                    Some(g) => {
+                        g.bytes_per_s += w;
+                        g.n += 1;
+                        g.bytes = g.bytes.saturating_add(bytes);
+                    }
+                    None => writers.push(Writer {
+                        name: p.name.clone(),
+                        bytes_per_s: w,
+                        scope,
+                        n: 1,
+                        bytes,
+                    }),
+                }
             }
             if cores > 0.0 {
                 let scope = scope();
@@ -2371,7 +2522,6 @@ impl Vitals {
         global.refused = global_acc.refused;
         global.gpu = global_acc.gpu;
         writers.sort_by(|a, b| b.bytes_per_s.total_cmp(&a.bytes_per_s));
-        writers.truncate(TOP_WRITERS);
         let busiest = groups
             .into_iter()
             .reduce(|a, b| if b.cores > a.cores { b } else { a });
@@ -2434,6 +2584,40 @@ impl Vitals {
             attribution: Some((membership, delegated_members)),
         }
     }
+}
+
+/// Each process's bytes written over the sweep window, by pid, where a window formed a rate
+/// (`sweep_dt`): its counter's rise since `last` read it under the same start (by pid alone where
+/// neither read knew a start), or, for one born inside the window, its whole counter. A process
+/// present in the last sweep under another known start was born inside it (its pid was reused
+/// after that read). One absent from a whole last sweep (`last_whole`) was born inside it only
+/// when its start is later than every start that sweep read: an older one was alive then and
+/// missed (a read that changed under the sweep, a pid list cut short), and its whole counter is
+/// its life's writes, not the window's. One the last sweep read with no counter, or whose start
+/// only one of the two reads knew, counts nothing until the next.
+fn window_writes(
+    last: &HashMap<u32, (Option<u64>, Option<u64>)>,
+    last_whole: bool,
+    procs: &[ProcSample],
+    sweep_dt: Option<f64>,
+) -> HashMap<u32, u64> {
+    if sweep_dt.is_none() {
+        return HashMap::new();
+    }
+    let newest = last.values().filter_map(|r| r.0).max();
+    procs
+        .iter()
+        .filter_map(|p| {
+            let now = p.disk_written?;
+            let bytes = match last.get(&p.pid) {
+                Some(&(start, Some(before))) if start == p.start => now.saturating_sub(before),
+                Some(&(Some(then), _)) if p.start.is_some_and(|s| s != then) => now,
+                None if last_whole && p.start.zip(newest).is_some_and(|(s, n)| s > n) => now,
+                _ => return None,
+            };
+            Some((p.pid, bytes))
+        })
+        .collect()
 }
 
 fn mem_rates(then: MemCounters, now: MemCounters, window_ns: u64) -> Option<MemRates> {
@@ -2606,6 +2790,20 @@ impl Rows {
 
         let live: HashSet<u64> = s.tabs.iter().map(|t| t.key).collect();
         self.tabs.retain(|k, _| live.contains(k));
+        // A program's tab is its `TabRoot::tab` (`ProcScope::Tab`), not a pane's key.
+        self.write_hour
+            .fold_closed(&s.tabs.iter().map(|t| t.tab).collect());
+        match (figs.filter(|f| f.writes_read), sweep_dt) {
+            (Some(f), Some(dt)) => {
+                self.write_hour
+                    .note(now, (dt * 1000.0).round() as u64, &f.writers);
+            }
+            _ => {
+                let _ = self.write_hour.at(now);
+            }
+        }
+        facts.hour_writers = self.write_hour.top();
+        facts.writes_covered_s = self.write_hour.covered_s();
         if let Some(f) = figs {
             let vals = |acc: &ScopeAcc, tokens: Option<f64>| -> [Option<f64>; 7] {
                 let mut v = [None; 7];
@@ -2625,7 +2823,7 @@ impl Rows {
                 let rings = self.tabs.entry(root.key).or_default();
                 rings.push(now, vals(acc, tokens.tabs.get(&root.key).copied()));
             }
-            facts.writers = f.writers.clone();
+            facts.writers = crate::writes::top_per_scope(f.writers.iter().cloned(), |w| w.scope);
             facts.busiest = f.busiest.clone();
         }
         let gpu_held = self.gpu_clients.held();
@@ -3266,11 +3464,8 @@ mod tests {
         assert_eq!(snapshot.tab(2).unwrap().scope.cores.raw, 0.5);
         let cpu = &snapshot.resources[Resource::Cpu.index()];
         assert_eq!(cpu.aterm.now, Some(0.75));
-        assert_eq!(
-            snapshot.resource(Resource::Cpu, Some(1)).tab.now,
-            Some(0.25)
-        );
-        assert_eq!(snapshot.resource(Resource::Cpu, Some(2)).tab.now, Some(0.5));
+        assert_eq!(snapshot.resource(Resource::Cpu, &[1]).tab.now, Some(0.25));
+        assert_eq!(snapshot.resource(Resource::Cpu, &[2]).tab.now, Some(0.5));
         assert_eq!(
             snapshot.resources[Resource::Memory.index()].aterm.now,
             Some((100 << 20) as f64)
@@ -3910,7 +4105,7 @@ mod tests {
             s = v.absorb(&blank(t));
         }
         for res in Resource::ALL {
-            let r = s.resource(res, Some(7));
+            let r = s.resource(res, &[7]);
             assert_eq!((r.now, r.heat_now), (None, None), "{res:?}");
             assert!(r.ring.iter().all(|c| c.mean.is_none()), "{res:?}");
             for per in [10, 20, 30] {
@@ -3977,7 +4172,7 @@ mod tests {
         let tx = s.resources[Network.index()].second.as_ref().expect("send");
         assert_eq!(tx.ring.last().and_then(|c| c.mean), None);
         assert_eq!(s.resources[Disk.index()].aterm.now, None, "bytes written");
-        assert_eq!(s.resource(Disk, Some(7)).tab.now, None);
+        assert_eq!(s.resource(Disk, &[7]).tab.now, None);
         assert!(close(open(&s, Memory), (8u64 << 30) as f64));
         assert!(close(open(&s, Disk), 1e12));
 
@@ -3986,7 +4181,7 @@ mod tests {
         assert!(close(open(&s, Network), 1e6));
         assert!(close(open(&s, Tokens), 36_000.0));
         assert!(close(s.resources[Disk.index()].aterm.now, 2e6));
-        assert!(close(s.resource(Disk, Some(7)).tab.now, 2e6));
+        assert!(close(s.resource(Disk, &[7]).tab.now, 2e6));
 
         let renamed = |mono_ms: u64| {
             let mut r = rig(mono_ms, mono_ms as i64 + 590_000, 10_000);
@@ -4162,7 +4357,7 @@ mod tests {
             s = v.absorb(&r);
         }
         let want = (65..75).map(|i| used(i) as f64).sum::<f64>() / 10.0;
-        let mem = s.resource(Memory, Some(7));
+        let mem = s.resource(Memory, &[7]);
         assert!(close(mem.now, want), "{:?} vs {want}", mem.now);
         assert!(close(
             mem.heat_now.map(f64::from),
@@ -4186,8 +4381,8 @@ mod tests {
             assert!(o.is_some_and(|o| (o - want).abs() > 1.0), "{opens:?}");
         }
         assert_ne!(opens[0], opens[1]);
-        assert_eq!(s.resource(Memory, None).now, mem.now);
-        assert_eq!(s.resource(Memory, Some(99)).aterm, mem.aterm);
+        assert_eq!(s.resource(Memory, &[]).now, mem.now);
+        assert_eq!(s.resource(Memory, &[99]).aterm, mem.aterm);
     }
 
     #[test]
@@ -4203,7 +4398,7 @@ mod tests {
             s = v.absorb(&hidden(10 * i));
         }
         for res in Resource::ALL {
-            let r = s.resource(res, Some(7));
+            let r = s.resource(res, &[7]);
             let read: Vec<bool> = r.ring.iter().map(|c| c.mean.is_some()).collect();
             assert_eq!(read.len(), 61, "{res:?}: one bucket per 10 s");
             let counter = matches!(res, Cpu | Network | Tokens);
@@ -4215,11 +4410,11 @@ mod tests {
         let _ = v.absorb(&at(601_000, 1000));
         let s = v.absorb(&at(602_000, 1000));
         for res in [Cpu, Memory, Disk, Tokens, Processes] {
-            let r = s.resource(res, Some(7));
+            let r = s.resource(res, &[7]);
             assert!(r.aterm.now.is_some() && r.tab.now.is_some(), "{res:?}");
         }
         for res in [Gpu, Network] {
-            let r = s.resource(res, Some(7));
+            let r = s.resource(res, &[7]);
             assert_eq!(r.aterm.missing, Some(NoFigure::NotPerApp));
             assert_eq!(r.tab.missing, Some(NoFigure::NotPerApp));
         }
@@ -4264,7 +4459,7 @@ mod tests {
         for device in [12u8, 0] {
             let mut v = Vitals::new();
             let first = v.absorb(&reading(1000, device, Some(0)));
-            let r = first.resource(Gpu, Some(7));
+            let r = first.resource(Gpu, &[7]);
             assert_eq!(
                 r.aterm.missing,
                 Some(NoFigure::NotPerApp),
@@ -4287,7 +4482,7 @@ mod tests {
             // WindowServer's 0.02 and the reused pid's unclaimed 0.5.
             assert!(split.others.abs() < 1e-6 && (split.services - 0.52).abs() < 1e-5);
 
-            let r = s.resource(Gpu, Some(7));
+            let r = s.resource(Gpu, &[7]);
             assert_eq!((r.aterm.missing, r.tab.missing), (None, None));
             let (mac, all, tab) = (r.now.expect("Mac"), r.aterm.now.expect("all"), r.tab.now);
             let tab = tab.expect("tab");
@@ -4305,7 +4500,7 @@ mod tests {
 
             let max_ms = crate::explain::WINDOW_MAX_NS / MS;
             let later = v.absorb(&reading(3000 + max_ms + 1000, device, None));
-            let r = later.resource(Gpu, Some(7));
+            let r = later.resource(Gpu, &[7]);
             assert_eq!(r.aterm.missing, Some(NoFigure::NotPerApp), "expired");
             assert_eq!(later.aterm.as_ref().and_then(|a| a.gpu), None);
         }
@@ -4343,7 +4538,7 @@ mod tests {
             (Processes, 2.0, 3.0),
             (Disk, 2e6, 2e6),
         ] {
-            let r = s.resource(res, Some(7));
+            let r = s.resource(res, &[7]);
             for (key, fig, want) in [(Some(7), &r.tab, tab), (None, &r.aterm, aterm)] {
                 assert_eq!(
                     scope_ring(&v, key, res).map(BucketRing::len),
@@ -4394,7 +4589,7 @@ mod tests {
             s = v.absorb(&r);
         }
         for res in [Cpu, Memory, Processes, Disk] {
-            let r = s.resource(res, Some(7));
+            let r = s.resource(res, &[7]);
             let tab = r.tab.columns(10, 60, s.at_unix_ms);
             let aterm = r.aterm.columns(10, 60, s.at_unix_ms);
             let both: Vec<(f64, f64)> = tab
@@ -4432,7 +4627,7 @@ mod tests {
                 whole(t_s)
             });
             if i == 40 {
-                let r = s.resource(Memory, Some(7));
+                let r = s.resource(Memory, &[7]);
                 assert_eq!(r.tab.now, None, "no figure while hidden");
                 assert_eq!(r.tab.run.len(), 29, "the run is carried while hidden");
             }
@@ -4446,7 +4641,7 @@ mod tests {
             "the Mac reads throughout"
         );
         for res in [Cpu, Memory, Disk, Processes] {
-            let r = s.resource(res, Some(7));
+            let r = s.resource(res, &[7]);
             let back = if matches!(res, Cpu | Disk) { 49 } else { 48 };
             let hidden_span: Vec<usize> = std::iter::once(0).chain(30..back).collect();
             for fig in [&r.tab, &r.aterm] {
@@ -4479,15 +4674,270 @@ mod tests {
         let s = v.absorb(&gone);
         assert!(!v.rows.tabs.contains_key(&7));
         assert!(s.resources.iter().all(|r| r.tabs.is_empty()));
-        assert!(s.resource(Memory, Some(7)).tab.run.is_empty());
+        assert!(s.resource(Memory, &[7]).tab.run.is_empty());
         let s = v.absorb(&whole(70));
-        let back = s.resource(Memory, Some(7));
+        let back = s.resource(Memory, &[7]);
         assert_eq!(
             means(&back.tab.run),
             [Some(305.0 * MIB)],
             "a returning key starts hollow"
         );
         assert_eq!(back.aterm.run.len(), 7, "aterm's run goes on");
+    }
+
+    /// Tab 1 split in two panes ([`TabRoot::tab`]): pane 8 (node, 0.25 cores) opens 200 s in
+    /// beside pane 7 (cargo, 0.5 cores), and no sweep runs from 400 s to 450 s. "This tab" is
+    /// both panes summed in each row a scope shares, cell by cell: hollow only where no pane
+    /// read, the focused pane's alone before the other opened, never past all tabs. One pane
+    /// reads as its own figure, as before tabs were summed.
+    #[test]
+    fn a_split_tab_reads_its_panes_summed() {
+        let split = |i: u64| {
+            let mut s = whole(10 * i);
+            if i >= 20 {
+                let ms = 10_000 * i;
+                s.tabs.push(TabRoot {
+                    tab: 7,
+                    ..tab(8, 300, "Tab 1", "")
+                });
+                let procs = s.procs.as_mut().expect("swept");
+                for (pid, ppid, cpu_ms, mib, name, wrote) in [
+                    (300, 100, 0, 5, "zsh", 0),
+                    (301, 300, ms / 4, 100, "node", 500 * ms),
+                ] {
+                    procs.push(ProcSample {
+                        disk_written: Some(wrote),
+                        uid: Some(501),
+                        ..proc(pid, ppid, cpu_ms, mib, name)
+                    });
+                }
+            }
+            if (40..45).contains(&i) {
+                s.procs = None;
+                s.machine_only = true;
+            }
+            s
+        };
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for i in 0..60 {
+            s = v.absorb(&split(i));
+        }
+        let now = s.at_unix_ms;
+        let same = |a: Option<f64>, b: Option<f64>| match (a, b) {
+            (Some(a), Some(b)) => close(Some(a), b),
+            (a, b) => a == b,
+        };
+        for (res, focused, other) in [
+            (Cpu, 0.5, 0.25),
+            (Memory, 305.0 * MIB, 105.0 * MIB),
+            (Processes, 2.0, 2.0),
+            (Disk, 2e6, 0.5e6),
+        ] {
+            let own = |key: u64| {
+                s.resources[res.index()]
+                    .tabs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, f)| f.clone())
+            };
+            let (seven, eight) = (s.resource(res, &[7]).tab, s.resource(res, &[8]).tab);
+            assert_eq!(
+                Some(&seven),
+                own(7).as_ref(),
+                "{res:?}: one pane is its own"
+            );
+            assert_eq!(Some(&eight), own(8).as_ref(), "{res:?}");
+            assert!(close(seven.now, focused), "{res:?}: {:?}", seven.now);
+            assert!(close(eight.now, other), "{res:?}: {:?}", eight.now);
+            let r = s.resource(res, &[7, 8]);
+            assert!(
+                close(r.tab.now, focused + other),
+                "{res:?}: {:?}",
+                r.tab.now
+            );
+            assert_eq!(s.resource(res, &[8, 7]).tab, r.tab, "{res:?}: in any order");
+            assert!(r.tab.now <= r.aterm.now, "{res:?}: this tab ≤ all tabs");
+
+            let cols = |f: &ScopeFig| f.columns(10, 60, now);
+            let (a, b, tab, all) = (cols(&seven), cols(&eight), cols(&r.tab), cols(&r.aterm));
+            let back = if matches!(res, Cpu | Disk) { 46 } else { 45 };
+            let hollow: Vec<usize> = (0..60).filter(|&j| tab[j].mean.is_none()).collect();
+            let unread: Vec<usize> = std::iter::once(0).chain(40..back).collect();
+            assert_eq!(hollow, unread, "{res:?}: hollow only where no pane read");
+            for j in 0..60 {
+                let sum = plus(a[j].mean, b[j].mean, |x, y| x + y);
+                assert!(
+                    same(tab[j].mean, sum),
+                    "{res:?} {j}: {:?} vs {sum:?}",
+                    tab[j]
+                );
+                if let (Some(t), Some(all)) = (tab[j].max, all[j].max) {
+                    assert!(t <= all, "{res:?} {j}: tab {t} > all tabs {all}");
+                }
+            }
+            assert!(
+                (1..20).all(|j| tab[j] == a[j]),
+                "{res:?}: before pane 8 opened"
+            );
+            assert!(
+                (21..40).all(|j| tab[j].mean > a[j].mean),
+                "{res:?}: the focused pane alone reads less: {:?} vs {:?}",
+                means(&tab[21..40]),
+                means(&a[21..40])
+            );
+        }
+
+        let tokens = s.resource(Tokens, &[7, 8]).tab;
+        assert_eq!(
+            s.resource(Tokens, &[8]).tab.missing,
+            Some(NoFigure::NoAgent)
+        );
+        assert_eq!(tokens.missing, None, "an agent in either pane is the tab's");
+        assert!(tokens.now.is_some() && tokens.now == s.resource(Tokens, &[7]).tab.now);
+        let net = s.resource(Network, &[7, 8]).tab;
+        assert_eq!(net.missing, Some(NoFigure::NotPerApp));
+
+        let t = s.tab_of(&[7, 8]).expect("the tab");
+        assert_eq!((t.key, t.label.as_str()), (7, "Tab 1"));
+        assert_eq!(t.scope.procs, 4);
+        assert!(
+            (t.scope.cores.raw - 0.75).abs() < 1e-6,
+            "{:?}",
+            t.scope.cores
+        );
+        assert_eq!(t.scope.footprint, Some(410 << 20));
+        assert!(close(t.scope.write_bps, 2.5e6), "{:?}", t.scope.write_bps);
+        assert_eq!(t.scope.top.as_ref().map(|t| t.0.as_str()), Some("cargo"));
+        let aterm = s.aterm.as_ref().expect("aterm");
+        assert!(t.scope.cores.raw <= aterm.cores.raw && t.scope.procs <= aterm.procs);
+        assert_eq!(s.tab_of(&[7]), s.tab(7).cloned(), "one pane is itself");
+        assert_eq!(
+            s.tab_of(&[8, 7]).map(|t| (t.key, t.scope.procs)),
+            Some((8, 4)),
+            "the focused pane names it"
+        );
+        assert_eq!(s.tab_of(&[99]), None);
+    }
+
+    /// Each pane's GPU figure is held at the Mac's device reading (12%), so two panes at 10%
+    /// each sum past it; the tab's figure is held at all tabs', and this tab ≤ all tabs ≤ the
+    /// Mac's holds for the split tab too.
+    #[test]
+    fn a_split_tabs_gpu_stays_inside_all_tabs() {
+        use crate::gpu_clients::{GpuClientRow, GpuClientsSample};
+        let reading = |t_ms: u64, ran: Option<u64>| {
+            let mut s = at(t_ms, 1000);
+            s.gpu.as_mut().expect("GPU").device_pct = Some(12);
+            s.tabs.push(TabRoot {
+                tab: 7,
+                ..tab(8, 300, "Tab 1", "")
+            });
+            let procs = s.procs.as_mut().expect("sweep");
+            procs.push(proc(300, 100, 0, 5, "zsh"));
+            procs.push(proc(301, 300, 0, 50, "node"));
+            s.gpu_clients = ran.map(|k| GpuClientsSample {
+                at_ns: s.at_ns,
+                complete: true,
+                entries: vec![1, 2],
+                rows: [(1, 201, "cargo"), (2, 301, "node")]
+                    .into_iter()
+                    .map(|(entry, pid, name)| GpuClientRow {
+                        entry,
+                        pid,
+                        name: name.into(),
+                        gpu_ns: 200_000_000 * k,
+                    })
+                    .collect(),
+            });
+            s
+        };
+        let mut v = Vitals::new();
+        let _ = v.absorb(&reading(1000, Some(0)));
+        let _ = v.absorb(&reading(2000, None));
+        let s = v.absorb(&reading(3000, Some(1)));
+        for pane in [7, 8] {
+            let fig = s.resource(Gpu, &[pane]).tab;
+            assert!(close(fig.now, 10.0), "pane {pane}: {:?}", fig.now);
+        }
+        let r = s.resource(Gpu, &[7, 8]);
+        let (mac, all) = (r.now.expect("Mac"), r.aterm.now.expect("all tabs"));
+        assert!(close(Some(all), 12.0), "{all}");
+        assert!(close(r.tab.now, all), "held at all tabs': {:?}", r.tab.now);
+        assert!(all <= mac);
+        let last = |run: &[Cell]| run.last().and_then(|c| c.mean).expect("a cell");
+        assert!(
+            last(&r.tab.run) <= last(&r.aterm.run),
+            "{:?}",
+            r.tab.run.last()
+        );
+    }
+
+    /// A process in either pane of a split tab is that tab's ([`TabRoot::tab`]): rustc in both
+    /// panes is one program of Tab 1 among the busiest, the top processes and the writers,
+    /// never two scopes nor none. CONTROL: the same panes as two tabs leave it unnamed.
+    #[test]
+    fn a_split_tabs_processes_are_the_tabs() {
+        let read = |tab_of_8: u64| {
+            let procs = |t: u64| {
+                let wrote = |p: ProcSample, mb: u64| ProcSample {
+                    disk_written: Some(t * mb * 1_000_000),
+                    ..p
+                };
+                vec![
+                    proc(100, 1, 0, 200, "aterm"),
+                    proc(200, 100, 0, 5, "zsh"),
+                    wrote(proc(201, 200, t * 500, 100, "rustc"), 1),
+                    proc(300, 100, 0, 5, "zsh"),
+                    wrote(proc(301, 300, t * 1000, 100, "rustc"), 2),
+                ]
+            };
+            let mut v = Vitals::new();
+            let mut s = Snapshot::default();
+            for t in [10, 11] {
+                let mut swept = Sample {
+                    mono_ms: t * 1000,
+                    at_unix_ms: T0 + t as i64 * 1000,
+                    cadence_ms: 1000,
+                    ..sample(t, &[0, 0, 0, 0], procs(t))
+                };
+                swept.tabs.push(TabRoot {
+                    tab: tab_of_8,
+                    ..tab(8, 300, "Tab 1", "")
+                });
+                s = v.absorb(&swept);
+            }
+            s
+        };
+        let s = read(7);
+        let b = s.facts.busiest.as_ref().expect("a busy program");
+        assert_eq!(
+            (b.name.as_str(), b.n, b.scope),
+            ("rustc", 2, Some(ProcScope::Tab(7)))
+        );
+        assert!((b.cores - 1.5).abs() < 1e-4, "{b:?}");
+        let scopes = |names: Vec<(&str, ProcScope)>| -> Vec<ProcScope> {
+            names
+                .into_iter()
+                .filter(|(n, _)| *n == "rustc")
+                .map(|(_, s)| s)
+                .collect()
+        };
+        let top = scopes(s.top.iter().map(|t| (t.name.as_str(), t.scope)).collect());
+        assert_eq!(top, [ProcScope::Tab(7); 2], "{:?}", s.top);
+        let writers: Vec<_> = s
+            .facts
+            .writers
+            .iter()
+            .filter(|w| w.name == "rustc")
+            .map(|w| (w.scope, w.n))
+            .collect();
+        assert_eq!(writers, [(ProcScope::Tab(7), 2)], "one program of Tab 1");
+        assert_eq!(s.tab(7).map(|t| t.label.as_str()), Some("Tab 1"));
+
+        let apart = read(8);
+        let b = apart.facts.busiest.as_ref().expect("a busy program");
+        assert_eq!((b.n, b.scope), (2, None), "CONTROL: two tabs");
     }
 
     #[test]
@@ -4498,7 +4948,7 @@ mod tests {
             s = v.absorb(&whole(10 * i));
         }
         for res in [Gpu, Network] {
-            let r = s.resource(res, Some(7));
+            let r = s.resource(res, &[7]);
             for fig in [&r.aterm, &r.tab] {
                 assert_eq!(fig.missing, Some(NoFigure::NotPerApp), "{res:?}");
                 assert!(fig.run.is_empty() && fig.now.is_none(), "{res:?}");
@@ -4506,7 +4956,7 @@ mod tests {
             assert!(scope_ring(&v, None, res).is_none(), "{res:?}");
             assert!(scope_ring(&v, Some(7), res).is_none(), "{res:?}");
         }
-        assert_eq!(s.resource(Memory, Some(7)).tab.run.len(), 5);
+        assert_eq!(s.resource(Memory, &[7]).tab.run.len(), 5);
     }
 
     #[test]
@@ -4524,7 +4974,7 @@ mod tests {
             "the per-user limit binds, not the first series' system limit"
         );
         for res in [Disk, Gpu, Network] {
-            let r = s.resource(res, Some(7));
+            let r = s.resource(res, &[7]);
             assert_eq!(
                 s.scope_heat_columns(res, &r.tab, 10, 60, s.at_unix_ms),
                 None,
@@ -4532,7 +4982,7 @@ mod tests {
             );
         }
         assert!(
-            s.resource(Disk, Some(7))
+            s.resource(Disk, &[7])
                 .tab
                 .run
                 .iter()
@@ -4540,7 +4990,7 @@ mod tests {
             "the writes run itself is carried raw"
         );
         for res in [Cpu, Memory, Processes] {
-            let r = s.resource(res, Some(7));
+            let r = s.resource(res, &[7]);
             let cap = r.binding().capacity.expect("a capacity");
             for fig in [&r.aterm, &r.tab] {
                 let cols = s
@@ -4599,7 +5049,7 @@ mod tests {
                 None => assert_eq!(open(&s, Tokens), None, "step {i}"),
             }
             assert_eq!(s.facts.agents, 1);
-            let t2 = s.resource(Tokens, Some(8)).tab;
+            let t2 = s.resource(Tokens, &[8]).tab;
             assert_eq!(t2.missing, Some(NoFigure::NoAgent), "Tab 2 runs no agent");
         }
         let mut out = 114_000;
@@ -4633,7 +5083,7 @@ mod tests {
         for i in 0..=100u64 {
             let k = (i / 15).min(2);
             let s = v.absorb(&reading(i, k, k as i64 * 15, 0));
-            let now = s.resource(Tokens, None).now;
+            let now = s.resource(Tokens, &[]).now;
             match i {
                 0..15 => assert_eq!(open(&s, Tokens), None, "{i}: one fold"),
                 15..=90 => {
@@ -5056,5 +5506,330 @@ mod tests {
         let s = b.absorb(&sample(3, DAY + 8, vec![week("c-b", true, None)]));
         assert_eq!(s.facts.plan_week, None, "nothing read in the last 7 days");
         assert_eq!(*b.peaks(), held, "a reading with no figure keeps nothing");
+    }
+
+    /// A process of tab 7's `cargo` (pid 201), own user's, with its own start.
+    fn child(pid: u32, start: u64, name: &str, written: u64) -> ProcSample {
+        ProcSample {
+            start: Some(start),
+            disk_written: Some(written),
+            uid: Some(501),
+            ..proc(pid, 201, 10, 20, name)
+        }
+    }
+
+    fn write_bps(s: &Snapshot, pid: u32) -> Option<f64> {
+        s.procs
+            .iter()
+            .find(|p| p.pid == pid)
+            .and_then(|p| p.write_bps)
+    }
+
+    fn writer<'a>(s: &'a Snapshot, name: &str) -> Option<&'a Writer> {
+        s.facts.writers.iter().find(|w| w.name == name)
+    }
+
+    #[test]
+    fn a_process_born_between_sweeps_counts_what_it_wrote_since_birth() {
+        let mut v = Vitals::new();
+        let _ = v.absorb(&at(0, 1000));
+        let _ = v.absorb(&at(1000, 1000));
+        let mut r = at(2000, 1000);
+        r.procs
+            .as_mut()
+            .expect("swept")
+            .push(child(300, 300, "rustc", 5_000_000));
+        let s = v.absorb(&r);
+        assert!(close(write_bps(&s, 300), 5e6), "{:?}", write_bps(&s, 300));
+        let w = writer(&s, "rustc").expect("a writer");
+        assert_eq!((w.scope, w.n, w.bytes), (ProcScope::Tab(7), 1, 5_000_000));
+        assert!(
+            close(s.tab(7).and_then(|t| t.scope.write_bps), 7e6),
+            "cargo's and rustc's"
+        );
+    }
+
+    /// NEGATIVE CONTROL: across a gap no window forms, so even a newborn counts nothing.
+    #[test]
+    fn the_first_sweep_after_a_gap_counts_nothing() {
+        let mut v = Vitals::new();
+        let _ = v.absorb(&at(0, 1000));
+        let _ = v.absorb(&at(1000, 1000));
+        let mut r = at(14_000, 1000);
+        r.procs
+            .as_mut()
+            .expect("swept")
+            .push(child(300, 300, "rustc", 5_000_000));
+        let s = v.absorb(&r);
+        assert_eq!(write_bps(&s, 300), None);
+        assert_eq!(write_bps(&s, 201), None, "nor the old cargo");
+        assert!(s.facts.writers.is_empty(), "{:?}", s.facts.writers);
+        assert!(
+            (s.facts.writes_covered_s - 1.0).abs() < 1e-9,
+            "only the first window"
+        );
+        let s = v.absorb(&at(15_000, 1000));
+        assert!(close(write_bps(&s, 201), 2e6));
+        assert!((s.facts.writes_covered_s - 2.0).abs() < 1e-9);
+    }
+
+    /// NEGATIVE CONTROL: a sweep that stopped at its cap may have missed any process, so the
+    /// next counts none as born since it.
+    #[test]
+    fn after_a_truncated_sweep_no_process_counts_as_newborn() {
+        let mut v = Vitals::new();
+        let _ = v.absorb(&at(0, 1000));
+        let mut cut = at(1000, 1000);
+        cut.procs_truncated = true;
+        let _ = v.absorb(&cut);
+        let mut r = at(2000, 1000);
+        r.procs
+            .as_mut()
+            .expect("swept")
+            .push(child(300, 300, "rustc", 5_000_000));
+        let s = v.absorb(&r);
+        assert_eq!(write_bps(&s, 300), None);
+        assert!(
+            close(write_bps(&s, 201), 2e6),
+            "one it read last time still counts"
+        );
+        let mut r = at(3000, 1000);
+        r.procs
+            .as_mut()
+            .expect("swept")
+            .push(child(300, 300, "rustc", 6_000_000));
+        let s = v.absorb(&r);
+        assert!(close(write_bps(&s, 300), 1e6), "from the next sweep on");
+    }
+
+    /// A LIVE PROCESS ONE SWEEP MISSED IS NO NEWBORN: a long-lived writer (its start older than
+    /// the newest the last sweep read) that one whole sweep skipped reads, on its return, nothing
+    /// for that window, never its life's 50 GB as one second's writes. NEGATIVE CONTROL: a process
+    /// truly born in the same window (its start the newest) counts its whole counter.
+    #[test]
+    fn a_live_process_one_sweep_missed_never_counts_its_life_as_one_window() {
+        let mut v = Vitals::new();
+        let old = |written| child(500, 5, "postgres", written);
+        let mut r = at(0, 1000);
+        let procs = r.procs.as_mut().expect("swept");
+        procs.push(old(50_000_000_000));
+        procs.push(child(300, 300, "rustc", 1_000_000));
+        let _ = v.absorb(&r);
+        let mut r = at(1000, 1000);
+        r.procs
+            .as_mut()
+            .expect("swept")
+            .push(child(300, 300, "rustc", 2_000_000));
+        let _ = v.absorb(&r);
+        let mut r = at(2000, 1000);
+        let procs = r.procs.as_mut().expect("swept");
+        procs.push(old(50_000_001_000));
+        procs.push(child(300, 300, "rustc", 3_000_000));
+        procs.push(child(600, 600, "cc", 3_000_000));
+        let s = v.absorb(&r);
+        assert_eq!(write_bps(&s, 500), None, "{:?}", write_bps(&s, 500));
+        assert!(writer(&s, "postgres").is_none(), "{:?}", s.facts.writers);
+        assert!(
+            s.facts.hour_writers.iter().all(|p| p.name != "postgres"),
+            "{:?}",
+            s.facts.hour_writers
+        );
+        assert!(close(write_bps(&s, 600), 3e6), "{:?}", write_bps(&s, 600));
+        assert_eq!(writer(&s, "cc").map(|w| w.bytes), Some(3_000_000));
+        let mut r = at(3000, 1000);
+        let procs = r.procs.as_mut().expect("swept");
+        procs.push(old(50_000_003_000));
+        let s = v.absorb(&r);
+        assert!(
+            close(write_bps(&s, 500), 2_000.0),
+            "from the next sweep on: {:?}",
+            write_bps(&s, 500)
+        );
+    }
+
+    #[test]
+    fn a_reused_pid_never_reads_as_the_old_processs_delta() {
+        let mut v = Vitals::new();
+        for t in [0, 1000] {
+            let mut r = at(t, 1000);
+            r.procs
+                .as_mut()
+                .expect("swept")
+                .push(child(300, 300, "rustc", 400_000_000));
+            let _ = v.absorb(&r);
+        }
+        let mut r = at(2000, 1000);
+        r.procs
+            .as_mut()
+            .expect("swept")
+            .push(child(300, 301, "cp", 500_000_000));
+        let s = v.absorb(&r);
+        assert!(
+            close(write_bps(&s, 300), 5e8),
+            "the new process's own bytes, not 100 MB over the old one's: {:?}",
+            write_bps(&s, 300)
+        );
+        assert!(writer(&s, "rustc").is_none());
+        assert_eq!(writer(&s, "cp").map(|w| w.bytes), Some(500_000_000));
+    }
+
+    #[test]
+    fn a_zombie_row_gives_the_writes_after_its_last_live_sweep() {
+        let mut v = Vitals::new();
+        for (t, written) in [(0, 10_000_000), (1000, 20_000_000)] {
+            let mut r = at(t, 1000);
+            r.procs
+                .as_mut()
+                .expect("swept")
+                .push(child(300, 300, "rustc", written));
+            let _ = v.absorb(&r);
+        }
+        let mut r = at(2000, 1000);
+        r.procs.as_mut().expect("swept").push(ProcSample {
+            cpu_ns: None,
+            footprint: None,
+            state: ProcState::Zombie,
+            ..child(300, 300, "rustc", 68_000_000)
+        });
+        let s = v.absorb(&r);
+        assert!(close(write_bps(&s, 300), 48e6), "{:?}", write_bps(&s, 300));
+        let s = v.absorb(&at(3000, 1000));
+        assert_eq!(write_bps(&s, 300), None, "reaped");
+    }
+
+    #[test]
+    fn a_program_split_over_many_processes_is_one_writer() {
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for t in [0u64, 1000] {
+            let mut r = at(t, 1000);
+            let procs = r.procs.as_mut().expect("swept");
+            for i in 0..9 {
+                procs.push(child(400 + i, 400 + u64::from(i), "rustc", 3_400 * t));
+            }
+            procs.push(ProcSample {
+                start: Some(900),
+                disk_written: Some(10_000 * t),
+                uid: Some(501),
+                ..proc(900, 1, 10, 20, "cp")
+            });
+            s = v.absorb(&r);
+        }
+        let rustc = &s.facts.writers[0];
+        assert_eq!(
+            (rustc.name.as_str(), rustc.scope, rustc.n),
+            ("rustc", ProcScope::Tab(7), 9),
+            "{:?}",
+            s.facts.writers
+        );
+        assert!(close(Some(rustc.bytes_per_s), 30.6e6), "{rustc:?}");
+        assert_eq!(rustc.bytes, 30_600_000);
+        let cp = writer(&s, "cp").expect("cp");
+        assert_eq!((cp.scope, cp.n), (ProcScope::Other, 1));
+        // NEGATIVE CONTROL: process by process, cp outranks every rustc.
+        assert!(
+            (400..409).all(|pid| write_bps(&s, pid).is_some_and(|r| r < cp.bytes_per_s)),
+            "{:?}",
+            s.procs
+        );
+    }
+
+    /// EACH SCOPE KEEPS ITS OWN FIRST WRITERS THIS SWEEP: five programs of the rest of the Mac,
+    /// each writing more than tab 7's cargo, leave cargo among the writers (the lens's "this
+    /// tab" finds it), and the rest of the Mac keeps its first four. NEGATIVE CONTROL: by rate
+    /// alone cargo is sixth, past a single first four.
+    #[test]
+    fn each_scope_keeps_its_own_first_writers_this_sweep() {
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for t in [0u64, 1000] {
+            let mut r = at(t, 1000);
+            let procs = r.procs.as_mut().expect("swept");
+            for i in 0..5u32 {
+                procs.push(ProcSample {
+                    start: Some(900 + u64::from(i)),
+                    disk_written: Some((10_000 + u64::from(i)) * t),
+                    uid: Some(501),
+                    ..proc(900 + i, 1, 10, 20, &format!("cp{i}"))
+                });
+            }
+            s = v.absorb(&r);
+        }
+        let others: Vec<&str> = s
+            .facts
+            .writers
+            .iter()
+            .filter(|w| w.scope == ProcScope::Other)
+            .map(|w| w.name.as_str())
+            .collect();
+        assert_eq!(
+            others,
+            ["cp4", "cp3", "cp2", "cp1"],
+            "{:?}",
+            s.facts.writers
+        );
+        let cargo = writer(&s, "cargo").expect("tab 7's writer");
+        assert_eq!(cargo.scope, ProcScope::Tab(7));
+        assert!(
+            (900..905).all(|pid| write_bps(&s, pid).is_some_and(|r| r > cargo.bytes_per_s)),
+            "{:?}",
+            s.procs
+        );
+    }
+
+    #[test]
+    fn a_tabs_hour_names_its_top_writer_with_its_coverage() {
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for t in 0..=30u64 {
+            s = v.absorb(&at(t * 1000, 1000));
+        }
+        assert!((s.facts.writes_covered_s - 30.0).abs() < 1e-9);
+        let cargo = &s.facts.hour_writers[0];
+        assert_eq!(
+            (cargo.name.as_str(), cargo.scope),
+            ("cargo", ProcScope::Tab(7))
+        );
+        assert_eq!(
+            cargo.per_hour(s.facts.writes_covered_s),
+            None,
+            "half a minute read"
+        );
+        for t in 31..=90u64 {
+            s = v.absorb(&at(t * 1000, 1000));
+        }
+        let cargo = &s.facts.hour_writers[0];
+        assert_eq!((cargo.bytes, cargo.n_max), (180_000_000, 1));
+        let per_hour = cargo.per_hour(s.facts.writes_covered_s);
+        assert!(close(per_hour, 7.2e9), "{per_hour:?}");
+        // Hidden for ten minutes (no sweep): the hour keeps what it read and its coverage.
+        for t in 91..=690u64 {
+            let mut r = at(t * 1000, 1000);
+            r.procs = None;
+            r.machine_only = true;
+            s = v.absorb(&r);
+        }
+        assert!((s.facts.writes_covered_s - 90.0).abs() < 1e-9);
+        assert!(close(s.facts.hour_writers[0].per_hour(90.0), 7.2e9));
+    }
+
+    #[test]
+    fn no_disk_counter_means_no_coverage() {
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for t in 0..90u64 {
+            let mut r = at(t * 1000, 1000);
+            for p in r.procs.as_mut().expect("swept") {
+                p.disk_written = None;
+            }
+            s = v.absorb(&r);
+        }
+        assert_eq!(s.facts.writes_covered_s, 0.0);
+        assert!(s.facts.hour_writers.is_empty());
+        assert!(s.facts.writers.is_empty());
+        assert_eq!(
+            s.resources[Disk.index()].aterm.missing,
+            Some(NoFigure::NotReadHere)
+        );
     }
 }

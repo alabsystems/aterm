@@ -66,7 +66,7 @@ fn placing_an_aterm_without_caffeine_turns_its_login_job_off() {
         &[],
     );
     // bounded's cut-off; a run that could not start (126, 127); one a signal
-    // ended, bounded's own Ctrl-C (130) and a SIGKILL (137) among them.
+    // ended, an interrupt (130) and a SIGKILL (137) among them.
     let no_answers: Vec<usize> = ["124", "126", "127", "130", "kill"]
         .into_iter()
         .map(|verdict| {

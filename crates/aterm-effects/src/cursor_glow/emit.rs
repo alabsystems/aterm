@@ -4731,6 +4731,7 @@ impl CursorGlow {
 }
 
 /// Whether a cell's ground `ground` reads as the page `page` rather than a surface of its own.
+#[inline]
 pub(super) fn reads_as_page(ground: u32, page: u32) -> bool {
     let (g, p) = (ground & 0x00FF_FFFF, page & 0x00FF_FFFF);
     if g == p {

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND (MIT OR Apache-2.0)
 //
 // `IUnknown_Vtbl` is derived from windows-core 0.62.2 src/unknown.rs
-// (MIT OR Apache-2.0, see ../LICENSE-MIT and ../LICENSE-APACHE).
+// (MIT OR Apache-2.0, see ../LICENSE-MIT and ../LICENSE-APACHE); the rest of the file is aterm's.
 
 //! COM's vocabulary.
 

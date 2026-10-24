@@ -13,7 +13,7 @@ use crate::tty::{Readiness, Tty};
 /// How long the probe waits for DA1.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Probe query: XTVERSION, kitty flags, DECRQM (2026, 2048, 1004, 2004), and DA1.
+/// Probe query: XTVERSION, kitty flags, DECRQM (2026, 2048, 1004, 2004), and DA1 last.
 pub const QUERY: &[u8] = b"\x1b[>0q\x1b[?u\x1b[?2026$p\x1b[?2048$p\x1b[?1004$p\x1b[?2004$p\x1b[c";
 
 /// Terminal capabilities reported by [`probe`].
@@ -64,7 +64,8 @@ pub struct Probed {
     pub caps: Caps,
     /// Non-reply events (typeahead, resize reports) read during the probe, in order.
     pub events: Vec<Event>,
-    /// Signals taken during the probe (`CONT` restores raw mode; `WINCH` updates size).
+    /// Signals taken during the probe, for the caller to handle as its loop would: after `CONT`
+    /// (raw again) a repaint, after `WINCH` a new size.
     pub signals: Signals,
 }
 

@@ -818,7 +818,13 @@ app_already_current() { # <elected_tag> <tag_explicit> <bundle_id> <installed_ve
 # the in-app updater measured codesign at 0.09 s on 851 MB and spctl under half a
 # second (crates/aterm-update/src/verify.rs), and a binary asked what it is
 # (first_line_bounded) answers at once after its first exec's wait on the
-# system's code assessment, seconds on a loaded machine.
+# system's code assessment, seconds on a loaded machine. A Ctrl-C, hang-up or
+# TERM to this script's process group (a terminal's Ctrl-C reaches it whole)
+# while CMD runs SIGKILLs CMD's group and ends the run with that signal
+# (die_of), as it would have ended without bounded, never as a status a
+# caller could take for CMD's answer. The run then never reaches a caller's
+# own rm, so bounded removes the files the caller names in BOUNDED_TEMPS, a
+# local array a nested caller extends rather than shadows (bounded_cut).
 VERIFY_WAIT_SECS=60
 bounded() {
 	local secs="$1"
@@ -828,9 +834,9 @@ bounded() {
 		"$@" 2>&3 </dev/null &
 		pid=$!
 		set +m
-		trap 'kill -KILL -- "-$pid" 2>/dev/null; exit 130' INT
-		trap 'kill -KILL -- "-$pid" 2>/dev/null; exit 143' TERM
-		trap 'kill -KILL -- "-$pid" 2>/dev/null; exit 129' HUP
+		trap 'bounded_cut INT 130' INT
+		trap 'bounded_cut TERM 143' TERM
+		trap 'bounded_cut HUP 129' HUP
 		deadline=$((SECONDS + secs))
 		looks=0
 		while kill -0 "$pid" 2>/dev/null; do
@@ -849,6 +855,29 @@ bounded() {
 		wait "$pid" || status=$?
 		exit "$status"
 	) 3>&2 2>/dev/null
+}
+
+# bounded's trap for <signal>: SIGKILL CMD's group, which bounded's $pid
+# leads, remove the caller's BOUNDED_TEMPS, and end by the signal (die_of).
+# set -e holds in a trap whatever its caller's context, so neither step may end
+# it first: a group already gone (CMD ended just before the signal) answers
+# kill with 1.
+bounded_cut() { # <signal> <status>
+	kill -KILL -- "-$pid" 2>/dev/null || true
+	rm -f -- ${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"} 2>/dev/null || true
+	die_of "$1" "$2"
+}
+
+# Ends the subshell it runs in by <signal>, its trap reset first, so the shell
+# waiting on it, which got the same signal (the terminal sends a Ctrl-C to its
+# whole process group), ends too: bash ends a waiting shell whose child died of
+# the SIGINT it got, but goes on after a child's ordinary exit
+# (wait-and-cooperative-exit). sh's parent is this subshell, whose pid bash 3.2
+# cannot name. <status> if it lives on.
+die_of() { # <signal> <status>
+	trap - "$1"
+	kill -s "$1" "$(exec sh -c 'echo "$PPID"')" || true
+	exit "$2"
 }
 
 # The gate may only vouch for a bundle the fresh install would have accepted:
@@ -2390,6 +2419,7 @@ linux_candidate_answers_tag() { # <exe> <tag>
 	local out s=0
 	LINUX_CANDIDATE_SAID=""
 	out="$(mktemp "${TMPDIR:-/tmp}/aterm-probe.XXXXXX")" || return 2
+	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"} "$out")
 	bounded "$VERIFY_WAIT_SECS" "$1" --version >"$out" || s=$?
 	[[ "$s" -ne 0 ]] || LINUX_CANDIDATE_SAID="$(head -n 1 "$out")"
 	rm -f "$out"
@@ -3223,13 +3253,16 @@ app_dest_verdict() { # <app-dir>
 # ownership on this volume" on. Every entry there reads as the mount's owner,
 # and an exFAT or FAT one keeps no ACL either, so stage_bundle cannot make its
 # staging folder root's alone, and would refuse only after the download. A
-# volume df or mount does not name is not judged.
+# volume df or the mount table does not name is not judged, nor is any while
+# that table is not read in time (macos_mounts). A Ctrl-C, hang-up or TERM
+# while it is read ends the run (bounded).
 root_dest_keeps_no_owner() { # <dest>
 	[[ "$(installer_uid)" == 0 && "$(uname -s)" == Darwin ]] || return 1
-	local dev
+	local dev table
 	dev="$(df -P -- "$(existing_anchor "$1")" 2>/dev/null | awk 'NR == 2 { print $1 }')"
 	[[ -n "$dev" ]] || return 1
-	mount 2>/dev/null | awk -v d="$dev on " 'index($0, d) == 1 && /[(,] *noowners *[,)]/ { found = 1 } END { exit !found }'
+	table="$(macos_mounts 2>/dev/null)" || return 1
+	awk -v d="$dev on " 'index($0, d) == 1 && /[(,] *noowners *[,)]/ { found = 1 } END { exit !found }' <<<"$table"
 }
 
 root_dest_acl_open() { # <dest>
@@ -3418,7 +3451,7 @@ install_app_cleanup() {
 # all session. When <exe>, at its final path, answers `help caffeine` with a
 # definite no (code::serves_caffeine's probe and its reading: a status <exe>
 # chose, 1 to 125 but bounded's cut-off, 124; from 126 up a run that could not
-# start or one a signal ended, Ctrl-C's in bounded among them, is no answer),
+# start or one a signal ended is no answer),
 # each such job is turned off, as a running mug whose code lost the verb turns
 # its own off (macos/app.rs restart_or_retire): its plist in this home's
 # ~/Library/LaunchAgents goes, and launchd unloads the job, ending a mug it
@@ -3897,13 +3930,29 @@ macos_mount_foreign() { # <flags>
 	[[ "$flags" != *", local,"* || "$flags" == *", mounted by "* ]]
 }
 
-# macOS's mounts, as /sbin/mount (by its fixed path, which PATH cannot
-# shadow) lists them, or status 124 when it has not listed them within
-# VERIFY_WAIT_SECS: it asks each mount's folder for its volume's capabilities,
-# and one in a share whose server stopped answering never answers (a test
-# replaces it).
+# macOS's mounts, as mount_table lists them, or status 124 when it has not
+# listed them within VERIFY_WAIT_SECS (what it printed by then answers
+# nothing): /sbin/mount asks each mount's folder for its volume's
+# capabilities, and one in a share whose server stopped answering never
+# answers. Its lines reach the read through cat, inside the run bounded cuts
+# off, so the read ends at the cut-off: a program in a file system's call that
+# does not heed SIGKILL lives on until that call returns, but holds only its
+# pipe to cat, which the SIGKILL ends (a test replaces it). No file holds
+# them, so a full disk cannot cut the table short and a signal leaves nothing.
 macos_mounts() {
-	bounded "$VERIFY_WAIT_SECS" /sbin/mount
+	bounded "$VERIFY_WAIT_SECS" mount_table_relayed
+}
+
+# mount_table through cat, in one process group; under pipefail its status is
+# mount_table's.
+mount_table_relayed() {
+	mount_table | cat
+}
+
+# The mount table, as /sbin/mount (by its fixed path, which PATH cannot
+# shadow) prints it (a test replaces it).
+mount_table() {
+	/sbin/mount
 }
 
 # The folders (or files) Linux has a filesystem mounted at that could be a
@@ -4072,16 +4121,18 @@ linux_acl_clear() { # <getfacl-arg>...
 }
 
 # The first entry at or below folder <dir> (a physical path) that another
-# account could change: one, a link aside, that is not root's, or that every
-# account or a group but root's can write, or <dir> when an ACL is on any or
-# the ACLs cannot be read whole, or a folder in it with a filesystem mounted
+# account could change: one that is not root's (links on Linux aside), or a
+# non-link that every account or a group but root's can write, or <dir> when an
+# ACL is on any or the ACLs cannot be read whole, or a folder in it with a filesystem mounted
 # whose owners say nothing (foreign_mount_in's); nothing when there is none.
 # A name with a newline, which would read as two paths, is named by the folder
 # that holds it.
 root_entries_offender() { # <dir>
-	local f
+	local f link_owner=-false
+	[[ "$OSTYPE" != darwin* ]] || link_owner=-true
 	f="$(find "$1" \( -name "*"$'\n'"*" -prune -exec dirname {} \; \) -o \
-		\( ! -type l \( ! -user 0 -o -perm -002 -o \( -perm -020 ! -group 0 \) \) -print \) 2>/dev/null |
+		\( \( \( ! -type l -o "$link_owner" \) ! -user 0 \) -o \
+		\( ! -type l \( -perm -002 -o \( -perm -020 ! -group 0 \) \) \) \) -print 2>/dev/null |
 		head -n 1)"
 	if [[ -n "$f" ]]; then
 		printf '%s\n' "$f"
@@ -4225,6 +4276,7 @@ first_line_bounded() {
 	local out s=0
 	may_run "$1" || return 0
 	out="$(mktemp "${TMPDIR:-/tmp}/aterm-probe.XXXXXX")" || return 0
+	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"} "$out")
 	bounded "$VERIFY_WAIT_SECS" "$@" >"$out" 2>/dev/null || s=$?
 	[[ "$s" -eq 124 ]] || head -n 1 "$out"
 	rm -f "$out"
@@ -4233,10 +4285,11 @@ first_line_bounded() {
 # Whether <exe> has shown it ran, asked `--version` through bounded; when it
 # has not, UNPROVEN says why. An exec waits on macOS's check of its file, so a
 # run that wrote a line, or ended other than as bounded ends one (124 at the
-# deadline; 129, 130 or 143 on a signal to this script), is past that check: by
-# its own exit, or a signal it or macOS raised. A run cut off may still be in
-# it, and macOS 27.0.1's syspolicyd crashes when the file it is checking at a
-# first exec is removed or renamed, stranding every later exec until a restart.
+# deadline; 129, 130 or 143 when a hang-up, interrupt or TERM cut it short),
+# is past that check: by its own exit, or a signal it or macOS raised. A run
+# cut off may still be in it, and macOS 27.0.1's syspolicyd crashes when the
+# file it is checking at a first exec is removed or renamed, stranding every
+# later exec until a restart.
 # A path that is no executable file never ran, and off macOS there is no such
 # check. An end of 126 or 127 with no line may be the shell's own failure to
 # exec it (denied, or a missing interpreter), which shows nothing but a kernel
@@ -4263,6 +4316,7 @@ showed_it_ran() { # <exe>
 		UNPROVEN="$1 could not be asked (no temporary file)"
 		return 1
 	}
+	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"} "$out" "$err")
 	if may_run "$1"; then
 		bounded "$VERIFY_WAIT_SECS" "$1" --version >"$out" 2>"$err" || s=$?
 		[[ ! -s "$out" ]] || s=0
@@ -4336,10 +4390,23 @@ exec_refused() { # <err> <exe>
 # in Contents/MacOS but a link, since a toolset generation's aterm-cli starts
 # its siblings (atpkg for `pkg`).
 bundle_showed_it_ran() { # <app>
-	local f
-	for f in "$1"/Contents/MacOS/*; do
-		[[ -L "$f" ]] || showed_it_ran "$f" || return 1
-	done
+	local f inventory dir="$1/Contents/MacOS"
+	UNPROVEN="$dir could not be inventoried"
+	UNPROVEN_THEN="make its program folder readable and searchable, then run this again"
+	# A failed glob looks just like a folder with no programs. Require an actual
+	# directory and a complete, successful inventory before asking any program.
+	[[ -d "$dir" && ! -L "$dir" ]] || return 1
+	inventory="$(mktemp "${TMPDIR:-/tmp}/aterm-programs.XXXXXX")" || return 1
+	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"} "$inventory")
+	if ! find "$dir" -mindepth 1 -maxdepth 1 -type f -print0 >"$inventory" 2>/dev/null; then
+		rm -f "$inventory"
+		return 1
+	fi
+	while IFS= read -r -d '' f; do
+		showed_it_ran "$f" || { rm -f "$inventory"; return 1; }
+	done <"$inventory"
+	rm -f "$inventory"
+	UNPROVEN=""
 }
 
 # Say that <path> was left where it is, for UNPROVEN (showed_it_ran).

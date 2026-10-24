@@ -2889,6 +2889,7 @@ impl SessionTimeline {
     }
 
     /// The group each holder-fence mark's drawer leads ([`crate::holder_image::DrawerGroups`]).
+    #[cfg(unix)]
     pub(crate) const fn drawer_groups(&self) -> &crate::holder_image::DrawerGroups {
         &self.drawer_groups
     }

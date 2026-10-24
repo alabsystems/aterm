@@ -16,9 +16,9 @@ use aterm_vitals::model::{
 };
 use aterm_vitals::words::{self, InkKind, Ladder, Locale, Platform};
 
-use crate::stats_deck::{ASCENT_EM, DESCENT_EM, DeckInput, StatsBars, deck_metrics, kind_ink};
+use crate::deck_face::{ASCENT_EM, DESCENT_EM, FaceMetrics, deck_metrics};
+use crate::stats_deck::{DeckInput, StatsBars, kind_ink};
 use crate::stats_paint::{Bar, Instrument, Painter, WellMark, a, panel};
-use crate::stats_plan::FaceMetrics;
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, Rgba, TextFace, TextWeight, rgba, text_prim};
 
@@ -155,11 +155,11 @@ pub(crate) fn how_to_read_words(platform: Platform) -> String {
 pub(crate) fn lens_sentence(
     snap: &Snapshot,
     focus: Instrument,
-    tab_key: Option<u64>,
+    panes: &[u64],
     loc: &Locale,
 ) -> String {
     match focus.resource() {
-        Some(res) => words::row_sentence(res, snap, tab_key, loc),
+        Some(res) => words::row_sentence(res, snap, panes, loc),
         None => how_to_read_words(loc.platform),
     }
 }
@@ -780,16 +780,18 @@ fn grouped<'a>(
     groups.sort_by(|a, b| b.2.total_cmp(&a.2));
     groups
         .into_iter()
-        .map(|(name, scope, v, n)| {
-            let name = aterm_vitals::jobs::wire::person_name(name);
-            let name = if n > 1 {
-                format!("{name} \u{d7}{n}")
-            } else {
-                name
-            };
-            (name, scope, v)
-        })
+        .map(|(name, scope, v, n)| (program_label(name, n), scope, v))
         .collect()
+}
+
+/// A program's row name: its name as a person reads it, `×n` where it runs as several processes.
+fn program_label(name: &str, n: usize) -> String {
+    let name = aterm_vitals::jobs::wire::person_name(name);
+    if n > 1 {
+        format!("{name} \u{d7}{n}")
+    } else {
+        name
+    }
 }
 
 /// A list's height.
@@ -797,10 +799,10 @@ fn rows_h(n: usize, note: bool) -> f64 {
     PITCH * (n + usize::from(note)) as f64 + 14.0
 }
 
-/// A chip's ink (§11.3).
-fn chip_ink(pen: &Pen<'_>, scope: ProcScope, tab_key: Option<u64>) -> Rgb {
+/// A chip's ink (§11.3): this tab's for a process in any of its `panes`.
+fn chip_ink(pen: &Pen<'_>, scope: ProcScope, panes: &[u64]) -> Rgb {
     match scope {
-        ProcScope::Tab(k) if Some(k) == tab_key => {
+        ProcScope::Tab(k) if panes.contains(&k) => {
             if pen.ic {
                 pen.inks.tab_ic
             } else {
@@ -819,7 +821,7 @@ fn chip_ink(pen: &Pen<'_>, scope: ProcScope, tab_key: Option<u64>) -> Rgb {
 }
 
 /// `rows` under a heading at `p`'s top.
-fn draw_rows(pen: &mut Pen<'_>, p: Place, rows: &[Row], tab_key: Option<u64>) {
+fn draw_rows(pen: &mut Pen<'_>, p: Place, rows: &[Row], panes: &[u64]) {
     let fig_w = rows
         .iter()
         .map(|r| pen.width(&r.figure, BODY_PT, false))
@@ -849,7 +851,7 @@ fn draw_rows(pen: &mut Pen<'_>, p: Place, rows: &[Row], tab_key: Option<u64>) {
     for (i, r) in rows.iter().enumerate() {
         let base = p.y + ROW0_BASE + PITCH * i as f64;
         if let Some(scope) = r.chip {
-            let ink = chip_ink(pen, scope, tab_key);
+            let ink = chip_ink(pen, scope, panes);
             pen.rect(p.x, base - 7.0, 6.0, 7.0, 1.0, rgba(ink, 0xFF));
         }
         let name = pen.cut(&r.name, name_w, BODY_PT, false);
@@ -892,7 +894,7 @@ fn list_section<'d>(
 ) -> Section<'d> {
     let mut words: Vec<String> = rows.iter().map(Row::said).collect();
     words.extend(note.clone());
-    let tab_key = c.tab_key;
+    let panes = c.panes;
     let mut forms = Vec::new();
     let counts: Vec<usize> = if c.two {
         vec![rows.len().min(most)]
@@ -907,7 +909,7 @@ fn list_section<'d>(
             (rows[..n].to_vec(), subs.clone(), name.clone(), note.clone());
         forms.push(form(rows_h(n, with_note), move |pen, p| {
             heading(pen, p, &name, &subs);
-            draw_rows(pen, p, &rows, tab_key);
+            draw_rows(pen, p, &rows, panes);
             if with_note && let Some(note) = &note {
                 let base = p.y + ROW0_BASE + PITCH * rows.len() as f64;
                 let lead = 10.0;
@@ -937,8 +939,6 @@ struct Trace {
     min_span: f64,
     /// A rule at a fractional bucket index, and its label.
     mark: Option<(f64, String)>,
-    /// What an unread span inside the window says.
-    gap: &'static str,
 }
 
 /// The labels under a 24 hour trace and an hour's.
@@ -1093,7 +1093,7 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
         } else {
             pen.hollow(xa, y1 - 4.0, xb - xa, 4.0, rgba(inks.hollow, 0xFF));
         }
-        let words = if start == 0 { "not read" } else { t.gap };
+        let words = "not read";
         let lw = pen.width(words, AXIS_PT, false);
         if ch >= 30.0 && lw <= xb - xa + 16.0 && lw <= x1 - x0 {
             let lx = ((xa + xb) / 2.0 - lw / 2.0).clamp(x0, x1 - lw);
@@ -1327,12 +1327,7 @@ fn trace_said(what: &str, unit: &str, t: &Trace, span: (i64, i64), loc: &Locale)
                 t.truncate(5);
                 t
             };
-            out.push_str(&format!(
-                " Not read from {} to {}, {}.",
-                at(start),
-                at(j),
-                t.gap.trim_end_matches(", not read")
-            ));
+            out.push_str(&format!(" Not read from {} to {}.", at(start), at(j)));
             gaps += 1;
         }
     }
@@ -1349,7 +1344,6 @@ fn gib(bytes: u64) -> f64 {
 struct Ctx<'d> {
     snap: &'d Snapshot,
     m: &'d FaceMetrics,
-    tab_key: Option<u64>,
     /// The front tab's sessions ([`DeckInput::tab_panes`]).
     panes: &'d [u64],
     tab_label: &'d str,
@@ -1366,7 +1360,7 @@ impl Ctx<'_> {
         match self.bar {
             Bar::Global => true,
             Bar::Aterm => scope != ProcScope::Other,
-            Bar::Tab => self.tab_key.is_some_and(|k| scope == ProcScope::Tab(k)),
+            Bar::Tab => matches!(scope, ProcScope::Tab(k) if self.panes.contains(&k)),
         }
     }
 
@@ -1396,7 +1390,7 @@ impl Ctx<'_> {
     }
 
     fn view(&self, res: Resource) -> ResourceView {
-        self.snap.resource(res, self.tab_key)
+        self.snap.resource(res, self.panes)
     }
 
     /// The row's state now (the answer of every lens but Disk's).
@@ -1647,7 +1641,6 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
         under: DAY,
         min_span: 1.0,
         mark,
-        gap: "asleep, not read",
     };
     let mut said = trace_said(
         "GB free over the last 24 hours",
@@ -1756,13 +1749,16 @@ fn where_section(c: Ctx<'_>) -> Section<'_> {
 /// Writing now (§7.7).
 fn writing_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
-    let writers = grouped(
-        snap.facts
-            .writers
-            .iter()
-            .filter(|w| c.in_scope(w.scope))
-            .map(|w| (w.name.as_str(), w.scope, w.bytes_per_s)),
-    );
+    let writers: Vec<(String, ProcScope, f64)> = snap
+        .facts
+        .writers
+        .iter()
+        .filter(|w| c.in_scope(w.scope))
+        .map(|w| {
+            let n = usize::try_from(w.n).unwrap_or(usize::MAX);
+            (program_label(&w.name, n), w.scope, w.bytes_per_s)
+        })
+        .collect();
     let name = format!("Writing now{}", c.suffix());
     if writers.is_empty() {
         let says = match c.loc.platform {
@@ -2436,7 +2432,6 @@ fn memory_doc(c: Ctx<'_>) -> LensDoc<'_> {
         under: HOUR,
         min_span: 0.5,
         mark: None,
-        gap: "not read",
     };
     let start = (now.div_euclid(60_000) - 59) * 60_000;
     let said = trace_said(
@@ -2700,7 +2695,6 @@ fn processes_doc(c: Ctx<'_>) -> LensDoc<'_> {
         under: HOUR,
         min_span: 5.0,
         mark: None,
-        gap: "not read",
     };
     let start = (now.div_euclid(60_000) - 59) * 60_000;
     let said = trace_said(
@@ -2788,7 +2782,7 @@ fn counts_section<'d>(c: Ctx<'d>, unit: &'static str) -> Section<'d> {
             figure: words::grouped(n.round() as u64),
         });
     }
-    if let (Some(n), Some(k)) = (view.tab.now, c.tab_key) {
+    if let (Some(n), Some(&k)) = (view.tab.now, c.panes.first()) {
         rows.push(Row {
             chip: Some(ProcScope::Tab(k)),
             name: c.tab_label.to_owned(),
@@ -2827,7 +2821,7 @@ fn jobs_section(c: Ctx<'_>) -> Section<'_> {
         return line_section(&name, "Jobs", vec!["reading the jobs\u{2026}".into()], true);
     };
     let tab_ok = |tab: u64| match c.bar {
-        Bar::Tab => c.tab_key == Some(tab),
+        Bar::Tab => c.panes.contains(&tab),
         Bar::Global | Bar::Aterm => true,
     };
     let tab_word = |key: u64| {
@@ -3127,8 +3121,8 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
                 let mut x = p.x;
                 let items = [
                     (pen.machine(), machine),
-                    (chip_ink(pen, ProcScope::Aterm, None), "aterm"),
-                    (chip_ink(pen, ProcScope::Tab(0), Some(0)), "this tab"),
+                    (chip_ink(pen, ProcScope::Aterm, &[]), "aterm"),
+                    (chip_ink(pen, ProcScope::Tab(0), &[0]), "this tab"),
                 ];
                 let words = pen.inks.words;
                 for (ink, word) in items {
@@ -3290,7 +3284,7 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
         _ => ("GPU", "Heat is how much of the time the GPU was busy."),
     };
     let details = words::details(res, snap, &c.loc);
-    let mut sentence = words::row_sentence(res, snap, c.tab_key, &c.loc);
+    let mut sentence = words::row_sentence(res, snap, c.panes, &c.loc);
     for d in &details {
         if let Some(i) = sentence.find(&d.spoken) {
             sentence.replace_range(i..i + d.spoken.len(), "");
@@ -3694,7 +3688,6 @@ pub(crate) fn lay_lens(
             let c = Ctx {
                 snap,
                 m: metrics,
-                tab_key: input.tab_key,
                 panes: &input.tab_panes,
                 tab_label: &input.tab_label,
                 loc: input.locale,
@@ -3826,7 +3819,6 @@ impl crate::App {
     fn lens_input(&self, f: &crate::stats_deck::DeckFrame) -> DeckInput<'_> {
         DeckInput {
             snap: self.vitals.snapshot.as_deref(),
-            tab_key: f.tab_key,
             tab_panes: f.tab_panes.clone(),
             tab_label: f.tab_label.clone(),
             tab_count: f.tab_count,
@@ -3853,8 +3845,7 @@ impl crate::App {
         self.vitals.snapshot.as_ref().map(|s| s.seq).hash(&mut h);
         lens.hash(&mut h);
         (lg.dx, lg.dy, lg.w.to_bits(), lg.h.to_bits()).hash(&mut h);
-        format!("{:?}", f.lens_inks).hash(&mut h);
-        f.tab_key.hash(&mut h);
+        f.lens_inks.hash(&mut h);
         f.tab_panes.hash(&mut h);
         f.tab_label.hash(&mut h);
         (f.dwc, f.contrast).hash(&mut h);
@@ -4177,12 +4168,12 @@ impl crate::App {
     pub(crate) fn stats_lens_sentence(&self, wid: crate::WindowId) -> Option<String> {
         let open = self.windows.get(&wid).and_then(|ws| ws.stats_lens.open)?;
         let snap = self.vitals.snapshot.as_deref()?;
-        let (tab_key, _) = self.deck_tab(wid);
+        let panes = self.deck_tab_panes(wid);
         let loc = Locale {
             platform: Platform::host(),
             utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
         };
-        Some(lens_sentence(snap, open.focus, tab_key, &loc))
+        Some(lens_sentence(snap, open.focus, &panes, &loc))
     }
 
     /// Copy the open lens's sentence (⌘C in a pinned or keyboard lens).

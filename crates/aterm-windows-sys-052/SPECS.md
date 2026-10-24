@@ -35,7 +35,7 @@ id	kind	functions	statement	subsumes	difficulty	blocking gaps
 WSYS052-PF-VALUE	table-property	windows_sys::Win32::System::Threading::PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE	PF : u32 ∧ PF == 30, the winnt.h value that windows-sys 0.52.0 RECORDED on x86_64- and aarch64-pc-windows-msvc. The statement has one row and no free variables, so it holds on every host and target where the crate compiles. Nothing is quantified. Cheapest sound discharge: `const _: () = assert!(PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE == 30);` in tests/recorded.rs, next to the three existing `const _` checks. rustc CTFE proves it on every build of the test target, and planting any other value breaks the build (the negative control). A Clean island form (`def pf_arm_v8_crypto : UInt32 := 30`, with the Rust const bound to it) would only restate the same constant.	tests/recorded.rs::the_constant_holds_its_recorded_value	TRIVIAL: one scalar u32 const. No loops, no heap, no &mut, no unsafe. The spec does not reach the surrounding extern "system" fn declaration.	0
 ```
 
-## 2. Test → spec map (TSV; all 1)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

@@ -80,12 +80,12 @@ impl SyncCounter {
         self.pending.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Records a sync request for `value` from the window manager.
+    /// Step 1: the window manager asked for `value`.
     pub(super) fn requested(&self, value: i64) {
         *self.pending() = Some(Pending { value, wait: Wait::Configure, since: Instant::now() });
     }
 
-    /// Records a `ConfigureNotify` event and whether it resized the window.
+    /// Step 2: a `ConfigureNotify` arrived, whether or not it changed the window's size.
     pub(super) fn configured(&self, xconn: &XConnection, resized: bool) {
         let mut pending = self.pending();
         match pending.as_mut() {
@@ -100,7 +100,7 @@ impl SyncCounter {
         }
     }
 
-    /// Marks the pending frame presented and answers the sync request if due.
+    /// Step 3: the application presented a frame of the window.
     pub(super) fn presented(&self, xconn: &XConnection) {
         let mut pending = self.pending();
         if let Some(p) = pending.take_if(|p| p.wait == Wait::Frame) {
@@ -109,7 +109,7 @@ impl SyncCounter {
         }
     }
 
-    /// Answers any pending request whose wait or deadline is satisfied at `now`.
+    /// Steps 4 and 5: an event-loop turn ended at `now`, or the loop woke for [`Self::deadline`].
     pub(super) fn turn_ended(
         &self,
         xconn: &XConnection,

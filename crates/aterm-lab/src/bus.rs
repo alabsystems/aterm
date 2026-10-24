@@ -11,7 +11,7 @@ use aterm_uds::spawnfd::Stdio;
 /// The fleet a lab's bus names (`/f/lab/…`).
 pub const FLEET: &str = "lab";
 
-/// The bus: its broker.
+/// A lab's bus: its broker, the instance's `[fabric]` table and the bridge's state dir.
 pub struct Fabric {
     broker: Option<aterm_uds::spawnfd::Child>,
     /// The broker's lifeline (`aterm_uds::lifeline`): it ends itself once this is

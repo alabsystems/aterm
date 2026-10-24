@@ -6,8 +6,11 @@
 use super::*;
 use aterm_net::fleet::{FleetEvent, Listening, read_key_file, serve};
 use aterm_net::fleet_member::{Issuer, read_peers, serve_book, serve_join};
+use aterm_uds::private_file::{remove_private, write_private};
+use std::cell::{Cell, RefCell};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -258,7 +261,7 @@ impl Listener {
             port,
             version: "0.95.0".to_owned(),
         });
-        let state = state.to_path_buf();
+        let (state, secret) = (state.to_path_buf(), listening.secret.clone());
         let serving = std::thread::spawn({
             let running = Arc::clone(&running);
             move || {
@@ -289,7 +292,7 @@ impl Listener {
                             serve_join(
                                 stream,
                                 (from, proof.as_ref()),
-                                &state,
+                                (&state, &secret),
                                 move || Ok(issuer),
                                 1_760_000_000_000,
                             )
@@ -565,7 +568,7 @@ fn a_machine_that_takes_a_members_node_id_is_refused() {
 
     let taker = World::new("bind-taker");
     member::ensure_private_dir(&taker.places.state).unwrap();
-    member::write_private(
+    write_private(
         &taker.places.state,
         member::NODE_FILE,
         format!("{node}\n").as_bytes(),
@@ -652,8 +655,11 @@ fn a_join_again_of_the_same_fleet_reaches_only_the_issuer_it_binds() {
         &other.places,
         &args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()]),
     ));
-    member::write_key_file(&other.places.state, &secret).unwrap();
-    member::remove_private(&other.places.state, NODE_KEY_FILE).unwrap();
+    member::hold_book(&other.places.state)
+        .unwrap()
+        .write_key(&secret)
+        .unwrap();
+    remove_private(&other.places.state, NODE_KEY_FILE).unwrap();
     let issuer_node = member::node_id(&issuer.places.state).unwrap();
     for proves in ["no node", "its own node"] {
         if proves == "its own node" {
@@ -730,7 +736,10 @@ fn a_join_again_reaches_only_the_issuer_it_binds_while_its_state_reads_as_open()
         &args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()]),
     ));
     let secret = JoinCode::parse(&code).unwrap().secret;
-    member::write_key_file(&other.places.state, &secret).unwrap();
+    member::hold_book(&other.places.state)
+        .unwrap()
+        .write_key(&secret)
+        .unwrap();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let there = JoinCode {
         secret,
@@ -907,6 +916,46 @@ fn a_leave_says_it_narrowed_an_open_state() {
 }
 
 #[test]
+fn a_leave_where_no_writer_can_make_the_state_takes_the_fleet_out_of_aterm_toml() {
+    let world = World::new("leave-unmade");
+    let root = world.places.state.parent().unwrap().to_owned();
+    std::fs::write(root.join("a-file"), b"x").unwrap();
+    std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling")).unwrap();
+    let unwritable = root.join("unwritable");
+    std::fs::create_dir(&unwritable).unwrap();
+    std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o500)).unwrap();
+    for odd in [
+        "a-file",
+        "a-file/state",
+        "dangling/state",
+        "unwritable/state",
+    ] {
+        let places = Places {
+            state: root.join(odd),
+            config: world.places.config.clone(),
+        };
+        world.write_config(&format!(
+            "[fleet]\nlisten = \"0.0.0.0:{}\"\nallow = \"facts\"\n",
+            closed_port()
+        ));
+        let listening = world.config();
+        assert!(init(&places, &racing_init()).is_err(), "{odd}");
+        assert_eq!(
+            world.config(),
+            listening,
+            "{odd}: an init there writes nothing"
+        );
+        let left = ok(leave(&places, &[]));
+        assert!(
+            left.contains("[fleet] listen, allow and drive_from removed"),
+            "{odd}: {left}"
+        );
+        assert!(!places.state.is_dir(), "{odd}");
+    }
+    std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
 fn an_issuer_entry_an_older_aterm_wrote_binds_a_join_only_beside_a_key_held() {
     let (_first, first_code, _first_serving) = issuing("unmarked-first");
     let (other, other_code, _other_serving) = issuing("unmarked-other");
@@ -922,7 +971,7 @@ fn an_issuer_entry_an_older_aterm_wrote_binds_a_join_only_beside_a_key_held() {
         text.push_str(&peer.line());
         text.push('\n');
     }
-    member::write_private(&member.places.state, PEERS_FILE, text.as_bytes()).unwrap();
+    write_private(&member.places.state, PEERS_FILE, text.as_bytes()).unwrap();
     let key_file = member.places.state.join(KEY_FILE);
     std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o644)).unwrap();
 
@@ -983,7 +1032,7 @@ fn an_issuer_that_lost_its_node_key_is_bound_again_as_its_refusal_says() {
     let node = member::node_id(&issuer.places.state).unwrap();
     let book = read_peers(&member.places.state).unwrap();
 
-    member::remove_private(&issuer.places.state, NODE_KEY_FILE).unwrap();
+    remove_private(&issuer.places.state, NODE_KEY_FILE).unwrap();
     let (serving, code) = serve();
     let refused = match join(&member.places, &opts, &code) {
         Err(Failure::Failed(why)) => why,
@@ -1164,7 +1213,7 @@ fn rotate_mints_a_new_secret_and_keeps_the_roster() {
         "the host stays"
     );
 
-    member::remove_private(&issuer.places.state, CODE_FILE).unwrap();
+    remove_private(&issuer.places.state, CODE_FILE).unwrap();
     assert!(matches!(init(&issuer.places, &[]), Err(Failure::Failed(_))));
 
     let looped = World::new("rotate-loopback");
@@ -1659,7 +1708,10 @@ fn a_members_peers_reads_its_issuers_book_and_keeps_a_copy() {
         via: Via::IssuerBook,
         ..manual_peer("127.0.0.1".to_owned(), named)
     }];
-    member::write_issuer_book(&member.places.state, &issuer_node, &stale).unwrap();
+    member::hold_book(&member.places.state)
+        .unwrap()
+        .keep_issuer_book(Some((&issuer_node, &stale)))
+        .unwrap();
     let listing = check_peers(&member.places, HANG).unwrap_or_else(|f| panic!("{f:?}"));
     assert_eq!(listing.rows.len(), 0, "an orphan copy is never read");
     assert!(!copy_file.exists(), "an orphan copy is cleared");
@@ -2236,7 +2288,10 @@ fn a_persons_entry_at_a_copys_place_is_read_beside_it() {
         via: Via::IssuerBook,
         ..manual_peer("m7.local".to_owned(), member::DEFAULT_PORT)
     };
-    member::write_issuer_book(&world.places.state, &issuer_node, &[copy.clone(), by_hand]).unwrap();
+    member::hold_book(&world.places.state)
+        .unwrap()
+        .keep_issuer_book(Some((&issuer_node, &[copy.clone(), by_hand])))
+        .unwrap();
     let known = known_peers(&world.places).unwrap_or_else(|f| panic!("{f:?}"));
     let targets: Vec<Peer> = known.peers.iter().map(|(peer, _)| peer.clone()).collect();
     assert_eq!(
@@ -2510,7 +2565,7 @@ fn a_join_of_another_fleet_that_fails_after_its_issuer_recorded_it_finishes_on_a
     assert!(refused.contains("before it dials the issuer"), "{refused}");
     assert_eq!(read_peers(&other.places.state).unwrap(), Vec::new());
     std::fs::remove_dir(&book).unwrap();
-    member::write_private(&member.places.state, PEERS_FILE, &held).unwrap();
+    write_private(&member.places.state, PEERS_FILE, &held).unwrap();
 
     let set_mode = |bits| {
         std::fs::set_permissions(&member.places.state, std::fs::Permissions::from_mode(bits))
@@ -2587,7 +2642,7 @@ fn a_join_of_another_fleet_whose_key_cannot_be_written_leaves_the_book_as_it_was
     assert_eq!(read_peers(&other.places.state).unwrap().len(), 1);
 
     std::fs::remove_dir(&key).unwrap();
-    member::write_private(&member.places.state, KEY_FILE, &held).unwrap();
+    write_private(&member.places.state, KEY_FILE, &held).unwrap();
     assert_eq!(
         read_peers(&member.places.state).unwrap(),
         book_before,
@@ -2723,7 +2778,6 @@ fn a_read_while_a_join_of_another_fleet_writes_its_key_finds_the_old_fleet_whole
             move |at| {
                 if at == "key" {
                     let _ = peers(&elsewhere, &[]);
-                    let _ = drop_unbacked_grants(&elsewhere);
                     // The key's write fails now.
                     std::fs::remove_file(&key).unwrap();
                     std::fs::create_dir(&key).unwrap();
@@ -2734,7 +2788,7 @@ fn a_read_while_a_join_of_another_fleet_writes_its_key_finds_the_old_fleet_whole
     );
     assert!(matches!(failed, Err(Failure::Failed(_))), "{failed:?}");
     std::fs::remove_dir(&key).unwrap();
-    member::write_private(&member.places.state, KEY_FILE, &held).unwrap();
+    write_private(&member.places.state, KEY_FILE, &held).unwrap();
     assert_eq!(
         fleet_table(&member.config()).unwrap(),
         granted,
@@ -2941,7 +2995,7 @@ fn a_join_of_another_fleet_unfinished_leaves_an_older_aterm_the_issuer_of_neithe
         text.push_str(&peer.line());
         text.push('\n');
     }
-    member::write_private(&member.places.state, PEERS_FILE, text.as_bytes()).unwrap();
+    write_private(&member.places.state, PEERS_FILE, text.as_bytes()).unwrap();
 
     std::fs::remove_dir(&lock).unwrap();
     ok(join(&member.places, &opts, &other_code));
@@ -2993,7 +3047,7 @@ fn an_older_aterms_edit_never_comes_between_a_joins_marks_and_its_key() {
                     text.push_str(&peer.line());
                     text.push('\n');
                 }
-                member::write_private(&state, PEERS_FILE, text.as_bytes()).unwrap();
+                write_private(&state, PEERS_FILE, text.as_bytes()).unwrap();
             }
         },
         || join(&member.places, &opts, &other_code),
@@ -3140,7 +3194,7 @@ fn a_join_an_older_aterm_finished_still_reaches_only_the_issuer_it_binds() {
         text.push_str(&peer.line());
         text.push('\n');
     }
-    member::write_private(&member.places.state, PEERS_FILE, text.as_bytes()).unwrap();
+    write_private(&member.places.state, PEERS_FILE, text.as_bytes()).unwrap();
     ok(join(&member.places, &opts, &other_code));
     assert_eq!(
         (
@@ -3168,7 +3222,10 @@ fn a_join_an_older_aterm_finished_still_reaches_only_the_issuer_it_binds() {
         &args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()]),
     ));
     let secret = JoinCode::parse(&other_code).unwrap().secret;
-    member::write_key_file(&stranger.places.state, &secret).unwrap();
+    member::hold_book(&stranger.places.state)
+        .unwrap()
+        .write_key(&secret)
+        .unwrap();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let there = JoinCode {
         secret,
@@ -3285,11 +3342,12 @@ fn a_leave_beside_an_edit_of_the_book_leaves_no_book() {
         output: Vec::new(),
     };
     let node = member::node_id(&state).unwrap();
+    let secret = read_key_file(&state).unwrap();
     // The leave comes after the registration's check of the code, before its edit.
     let recorded = serve_join(
         &mut wire,
         (IpAddr::from(Ipv4Addr::LOCALHOST), None),
-        &state,
+        (&state, &secret),
         || {
             ok(leave(&issuer.places, &[]));
             Ok(Issuer {
@@ -3486,7 +3544,7 @@ fn a_join_again_a_leave_and_an_unfinished_join_come_into_keeps_no_grant() {
 
 #[test]
 fn an_init_a_leave_comes_into_holds_the_fleet_whole_or_none_of_it() {
-    // Before the key, the init makes the fleet a leave left none of; after it, the leave took the fleet out.
+    // Before the key, an init makes the fleet a leave left none of, and a rotate, of no fleet now, is refused; after it, the leave took the fleet out.
     for (step, rotate) in [
         ("key", false),
         ("key", true),
@@ -3522,7 +3580,14 @@ fn an_init_a_leave_comes_into_holds_the_fleet_whole_or_none_of_it() {
         );
         let state = &world.places.state;
         let table = fleet_table(&world.config()).unwrap();
-        if step == "key" {
+        if step == "key" && rotate {
+            assert!(
+                matches!(&inited, Err(Failure::Usage(why)) if why.contains("it issues none")),
+                "{inited:?}"
+            );
+            assert!(read_key_file(state).is_err() && !state.join(CODE_FILE).exists());
+            assert_eq!(table.listen, None, "as a rotate after the leave");
+        } else if step == "key" {
             let inited = ok(inited);
             assert!(
                 read_key_file(state).is_ok() && state.join(CODE_FILE).exists(),
@@ -3868,4 +3933,673 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
             .expect("refused before any dial");
         assert!(refused.why.contains("named by hand"), "{word}: {refused:?}");
     }
+}
+
+// A state, each fleet by its role: A's, B's or C's, the subject's own, or one a verb minted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct End {
+    key: &'static str,
+    code: &'static str,
+    listen: bool,
+    level: Option<&'static str>,
+    grants: Vec<&'static str>,
+    issuer: &'static str,
+    members: usize,
+    stale: usize,
+    copy: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Fixture {
+    // A member of A naming a peer in aterm.toml, with A's book copied.
+    Member,
+    Granted,
+    // Granted, then a leave stopped short of aterm.toml.
+    Left,
+    // No state directory, nor aterm.toml.
+    Empty,
+    // No state directory (one removed by hand), and the `[fleet]` aterm.toml kept.
+    Stale,
+    // An issuer letting the member its book binds drive it.
+    Issuer,
+    // An issuer whose init was killed before aterm.toml.
+    Unlistened,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Other {
+    Leave,
+    // A leave stopped short of aterm.toml.
+    StoppedLeave,
+    // A join of C's code, which no verb joins.
+    JoinC,
+    // An init, or an init again where this machine issues a fleet.
+    Init,
+    // A kill, then the verb again.
+    Kill,
+    // The book's lock held across the verb's next write, then the verb again.
+    Busy,
+}
+
+const DRIVER: &str = "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4";
+
+type Verb = fn(&Racing, &Places, Option<&FleetSecret>) -> Result<String, Failure>;
+
+struct Race {
+    verb: &'static str,
+    fixture: Fixture,
+    steps: &'static [&'static str],
+    run: Verb,
+    // The verb again after a kill or a busy lock, as its refusal says: `run` where none is named.
+    again: Option<Verb>,
+    alone: fn(&End) -> bool,
+}
+
+// Every writer of fleet state, with the steps another verb or a kill could come before.
+const RACES: &[Race] = &[
+    Race {
+        verb: "join again",
+        fixture: Fixture::Granted,
+        steps: &["lock", "key", "drop", "config", "book"],
+        run: |racing, places, _| join(places, &racing_opts(), &racing.a.1),
+        again: None,
+        alone: |end| end.grants == ["A"],
+    },
+    Race {
+        verb: "first join",
+        fixture: Fixture::Empty,
+        steps: &["lock", "key", "drop", "config", "book"],
+        run: |racing, places, _| join(places, &racing_opts(), &racing.a.1),
+        again: None,
+        alone: |end| end.key == "A" && end.issuer == "A",
+    },
+    Race {
+        verb: "join of another code",
+        fixture: Fixture::Granted,
+        steps: &["lock", "key", "drop", "config", "book"],
+        run: |racing, places, _| join(places, &racing_opts(), &racing.b.1),
+        again: None,
+        alone: |end| end.issuer == "B" && end.grants.is_empty(),
+    },
+    Race {
+        verb: "allow drive",
+        fixture: Fixture::Member,
+        steps: &["grant"],
+        run: |racing, places, _| allow(places, &args(&["drive", "--from", &racing.a_node()])),
+        again: None,
+        alone: |end| end.grants == ["A"],
+    },
+    Race {
+        verb: "allow content",
+        fixture: Fixture::Granted,
+        steps: &["level"],
+        run: |_, places, _| allow(places, &args(&["content"])),
+        again: None,
+        alone: |end| end.grants.is_empty(),
+    },
+    Race {
+        verb: "peers",
+        fixture: Fixture::Granted,
+        steps: &["keep"],
+        run: |_, places, _| peers(places, &[]),
+        again: None,
+        alone: |end| end.copy == "A",
+    },
+    Race {
+        verb: "leave",
+        fixture: Fixture::Granted,
+        steps: &["removed", "unlisten"],
+        run: |_, places, _| leave(places, &[]),
+        again: None,
+        alone: |end| end.key == "-" && !end.listen,
+    },
+    Race {
+        verb: "leave of no state directory",
+        fixture: Fixture::Stale,
+        steps: &["removed", "unlisten"],
+        run: |_, places, _| leave(places, &[]),
+        again: None,
+        alone: |end| end.key == "-" && !end.listen,
+    },
+    Race {
+        verb: "first join beside a stale listen",
+        fixture: Fixture::Stale,
+        steps: &["lock", "key", "drop", "config", "book"],
+        run: |racing, places, _| join(places, &racing_opts(), &racing.a.1),
+        again: None,
+        alone: |end| end.key == "A" && end.issuer == "A" && end.listen,
+    },
+    Race {
+        verb: "init beside a stale listen",
+        fixture: Fixture::Stale,
+        steps: &["key", "code", "config"],
+        run: |_, places, _| init(places, &racing_init()),
+        again: Some(|_, places, _| init(places, &racing_init()).or_else(|_| init(places, &[]))),
+        alone: |end| end.key == "minted" && end.listen,
+    },
+    Race {
+        verb: "init",
+        fixture: Fixture::Empty,
+        steps: &["key", "code", "config"],
+        run: |_, places, _| init(places, &racing_init()),
+        again: Some(|_, places, _| init(places, &racing_init()).or_else(|_| init(places, &[]))),
+        alone: |end| end.key == "minted" && end.listen,
+    },
+    Race {
+        verb: "init after a stopped leave",
+        fixture: Fixture::Left,
+        steps: &["key", "code", "config"],
+        run: |_, places, _| init(places, &racing_init()),
+        again: Some(|_, places, _| init(places, &racing_init()).or_else(|_| init(places, &[]))),
+        alone: |end| end.key == "minted" && end.listen && end.grants.is_empty(),
+    },
+    Race {
+        verb: "init again",
+        fixture: Fixture::Unlistened,
+        steps: &["key"],
+        run: |_, places, _| init(places, &[]),
+        again: None,
+        alone: |end| end.key == "own" && end.listen,
+    },
+    Race {
+        verb: "rotate",
+        fixture: Fixture::Issuer,
+        steps: &["key", "code", "config"],
+        run: |_, places, _| init(places, &args(&["--rotate"])),
+        again: None,
+        alone: |end| end.key == "minted" && end.grants == ["driver"],
+    },
+    Race {
+        verb: "a join the issuer serves",
+        fixture: Fixture::Issuer,
+        steps: &["issuer"],
+        run: serve_a_join,
+        again: None,
+        alone: |end| end.members == 2,
+    },
+];
+
+fn racing_opts() -> Opts {
+    Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    }
+}
+
+fn racing_init() -> Vec<String> {
+    args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()])
+}
+
+fn granting_issuer(places: &Places) {
+    ok(init(places, &racing_init()));
+    let key = NodeIdentity::from_seed(DRIVER, &[5; 32]).unwrap().key();
+    member::update_peers(&places.state, |book| {
+        book.push(Peer {
+            node: Some(DRIVER.to_owned()),
+            key: Some(key),
+            key_from: None,
+            host: "127.0.0.1".to_owned(),
+            addr: Some(IpAddr::from(Ipv4Addr::LOCALHOST)),
+            port: closed_port(),
+            version: None,
+            seen_ms: None,
+            via: Via::Joined,
+            fleet: None,
+        });
+        Ok(())
+    })
+    .unwrap();
+    ok(allow(places, &args(&["drive", "--from", DRIVER])));
+}
+
+fn serve_a_join(
+    _: &Racing,
+    places: &Places,
+    served: Option<&FleetSecret>,
+) -> Result<String, Failure> {
+    let reg = Registration {
+        node: "e5".repeat(16),
+        host: "lab-mini".to_owned(),
+        port: 7199,
+        version: "0.130.0".to_owned(),
+        key: None,
+    };
+    let mut wire = Wire {
+        input: std::io::Cursor::new(reg.line().into_bytes()),
+        output: Vec::new(),
+    };
+    let state = places.state.clone();
+    let issuer = move || {
+        at_step("issuer");
+        Ok(Issuer {
+            node: member::node_id(&state).map_err(|e| e.to_string())?,
+            host: "127.0.0.1".to_owned(),
+            port: 7100,
+            version: "0.95.0".to_owned(),
+        })
+    };
+    let served = served.expect("the issuer's own key");
+    match serve_join(
+        &mut wire,
+        (IpAddr::from(Ipv4Addr::LOCALHOST), None),
+        (&places.state, served),
+        issuer,
+        7,
+    ) {
+        Ok(Ok(_)) => Ok(String::new()),
+        Ok(Err(why)) => Err(failed(why)),
+        Err(e) => Err(failed(e)),
+    }
+}
+
+fn interfere(other: Other, c_code: &str, places: &Places) {
+    match other {
+        Other::Leave => drop(leave(places, &[])),
+        Other::StoppedLeave => {
+            let lock = places.config.with_file_name(".aterm.toml.aterm-write.lock");
+            std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+            let _ = std::fs::remove_file(&lock);
+            std::fs::create_dir(&lock).unwrap();
+            drop(leave(places, &[]));
+            std::fs::remove_dir(&lock).unwrap();
+        }
+        Other::JoinC => drop(join(places, &racing_opts(), c_code)),
+        Other::Init => drop(init(places, &racing_init()).or_else(|_| init(places, &[]))),
+        Other::Kill => panic!("killed here"),
+        Other::Busy => unreachable!("the hook holds the book"),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum When {
+    Before,
+    After,
+    At(&'static str),
+    Instead,
+}
+
+struct Racing {
+    a: (World, String, Listener),
+    b: (World, String, Listener),
+    c: (World, String, Listener),
+}
+
+impl Racing {
+    fn a_node(&self) -> String {
+        member::node_id(&self.a.0.places.state).unwrap()
+    }
+
+    fn fixture(&self, fixture: Fixture) -> (World, Option<FleetSecret>) {
+        for issuer in [&self.a.0, &self.b.0, &self.c.0] {
+            member::update_peers(&issuer.places.state, |book| {
+                book.retain(|peer| peer.via != Via::Joined);
+                Ok(())
+            })
+            .unwrap();
+        }
+        let world = World::new("race");
+        let places = &world.places;
+        match fixture {
+            Fixture::Empty => {}
+            Fixture::Stale => world.write_config(&format!(
+                "[fleet]\nlisten = \"0.0.0.0:{}\"\nallow = \"facts\"\n",
+                closed_port()
+            )),
+            Fixture::Member | Fixture::Granted | Fixture::Left => {
+                world.write_config(&format!(
+                    "[[fleet.peers]]\nhost = \"127.0.0.1:{}\"\n",
+                    closed_port()
+                ));
+                ok(join(places, &racing_opts(), &self.a.1));
+                if !matches!(fixture, Fixture::Member) {
+                    ok(allow(places, &args(&["drive", "--from", &self.a_node()])));
+                }
+                ok(peers(places, &[]));
+                if matches!(fixture, Fixture::Left) {
+                    interfere(Other::StoppedLeave, &self.c.1, places);
+                }
+            }
+            Fixture::Issuer => granting_issuer(places),
+            Fixture::Unlistened => {
+                assert!(killed_at("config", || init(places, &racing_init())));
+            }
+        }
+        let own = read_key_file(&places.state)
+            .ok()
+            .filter(|_| matches!(fixture, Fixture::Issuer | Fixture::Unlistened));
+        (world, own)
+    }
+
+    fn end(&self, world: &World, own: Option<&FleetSecret>) -> End {
+        let state = &world.places.state;
+        let fleets: Vec<(&'static str, FleetSecret, String)> =
+            [("A", &self.a.0), ("B", &self.b.0), ("C", &self.c.0)]
+                .into_iter()
+                .map(|(name, issuer)| {
+                    let state = &issuer.places.state;
+                    (
+                        name,
+                        read_key_file(state).unwrap(),
+                        member::node_id(state).unwrap(),
+                    )
+                })
+                .collect();
+        let role = |secret: &FleetSecret| {
+            fleets
+                .iter()
+                .find(|(_, key, _)| key == secret)
+                .map_or(if Some(secret) == own { "own" } else { "minted" }, |f| f.0)
+        };
+        let node_role = |node: &str| {
+            fleets
+                .iter()
+                .find(|(.., id)| id == node)
+                .map_or(if node == DRIVER { "driver" } else { "?" }, |f| f.0)
+        };
+        let held = Held::read(state);
+        let table = fleet_table(&world.config()).unwrap();
+        let book = read_peers(state).unwrap_or_default();
+        End {
+            key: match &held {
+                Held::Nothing => "-",
+                Held::Unreadable => "unreadable",
+                Held::Key(secret) => role(secret),
+            },
+            code: match member::read_join_code(state) {
+                Err(_) => "-",
+                Ok(code) => {
+                    let secret = FleetSecret::new(&code.secret).unwrap();
+                    if held.secret() == Some(&secret) {
+                        "=key"
+                    } else {
+                        role(&secret)
+                    }
+                }
+            },
+            listen: table.listen.is_some(),
+            level: table.level(),
+            grants: table
+                .drive_from
+                .iter()
+                .map(|word| node_role(&DriveGrant::node_of(word)))
+                .collect(),
+            issuer: book
+                .iter()
+                .find(|peer| peer.via == Via::Issuer)
+                .and_then(|peer| peer.node.as_deref())
+                .map_or("-", node_role),
+            members: book.iter().filter(|peer| peer.via == Via::Joined).count(),
+            stale: read_as_older(state).len() - book.len(),
+            copy: match fleets
+                .iter()
+                .find(|(.., id)| member::holds_issuer_book(state, id))
+            {
+                Some(fleet) => fleet.0,
+                None if state.join(ISSUER_BOOK_FILE).exists() => "?",
+                None => "-",
+            },
+        }
+    }
+
+    // The end the verb leaves on a fresh fixture with `other` where `when` puts it, and whether its last run did what it was asked.
+    fn run(&self, race: &Race, with: Option<(Other, When)>) -> (End, bool) {
+        let (world, own) = self.fixture(race.fixture);
+        let places = &world.places;
+        let own = own.as_ref();
+        let c_code = &self.c.1;
+        let verb = || (race.run)(self, places, own);
+        let done = match with {
+            None => verb().is_ok(),
+            Some((other, When::Before)) => {
+                interfere(other, c_code, places);
+                verb().is_ok()
+            }
+            Some((other, When::After)) => {
+                let done = verb().is_ok();
+                interfere(other, c_code, places);
+                done
+            }
+            Some((other, When::Instead)) => {
+                interfere(other, c_code, places);
+                false
+            }
+            Some((other, When::At(step))) => {
+                let dir: &'static Path = Box::leak(places.state.clone().into_boxed_path());
+                let here = Places {
+                    state: places.state.clone(),
+                    config: places.config.clone(),
+                };
+                let (reached, pending) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
+                let busy: Rc<RefCell<Option<member::HeldBook<'static>>>> = Rc::default();
+                let hook = {
+                    let (reached, pending, busy, c_code) = (
+                        reached.clone(),
+                        pending.clone(),
+                        busy.clone(),
+                        c_code.clone(),
+                    );
+                    move |now: &str| {
+                        if now == step {
+                            reached.set(true);
+                            pending.set(true);
+                        }
+                        // A step under the book's lock: another verb waits it out, and comes at the next step past it.
+                        if pending.get()
+                            && (matches!(other, Other::Kill) || !member::book_held(dir))
+                        {
+                            pending.set(false);
+                            match other {
+                                Other::Busy => {
+                                    *busy.borrow_mut() = Some(member::hold_book(dir).unwrap())
+                                }
+                                other => interfere(other, &c_code, &here),
+                            }
+                        }
+                    }
+                };
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_step_hook(hook, verb)
+                }));
+                drop(busy.borrow_mut().take());
+                assert!(reached.get(), "{} never reaches `{step}`", race.verb);
+                if pending.get() && !matches!(other, Other::Busy) {
+                    interfere(other, c_code, places);
+                }
+                matches!(ran, Ok(Ok(_)))
+                    || matches!(other, Other::Kill | Other::Busy)
+                        && race.again.unwrap_or(race.run)(self, places, own).is_ok()
+            }
+        };
+        (self.end(&world, own), done)
+    }
+}
+
+fn race(racing: &Racing, race: &Race) -> Vec<String> {
+    let verb = race.verb;
+    let (alone, done) = racing.run(race, None);
+    if !done || !(race.alone)(&alone) {
+        return vec![format!("{verb} alone: {alone:#?}")];
+    }
+    let mut unserial = Vec::new();
+    for other in [
+        Other::Leave,
+        Other::StoppedLeave,
+        Other::JoinC,
+        Other::Init,
+        Other::Kill,
+        Other::Busy,
+    ] {
+        let (serial, instead) = if matches!(other, Other::Kill | Other::Busy) {
+            (vec![alone.clone()], None)
+        } else {
+            (
+                vec![
+                    racing.run(race, Some((other, When::Before))).0,
+                    racing.run(race, Some((other, When::After))).0,
+                ],
+                Some(racing.run(race, Some((other, When::Instead))).0),
+            )
+        };
+        for &step in race.steps {
+            let (end, done) = racing.run(race, Some((other, When::At(step))));
+            // A verb refused once the other came between leaves what the other makes alone.
+            let want: Vec<&End> = serial
+                .iter()
+                .chain(instead.iter().filter(|_| !done))
+                .collect();
+            if !want.contains(&&end) {
+                unserial.push(format!(
+                    "{verb}, {other:?} at `{step}`, ends as no serial order does:\n{end:#?}\nwhere \
+                     one of these:\n{want:#?}"
+                ));
+            }
+        }
+    }
+    unserial
+}
+
+#[test]
+fn every_fleet_writer_ends_as_some_serial_order_would() {
+    let unserial: Vec<String> = std::thread::scope(|scope| {
+        let races: Vec<_> = RACES
+            .iter()
+            .enumerate()
+            .map(|(at, one)| {
+                scope.spawn(move || {
+                    let racing = Racing {
+                        a: issuing(&format!("race{at}-a")),
+                        b: issuing(&format!("race{at}-b")),
+                        c: issuing(&format!("race{at}-c")),
+                    };
+                    race(&racing, one)
+                })
+            })
+            .collect();
+        races
+            .into_iter()
+            .flat_map(|one| one.join().unwrap())
+            .collect()
+    });
+    assert!(unserial.is_empty(), "{}", unserial.join("\n"));
+}
+
+#[test]
+fn a_rotate_after_a_leave_stopped_past_its_key_is_refused_and_an_init_keeps_no_grant() {
+    let world = World::new("rotate-keyless");
+    let places = &world.places;
+    granting_issuer(places);
+    // A leave stopped past its first removal, the key's, leaves the code beside no key.
+    std::fs::remove_file(places.state.join(KEY_FILE)).unwrap();
+    let config = world.config();
+    let refused = init(places, &args(&["--rotate"]));
+    assert!(
+        matches!(&refused, Err(Failure::Usage(why)) if why.contains("it issues none")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        (world.config(), Held::read(&places.state)),
+        (config, Held::Nothing)
+    );
+    let inited = ok(init(places, &racing_init()));
+    assert!(inited.contains(GRANTS_GONE), "{inited}");
+    let table = fleet_table(&world.config()).unwrap();
+    assert_eq!(
+        (table.level(), table.drive_from.len()),
+        (Some(FleetScope::Content.word()), 0)
+    );
+}
+
+#[test]
+fn an_init_again_beside_a_code_its_key_is_not_refuses_and_a_rotate_again_mints_both() {
+    let world = World::new("rotate-split");
+    let places = &world.places;
+    granting_issuer(places);
+    let key = read_key_file(&places.state).unwrap();
+    assert!(killed_at("code", || init(places, &args(&["--rotate"]))));
+    let code = std::fs::read_to_string(places.state.join(CODE_FILE)).unwrap();
+    let refused = init(places, &[]);
+    assert!(
+        matches!(&refused, Err(Failure::Failed(why)) if why.contains("`aterm fleet init --rotate` again mints both")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        (
+            read_key_file(&places.state).unwrap(),
+            std::fs::read_to_string(places.state.join(CODE_FILE)).unwrap()
+        ),
+        (key.clone(), code),
+        "nothing written"
+    );
+    ok(init(places, &args(&["--rotate"])));
+    let rotated = read_key_file(&places.state).unwrap();
+    assert_ne!(rotated, key);
+    assert_eq!(
+        FleetSecret::new(&member::read_join_code(&places.state).unwrap().secret).unwrap(),
+        rotated
+    );
+    assert_eq!(fleet_table(&world.config()).unwrap().drive_from.len(), 1);
+}
+
+#[test]
+fn a_grant_beside_a_key_missing_or_unread_is_refused_saying_which() {
+    let world = World::new("keyless-grant");
+    let places = &world.places;
+    granting_issuer(places);
+    ok(allow(places, &args(&["content"])));
+    let config = world.config();
+    let key = places.state.join(KEY_FILE);
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let unread = allow(places, &args(&["drive", "--from", DRIVER]));
+    assert!(
+        matches!(&unread, Err(Failure::Failed(why)) if why.contains("is not private") && why.contains("(0600, one link)") && !why.contains("leave")),
+        "{unread:?}"
+    );
+    assert_eq!(world.config(), config, "nothing granted");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // A leave stopped past its first removal, the key's, then past its second, the code's.
+    for gone in [KEY_FILE, CODE_FILE] {
+        std::fs::remove_file(places.state.join(gone)).unwrap();
+        let refused = allow(places, &args(&["drive", "--from", DRIVER]));
+        assert!(
+            matches!(&refused, Err(Failure::Failed(why)) if why.contains("holds no fleet's key")),
+            "{refused:?}"
+        );
+        assert_eq!(world.config(), config, "nothing granted");
+    }
+}
+
+#[test]
+fn an_init_again_of_one_stopped_before_aterm_toml_writes_what_it_asked() {
+    let world = World::new("init-asked-again");
+    let places = &world.places;
+    let port = closed_port();
+    let asked = args(&[
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port.to_string(),
+        "--allow",
+        "content",
+    ]);
+    assert!(killed_at("config", || init(places, &asked)));
+    let config = world.config();
+    let refused = init(places, &args(&["--port", &(port ^ 1).to_string()]));
+    assert!(
+        matches!(&refused, Err(Failure::Usage(why)) if why.contains("takes `--rotate`")),
+        "{refused:?}"
+    );
+    assert_eq!(world.config(), config, "nothing written");
+    let again = ok(init(places, &asked));
+    assert!(again.contains("already the fleet's issuer"), "{again}");
+    let table = fleet_table(&world.config()).unwrap();
+    assert_eq!(
+        (table.listen_port(), table.level()),
+        (Some(port), Some(FleetScope::Content.word()))
+    );
+    let whole = init(places, &asked);
+    assert!(
+        matches!(&whole, Err(Failure::Usage(why)) if why.contains("changes nothing without") && why.contains("`aterm fleet allow content`")),
+        "{whole:?}"
+    );
 }

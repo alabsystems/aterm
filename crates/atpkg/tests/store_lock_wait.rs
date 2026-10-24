@@ -92,6 +92,8 @@ impl Fixture {
     }
 
     fn spawn(&self, args: &[&str]) -> Child {
+        // A fresh build's first-exec check is waited out here, outside the line waits.
+        aterm_spec::wait::first_exec(Path::new(env!("CARGO_BIN_EXE_atpkg")), &["--help"]);
         self.command(env!("CARGO_BIN_EXE_atpkg"))
             .args(args)
             .spawn()

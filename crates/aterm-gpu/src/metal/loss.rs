@@ -98,7 +98,8 @@ pub(crate) fn command_buffer_status(cb: Id) -> usize {
     }
 }
 
-fn command_buffer_error_code(cb: Id) -> Option<isize> {
+/// `-[cb error].code`, or `None` when `cb`, a live `MTLCommandBuffer`, has no error.
+pub(crate) fn command_buffer_error_code(cb: Id) -> Option<isize> {
     let _pool = AutoreleasePool::new();
     // SAFETY: `-error` returns a borrowed `NSError` (or nil) owned by the pool;
     // `-code` is read while the pool lives.

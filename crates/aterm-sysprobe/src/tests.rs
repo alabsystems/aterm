@@ -1192,6 +1192,23 @@ fn the_gpu_reads_on_this_host_in_whole_percent() {
     }
 }
 
+/// On Apple silicon the GPU driver names its bundle and version, read twice alike.
+#[test]
+fn the_gpu_driver_names_itself_on_this_host() {
+    let d = crate::gpu_driver();
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        let d = d.as_ref().expect("an Apple silicon accelerator entry");
+        assert!(
+            d.bundle
+                .as_ref()
+                .is_some_and(|b| b.starts_with("com.apple.")),
+            "{d:?}"
+        );
+        assert!(d.version.as_ref().is_some_and(|v| v.contains('.')), "{d:?}");
+    }
+    assert_eq!(d, crate::gpu_driver());
+}
+
 /// An `IOUserClientCreator` string reads as its pid and name: the kernel's
 /// pid 0, an overflowing or signed pid and a string of any other shape read
 /// as nothing; a name keeps its commas.

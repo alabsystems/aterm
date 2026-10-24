@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Real [`World`] implementation for site engine builds, verification, and deployment.
+//! Real [`World`] implementation for site engine builds, verification, and deployment
+//! (Firebase Hosting's REST API, [`super::hosting`]).
 
 use std::io::{BufRead as _, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use aterm_update_core::github_rest::Spawn;
 use aterm_verify::wasm_glue::WASM_OPT_FLAGS;
 
 use super::engine::{STEM, TARGET};
-use super::{ENGINE_UNPROVEN, Launch, Ran, World, output};
+use super::{ENGINE_UNPROVEN, Launch, Ran, World, hosting, output};
 
 /// Environment variables stripped from the engine cargo build.
 pub const ENGINE_BUILD_UNSET: [&str; 12] = [
@@ -105,43 +106,6 @@ fn wasm_opt_program() -> PathBuf {
     aterm_uds::host::find_tool("wasm-opt").unwrap_or_else(|| "wasm-opt".into())
 }
 
-/// The site's `deploy.sh`, run in `site`, with `unset` removed.
-#[must_use]
-pub fn deploy_command(site: &Path, unset: &[String]) -> Command {
-    let mut deploy = command("./deploy.sh");
-    deploy.current_dir(site);
-    for name in unset {
-        deploy.env_remove(name);
-    }
-    deploy
-}
-
-/// Builds the `firebase projects:list` probe command for `site`.
-#[must_use]
-pub fn firebase_probe_command(
-    site: &Path,
-    account: Option<&str>,
-    sa_key: Option<&Path>,
-) -> Command {
-    let mut probe = command("firebase");
-    match sa_key.filter(|k| k.is_file()) {
-        Some(key) => {
-            probe
-                .env("GOOGLE_APPLICATION_CREDENTIALS", key)
-                .env("XDG_CONFIG_HOME", site.join(".firebase/headless-config"));
-        }
-        None => {
-            if let Some(account) = account {
-                probe.args(["--account", account]);
-            }
-        }
-    }
-    probe
-        .args(["projects:list", "--non-interactive"])
-        .stdin(Stdio::null());
-    probe
-}
-
 const DRAIN_AFTER_EXIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 enum Event {
@@ -225,7 +189,9 @@ fn streamed(
 pub struct Real {
     pub unset: Vec<String>,
     pub launch: Rc<dyn Launch>,
-    pub github: Arc<dyn Spawn>,
+    /// How the REST calls start curl: GitHub's, and Firebase Hosting's and Google's token
+    /// endpoint's for the deploy.
+    pub curl: Arc<dyn Spawn>,
 }
 
 impl World for Real {
@@ -239,7 +205,7 @@ impl World for Real {
                 "not asked: the sync was interrupted by signal {signal}"
             ));
         }
-        let spawn = Some(&self.github);
+        let spawn = Some(&self.curl);
         let answered = if paginate {
             crate::github::pages_via(spawn, path, 100).map(aterm_json::Value::Array)
         } else {
@@ -373,35 +339,34 @@ impl World for Real {
         }
     }
 
-    fn deploy(&mut self, site: &Path, out: &mut dyn Write) -> Ran {
-        streamed(
-            &*self.launch,
-            &mut deploy_command(site, &self.unset),
-            out,
-            DRAIN_AFTER_EXIT,
-        )
-        .unwrap_or_else(|e| Ran { code: -1, log: e })
-    }
-
-    fn firebase_refuses(
+    fn deploy(
         &mut self,
-        site: &Path,
-        account: Option<&str>,
-        sa_key: Option<&Path>,
-    ) -> Option<String> {
-        let mut probe = firebase_probe_command(site, account, sa_key);
-        for name in &self.unset {
-            probe.env_remove(name);
-        }
-        match output(&*self.launch, &mut probe) {
-            Ok(o) if o.status.success() => None,
-            Ok(o) => Some(format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            )),
-            Err(e) => Some(format!("cannot run firebase: {e}")),
-        }
+        plan: &hosting::Plan,
+        key: Option<&Path>,
+        message: &str,
+        out: &mut dyn Write,
+    ) -> Result<hosting::Released, hosting::Failed> {
+        let key = key.ok_or_else(|| {
+            hosting::Failed::Credential(
+                "no service-account key is named (FIREBASE_SA_KEY, or publish/site.toml's \
+                 firebase_sa_key)"
+                    .into(),
+            )
+        })?;
+        let key = hosting::Key::read(key).map_err(hosting::Failed::Credential)?;
+        let client = hosting::Client::new(
+            hosting::Origins::google(),
+            Arc::clone(&self.curl),
+            &std::env::temp_dir(),
+        )
+        .map_err(|why| hosting::Failed::NotReleased {
+            why: format!("cannot make a scratch directory: {why}"),
+            version: None,
+        })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        hosting::deploy(&client, &key, plan, message, now, out)
     }
 
     fn sleep(&mut self, secs: u64) {
@@ -504,42 +469,6 @@ mod tests {
         assert_eq!(ran.code, 3);
         assert_eq!(ran.log, "a\u{fffd}b\nafter\n");
         assert_eq!(String::from_utf8(shown).unwrap(), ran.log);
-    }
-
-    #[test]
-    fn the_login_probe_asks_with_the_credential_deploy_would_use() {
-        let site = Path::new("/no/such/site");
-        let cmd = firebase_probe_command(site, Some("owner@example.invalid"), None);
-        assert_eq!(
-            cmd.get_args().collect::<Vec<_>>(),
-            [
-                "--account",
-                "owner@example.invalid",
-                "projects:list",
-                "--non-interactive"
-            ]
-        );
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("aterm-site-key-")
-            .tempdir()
-            .unwrap();
-        let key = dir.path().join("deployer.json");
-        std::fs::write(&key, "{}").unwrap();
-        let cmd = firebase_probe_command(site, Some("owner@example.invalid"), Some(&key));
-        assert_eq!(
-            cmd.get_args().collect::<Vec<_>>(),
-            ["projects:list", "--non-interactive"]
-        );
-        assert_eq!(
-            set(&cmd, "GOOGLE_APPLICATION_CREDENTIALS"),
-            Some(key.as_os_str())
-        );
-        assert_eq!(
-            set(&cmd, "XDG_CONFIG_HOME"),
-            Some(site.join(".firebase/headless-config").as_os_str())
-        );
-        let cmd = firebase_probe_command(site, Some("a@b.invalid"), Some(&dir.path().join("gone")));
-        assert_eq!(cmd.get_args().next(), Some(OsStr::new("--account")));
     }
 
     struct Daemon(std::path::PathBuf);

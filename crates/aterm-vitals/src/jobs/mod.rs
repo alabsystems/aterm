@@ -90,6 +90,8 @@ pub struct SweepProc {
     pub session_leader: Option<bool>,
     /// Whether it has a controlling terminal; `None` where unread.
     pub has_tty: Option<bool>,
+    /// Whether it ran a program since its fork; `None` where unread.
+    pub exec: Option<bool>,
 }
 
 /// A process's cumulative counters (`aterm_sysprobe::jobs::Counters`).

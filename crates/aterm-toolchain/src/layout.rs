@@ -9,11 +9,20 @@
 //! is a symbolic link whose target is exactly `<build>.noindex` ([`is_linked_aside`]).
 //! Every path through `<build>` (the `current` link, the shims, the rustup view laid from it,
 //! a lease) reaches the build unchanged; a compiler that canonicalizes its sysroot reports
-//! the `.noindex` folder, which every reader of a store path takes for the build. A real directory at `store/<program>/<build>` that ships a sysroot is a
-//! build not moved yet ([`spotlight_exposed_builds`]): atpkg installs every new one aside,
-//! and moves an older one once no `current` link or shim names it and nothing runs from it.
-//! A reader that cannot link this crate reads the same contract from the directory alone:
-//! a plain numeric directory is not moved yet, a symbolic link is moved.
+//! the `.noindex` folder, which every reader of a store path takes for the build.
+//! A real directory at `store/<program>/<build>` that ships a sysroot is a build not moved
+//! yet ([`spotlight_exposed_builds`]): atpkg installs every new one aside, and moves an older
+//! one once no `current` link or shim names it and nothing runs from it.
+//!
+//! The rustup view (`rustup/<name>`, a copy of the current build that rustup's
+//! `toolchains/<name>` links to) follows the same contract: it lives in
+//! `rustup/<name>.noindex` with `rustup/<name>` its link. A plain view
+//! ([`spotlight_exposed_views`]) is laid anew aside only where atpkg lays the view anyway
+//! (the next update, or a repair of a view that no longer matches its build), never renamed
+//! while it may be running.
+//!
+//! A reader that cannot link this crate reads the same contract from the directories alone:
+//! a plain directory that holds `lib/rustlib` is not moved yet, a symbolic link is moved.
 
 use std::path::{Path, PathBuf};
 
@@ -124,6 +133,40 @@ pub fn spotlight_exposed_builds(prefix: &Path) -> Vec<ExposedBuild> {
         }
     }
     out.sort_by(|a, b| (&a.program, a.build).cmp(&(&b.program, b.build)));
+    out
+}
+
+/// A rustup view Spotlight still indexes: a real directory at `rustup/<name>` that ships a
+/// Rust sysroot ([`spotlight_exposed_views`]). It is always the view in use, and atpkg lays it
+/// anew aside the next time it lays the view at all, so it asks nothing of a person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExposedView {
+    pub name: String,
+    /// `<prefix>/rustup/<name>`.
+    pub dir: PathBuf,
+}
+
+/// Every rustup view under `prefix` not yet laid aside ([`ExposedView`]), by name; empty when
+/// there is none or the views cannot be read. A view whose `lib/` links into a dev checkout
+/// holds no sysroot of its own and is not one.
+#[must_use]
+pub fn spotlight_exposed_views(prefix: &Path) -> Vec<ExposedView> {
+    let Ok(entries) = std::fs::read_dir(prefix.join(VIEWS_DIR)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ExposedView> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_owned();
+            let named = !name.starts_with('.') && !name.ends_with(crate::build_cache::NOINDEX);
+            (named && ships_rust_sysroot(&entry.path())).then(|| ExposedView {
+                name,
+                dir: entry.path(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
@@ -250,6 +293,47 @@ mod tests {
             spotlight_exposed_builds(prefix).iter().all(|b| !b.active),
             "current names the moved build"
         );
+    }
+
+    /// The views root holds every shape [`spotlight_exposed_views`] tells apart.
+    #[cfg(unix)]
+    #[test]
+    fn exposed_views_are_the_plain_sysroot_views() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("atc-layout-views-")
+            .tempdir()
+            .expect("a scratch prefix");
+        let prefix = scratch.path();
+        assert!(
+            spotlight_exposed_views(prefix).is_empty(),
+            "no views at all"
+        );
+        let views = prefix.join(VIEWS_DIR);
+        let view = |name: &str| {
+            let tree = views.join(name);
+            std::fs::create_dir_all(tree.join("lib/rustlib/aarch64-apple-darwin/lib")).unwrap();
+            std::fs::create_dir_all(tree.join("bin")).unwrap();
+            tree
+        };
+        view("trust");
+        view("trust-dev.noindex");
+        std::os::unix::fs::symlink("trust-dev.noindex", views.join("trust-dev")).unwrap();
+        view(".trust.old-4242");
+        let checkout = prefix.join("checkout/lib/rustlib");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(views.join("linked")).unwrap();
+        std::os::unix::fs::symlink(prefix.join("checkout/lib"), views.join("linked/lib")).unwrap();
+
+        assert_eq!(
+            spotlight_exposed_views(prefix),
+            [ExposedView {
+                name: "trust".to_owned(),
+                dir: views.join("trust"),
+            }],
+            "a link is moved, debris and asides are no views, and a dev-linked view holds \
+             no sysroot of its own"
+        );
+        assert!(is_linked_aside(&views.join("trust-dev")));
     }
 
     #[test]

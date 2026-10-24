@@ -18,6 +18,33 @@ pub type CtlStream = std::os::unix::net::UnixStream;
 #[cfg(unix)]
 pub type CtlListener = std::os::unix::net::UnixListener;
 
+/// Keep a socket out of every child this process forks or spawns (`FD_CLOFORK`).
+///
+/// On macOS a socket is drained for good when one of its descriptors closes while another
+/// process is inside a call on that descriptor (a same-user descriptor scan such as lsof or
+/// [`holders`], or an `fstat`): every later blocking read of the socket answers `EBADF` at
+/// once, and a drained listener hands that to every connection it accepts. A spawned child
+/// holds a copy of each of its parent's descriptors until its `exec` closes it, even under
+/// `POSIX_SPAWN_CLOEXEC_DEFAULT`, so a scan of a child being spawned drains the parent's
+/// sockets. Mark each long-lived socket (a listener, what it accepts, a connection kept
+/// open) as it is created. Off Apple it does nothing (`astream_sys::close_on_fork`).
+///
+/// # Errors
+/// The `fcntl(2)` errno of reading or setting the descriptor's flags.
+#[cfg(unix)]
+pub fn keep_out_of_children(socket: &impl std::os::fd::AsFd) -> std::io::Result<()> {
+    astream_sys::close_on_fork(socket.as_fd())
+}
+
+/// Windows: nothing to do, as a handle reaches a child only when it is made inheritable.
+///
+/// # Errors
+/// None.
+#[cfg(windows)]
+pub fn keep_out_of_children<T>(_socket: &T) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// The Windows AF_UNIX-over-winsock implementation of [`CtlStream`] / [`CtlListener`] (afunix.sys; raw `ws2_32` FFI, no external deps).
 #[cfg(windows)]
 pub mod win;

@@ -285,7 +285,10 @@ fn serve_fleet_port(
             }
         };
         let listener = match TcpListener::bind(addr) {
-            Ok(listener) => listener,
+            Ok(listener) => {
+                let _ = aterm_uds::keep_out_of_children(&listener);
+                listener
+            }
             Err(error)
                 if matches!(
                     error.kind(),
@@ -382,7 +385,7 @@ fn serve_fleet_port(
                     let proof = served.peer_node().cloned();
                     return served.answer(|stream| {
                         stream.set_read_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
-                        register_member(stream, (peer, proof.as_ref()), port)
+                        register_member(stream, (peer, proof.as_ref()), (port, &recheck.0))
                     });
                 }
                 if op == FleetOp::Book {
@@ -498,12 +501,12 @@ fn refuse_driver(
     })
 }
 
-/// A member's `join` (`aterm fleet join` on another machine).
+/// A member's `join` (`aterm fleet join` on another machine), proved under `secret`.
 #[cfg(unix)]
 fn register_member<S: std::io::Read + std::io::Write>(
     stream: &mut S,
     (peer, proof): (Option<SocketAddr>, Option<&aterm_net::fleet::NodeProof>),
-    port: u16,
+    (port, secret): (u16, &aterm_net::fleet::FleetSecret),
 ) -> std::io::Result<()> {
     use aterm_net::fleet_member::{Issuer, is_host, read_join_code, read_node_id, serve_join};
     let (Some(peer), Some(state)) = (peer, aterm_types::dirs::state_dir()) else {
@@ -531,7 +534,7 @@ fn register_member<S: std::io::Read + std::io::Write>(
         })
     };
     let now_ms = aterm_time::unix_millis().unwrap_or(0);
-    match serve_join(stream, (peer.ip(), proof), &state, issuer, now_ms)? {
+    match serve_join(stream, (peer.ip(), proof), (&state, secret), issuer, now_ms)? {
         Ok((recorded, member)) => aterm_log::info!("{}", registration_note(recorded, &member)),
         Err(why) => aterm_log::warn!(
             "fleet: the join from {peer} was refused: {}",

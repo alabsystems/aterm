@@ -158,7 +158,7 @@ Only `master-seed-decode` (gaps 3, 5, 7), `master-base32-roundtrip` (3, 5, 7, 8)
 `roster-redo-refines-model` → `provision-write-rest-order` → free composites (`provision-setup-join-e2e`,
 `owner-client-roundtrip`) → `render-report-contract`, `cli-*` → `master-secret-noninterference`.
 
-## 2. Test → spec map (TSV; all 100)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

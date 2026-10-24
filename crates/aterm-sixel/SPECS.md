@@ -103,7 +103,7 @@ growth-amortized	contract	SixelDecoder::ensure_capacity	Assume RI(d). Let aw, ah
 params-bound	invariant	SixelDecoder::{put,start_params,finish_params}	∀ d∈Reach: d.params.len() ≤ PMAX (8). Because PMAX ≥ 5, a well-formed `#Pc;Pu;Px;Py;Pz` is collected intact, so the cap never changes the decoded result of a colour define.	semicolon_flood_keeps_params_bounded	MEDIUM: Vec push guarded by a len() comparison in a match guard, last_mut, &mut self, an invariant over Reach	0,1,2,5
 ```
 
-## 2. Test → spec map (TSV; all 25)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 Every path is `src/tests.rs`.

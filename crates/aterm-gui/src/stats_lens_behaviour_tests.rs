@@ -229,12 +229,12 @@ impl Rig {
 
     fn sentence(&self, focus: Instrument) -> String {
         let snap = self.app.vitals.snapshot.clone().expect("a snapshot");
-        let (tab_key, _) = self.app.deck_tab(self.wid);
+        let panes = self.app.deck_tab_panes(self.wid);
         let loc = aterm_vitals::words::Locale {
             platform: aterm_vitals::words::Platform::host(),
             utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
         };
-        super::lens_sentence(&snap, focus, tab_key, &loc)
+        super::lens_sentence(&snap, focus, &panes, &loc)
     }
 }
 
@@ -699,6 +699,52 @@ fn why_now_reads_the_front_tab_by_every_pane() {
     assert!(
         why.is_some_and(|w| w.contains(" \u{b7} aterm 0.40, Tab 1 0.20.")),
         "{why:?}"
+    );
+}
+
+/// A split front tab is one tab through the App: the CPU lens's sentence names Tab 1 with
+/// both panes' cores (claude's 1 and cargo's 2), and the tab's chip meters both panes. CONTROL:
+/// the focused pane alone, what the deck read before tabs were summed, says 2 cores.
+#[test]
+fn a_split_front_tab_reads_every_pane() {
+    let mut r = rig("deck");
+    let (_, cell) = r.app.win_cell_size(r.wid);
+    let ws = r.app.windows.get_mut(&r.wid).expect("window");
+    ws.metrics.head = crate::stats_deck::deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
+    let other = r.app.split_active_stub_tab(r.wid);
+    assert_eq!(
+        r.app.deck_tab_panes(r.wid),
+        [other, r.session],
+        "focused first"
+    );
+    let snap = Arc::new(crate::stats_deck::tests::split_tab(r.session, other));
+    r.app.vitals.snapshot = Some(Arc::clone(&snap));
+    r.app
+        .open_stats_lens(r.wid, Instrument::Cpu, Bar::Global, Opened::Pinned);
+
+    let said = r
+        .app
+        .stats_lens_sentence(r.wid)
+        .expect("the lens's sentence");
+    assert!(said.contains(", Tab 1 3.0 cores."), "{said}");
+    let alone = super::lens_sentence(
+        &snap,
+        Instrument::Cpu,
+        &[other],
+        &crate::stats_deck::tests::input(&snap).locale,
+    );
+    assert!(alone.contains(", Tab 1 2.0 cores."), "CONTROL: {alone}");
+
+    let level = |key: u64| snap.tab(key).map_or(0.0, |t| t.scope.cores.level);
+    let both = crate::tab_bar::chip_load_step(level(r.session) + level(other), 10.0);
+    let focused = crate::tab_bar::chip_load_step(level(other), 10.0);
+    assert!(both > focused, "CONTROL: {both} vs {focused}");
+    let ws = &r.app.windows[&r.wid];
+    let tab = ws.tab_set.tab_at(0).expect("the front tab");
+    assert_eq!(
+        r.app.chip_load(2, tab),
+        both,
+        "the chip meters the whole tab"
     );
 }
 

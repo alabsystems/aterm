@@ -467,64 +467,6 @@ impl Drop for FirstFrameWarm {
     }
 }
 
-/// Whether the process's headless launch warm was claimed.
-static SHADER_CACHE_BEGAN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// The right to run the process's headless launch warm, from [`crate::begin_shader_cache_warm`]: once per process, as the first-frame warm is.
-pub struct ShaderCacheWarm(());
-
-impl ShaderCacheWarm {
-    /// Claim the process's one headless launch warm.
-    #[inline]
-    pub(crate) fn begin() -> Option<Self> {
-        (!SHADER_CACHE_BEGAN.swap(true, std::sync::atomic::Ordering::SeqCst)).then_some(Self(()))
-    }
-
-    /// Whether the process's headless launch warm was claimed.
-    #[inline]
-    pub(crate) fn began() -> bool {
-        SHADER_CACHE_BEGAN.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Compile and build, in order, what a headless launch's renderer builds once its first pixel demand mints it, and drop it all: the first frames' rows under `knobs` (the split's, and the twins where the device has framebuffer fetch: its verdict is the renderer's to settle; an f16 destination only where `knobs.hdr_glow`), then, where `rest`, every other row and twin a frame or present can bind under it ([`bindable`]). Nothing waits on it, and it submits no GPU work: a process's first submission costs it the driver's footprint (320 MB measured on an M5 Max), which a headless run that never draws a pixel must not pay.
-    /// # Errors
-    /// No Metal device the device listing names (the window server, which only a renderer may ask, would have to pick it), or the compiles and builds that failed.
-    pub fn run(self, knobs: FirstFrameKnobs, rest: Option<PresentKnobs>) -> Result<(), String> {
-        let _pool = AutoreleasePool::new();
-        let dev = Device::preferred_listed()
-            .ok_or_else(|| "no Metal device the device listing names".to_owned())?;
-        let twins = super::fetch::capable(&dev);
-        let mut items: Vec<WarmItem> = first_frame_rows(knobs, false)
-            .into_iter()
-            .filter(|&(_, present)| knobs.hdr_glow || present != PixelFormat::Rgba16Float)
-            .map(|(row, present)| WarmItem::pipeline(row, present))
-            .chain(
-                first_frame_twins(knobs, twins)
-                    .into_iter()
-                    .map(WarmItem::Twin),
-            )
-            .collect();
-        for item in rest.map(|rest| bindable(rest, twins)).unwrap_or_default() {
-            if !items.contains(&item) {
-                items.push(item);
-            }
-        }
-        let mut failed = Vec::new();
-        build_each(&dev, &FIRST_FRAME, &items, |warmed| {
-            if warmed.pso.is_none() {
-                failed.push(warmed.item);
-            }
-            true
-        });
-        if failed.is_empty() {
-            Ok(())
-        } else {
-            Err(format!("{failed:?} did not build"))
-        }
-    }
-}
-
 /// The switches that decide which of a renderer's present passes can run, as the renderer holds them: a pass they turn off binds no row, so a pipeline warm builds none for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PresentKnobs {
@@ -1152,24 +1094,5 @@ mod tests {
             1,
             "a worker whose arm is gone stops at its first hand-over"
         );
-    }
-
-    /// A headless launch's warm compiles the first frames' rows and the rest a frame can bind on the shipped shaders.
-    #[test]
-    fn a_headless_launch_warm_builds_the_shipped_shaders() {
-        device();
-        let rest = PresentKnobs {
-            bloom: true,
-            shimmer: true,
-            hdr_glow: false,
-            sdr_glow: true,
-        };
-        let knobs = FirstFrameKnobs {
-            hdr_glow: false,
-            ..BENCH_KNOBS
-        };
-        ShaderCacheWarm(())
-            .run(knobs, Some(rest))
-            .expect("the headless warm on the shipped shaders");
     }
 }

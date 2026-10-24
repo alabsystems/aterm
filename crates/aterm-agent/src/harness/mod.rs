@@ -21,6 +21,7 @@ pub mod agents;
 pub mod agy_quota;
 pub mod agy_quota_store;
 pub mod align;
+pub mod browser_window;
 pub mod cli;
 pub mod codex_alab;
 pub mod codex_app_login;

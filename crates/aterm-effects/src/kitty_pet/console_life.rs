@@ -574,10 +574,13 @@ impl PetBrain {
         let prior_selection = world.selection_target();
         let prior_progress = world.progress();
         let typed = typed_run(input, pane, self.last_caret);
-        let old_ink = self
-            .console
-            .last_body
-            .and_then(|r| local_ink(world, r, typed));
+        let old_ink = if self.console.contact_changed {
+            None
+        } else {
+            self.console
+                .last_body
+                .and_then(|r| local_ink(world, r, typed))
+        };
         world.observe_with_exclusions_near(input, facts, pane, reserve, held_center);
         if world.stamp().is_some()
             && (prior_stamp != world.stamp()
@@ -891,6 +894,9 @@ impl PetBrain {
                             if distance > CHEER_STAGE_COLS
                                 || best.is_some_and(|(d, _, _)| distance >= d)
                             {
+                                if dc > 0.0 {
+                                    break;
+                                }
                                 continue;
                             }
                             if reachable(air, (dc, dr)) {
@@ -2508,17 +2514,19 @@ impl PetBrain {
         if !Self::console_must_yield(world, rect, passing) {
             return;
         }
-        if (frame.scale_x != 1.0 || frame.scale_y != 1.0)
-            && body_rect(
-                &PetFrame {
+        if (frame.scale_x != 1.0 || frame.scale_y != 1.0) && {
+            let natural = still_body_rect(
+                (frame.col, frame.row),
+                Stance {
                     scale_x: 1.0,
                     scale_y: 1.0,
-                    ..*frame
+                    lift: frame.lift,
                 },
-                sense,
-            )
-            .is_none_or(|natural| !Self::console_must_yield(world, natural, passing))
-        {
+                (sense.cell_w, sense.cell_h),
+                (sense.cols, sense.rows),
+            );
+            !Self::console_must_yield(world, natural, passing)
+        } {
             return;
         }
         if let Some(dy) = self.content_ride(rect) {
@@ -2757,7 +2765,7 @@ impl PetBrain {
             }
         }
         if frame.departures.iter().any(Option::is_some) {
-            let base = *frame;
+            let base_lane_alpha = frame.lane_alpha;
             let selection = world.selection_rect();
             let mut refused = 0u16;
             let mut handed = 0.0f32;
@@ -2769,14 +2777,20 @@ impl PetBrain {
                     d.under_ink = true;
                     continue;
                 }
-                let mut ghost = base;
-                ghost.alpha = d.alpha;
-                ghost.col = d.col;
-                ghost.row = d.row;
-                ghost.lift = d.lift;
-                ghost.scale_x = d.scale_x;
-                ghost.scale_y = d.scale_y;
-                let keep = match body_rect(&ghost, sense) {
+                let ghost_rect =
+                    (d.alpha != 0 && sense.cell_w != 0 && sense.cell_h != 0).then(|| {
+                        still_body_rect(
+                            (d.col, d.row),
+                            Stance {
+                                scale_x: d.scale_x,
+                                scale_y: d.scale_y,
+                                lift: d.lift,
+                            },
+                            (sense.cell_w, sense.cell_h),
+                            (sense.cols, sense.rows),
+                        )
+                    });
+                let keep = match ghost_rect {
                     None => false,
                     Some(rect) if selection.is_some_and(|s| rect.overlaps(s)) => false,
                     Some(rect) if live.is_some_and(|l| l.resight) => {
@@ -2789,7 +2803,7 @@ impl PetBrain {
                 };
                 if !keep {
                     if let Some(l) = live.take_if(|l| l.resight) {
-                        refused += u16::from(d.alpha) * u16::from(base.lane_alpha) / 255;
+                        refused += u16::from(d.alpha) * u16::from(base_lane_alpha) / 255;
                         handed += l.envelope((self.lane_clock - l.born) as f32);
                     }
                     *departure = None;
@@ -3002,8 +3016,8 @@ fn local_ink(
         {
             let t0 = first.max(c0);
             let t1 = end.min(c1);
-            for c in t0..t1 {
-                row_bits &= !(1u64 << (c - c0));
+            if t1 > t0 {
+                row_bits &= !(((1u64 << (t1 - t0)) - 1) << (t0 - c0));
             }
         }
         bits[dr >> 1] |= row_bits << ((dr & 1) << 5);

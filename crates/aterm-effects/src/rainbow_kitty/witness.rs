@@ -681,11 +681,14 @@ impl Witness {
             let beyond_hi = self
                 .follow_armed
                 .iter()
-                .any(|a| a.0 > hi && !neutral(a.0, a.1, a.3));
+                .rev()
+                .take_while(|a| a.0 > hi)
+                .any(|a| !neutral(a.0, a.1, a.3));
             let beyond_lo = self
                 .follow_armed
                 .iter()
-                .any(|a| a.0 < lo && !neutral(a.0, a.1, a.3));
+                .take_while(|a| a.0 < lo)
+                .any(|a| !neutral(a.0, a.1, a.3));
             while let Some(next) = hi.checked_add(1) {
                 let grows = match armed_at(next) {
                     Some(a) => neutral(a.0, a.1, a.3),
@@ -891,24 +894,22 @@ impl Witness {
             return;
         }
         moved.sort_unstable();
-        self.seen.retain(|s| {
-            moved.binary_search(&(s.row, s.col, s.born)).is_ok()
-                || !s
-                    .col
+        let mut any = false;
+        self.seen.retain_mut(|s| {
+            if moved.binary_search(&(s.row, s.col, s.born)).is_ok() {
+                if let Some(target) = s.col.checked_add_signed(dc) {
+                    s.col = target;
+                    s.forget_evidence();
+                    s.deferred = false;
+                    any = true;
+                }
+                true
+            } else {
+                !s.col
                     .checked_add_signed(-dc)
                     .is_some_and(|src| moved.binary_search(&(s.row, src, s.born)).is_ok())
-        });
-        let mut any = false;
-        for s in &mut self.seen {
-            if moved.binary_search(&(s.row, s.col, s.born)).is_ok()
-                && let Some(target) = s.col.checked_add_signed(dc)
-            {
-                s.col = target;
-                s.forget_evidence();
-                s.deferred = false;
-                any = true;
             }
-        }
+        });
         if any {
             self.seen.sort_unstable_by_key(|s| (s.row, s.col, s.born));
         }
@@ -1252,7 +1253,7 @@ impl Witness {
                 continue;
             };
             let unit = unit_at(sample.cols, cell.col);
-            if nb_row != Some(cell.row) {
+            if !unit.is_blank() && nb_row != Some(cell.row) {
                 nb_row = Some(cell.row);
                 nb = neighbours_of(rows, cell.row);
             }
@@ -1290,11 +1291,13 @@ impl Witness {
                 None => {
                     if unit.is_blank() {
                         self.blank_next.push((cell.row, cell.col, cell.born));
-                    } else if self.was_blank(cell) {
-                        self.landed
-                            .push((cell.row, cell.col, cell.born, cell.cohort));
+                    } else {
+                        if self.was_blank(cell) {
+                            self.landed
+                                .push((cell.row, cell.col, cell.born, cell.cohort));
+                        }
+                        self.arm(cell, unit, &nb, now);
                     }
-                    self.arm(cell, unit, &nb, now);
                 }
             }
         }
@@ -1524,18 +1527,26 @@ impl Witness {
         if withheld.is_empty() {
             return;
         }
+        let mut row_state: Option<(u16, Option<RowSample<'_>>)> = None;
         for cell in cells {
             if cell.leaving() {
                 continue;
             }
-            let blind = [cell.row.checked_sub(1), cell.row.checked_add(1)]
-                .into_iter()
-                .flatten()
-                .any(|r| withheld.contains(&r));
-            if !blind {
-                continue;
-            }
-            let Some(sample) = rows.iter().find(|s| s.row == cell.row) else {
+            let sample = match row_state {
+                Some((r, s)) if r == cell.row => s,
+                _ => {
+                    let blind = (cell.row > 0 && withheld.contains(&(cell.row - 1)))
+                        || (cell.row < u16::MAX && withheld.contains(&(cell.row + 1)));
+                    let s = if blind {
+                        rows.iter().find(|s| s.row == cell.row).copied()
+                    } else {
+                        None
+                    };
+                    row_state = Some((cell.row, s));
+                    s
+                }
+            };
+            let Some(sample) = sample else {
                 continue;
             };
             let Some(i) = self.find(cell.row, cell.col, cell.born) else {

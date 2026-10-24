@@ -1930,15 +1930,17 @@ fn scope_sentences(
     res: Resource,
     view: &ResourceView,
     snap: &Snapshot,
-    tab: Option<u64>,
+    panes: &[u64],
     loc: &Locale,
 ) -> Vec<String> {
     let (aterm, tab_cell) = match scope_forms(res, view, loc) {
         ScopeForms::Span(c) => return vec![sentence(&c.forms[0])],
         ScopeForms::Each { aterm, tab } => (aterm, tab),
     };
-    let label = tab.map(|key| {
-        snap.tab(key)
+    let label = (!panes.is_empty()).then(|| {
+        panes
+            .iter()
+            .find_map(|&key| snap.tab(key))
             .map_or_else(|| "this tab".to_string(), |t| t.label.clone())
     });
     let mut figures = Vec::new();
@@ -2026,14 +2028,15 @@ fn of_ten_minutes(n: usize) -> String {
     }
 }
 
-/// Full spoken and copied accessibility summary sentence for resource row `res`.
+/// Full spoken and copied accessibility summary sentence for resource row `res`, "this tab"
+/// being the tab whose panes are the sessions `panes` ([`Snapshot::resource`]).
 #[must_use]
-pub fn row_sentence(res: Resource, snap: &Snapshot, tab: Option<u64>, loc: &Locale) -> String {
+pub fn row_sentence(res: Resource, snap: &Snapshot, panes: &[u64], loc: &Locale) -> String {
     let name = resource_name(res);
     if snap.seq == 0 {
         return format!("{name}: reading.");
     }
-    let view = snap.resource(res, tab);
+    let view = snap.resource(res, panes);
     let mut out = Vec::new();
     let learning = network_learning(snap).filter(|_| res == Resource::Network);
     if res == Resource::Tokens && view.basis == CapBasis::Learning {
@@ -2056,7 +2059,7 @@ pub fn row_sentence(res: Resource, snap: &Snapshot, tab: Option<u64>, loc: &Loca
         });
         out.extend(learning.as_ref().map(|c| c.spoken.clone()));
     }
-    out.extend(scope_sentences(res, &view, snap, tab, loc));
+    out.extend(scope_sentences(res, &view, snap, panes, loc));
     out.extend(trend_sentences(&view, snap.at_unix_ms, loc));
     out.extend(
         details(res, snap, loc)
@@ -3191,7 +3194,7 @@ mod tests {
             clauses.iter().all(|c| !c.forms[0].contains("learning")),
             "{clauses:?}"
         );
-        assert!(!row_sentence(Resource::Network, &s, None, &MAC).contains("Learning"));
+        assert!(!row_sentence(Resource::Network, &s, &[], &MAC).contains("Learning"));
         let mut lost = row(2.1e6, 1.0);
         lost.capacity = None;
         lost.heat_now = None;
@@ -3334,6 +3337,29 @@ mod tests {
         assert_eq!(read(&s), [load, busiest], "no clause held");
     }
 
+    /// Tab 2 split in panes 2 and 3 speaks as one tab: named once, its figure both panes'.
+    #[test]
+    fn a_split_tab_speaks_for_all_its_panes() {
+        let mut s = snap();
+        s.tabs[1].label = "Tab 2".into();
+        let mut cpu = steady(row(17.7, 18.0), 48);
+        cpu.aterm = fig(6.8);
+        cpu.tabs = vec![(2, fig(0.1)), (3, fig(2.4))];
+        set(&mut s, Resource::Cpu, cpu);
+        let said = |panes: &[u64]| row_sentence(Resource::Cpu, &s, panes, &MAC);
+        assert!(
+            said(&[2, 3]).contains(". aterm 6.8 cores, Tab 2 2.5 cores. "),
+            "{}",
+            said(&[2, 3])
+        );
+        assert_eq!(said(&[3, 2]), said(&[2, 3]));
+        assert!(
+            said(&[2]).contains(". aterm 6.8 cores, Tab 2 0.1 cores. "),
+            "one pane, as before: {}",
+            said(&[2])
+        );
+    }
+
     #[test]
     fn row_sentences() {
         let mut s = snap();
@@ -3343,7 +3369,7 @@ mod tests {
         set(&mut s, Resource::Cpu, cpu);
         s.facts.load1 = Some(25.7);
         assert_eq!(
-            row_sentence(Resource::Cpu, &s, Some(2), &MAC),
+            row_sentence(Resource::Cpu, &s, &[2], &MAC),
             "CPU 98 percent of capacity: 17.7 of 18 cores. aterm 6.8 cores, Tab 2 0.1 cores. \
              Steady near 98 percent. Over capacity 8 of the last 10 minutes. 8 waiting for a \
              core, load 25.7 on 18 cores."
@@ -3356,7 +3382,7 @@ mod tests {
             scope: Some(ProcScope::Tab(3)),
         });
         assert!(
-            row_sentence(Resource::Cpu, &s, Some(2), &MAC).ends_with(
+            row_sentence(Resource::Cpu, &s, &[2], &MAC).ends_with(
                 "8 waiting for a core, load 25.7 on 18 cores. Why: Spotlight, after start-up. \
                  Busiest rustc, 9 processes in Tab 3, 5.9 cores."
             ),
@@ -3364,7 +3390,7 @@ mod tests {
         );
 
         assert_eq!(
-            row_sentence(Resource::Disk, &disk_trouble(), Some(2), &MAC),
+            row_sentence(Resource::Disk, &disk_trouble(), &[2], &MAC),
             "Disk 98 percent of capacity: 1.96 of 2.00 terabytes used. aterm writes 38 \
              megabytes per second, Tab 2 writes 0.2 megabytes per second. Steady near 98 \
              percent. Disk full in about 34 minutes, filling 1.2 gigabytes per minute. Disk low, \
@@ -3389,7 +3415,7 @@ mod tests {
             ..LinkSample::default()
         });
         assert_eq!(
-            row_sentence(Resource::Network, &s, Some(2), &MAC),
+            row_sentence(Resource::Network, &s, &[2], &MAC),
             "Network 9 percent of its link rate: 2.1 of 22.9 megabytes per second, downloading. \
              Learning its peak: 1 of 24 hours read. No per-app figure. Steady near 9 percent. \
              Sending 0.3 of 22.9 megabytes per second. Wi-Fi en0, link 22.9 megabytes per \
@@ -3405,7 +3431,7 @@ mod tests {
             ..crate::NetView::default()
         });
         assert!(
-            row_sentence(Resource::Network, &s, Some(2), &MAC)
+            row_sentence(Resource::Network, &s, &[2], &MAC)
                 .ends_with("14 TCP connections established, 6 listening."),
             "network row sentence reports TCP connection counts when present"
         );
@@ -3420,7 +3446,7 @@ mod tests {
         set(&mut s, Resource::Tokens, tokens);
         s.facts.tokens_read_s = 60;
         assert_eq!(
-            row_sentence(Resource::Tokens, &s, Some(2), &MAC),
+            row_sentence(Resource::Tokens, &s, &[2], &MAC),
             "Tokens: learning aterm's peak, 1 of 10 minutes. aterm 3.1 thousand per minute. \
              Tab 2 has no agent. Plan limit not read."
         );
@@ -3437,7 +3463,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .into();
             set(&mut s, Resource::Cpu, cpu);
-            row_sentence(Resource::Cpu, &s, None, &MAC)
+            row_sentence(Resource::Cpu, &s, &[], &MAC)
         };
         for (unread, said) in [
             (1, "Not read for 10 seconds of the last 10 minutes."),
@@ -3449,11 +3475,11 @@ mod tests {
         }
 
         assert_eq!(
-            row_sentence(Resource::Cpu, &Snapshot::default(), None, &MAC),
+            row_sentence(Resource::Cpu, &Snapshot::default(), &[], &MAC),
             "CPU: reading."
         );
         assert_eq!(
-            row_sentence(Resource::Gpu, &snap(), None, &MAC),
+            row_sentence(Resource::Gpu, &snap(), &[], &MAC),
             "GPU: not read."
         );
     }

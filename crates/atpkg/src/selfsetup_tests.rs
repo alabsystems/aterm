@@ -1829,6 +1829,43 @@ fn a_decline_left_for_a_kept_bundle_goes_with_it() {
 }
 
 #[test]
+fn an_uninstall_keeps_a_bundle_whose_program_inventory_cannot_be_read() {
+    let a = Account::new("unread-programs");
+    let app = a.home().join("Applications/aterm.app");
+    bundle(&app, None);
+    let programs = app.join("Contents/MacOS");
+    std::fs::write(&programs, b"not a directory").expect("private inventory obstruction");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(
+        !ok,
+        "an unread inventory is a partial uninstall: {out}{err}"
+    );
+    assert!(
+        app.is_dir(),
+        "an unread inventory keeps its bundle: {out}{err}"
+    );
+    assert_eq!(
+        std::fs::read(&programs).expect("retained obstruction"),
+        b"not a directory"
+    );
+    assert!(
+        err.contains(&format!("cannot read {}:", programs.display()))
+            && err.contains("whether every program has finished its first start cannot be told"),
+        "{err}"
+    );
+    std::fs::remove_file(&programs).expect("remove only our inventory obstruction");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(
+        ok,
+        "a missing program directory holds no programs: {out}{err}"
+    );
+    assert!(
+        !app.exists(),
+        "the known-empty bundle can be removed: {out}{err}"
+    );
+}
+
+#[test]
 fn an_uninstall_keeps_a_bundle_whose_program_has_not_answered() {
     let hang = Duration::from_millis(100);
     // `aterm-ctl` stands for any sibling an older toolset's `aterm-cli` may have started.

@@ -14,12 +14,12 @@ use super::{SettingsRoute, SettingsViewState};
 /// The least of a card a list's edge leaves in view that reads as the card going on.
 pub(super) const PEEK_MIN: f32 = crate::native_ui::LIST_PEEK_MIN;
 
-/// The keyboard's control, and for each height a stop lays it out, the words that name it.
-type WatchedWords = (UiKey, Vec<(f32, Words)>);
+/// The keyboard's control, and for each height a stop lays it out, the words it paints itself.
+type WatchedWords = (UiKey, Vec<(f32, Option<(f32, f32)>)>);
 
 /// The words whose cut makes a list draw a control as a picture, as bands from its top.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Words {
+pub(super) enum Words {
     /// Its own, which an edge crossing them cuts.
     Own(f32, f32),
     /// Its named row's, which a cut of the control leaves out of view.
@@ -32,6 +32,62 @@ thread_local! {
     /// The keyboard's control while a page is built ([`KeyboardWords`]).
     static KEYBOARD_WORDS: std::cell::RefCell<Option<WatchedWords>> =
         const { std::cell::RefCell::new(None) };
+    /// The plans lists were laid out by this render, while [`PlansShared`] is open.
+    static PLANS: std::cell::RefCell<Option<Vec<SharedPlan>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A list's items, its gap, room and what a bar takes of it, and the plan and stops they lay out.
+type SharedPlan = (
+    (std::rc::Rc<[ListItem]>, [u32; 3]),
+    std::rc::Rc<(ScrollPlan, ItemStops)>,
+);
+
+/// A RENDER'S SEATS AND TELLINGS SHARE THEIR LISTS' PLANS: while open, a list's plan in a room
+/// under a bar is laid out once ([`ListLaid::planned`], [`list_page_whole`]).
+pub(super) struct PlansShared;
+
+impl PlansShared {
+    pub(super) fn open() -> Self {
+        PLANS.with(|plans| plans.replace(Some(Vec::new())));
+        Self
+    }
+}
+
+impl Drop for PlansShared {
+    fn drop(&mut self) {
+        PLANS.with(|plans| plans.replace(None));
+    }
+}
+
+/// The plan and stops `items`, `gap` apart, lay out in a list `room` tall under a bar that takes
+/// `given` of it, as `plan` lays them out: once a render while [`PlansShared`] is open.
+fn shared_plan(
+    items: &std::rc::Rc<[ListItem]>,
+    (gap, room, given): (f32, f32, f32),
+    plan: impl FnOnce() -> (ScrollPlan, ItemStops),
+) -> std::rc::Rc<(ScrollPlan, ItemStops)> {
+    let at = [gap.to_bits(), room.to_bits(), given.to_bits()];
+    let known = PLANS.with(|plans| {
+        plans.borrow().as_ref().and_then(|plans| {
+            plans
+                .iter()
+                .find(|((seen, was), _)| *was == at && std::rc::Rc::ptr_eq(seen, items))
+                .map(|(_, planned)| std::rc::Rc::clone(planned))
+        })
+    });
+    known.unwrap_or_else(|| {
+        let planned = std::rc::Rc::new(plan());
+        PLANS.with(|plans| {
+            if let Some(plans) = plans.borrow_mut().as_mut() {
+                plans.push((
+                    (std::rc::Rc::clone(items), at),
+                    std::rc::Rc::clone(&planned),
+                ));
+            }
+        });
+        planned
+    })
 }
 
 /// WHAT A SCREEN SHOWS OF THE KEYBOARD'S CONTROL IS WHAT IT PAINTS of it, while a page is built:
@@ -44,45 +100,37 @@ impl KeyboardWords {
         Self
     }
 
-    /// Note control `node` laid out `height` tall at `top`, under `rows` (each with its top and height).
-    fn note(node: &UiNode, top: f32, height: f32, rows: &[(&UiNode, f32, f32)]) {
-        KEYBOARD_WORDS.with(|words| {
-            if let Some((key, bands)) = words.borrow_mut().as_mut()
-                && node.key == *key
-                && !bands.iter().any(|(tall, _)| (tall - height).abs() < 0.01)
-            {
+    /// The words naming the keyboard's `node`, `height` tall at `top`: its own, else its row's.
+    fn of_node(
+        node: &UiNode,
+        top: f32,
+        height: f32,
+        rows: &[(&UiNode, f32, f32)],
+    ) -> Option<(UiKey, Words)> {
+        let own = KEYBOARD_WORDS.with(|words| {
+            let mut words = words.borrow_mut();
+            let (key, owns) = words.as_mut().filter(|(key, _)| node.key == *key)?;
+            let known = owns
+                .iter()
+                .find(|(tall, _)| (tall - height).abs() < 0.01)
+                .map(|(_, own)| *own);
+            Some(known.unwrap_or_else(|| {
                 let own = crate::native_ui::words_band(key, &node.content, height);
-                let row = || {
-                    rows.iter().rev().find_map(|(row, at, tall)| {
-                        crate::native_ui::named_row_words(row, *tall)
-                            .map(|(from, to)| Words::Row(at + from - top, at + to - top))
-                    })
-                };
-                let words = own.map_or_else(
-                    || row().unwrap_or(Words::Nothing),
-                    |(from, to)| Words::Own(from, to),
-                );
-                bands.push((height, words));
-            }
-        });
-    }
-
-    /// The words naming `key` laid out `height` tall: they sit by its height (a row whose name
-    /// wraps at 2× text is taller), so one band read for another height counted Catppuccin
-    /// Latte's row 56pt shown where the list drew it as a picture.
-    fn of(key: &UiKey, height: f32) -> Option<Words> {
-        KEYBOARD_WORDS.with(|words| {
-            words
-                .borrow()
-                .as_ref()
-                .filter(|(watched, _)| watched == key)
-                .and_then(|(_, bands)| {
-                    bands
-                        .iter()
-                        .find(|(tall, _)| (tall - height).abs() < 0.01)
-                        .map(|(_, words)| *words)
-                })
-        })
+                owns.push((height, own));
+                own
+            }))
+        })?;
+        let row = || {
+            rows.iter().rev().find_map(|(row, at, tall)| {
+                crate::native_ui::named_row_words(row, *tall)
+                    .map(|(from, to)| Words::Row(at + from - top, at + to - top))
+            })
+        };
+        let words = own.map_or_else(
+            || row().unwrap_or(Words::Nothing),
+            |(from, to)| Words::Own(from, to),
+        );
+        Some((node.key.clone(), words))
     }
 }
 
@@ -132,6 +180,7 @@ pub(super) struct ScrollPlan {
     previews: Shared<Vec<UiKey>>,
     control_rows: Shared<Vec<(f32, f32, f32)>>,
     spans: Shared<Vec<(UiKey, f32, f32)>>,
+    words: Shared<Option<(UiKey, Words)>>,
     ink: Vec<f32>,
     ink_top: Vec<f32>,
     first_controls: Vec<Option<f32>>,
@@ -325,6 +374,7 @@ impl ScrollPlan {
         std::sync::Arc::make_mut(&mut self.ids).push(Vec::new());
         std::sync::Arc::make_mut(&mut self.within).push(Vec::new());
         std::sync::Arc::make_mut(&mut self.spans).push(Vec::new());
+        std::sync::Arc::make_mut(&mut self.words).push(None);
         self.heights.len() - 1
     }
 
@@ -352,6 +402,7 @@ impl ScrollPlan {
         std::sync::Arc::make_mut(&mut self.ids).insert(index, Vec::new());
         std::sync::Arc::make_mut(&mut self.within).insert(index, Vec::new());
         std::sync::Arc::make_mut(&mut self.spans).insert(index, Vec::new());
+        std::sync::Arc::make_mut(&mut self.words).insert(index, None);
     }
 
     /// A group card.
@@ -464,6 +515,13 @@ impl ScrollPlan {
         }
     }
 
+    /// Say which words name the keyboard's control where the last stop added lays it out.
+    pub(super) fn set_keyboard_words(&mut self, words: Option<(UiKey, Words)>) {
+        if let Some(last) = std::sync::Arc::make_mut(&mut self.words).last_mut() {
+            *last = words;
+        }
+    }
+
     /// Span of stop `index` revealed for control `key` ([`Self::revealed_span`]).
     pub(super) fn span_of(&self, index: usize, key: Option<&UiKey>, reveal: Reveal) -> (f32, f32) {
         let pressed = matches!(reveal, Reveal::Pressed | Reveal::Hold) && self.gives_to_status();
@@ -486,7 +544,9 @@ impl ScrollPlan {
         let mut within = Vec::new();
         keys_within(node, &mut within);
         self.set_within(within);
-        self.set_control_spans(control_spans_in(node, height));
+        let (spans, words) = control_spans_in(node, height);
+        self.set_control_spans(spans);
+        self.set_keyboard_words(words);
         self.set_control_rows(control_rows_in(node, height));
         self.set_first_controls(first_control_row(node, height).map(|(top, tall)| top + tall));
         let content = content_extent(node, height);
@@ -565,6 +625,7 @@ impl ScrollPlan {
         std::sync::Arc::make_mut(&mut self.ids).push(Vec::new());
         std::sync::Arc::make_mut(&mut self.within).push(Vec::new());
         std::sync::Arc::make_mut(&mut self.spans).push(Vec::new());
+        std::sync::Arc::make_mut(&mut self.words).push(None);
         self.heights.len() - 1
     }
 
@@ -959,7 +1020,11 @@ impl ScrollPlan {
                 .flatten()
                 .any(|edge| across((start, end), edge) && across(words, edge))
         };
-        let picture = match KeyboardWords::of(key, to - from) {
+        let words = self.words[index]
+            .as_ref()
+            .filter(|(watched, _)| watched == key)
+            .map(|(_, words)| *words);
+        let picture = match words {
             None => cut((start, end)),
             Some(Words::Own(top, under)) => cut((start + top, start + under)),
             Some(Words::Row(top, under)) => {
@@ -1852,6 +1917,55 @@ pub(super) struct ScrollContext {
     question: bool,
 }
 
+/// A list [`list_page_whole`] seated, kept with its rows, by which a bar's overrun is told.
+pub(super) struct ListLaid {
+    items: std::rc::Rc<[ListItem]>,
+    gap: f32,
+    rows: ListRows,
+}
+
+/// The rooms a list's caller builds the same rows for, and those it builds rows as wide for.
+pub(super) struct ListRows {
+    pub(super) same: SameRows,
+    pub(super) as_wide: SameRows,
+}
+
+/// The rooms a list's caller builds the same rows for.
+pub(super) type SameRows = Box<dyn Fn(f32) -> bool>;
+
+impl ListLaid {
+    /// The list `items` and `rows` lay out, `gap` apart, as [`list_page_whole`] would seat it.
+    pub(super) const fn new(items: std::rc::Rc<[ListItem]>, gap: f32, rows: ListRows) -> Self {
+        Self { items, gap, rows }
+    }
+
+    /// Whether the list's caller builds the same rows in `room`.
+    pub(super) fn builds_alike_in(&self, room: f32) -> bool {
+        (self.rows.same)(room)
+    }
+
+    /// Whether the list's caller builds its rows as wide in `room`, each laid out as here.
+    pub(super) fn builds_as_wide_in(&self, room: f32) -> bool {
+        (self.rows.as_wide)(room)
+    }
+
+    /// The plan the rows seated in a list `room` tall under a bar that takes `given` of it lay out,
+    /// as [`list_page_whole`] plans them.
+    pub(super) fn planned(&self, room: f32, given: f32) -> std::rc::Rc<(ScrollPlan, ItemStops)> {
+        shared_plan(&self.items, (self.gap, room, given), || {
+            let fitted = fit_rows(&self.items, (room - given).max(0.0), ListFoot::Whole);
+            plan_under_status(
+                &fitted,
+                self.gap,
+                room,
+                given,
+                Overhang::NONE,
+                ListFoot::Whole,
+            )
+        })
+    }
+}
+
 /// What the last render of a scrolling page measured and where it put the list.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct ScrollRecord {
@@ -2310,13 +2424,7 @@ impl SettingsViewState {
         if opening && land {
             self.land_beside_keyboard(plan, &mut top, owed);
         }
-        // A CONTROL IN A STOP TALLER THAN THE ROOM IS SHOWN WHOLE WHERE IT
-        // FITS (R2, R5), else from its top where the last screen showed it cut
-        // and R2 owes more of it: a whole-stop list seats partway into the
-        // stop. Seated at the stop, the Customize sheet's colour well at
-        // 444x420 at 2× text under a status went out of view, 22pt in the
-        // room's 32pt, and the chooser's pack row, 56pt, made 1240x151 at 2×
-        // text under a status, showed 47pt of the 48pt the screen before did.
+        // A control in a stop taller than the room shows whole where it fits, else from its top.
         if let Some(key) = focus
             && let Some(index) = plan.stop_of(key)
             && let Some(span) = plan.control_span(index, key)
@@ -2637,9 +2745,7 @@ impl SettingsViewState {
             .then_some(key)
     }
 
-    /// Whether the list last seated lists the keyboard's control and no screen shows it whole, by
-    /// its stop or its paint, a whole-stop list's seat partway into a stop taller than the room too
-    /// ([`ScrollPlan::tall_stop_seat`]).
+    /// Whether the list last seated lists the keyboard's control and no screen shows it whole.
     pub(super) fn keyboard_cut(&self) -> bool {
         let Some(key) = self.common.last_focus.as_ref() else {
             return false;
@@ -2673,13 +2779,14 @@ impl SettingsViewState {
             })
     }
 
+    /// Whether the list lands on the theme in use, which [`Self::landing_cut`] reads.
+    pub(super) const fn landing_owed(&self) -> bool {
+        self.page_reveal.is_some() && matches!(self.reveal_as, Reveal::Land | Reveal::LandWhole)
+    }
+
     /// Whether the screen last seated before the person's first event cuts the theme in use.
     pub(super) fn landing_cut(&self) -> bool {
-        let Some(landing) = self
-            .page_reveal
-            .as_ref()
-            .filter(|_| matches!(self.reveal_as, Reveal::Land | Reveal::LandWhole))
-        else {
+        let Some(landing) = self.page_reveal.as_ref().filter(|_| self.landing_owed()) else {
             return false;
         };
         let context = self.scroll_context();
@@ -2695,10 +2802,7 @@ impl SettingsViewState {
             })
     }
 
-    /// Whether the theme in use, as [`Self::landing_cut`] reads it, fits a room `more` taller than
-    /// the list last seated has; with `keyboard`, a list whose stops stay as they are, on one screen
-    /// with the keyboard's listed control where the screen showed that whole (R2 and R3 of
-    /// [`Self::seat_scroll`]).
+    /// Whether the theme in use fits a room `more` taller, with `keyboard` its control too (R3).
     pub(super) fn landing_fits(&self, more: f32, keyboard: bool) -> bool {
         let Some(landing) = self.page_reveal.as_ref() else {
             return false;
@@ -2746,9 +2850,7 @@ impl SettingsViewState {
             .map(|_| Left::on(&record.plan, key, record.top))
     }
 
-    /// Whether the screen last seated shows the keyboard's listed control less than `record`, the
-    /// screen before it, left the person; whole where the keyboard moved since (R2 of
-    /// [`Self::seat_scroll`]).
+    /// Whether the screen last seated shows the keyboard's control less than `record`'s (R2).
     pub(super) fn keyboard_short_of(&self, record: Option<&ScrollRecord>) -> bool {
         self.common.last_focus.is_some() && !self.keyboard_kept(self.keyboard_was(record).as_ref())
     }
@@ -2784,6 +2886,15 @@ impl SettingsViewState {
             .control_span(index, key)
             .unwrap_or_else(|| plan.controls_of(index));
         Some(to - from)
+    }
+
+    /// How tall the list last seated lays the keyboard's listed control out, where its screen
+    /// shows it whole.
+    pub(super) fn keyboard_whole(&self) -> Option<f32> {
+        self.keyboard_left()
+            .is_some_and(|left| left.whole)
+            .then(|| self.keyboard_height())
+            .flatten()
     }
 
     /// Whether the screen last seated shows the keyboard's control no less than `was` did.
@@ -2961,27 +3072,37 @@ impl SettingsViewState {
     }
 
     /// Records how far the status bar must shorten so it covers neither the active control nor,
-    /// where both fit, the landing beside it ([`ListFoot::Whole`]).
+    /// where both fit, the landing beside it ([`ListFoot::Whole`]), and a list seated under it.
     pub(super) fn note_status_room(&self, plan: &ScrollPlan, room: f32) {
-        let slack = self.status_slack.get();
-        let (given, room) = (plan.given + slack, room + slack);
-        if given <= 0.01 || self.measuring_calm.get() {
+        self.status_lists_seated
+            .set(self.status_lists_seated.get() + 1);
+        if self.measuring_calm.get() {
             return;
+        }
+        let overrun = self.status_overrun_of(plan, room, self.status_slack.get());
+        if overrun > 0.01 {
+            self.status_overrun
+                .set(self.status_overrun.get().max(overrun));
+        }
+    }
+
+    /// How far a status's bar must shorten over `plan`, seated in `room` with `slack` more the bar
+    /// could give back ([`Self::note_status_room`]).
+    fn status_overrun_of(&self, plan: &ScrollPlan, room: f32, slack: f32) -> f32 {
+        let (given, room) = (plan.given + slack, room + slack);
+        if given <= 0.01 {
+            return 0.0;
         }
         // A keyboard's control taller than the room takes the bar to its
         // least: Tokyo Night's 92pt row at 178x348 at 2× text under the
         // warning and a status showed 0pt, at the bar's least 64pt.
         let note = |need: f32, keyboard: bool| {
-            let overrun = if need <= room + 0.01 {
+            if need <= room + 0.01 {
                 given - (room - need)
             } else if keyboard {
                 given
             } else {
                 0.0
-            };
-            if overrun > 0.01 {
-                self.status_overrun
-                    .set(self.status_overrun.get().max(overrun));
             }
         };
         let focus = self.common.last_focus.as_ref();
@@ -2994,11 +3115,15 @@ impl SettingsViewState {
             })
             .collect();
         let keyboard = focus.and_then(|key| plan.stop_holding(key).or_else(|| plan.stop_of(key)));
+        let mut overrun = 0.0_f32;
         for &(index, (top, bottom)) in &spans {
             let seated = (plan.foot == ListFoot::Whole)
                 .then(|| plan.stop_top(index.min(plan.limit()), index) + bottom)
                 .filter(|need| *need <= room + 0.01);
-            note(seated.unwrap_or(bottom - top), keyboard == Some(index));
+            overrun = overrun.max(note(
+                seated.unwrap_or(bottom - top),
+                keyboard == Some(index),
+            ));
         }
         if let [first, second] = spans[..]
             && first.0 != second.0
@@ -3008,8 +3133,64 @@ impl SettingsViewState {
             } else {
                 (second, first)
             };
-            note(plan.stop_top(upper, lower) + to - from, false);
+            overrun = overrun.max(note(plan.stop_top(upper, lower) + to - from, false));
         }
+        overrun
+    }
+
+    /// The record of the screen `plan` ([`ListLaid::planned`]) would leave seated, `record` the
+    /// screen before, told with no page built; the state is left as it was.
+    pub(super) fn seated_under(
+        &self,
+        mut plan: ScrollPlan,
+        record: Option<ScrollRecord>,
+    ) -> Option<ScrollRecord> {
+        let was = (
+            self.scroll_record.replace(record),
+            self.page_window.get(),
+            self.result_page_limit.get(),
+        );
+        let _ = self.seat_scroll(&mut plan);
+        let told = self.scroll_record.replace(was.0);
+        self.page_window.set(was.1);
+        self.result_page_limit.set(was.2);
+        told
+    }
+
+    /// How tall the keyboard's listed control is among `laid`'s rows, seated in a list `room` tall.
+    pub(super) fn keyboard_box(&self, laid: &ListLaid, room: f32) -> Option<f32> {
+        let key = self.common.last_focus.as_ref()?;
+        let fitted = fit_rows(&laid.items, room, ListFoot::Whole);
+        let (plan, _) = plan_under_status(
+            &fitted,
+            laid.gap,
+            room,
+            0.0,
+            Overhang::NONE,
+            ListFoot::Whole,
+        );
+        let index = plan.stop_holding(key).or_else(|| plan.stop_of(key))?;
+        plan.control_span(index, key)
+            .map(|(top, bottom)| bottom - top)
+    }
+
+    /// What `read` says of the state with `record` the screen last seated; the state is left as
+    /// it was.
+    pub(super) fn reading<R>(
+        &self,
+        record: Option<ScrollRecord>,
+        read: impl FnOnce(&Self) -> R,
+    ) -> R {
+        let was = self.scroll_record.replace(record);
+        let said = read(self);
+        self.scroll_record.replace(was);
+        said
+    }
+
+    /// How far a status's bar over a list `room` tall, with `slack` more it could give back, must
+    /// shorten: `plan` ([`ListLaid::planned`]) seated there, with no page built.
+    pub(super) fn overrun_under(&self, plan: &ScrollPlan, room: f32, slack: f32) -> f32 {
+        self.status_overrun_of(plan, room, slack)
     }
 
     /// A STATUS NEVER COVERS A CONTROL PINNED AROUND THE LIST either: the bar shortens for the
@@ -3248,21 +3429,24 @@ fn keys_within(node: &UiNode, out: &mut Vec<UiKey>) {
     }
 }
 
-/// Each control under `node`, with `node` laid out `height` tall: its key, top and height.
-pub(super) fn control_spans_in(node: &UiNode, height: f32) -> Vec<(UiKey, f32, f32)> {
+/// Each control under `node`, with `node` laid out `height` tall: its key, top and height; and
+/// the words naming the keyboard's control there ([`KeyboardWords`]).
+pub(super) fn control_spans_in(node: &UiNode, height: f32) -> ControlSpans {
     fn walk<'a>(
         node: &'a UiNode,
         top: f32,
         height: f32,
-        out: &mut Vec<(UiKey, f32, f32)>,
+        out: &mut ControlSpans,
         rows: &mut Vec<(&'a UiNode, f32, f32)>,
     ) {
         if node.paint_only {
             return;
         }
         if is_control(node) {
-            out.push((node.key.clone(), top, height));
-            KeyboardWords::note(node, top, height, rows);
+            out.0.push((node.key.clone(), top, height));
+            if out.1.is_none() {
+                out.1 = KeyboardWords::of_node(node, top, height, rows);
+            }
         }
         rows.push((node, top, height));
         let layout = &node.layout;
@@ -3308,10 +3492,13 @@ pub(super) fn control_spans_in(node: &UiNode, height: f32) -> Vec<(UiKey, f32, f
         }
         rows.pop();
     }
-    let mut out = Vec::new();
+    let mut out = (Vec::new(), None);
     walk(node, 0.0, height, &mut out, &mut Vec::new());
     out
 }
+
+/// Where each control a stop holds sits in it, and the words naming the keyboard's there.
+pub(super) type ControlSpans = (Vec<(UiKey, f32, f32)>, Option<(UiKey, Words)>);
 
 /// Positions of controls within stop `node` of `height` ([`ScrollPlan::set_control_rows`]).
 pub(super) fn control_rows_in(node: &UiNode, height: f32) -> Vec<(f32, f32, f32)> {
@@ -3541,6 +3728,27 @@ fn stops_room(state: &SettingsViewState, room: f32, foot: ListFoot) -> f32 {
         ListFoot::Whole => (room - state.status_extra.get()).max(0.0),
         ListFoot::Peek => room,
     }
+}
+
+/// `items` planned and given their `room` under a status's bar that takes `given` of it, as a
+/// seat lays them out ([`seat_room_under_status`]).
+fn plan_under_status(
+    items: &[ListItem],
+    gap: f32,
+    room: f32,
+    given: f32,
+    overhang: Overhang,
+    foot: ListFoot,
+) -> (ScrollPlan, ItemStops) {
+    let stops = match foot {
+        ListFoot::Whole => (room - given).max(0.0),
+        ListFoot::Peek => room,
+    };
+    let (mut plan, item_stops) = plan_items(items, gap, stops);
+    plan.set_foot(foot);
+    seat_room(&mut plan, (room - given).max(0.0), overhang);
+    plan.give_to_status(given);
+    (plan, item_stops)
 }
 
 /// [`seat_room`] for a list a plain status's bar may stand under.
@@ -3860,16 +4068,19 @@ impl SplitCard {
         out
     }
 
-    /// Where each control `rows` hold sits, from the top of the first.
-    pub(super) fn control_spans(&self, rows: Range<usize>) -> Vec<(UiKey, f32, f32)> {
+    /// Where each control `rows` hold sits, from the top of the first, and the words naming the
+    /// keyboard's there.
+    pub(super) fn control_spans(&self, rows: Range<usize>) -> ControlSpans {
         let mut top = 0.0;
-        let mut out = Vec::new();
+        let mut out: ControlSpans = (Vec::new(), None);
         for (node, height) in &self.rows[rows] {
-            out.extend(
-                control_spans_in(node, *height)
+            let (spans, words) = control_spans_in(node, *height);
+            out.0.extend(
+                spans
                     .into_iter()
                     .map(|(key, at, tall)| (key, top + at, tall)),
             );
+            out.1 = out.1.or(words);
             top += height + self.gap;
         }
         out
@@ -4378,7 +4589,9 @@ fn plan_items_measured(
                     }
                     plan.set_within(within);
                     plan.set_control_rows(card.control_rows(rows.clone()));
-                    plan.set_control_spans(card.control_spans(rows.clone()));
+                    let (spans, words) = card.control_spans(rows.clone());
+                    plan.set_control_spans(spans);
+                    plan.set_keyboard_words(words);
                     plan.set_note(card.notes_only(rows.clone()));
                     plan.set_ink(card.ink(rows.clone()));
                     plan.set_ink_top(card.ink_top(rows.clone()));
@@ -4483,9 +4696,19 @@ impl SeatedList {
         overhang: Overhang,
         foot: ListFoot,
     ) -> Self {
-        let (mut plan, stops) = plan_items(items, gap, stops_room(state, room, foot));
-        plan.set_foot(foot);
-        seat_room_under_status(state, &mut plan, room, overhang);
+        let given = state.status_extra.get();
+        let (plan, stops) = plan_under_status(items, gap, room, given, overhang, foot);
+        Self::seated(state, plan, stops, room)
+    }
+
+    /// `plan` and its `stops` seated in a list `room` tall.
+    fn seated(
+        state: &SettingsViewState,
+        mut plan: ScrollPlan,
+        stops: ItemStops,
+        room: f32,
+    ) -> Self {
+        state.note_status_room(&plan, room);
         let view = state.seat_scroll(&mut plan);
         let drawn = drawn_stops(&plan, &view);
         Self {
@@ -4567,21 +4790,25 @@ impl SeatedList {
 /// [`list_page`] whose rows off the screen are in the tree too ([`UiNode::offscreen`]).
 pub(super) fn list_page_whole(
     state: &SettingsViewState,
-    key: &str,
-    label: &str,
-    items: Vec<ListItem>,
-    room: f32,
-    gap: f32,
+    (key, label): (&str, &str),
+    items: std::rc::Rc<[ListItem]>,
+    (room, gap): (f32, f32),
+    rows: ListRows,
 ) -> UiNode {
-    let items = fit_rows(
+    let given = state.status_extra.get();
+    let fitted = fit_rows(
         &items,
         stops_room(state, room, ListFoot::Whole),
         ListFoot::Whole,
     );
-    let seated = SeatedList::with_foot(state, &items, room, gap, Overhang::NONE, ListFoot::Whole);
+    let planned = shared_plan(&items, (gap, room, given), || {
+        plan_under_status(&fitted, gap, room, given, Overhang::NONE, ListFoot::Whole)
+    });
+    let (plan, stops) = (*planned).clone();
+    let seated = SeatedList::seated(state, plan, stops, room);
     let drawn = seated.drawn.clone();
-    let above = seated.offscreen_children(&items, 0..drawn.start, "above");
-    let below = seated.offscreen_children(&items, drawn.end..seated.plan.len(), "below");
+    let above = seated.offscreen_children(&fitted, 0..drawn.start, "above");
+    let below = seated.offscreen_children(&fitted, drawn.end..seated.plan.len(), "below");
     let lead = above
         .iter()
         .map(|node| match node.layout.height {
@@ -4589,7 +4816,8 @@ pub(super) fn list_page_whole(
             _ => seated.plan.gap(),
         })
         .sum::<f32>();
-    let screen = seated.screen_children(&items);
+    let screen = seated.screen_children(&fitted);
+    drop(fitted);
     let mut page = seated.screen_node(key, label, screen);
     if let Some(list) = find_node_mut(&mut page, key) {
         list.layout.offset += lead;
@@ -4598,6 +4826,9 @@ pub(super) fn list_page_whole(
         }
         let screen = std::mem::take(&mut list.children);
         list.children = above.into_iter().chain(screen).chain(below).collect();
+    }
+    if let Some(lists) = state.status_lists.borrow_mut().as_mut() {
+        lists.push(ListLaid { items, gap, rows });
     }
     page
 }

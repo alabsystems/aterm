@@ -40,7 +40,7 @@ TP-FIND	contract	find, withdrawn	find(s) is the t ∈ T with t.id = s ignoring A
 TP-INSTALL	io-contract	install, state_in	install(t, None, _) fails; Absent → Wrote with bytes = t.text; Installed → Unchanged; Modified → Exists without replace, Wrote with; a case variant → Failed(case_collision_message); a built-in's name → Refused and nothing written. An earlier copy (t.text but for its `name =` line) is Installed: Unchanged without replace, Wrote with; one other byte changed (a color) is Modified.	src/tests.rs::install_round_trips_in_a_scratch_folder, src/tests.rs::an_earlier_copy_reads_installed_and_an_edit_does_not	HIGH for a proof (filesystem); a test.	filesystem model
 ```
 
-## 2. Test → spec map (TSV; all 8)
+## 2. Test → spec map (TSV)
 
 ```tsv
 file	test	primary	also

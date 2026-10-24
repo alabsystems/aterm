@@ -63,6 +63,9 @@ fn p(dir: &Path, name: &str) -> String {
 /// The environment every child gets ([`settle_before_fork`]).
 fn base_command(dir: &Path, args: &[&str]) -> Command {
     settle_before_fork();
+    // A fresh build's first-exec check is waited out here, outside the terminal runs' hang
+    // detectors (an unknown verb ends it at once).
+    aterm_spec::wait::first_exec(Path::new(env!("CARGO_BIN_EXE_atpkg-keys")), &["--help"]);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg-keys"));
     cmd.args(args)
         .env("HOME", dir)

@@ -51,8 +51,11 @@ aterm-toml = { workspace = true }
 # carries the digest of the bytes we hashed.
 aterm-digest = { workspace = true }
 # Release-channel signatures are verified in the cutter: the external signer's exit status
-# would not bind the uploaded bytes to the public key compiled into clients.
-ring = { workspace = true }
+# would not bind the uploaded bytes to the public key compiled into clients. `ship site`
+# signs its Firebase Hosting deploy's OAuth2 assertion (RS256) with the deployer's
+# service-account key, which needs `alloc`'s RsaKeyPair; atpkg-keys already unifies ring's
+# default features (alloc among them) into this binary's graph, so naming it changes no build.
+ring = { workspace = true, features = ["alloc"] }
 # Standard padded Base64 — first-party; its one dependency is astream-wire
 # (dependency-free, vendor/astream). `decode_strict` is
 # the entry point every trust path uses: canonical padding REQUIRED and no
@@ -76,6 +79,11 @@ aterm-verify = { workspace = true }
 # aterm-converge items: one engine with `aterm init`, whose base report it reads back
 # from the installed aterm in the engine's own schema.
 aterm-converge = { workspace = true }
+
+# `ship site` uploads each file of the site as one gzip member around the PNG encoder's
+# deterministic DEFLATE (no clock, name or host in a member), so its SHA-256 names the
+# content for Firebase Hosting's populateFiles.
+aterm-png = { workspace = true }
 
 # Same-filesystem clock stamps own an exclusive scratch directory in the slot;
 # they never remove a fixed pre-existing marker merely to read its mtime.

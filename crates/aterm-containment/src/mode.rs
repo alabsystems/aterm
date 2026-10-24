@@ -69,6 +69,9 @@ impl Ord for ContainmentMode {
 }
 
 /// Error when parsing a containment mode from a string.
+///
+/// Its `Display` and `Error` are hand-written: no runtime-argument `format_args!`, which the
+/// Trust strict gate fails closed on.
 #[derive(Debug, Clone)]
 pub struct ParseModeError(pub(crate) String);
 

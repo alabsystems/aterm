@@ -144,7 +144,8 @@ pub struct Scene<'a> {
 pub struct JobFacts {
     /// The job holds the terminal's foreground.
     pub holds_fg: bool,
-    /// The job is the shell itself reading a line (its own `read` builtin).
+    /// The job is a shell itself reading a line (its own `read` builtin, a nested session's shell
+    /// at its prompt), taken while no leaf names a wait of its own.
     pub builtin: bool,
     /// The terminal mode word, only when stamped after the job's last output.
     pub tty: Option<TtyMode>,
@@ -162,9 +163,6 @@ pub fn name_job(
     leaves: &[(u32, String)],
     shell: (u32, &str),
 ) -> Wait {
-    if job.builtin {
-        return Wait::bare(WaitName::TtyBuiltinRead, Standing::Legit, shell.0, shell.1);
-    }
     let first = leaves
         .first()
         .map_or((shell.0, shell.1.to_owned()), |(p, n)| (*p, n.clone()));
@@ -180,6 +178,11 @@ pub fn name_job(
     if let Some(w) = best.as_ref().filter(|w| w.name == WaitName::ProgramCheck) {
         // A held leaf is not reading the terminal, whatever mode its program left it in.
         return w.clone();
+    }
+    // A shell's line read, while no leaf names a wait of its own (a REPL blocked on its socket,
+    // a `cd` into a dead share).
+    if job.builtin && best.is_none() {
+        return Wait::bare(WaitName::TtyBuiltinRead, Standing::Legit, shell.0, shell.1);
     }
     if job.holds_fg
         && job.queue_empty

@@ -80,6 +80,7 @@ fn agent_script() -> Script {
 struct Rig {
     core: Core<Fake>,
     seen: Seen,
+    tx: std::sync::mpsc::Sender<Input>,
     rx: Receiver<Input>,
     labs: BTreeMap<u64, Channel>,
     free: Arc<Mutex<u64>>,
@@ -136,8 +137,9 @@ impl Rig {
             }),
         };
         Self {
-            core: Core::new(fake, cfg, tx),
+            core: Core::new(fake, cfg, tx.clone()),
             seen,
+            tx,
             rx,
             labs: BTreeMap::new(),
             free,
@@ -1126,4 +1128,34 @@ fn stop_waits_its_own_grace_after_the_last_console_line_before_the_hard_stop() {
     assert!(
         matches!(rig.pump(S * 37), Flow::Exit(why) if why.contains("no new console line for 10 s")),
     );
+}
+
+#[test]
+fn a_connection_opened_behind_the_input_the_core_exits_on_ends_with_its_sessions() {
+    // The core takes its inputs in order, so a `down` that connected while the last session
+    // was closing is opened behind the close the core exits on. Its reader thread holds a
+    // duplicate of the socket (`held` here): only a shutdown gives the lab EOF.
+    let rig = Rig::new(agent_script());
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("vz")
+        .tempdir_in("/tmp")
+        .expect("a scratch folder short enough for sun_path");
+    let socket = dir.path().join("s.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (ours, lab) = UnixStream::pair().unwrap();
+    let held = ours.try_clone().unwrap();
+    rig.tx
+        .send(Input::Request(9, Request::Stop { grace_ms: 1 }))
+        .unwrap();
+    rig.tx.send(Input::Opened(1, ours)).unwrap();
+    let (why, core) = serve(listener, &socket, rig.core, &rig.tx, &rig.rx);
+    assert!(why.contains("nothing to power off"), "{why}");
+    drop(core);
+    lab.set_read_timeout(Some(SPAN)).unwrap();
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        std::io::Read::read(&mut &lab, &mut byte).expect("EOF within a minute, not silence"),
+        0
+    );
+    drop(held);
 }

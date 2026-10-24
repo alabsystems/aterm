@@ -4,6 +4,7 @@
 //! `ship site`: synchronizes alab.systems (`/terminal`, `/install.sh`, `/releases`) on release.
 mod diff;
 pub mod engine;
+pub mod hosting;
 pub mod linux;
 pub mod notes;
 pub mod pages;
@@ -24,11 +25,12 @@ pub use world::Real;
 
 /// Command-line usage string for `ship site`.
 pub const USAGE: &str = "usage: targo --unverified ship site [--latest] [--dry-run] [--no-deploy] \
-     [--skip-site] [--site-dir DIR] [--releases FILE]
+     [--redeploy] [--skip-site] [--site-dir DIR] [--releases FILE]
   --latest       sync to the public repo's main tip; PUB_PUBLIC_COMMIT, when set, names
                  the commit instead (one of the two is required)
   --dry-run      compute and print the plan; change nothing (PUB_DRY_RUN=1 too)
   --no-deploy    commit and push, no deploy, no live check (SITE_NO_DEPLOY=1 too)
+  --redeploy     deploy the committed site to Firebase Hosting even when nothing changed
   --skip-site    do nothing, say so, exit 0
   --site-dir DIR the site checkout (else SITE_DIR, else publish/site.toml's dir)
   --releases FILE take the release list from FILE instead of GitHub's API (needs
@@ -102,28 +104,9 @@ pub const OWED_MARK: &str = "aterm-post-promote-undeployed";
 /// Git-dir marker for an in-flight sync that has not yet committed.
 pub const IN_FLIGHT_MARK: &str = "aterm-site-sync-in-flight";
 
-/// Firebase's ways of saying its login is missing or expired (lowercase).
-const AUTH_PATTERNS: [&str; 8] = [
-    "authentication error",
-    "failed to authenticate",
-    "firebase login",
-    "not logged in",
-    "invalid_grant",
-    "unable to authorize",
-    "firebase-tools is not installed",
-    "credentials are no longer valid",
-];
-
-/// Returns whether `log` indicates a missing or expired Firebase login.
-#[must_use]
-pub fn auth_failure(log: &str) -> bool {
-    let low = log.to_lowercase();
-    let cli_list = low.match_indices("not in the cli").any(|(at, m)| {
-        let mut rest = low[at + m.len()..].chars();
-        rest.next().is_some() && rest.as_str().starts_with("s account list")
-    });
-    cli_list || AUTH_PATTERNS.iter().any(|p| low.contains(p))
-}
+/// The command that deploys the committed site again, said wherever a deploy did not
+/// happen or did not finish.
+pub const DEPLOY_LATER: &str = "targo --unverified ship site --latest --redeploy";
 
 /// Parsed command-line options for `ship site`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -131,6 +114,8 @@ pub struct Options {
     pub latest: bool,
     pub dry_run: bool,
     pub no_deploy: bool,
+    /// Deploy the committed site even when the sync changed nothing.
+    pub redeploy: bool,
     pub skip: bool,
     pub site_dir: Option<PathBuf>,
     pub releases: Option<PathBuf>,
@@ -148,6 +133,7 @@ pub fn parse_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Option<
             "--latest" => o.latest = true,
             "--dry-run" => o.dry_run = true,
             "--no-deploy" => o.no_deploy = true,
+            "--redeploy" => o.redeploy = true,
             "--skip-site" => o.skip = true,
             "--site-dir" | "--releases" => {
                 let v = it
@@ -165,6 +151,9 @@ pub fn parse_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Option<
             other => return Err(format!("unknown argument: {other}")),
         }
     }
+    if o.redeploy && o.no_deploy {
+        return Err("--redeploy and --no-deploy ask for opposite things".into());
+    }
     if o.releases.is_some() && !o.dry_run {
         return Err("--releases plans from a local release list: it needs --dry-run".into());
     }
@@ -177,7 +166,9 @@ pub fn parse_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Option<
 struct Settings {
     dir: Option<String>,
     url: Option<String>,
-    firebase_account: Option<String>,
+    /// The Firebase Hosting site deployed to when firebase.json's `hosting.site` names none
+    /// (when both do they must agree; else the key's project).
+    firebase_site: Option<String>,
     /// The deployer's service-account key, relative to the site directory.
     firebase_sa_key: Option<String>,
     author_name: Option<String>,
@@ -208,7 +199,9 @@ pub struct Env {
     pub verify_sleep: u64,
     /// `YYYY-MM-DD` date for sitemap `lastmod`.
     pub today: String,
-    pub firebase_account: Option<String>,
+    /// `FIREBASE_SITE`, else `publish/site.toml`'s `firebase_site`: the Hosting site when
+    /// firebase.json's `hosting.site` names none ([`hosting::site`]).
+    pub firebase_site: Option<String>,
     /// `FIREBASE_SA_KEY`: deployer service-account key path.
     pub firebase_sa_key: Option<PathBuf>,
     /// Service-account key path from `publish/site.toml`, relative to the site directory.
@@ -299,7 +292,7 @@ impl Env {
                 .unwrap_or(3),
             today: var("SITE_SYNC_TODAY")
                 .unwrap_or_else(|| aterm_types::rfc3339::format_rfc3339(now)[..10].to_string()),
-            firebase_account: var("FIREBASE_ACCOUNT").or(settings.firebase_account),
+            firebase_site: var("FIREBASE_SITE").or(settings.firebase_site),
             author,
             subject_prefix: settings.subject_prefix.unwrap_or_default(),
             wasm_pin,
@@ -310,6 +303,17 @@ impl Env {
                 .collect(),
             now_unix: i64::try_from(now).unwrap_or(i64::MAX),
             git_env: Vec::new(),
+        })
+    }
+
+    /// The deployer's service-account key: `FIREBASE_SA_KEY`, else `publish/site.toml`'s
+    /// `firebase_sa_key` under `site_dir`.
+    #[must_use]
+    pub fn sa_key(&self, site_dir: &Path) -> Option<PathBuf> {
+        self.firebase_sa_key.clone().or_else(|| {
+            self.firebase_sa_key_in_site
+                .as_ref()
+                .map(|k| site_dir.join(k))
         })
     }
 }
@@ -399,15 +403,19 @@ pub trait World {
     /// # Errors
     /// Returns an error if `wasm-opt` fails.
     fn optimise(&mut self, wasm: &Path, out: &mut dyn Write) -> Result<(), String>;
-    /// Runs `deploy.sh` in `site`.
-    fn deploy(&mut self, site: &Path, out: &mut dyn Write) -> Ran;
-    /// Returns `firebase projects:list` output when Firebase authentication fails.
-    fn firebase_refuses(
+    /// Deploys `plan` to Firebase Hosting with the service-account key at `key`, released
+    /// with `message` ([`hosting::deploy`]).
+    ///
+    /// # Errors
+    /// [`hosting::Failed`]: no key or a refused one, a step before the release failing (the
+    /// live site untouched), or the release itself.
+    fn deploy(
         &mut self,
-        site: &Path,
-        account: Option<&str>,
-        sa_key: Option<&Path>,
-    ) -> Option<String>;
+        plan: &hosting::Plan,
+        key: Option<&Path>,
+        message: &str,
+        out: &mut dyn Write,
+    ) -> Result<hosting::Released, hosting::Failed>;
     fn sleep(&mut self, secs: u64);
 }
 
@@ -448,7 +456,8 @@ pub enum Outcome {
     LiveUnchecked { deployed: bool },
     /// Committed and pushed without deploying (`--no-deploy` / `SITE_NO_DEPLOY`).
     NoDeploy,
-    /// Committed and pushed, but Firebase authentication was unavailable.
+    /// Committed and pushed, but not deployed: no service-account key, or one that Google
+    /// or Firebase Hosting refused.
     NotDeployed,
     /// No usable site checkout was found.
     NoCheckout(String),
@@ -507,6 +516,9 @@ pub enum Refusal {
     Uncaptured,
     /// The engine on disk does not match the committed engine.
     EngineNotInGit,
+    /// The site's firebase.json says something the Hosting deploy cannot express, or a
+    /// file under `public/` cannot be deployed as it is.
+    Hosting,
     /// File or directory I/O failed.
     Io,
 }
@@ -624,8 +636,15 @@ fn halt(launch: &dyn Launch, step: &'static str) -> Result<(), Failure> {
 /// # Errors
 /// Returns an error if the directory cannot be created or secured.
 pub(crate) fn private_dir(prefix: &str) -> Result<PathBuf, String> {
+    private_dir_in(&std::env::temp_dir(), prefix)
+}
+
+/// [`private_dir`], under `base`.
+///
+/// # Errors
+/// As [`private_dir`].
+pub(crate) fn private_dir_in(base: &Path, prefix: &str) -> Result<PathBuf, String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let base = std::env::temp_dir();
     let mut last = String::from("no attempt");
     for _ in 0..64 {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -715,19 +734,6 @@ fn say(out: &mut dyn Write, line: &str) {
     let _ = writeln!(out, "== {line}");
 }
 
-fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        path.metadata()
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
-}
-
 fn read_text(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
@@ -738,8 +744,9 @@ fn read_text(path: &Path) -> Option<String> {
 /// Returns [`Failure`] (exit 1) on refusal, child failure, or interruption (said as one,
 /// whatever the step it stopped said). A pull or push of the site repo that failed leaves
 /// the sync commit on this machine and nothing deployed; once the pull or push can go
-/// through, a re-run pushes and deploys it. A deploy that fails for a missing or expired
-/// Firebase login is not a failure but [`Outcome::NotDeployed`].
+/// through, a re-run pushes and deploys it. A deploy with no service-account key, or one
+/// Google or Hosting refuses, is not a failure but [`Outcome::NotDeployed`]; any other
+/// deploy failure before `releases.create` leaves the live site on its previous release.
 pub fn sync(
     opts: &Options,
     env: &Env,
@@ -819,14 +826,33 @@ fn steps(
             site_dir.display()
         )));
     }
-    if !is_executable(&site_dir.join("deploy.sh")) {
+    if !site_dir.join("firebase.json").is_file() {
         return Ok(Outcome::NoCheckout(format!(
-            "site checkout at {} has no executable deploy.sh — not a usable site checkout; set \
+            "site checkout at {} has no firebase.json — not a usable site checkout; set \
              SITE_DIR or skip with --skip-site",
             site_dir.display()
         )));
     }
     let site_dir = site_dir.canonicalize().unwrap_or(site_dir);
+    // The deploy's ServingConfig, ignore list, site and files, read before anything is
+    // written: a firebase.json the REST deploy cannot express, two settings naming different
+    // sites, or a file under public/ it cannot deploy (a link, a special file, a name that is
+    // not UTF-8, a private key) stops the sync here, never after a commit.
+    let hosting = hosting::config::read(&site_dir)
+        .and_then(|h| {
+            let ignore = hosting::files::patterns(&h.ignore)?;
+            if !no_deploy {
+                hosting::files::list(
+                    &site_dir.join(hosting::config::PUBLIC),
+                    &ignore,
+                    &BTreeMap::new(),
+                )?;
+            }
+            Ok(h)
+        })
+        .map_err(|e| refusal(Refusal::Hosting, e))?;
+    let hosting_site = hosting::site(hosting.site.as_deref(), env.firebase_site.as_deref())
+        .map_err(|e| refusal(Refusal::Hosting, e))?;
     let Some(site_root) = git
         .line(&site_dir, &["rev-parse", "--show-toplevel"])
         .map(PathBuf::from)
@@ -1425,13 +1451,37 @@ fn steps(
                 }
             }
         }
-        say(
-            out,
-            &format!(
-                "dry run: would commit, push origin main, and run {}/deploy.sh — nothing changed",
-                site_dir.display()
-            ),
-        );
+        if no_deploy {
+            say(
+                out,
+                "dry run: would commit and push origin main, and not deploy (--no-deploy) — \
+                 nothing changed",
+            );
+        } else {
+            let overlay: BTreeMap<String, Vec<u8>> = changed
+                .iter()
+                .filter_map(|rel| {
+                    rel.strip_prefix("public/")
+                        .map(|p| (p.to_string(), planned[rel].clone().into_bytes()))
+                })
+                .collect();
+            let plan = hosting::Plan::of(&site_dir, &hosting, hosting_site.clone(), &overlay)
+                .map_err(|e| refusal(Refusal::Hosting, e))?;
+            say(
+                out,
+                "dry run: would commit, push origin main, and deploy this to Firebase Hosting \
+                 (no key is read and nothing is sent in a dry run):",
+            );
+            plan.say(out);
+            if engine_changed {
+                say(
+                    out,
+                    "dry run: the engine's rebuilt files are not in this plan — the rebuild \
+                     runs only in a real sync",
+                );
+            }
+            say(out, "dry run: nothing changed");
+        }
         return Ok(Outcome::Planned {
             files: changed.iter().map(|f| (*f).to_string()).collect(),
             engine: engine_changed,
@@ -1537,15 +1587,24 @@ fn steps(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     let mut owed_only = false;
-    if nothing && unpushed.is_empty() && !owed.is_empty() && !no_deploy {
-        say(
-            out,
-            &format!(
-                "an earlier sync commit ({} when it was made) is on origin but was never deployed \
-                 (pushed by hand, --no-deploy, or a deploy that did not finish): deploying it now",
-                short(&owed)
-            ),
-        );
+    if nothing && unpushed.is_empty() && (!owed.is_empty() || opts.redeploy) && !no_deploy {
+        if owed.is_empty() {
+            say(
+                out,
+                "--redeploy: nothing changed, deploying the committed site to Firebase Hosting \
+                 again",
+            );
+        } else {
+            say(
+                out,
+                &format!(
+                    "an earlier sync commit ({} when it was made) is on origin but was never \
+                     deployed (pushed by hand, --no-deploy, or a deploy that did not finish): \
+                     deploying it now",
+                    short(&owed)
+                ),
+            );
+        }
         owed_only = true;
         nothing = false;
     }
@@ -1656,11 +1715,11 @@ fn steps(
         );
     }
 
-    let deploy_later = format!("(cd {} && ./deploy.sh)", site_dir.display());
-    let not_deployed = |out: &mut dyn Write| {
+    let not_deployed = |out: &mut dyn Write, failed: &hosting::Failed| {
         let _ = writeln!(
             out,
-            "SITE NOT DEPLOYED — committed and pushed; deploy later with: {deploy_later}"
+            "SITE NOT DEPLOYED — committed and pushed, but {failed}; deploy later with: \
+             {DEPLOY_LATER}"
         );
         Ok(Outcome::NotDeployed)
     };
@@ -1668,51 +1727,68 @@ fn steps(
     if no_deploy {
         say(
             out,
-            &format!("deploy skipped (--no-deploy) — deploy later with: {deploy_later}"),
+            &format!("deploy skipped (--no-deploy) — deploy later with: {DEPLOY_LATER}"),
         );
     } else if nothing {
         say(out, "nothing changed — no deploy needed");
     } else {
         halt(launch, "the deploy")?;
-        say(out, &format!("deploying: {}/deploy.sh", site_dir.display()));
-        let ran = world.deploy(&site_dir, out);
-        if ran.code == 0 {
-            deployed = true;
-            let _ = std::fs::remove_file(&owed_mark);
-        } else if auth_failure(&ran.log) {
-            return not_deployed(out);
-        } else {
-            halt(launch, "the login probe")?;
-            let key = env.firebase_sa_key.clone().or_else(|| {
-                env.firebase_sa_key_in_site
-                    .as_ref()
-                    .map(|k| site_dir.join(k))
-            });
-            let Some(probe) =
-                world.firebase_refuses(&site_dir, env.firebase_account.as_deref(), key.as_deref())
-            else {
+        let plan = hosting::Plan::of(&site_dir, &hosting, hosting_site.clone(), &BTreeMap::new())
+            .map_err(|e| {
+            refusal(
+                Refusal::Hosting,
+                format!(
+                    "{e}. The site commit is pushed and nothing was deployed; once the \
+                         file is fixed, rerun: {DEPLOY_LATER}"
+                ),
+            )
+        })?;
+        let (raw, gz) = plan.bytes();
+        say(
+            out,
+            &format!(
+                "deploying to Firebase Hosting{}: {} files, {raw} bytes ({gz} gzipped)",
+                hosting_site
+                    .as_deref()
+                    .map(|s| format!(" site {s}"))
+                    .unwrap_or_default(),
+                plan.files.len()
+            ),
+        );
+        let key = env.sa_key(&site_dir);
+        let message = format!("ship site: {slug} @ {}", short(&commit));
+        match world.deploy(&plan, key.as_deref(), &message, out) {
+            Ok(released) => {
+                deployed = true;
+                let _ = std::fs::remove_file(&owed_mark);
+                say(
+                    out,
+                    &format!(
+                        "deployed: {} serves {} ({} of its {} files uploaded, the rest already \
+                         on Hosting)",
+                        released.release, released.version, released.uploaded, released.files
+                    ),
+                );
+            }
+            Err(failed @ hosting::Failed::Credential(_)) => return not_deployed(out, &failed),
+            Err(failed @ hosting::Failed::NotReleased { .. }) => {
                 return Err(child_failed(
-                    "deploy.sh",
+                    "firebase hosting",
                     format!(
-                        "deploy.sh failed (rc {}) — the site commit is pushed; fix and re-run: \
-                         {deploy_later}",
-                        ran.code
+                        "the deploy failed: {failed}. The site commit is pushed; rerun: \
+                         {DEPLOY_LATER}"
                     ),
                 ));
-            };
-            say(
-                out,
-                &format!(
-                    "deploy.sh failed (rc {}) and `firebase projects:list` cannot authenticate \
-                     either — treating it as a missing or expired Firebase login",
-                    ran.code
-                ),
-            );
-            let lines: Vec<&str> = probe.lines().collect();
-            for l in &lines[lines.len().saturating_sub(3)..] {
-                let _ = writeln!(out, "  {l}");
             }
-            return not_deployed(out);
+            Err(failed @ hosting::Failed::Release { .. }) => {
+                return Err(child_failed(
+                    "firebase hosting",
+                    format!(
+                        "{failed}. The site commit is pushed; check {} and rerun: {DEPLOY_LATER}",
+                        env.site_url
+                    ),
+                ));
+            }
         }
     }
 
@@ -1782,7 +1858,7 @@ fn steps(
             let _ = if deployed {
                 writeln!(
                     out,
-                    "SITE DEPLOYED BUT THE LIVE SITE DISAGREES — deploy.sh succeeded, yet {url} \
+                    "SITE DEPLOYED BUT THE LIVE SITE DISAGREES — Hosting released it, yet {url} \
                      still serves something else after {} checks (CDN lag, or another deploy in \
                      flight). Re-check in a minute: {url}/terminal",
                     env.verify_retries
@@ -1791,7 +1867,7 @@ fn steps(
                 writeln!(
                     out,
                     "LIVE SITE DIFFERS FROM THE COMMITTED SITE — nothing changed here, but {url} \
-                     does not show the committed checkout; deploy with: {deploy_later}"
+                     does not show the committed checkout; deploy with: {DEPLOY_LATER}"
                 )
             };
             return Ok(Outcome::LiveDisagrees {
@@ -1886,7 +1962,7 @@ pub fn run_cli(args: &[String], repo: &Path) -> i32 {
             .filter(|k| crate::release_steps::launcher_env(k))
             .collect(),
         launch: Rc::new(Plain),
-        github: std::sync::Arc::new(crate::github::Launched(Plain)),
+        curl: std::sync::Arc::new(crate::github::Launched(Plain)),
     };
     let mut out = std::io::stdout();
     let ended = sync(&opts, &env, &mut world, &mut out);
@@ -1941,24 +2017,6 @@ mod tests {
     }
 
     #[test]
-    fn firebase_login_failures_are_recognised_and_others_are_not() {
-        for log in [
-            "Error: Authentication Error: Your credentials are no longer valid.",
-            "firebase-tools is not installed. Run:  npm install -g firebase-tools",
-            "admin@example.invalid is not in the CLI\u{2019}s account list",
-            "Error: invalid_grant",
-        ] {
-            assert!(auth_failure(log), "{log}");
-        }
-        for log in [
-            "Error: HTTP Error: 500, Internal Server Error",
-            "Error: An unexpected error has occurred.",
-        ] {
-            assert!(!auth_failure(log), "{log}");
-        }
-    }
-
-    #[test]
     fn the_command_line_is_the_hooks() {
         let o = parse_args(["--latest", "--site-dir", "/s", "--no-deploy"])
             .unwrap()
@@ -1968,6 +2026,14 @@ mod tests {
         assert_eq!(parse_args(["--help"]).unwrap(), None);
         assert!(parse_args(["--site-dir"]).is_err());
         assert!(parse_args(["--bogus"]).is_err());
+        assert!(
+            parse_args(["--latest", "--redeploy"])
+                .unwrap()
+                .unwrap()
+                .redeploy
+        );
+        let why = parse_args(["--redeploy", "--no-deploy"]).unwrap_err();
+        assert!(why.contains("--redeploy"), "{why}");
     }
 
     #[test]

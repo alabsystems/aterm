@@ -252,7 +252,7 @@ chrome-search-match	table-property	tokens::ChromeTokens::search_match	For every 
 chrome-status-hues	contract	tokens::ChromeTokens::derive (danger_hue, success_hue)	danger_hue is Some(ANSI red) iff that slot is chromatic, success_hue Some(ANSI green) iff chromatic; a grey slot or no palette gives None.	tokens_tests::status_hues_come_from_the_palette	f64 chroma test over [u8;3]	0,3
 ```
 
-## 2. Test → spec map (TSV; all 484)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 A test in §4 has `primary` = `-` and its action in `also`.

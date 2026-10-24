@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Derived from accesskit_atspi_common 0.19.0 (MIT OR Apache-2.0, used under
-// Apache-2.0) src/util.rs.
+// Apache-2.0) src/util.rs, and changed by the aterm project in 2026.
 
 //! AT-SPI window coordinate conversions and text offset utilities.
 

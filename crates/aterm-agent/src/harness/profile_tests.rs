@@ -1935,6 +1935,39 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
             true
         )
     );
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        let custom_log = cfg.join("custom.log");
+        std::fs::write(&custom_log, log).expect("write custom.log");
+        std::fs::remove_file(cfg.join("settings.json")).expect("rm settings.json");
+        std::fs::remove_file(cfg.join("cli.log")).expect("rm cli.log");
+        for fifo in [cfg.join("settings.json"), cfg.join("cli.log")] {
+            let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        }
+        assert_eq!(
+            agy_model_effort_for(
+                &[
+                    "agy".to_owned(),
+                    format!("-log-file={}", custom_log.display()),
+                ],
+                &env,
+                &home,
+            ),
+            (
+                Some("Gemini 4 Argon".to_owned()),
+                Some("high".to_owned()),
+                true,
+                true
+            )
+        );
+        std::fs::remove_file(cfg.join("settings.json")).expect("rm fifo settings.json");
+        std::fs::remove_file(cfg.join("cli.log")).expect("rm fifo cli.log");
+        std::fs::write(cfg.join("settings.json"), br"{}").expect("restore settings.json");
+        std::fs::write(cfg.join("cli.log"), log).expect("restore cli.log");
+    }
 
     let muse_cfg = home.join(".config/muse");
     std::fs::create_dir_all(&muse_cfg).expect("create muse config");
@@ -1990,8 +2023,15 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
 "#;
     std::fs::write(logs_dir.join("transcript.jsonl"), transcript_bytes)
         .expect("write transcript.jsonl");
-    let (excerpts, len) =
-        agy_excerpts_for(0, &argv, &env, &home, Some(&workspace)).expect("agy excerpts");
+    let (excerpts, len) = agy_excerpts_for(
+        &argv,
+        &env,
+        &home,
+        Some(&[
+            std::fs::canonicalize(crate::harness::upgrade_agy::presence_lock(&cfg, cid)).unwrap(),
+        ]),
+    )
+    .expect("agy excerpts");
     assert_eq!(len, transcript_bytes.len() as u64);
     assert_eq!(excerpts.prompts.len(), 1);
     assert_eq!(excerpts.prompts[0].text, "inspect the window");
@@ -2001,12 +2041,21 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
     );
     assert_eq!(excerpts.doing.as_deref(), Some("edit_file"));
     assert_eq!(
-        agy_resume_for(0, &argv, &env, &home, Some(&workspace)).as_deref(),
+        agy_resume_for(
+            &argv,
+            &env,
+            &home,
+            Some(&[
+                std::fs::canonicalize(crate::harness::upgrade_agy::presence_lock(&cfg, cid))
+                    .unwrap()
+            ])
+        )
+        .as_deref(),
         Some(format!("agy --conversation={cid}").as_str())
     );
 
     // When two conversations share the same workspace and `cid_newer` is later in `history.jsonl`,
-    // `pid` holding `<config>/presence/<cid>.lock` open resolves to `cid` instead of `cid_newer`.
+    // the observed presence lock resolves to `cid`; without held evidence neither history owns it.
     let cid_newer = "b14557eb-9109-4eb3-ae3d-212449d689cb";
     let newer_logs = cfg
         .join("brain")
@@ -2029,27 +2078,72 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
         ),
     )
     .expect("write two-tab history.jsonl");
-    assert_eq!(
-        agy_resume_for(0, &argv, &env, &home, Some(&workspace)).as_deref(),
-        Some(format!("agy --conversation={cid_newer}").as_str())
-    );
-    let held_lock =
-        std::fs::File::open(presence_dir.join(format!("{cid}.lock"))).expect("open cid lock");
-    let self_pid = std::process::id();
+    assert!(agy_resume_for(&argv, &env, &home, None).is_none());
+    let lock = std::fs::canonicalize(presence_dir.join(format!("{cid}.lock"))).unwrap();
+    let newer_lock = std::fs::canonicalize(presence_dir.join(format!("{cid_newer}.lock"))).unwrap();
     let resumed_argv = vec!["agy".to_owned(), format!("--conversation={cid_newer}")];
     assert_eq!(
-        agy_resume_for(self_pid, &resumed_argv, &env, &home, Some(&workspace)).as_deref(),
-        Some(format!("agy --conversation={cid}").as_str()),
-        "live pid holding cid's presence lock overrides argv's initial --conversation"
+        agy_resume_for(
+            &resumed_argv,
+            &env,
+            &home,
+            Some(std::slice::from_ref(&lock))
+        )
+        .as_deref(),
+        Some(format!("agy --conversation={cid}").as_str())
     );
-    let (held_excerpts, _) =
-        agy_excerpts_for(self_pid, &resumed_argv, &env, &home, Some(&workspace))
-            .expect("held pid agy excerpts");
+    let (held_excerpts, _) = agy_excerpts_for(
+        &resumed_argv,
+        &env,
+        &home,
+        Some(std::slice::from_ref(&lock)),
+    )
+    .expect("held agy excerpts");
     assert_eq!(
         held_excerpts.said.as_deref(),
         Some("All footer fields are populated.")
     );
-    drop(held_lock);
+    let db_dir = cfg.join(crate::harness::upgrade_agy::CONVERSATIONS);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = db_dir.join(format!("{cid}.db"));
+    let newer_db = db_dir.join(format!("{cid_newer}.db"));
+    std::fs::write(&db, b"").unwrap();
+    std::fs::write(&newer_db, b"").unwrap();
+    let db = std::fs::canonicalize(db).unwrap();
+    let newer_db = std::fs::canonicalize(newer_db).unwrap();
+    let old_launch = vec!["agy".to_owned(), format!("--conversation={cid}")];
+    assert_eq!(
+        agy_resume_for(
+            &old_launch,
+            &env,
+            &home,
+            Some(std::slice::from_ref(&newer_db))
+        )
+        .as_deref(),
+        Some(format!("agy --conversation={cid_newer}").as_str())
+    );
+    assert_eq!(
+        agy_excerpts_for(&argv, &env, &home, Some(std::slice::from_ref(&newer_db)))
+            .unwrap()
+            .0
+            .said
+            .as_deref(),
+        Some("Other tab response.")
+    );
+    assert!(agy_resume_for(&old_launch, &env, &home, Some(&[db, newer_db.clone()])).is_none());
+    assert!(
+        agy_resume_for(
+            &old_launch,
+            &env,
+            &home,
+            Some(&[lock.clone(), newer_lock, newer_db.clone()])
+        )
+        .is_none()
+    );
+    assert_eq!(
+        agy_resume_for(&argv, &env, &home, Some(&[lock, newer_db])).as_deref(),
+        Some(format!("agy --conversation={cid}").as_str())
+    );
 
     let muse_sid = "01a16480-f908-7d10-a78e-5d95372dfb98";
     let muse_old_sid = "01a16470-0000-7d10-a78e-5d95372dfb98";
@@ -2075,17 +2169,29 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
         muse_old_sid.to_owned(),
     ];
     assert_eq!(
-        muse_resume_for(4242, &muse_resumed_argv, &env, &home).as_deref(),
-        Some(format!("muse resume {muse_sid}").as_str()),
-        "pid's active .session.lock overrides argv's initial muse resume <old_sid>"
+        muse_resume_for(
+            4242,
+            &muse_resumed_argv,
+            &env,
+            &home,
+            Some(&[std::fs::canonicalize(muse_dir.join(".session.lock")).unwrap()])
+        )
+        .as_deref(),
+        Some(format!("muse resume {muse_sid}").as_str())
     );
     assert_eq!(
-        muse_resume_for(0, &muse_resumed_argv, &env, &home).as_deref(),
+        muse_resume_for(0, &muse_resumed_argv, &env, &home, None).as_deref(),
         Some(format!("muse resume {muse_old_sid}").as_str()),
-        "without a matching pid lock, argv's muse resume <old_sid> is used"
+        "without an observed lock the explicit launch UUID remains available"
     );
-    let (muse_exc, muse_len) =
-        muse_excerpts_for(4242, &muse_resumed_argv, &env, &home).expect("muse excerpts");
+    let (muse_exc, muse_len) = muse_excerpts_for(
+        4242,
+        &muse_resumed_argv,
+        &env,
+        &home,
+        Some(&[std::fs::canonicalize(muse_dir.join(".session.lock")).unwrap()]),
+    )
+    .expect("muse excerpts");
     assert_eq!(muse_len, muse_log.len() as u64);
     assert_eq!(muse_exc.prompts.len(), 1);
     assert_eq!(muse_exc.prompts[0].text, "verify muse resume");
@@ -2104,7 +2210,317 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
         .as_bytes(),
     );
     std::fs::write(muse_dir.join("session.jsonl"), &large_log).expect("write large muse log");
-    let (large_exc, _) =
-        muse_excerpts_for(4242, &muse_resumed_argv, &env, &home).expect("large muse excerpts");
+    let (large_exc, _) = muse_excerpts_for(
+        4242,
+        &muse_resumed_argv,
+        &env,
+        &home,
+        Some(&[std::fs::canonicalize(muse_dir.join(".session.lock")).unwrap()]),
+    )
+    .expect("large muse excerpts");
     assert_eq!(large_exc.doing.as_deref(), Some("bash"));
+}
+
+#[test]
+fn agy_excerpts_belong_to_the_processes_held_conversation() {
+    let dir = tmp_dir("agy-excerpt-owner");
+    let cfg = dir.path().join("config");
+    let presence = cfg.join("presence");
+    std::fs::create_dir_all(&presence).unwrap();
+    let cfg = std::fs::canonicalize(cfg).unwrap();
+    let presence = cfg.join("presence");
+    let a = "11111111-1111-4111-8111-111111111111";
+    let b = "22222222-2222-4222-8222-222222222222";
+    for (cid, words) in [(a, "own A"), (b, "other B")] {
+        let logs = cfg.join("brain").join(cid).join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("transcript.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"type":"USER_INPUT", "content":format!("<USER_REQUEST>\n{words} prompt\n</USER_REQUEST>")}),
+                json!({"type":"PLANNER_RESPONSE", "content":format!("{words} reply")}),
+            ),
+        )
+        .unwrap();
+        std::fs::write(presence.join(format!("{cid}.lock")), b"").unwrap();
+    }
+    let history = cfg.join("history.jsonl");
+    let write_history = |workspace: &str| {
+        std::fs::write(
+            &history,
+            format!(
+                "{}\n{}\n",
+                json!({"conversationId":a, "workspace":workspace, "display":"own A history"}),
+                json!({"conversationId":b, "workspace":workspace, "display":"other B history"}),
+            ),
+        )
+        .unwrap();
+    };
+    write_history("/same-workspace");
+    let argv = vec!["agy".to_owned()];
+    let explicit_a = vec!["agy".to_owned(), format!("--conversation={a}")];
+    let env = vec![format!("AGY_CLI_CONFIG_DIR={}", cfg.display())];
+    let lock_a = presence.join(format!("{a}.lock"));
+    let lock_b = presence.join(format!("{b}.lock"));
+    let read = |argv: &[String], files: Option<&[PathBuf]>| {
+        agy_excerpts_for(argv, &env, dir.path(), files).map(|(excerpts, _)| excerpts)
+    };
+    let resume =
+        |argv: &[String], files: Option<&[PathBuf]>| agy_resume_for(argv, &env, dir.path(), files);
+    let own = read(&argv, Some(std::slice::from_ref(&lock_a))).unwrap();
+    assert_eq!(own.prompts[0].text, "own A prompt");
+    assert_eq!(own.said.as_deref(), Some("own A reply"));
+    assert!(own.prompts.iter().all(|p| !p.text.contains("other B")));
+    let switched = read(&explicit_a, Some(std::slice::from_ref(&lock_b))).unwrap();
+    assert_eq!(switched.said.as_deref(), Some("other B reply"));
+    assert!(
+        resume(&explicit_a, Some(std::slice::from_ref(&lock_b)))
+            .unwrap()
+            .ends_with(&format!("agy --conversation={b}"))
+    );
+    assert!(resume(&explicit_a, Some(&[lock_a.clone(), lock_b.clone()])).is_none());
+    assert!(resume(&argv, None).is_none());
+    assert!(read(&explicit_a, Some(&[lock_a.clone(), lock_b])).is_none());
+    assert_eq!(
+        read(&argv, Some(&[lock_a.clone(), lock_a.clone()]))
+            .unwrap()
+            .said,
+        own.said,
+        "two descriptors for one lock are one identity"
+    );
+    assert!(
+        read(&argv, Some(&[])).is_none(),
+        "unheld files are no identity"
+    );
+    assert!(
+        read(&argv, None).is_none(),
+        "an unread table is no identity"
+    );
+    write_history("/other-workspace");
+    assert!(read(&argv, Some(&[])).is_none());
+    assert_eq!(
+        read(&argv, Some(std::slice::from_ref(&lock_a)))
+            .unwrap()
+            .said,
+        own.said
+    );
+    #[cfg(unix)]
+    {
+        let alias = dir.path().join("config-alias");
+        std::os::unix::fs::symlink(&cfg, &alias).unwrap();
+        let alias_env = vec![format!("AGY_CLI_CONFIG_DIR={}", alias.display())];
+        assert_eq!(
+            agy_excerpts_for(
+                &argv,
+                &alias_env,
+                dir.path(),
+                Some(std::slice::from_ref(&lock_a))
+            )
+            .unwrap()
+            .0
+            .said,
+            own.said
+        );
+    }
+    assert_eq!(read(&explicit_a, None).unwrap().said, own.said);
+    let transcript_a = cfg
+        .join("brain")
+        .join(a)
+        .join(".system_generated/logs/transcript.jsonl");
+    std::fs::remove_file(&transcript_a).unwrap();
+    assert!(read(&explicit_a, None).is_none());
+    assert!(
+        resume(&explicit_a, None)
+            .unwrap()
+            .ends_with(&format!("agy --conversation={a}"))
+    );
+    assert!(
+        resume(&argv, Some(std::slice::from_ref(&lock_a)))
+            .unwrap()
+            .ends_with(&format!("agy --conversation={a}"))
+    );
+    assert!(
+        read(
+            &["agy".to_owned(), "--conversation=../foreign".to_owned()],
+            None
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn agy_jsonl_tail_reads_only_regular_files_with_the_same_window() {
+    let dir = tmp_dir("agy-excerpt-tail");
+    let path = dir.path().join("history.jsonl");
+    let tail = b"{\"display\":\"kept\"}\n";
+    std::fs::write(&path, tail).unwrap();
+    assert_eq!(
+        read_jsonl_tail(&path, 65_536),
+        Some((tail.to_vec(), tail.len() as u64))
+    );
+    let mut large = vec![b'x'; 70_000];
+    large.push(b'\n');
+    large.extend_from_slice(tail);
+    std::fs::write(&path, &large).unwrap();
+    assert_eq!(
+        read_jsonl_tail(&path, 65_536),
+        Some((tail.to_vec(), large.len() as u64))
+    );
+    let wide = dir.path().join("wide.jsonl");
+    let row = format!("{{\"display\":\"{}\"}}\n", "x".repeat(70_000));
+    std::fs::write(&wide, &row).unwrap();
+    assert_eq!(
+        read_jsonl_tail(&wide, 64),
+        Some((row.as_bytes().to_vec(), row.len() as u64)),
+        "a small initial window grows to a complete row"
+    );
+    let fragment = dir.path().join("fragment.jsonl");
+    let mut partial = vec![b' '; 4 * 1024 * 1024 + 1];
+    partial[0] = b'x';
+    let record = b"{\"display\":\"unproved fragment\"}";
+    let at = partial.len() - record.len();
+    partial[at..].copy_from_slice(record);
+    std::fs::write(&fragment, partial).unwrap();
+    assert!(read_jsonl_tail(&fragment, 64).is_none());
+    assert!(read_jsonl_tail(&fragment, u64::MAX).is_none());
+    assert!(read_jsonl_tail(dir.path(), 65_536).is_none());
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let alias = dir.path().join("alias.jsonl");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert_eq!(
+            read_jsonl_tail(&alias, 65_536),
+            Some((tail.to_vec(), large.len() as u64))
+        );
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: one NUL-terminated private path; mkfifo retains no pointer.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_jsonl_tail(&path, 65_536).is_none());
+        assert!(read_jsonl_tail(&alias, 65_536).is_none());
+
+        let cid = "11111111-1111-4111-8111-111111111111";
+        let logs = dir
+            .path()
+            .join("brain")
+            .join(cid)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let transcript = logs.join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            b"{\"type\":\"PLANNER_RESPONSE\",\"content\":\"regular transcript\"}\n",
+        )
+        .unwrap();
+        let argv = vec!["agy".to_owned(), format!("--conversation={cid}")];
+        let env = vec![format!("AGY_CLI_CONFIG_DIR={}", dir.path().display())];
+        let read = || agy_excerpts_for(&argv, &env, dir.path(), None);
+        assert_eq!(
+            read().unwrap().0.said.as_deref(),
+            Some("regular transcript")
+        );
+        std::fs::remove_file(&transcript).unwrap();
+        let name = std::ffi::CString::new(transcript.as_os_str().as_bytes()).unwrap();
+        // SAFETY: one NUL-terminated private path; mkfifo retains no pointer.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read().is_none());
+    }
+    let data = dir.path().join("muse-data");
+    let day = data.join("muse/sessions/2026/10/24");
+    let sid_a = "01a16480-f908-7d10-a78e-5d95372dfb98";
+    let sid_b = "01a16480-f908-7d10-a78e-5d95372dfb99";
+    let a = day.join(sid_a);
+    let b = day.join(sid_b);
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let lock = a.join(".session.lock");
+    let other_lock = b.join(".session.lock");
+    std::fs::write(&lock, b"pid=4242\nhost=private\n").unwrap();
+    std::fs::write(&other_lock, b"pid=4242\n").unwrap();
+    for (session, words) in [(&a, "own Muse reply"), (&b, "other Muse reply")] {
+        std::fs::write(session.join("session.jsonl"), format!("{}\n", json!({"payload_type":"runtime.session", "payload":{"kind":"run", "event":{"kind":"assistant_message_committed", "text":words}}}))).unwrap();
+    }
+    let lock = std::fs::canonicalize(lock).unwrap();
+    let other_lock = std::fs::canonicalize(other_lock).unwrap();
+    let files = std::cell::RefCell::new(vec![lock.clone()]);
+    let argv = vec!["muse".to_owned()];
+    let explicit_a = vec!["muse".to_owned(), "resume".to_owned(), sid_a.to_owned()];
+    let env = vec![format!("XDG_DATA_HOME={}", data.display())];
+    let resume = || muse_resume_for(4242, &argv, &env, dir.path(), Some(&files.borrow()));
+    let excerpts = || muse_excerpts_for(4242, &argv, &env, dir.path(), Some(&files.borrow()));
+    assert!(resume().unwrap().ends_with(&format!("muse resume {sid_a}")));
+    assert_eq!(
+        excerpts().unwrap().0.said.as_deref(),
+        Some("own Muse reply")
+    );
+    files.borrow_mut().clear();
+    assert!(
+        resume().is_none() && excerpts().is_none(),
+        "saved PID records are not observed ownership"
+    );
+    assert!(
+        muse_resume_for(
+            4242,
+            &explicit_a,
+            &env,
+            dir.path(),
+            Some(std::slice::from_ref(&other_lock))
+        )
+        .unwrap()
+        .ends_with(&format!("muse resume {sid_b}"))
+    );
+    assert_eq!(
+        muse_excerpts_for(
+            4242,
+            &explicit_a,
+            &env,
+            dir.path(),
+            Some(std::slice::from_ref(&other_lock))
+        )
+        .unwrap()
+        .0
+        .said
+        .as_deref(),
+        Some("other Muse reply")
+    );
+    *files.borrow_mut() = vec![lock.clone(), other_lock];
+    assert!(
+        resume().is_none() && excerpts().is_none(),
+        "two held records are ambiguous"
+    );
+    *files.borrow_mut() = vec![lock.clone(), lock.clone()];
+    assert!(resume().is_some(), "duplicate descriptors name one lock");
+    *files.borrow_mut() = vec![lock.clone()];
+    std::fs::write(&lock, b"pid=5252\n").unwrap();
+    assert!(resume().is_none(), "the held record must name this process");
+    let mut body = b"pid=4242\n".to_vec();
+    body.resize(65_536, b' ');
+    std::fs::write(&lock, &body).unwrap();
+    assert!(resume().is_some(), "a complete record at the bound is read");
+    body.push(b' ');
+    std::fs::write(&lock, &body).unwrap();
+    assert!(
+        resume().is_none() && excerpts().is_none(),
+        "a valid prefix is no complete PID proof"
+    );
+    std::fs::write(&lock, b"pid=4242\n\xff").unwrap();
+    assert!(resume().is_none(), "invalid UTF-8 is not a complete record");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        std::fs::remove_file(&lock).unwrap();
+        let name = std::ffi::CString::new(lock.as_os_str().as_bytes()).unwrap();
+        // SAFETY: one NUL-terminated private path; mkfifo retains no pointer.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(resume().is_none() && excerpts().is_none());
+    }
+    std::fs::remove_file(a.join("session.jsonl")).unwrap();
+    assert!(
+        muse_resume_for(0, &explicit_a, &env, dir.path(), None)
+            .unwrap()
+            .ends_with(&format!("muse resume {sid_a}"))
+    );
+    assert!(muse_excerpts_for(0, &explicit_a, &env, dir.path(), None).is_none());
 }

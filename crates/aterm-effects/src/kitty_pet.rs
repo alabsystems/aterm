@@ -824,7 +824,12 @@ impl Departure {
         }
         let stride = self.stride0 + run / RUN_STRIDE_CELLS;
         let cycle = PetBrain::CYCLE_RUN;
-        let idx = (stride.rem_euclid(1.0) * cycle.len() as f32) as usize;
+        let phase = if (0.0..1.0).contains(&stride) {
+            stride
+        } else {
+            stride.rem_euclid(1.0)
+        };
+        let idx = (phase * cycle.len() as f32) as usize;
         let frame = if idx < cycle.len() - 1 {
             idx
         } else {
@@ -2709,43 +2714,55 @@ impl PetBrain {
         {
             let right_base = (want + INK_PAD).floor();
             let left_base = (want + width - INK_PAD).ceil() - width;
-            for require_upper_clear in [true, false] {
-                for step in 1..=INK_EVICT_MAX as u16 {
+            let mut fallback = None;
+            for step in 1..=INK_EVICT_MAX as u16 {
+                let step = f32::from(step);
+                for candidate in [right_base + step, left_base - step] {
+                    if candidate >= 0.0
+                        && candidate <= limit
+                        && clears_caret(candidate)
+                        && (candidate - want).abs() <= INK_EVICT_MAX
+                        && self.observed_ink_overlaps(candidate, row, width) == Some(false)
+                    {
+                        if row < 1.0
+                            || self.observed_ink_overlaps(candidate, row - 1.0, width)
+                                == Some(false)
+                        {
+                            return candidate;
+                        }
+                        if fallback.is_none() {
+                            fallback = Some(candidate);
+                        }
+                    }
+                }
+            }
+            if let Some(candidate) = fallback {
+                return candidate;
+            }
+            if !clears_caret(beside) || self.ink_overlaps(beside, row, width) {
+                let mut fallback = None;
+                for step in (INK_EVICT_MAX as u16 + 1)..cols {
                     let step = f32::from(step);
                     for candidate in [right_base + step, left_base - step] {
                         if candidate >= 0.0
                             && candidate <= limit
                             && clears_caret(candidate)
-                            && (candidate - want).abs() <= INK_EVICT_MAX
                             && self.observed_ink_overlaps(candidate, row, width) == Some(false)
-                            && (!require_upper_clear
-                                || row < 1.0
-                                || self.observed_ink_overlaps(candidate, row - 1.0, width)
-                                    == Some(false))
                         {
-                            return candidate;
-                        }
-                    }
-                }
-            }
-            if !clears_caret(beside) || self.ink_overlaps(beside, row, width) {
-                for require_upper_clear in [true, false] {
-                    for step in (INK_EVICT_MAX as u16 + 1)..cols {
-                        let step = f32::from(step);
-                        for candidate in [right_base + step, left_base - step] {
-                            if candidate >= 0.0
-                                && candidate <= limit
-                                && clears_caret(candidate)
-                                && self.observed_ink_overlaps(candidate, row, width) == Some(false)
-                                && (!require_upper_clear
-                                    || row < 1.0
-                                    || self.observed_ink_overlaps(candidate, row - 1.0, width)
-                                        == Some(false))
+                            if row < 1.0
+                                || self.observed_ink_overlaps(candidate, row - 1.0, width)
+                                    == Some(false)
                             {
                                 return candidate;
                             }
+                            if fallback.is_none() {
+                                fallback = Some(candidate);
+                            }
                         }
                     }
+                }
+                if let Some(candidate) = fallback {
+                    return candidate;
                 }
             }
         }
@@ -5107,7 +5124,12 @@ impl PetBrain {
         } else {
             STRIDE_CELLS
         };
-        self.stride = (self.stride + travelled / stride_cells).rem_euclid(1024.0);
+        let next_stride = self.stride + travelled / stride_cells;
+        self.stride = if (0.0..1024.0).contains(&next_stride) {
+            next_stride
+        } else {
+            next_stride.rem_euclid(1024.0)
+        };
 
         if !self.braking
             && skid_leg
@@ -7380,6 +7402,15 @@ impl PetBrain {
             .clamp(1, i32::from(u16::MAX));
         let max_half = (max_dest + 1) / 2;
         let max_drift = NOTE_BASE + NOTE_RUN + NOTE_SWAY + 0.01;
+        let safe_inside_at = |(x, _): (f32, f32)| {
+            max_dest <= grid_w
+                && max_dest <= grid_h
+                && ((x - max_drift) * cell_w_f).floor() as i32 - max_half >= 0
+                && ((x + max_drift) * cell_w_f).ceil() as i32 + max_half <= grid_w
+        };
+        if live.is_empty() && safe_inside_at((col, row)) {
+            return (col, row);
+        }
         let dir = if self.facing_left { -1.0 } else { 1.0 };
         let step = note_lane_step(cell.0, cell.1);
         const MAX_TICKS: usize = (PURR_MOTE_LIFE * 60.0).ceil() as usize;
@@ -7389,10 +7420,7 @@ impl PetBrain {
         let mut clear_of_them = None;
         for &(along, up) in &NOTE_LANES {
             let at = (col + dir * along * step, row - up);
-            let safe_inside = max_dest <= grid_w
-                && max_dest <= grid_h
-                && ((at.0 - max_drift) * cell_w_f).floor() as i32 - max_half >= 0
-                && ((at.0 + max_drift) * cell_w_f).ceil() as i32 + max_half <= grid_w;
+            let safe_inside = safe_inside_at(at);
             if live.is_empty() && safe_inside {
                 return at;
             }
@@ -7501,9 +7529,6 @@ impl PetBrain {
 
     fn resolve_motes(&mut self) -> [Option<PetMoteSprite>; PET_MOTES_MAX] {
         let mut out = [None; PET_MOTES_MAX];
-        if self.motes.iter().all(Option::is_none) {
-            return out;
-        }
         let clock = self.clock;
         for (i, slot) in out.iter_mut().enumerate() {
             let Some(m) = self.motes[i] else { continue };
@@ -7592,30 +7617,23 @@ impl PetBrain {
     }
 
     fn spawn_departure(&mut self, d: Departure) {
-        let slot = match self.departures.iter().position(Option::is_none) {
-            Some(free) => free,
-            None => {
-                let mut oldest = 0;
-                let mut oldest_born = f64::INFINITY;
-                for (i, live) in self.departures.iter().enumerate() {
-                    if let Some(a) = live
-                        && a.born < oldest_born
-                    {
-                        oldest_born = a.born;
-                        oldest = i;
-                    }
-                }
-                oldest
+        let mut slot = 0;
+        let mut oldest_born = f64::INFINITY;
+        for (i, live) in self.departures.iter().enumerate() {
+            let Some(a) = live else {
+                slot = i;
+                break;
+            };
+            if a.born < oldest_born {
+                oldest_born = a.born;
+                slot = i;
             }
-        };
+        }
         self.departures[slot] = Some(d);
     }
 
     fn resolve_departures(&mut self) -> [Option<PetDepartureSprite>; PET_DEPARTURES_MAX] {
         let mut out = [None; PET_DEPARTURES_MAX];
-        if self.departures.iter().all(Option::is_none) {
-            return out;
-        }
         for (i, slot) in out.iter_mut().enumerate() {
             let Some(d) = self.departures[i] else {
                 continue;
@@ -7737,7 +7755,6 @@ impl PetBrain {
             PetAction::Sit if sense.reduced_motion => PetGlyphId::PetSit,
             PetAction::Sit => {
                 (scale_x, scale_y) = Self::seat_scale(self.quiet, self.clock, false);
-                let tail = self.sit_tail();
                 if self.sit_front && !self.sit_glance() {
                     // Face-on eye contact has its own blink, a one-field
                     // departure from the frame beneath it, so a stare can
@@ -7749,10 +7766,11 @@ impl PetBrain {
                     }
                 } else if self.peek {
                     PetGlyphId::PetPeekShoulder
-                } else if tail.is_none() && self.sit_yawn() {
+                } else if let Some(pose) = self.sit_tail() {
+                    pose
+                } else if self.sit_yawn() {
                     PetGlyphId::PetYawn
-                } else if tail.is_none()
-                    && self.twitch_t > 0.0
+                } else if self.twitch_t > 0.0
                     && self.side_on_holds(TWITCH_DUR - self.twitch_t, TWITCH_DUR)
                     && self.tail_room(TWITCH_DUR - self.twitch_t, TWITCH_DUR)
                     && self
@@ -7765,12 +7783,10 @@ impl PetBrain {
                     } else {
                         PetGlyphId::PetSitEarFar
                     }
-                } else if tail.is_none() && self.look_row < 0 {
+                } else if self.look_row < 0 {
                     PetGlyphId::PetSitLookup
-                } else if tail.is_none() && self.look_row > 0 {
+                } else if self.look_row > 0 {
                     PetGlyphId::PetSitLookdown
-                } else if let Some(pose) = tail {
-                    pose
                 } else if let Some((p, len)) = self.sit_blink_shows()
                     && self.side_on_holds(p, len)
                 {
@@ -8016,7 +8032,11 @@ impl PetBrain {
             scale_x *= 1.0 + q * 0.7;
         }
         if self.action == PetAction::Walk && self.content >= SKIP_CONTENT {
-            let whole = self.stride.rem_euclid(4.0);
+            let whole = if (0.0..4.0).contains(&self.stride) {
+                self.stride
+            } else {
+                self.stride.rem_euclid(4.0)
+            };
             if whole < 1.0 {
                 lift += 0.07 * (whole * core::f32::consts::PI).sin().max(0.0);
             }
@@ -8607,7 +8627,11 @@ impl PetBrain {
 
     #[inline]
     fn gait_index(&self, len: usize) -> usize {
-        let phase = self.stride.rem_euclid(1.0);
+        let phase = if (0.0..1.0).contains(&self.stride) {
+            self.stride
+        } else {
+            self.stride.rem_euclid(1.0)
+        };
         ((phase * len as f32) as usize).min(len - 1)
     }
 
@@ -9277,6 +9301,9 @@ fn first_px_step(
     slope: (f32, f32),
     scale_at: impl Fn(f32) -> (f32, f32),
 ) -> Option<f32> {
+    if horizon <= 0.0 {
+        return None;
+    }
     let (w, h) = box_px;
     let key = |t: f32| {
         let (sx, sy) = scale_at(t);

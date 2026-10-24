@@ -443,7 +443,7 @@ Merge notes:
 - No two specs stated the same property, so nothing was merged away. The building blocks `Flush`,
   `EndEpoch`, `W` and `Vis` are defined once, in §0, and every spec cites them from there.
 
-## 2. Test → spec map (TSV; all 162)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists other specs the same test samples. The
 `also` column comes from what each statement names as a consequence, so it is a reading, not a census.

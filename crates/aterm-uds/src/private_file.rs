@@ -358,14 +358,21 @@ pub fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     crate::atomic_file::write(&dir.join(name), bytes, 0o600)
 }
 
-/// Removes single-component file `name` from `dir`, returning `Ok(true)` if it existed.
+/// Removes single-component file `name` from `dir`, returning `Ok(true)` if it existed (none does where `dir` is no directory).
 /// # Errors
 /// Returns an error if `name` spans multiple components or unlinking fails.
 pub fn remove_private(dir: &Path, name: &str) -> io::Result<bool> {
     one_component_io(name)?;
     match std::fs::remove_file(dir.join(name)) {
         Ok(()) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
         Err(e) => Err(e),
     }
 }
@@ -537,6 +544,16 @@ mod tests {
         assert!(root.path().join("beside").exists());
         write_private(&dir, "token", b"t").unwrap();
         assert!(remove_private(&dir, "token").unwrap());
+    }
+
+    #[test]
+    fn a_file_beneath_no_directory_was_never_there() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        file_in(root.path(), "state", b"x", 0o600);
+        let file = root.path().join("state");
+        assert!(!remove_private(&file, "token").unwrap());
+        assert!(!remove_private(&file.join("sub"), "token").unwrap());
+        assert!(file.exists());
     }
 
     #[test]

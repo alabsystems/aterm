@@ -61,6 +61,9 @@ pub mod harness_card;
 pub mod harness_panel;
 /// Host boundary contract for effect engines.
 pub mod host;
+/// The integer bag-of-ids MLP job kind and its CPU reference (Aos M5a).
+#[cfg(any(test, debug_assertions, feature = "int-bag-mlp"))]
+pub mod int_bag_mlp;
 /// The rainbow kitty that flies in front of the cursor on the `rainbow kitty` trail style.
 pub mod kitty_cursor;
 /// The rainbow kitty pet.
@@ -108,6 +111,9 @@ pub mod test_pool;
 pub mod tone;
 /// The tone-of-typing tracker.
 pub mod tone_infer;
+/// tone-int v1, the tone classifier as an integer bag-of-ids MLP (Aos M5a).
+#[cfg(any(test, debug_assertions, feature = "int-bag-mlp"))]
+pub mod tone_int;
 pub mod trail_sound;
 pub mod trail_sweep;
 mod trick_flash;

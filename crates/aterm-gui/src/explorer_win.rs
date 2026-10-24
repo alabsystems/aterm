@@ -58,6 +58,8 @@ fn set_string(hk: Hkey, name: Option<&str>, value: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// The trailing dot prevents a drive root (`C:\`) from escaping the closing quote under MSVCRT
+/// argv rules.
 fn verb_command(exe: &str, token: &str) -> String {
     format!("\"{exe}\" -d \"{token}.\"")
 }

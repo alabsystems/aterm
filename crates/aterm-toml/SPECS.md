@@ -111,7 +111,7 @@ value-index	contract	<aterm_toml::Value as Index<I>>::index, aterm_toml::Value::
 `serde-roundtrip`. `entry-points-agree` (b) is definitional; (a) needs `deser-refines-model` on the
 `Value` instance.
 
-## 2. Test → spec map (TSV; 49 of the 50 tests)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

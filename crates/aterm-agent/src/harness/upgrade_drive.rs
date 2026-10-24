@@ -4914,6 +4914,11 @@ pub(super) fn state_dir(opts: &Opts) -> PathBuf {
     opts.state.join("upgrade")
 }
 
+/// Small regular record files; a FIFO must never park the synchronous upgrade watcher.
+fn read_record_text(path: &Path) -> std::io::Result<Option<String>> {
+    super::accounts::read_bounded(path, 2 * 1024 * 1024)
+}
+
 fn forget_settled_pending(
     opts: &Opts,
     session: &str,
@@ -5051,8 +5056,9 @@ fn prune_states(opts: &Opts, files: &[SessionFile], now: u64) {
         if live.contains(id) || !sat_a_week(&entry, now) {
             continue;
         }
-        let Some(st) = std::fs::read_to_string(&path)
+        let Some(st) = read_record_text(&path)
             .ok()
+            .flatten()
             .and_then(|text| St::from_json(&text))
         else {
             continue;
@@ -5143,7 +5149,30 @@ pub(super) fn build_proved(
 
 mod record {
     use super::{Opts, St, state_dir};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    fn replace_text(path: &Path, text: &str) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            let (tmp, mut file) = aterm_uds::atomic_file::create_temp_beside(path, 0o666)?;
+            let written = file.write_all(text.as_bytes());
+            drop(file);
+            let result = written.and_then(|()| std::fs::rename(&tmp, path));
+            if result.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            result
+        }
+        #[cfg(not(unix))]
+        {
+            let mut tmp = path.as_os_str().to_os_string();
+            tmp.push(".tmp");
+            let tmp = PathBuf::from(tmp);
+            std::fs::write(&tmp, text)?;
+            std::fs::rename(&tmp, path)
+        }
+    }
 
     fn state_path(opts: &Opts, session: &str) -> PathBuf {
         state_dir(opts).join(format!("{session}.json"))
@@ -5154,7 +5183,7 @@ mod record {
     }
 
     pub(in super::super) fn kept_move(opts: &Opts, session: &str) -> Option<St> {
-        St::from_json(&std::fs::read_to_string(move_path(opts, session)).ok()?)
+        St::from_json(&super::read_record_text(&move_path(opts, session)).ok()??)
             .filter(|st| st.moved_at != 0)
     }
 
@@ -5173,10 +5202,7 @@ mod record {
             ..St::default()
         };
         let path = move_path(opts, session);
-        let tmp = path.with_extension("move.tmp");
-        if std::fs::write(&tmp, kept.to_json()).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        let _ = replace_text(&path, &kept.to_json());
     }
 
     pub(in super::super) fn prune_kept_move(opts: &Opts, session: &str, now: u64) -> bool {
@@ -5195,7 +5221,12 @@ mod record {
     }
 
     pub(in super::super) fn load(opts: &Opts, session: &str) -> Option<St> {
-        St::from_json(&std::fs::read_to_string(state_path(opts, session)).ok()?)
+        load_checked(opts, session).ok().flatten()
+    }
+
+    fn load_checked(opts: &Opts, session: &str) -> std::io::Result<Option<St>> {
+        Ok(super::read_record_text(&state_path(opts, session))?
+            .and_then(|text| St::from_json(&text)))
     }
 
     pub(in super::super) fn save_at(opts: &Opts, session: &str, st: &St, now: u64) {
@@ -5225,7 +5256,7 @@ mod record {
             return Ok(());
         }
         let key = st.progress_key();
-        let on_disk = load(opts, session);
+        let on_disk = load_checked(opts, session)?;
         let mut out = st.clone();
         match &on_disk {
             Some(disk) if disk.progress_key == key => out.progress_at = disk.progress_at,
@@ -5275,10 +5306,7 @@ mod record {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, st.to_json()).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        let _ = replace_text(&path, &st.to_json());
     }
 
     fn write_verbatim_checked(opts: &Opts, session: &str, st: &St) -> std::io::Result<()> {
@@ -5403,8 +5431,9 @@ pub(super) fn session_files_in(claude_dir: &Path) -> Option<Vec<SessionFile>> {
         else {
             continue;
         };
-        let file = std::fs::read_to_string(&path)
+        let file = read_record_text(&path)
             .ok()
+            .flatten()
             .and_then(|text| upgrade::parse_session_file(&text).ok());
         match file {
             Some(file) if file.pid == file_pid => files.push(SessionFile {
@@ -5600,7 +5629,7 @@ pub(super) fn session_file_of(home: &Path, pid: u32) -> Option<SessionFile> {
 }
 
 pub(super) fn session_file_in(claude_dir: &Path, pid: u32) -> Option<SessionFile> {
-    let t = std::fs::read_to_string(claude_dir.join(format!("sessions/{pid}.json"))).ok()?;
+    let t = read_record_text(&claude_dir.join(format!("sessions/{pid}.json"))).ok()??;
     let file = upgrade::parse_session_file(&t).ok()?;
     Some(SessionFile {
         claude_dir: Some(claude_dir.to_path_buf()),
@@ -7237,7 +7266,7 @@ fn recorded_homes(opts: &Opts) -> Vec<Records> {
     };
     dir.flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| St::from_json(&std::fs::read_to_string(e.path()).ok()?))
+        .filter_map(|e| St::from_json(&read_record_text(&e.path()).ok()??))
         .filter(|st| driven_here(st.agent) && st.home.is_some())
         .map(|st| st.agent_records(&opts.home))
         .collect()
@@ -8300,8 +8329,9 @@ fn confirming(opts: &Opts) -> bool {
         dir.flatten().any(|e| {
             let path = e.path();
             path.extension().is_some_and(|x| x == "json")
-                && std::fs::read_to_string(&path)
+                && read_record_text(&path)
                     .ok()
+                    .flatten()
                     .and_then(|text| St::from_json(&text))
                     .is_some_and(|st| {
                         st.confirming() && opts.only_sid.as_ref().is_none_or(|s| *s == st.tab)

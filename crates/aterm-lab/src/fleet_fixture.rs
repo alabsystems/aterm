@@ -6,6 +6,9 @@
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
+/// Each fixture session's prompt, report and tool, picked by `<n>`: each text near the
+/// 400-byte excerpt record, so a fleet read is over its budget and the client's cut is
+/// what the simulation judges (`fleet_judge::judge_text`).
 const WORDS: &[(&str, &str, &str)] = &[
     (
         "Fix the flaky reconnect test in crates/net: run it fifty times with the seed printed, \

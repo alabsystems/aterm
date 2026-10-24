@@ -125,7 +125,7 @@ slicesink-model	invariant	sink::SliceSink::new, sink::SliceSink (Sink impl): pos
 `compress-total-and-bounded` (uses `count-same-bytes-lcp` and the sink model) → `lz4-round-trip`
 (the compressor lemma `RefDecode(compress(x),|x|) = Ok(x)`, then the decoder refinement).
 
-## 2. Test → spec map (TSV; all 26)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

@@ -3,7 +3,7 @@
 
 //! The installer's pure decisions: the manifest's identity fields, the official channel's signing-team pin, the app half's idempotence and its signature gate, the container election, which repository a checkout installs from, and the Linux candidate's identity line.
 
-use crate::support::{Lib, Scratch, q, root, s};
+use crate::support::{Lib, Scratch, bash, install_sh, q, root, s};
 
 /// A required identity field occurs exactly once as a one-line string; an optional one at most once.
 #[test]
@@ -142,6 +142,77 @@ fn the_installed_bundle_gate_verifies_like_a_fresh_install() {
         assert_eq!(recs[i].rc, row.2, "{row:?}");
     }
     assert_eq!(recs[hung].rc, 124);
+}
+
+/// A Ctrl-C while bounded waits ends the run with that SIGINT, as it would
+/// without bounded, and the run's EXIT trap still runs. The group leader stands
+/// for a terminal's foreground group, which a Ctrl-C reaches whole, and the
+/// stand-in sends it one from inside bounded's job. Before, bounded's trap
+/// exited 130, bash went on (wait-and-cooperative-exit), and the installed-bundle
+/// gate read the 130 as a FAILED signature and reinstalled. The group SIGKILL
+/// may find CMD already gone (it ended just before the Ctrl-C), and kill's 1
+/// then ended the trap under set -e, a status 1 read as a definite answer. The
+/// callers' temporary files go with the run: first_line_bounded's, and those of
+/// a caller around it.
+#[test]
+fn a_ctrl_c_while_bounded_waits_ends_the_run() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.env("INSTALL_SH", s(&install_sh()));
+    lib.step(
+        "cat >\"$TMPDIR/ctrl-c.bash\" <<'EOF'
+ATERM_INSTALL_LIBRARY_ONLY=1
+. \"$INSTALL_SH\"
+G=$$ row=$1 go=\"$TMPDIR/go-$1\"
+trap 'echo cleaned >\"$TMPDIR/cleaned-$row\"' EXIT
+mkfifo \"$go\"
+# bounded sleeps only once its traps are set. Its first sleep opens go to
+# read, which the stand-in's open to write waits for, so the Ctrl-C reaches
+# bounded's job while it runs its own code, never while it forks or waits.
+sleep() {
+\t[[ -e \"$go.read\" ]] || { : >\"$go.read\"; read -r _ <\"$go\" || :; }
+\t/bin/sleep \"$@\"
+}
+ctrl_c() { exec 9>\"$go\"; kill -INT -- \"-$G\"; exec 9>&- /bin/sleep 30; }
+codesign() { ctrl_c; }
+around() {
+\tlocal t
+\tt=\"$(mktemp \"$TMPDIR/aterm-probe.around.XXXXXX\")\"
+\tlocal BOUNDED_TEMPS=(\"$t\")
+\tfirst_line_bounded ctrl_c
+}
+s=0
+case \"$1\" in
+bounded) bounded 60 ctrl_c || s=$? ;;
+gate) installed_bundle_verified /nonexistent/aterm.app '' || s=$? ;;
+gone) kill() { if [[ \"$1\" == -KILL ]]; then builtin kill \"$@\"; return 1; fi; builtin kill \"$@\"; }; bounded 60 ctrl_c || s=$? ;;
+temps) around || s=$? ;;
+esac
+echo \"went on ($s)\"
+EOF",
+    );
+    let tags = ["bounded", "gate", "gone", "temps"];
+    let calls: Vec<usize> = tags
+        .iter()
+        .map(|tag| {
+            lib.call(
+                format!(
+                    "/usr/bin/perl -e '$SIG{{INT}} = \"DEFAULT\"; setpgrp(0, 0); exec @ARGV or die' {bash} \"$TMPDIR/ctrl-c.bash\" {tag}; \
+                     echo \"ended $? $(cat \"$TMPDIR/cleaned-{tag}\" 2>/dev/null), $(ls \"$TMPDIR\" | grep -c '^aterm-probe') left\"",
+                    bash = q(s(&bash())),
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for (tag, call) in tags.iter().zip(calls) {
+        assert_eq!(
+            recs[call].out, "ended 130 cleaned, 0 left",
+            "{tag}: {}",
+            recs[call].err
+        );
+    }
 }
 
 /// One digest, two spellings: equality is case-blind, and an empty operand never matches.

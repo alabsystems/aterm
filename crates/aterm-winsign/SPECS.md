@@ -127,7 +127,7 @@ Independently: `winsign-win-join`, `winsign-versions-newest-first` → `winsign-
 `winsign-config-precedence`, `winsign-config-lane`, and `winsign-metadata-json-roundtrip`. The
 three `winsign-run-*` specs come last; they compose every spec above under the host trace.
 
-## 2. Test → spec map (TSV; all 22)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 All tests are in `crates/aterm-winsign/src/lib.rs` `mod tests`.

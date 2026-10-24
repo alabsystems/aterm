@@ -124,7 +124,9 @@ fn witness(root: &Path, files: &[PathBuf], pid: u32) -> Option<(String, PathBuf)
     let held: BTreeSet<&PathBuf> = files.iter().collect();
     let mut found = held.into_iter().filter_map(|lock| {
         let session = mz::session_of_lock(root, lock)?;
-        let body = std::fs::read_to_string(lock).ok()?;
+        let body = super::super::accounts::read_bounded(lock, 64 * 1024)
+            .ok()
+            .flatten()?;
         (mz::lock_pid(&body) == Some(pid)).then(|| (session, lock.clone()))
     });
     let one = found.next()?;
@@ -154,7 +156,9 @@ fn locks_naming(root: &Path, pid: u32, since_ms: u64) -> Vec<(String, PathBuf)> 
         .map(|s| s.join(mz::LOCK))
         .filter_map(|lock| {
             let session = mz::session_of_lock(root, &lock)?;
-            let body = std::fs::read_to_string(&lock).ok()?;
+            let body = super::super::accounts::read_bounded(&lock, 64 * 1024)
+                .ok()
+                .flatten()?;
             (mz::lock_pid(&body) == Some(pid)
                 && written_ms(&lock).is_some_and(|at| at.saturating_add(1000) >= since_ms))
             .then_some((session, lock))
@@ -188,8 +192,19 @@ fn find_lock(root: &Path, session: &str) -> Option<PathBuf> {
 fn session_log_tail(lock: &Path, cap: u64) -> Option<String> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let log = lock.parent()?.join(mz::LOG);
-    let mut f = std::fs::File::open(log).ok()?;
-    let len = f.metadata().ok()?.len();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut f = options.open(log).ok()?;
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let len = meta.len();
     let from = len.saturating_sub(cap);
     f.seek(SeekFrom::Start(from)).ok()?;
     let mut bytes = Vec::new();

@@ -1231,6 +1231,8 @@ fn lower_node(
     Ok(node)
 }
 
+/// Mark `node` a live region that speaks `announced` on every platform, so it sets both its
+/// label and its value.
 fn announce_live(node: &mut Node, politeness: Live, announced: &str) {
     node.set_label(announced.to_string());
     node.set_value(announced.to_string());

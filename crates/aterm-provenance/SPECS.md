@@ -59,7 +59,7 @@ pty-wrap-ref-identity	contract	pty_wrap::pty_wrap_ref, provenance::Provenance::a
 the layout fact discharges the unsafe cast, and `inner(p) = &p.value` lets the identity be stated through
 `as_ref`.
 
-## 2. Test → spec map (TSV; all 3)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

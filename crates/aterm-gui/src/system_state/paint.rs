@@ -9,7 +9,7 @@
 use crate::native_ui::LogicalRect;
 use crate::settings::Roles;
 use crate::type_scale::TypeStep;
-use crate::widget::{DrawPrim, ImageArt, TextFace, TextWeight, rgba, text_prim};
+use crate::widget::{ArtSpan, DrawPrim, ImageArt, TextFace, TextWeight, rgba, text_prim};
 
 /// The app icon's teal on a dark ground (`❯` and the caret of `>a|`).
 const TEAL_DARK: [u8; 3] = [0x5E, 0xEA, 0xD4];
@@ -29,6 +29,20 @@ const KITTY_MAX_CAPS: f32 = 2.4;
 /// is (`assets/aterm-rainbow-kitty.png` reads about 24% on its dark ground).
 const RIBBON_DARK: f32 = 0.24;
 const RIBBON_LIGHT: f32 = 0.30;
+/// The left edge of the kitty's `h`-tall box behind a caret at `caret_x`,
+/// `caret_w` wide, measured from the pixels the art draws: its drawn left edge
+/// (the raised tail and the stretched hind foot) stands at the caret's middle,
+/// so the caret covers its haunch and the tail rises past the caret's top, as
+/// in `assets/aterm-rainbow-kitty.png`, and none of it shows over the letters.
+fn kitty_x(caret_x: f32, caret_w: f32, h: f32, art: ImageArt) -> f32 {
+    let drawn = art.mask().drawn(ArtSpan::BOX).unwrap_or(ArtSpan::BOX);
+    caret_x + caret_w * 0.5 - drawn.left * h * art.aspect()
+}
+
+/// The caret's width for a mono `advance`.
+fn caret_width(advance: f32) -> f32 {
+    (advance * 0.55).round().max(2.0)
+}
 
 /// What a brand node draws, from its value (`kitty,<px>,<scale>` or
 /// `text,<px>,<scale>`): the kitty or the words alone, the mono size, and the
@@ -100,8 +114,8 @@ impl BrandSpec {
         let words = crate::tray_raster::measure_text(BRAND_WORDS, self.px, TextWeight::Regular);
         let caret_x = advance * 2.0 + words + advance * 0.2;
         let kitty = if self.kitty {
-            let h = self.kitty_height();
-            caret_x + h * ImageArt::BrandKitty { dark: true }.aspect()
+            let (h, art) = (self.kitty_height(), ImageArt::BrandKitty { dark: true });
+            kitty_x(caret_x, caret_width(advance), h, art) + h * art.aspect()
         } else {
             caret_x + advance * 0.55
         };
@@ -112,7 +126,8 @@ impl BrandSpec {
 /// THE BRAND LOCKUP (§3.1): `❯ aterm · ALab▌` in the terminal's mono face,
 /// the prompt and the caret in the icon's teal, a dim six-stripe ribbon behind
 /// the words that fades in under their first letter and ends flush at the
-/// caret, and the tabby right after the caret, which overlaps its haunch.
+/// caret, and the tabby behind the caret, which covers its haunch while the
+/// tail rises past the caret's top, as the brand image draws them.
 /// Text only for Serious Mode and high contrast.
 pub(crate) fn paint_brand(
     prims: &mut Vec<DrawPrim>,
@@ -144,7 +159,7 @@ pub(crate) fn paint_brand(
     let x0 = rect.x;
     let words_x = x0 + advance * 2.0;
     let caret_x = words_x + words_w + advance * 0.2;
-    let caret_w = (advance * 0.55).round().max(2.0);
+    let caret_w = caret_width(advance);
     let caret_top = baseline - px * 0.95;
     let caret_h = px * 1.25;
 
@@ -183,10 +198,10 @@ pub(crate) fn paint_brand(
         let h = spec.kitty_height();
         let art = ImageArt::BrandKitty { dark };
         let w = h * art.aspect();
-        // It starts where the caret does, never under the words: the caret
-        // covers its haunch, and the last letter stays whole.
+        // Placed by the pixels it draws, as the brand image is: the caret
+        // covers its haunch, and the tail rises past the caret's top.
         prims.push(DrawPrim::Image {
-            x: caret_x,
+            x: kitty_x(caret_x, caret_w, h, art),
             y: baseline + px * 0.12 - h,
             w,
             h,

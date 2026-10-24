@@ -35,6 +35,8 @@ pub const PROC_KQUEUE_SLEEP: u32 = 2;
 pub const PROC_FLAG_SLEADER: u32 = 0x20;
 /// `PROC_FLAG_CONTROLT`: the process has a controlling terminal.
 pub const PROC_FLAG_CONTROLT: u32 = 0x80;
+/// `PROC_FLAG_EXEC`: the process ran a program since its fork.
+pub const PROC_FLAG_EXEC: u32 = 0x4000;
 /// `FREAD` in `proc_fileinfo.fi_openflags`.
 pub const FREAD: u32 = 0x1;
 /// `FWRITE` in `proc_fileinfo.fi_openflags`.
@@ -155,6 +157,8 @@ pub const KINFO_TPGID_AT: usize = 576;
 pub const KINFO_EFLAG_AT: usize = 612;
 /// `P_CONTROLT` in `p_flag`: the process has a controlling terminal.
 pub const P_CONTROLT: u32 = 0x2;
+/// `P_EXEC` in `p_flag`: the process ran a program since its fork.
+pub const P_EXEC: u32 = 0x4000;
 /// `EPROC_SLEADER` in `e_flag`: the process leads its session.
 pub const EPROC_SLEADER: u32 = 0x2;
 
@@ -189,6 +193,7 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     ("PROC_KQUEUE_SLEEP", PROC_KQUEUE_SLEEP as i64),
     ("PROC_FLAG_SLEADER", PROC_FLAG_SLEADER as i64),
     ("PROC_FLAG_CONTROLT", PROC_FLAG_CONTROLT as i64),
+    ("PROC_FLAG_EXEC", PROC_FLAG_EXEC as i64),
     ("SOCKINFO_IN", SOCKINFO_IN as i64),
     ("SOCKINFO_TCP", SOCKINFO_TCP as i64),
     ("INI_IPV4", INI_IPV4 as i64),
@@ -312,6 +317,7 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     ("KERN_PROC", KERN_PROC as i64),
     ("KERN_PROC_PID", KERN_PROC_PID as i64),
     ("P_CONTROLT", P_CONTROLT as i64),
+    ("P_EXEC", P_EXEC as i64),
     ("EPROC_SLEADER", EPROC_SLEADER as i64),
     ("sizeof(struct kinfo_proc)", KINFO_SIZE as i64),
     (
@@ -582,6 +588,8 @@ pub struct Kinfo {
     pub tpgid: Option<u32>,
     /// `EPROC_SLEADER`.
     pub session_leader: bool,
+    /// `P_EXEC`: it ran a program since its fork.
+    pub exec: bool,
     /// `p_comm`.
     pub comm: String,
 }
@@ -597,7 +605,8 @@ pub fn kinfo(b: &[u8]) -> Option<Kinfo> {
     let sec = u64::try_from(i64_at(b, KINFO_START_SEC_AT)?).unwrap_or(0);
     let usec = u64::try_from(i32_at(b, KINFO_START_USEC_AT)?).unwrap_or(0);
     let tdev = u32_at(b, KINFO_TDEV_AT)?;
-    let has_tty = u32_at(b, KINFO_FLAG_AT)? & P_CONTROLT != 0 && tdev != NODEV;
+    let flag = u32_at(b, KINFO_FLAG_AT)?;
+    let has_tty = flag & P_CONTROLT != 0 && tdev != NODEV;
     let tty = has_tty.then_some(tdev);
     Some(Kinfo {
         pid: u32_at(b, KINFO_PID_AT)?,
@@ -609,6 +618,7 @@ pub fn kinfo(b: &[u8]) -> Option<Kinfo> {
         tty,
         tpgid: tty.and(u32_at(b, KINFO_TPGID_AT).filter(|g| *g != 0)),
         session_leader: u32_at(b, KINFO_EFLAG_AT)? & EPROC_SLEADER != 0,
+        exec: flag & P_EXEC != 0,
         comm: String::from_utf8_lossy(&comm[..end]).into_owned(),
     })
 }

@@ -2141,10 +2141,10 @@ pub const VERBS: &[VerbSpec] = &[
              `if-supervisor=<holder>` fences on the live supervisor claim; `cause=` links the \
              turn in `log` to held mail (`@<off>`) or a log record (`<seq>`; `ERR cause` when it \
              names neither). A leading `id=<epoch>:<producer>:<seq>` makes it exactly-once (`OK \
-             0 dup=1` on a repeat; a turn that reached for the PTY with nothing, or whose first \
-             write a full input queue or the `if-supervisor=` fence refused, gives the id back, \
-             whatever it answered, and any other refused write leaves it in doubt; see `send`). \
-             A `hold` before the bytes land is `ERR halted …`; one after \
+             0 dup=1` on a repeat; a turn that never reached for the PTY, or whose first write \
+             a full input queue or the `if-supervisor=` fence refused, gives the id back, \
+             whatever it answered, and any other refused write that ends the turn leaves it in \
+             doubt; see `send`). A `hold` before the bytes land is `ERR halted …`; one after \
              but before the first submit press stops it (`OK 0 turn skipped reason=halted[ \
              typed=<k> pasted=<p>] submitted=0 seq=<n> id=<n>`, `typed=` on a `typed=1` turn); a \
              later one only ends re-presses. Into a `stalled` or stopped program it is `ERR busy \
@@ -2202,7 +2202,7 @@ pub const VERBS: &[VerbSpec] = &[
          relaunch). A refusal at admission or of the request's own words (`ERR halted`, `ERR \
          rate`, `ERR usage`, `ERR badregex`, `ERR cause`) takes no sequence. Once claimed, the \
          id goes back only on `ERR busy…`, `ERR denied`, a fence's `OK skipped…`, or a `turn` \
-         that reached for the PTY with nothing, or whose first write the input queue or the \
+         that never reached for the PTY, or whose first write the input queue or the \
          `if-supervisor=` fence refused, whatever it answered (`ERR halted`, `ERR yield`, `ERR exited`, an \
          `OK 0 turn skipped` before its first paste or key: the `if-gen=`/`if-rows=` fence's \
          `reason=changed` with no `typed=`, or `typed=0 pasted=0`); any other attempt that did \

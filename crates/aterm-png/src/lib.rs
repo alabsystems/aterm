@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-png` — first-party PNG decode and encode.
+//! `aterm-png` — first-party PNG decode and encode, and [`gzip`]: one gzip member around a
+//! whole-buffer DEFLATE at zlib level 9's search with dynamic-Huffman blocks (`ship site`
+//! uploads each file of the site as one).
 
 mod checksum;
 mod decode;
 mod deflate;
 mod encode;
+mod gzip;
 mod rgba;
+mod squeeze;
 
 pub use decode::{Decoder, Reader};
 pub use encode::{Encoder, Writer, encoder_scratch_len, max_encoded_len};
+pub use gzip::gzip;
 pub use rgba::decode_rgba8;
 
 /// How samples are laid out per pixel.

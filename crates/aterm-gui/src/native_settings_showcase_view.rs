@@ -220,23 +220,87 @@ fn stacked_demo(
 thread_local! {
     /// What [`list_room`] measured of the page laid out, while it measures one.
     static MEASURING: Cell<Option<Option<ListRoom>>> = const { Cell::new(None) };
+    /// How the page built last laid its list out ([`laid_last`]).
+    static LAID: Cell<Option<ListRoom>> = const { Cell::new(None) };
+    /// The rows [`list_laid`] laid its list out with, while it lays one out.
+    static LAYING: RefCell<Option<Option<scroll::ListLaid>>> = const { RefCell::new(None) };
+    /// Whether the page measured pins the keyboard's control around its list ([`pin`]).
+    static KEYBOARD_PINNED: Cell<bool> = const { Cell::new(false) };
+    /// The lists' items built this render, while [`BlocksShared`] is open ([`shared_items`]).
+    static ITEMS: RefCell<Option<Vec<SharedItems>>> = const { RefCell::new(None) };
 }
 
-/// WHAT A PAGE LAYS ITS LIST OUT IN, measured before a seat builds it: the panel's width and
-/// height, how it holds its head, footer and lead, the list's room and what a status's bar takes
-/// of it. Two seats that lay a list out alike build the same list.
+/// A list's items built this render and what they were built of.
+type SharedItems = (ItemsAt, std::rc::Rc<[ListItem]>);
+
+/// What a list's items are built of: the chooser's or the sheet's rows, and how they are held.
+#[derive(PartialEq)]
+enum ItemsAt {
+    Chooser(
+        (u32, bool, String, bool),
+        (bool, bool, bool),
+        Vec<(UiKey, u32)>,
+    ),
+    Sheet((usize, u32), (bool, bool), Vec<(UiKey, u32)>),
+}
+
+/// The lead's nodes as [`ItemsAt`] tells them apart.
+fn lead_at(lead: &[(UiNode, f32)]) -> Vec<(UiKey, u32)> {
+    lead.iter()
+        .map(|(node, height)| (node.key.clone(), height.to_bits()))
+        .collect()
+}
+
+/// The items `build` builds at `at`, built once a render while [`BlocksShared`] is open.
+fn shared_items(at: ItemsAt, build: impl FnOnce() -> Vec<ListItem>) -> std::rc::Rc<[ListItem]> {
+    let known = ITEMS.with(|items| {
+        items.borrow().as_ref().and_then(|items| {
+            items
+                .iter()
+                .find(|(seen, _)| *seen == at)
+                .map(|(_, built)| std::rc::Rc::clone(built))
+        })
+    });
+    known.unwrap_or_else(|| {
+        let built: std::rc::Rc<[ListItem]> = build().into();
+        ITEMS.with(|items| {
+            if let Some(items) = items.borrow_mut().as_mut() {
+                items.push((at, std::rc::Rc::clone(&built)));
+            }
+        });
+        built
+    })
+}
+
+/// How the page built since this was last asked laid its list out, as [`list_room`] measures it.
+pub(in crate::native_settings) fn laid_last() -> Option<ListRoom> {
+    LAID.with(Cell::take)
+}
+
+/// WHAT A PAGE LAYS ITS LIST OUT IN, measured unseated: two seats alike build the same list.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::native_settings) struct ListRoom {
     panel: (f32, f32),
     held: (bool, bool, usize),
     room: f32,
     extra: f32,
+    keyboard_pinned: bool,
 }
 
 impl ListRoom {
     /// The room the list's stops are seated in ([`scroll::seat_room_under_status`]).
     pub(in crate::native_settings) fn stops(self) -> f32 {
         (self.room - self.extra).max(0.0)
+    }
+
+    /// The room the list is seated in, before a status's bar takes any of it.
+    pub(in crate::native_settings) const fn room(self) -> f32 {
+        self.room
+    }
+
+    /// Whether the keyboard's control is pinned around the list, so the list never cuts it.
+    pub(in crate::native_settings) const fn pins_keyboard(self) -> bool {
+        self.keyboard_pinned
     }
 
     /// Whether the list lays its stops out as `other` does: as wide, pinned and led the same.
@@ -254,25 +318,72 @@ pub(in crate::native_settings) fn list_room(
 ) -> Option<ListRoom> {
     #[cfg(test)]
     crate::work_counts::settings_list_measured();
+    KEYBOARD_PINNED.with(|pinned| pinned.set(false));
     MEASURING.with(|measuring| measuring.set(Some(None)));
     let _ = themes_page(state, width, cx);
     MEASURING.with(Cell::take).flatten()
+}
+
+/// [`list_room`] with the rows a seat there seats its list with, laid out with no page built.
+pub(in crate::native_settings) fn list_laid(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    cx: &ViewCx<'_>,
+) -> (Option<ListRoom>, Option<scroll::ListLaid>) {
+    LAYING.with(|laying| laying.replace(Some(None)));
+    let room = list_room(state, width, cx);
+    (room, LAYING.with(RefCell::take).flatten())
 }
 
 fn measuring() -> bool {
     MEASURING.with(Cell::get).is_some()
 }
 
-/// Whether the page is only measured ([`list_room`]), its list laid out as `room` says.
-fn measured(state: &SettingsViewState, room: ListRoom) -> bool {
-    MEASURING.with(|measuring| {
-        measuring.get().is_some() && {
-            measuring.set(Some(Some(ListRoom {
-                extra: state.status_extra.get(),
-                ..room
-            })));
-            true
+/// Whether the list measured is laid out too ([`list_laid`]).
+fn laying() -> bool {
+    LAYING.with(|laying| laying.borrow().is_some())
+}
+
+/// Keep `list`, the rows [`list_laid`] lays its list out with.
+fn lay(list: scroll::ListLaid) {
+    LAYING.with(|laying| {
+        if let Some(laid) = laying.borrow_mut().as_mut() {
+            *laid = Some(list);
         }
+    });
+}
+
+/// Note `node`, pinned around the list, and whether it holds the keyboard's control.
+fn pin(state: &SettingsViewState, node: &UiNode) {
+    fn holds(node: &UiNode, key: &UiKey) -> bool {
+        node.key == *key || node.children.iter().any(|child| holds(child, key))
+    }
+    if measuring()
+        && state
+            .common
+            .last_focus
+            .as_ref()
+            .is_some_and(|key| holds(node, key))
+    {
+        KEYBOARD_PINNED.with(|pinned| pinned.set(true));
+    }
+}
+
+/// Whether the page is only measured ([`list_room`]), its list laid out as `room` says, which a
+/// page built keeps for [`laid_last`].
+fn measured(state: &SettingsViewState, room: ListRoom) -> bool {
+    let room = ListRoom {
+        extra: state.status_extra.get(),
+        keyboard_pinned: measuring() && KEYBOARD_PINNED.with(Cell::get),
+        ..room
+    };
+    MEASURING.with(|measuring| {
+        if measuring.get().is_some() {
+            measuring.set(Some(Some(room)));
+            return true;
+        }
+        LAID.with(|laid| laid.set(Some(room)));
+        false
     })
 }
 
@@ -331,19 +442,20 @@ pub(crate) fn themes_page(
             // bar, the sheet's Done at 640x480 at 2× text was 8pt of 48.
             let cover = (state.status_extra.get() - (body - room)).max(0.0);
             let demo_height = (room - cover - DEMO_STRIP_GAP - strip).max(0.0);
+            state.note_pinned_status_room(&strip_box, body - DEMO_STRIP_GAP - strip);
+            pin(state, &strip_box);
             if measuring() {
                 let _ = if state.showcase.sheet_open {
-                    sheet_panel(state, chooser, room, Vec::new())
+                    sheet_panel(state, chooser, room, (Vec::new(), None))
                 } else {
-                    chooser_panel(state, chooser, room, shape, Vec::new())
+                    chooser_panel(state, chooser, room, shape, (Vec::new(), None))
                 };
                 return out;
             }
-            state.note_pinned_status_room(&strip_box, body - DEMO_STRIP_GAP - strip);
             let left = if state.showcase.sheet_open {
-                sheet_panel(state, chooser, room, Vec::new())
+                sheet_panel(state, chooser, room, (Vec::new(), None))
             } else {
-                chooser_panel(state, chooser, room, shape, Vec::new())
+                chooser_panel(state, chooser, room, shape, (Vec::new(), None))
             };
             let right = UiNode::new(
                 "settings/showcase/stage-column",
@@ -405,18 +517,21 @@ pub(crate) fn themes_page(
                     let inner = (page_width - 2.0 * PANEL_INSET - THUMB_GUTTER).max(0.0);
                     let list_room = (room - 2.0 * PANEL_INSET).max(0.0);
                     let (strip_box, strip) = strip_node(state, inner);
-                    let demo = (1..=6)
-                        .rev()
-                        .map(|rows| frame.demo_height(rows))
-                        .find(|&height| {
-                            height + DEMO_STRIP_GAP + strip + DEMO_STRIP_GAP <= list_room + 0.01
-                        })
-                        .unwrap_or_else(|| frame.demo_height(1));
-                    let lead = vec![(demo_node(spec, demo), demo), (strip_box, strip)];
+                    let sizing = LeadSizing::new(frame, strip, list_room);
+                    let lead = vec![
+                        (demo_node(spec, sizing.chosen), sizing.chosen),
+                        (strip_box, strip),
+                    ];
                     out.push(if state.showcase.sheet_open {
-                        sheet_panel(state, page_width, room, lead)
+                        sheet_panel(state, page_width, room, (lead, Some(sizing)))
                     } else {
-                        chooser_panel(state, page_width, room, Shape::Stacked, lead)
+                        chooser_panel(
+                            state,
+                            page_width,
+                            room,
+                            Shape::Stacked,
+                            (lead, Some(sizing)),
+                        )
                     });
                 }
                 (spec, _) => {
@@ -430,14 +545,19 @@ pub(crate) fn themes_page(
                     let panel_height = whole_rows_height(state, panel_height, pins)
                         .max(least)
                         .min(panel_height);
-                    if !measuring() {
-                        state.note_pinned_status_room(&strip_box, panel_height);
-                    }
+                    state.note_pinned_status_room(&strip_box, panel_height);
+                    pin(state, &strip_box);
                     out.push(strip_box);
                     out.push(if state.showcase.sheet_open {
-                        sheet_panel(state, page_width, panel_height, Vec::new())
+                        sheet_panel(state, page_width, panel_height, (Vec::new(), None))
                     } else {
-                        chooser_panel(state, page_width, panel_height, Shape::Stacked, Vec::new())
+                        chooser_panel(
+                            state,
+                            page_width,
+                            panel_height,
+                            Shape::Stacked,
+                            (Vec::new(), None),
+                        )
                     });
                 }
             }
@@ -445,6 +565,47 @@ pub(crate) fn themes_page(
     }
     out
 }
+
+/// How the demo that leads a stacked list over the strip is sized by the list's room: the demo's
+/// heights by its rows, the strip's height, and the height chosen.
+#[derive(Clone, Copy)]
+struct LeadSizing {
+    heights: [f32; 6],
+    strip: f32,
+    chosen: f32,
+}
+
+impl LeadSizing {
+    fn new(frame: &SettingsPreviewSpec, strip: f32, list_room: f32) -> Self {
+        let mut sizing = Self {
+            heights: std::array::from_fn(|rows| frame.demo_height(rows + 1)),
+            strip,
+            chosen: 0.0,
+        };
+        sizing.chosen = sizing.demo_in(list_room);
+        sizing
+    }
+
+    /// The tallest demo that leaves the strip room in a list `list_room` tall, else one row's.
+    fn demo_in(self, list_room: f32) -> f32 {
+        self.heights
+            .iter()
+            .rev()
+            .copied()
+            .find(|&height| {
+                height + DEMO_STRIP_GAP + self.strip + DEMO_STRIP_GAP <= list_room + 0.01
+            })
+            .unwrap_or(self.heights[0])
+    }
+
+    /// Whether a list `list_room` tall is led by the same demo.
+    fn alike_in(sizing: Option<Self>, list_room: f32) -> bool {
+        sizing.is_none_or(|sizing| sizing.demo_in(list_room) == sizing.chosen)
+    }
+}
+
+/// Rows built over the page that lead a panel's list, and how they are sized by its room.
+type Lead = (Vec<(UiNode, f32)>, Option<LeadSizing>);
 
 fn panel_width(chooser: f32, page_width: f32) -> f32 {
     let sheet = colour_rows_least_column() + 2.0 * PANEL_INSET + THUMB_GUTTER;
@@ -701,7 +862,58 @@ pub(crate) fn demo_spec(
     .map(|(spec, _)| spec)
 }
 
+/// The demo's spec and frame at what they are built at, shared while [`BlocksShared`] is open.
+pub(in crate::native_settings) type SharedDemo =
+    (DemoAt, Option<(SettingsPreviewSpec, SettingsPreviewSpec)>);
+
+/// What the demo is built at: the phase, motion, type size and scale, and the prepared font.
+type DemoAt = (
+    u64,
+    crate::native_app::ViewMotionCx,
+    u32,
+    u32,
+    Option<usize>,
+);
+
+/// [`build_demo_spec_and_frame`], built once a render while [`BlocksShared`] is open.
 fn demo_spec_and_frame(
+    state: &SettingsViewState,
+    phase_ms: u64,
+    motion: crate::native_app::ViewMotionCx,
+    terminal_font_px: f32,
+    terminal_scale: f32,
+    prepared_font: Option<&crate::tray_raster::PreparedSemanticFont>,
+) -> Option<(SettingsPreviewSpec, SettingsPreviewSpec)> {
+    let at = (
+        phase_ms,
+        motion,
+        terminal_font_px.to_bits(),
+        terminal_scale.to_bits(),
+        prepared_font.map(|font| std::ptr::from_ref(font) as usize),
+    );
+    let built = state
+        .showcase_demo
+        .borrow()
+        .as_ref()
+        .and_then(|shared| shared.iter().find(|(seen, _)| *seen == at))
+        .map(|(_, demo)| demo.clone());
+    built.unwrap_or_else(|| {
+        let demo = build_demo_spec_and_frame(
+            state,
+            phase_ms,
+            motion,
+            terminal_font_px,
+            terminal_scale,
+            prepared_font,
+        );
+        if let Some(shared) = state.showcase_demo.borrow_mut().as_mut() {
+            shared.push((at, demo.clone()));
+        }
+        demo
+    })
+}
+
+fn build_demo_spec_and_frame(
     state: &SettingsViewState,
     phase_ms: u64,
     motion: crate::native_app::ViewMotionCx,
@@ -796,7 +1008,28 @@ pub(crate) fn demo_font_candidate(
     candidate
 }
 
+/// The strip and its height at a width, shared while [`BlocksShared`] is open.
+pub(in crate::native_settings) type SharedStrip = (u32, (UiNode, f32));
+
+/// [`build_strip_node`], built once a render for each width while [`BlocksShared`] is open.
 fn strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
+    let at = width.to_bits();
+    let built = state
+        .showcase_strip
+        .borrow()
+        .as_ref()
+        .and_then(|shared| shared.iter().find(|(seen, _)| *seen == at))
+        .map(|(_, strip)| strip.clone());
+    built.unwrap_or_else(|| {
+        let strip = build_strip_node(state, width);
+        if let Some(shared) = state.showcase_strip.borrow_mut().as_mut() {
+            shared.push((at, strip.clone()));
+        }
+        strip
+    })
+}
+
+fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
     let showcase = &state.showcase;
     let configured = state.configured_theme_id();
     let in_use = showcase.label_of(&configured);
@@ -1214,7 +1447,7 @@ fn chooser_panel(
     panel_width: f32,
     height: f32,
     shape: Shape,
-    lead: Vec<(UiNode, f32)>,
+    (lead, sizing): Lead,
 ) -> UiNode {
     let stacked = !matches!(shape, Shape::Beside { .. });
     let inner = (panel_width - 2.0 * PANEL_INSET).max(0.0);
@@ -1249,17 +1482,6 @@ fn chooser_panel(
     let footer_pins = footer
         .iter()
         .all(|(_, height)| *height <= field_height() + 0.01);
-    // The list at `inner` as tall as it lays out, whether it scrolls there.
-    let query = state.showcase.query();
-    let probe = with_blocks(state, (inner, narrow, &query), false, |entry| {
-        entry.blocks.clone()
-    });
-    if !measuring() {
-        *state.showcase.order.borrow_mut() = probe
-            .iter()
-            .filter_map(|(_, _, slug)| slug.clone())
-            .collect();
-    }
     let tallest_row = chooser_rows_tallest(state, inner, narrow);
     let rows = tallest_row.max(footer.iter().map(|(_, height)| *height).fold(0.0, f32::max));
     let lead_items: Vec<ListItem> = lead
@@ -1283,37 +1505,8 @@ fn chooser_panel(
         held: (pins.head, pins.footer, lead.len()),
         room,
         extra: 0.0,
+        keyboard_pinned: false,
     };
-    if measured(state, laid) {
-        return UiNode::new(
-            "settings/showcase/chooser",
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        );
-    }
-    state
-        .showcase
-        .page_rows
-        .set(((room / row_height()).floor() as usize).max(1));
-    let captions = room + 0.5 >= caption_height() + SECTION_ABOVE + tallest_row.max(row_height());
-    let items_at = |blocks, width: f32, footer: Option<Vec<(UiNode, f32)>>| {
-        chooser_items(state, blocks, width, pins, lead.clone(), captions, footer)
-    };
-    let probe = items_at(probe, inner, (!pins.footer).then(|| footer.clone()));
-    let span = scroll::leading_span(&probe, 0.0, f32::INFINITY, usize::MAX);
-    let items = if span > room + 0.01 {
-        let width = (inner - THUMB_GUTTER).max(0.0);
-        let footer = (!pins.footer).then(|| footer_rows(state, width, narrow));
-        items_at(list_blocks_for(state, width, narrow, &query), width, footer)
-    } else {
-        let footer = (!pins.footer).then(|| footer.clone());
-        items_at(list_blocks_for(state, inner, narrow, &query), inner, footer)
-    };
-    let mut list = scroll::list_page_whole(state, SHOWCASE_LIST, "Themes", items, room, 0.0);
-    set_role(&mut list, SHOWCASE_LIST, SemanticRole::ListBox);
-    transparent_sections(&mut list);
-    if pins.footer {
-        list.layout.height = Length::Fixed(room);
-    }
     let head = if pins.head {
         chooser_head(state, inner)
     } else {
@@ -1324,13 +1517,92 @@ fn chooser_panel(
         .fold(height - PANEL_INSET + PANEL_GAP, |under, (_, tall)| {
             under - tall - PANEL_GAP
         });
-    let mut children: Vec<UiNode> = head
-        .into_iter()
-        .map(|(node, _)| {
-            state.note_pinned_status_room(&node, under_head);
-            node
+    for (node, _) in &head {
+        state.note_pinned_status_room(node, under_head);
+        pin(state, node);
+    }
+    for (node, _) in footer.iter().filter(|_| pins.footer) {
+        pin(state, node);
+    }
+    let unbuilt = || {
+        UiNode::new(
+            "settings/showcase/chooser",
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+    };
+    if measured(state, laid) && !laying() {
+        return unbuilt();
+    }
+    let query = state.showcase.query();
+    if !measuring() {
+        *state.showcase.order.borrow_mut() =
+            with_blocks(state, (inner, narrow, &query), false, |entry| {
+                entry
+                    .blocks
+                    .iter()
+                    .filter_map(|(_, _, slug)| slug.clone())
+                    .collect()
+            });
+        state
+            .showcase
+            .page_rows
+            .set(((room / row_height()).floor() as usize).max(1));
+    }
+    let captions_from = caption_height() + SECTION_ABOVE + tallest_row.max(row_height());
+    let captions = room + 0.5 >= captions_from;
+    let led = lead_at(&lead);
+    let items_at = |width: f32, painted: bool| {
+        let at = (width.to_bits(), narrow, query.clone(), painted);
+        let held = (pins.head, pins.footer, captions);
+        shared_items(ItemsAt::Chooser(at, held, led.clone()), || {
+            let blocks = with_blocks(state, (width, narrow, &query), painted, |entry| {
+                entry.blocks.clone()
+            });
+            let footer = (!pins.footer).then(|| {
+                if width == inner {
+                    footer.clone()
+                } else {
+                    footer_rows(state, width, narrow)
+                }
+            });
+            chooser_items(state, blocks, width, pins, lead.clone(), captions, footer)
         })
-        .collect();
+    };
+    // The list at `inner` as tall as it lays out, whether it scrolls there.
+    let span = scroll::leading_span(&items_at(inner, false), 0.0, f32::INFINITY, usize::MAX);
+    let scrolls = span > room + 0.01;
+    let items = items_at(
+        if scrolls {
+            (inner - THUMB_GUTTER).max(0.0)
+        } else {
+            inner
+        },
+        true,
+    );
+    // The rooms these rows are built for: captioned, scrolling and led as in `room`; and as wide
+    // for, scrolling as there.
+    let as_wide = move |room: f32| (span > room + 0.01) == scrolls;
+    let same = move |room: f32| {
+        as_wide(room)
+            && (room + 0.5 >= captions_from) == captions
+            && LeadSizing::alike_in(sizing, room)
+    };
+    let rows = scroll::ListRows {
+        same: Box::new(same),
+        as_wide: Box::new(as_wide),
+    };
+    if measuring() {
+        lay(scroll::ListLaid::new(items, 0.0, rows));
+        return unbuilt();
+    }
+    let mut list =
+        scroll::list_page_whole(state, (SHOWCASE_LIST, "Themes"), items, (room, 0.0), rows);
+    set_role(&mut list, SHOWCASE_LIST, SemanticRole::ListBox);
+    transparent_sections(&mut list);
+    if pins.footer {
+        list.layout.height = Length::Fixed(room);
+    }
+    let mut children: Vec<UiNode> = head.into_iter().map(|(node, _)| node).collect();
     children.push(list);
     if pins.footer {
         children.push(rule_node("settings/showcase/footer/rule"));
@@ -1422,7 +1694,7 @@ fn sheet_panel(
     state: &SettingsViewState,
     panel_width: f32,
     height: f32,
-    lead: Vec<(UiNode, f32)>,
+    (lead, sizing): Lead,
 ) -> UiNode {
     let inner = (panel_width - 2.0 * PANEL_INSET).max(0.0);
     let title_height = field_height();
@@ -1439,12 +1711,16 @@ fn sheet_panel(
         held: (pin_title, false, lead.len()),
         room,
         extra: 0.0,
+        keyboard_pinned: false,
     };
-    if measured(state, laid) {
-        return UiNode::new(
+    let unbuilt = || {
+        UiNode::new(
             "settings/showcase/sheet",
             UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        );
+        )
+    };
+    if measured(state, laid) && !laying() {
+        return unbuilt();
     }
     let gap = PANEL_GAP;
     let label = SHEET_TITLE.to_string();
@@ -1479,31 +1755,47 @@ fn sheet_panel(
         .sum::<f32>()
         + if pin_title { 0.0 } else { title_height + gap };
     let one_line = colour_rows_on_one_line((inner - THUMB_GUTTER).max(0.0));
-    let probe = shared_sheet_blocks(state, inner, room, one_line);
-    let span: f32 = head_span + probe.iter().map(|(_, height)| height + gap).sum::<f32>() - gap;
+    let rows_span = with_sheet_blocks(state, (inner, room, one_line), |_, blocks| {
+        blocks.iter().map(|(_, height)| height + gap).sum::<f32>()
+    });
+    let span = head_span + rows_span - gap;
     let scrolls = span > room + 0.01;
-    let (width, blocks) = if scrolls {
-        let width = inner - THUMB_GUTTER;
-        (width, shared_sheet_blocks(state, width, room, one_line))
-    } else {
-        (inner, probe)
+    let width = if scrolls { inner - THUMB_GUTTER } else { inner };
+    let led = lead_at(&lead);
+    let items = with_sheet_blocks(state, (width, room, one_line), |built, blocks| {
+        let at = (built, width.to_bits());
+        shared_items(ItemsAt::Sheet(at, (pin_title, scrolls), led), || {
+            head(width)
+                .into_iter()
+                .chain(blocks.iter().cloned().map(|(mut node, height)| {
+                    if scrolls {
+                        node.layout.padding.right += THUMB_GUTTER;
+                    }
+                    ListItem::of(node, height)
+                }))
+                .collect()
+        })
+    });
+    // The rooms these rows are built for: scrolling as in `room`, and that room where an open
+    // picker is sized by it.
+    let sized = sheet_sized_by_room(state);
+    let built_in = room;
+    let as_wide = move |room: f32| (!sized || room == built_in) && (span > room + 0.01) == scrolls;
+    let same = move |room: f32| as_wide(room) && LeadSizing::alike_in(sizing, room);
+    let rows = scroll::ListRows {
+        same: Box::new(same),
+        as_wide: Box::new(as_wide),
     };
-    let items: Vec<ListItem> = head(width)
-        .into_iter()
-        .chain(blocks.into_iter().map(|(mut node, height)| {
-            if scrolls {
-                node.layout.padding.right += THUMB_GUTTER;
-            }
-            ListItem::of(node, height)
-        }))
-        .collect();
+    if measuring() {
+        lay(scroll::ListLaid::new(items, gap, rows));
+        return unbuilt();
+    }
     let list = scroll::list_page_whole(
         state,
-        "settings/showcase/sheet-list",
-        &label,
+        ("settings/showcase/sheet-list", &label),
         items,
-        room,
-        gap,
+        (room, gap),
+        rows,
     );
     let mut children = Vec::with_capacity(2);
     if pin_title {
@@ -1811,7 +2103,12 @@ pub(in crate::native_settings) fn list_blocks(
     width: f32,
     narrow: bool,
 ) -> Vec<(UiNode, f32, Option<String>)> {
-    list_blocks_for(state, width, narrow, &state.showcase.query())
+    with_blocks(
+        state,
+        (width, narrow, &state.showcase.query()),
+        true,
+        |entry| entry.blocks.clone(),
+    )
 }
 
 /// The chooser's rows at a width, narrow or not, under a query, painted or not.
@@ -1821,57 +2118,78 @@ pub(in crate::native_settings) struct SharedBlocks {
     painted: bool,
 }
 
-/// THE PAGE'S SEATS SHARE THE CHOOSER'S ROWS: while open, each width's rows are built once a render.
+/// THE PAGE'S SEATS SHARE THE CHOOSER'S ROWS, the demo and the strip: while open, each width's are
+/// built once a render.
 pub(in crate::native_settings) struct BlocksShared<'a>(&'a SettingsViewState);
 
 impl<'a> BlocksShared<'a> {
     pub(in crate::native_settings) fn open(state: &'a SettingsViewState) -> Self {
+        ITEMS.with(|items| items.replace(Some(Vec::new())));
         state.showcase_blocks.replace(Some(Vec::new()));
         state.showcase_sheet.replace(Some(Vec::new()));
+        state.showcase_demo.replace(Some(Vec::new()));
+        state.showcase_strip.replace(Some(Vec::new()));
         Self(state)
     }
 }
 
 impl Drop for BlocksShared<'_> {
     fn drop(&mut self) {
+        ITEMS.with(|items| items.replace(None));
         self.0.showcase_blocks.replace(None);
         self.0.showcase_sheet.replace(None);
+        self.0.showcase_demo.replace(None);
+        self.0.showcase_strip.replace(None);
     }
 }
 
-/// The Customize sheet's rows at a width, in a room, colour rows on one line or not.
-pub(in crate::native_settings) type SharedSheet = (SheetAt, Vec<(UiNode, f32)>);
+/// The Customize sheet's rows at a width, in a room, colour rows on one line or not, and the lines
+/// a field was left and the most it wrapped to.
+pub(in crate::native_settings) type SharedSheet = (SheetAt, (usize, usize), Vec<(UiNode, f32)>);
 
 /// What the sheet's rows are built at: the width, the room where an open picker reads it, colour
-/// rows on one line or not, and what the seat lays setting rows out by.
-type SheetAt = (u32, Option<u32>, bool, (Option<u32>, usize));
+/// rows on one line or not, and how tall rows stand too tall to stack.
+type SheetAt = (u32, Option<u32>, bool, Option<u32>);
 
-/// [`sheet_blocks`], built once a render for each width and room while [`BlocksShared`] is open.
-fn shared_sheet_blocks(
+/// `read` of [`sheet_blocks`], built once a render for each width and room while [`BlocksShared`]
+/// is open, and which of the render's they are.
+fn with_sheet_blocks<R>(
     state: &SettingsViewState,
-    width: f32,
-    room: f32,
-    one_line: bool,
-) -> Vec<(UiNode, f32)> {
+    (width, room, one_line): (f32, f32, bool),
+    read: impl FnOnce(usize, &[(UiNode, f32)]) -> R,
+) -> R {
+    let (tall, most) = crate::native_settings::seat_row_rooms();
     let at = (
         width.to_bits(),
         sheet_sized_by_room(state).then_some(room.to_bits()),
         one_line,
-        crate::native_settings::seat_row_rooms(),
+        tall,
     );
-    let built = state
-        .showcase_sheet
-        .borrow()
-        .as_ref()
-        .and_then(|shared| shared.iter().find(|(seen, _)| *seen == at))
-        .map(|(_, blocks)| blocks.clone());
-    built.unwrap_or_else(|| {
-        let blocks = sheet_blocks(state, width, room, one_line);
-        if let Some(shared) = state.showcase_sheet.borrow_mut().as_mut() {
-            shared.push((at, blocks.clone()));
-        }
-        blocks
-    })
+    // Rows whose fields all fit the lines left them are built alike under any as many.
+    let shared = state.showcase_sheet.borrow();
+    let built = shared.as_ref().and_then(|shared| {
+        shared.iter().position(|(seen, (left, wanted), _)| {
+            *seen == at && (*left == most || (*wanted <= *left && *wanted <= most))
+        })
+    });
+    if let Some((index, shared)) = built.zip(shared.as_ref()) {
+        return read(index, &shared[index].2);
+    }
+    drop(shared);
+    let (blocks, wanted) =
+        crate::native_settings::field_lines_wanted(|| sheet_blocks(state, width, room, one_line));
+    if let Some(shared) = state.showcase_sheet.borrow_mut().as_mut() {
+        shared.push((at, (most, wanted), blocks));
+    } else {
+        return read(usize::MAX, &blocks);
+    }
+    let shared = state.showcase_sheet.borrow();
+    let shared = shared.as_deref().unwrap_or_default();
+    let index = shared.len().saturating_sub(1);
+    read(
+        index,
+        shared.get(index).map_or(&[], |(_, _, blocks)| blocks),
+    )
 }
 
 /// `read` of the rows [`build_list_blocks`] builds, `painted` or any, shared while
@@ -1903,17 +2221,6 @@ fn with_blocks<R>(
         }
     };
     read(&shared[index])
-}
-
-fn list_blocks_for(
-    state: &SettingsViewState,
-    width: f32,
-    narrow: bool,
-    query: &str,
-) -> Vec<(UiNode, f32, Option<String>)> {
-    with_blocks(state, (width, narrow, query), true, |entry| {
-        entry.blocks.clone()
-    })
 }
 
 /// The chooser's list as blocks, each with its height and its theme's slug; `painted`, each

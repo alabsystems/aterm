@@ -386,6 +386,19 @@ fn apply_part_with(
                 _ => initial::accounts(selected),
             };
             if selected.is_empty() {
+                // A scope a choice narrowed to nothing owes nothing: the stage is done.
+                if matches!(part, Part::Preferences { only: Some(_) }) {
+                    return Ok(Some(Report {
+                        action: Action::Apply,
+                        rows: vec![Row {
+                            name: "Mac settings".into(),
+                            status: "ok".into(),
+                            detail: "nothing left to set in the groups turned to Set up".into(),
+                        }],
+                        manual_steps: Vec::new(),
+                        backup: root.join("original-preferences.json"),
+                    }));
+                }
                 return Ok(None);
             }
             selected
@@ -1649,10 +1662,7 @@ fn execute_pass(
     }
     if host.selection().is_empty() {
         if action == Action::Apply {
-            write_json(
-                &root.join("first-run.json"),
-                &json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true }),
-            )?;
+            record_applied(root, host.selection())?;
         }
         report.rows.push(Row {
             name: "Selected Mac settings".into(),
@@ -1716,16 +1726,28 @@ fn execute_pass(
     );
     settled.extend(host.settled());
     if !report.needs_attention() {
-        write_json(
-            &root.join("first-run.json"),
-            &json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true }),
-        )?;
+        record_applied(root, host.selection())?;
     }
     Ok(Pass {
         report,
         unverified,
         settled,
     })
+}
+
+/// Record the profile applied after a pass over `set` that needs nothing more, unless the
+/// plan still owes Mac settings outside `set` ([`initial::owed_beyond`]): a pass that set
+/// one group after Restore, or only the sign-outs, leaves the record restored, so a group
+/// no pass set again still reads restored; and the sign-outs after a preferences pass
+/// that failed leave it pending.
+fn record_applied(root: &Path, set: Selection) -> Result<(), String> {
+    if initial::owed_beyond(root, set) {
+        return Ok(());
+    }
+    write_json(
+        &root.join("first-run.json"),
+        &json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true }),
+    )
 }
 
 fn apply_preferences(
@@ -4115,6 +4137,33 @@ mod tests {
             pass(None),
             Some(initial::preferences(Selection::all()).workstation())
         );
+    }
+
+    /// A Workstation pass whose scope a choice narrowed to nothing (a group turned to Set
+    /// up, then back before its pass landed) owes nothing: it reports the stage done, never
+    /// the blocked "waiting for the next automatic Mac settings retry" on every pass.
+    #[test]
+    fn an_empty_workstation_scope_is_a_finished_stage() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        authorize_automatic_setup_at(root.path(), Selection::all()).unwrap();
+        let mut host = Fake::default();
+        let pass = apply_part_with(
+            root.path(),
+            &Inert::default(),
+            &mut host,
+            BUILD,
+            at(0),
+            Part::Preferences {
+                only: Some(Selection::none()),
+            },
+        )
+        .expect("pass");
+        let rows = pass.expect("an empty scope is a report, not a retry").rows;
+        assert!(
+            rows.iter().all(|row| row.status == "ok") && !rows.is_empty(),
+            "{rows:?}"
+        );
+        assert!(host.selected.is_none(), "nothing was set");
     }
 
     #[test]

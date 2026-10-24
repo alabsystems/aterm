@@ -4507,6 +4507,10 @@ fn check_initial_setup(plan: aterm_types::macos_setup::Plan) -> aterm_gui::Check
     let reading = plan.clone();
     begin_check_again(
         move || {
+            // Spotlight is searched anew for the Rust in Spotlight row: the search the
+            // reading and the check would share otherwise, found or failed, stands
+            // five minutes.
+            aterm_machines::init_spotlight::search_again();
             request_observation(
                 Some(reading),
                 aterm_types::macos_setup::Subject::all(),

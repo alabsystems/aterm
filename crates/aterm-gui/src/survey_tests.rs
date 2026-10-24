@@ -492,7 +492,10 @@ fn a_fleet_key_file_is_never_quoted_whole() {
         .tempdir()
         .unwrap();
     let secret = aterm_net::fleet_member::mint_secret().unwrap();
-    aterm_net::fleet_member::write_key_file(dir.path(), &secret).unwrap();
+    aterm_net::fleet_member::hold_book(dir.path())
+        .unwrap()
+        .write_key(&secret)
+        .unwrap();
     let text = std::fs::read_to_string(dir.path().join(aterm_net::fleet::KEY_FILE)).unwrap();
     let key = text.trim();
     assert_eq!(key.len(), 40, "{text:?}");

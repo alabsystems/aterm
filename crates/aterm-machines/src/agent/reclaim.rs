@@ -22,8 +22,14 @@ const DAEMONS: &str = "/Library/LaunchDaemons";
 /// The file uninstall writes in each folder it keeps, holding its run id. The job takes only
 /// a folder that holds it, so a folder made again at that path since (a later enrollment's
 /// stage), or one a program is started from again ([`crate::first_exec::stamp`]) before the
-/// job reads its mark, stays.
+/// job claims its mark, stays.
 pub const KEPT: &str = "kept";
+
+/// The hard link by which a reclaim job claims [`KEPT`] before reading it. A new start
+/// cancels `KEPT`, then refuses any claim; the job removes its claim only after emptying
+/// the folder. Its run id lets the same launchd job resume after a restart, while another
+/// generation's claim stays untouched.
+pub const CLAIM: &str = "reclaiming";
 
 /// The commands the job reads the clocks, waits and takes itself out with.
 struct Commands<'a> {
@@ -35,6 +41,8 @@ struct Commands<'a> {
     sleep: &'a str,
     /// `launchctl`.
     launchctl: &'a str,
+    /// Atomically link the uninstall's mark to its claim without replacing a destination.
+    link: &'a str,
 }
 
 /// This Mac's [`Commands`].
@@ -43,13 +51,14 @@ const MAC: Commands<'static> = Commands {
     wake: "/usr/sbin/sysctl -n kern.waketime",
     sleep: "/bin/sleep",
     launchctl: "/bin/launchctl",
+    link: "/bin/ln",
 };
 
 /// The job's `/bin/sh` script, run as `sh -c <script> <label> <run> <boot id> <seconds>
 /// <folder>...`. Unless the Mac has restarted since uninstall read `<boot id>`, it first
 /// waits `<seconds>` with no wake inside them, so they are awake time whether or not `sleep`
-/// counts time asleep. Then it empties each folder that still holds [`KEPT`] with `<run>`
-/// from inside it, so a folder made again at that path since is never entered, [`KEPT`] last
+/// counts time asleep. Then it atomically claims each folder's [`KEPT`] and empties only one
+/// whose regular, non-link claim names `<run>`, from inside that folder. The claim goes last
 /// so a run cut short by a shutdown is taken up at the next boot. It removes each folder,
 /// `stage/`, `state/` and the agent root that is empty then. Last it removes its plist and
 /// itself.
@@ -59,6 +68,7 @@ fn script(layout: &Layout, plist: &Path, label: &str, c: &Commands<'_>) -> Strin
         wake,
         sleep,
         launchctl,
+        link,
     } = c;
     let q = |p: &Path| shell_word(&p.to_string_lossy());
     let (root, stage, state, plist) = (
@@ -80,8 +90,11 @@ fn script(layout: &Layout, plist: &Path, label: &str, c: &Commands<'_>) -> Strin
          done\n\
          fi\n\
          for dir in \"$@\"; do\n\
-         [ -L \"$dir\" ] || (cd -P \"$dir\" && [ \"$(/bin/cat {KEPT} 2>/dev/null)\" = \"$run\" ] \
-         && /usr/bin/find . -mindepth 1 ! -path ./{KEPT} -delete && /bin/rm {KEPT})\n\
+         [ -L \"$dir\" ] || (cd -P \"$dir\" || exit\n\
+         if [ ! -e {CLAIM} ] && [ ! -L {CLAIM} ]; then {link} {KEPT} {CLAIM} 2>/dev/null || :; fi\n\
+         [ -f {CLAIM} ] && [ ! -L {CLAIM} ] \
+         && [ \"$(/bin/cat {CLAIM} 2>/dev/null)\" = \"$run\" ] \
+         && /usr/bin/find . -mindepth 1 ! -path ./{CLAIM} -delete && /bin/rm {CLAIM})\n\
          /bin/rmdir \"$dir\" 2>/dev/null\n\
          done\n\
          /bin/rmdir {stage} {state} {root} 2>/dev/null\n\
@@ -205,6 +218,27 @@ mod tests {
         (was, secs): (&str, u64),
         dirs: &[PathBuf],
     ) -> Ran {
+        job_with_gate(
+            layout,
+            plist,
+            log,
+            (session, wakes),
+            (was, secs),
+            dirs,
+            None,
+        )
+    }
+
+    /// [`job`], optionally stopping after the real hard-link claim until `release` exists.
+    fn job_with_gate(
+        layout: &Layout,
+        plist: &Path,
+        log: &Path,
+        (session, wakes): (&str, bool),
+        (was, secs): (&str, u64),
+        dirs: &[PathBuf],
+        gate: Option<(&Path, &Path)>,
+    ) -> Ran {
         let scratch = log.parent().unwrap();
         let (wake, woken) = (scratch.join("wake"), scratch.join("woken"));
         std::fs::write(&wake, b"first\n").unwrap();
@@ -212,6 +246,14 @@ mod tests {
             std::fs::write(&woken, b"").unwrap();
         }
         let q = |p: &Path| shell_word(&p.to_string_lossy());
+        let claim = gate.map_or_else(String::new, |(claimed, release)| {
+            format!(
+                "claim() {{ /bin/ln \"$@\" || return; echo claimed > {}; \
+                 while [ ! -e {} ]; do /bin/sleep 0.01; done; }}\n",
+                q(claimed),
+                q(release),
+            )
+        });
         let stubs = format!(
             "boot_id() {{ echo {session}; }}\n\
              last_wake() {{ /bin/cat {wake}; }}\n\
@@ -227,6 +269,7 @@ mod tests {
             wake: "last_wake",
             sleep: "nap",
             launchctl: "launchctl_stub",
+            link: if gate.is_some() { "claim" } else { "/bin/ln" },
         };
         let label = format!("{LABEL}.1-9");
         let body = script(layout, plist, &label, &commands);
@@ -234,9 +277,10 @@ mod tests {
             .run(
                 &Cmd::new("/bin/sh")
                     .arg("-c")
-                    .arg(format!("{stubs}{body}"))
+                    .arg(format!("{stubs}{claim}{body}"))
                     .args([label.as_str(), "1-9", was, &secs.to_string()])
-                    .args(dirs.iter().map(|d| d.as_os_str())),
+                    .args(dirs.iter().map(|d| d.as_os_str()))
+                    .budget(Duration::from_secs(60)),
             )
             .unwrap()
     }
@@ -324,6 +368,156 @@ mod tests {
         assert!(ran.success(), "{}", ran.err());
         assert!(read(&log).starts_with("sleep 60\n"), "{}", read(&log));
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_reclaim_claim_and_a_new_start_cannot_both_own_the_same_folder() {
+        struct Release<'a>(&'a Path);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::write(self.0, b"release");
+            }
+        }
+
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let live = Live::new();
+        let layout = Layout {
+            root: tmp.path().join("claimed"),
+        };
+        let dir = kept(&layout.root, "state/aterm.app-first-run", Some("1-9"));
+        let (plist, log) = (tmp.path().join("job.plist"), tmp.path().join("log"));
+        let (claimed, release) = (
+            tmp.path().join("claim-observed"),
+            tmp.path().join("release"),
+        );
+        let dirs = [dir.clone()];
+        std::thread::scope(|scope| {
+            let _release_on_panic = Release(&release);
+            let child = scope.spawn(|| {
+                job_with_gate(
+                    &layout,
+                    &plist,
+                    &log,
+                    (BOOT_ID, false),
+                    (BOOT_ID, 0),
+                    &dirs,
+                    Some((&claimed, &release)),
+                )
+            });
+            let by = std::time::Instant::now() + Duration::from_secs(60);
+            while !claimed.is_file() {
+                assert!(
+                    std::time::Instant::now() < by,
+                    "the job must claim its mark"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                crate::first_exec::stamp(&live, &dir).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "the actual paused reclaim job already owns this folder"
+            );
+            assert!(
+                dir.join(CLAIM).is_file(),
+                "cancellation cannot erase the claim"
+            );
+            std::fs::write(&release, b"release").unwrap();
+            let ran = child.join().unwrap();
+            assert!(ran.success(), "{}", ran.err());
+        });
+        assert!(
+            !dir.exists(),
+            "the claimed generation finishes before a new start"
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::first_exec::stamp(&live, &dir).unwrap();
+        assert!(crate::first_exec::hold_left(&live, &dir).is_some());
+
+        // Cancellation wins before the job's real link: its mark is gone, so it must not
+        // touch the fresh stamp even though it was given that same path.
+        let layout = Layout {
+            root: tmp.path().join("canceled"),
+        };
+        let dir = kept(&layout.root, "state/aterm.app-first-run", Some("1-9"));
+        crate::first_exec::stamp(&live, &dir).unwrap();
+        let stamp = std::fs::read(dir.join(aterm_uds::deadline::EXEC_STAMP)).unwrap();
+        let ran = job(
+            &layout,
+            &plist,
+            &log,
+            (BOOT_ID, false),
+            (BOOT_ID, 0),
+            std::slice::from_ref(&dir),
+        );
+        assert!(ran.success(), "{}", ran.err());
+        assert_eq!(
+            std::fs::read(dir.join(aterm_uds::deadline::EXEC_STAMP)).unwrap(),
+            stamp
+        );
+        assert!(!dir.join(CLAIM).exists());
+
+        // A shutdown after the claim leaves the exact run's claim for its launchd job to
+        // resume. No second marker is needed, and the completed job removes its claim.
+        let layout = Layout {
+            root: tmp.path().join("resumed"),
+        };
+        let dir = kept(&layout.root, "state/aterm.app-first-run", Some("1-9"));
+        std::fs::hard_link(dir.join(KEPT), dir.join(CLAIM)).unwrap();
+        std::fs::remove_file(dir.join(KEPT)).unwrap();
+        let ran = job(
+            &layout,
+            &plist,
+            &log,
+            (BOOT_ID, false),
+            (BOOT_ID, 0),
+            std::slice::from_ref(&dir),
+        );
+        assert!(ran.success(), "{}", ran.err());
+        assert!(!dir.exists(), "the matching interrupted claim is finished");
+
+        for bad in ["foreign", "malformed", "directory", "symlink"] {
+            let layout = Layout {
+                root: tmp.path().join(bad),
+            };
+            let dir = kept(&layout.root, "state/aterm.app-first-run", Some("1-9"));
+            let claim = dir.join(CLAIM);
+            let outside = tmp.path().join(format!("outside-{bad}"));
+            std::fs::write(&outside, b"1-9").unwrap();
+            match bad {
+                "foreign" => std::fs::write(&claim, b"1-8").unwrap(),
+                "malformed" => std::fs::write(&claim, b"not a run").unwrap(),
+                "directory" => std::fs::create_dir(&claim).unwrap(),
+                "symlink" => std::os::unix::fs::symlink(&outside, &claim).unwrap(),
+                _ => unreachable!(),
+            }
+            let ran = job(
+                &layout,
+                &plist,
+                &log,
+                (BOOT_ID, false),
+                (BOOT_ID, 0),
+                std::slice::from_ref(&dir),
+            );
+            assert!(ran.success(), "{bad}: {}", ran.err());
+            assert!(
+                dir.join("payload/aterm").is_file(),
+                "{bad}: no admitted claim"
+            );
+            assert!(
+                std::fs::symlink_metadata(&claim).is_ok(),
+                "{bad}: preserve the claim"
+            );
+            assert!(
+                !claim.join(KEPT).exists(),
+                "ln must not populate a claim directory"
+            );
+            assert_eq!(std::fs::read(&outside).unwrap(), b"1-9");
+            assert_eq!(
+                crate::first_exec::stamp(&live, &dir).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "{bad}: an existing claim never authorizes a new exec"
+            );
+        }
     }
 
     #[test]

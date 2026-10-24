@@ -137,6 +137,8 @@ fn land_reads_the_needs_table_as_labelled() {
         landed.len(),
         landed.join("\n")
     );
+    // Negative controls: the open-work reading alone, needs left out, would land some NEED
+    // row, and a reader that took every NEEDS YOU line for a need would hold some NONE row.
     assert!(rows.iter().any(|(row, reply)| {
         matches!(row, NeedsRow::Need(_))
             && open_work_strict(Some(&needs::defense_body(reply))).is_empty()

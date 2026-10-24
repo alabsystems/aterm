@@ -588,6 +588,12 @@ fn build_stands(build: &Path) -> io::Result<bool> {
     }
 }
 
+/// Elsewhere no build is laid aside, and [`reconcile`] lays no root.
+#[cfg(not(unix))]
+fn build_stands(build: &Path) -> io::Result<bool> {
+    Ok(std::fs::symlink_metadata(build).is_ok_and(|m| m.is_dir()))
+}
+
 /// `<prefix>/compat/trust`, when it and `<prefix>/compat` are both real directories — the
 /// only shape [`sweep`] and [`strays`] walk.
 #[cfg(unix)]

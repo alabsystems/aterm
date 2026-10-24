@@ -563,6 +563,9 @@ pub fn all() -> Vec<Scenario> {
             row: "6 read -r x",
             stretch_milli: 1000,
             setup: |w| {
+                // A pass saw the shell at its prompt before the line ran.
+                w.mark(1);
+                let _ = w.tick(TICK_MS);
                 let at = w.at;
                 w.tab(1).tab.block = Some(Block {
                     id: 51,

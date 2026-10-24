@@ -3358,7 +3358,7 @@ fn measure(lab: &Path, plans: &Path, out: &Path, flags: &[String]) -> Result<Mea
 }
 
 /// The 1-minute load average, from `sysctl -n vm.loadavg` spawned through `spawnfd`.
-fn load_average() -> Result<f64, String> {
+pub(crate) fn load_average() -> Result<f64, String> {
     let mut cmd = aterm_uds::spawnfd::command("/usr/sbin/sysctl");
     cmd.args(["-n", "vm.loadavg"]);
     let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(10))
@@ -3378,10 +3378,10 @@ fn read_bundle(path: &Path) -> Result<UncheckedBundle, String> {
     UncheckedBundle::decode(&bytes).map_err(|r| format!("does not decode: {r}"))
 }
 
-/// The digest of the file at `path` in the workers' executable-identity domain.
-fn digest_file(path: &Path) -> Result<Digest, String> {
+/// The digest of the file at `path` in `domain` (the workers' executable identity's, here).
+pub(crate) fn digest_file(path: &Path, domain: &[u8]) -> Result<Digest, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    Ok(Digest::of(EXECUTABLE_DOMAIN, &[&bytes]))
+    Ok(Digest::of(domain, &[&bytes]))
 }
 
 /// The regular file `given` names, made absolute and physical.
@@ -3405,16 +3405,37 @@ struct Bench {
     bundles: Vec<Vec<Result<UncheckedBundle, String>>>,
 }
 
+enum Halt {
+    Interrupted(Stopped),
+    Evidence(Fail),
+}
+
+impl From<Stopped> for Halt {
+    fn from(stopped: Stopped) -> Self {
+        Halt::Interrupted(stopped)
+    }
+}
+
+impl From<Fail> for Halt {
+    fn from(failed: Fail) -> Self {
+        Halt::Evidence(failed)
+    }
+}
+
+fn write_evidence(path: &Path, bytes: &[u8]) -> Result<(), Fail> {
+    std::fs::write(path, bytes).map_err(|e| {
+        Fail::die(format!(
+            "aos-workers-bench: cannot write {}: {e}",
+            path.display()
+        ))
+    })
+}
+
 impl Bench {
-    fn write(&self, state: State) -> (String, i32) {
+    fn write(&self, state: State) -> Result<(String, i32), Fail> {
         let (text, code) = render(&self.header, &self.runs, state);
-        if let Err(e) = std::fs::write(self.out.join("record.txt"), &text) {
-            eprintln!(
-                "aos-workers-bench: cannot write {}: {e}",
-                self.out.join("record.txt").display()
-            );
-        }
-        (text, code)
+        write_evidence(&self.out.join("record.txt"), text.as_bytes())?;
+        Ok((text, code))
     }
 
     fn one(
@@ -3424,7 +3445,7 @@ impl Bench {
         pos: usize,
         arm: Arm,
         fault: Option<FaultCase>,
-    ) -> Result<(), Stopped> {
+    ) -> Result<(), Halt> {
         stop::sleep(IDLE)?;
         let load1 = load_average();
         let id = run_id(phase, round, pos);
@@ -3432,8 +3453,14 @@ impl Bench {
         let runs_dir = self.out.join("runs");
         let dir = runs_dir.join(&name);
         let m = measure(&self.lab, &self.plans, &dir, &run_flags(arm, fault))?;
-        let _ = std::fs::write(runs_dir.join(format!("{name}.stdout")), &m.stdout);
-        let _ = std::fs::write(runs_dir.join(format!("{name}.stderr")), &m.stderr);
+        write_evidence(
+            &runs_dir.join(format!("{name}.stdout")),
+            m.stdout.as_bytes(),
+        )?;
+        write_evidence(
+            &runs_dir.join(format!("{name}.stderr")),
+            m.stderr.as_bytes(),
+        )?;
         let summary = parse_summary(&m.stdout);
         let bundles = SEARCHES
             .iter()
@@ -3455,7 +3482,7 @@ impl Bench {
         });
         self.bundles.push(bundles);
         settle(&mut self.runs, &self.bundles, phase);
-        let _ = self.write(State::Running);
+        self.write(State::Running)?;
         if let Some(r) = self.runs.last() {
             eprintln!(
                 "aos-workers-bench: {} wall_ms={:.1} cpu_ms={} {}",
@@ -3473,7 +3500,7 @@ impl Bench {
         Ok(())
     }
 
-    fn clean_session(&mut self) -> Result<(), Stopped> {
+    fn clean_session(&mut self) -> Result<(), Halt> {
         for (n, order) in schedule(self.header.rounds).iter().enumerate() {
             for (p, arm) in order.iter().enumerate() {
                 self.one(Phase::Clean, n + 1, p + 1, *arm, None)?;
@@ -3485,7 +3512,7 @@ impl Bench {
         Ok(())
     }
 
-    fn fault_session(&mut self) -> Result<(), Stopped> {
+    fn fault_session(&mut self) -> Result<(), Halt> {
         self.one(Phase::Fault, 0, 1, Arm::A, None)?;
         for n in 1..=fault_rounds(self.header.rounds) {
             for (p, case) in FaultCase::ALL.iter().enumerate() {
@@ -3550,9 +3577,11 @@ pub fn cmd_aos_workers_bench(args: &[String]) -> Res {
         Some(p) => regular_file(&from_caller(p), "--lab")?,
         None => me.clone(),
     };
-    let lab_digest =
-        digest_file(&lab).map_err(|e| Fail::usage(format!("aos-workers-bench: --lab {e}")))?;
-    let runner_is_lab = digest_file(&me).ok().map(|d| d == lab_digest);
+    let lab_digest = digest_file(&lab, EXECUTABLE_DOMAIN)
+        .map_err(|e| Fail::usage(format!("aos-workers-bench: --lab {e}")))?;
+    let runner_is_lab = digest_file(&me, EXECUTABLE_DOMAIN)
+        .ok()
+        .map(|d| d == lab_digest);
     std::fs::create_dir_all(out.join("runs")).map_err(|e| {
         Fail::die(format!(
             "aos-workers-bench: cannot make {}: {e}",
@@ -3602,15 +3631,17 @@ pub fn cmd_aos_workers_bench(args: &[String]) -> Res {
         }
         Ok(())
     });
-    bench.header.lab_facts.unchanged = Some(digest_file(&lab).is_ok_and(|d| d == lab_digest));
+    bench.header.lab_facts.unchanged =
+        Some(digest_file(&lab, EXECUTABLE_DOMAIN).is_ok_and(|d| d == lab_digest));
     match ran {
-        Err(stopped) => {
-            let (text, _) = bench.write(State::Interrupted(stopped.0));
+        Err(Halt::Interrupted(stopped)) => {
+            let (text, _) = bench.write(State::Interrupted(stopped.0))?;
             print!("{text}");
             Err(Fail::from(stopped))
         }
+        Err(Halt::Evidence(failed)) => Err(failed),
         Ok(()) => {
-            let (text, code) = bench.write(State::Done);
+            let (text, code) = bench.write(State::Done)?;
             print!("{text}");
             println!(
                 "aos-workers-bench: wrote {}",

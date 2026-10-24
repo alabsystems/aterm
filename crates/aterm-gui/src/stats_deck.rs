@@ -5,16 +5,19 @@
 
 use std::sync::Arc;
 
-use aterm_render::font::Font;
 use aterm_vitals::ink::{self, Rgb, VitalsInks};
 use aterm_vitals::model::{DiskLevel, HeatCell, Resource, ResourceView, ScopeFig, Snapshot, State};
 use aterm_vitals::words::{self, InkKind, Ladder, Locale, Platform, ScopeForms};
 
+#[cfg(test)]
+use crate::deck_face::Boxed;
+use crate::deck_face::{
+    ASCENT_EM, BoxKind, Boxes, DESCENT_EM, FaceMetrics, Txt, deck_metrics, fit, txts,
+};
 use crate::stats_paint::{Bar, Hit, Instrument, Painter, Rect, StatsMark, WellMark, panel};
 use crate::stats_plan::{
     self as plan, BlockKind, BlockPlan, Cluster, Col, CoresAt, CoresMode, DeckForm, DeckSizePref,
-    FaceMetrics, FullKind, FullPlan, HeaderPlan, HeaderText, KeyItem, Label, Rows, StateLabel,
-    Strip,
+    FullKind, FullPlan, HeaderPlan, HeaderText, KeyItem, Label, Rows, StateLabel, Strip,
 };
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
@@ -263,9 +266,8 @@ pub(crate) struct DeckGeom {
 pub(crate) struct DeckInput<'a> {
     /// The latest snapshot, `None` before the first.
     pub(crate) snap: Option<&'a Snapshot>,
-    /// This window's active tab's key (its session id).
-    pub(crate) tab_key: Option<u64>,
-    /// That tab's sessions, its focused pane first (`App::deck_tab_panes`).
+    /// This window's active tab's sessions, its focused pane first (`App::deck_tab_panes`):
+    /// every figure of "this tab" is theirs summed ([`Snapshot::resource`], [`Snapshot::tab_of`]).
     pub(crate) tab_panes: Vec<u64>,
     /// Its label, `Tab 2`.
     pub(crate) tab_label: String,
@@ -287,10 +289,6 @@ pub(crate) struct DeckInput<'a> {
     pub(crate) locale: Locale,
 }
 
-/// A glyph's ink above the baseline, per em: the box T-G4 checks.
-pub(crate) const ASCENT_EM: f64 = 0.76;
-/// A descender's depth below the baseline, per em (§3.1: "descent ≈ 2 pt" at 9.5 pt).
-pub(crate) const DESCENT_EM: f64 = 0.22;
 const HEADER_BASE_FULL: f64 = 11.5;
 const HEADER_BASE_FOLDED: f64 = 9.5;
 const HEADER_HIT_FULL: f64 = 14.5;
@@ -301,69 +299,6 @@ const SMALL_PT: f64 = 9.5;
 const MARK_EM: f64 = 1.1;
 const STATE_GAP: f64 = 6.0;
 const STRIP_PERIODS: [u32; 3] = [10, 20, 30];
-
-/// The chrome face's advances the deck measures with: the UI faces the rasterizer draws `TextFace::Ui` and `UiBold` in, or the pen's 0.6 em placeholder while none is installed.
-pub(crate) fn deck_metrics() -> Arc<FaceMetrics> {
-    type Held = (Option<Arc<Font>>, Option<Arc<Font>>, Arc<FaceMetrics>);
-    thread_local! {
-        static HELD: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) };
-    }
-    let regular = crate::tray_raster::ui_font_of(TextFace::Ui);
-    let bold = crate::tray_raster::ui_font_of(TextFace::UiBold);
-    let same = |a: &Option<Arc<Font>>, b: &Option<Arc<Font>>| match (a, b) {
-        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-        (None, None) => true,
-        _ => false,
-    };
-    HELD.with(|held| {
-        let mut held = held.borrow_mut();
-        if let Some((r, b, m)) = held.as_ref()
-            && same(r, &regular)
-            && same(b, &bold)
-        {
-            return Arc::clone(m);
-        }
-        let metrics = Arc::new(match (&regular, &bold) {
-            (Some(r), Some(b)) => FaceMetrics::of_faces(r, b),
-            _ => FaceMetrics::placeholder(),
-        });
-        *held = Some((regular, bold, Arc::clone(&metrics)));
-        metrics
-    })
-}
-
-/// A text and its advance at 1 pt in the deck's face, regular and bold:
-/// measured once, so fitting it at any size is arithmetic.
-#[derive(Clone, Debug, PartialEq)]
-struct Txt {
-    s: String,
-    em: [f64; 2],
-}
-
-impl Txt {
-    fn new(s: impl Into<String>, m: &FaceMetrics) -> Self {
-        let s = s.into();
-        let em = [m.width(&s, 1.0, false), m.width(&s, 1.0, true)];
-        Self { s, em }
-    }
-
-    fn w(&self, pt: f64, bold: bool) -> f64 {
-        self.em[usize::from(bold)] * pt
-    }
-}
-
-fn txts(forms: impl IntoIterator<Item = String>, m: &FaceMetrics) -> Vec<Txt> {
-    forms.into_iter().map(|s| Txt::new(s, m)).collect()
-}
-
-fn fit(forms: &[Txt], room: f64, pt: f64, bold: bool, m: &FaceMetrics) -> String {
-    if let Some(t) = forms.iter().find(|t| t.w(pt, bold) <= room + 0.01) {
-        return t.s.clone();
-    }
-    forms
-        .last()
-        .map_or_else(String::new, |last| m.fit(&[&last.s], room, pt, bold))
-}
 
 /// The scope bar's segments as shares of the row's capacity (§6), each
 /// `0..=1`.
@@ -474,7 +409,7 @@ impl DeckWords {
         };
         let rows = DECK_RESOURCES
             .iter()
-            .map(|&res| RowWords::new(res, snap, input.tab_key, &input.locale, m))
+            .map(|&res| RowWords::new(res, snap, &input.tab_panes, &input.locale, m))
             .collect();
         let cores = snap
             .cpu
@@ -542,14 +477,8 @@ impl DeckWords {
 }
 
 impl RowWords {
-    fn new(
-        res: Resource,
-        snap: &Snapshot,
-        tab_key: Option<u64>,
-        loc: &Locale,
-        m: &FaceMetrics,
-    ) -> Self {
-        let view = snap.resource(res, tab_key);
+    fn new(res: Resource, snap: &Snapshot, panes: &[u64], loc: &Locale, m: &FaceMetrics) -> Self {
+        let view = snap.resource(res, panes);
         let facts = &snap.facts;
         let forms = |ladder| words::amount_forms(res, &view, facts, ladder, loc);
         let mut det = forms(Ladder::Det);
@@ -656,34 +585,6 @@ const fn ladder_ix(details: bool, cols: bool) -> usize {
         (false, true) => 1,
         (false, false) => 2,
     }
-}
-
-/// What T-G4 records of a drawn deck: one text, mark or region, in points.
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Boxed {
-    pub(crate) kind: BoxKind,
-    pub(crate) text: String,
-    /// `x0, y0, x1, y1`.
-    pub(crate) r: [f64; 4],
-    /// The column a text must stay inside, where it has one.
-    pub(crate) room: Option<(f64, f64)>,
-}
-
-/// What a recorded box is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BoxKind {
-    Text,
-    Mark,
-    /// A strip's cells and their over caps' room.
-    Strip,
-    Bar,
-    /// Disk's warn line, past the bar's top and bottom.
-    Tick,
-    /// A header swatch or a key item's cell or ramp.
-    Swatch,
-    /// A cluster's squares.
-    Core,
 }
 
 /// One table's columns: the Full plan's, or one Folded block's.
@@ -810,8 +711,7 @@ struct Deck<'a> {
     hits_first: Vec<Hit>,
     hits_rows: Vec<Hit>,
     hits_last: Vec<Hit>,
-    #[cfg(test)]
-    boxes: Option<Vec<Boxed>>,
+    boxes: Boxes,
     /// The header line as planned (T-G14).
     #[cfg(test)]
     head: Option<HeaderPlan>,
@@ -841,8 +741,7 @@ impl<'a> Deck<'a> {
             hits_first: Vec::new(),
             hits_rows: Vec::new(),
             hits_last: Vec::new(),
-            #[cfg(test)]
-            boxes: None,
+            boxes: Boxes::default(),
             #[cfg(test)]
             head: None,
         }
@@ -857,21 +756,9 @@ impl<'a> Deck<'a> {
         (a, b, self.px(x1) - a, self.px(y1) - b)
     }
 
-    #[cfg(test)]
     fn note(&mut self, kind: BoxKind, r: [f64; 4], text: &str, room: Option<(f64, f64)>) {
-        if let Some(boxes) = self.boxes.as_mut() {
-            boxes.push(Boxed {
-                kind,
-                text: text.to_owned(),
-                r,
-                room,
-            });
-        }
+        self.boxes.note(kind, r, text, room);
     }
-
-    /// The boxes T-G4 checks are recorded only under test.
-    #[cfg(not(test))]
-    const fn note(&mut self, _: BoxKind, _: [f64; 4], _: &str, _: Option<(f64, f64)>) {}
 
     fn ink(&self, k: InkKind) -> Rgb {
         kind_ink(&self.inks, k)
@@ -1951,11 +1838,11 @@ pub(crate) fn lay(
     draw: bool,
 ) -> Laid {
     let mut deck = Deck::new(g, input, m, draw);
-    deck.boxes = Some(Vec::new());
+    deck.boxes.record();
     deck.paint(words, input.form);
     let hits = deck.hits();
     Laid {
-        boxes: deck.boxes.take().unwrap_or_default(),
+        boxes: deck.boxes.take(),
         head: deck.head.take(),
         cells: deck.cells,
         prims: deck.p.prims,
@@ -1969,10 +1856,14 @@ pub(crate) fn deck_prims(g: &DeckGeom, input: &DeckInput<'_>) -> Vec<DrawPrim> {
     deck_paint(g, input).0
 }
 
-/// A fingerprint of the prims, so an identical layout presents nothing.
+/// A fingerprint of the prims, in order, by their fields ([`DrawPrim::fingerprint_into`]), so an identical layout presents nothing; never `0`.
 pub(crate) fn prims_fp(prims: &[DrawPrim]) -> u64 {
-    let text = format!("{prims:?}");
-    aterm_hash::fnv1a_64(text.as_bytes()) | 1
+    use std::hash::Hasher;
+    let mut state = std::collections::hash_map::DefaultHasher::new();
+    for p in prims {
+        p.fingerprint_into(&mut state);
+    }
+    state.finish() | 1
 }
 
 /// The stats card's inputs for a window, read off the App.
@@ -1982,7 +1873,6 @@ pub(crate) struct DeckFrame {
     pub(crate) plate: Option<u8>,
     pub(crate) geom: DeckGeom,
     pub(crate) dy: u32,
-    pub(crate) tab_key: Option<u64>,
     /// [`DeckInput::tab_panes`].
     pub(crate) tab_panes: Vec<u64>,
     pub(crate) tab_label: String,
@@ -2051,7 +1941,6 @@ impl crate::App {
                         font_px: self.win_font_px(wid),
                     },
                     dy: u32::try_from(dy).unwrap_or(0),
-                    tab_key,
                     tab_panes,
                     tab_label,
                     tab_count,
@@ -2087,7 +1976,6 @@ impl crate::App {
                         font_px: self.win_font_px(wid),
                     },
                     dy: u32::try_from(frame_h.saturating_sub(pad)).unwrap_or(0),
-                    tab_key,
                     tab_panes,
                     tab_label,
                     tab_count,
@@ -2158,14 +2046,14 @@ impl crate::App {
             v.to_bits().hash(&mut h);
         }
         f.dy.hash(&mut h);
-        f.tab_key.hash(&mut h);
+        f.tab_panes.hash(&mut h);
         f.tab_label.hash(&mut h);
         f.tab_count.hash(&mut h);
         f.dwc.hash(&mut h);
         f.plate.hash(&mut h);
         f.deck.hash(&mut h);
         f.contrast.hash(&mut h);
-        format!("{:?}", f.inks).hash(&mut h);
+        f.inks.hash(&mut h);
         Arc::as_ptr(&deck_metrics()).hash(&mut h);
         h.finish() | 1
     }
@@ -2173,7 +2061,6 @@ impl crate::App {
     fn deck_layout(&self, wid: crate::WindowId, f: &DeckFrame, key: u64) -> Vec<DrawPrim> {
         let input = DeckInput {
             snap: self.vitals.snapshot.as_deref(),
-            tab_key: f.tab_key,
             tab_panes: f.tab_panes.clone(),
             tab_label: f.tab_label.clone(),
             tab_count: f.tab_count,
@@ -2360,7 +2247,7 @@ fn meter_pct(share: Option<f32>) -> Option<f32> {
 #[cfg(a11y_tree)]
 pub(crate) fn stats_a11y_group(
     snap: Option<&Snapshot>,
-    tab_key: Option<u64>,
+    panes: &[u64],
     loc: &Locale,
 ) -> crate::a11y_tree::StatsGroup {
     use crate::a11y_tree::{StatsGroup, StatsMeter};
@@ -2381,7 +2268,7 @@ pub(crate) fn stats_a11y_group(
                     .then(|| snap.resources[res.index()].heat_now)
                     .flatten(),
             ),
-            words: words::row_sentence(res, snap, tab_key, loc),
+            words: words::row_sentence(res, snap, panes, loc),
         })
         .collect();
     let cores: Vec<StatsMeter> = snap.cpu.as_ref().map_or_else(Vec::new, |cpu| {
@@ -2446,7 +2333,7 @@ impl crate::App {
                 }),
             });
         Some(crate::a11y_tree::GridStats {
-            group: stats_a11y_group(self.vitals.snapshot.as_deref(), f.tab_key, &loc),
+            group: stats_a11y_group(self.vitals.snapshot.as_deref(), &f.tab_panes, &loc),
             bounds: Some(bounds),
             lens,
         })
@@ -2802,19 +2689,12 @@ pub(crate) mod tests {
             ("Nord", "heat_ic steps", 0.038),
             ("One Dark", "heat_ic steps", 0.049),
         ];
-        let names = aterm_types::scheme::builtin_names();
-        assert!(names.len() > 2, "CONTROL: themes to judge");
+        let bands = built_in_bands();
+        assert!(bands.len() > 2, "CONTROL: themes to judge");
         let (mut failed, mut seen) = (Vec::new(), Vec::new());
-        for name in names {
-            let scheme = aterm_types::scheme::builtin(name).expect("listed scheme exists");
-            let band = crate::chrome_band::band_colors(crate::chrome_band::ChromePalette {
-                theme: aterm_render::Theme::from(&scheme),
-                ansi: Some(crate::chrome_band::ansi_of_scheme(&scheme)),
-                authored: aterm_messages::tokens::AuthoredChrome::NONE,
-            });
-            let inks = ink::vitals_inks(band.bar_bg, band.value, band.accent);
+        for (name, inks) in bands {
             for miss in inks.deck_floor_misses() {
-                let line = format!("{name} (band {:?}): {}", band.bar_bg, miss.what);
+                let line = format!("{name} (band {:?}): {}", inks.ground, miss.what);
                 let pin = pinned
                     .iter()
                     .find(|(theme, floor, _)| *theme == name && miss.what.starts_with(floor));
@@ -2840,10 +2720,233 @@ pub(crate) mod tests {
         assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 
+    /// Each built-in theme's name and the inks solved on its band.
+    fn built_in_bands() -> Vec<(&'static str, VitalsInks)> {
+        aterm_types::scheme::builtin_names()
+            .into_iter()
+            .map(|name| {
+                let scheme = aterm_types::scheme::builtin(name).expect("listed scheme exists");
+                let band = crate::chrome_band::band_colors(crate::chrome_band::ChromePalette {
+                    theme: aterm_render::Theme::from(&scheme),
+                    ansi: Some(crate::chrome_band::ansi_of_scheme(&scheme)),
+                    authored: aterm_messages::tokens::AuthoredChrome::NONE,
+                });
+                (name, ink::vitals_inks(band.bar_bg, band.value, band.accent))
+            })
+            .collect()
+    }
+
+    /// The merged deck's inks on every built-in band, under Increase
+    /// Contrast below, then on the mockups' two grounds above the inks the
+    /// mockups' generator drew, to judge against the swatches in
+    /// `docs/design-studies/top-deck-*-2026-10-23.png`.
+    #[test]
+    #[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
+    fn merged_ink_sheet() {
+        let Some(dir) = std::env::var_os("ATERM_DECK_GALLERY") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("the gallery directory");
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let (w, row) = (2240.0_f32, 112.0_f32);
+        let bands = built_in_bands();
+        let mut prims = Vec::new();
+        for (i, (name, inks)) in bands.iter().enumerate() {
+            ink_sheet_row(&mut prims, i as f32 * row, w, name, inks);
+        }
+        let mut y = bands.len() as f32 * row;
+        for (ground, fg, accent, mockup) in [
+            (
+                [0x30, 0x31, 0x35],
+                [0xF8, 0xF8, 0xF2],
+                [0x50, 0xFA, 0x7B],
+                MOCKUP_DARK,
+            ),
+            (
+                [0xE2, 0xE3, 0xE5],
+                [0x24, 0x29, 0x2F],
+                [0x1A, 0x7F, 0x37],
+                MOCKUP_LIGHT,
+            ),
+        ] {
+            let inks = ink::vitals_inks(ground, fg, accent);
+            y += ink_sheet_reference(&mut prims, y, w, &inks, &mockup);
+        }
+        let (rgba, pw, ph) =
+            crate::tray_raster::rasterize_tray(&prims, w as u32, y as u32, 1.0, [0, 0, 0, 0xFF]);
+        let png =
+            crate::app_introspect::encode_rgba8_png(&rgba, pw, ph).expect("the sheet encodes");
+        let file = dir.join("merged_inks.png");
+        std::fs::write(&file, png).expect("the PNG writes");
+        eprintln!("{} bands: {}", bands.len(), file.display());
+    }
+
+    /// The mockups' inks, as their generator drew them, in
+    /// [`ink_sheet_reference`]'s order.
+    const MOCKUP_DARK: [&str; 17] = [
+        "#FF6CB8", "#1B1B1E", "#5EBEB6", "#C6B6FF", "#3A4448", "#464551", "#C3C4CA", "#A2A3A9",
+        "#FFAE5C", "#404145", "#4C6277", "#607886", "#768D90", "#9DA27D", "#C3B660", "#E1CB57",
+        "#FFE148",
+    ];
+    const MOCKUP_LIGHT: [&str; 17] = [
+        "#B40065", "#FFFFFF", "#03645D", "#5434C8", "#C8D1D3", "#CECDDB", "#474E57", "#5E6570",
+        "#A24200", "#FFFFFF", "#7E95AD", "#758FAA", "#6C8B9E", "#8E875D", "#A48A32", "#B78600",
+        "#C27B00",
+    ];
+
+    fn hex(c: Rgb) -> String {
+        format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2])
+    }
+
+    fn sheet_text(prims: &mut Vec<DrawPrim>, x: f32, baseline: f32, s: &str, color: Rgb) {
+        sheet_words(prims, x, baseline, s, color, TypeStep::Body);
+    }
+
+    fn sheet_words(
+        prims: &mut Vec<DrawPrim>,
+        x: f32,
+        baseline: f32,
+        s: &str,
+        color: Rgb,
+        step: TypeStep,
+    ) {
+        prims.push(text_prim(
+            x,
+            baseline,
+            s.to_owned(),
+            step.px(20.0),
+            TextWeight::Regular,
+            TextFace::Ui,
+            rgba(color, 0xFF),
+        ));
+    }
+
+    /// One band's row: its name, then the merged inks as the deck draws them,
+    /// above and under Increase Contrast below.
+    fn ink_sheet_row(prims: &mut Vec<DrawPrim>, y: f32, w: f32, name: &str, inks: &VitalsInks) {
+        prims.push(panel(0.0, y, w, 112.0, 0.0, rgba(inks.ground, 0xFF)));
+        sheet_text(prims, 12.0, y + 34.0, name, inks.words);
+        sheet_text(prims, 12.0, y + 62.0, &hex(inks.ground), inks.words2);
+        for (k, m) in [inks.merged, inks.merged_ic].iter().enumerate() {
+            let y = y + 6.0 + k as f32 * 52.0;
+            let mut x = 300.0;
+            for i in 0..=120 {
+                let c = m.heat_at(i as f32 / 120.0);
+                prims.push(panel(
+                    x + i as f32 * 2.0,
+                    y + 6.0,
+                    2.0,
+                    32.0,
+                    0.0,
+                    rgba(c, 0xFF),
+                ));
+            }
+            x += 260.0;
+            for (j, level) in [0.1_f32, 0.35, 0.6, 0.85, 1.0].into_iter().enumerate() {
+                let tx = x + j as f32 * 22.0;
+                prims.push(panel(tx, y + 4.0, 16.0, 36.0, 2.0, rgba(m.well, 0xFF)));
+                let fh = 36.0 * level;
+                prims.push(panel(
+                    tx,
+                    y + 40.0 - fh,
+                    16.0,
+                    fh,
+                    2.0,
+                    rgba(m.heat_at(level), 0xFF),
+                ));
+            }
+            x += 124.0;
+            prims.push(panel(x, y + 8.0, 190.0, 30.0, 15.0, rgba(m.needs, 0xFF)));
+            sheet_text(prims, x + 14.0, y + 30.0, "Tab 1 password", m.needs_text);
+            sheet_text(prims, x + 204.0, y + 30.0, "Needs you", m.needs);
+            x += 330.0;
+            for (ink, tint, words) in [
+                (m.all_tabs, m.all_tabs_tint, "all tabs 57%"),
+                (m.this_tab, m.this_tab_tint, "this tab 52%"),
+            ] {
+                prims.push(panel(x, y + 2.0, 400.0, 42.0, 6.0, rgba(tint, 0xFF)));
+                sheet_text(prims, x + 10.0, y + 30.0, words, ink);
+                sheet_text(prims, x + 150.0, y + 30.0, "22 GiB", m.secondary);
+                prims.push(panel(
+                    x + 236.0,
+                    y + 14.0,
+                    150.0,
+                    16.0,
+                    3.0,
+                    rgba(m.well, 0xFF),
+                ));
+                prims.push(panel(x + 236.0, y + 14.0, 86.0, 16.0, 3.0, rgba(ink, 0xFF)));
+                x += 412.0;
+            }
+            sheet_text(prims, x, y + 30.0, "10m", m.axis);
+            sheet_text(prims, x + 70.0, y + 30.0, "now", m.axis);
+            x += 140.0;
+            for s in 0..3 {
+                prims.push(panel(
+                    x,
+                    y + 34.0 - s as f32 * 9.0,
+                    28.0,
+                    6.0,
+                    1.0,
+                    rgba(inks.over, 0xFF),
+                ));
+            }
+            sheet_text(prims, x + 36.0, y + 30.0, "~8 waiting", m.over_text);
+        }
+    }
+
+    /// The mockups' grounds: each merged ink above the mockup's own, with both
+    /// values. Returns the block's height.
+    fn ink_sheet_reference(
+        prims: &mut Vec<DrawPrim>,
+        y: f32,
+        w: f32,
+        inks: &VitalsInks,
+        mockup: &[&str; 17],
+    ) -> f32 {
+        let m = &inks.merged;
+        let ours = [
+            ("needs", m.needs),
+            ("needs_text", m.needs_text),
+            ("all_tabs", m.all_tabs),
+            ("this_tab", m.this_tab),
+            ("all_tabs_tint", m.all_tabs_tint),
+            ("this_tab_tint", m.this_tab_tint),
+            ("secondary", m.secondary),
+            ("axis", m.axis),
+            ("over_text", m.over_text),
+            ("well", m.well),
+        ]
+        .into_iter()
+        .chain((0..7).map(|k| ("heat", m.heat[k])));
+        prims.push(panel(0.0, y, w, 230.0, 0.0, rgba(inks.ground, 0xFF)));
+        sheet_text(prims, 12.0, y + 30.0, &hex(inks.ground), inks.words);
+        sheet_text(prims, 12.0, y + 100.0, "ours", inks.words);
+        sheet_text(prims, 12.0, y + 190.0, "the mockup's", inks.words);
+        for (i, ((name, c), theirs)) in ours.zip(mockup).enumerate() {
+            let x = 200.0 + i as f32 * 120.0;
+            let theirs = u32::from_str_radix(&theirs[1..], 16).expect("a hex colour");
+            let theirs = [(theirs >> 16) as u8, (theirs >> 8) as u8, theirs as u8];
+            sheet_words(prims, x, y + 40.0, name, inks.words2, TypeStep::Caption);
+            prims.push(panel(x, y + 52.0, 110.0, 40.0, 3.0, rgba(c, 0xFF)));
+            sheet_words(prims, x, y + 116.0, &hex(c), inks.words, TypeStep::Caption);
+            prims.push(panel(x, y + 142.0, 110.0, 40.0, 3.0, rgba(theirs, 0xFF)));
+            sheet_words(
+                prims,
+                x,
+                y + 206.0,
+                &hex(theirs),
+                inks.words,
+                TypeStep::Caption,
+            );
+        }
+        230.0
+    }
+
     pub(crate) fn input(snap: &Snapshot) -> DeckInput<'_> {
         DeckInput {
             snap: Some(snap),
-            tab_key: Some(7),
             tab_panes: vec![7],
             tab_label: "Tab 1".into(),
             tab_count: 1,
@@ -2858,6 +2961,136 @@ pub(crate) mod tests {
                 utc_offset_s: 0,
             },
         }
+    }
+
+    /// Tab 1 split in two panes after three readings a second apart: claude in pane `a` (1 core,
+    /// 400 MiB) and cargo in pane `b` (2 cores, 600 MiB), each under its own zsh, on ten cores.
+    pub(crate) fn split_tab(a: u64, b: u64) -> Snapshot {
+        split_tab_running(a, b, ["claude", "cargo"])
+    }
+
+    /// [`split_tab`] with the panes' programs named `names`.
+    pub(crate) fn split_tab_running(a: u64, b: u64, names: [&str; 2]) -> Snapshot {
+        use aterm_vitals::model::ProcLimits;
+        let pane = |key: u64, shell_pid: u32| TabRoot {
+            key,
+            tab: a.min(b),
+            shell_pid,
+            label: "Tab 1".into(),
+            program: String::new(),
+        };
+        let proc = |pid: u32, ppid: u32, cpu_ms: u64, mib: u64, name: &str| ProcSample {
+            start: Some(1),
+            pid,
+            ppid,
+            cpu_ns: Some(cpu_ms * 1_000_000),
+            footprint: Some(mib << 20),
+            name: name.into(),
+            ..ProcSample::default()
+        };
+        let mk = |t: u64| Sample {
+            at_ns: t * 1_000_000_000,
+            at_unix_ms: 1_792_000_800_000 + t as i64 * 1000,
+            mono_ms: t * 1000,
+            cadence_ms: 1000,
+            cores: Some(vec![
+                Ticks {
+                    busy: t * 50,
+                    total: t * 100,
+                };
+                10
+            ]),
+            mem: Some(MemSample {
+                total: 32 << 30,
+                app: 12 << 30,
+                ..MemSample::default()
+            }),
+            procs: Some(vec![
+                proc(100, 1, 0, 300, "aterm"),
+                proc(200, 100, 0, 5, "zsh"),
+                proc(201, 200, t * 1000, 400, names[0]),
+                proc(300, 100, 0, 5, "zsh"),
+                proc(301, 300, t * 2000, 600, names[1]),
+            ]),
+            self_pid: 100,
+            tabs: vec![pane(a, 200), pane(b, 300)],
+            proc_limits: ProcLimits {
+                system: Some(1000),
+                per_user: Some(500),
+            },
+            pid_counts: (Some(900), Some(400)),
+            ..Sample::default()
+        };
+        let mut v = aterm_vitals::Vitals::new();
+        let _ = v.absorb(&mk(10));
+        let _ = v.absorb(&mk(11));
+        v.absorb(&mk(12))
+    }
+
+    /// The deck of a split tab, focused on pane 8, reads the whole tab: each scoped row's "this
+    /// tab" share is both panes', inside all tabs, and its words say so. CONTROL: the focused
+    /// pane alone, what the deck read before a tab was summed, is less.
+    #[test]
+    fn a_split_tabs_deck_reads_every_pane() {
+        let snap = split_tab(7, 8);
+        let m = deck_metrics();
+        let deck = |panes: Vec<u64>| DeckInput {
+            tab_panes: panes,
+            tab_count: 2,
+            ..input(&snap)
+        };
+        let bar = |input: &DeckInput<'_>, res: Resource| {
+            DeckWords::new(input, &m)
+                .rows
+                .into_iter()
+                .find(|r| r.res == res)
+                .and_then(|r| r.bar)
+                .expect("a scoped row's bar")
+        };
+        let near = |a: Option<f32>, b: f64| a.is_some_and(|a| (f64::from(a) - b).abs() < 1e-4);
+        let gib = (32u64 << 30) as f64;
+        for (res, tab, focused) in [
+            (Resource::Cpu, 0.3, 0.2),
+            (
+                Resource::Memory,
+                (1010u64 << 20) as f64 / gib,
+                (605u64 << 20) as f64 / gib,
+            ),
+            (Resource::Processes, 0.004, 0.002),
+        ] {
+            let (whole, alone) = (bar(&deck(vec![8, 7]), res), bar(&deck(vec![8]), res));
+            assert!(near(whole.tab, tab), "{res:?}: {:?} vs {tab}", whole.tab);
+            assert!(near(alone.tab, focused), "CONTROL {res:?}: {:?}", alone.tab);
+            assert!(whole.tab <= whole.aterm, "{res:?}: this tab ≤ all tabs");
+            assert_eq!(
+                bar(&deck(vec![7, 8]), res),
+                whole,
+                "{res:?}: whichever pane leads"
+            );
+        }
+        let cpu =
+            |panes: &[u64]| words::row_sentence(Resource::Cpu, &snap, panes, &input(&snap).locale);
+        assert!(
+            cpu(&[8, 7]).contains("Tab 1 3.0 cores."),
+            "{}",
+            cpu(&[8, 7])
+        );
+        assert!(
+            cpu(&[8]).contains("Tab 1 2.0 cores."),
+            "CONTROL: {}",
+            cpu(&[8])
+        );
+        let tab = snap.tab_of(&[8, 7]).expect("the tab");
+        assert_eq!(
+            (tab.key, tab.scope.procs),
+            (8, 4),
+            "the sill's lanes and the chip's meter"
+        );
+        assert!(
+            (tab.scope.cores.raw - 3.0).abs() < 1e-4,
+            "{:?}",
+            tab.scope.cores
+        );
     }
 
     const GEOM: DeckGeom = DeckGeom {
@@ -2993,6 +3226,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_panel_one_ulp_over_or_two_prims_swapped_is_another_deck() {
+        let snap = snapshot();
+        let laid = deck_prims(&GEOM, &input(&snap));
+        let mut moved = laid.clone();
+        let x = moved
+            .iter_mut()
+            .find_map(|p| match p {
+                DrawPrim::Panel { x, .. } => Some(x),
+                _ => None,
+            })
+            .expect("the deck lays a panel");
+        *x = f32::from_bits(x.to_bits() + 1);
+        assert_ne!(prims_fp(&moved), prims_fp(&laid));
+        let mut swapped = laid.clone();
+        swapped.swap(0, laid.len() - 1);
+        assert_ne!(prims_fp(&swapped), prims_fp(&laid));
+    }
+
+    #[test]
     fn before_the_first_snapshot_the_deck_says_it_is_reading() {
         let empty = Snapshot::default();
         for form in [DeckForm::Full, DeckForm::Folded] {
@@ -3064,7 +3316,7 @@ pub(crate) mod tests {
             platform: Platform::MacOs,
             utc_offset_s: 0,
         };
-        let said = |snap: &Snapshot| stats_a11y_group(Some(snap), Some(FRONT), &MAC);
+        let said = |snap: &Snapshot| stats_a11y_group(Some(snap), &[FRONT], &MAC);
         let meter = |snap: &Snapshot, res: Resource| {
             let want = words::resource_name(res);
             said(snap)
@@ -3083,7 +3335,7 @@ pub(crate) mod tests {
             ["CPU", "GPU", "Memory", "Disk", "Network", "Processes"]
         );
         for (m, &res) in g.meters.iter().zip(&DECK_RESOURCES) {
-            assert_eq!(m.words, words::row_sentence(res, &calm, Some(FRONT), &MAC));
+            assert_eq!(m.words, words::row_sentence(res, &calm, &[FRONT], &MAC));
         }
         assert_eq!(g.meters[0].value, Some(98.0));
         assert_eq!(
@@ -3096,7 +3348,7 @@ pub(crate) mod tests {
         let cpu = meter(&trouble, Resource::Cpu);
         assert_eq!(
             cpu.words,
-            words::row_sentence(Resource::Cpu, &trouble, Some(FRONT), &MAC)
+            words::row_sentence(Resource::Cpu, &trouble, &[FRONT], &MAC)
         );
         assert!(
             cpu.words.contains(" Why: Spotlight, after start-up. "),
@@ -3148,7 +3400,7 @@ pub(crate) mod tests {
         };
         first.resources[Resource::Tokens.index()].tabs = vec![(FRONT, no_agent)];
         assert_eq!(
-            words::row_sentence(Resource::Tokens, &first, Some(FRONT), &MAC),
+            words::row_sentence(Resource::Tokens, &first, &[FRONT], &MAC),
             "Tokens: learning aterm's peak, 1 of 10 minutes. aterm 3.1 thousand per minute. Tab \
              2 has no agent. Not read for 9 of the last 10 minutes. Input 410 thousand tokens \
              per minute, cache re-reads included. Plan limit not read."
@@ -3159,7 +3411,7 @@ pub(crate) mod tests {
         let gpu = meter(&unread, Resource::Gpu);
         assert_eq!((gpu.value, gpu.words.as_str()), (None, "GPU: not read."));
 
-        let reading = stats_a11y_group(None, Some(FRONT), &MAC);
+        let reading = stats_a11y_group(None, &[FRONT], &MAC);
         for (m, &res) in reading.meters.iter().zip(&DECK_RESOURCES) {
             assert_eq!(m.value, None, "{m:?}");
             assert_eq!(m.words, format!("{}: reading.", words::resource_name(res)));
@@ -3172,3 +3424,7 @@ pub(crate) mod tests {
 #[cfg(test)]
 #[path = "stats_deck_paint_tests.rs"]
 pub(crate) mod paint_tests;
+
+#[cfg(test)]
+#[path = "stats_deck_fixtures.rs"]
+pub(crate) mod deck_fixtures;

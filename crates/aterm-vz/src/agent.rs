@@ -53,9 +53,15 @@ pub fn exec_of(argv: &[&str], cwd: &str, env: &[(&str, &str)]) -> Exec {
 /// `span` (the words say which).
 pub fn run(fd: OwnedFd, exec: &Exec, span: Duration) -> Result<Output, String> {
     let mut stream = UnixStream::from(fd);
-    stream
-        .set_read_timeout(Some(span))
-        .map_err(|e| format!("the command connection: {e}"))?;
+    // XNU refuses every option on a socket that can neither send nor receive (EINVAL): the
+    // agent closed the connection before the command went.
+    stream.set_read_timeout(Some(span)).map_err(|e| {
+        if e.raw_os_error() == Some(libc::EINVAL) {
+            "the agent closed the command connection before the command".to_owned()
+        } else {
+            format!("the command connection: {e}")
+        }
+    })?;
     wire::write_frame(&mut stream, &Frame::Exec(exec.clone())).map_err(|e| format!("Exec: {e}"))?;
     let (mut out, mut err) = (Vec::new(), Vec::new());
     loop {
@@ -138,7 +144,7 @@ mod tests {
         let e = run(OwnedFd::from(ours), &exec, Duration::from_secs(60)).unwrap_err();
         // macOS refuses even the read timeout on a socket whose peer is gone (EINVAL).
         assert!(
-            e.starts_with("the command connection")
+            e == "the agent closed the command connection before the command"
                 || e.contains("Exec")
                 || e.contains("before its Exit"),
             "{e}"

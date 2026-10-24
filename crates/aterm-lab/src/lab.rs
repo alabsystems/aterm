@@ -425,6 +425,17 @@ pub(crate) fn release_scratch(run_dir: &Path, name: &str) {
     let _ = fs::remove_dir_all(run_dir.join(HELD).join(name));
 }
 
+/// The scratch's holds, with an unread inventory kept unknown rather than empty.
+fn scratch_holds(run_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    match fs::read_dir(run_dir.join(HELD)) {
+        Ok(entries) => entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Stamp what `down` (or an `up` that aborted) keeps once its jail is ended,
 /// so nothing can start a program from it any more: each scratch hold
 /// ([`HELD`]), a started [`CLOCK_CLONE`] ([`CLOCK_UNSTARTED`]), the lab
@@ -445,13 +456,13 @@ fn stamp_holds(run_dir: &Path) -> bool {
         .into_iter()
         .map(|d| run_dir.join(d))
         .filter(|d| d.exists());
-    let holds = fs::read_dir(run_dir.join(HELD))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path());
     let mut stamped = true;
-    for dir in holds.chain(clock).chain(copies) {
+    let holds = scratch_holds(run_dir).unwrap_or_else(|e| {
+        eprintln!("aterm-lab: cannot read the scratch's holds: {e}; this down keeps it");
+        stamped = false;
+        Vec::new()
+    });
+    for dir in holds.into_iter().chain(clock).chain(copies) {
         if !dir.join(aterm_uds::deadline::RAN).exists()
             && aterm_uds::deadline::exec_stamp(&dir).is_none()
             && let Err(e) = aterm_uds::deadline::try_stamp_exec(&dir)
@@ -471,11 +482,11 @@ fn stamp_holds(run_dir: &Path) -> bool {
 /// released, or spent ([`copies_may_go`]) when no stamp failed
 /// (`unstamped`, [`stamp_holds`]).
 fn scratch_may_go(run_dir: &Path, unstamped: bool, now: std::time::SystemTime) -> bool {
-    fs::read_dir(run_dir.join(HELD))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .all(|e| !unstamped && copies_may_go(&e.path(), false, now))
+    scratch_holds(run_dir).is_ok_and(|holds| {
+        holds
+            .iter()
+            .all(|dir| !unstamped && copies_may_go(dir, false, now))
+    })
 }
 
 /// Whether a directory of copies may be removed: one started from it showed
@@ -587,7 +598,7 @@ fn bin_unproven(run: &Run) -> bool {
 /// and `down` removes it once nothing holds it.
 fn abort(run: &Run, pids: &[i32], msg: &str) -> Fail {
     let unproven = bin_unproven(run);
-    let held = fs::read_dir(run.run.join(HELD)).is_ok_and(|mut d| d.next().is_some());
+    let held = scratch_holds(&run.run).map_or(true, |holds| !holds.is_empty());
     let sig = if unproven {
         libc::SIGKILL
     } else {
@@ -1453,13 +1464,22 @@ fn scratch_claude_config(run: &Run, helper: &str, proj: &str, o: &UpOpts) -> (St
     (settings.dump(pretty), cj.dump(pretty))
 }
 
-/// `up [tag]`.
+/// `up [tag] [--window]`: the existing jailed instance, headless by default.
 pub fn cmd_up(args: &[String]) -> Res {
-    let tag = args
-        .first()
-        .cloned()
-        .unwrap_or_else(crate::run::default_tag);
-    let o = UpOpts::from_env();
+    let mut tag = None;
+    let mut o = UpOpts::from_env();
+    for arg in args {
+        if arg == "--window" {
+            o.window = true;
+        } else if arg.starts_with('-') {
+            return Err(Fail::usage(format!("up: unknown option '{arg}'")));
+        } else if tag.is_none() {
+            tag = Some(arg.clone());
+        } else {
+            return Err(Fail::usage("up: takes one optional tag and --window"));
+        }
+    }
+    let tag = tag.unwrap_or_else(crate::run::default_tag);
     let run = up(&tag, &o)?;
     let aterm = run.aterm.clone();
     println!("lab '{}' is up", run.tag);
@@ -3006,35 +3026,77 @@ mod tests {
         }
     }
 
-    /// AN ABORTED UP KEEPS A SCRATCH A CLONE HOLDS: the reroute prefix's clone
-    /// of Claude Code, started and never shown to run (its hold, stamped at
-    /// its exec, still there), keeps the run directory with that reading, and
-    /// writes the `env.sh` `up` had not written yet, so `ps` lists the lab and
-    /// `down` sweeps it. NEGATIVE CONTROL: with the hold gone (the clone showed
-    /// it ran), the run directory goes.
     #[test]
-    fn an_aborted_up_keeps_a_scratch_a_clone_holds() {
+    fn a_scratch_hold_keeps_an_aborted_up_before_its_first_lab_child() {
         let root = aterm_tempfile::tempdir().unwrap();
         let state = fs::canonicalize(root.path()).unwrap();
-        for (what, showed, kept) in [
-            ("the clone printed nothing", false, true),
-            ("the clone showed it ran", true, false),
+        for (what, released, unread, kept) in [
+            ("reroute probe failed", false, false, true),
+            ("reroute probe showed it ran", true, false, false),
+            ("hold inventory unread", false, true, true),
         ] {
             let run = half_made(root.path());
-            let hold = run.run.join(HELD).join(REROUTE_HOLD);
-            hold_scratch(&run.run, REROUTE_HOLD).unwrap();
-            aterm_uds::deadline::stamp_exec(&hold);
-            let at_exec = aterm_uds::deadline::exec_stamp(&hold);
-            assert!(at_exec.is_some(), "{what}");
-            if showed {
-                release_scratch(&run.run, REROUTE_HOLD);
+            let clone = run.w.join("home/clone");
+            fs::create_dir_all(clone.parent().unwrap()).unwrap();
+            fs::write(&clone, "data, not an executable").unwrap();
+            hold_scratch(&run.run, "reroute").unwrap();
+            if released {
+                release_scratch(&run.run, "reroute");
             }
-            let failed = abort(&run, &[], "x");
-            assert_eq!(failed.msg.as_deref(), Some("x"), "{what}");
-            assert_eq!(run.w.is_dir(), kept, "{what}");
+            if unread {
+                fs::remove_dir_all(run.run.join(HELD)).unwrap();
+                fs::write(run.run.join(HELD), "not a directory").unwrap();
+            }
+            let hold = run.run.join(HELD).join("reroute");
+            if !released && !unread {
+                aterm_uds::deadline::stamp_exec(&hold);
+            }
+            let at_exec = aterm_uds::deadline::exec_stamp(&hold);
+            assert_eq!((run.sampler_pid, run.stub_pid, run.instance_pid), (0, 0, 0));
+            let failed = abort(&run, &[], "probe failed");
+            assert_eq!(failed.msg.as_deref(), Some("probe failed"), "{what}");
+            assert_eq!(clone.is_file(), kept, "{what}");
             if kept {
-                assert_eq!(aterm_uds::deadline::exec_stamp(&hold), at_exec, "{what}");
                 assert_eq!(all_runs(&state), ["abort-t"], "{what}: ps lists it");
+                assert!(run.run.join("env.sh").is_file(), "{what}: down can load it");
+                if !unread {
+                    assert_eq!(aterm_uds::deadline::exec_stamp(&hold), at_exec, "{what}");
+                }
+                // A saved lab must be taken down before its tag can come up again.
+                // The fake program is data, so isolate the clone's scratch hold.
+                fs::write(run.run.join(BIN_RAN), "").unwrap();
+                let now = std::time::SystemTime::now();
+                assert!(room_for(&run, now).is_err(), "{what}: down is required");
+                let unstamped = !stamp_holds(&run.run);
+                clear_run_dir(&run.run, false, unstamped, &run.tag, past_the_hang(now));
+                assert!(
+                    clone.is_file(),
+                    "{what}: wall time cannot spend an unread hold"
+                );
+                assert!(
+                    run.run.join("env.sh").is_file(),
+                    "{what}: down keeps its record"
+                );
+                if unread {
+                    fs::remove_file(run.run.join(HELD)).unwrap();
+                } else {
+                    let hold = run.run.join(HELD).join("reroute");
+                    assert!(aterm_uds::deadline::exec_stamp(&hold).is_some(), "{what}");
+                    // A deterministic restart observation spends the awake-clock stamp.
+                    fs::write(
+                        hold.join(aterm_uds::deadline::EXEC_STAMP),
+                        u64::MAX.to_string(),
+                    )
+                    .unwrap();
+                }
+                let unstamped = !stamp_holds(&run.run);
+                clear_run_dir(&run.run, false, unstamped, &run.tag, now);
+                assert!(!clone.exists(), "{what}: the later down may reclaim it");
+                assert!(
+                    !run.run.join("env.sh").exists(),
+                    "{what}: down removed its record"
+                );
+                assert!(room_for(&run, now).is_ok(), "{what}: custody is resolved");
             }
             let _ = fs::remove_dir_all(root.path().join("runs"));
         }

@@ -337,6 +337,20 @@ pub const fn heat_ic_stops(dark: bool) -> &'static [Rgb] {
     if dark { &LOAD_DARK } else { &HEAT_IC_LIGHT }
 }
 
+/// The merged deck's light heat stops, slate to ochre to amber: OKLCH
+/// (0.72 0.045 250), (0.70 0.05 250), (0.68 0.045 235), (0.66 0.06 100),
+/// (0.65 0.11 92), (0.645 0.145 85) and (0.64 0.165 78), the mockups' hues and
+/// chromas with the lightness falling toward the hot end.
+const HEAT_MERGED_LIGHT: [Rgb; 7] = [
+    [0x90, 0xA7, 0xC0],
+    [0x87, 0xA1, 0xBD],
+    [0x7E, 0x9D, 0xB0],
+    [0x9A, 0x93, 0x69],
+    [0xA7, 0x8D, 0x35],
+    [0xB6, 0x85, 0x00],
+    [0xC2, 0x7B, 0x00],
+];
+
 /// The heat steps' lower edges as fractions of max.
 pub const HEAT_EDGES: [f32; 6] = [0.05, 0.20, 0.40, 0.60, 0.80, 0.95];
 
@@ -390,9 +404,13 @@ pub const HEAT_FLOOR_LIGHT: f32 = 1.80;
 pub const NON_TEXT: f32 = 3.0;
 /// Minimum OkLab lightness step between adjacent scope inks.
 pub const SCOPE_DL: f32 = 0.08;
+/// The least OkLab distance between the merged deck's magenta and any other
+/// ink it draws a reading in, so magenta means only "needs you" (0.157 at
+/// least on the mockups' grounds).
+pub const NEEDS_APART: f32 = 0.10;
 
 /// Halo blend mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HaloMode {
     /// Add light.
     Add,
@@ -401,7 +419,7 @@ pub enum HaloMode {
 }
 
 /// Every ink the stats surfaces draw with, for one ground.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VitalsInks {
     /// Whether the ground is dark.
     pub dark: bool,
@@ -467,6 +485,66 @@ pub struct VitalsInks {
     pub warn_text: Rgb,
     /// The Deck's critical words and marks.
     pub critical_text: Rgb,
+    /// The merged deck's own inks.
+    pub merged: MergedInks,
+    /// The merged deck's inks under Increase Contrast: `merged`'s, with
+    /// every heat stop shown on the well, fainter lane tints and stronger
+    /// framing words.
+    pub merged_ic: MergedInks,
+}
+
+/// The inks only the merged deck draws with, for one ground
+/// (`DESIGN-top-deck-merged-2026-10-21.md` §4): heat, magenta for what needs
+/// the owner, teal for all tabs, violet for this tab, and its greys. It shares
+/// `words`, `rim`, `tide`, `over`, `grid` and `seam` with the v2 Deck.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MergedInks {
+    /// The heat ramp's seven stops, cool to hot, that [`MergedInks::heat_at`]
+    /// runs through: the v2 Deck's on a dark ground, slate to ochre to amber
+    /// on a light one, moved together away from the ground where the stops
+    /// that must show on the well would not.
+    pub heat: [Rgb; 7],
+    /// An idle capacity: a tile's, gauge's, run bucket's or share bar's
+    /// empty part. The v2 track on a dark ground; lighter than a light ground,
+    /// up to white.
+    pub well: Rgb,
+    /// What needs the owner (magenta): the pills, the edge, the rings, the
+    /// projection and their words. Nothing else is drawn in it.
+    pub needs: Rgb,
+    /// Words and icons on a needs pill.
+    pub needs_text: Rgb,
+    /// All tabs (teal): the share bar, the figure, the band name and the
+    /// chips' names.
+    pub all_tabs: Rgb,
+    /// This tab (violet), as `all_tabs`.
+    pub this_tab: Rgb,
+    /// The all-tabs lane's ground: teal veiled over the lane, opaque.
+    pub all_tabs_tint: Rgb,
+    /// The this-tab lane's ground: violet veiled over the lane, opaque.
+    pub this_tab_tint: Rgb,
+    /// Secondary words (capacity words, units, counts, a chip's memory),
+    /// eased toward `words` until they read on the ground and on both
+    /// tints, so the tints keep their veils; never past `words`.
+    pub secondary: Rgb,
+    /// Framing words: a run's two ends and its bracket.
+    pub axis: Rgb,
+    /// Words past capacity ("~8 waiting", "6 GiB swap"), beside `over`.
+    pub over_text: Rgb,
+}
+
+impl MergedInks {
+    /// The heat ink at `v` (`0..=1`), continuous in OkLab through the seven
+    /// stops; not a reading is cool.
+    #[must_use]
+    pub fn heat_at(&self, v: f32) -> Rgb {
+        let t = if v.is_nan() {
+            0.0
+        } else {
+            v.clamp(0.0, 1.0) * 6.0
+        };
+        let i = (t.floor() as usize).min(5);
+        mix(self.heat[i], self.heat[i + 1], t - i as f32)
+    }
 }
 
 const fn over_orange(dark: bool) -> Rgb {
@@ -474,6 +552,185 @@ const fn over_orange(dark: bool) -> Rgb {
         [0xFF, 0x9A, 0x2E]
     } else {
         [0xE0, 0x7A, 0x1F]
+    }
+}
+
+/// Magenta: OKLCH (0.733 0.195 351) on a dark ground, (0.50 0.205 357) on a light one.
+const fn needs_magenta(dark: bool) -> Rgb {
+    if dark {
+        [0xFF, 0x6C, 0xB8]
+    } else {
+        [0xB4, 0x00, 0x65]
+    }
+}
+
+/// A needs pill's words: near black on a dark ground's magenta, white on a light one's.
+const fn needs_words(dark: bool) -> Rgb {
+    if dark { [0x1B, 0x1B, 0x1E] } else { [0xFF; 3] }
+}
+
+/// Teal: OKLCH (0.741 0.092 188) on a dark ground, (0.453 0.079 186) on a light one.
+const fn all_tabs_teal(dark: bool) -> Rgb {
+    if dark {
+        [0x5E, 0xBE, 0xB6]
+    } else {
+        [0x03, 0x64, 0x5D]
+    }
+}
+
+/// Violet: OKLCH (0.816 0.103 294) on a dark ground, (0.463 0.213 284) on a light one.
+const fn this_tab_violet(dark: bool) -> Rgb {
+    if dark {
+        [0xC6, 0xB6, 0xFF]
+    } else {
+        [0x54, 0x34, 0xC8]
+    }
+}
+
+/// How much of all tabs' and this tab's ink veils its lane.
+const fn tint_veils(dark: bool) -> (f32, f32) {
+    if dark { (0.10, 0.11) } else { (0.08, 0.08) }
+}
+
+/// A tinted lane's lightness step from the ground, before its veil.
+const LANE_DL: f32 = 0.025;
+/// How far a light ground's well sits above it in OkLab lightness.
+const WELL_LIFT: f32 = 0.084;
+/// Words' share of the ground, before their floor.
+const WORDS_T: f32 = 0.05;
+/// Secondary words' share of the ground, eased toward `WORDS_T` until they
+/// read on both tints.
+const SECONDARY_T: f32 = 0.23;
+/// Framing words' share of the ground, before their floor.
+const AXIS_T: f32 = 0.40;
+/// The first heat stop that clears `NON_TEXT` on the well: the upper half.
+/// Every stop does under Increase Contrast.
+const HEAT_SHOWN_FROM: usize = 3;
+
+/// `c` lightened by `dl` in OkLab, on either polarity.
+fn lifted(c: Rgb, dl: f32) -> Rgb {
+    let x = to_lab(c);
+    from_lab(Lab {
+        l: (x.l + dl).min(1.0),
+        ..x
+    })
+}
+
+/// `stops` moved together away from the ground until each from `from` on
+/// clears `NON_TEXT` on `well`.
+fn cleared(stops: [Rgb; 7], well: Rgb, from: usize, dark: bool) -> [Rgb; 7] {
+    let labs = stops.map(to_lab);
+    let step = if dark { 0.004 } else { -0.004 };
+    let (mut ramp, mut d) = (stops, 0.0_f32);
+    while ramp[from..].iter().any(|&c| contrast(c, well) < NON_TEXT) && d.abs() < 1.0 {
+        d += step;
+        ramp = labs.map(|x| {
+            from_lab(Lab {
+                l: (x.l + d).clamp(0.0, 1.0),
+                ..x
+            })
+        });
+    }
+    ramp
+}
+
+/// `ink` veiled `veil` over a lane `LANE_DL` from `ground`, faded toward the
+/// ground (first the veil, then the lane) until `reads` holds.
+fn tinted(ground: Rgb, dark: bool, ink: Rgb, veil: f32, reads: impl Fn(Rgb) -> bool) -> Rgb {
+    let at = |dl: f32, v: f32| mix(away(ground, dl, dark), ink, v);
+    let (mut dl, mut v) = (LANE_DL, veil);
+    while !reads(at(dl, v)) && v > 0.0 {
+        v = (v - 0.01).max(0.0);
+    }
+    while !reads(at(dl, v)) && dl > 0.0 {
+        dl = (dl - 0.005).max(0.0);
+    }
+    at(dl, v)
+}
+
+/// A lane's tint: `ink` veiled `veil` over the lane, faded until `words`,
+/// `secondary` and `ink` read on it ([`tinted`]).
+fn lane_tint(ground: Rgb, dark: bool, ink: Rgb, veil: f32, words: Rgb, secondary: Rgb) -> Rgb {
+    tinted(ground, dark, ink, veil, |t| {
+        [words, secondary, ink]
+            .iter()
+            .all(|&w| contrast(w, t) >= WORD_AA)
+    })
+}
+
+/// The merged deck's inks on `ground`, with the theme's `fg` and the v2
+/// `track`, `words` and `heat` (on a dark ground) they share. Each hue holds;
+/// each lightness steps away from the ground until its floors hold.
+fn merged_inks(ground: Rgb, fg: Rgb, track: Rgb, words: Rgb, heat: [Rgb; 7]) -> MergedInks {
+    let dark = is_dark(ground);
+    let well = if dark {
+        track
+    } else {
+        lifted(ground, WELL_LIFT)
+    };
+    let heat = if dark { heat } else { HEAT_MERGED_LIGHT };
+    let reads = |c: Rgb, on: Rgb| contrast(c, on) >= WORD_AA;
+    let shows = |c: Rgb, on: Rgb| contrast(c, on) >= NON_TEXT;
+    let (veil_all, veil_this) = tint_veils(dark);
+    let lane = away(ground, LANE_DL, dark);
+    let scope = |target: Rgb, veil: f32, apart: &dyn Fn(Rgb) -> bool| {
+        pushed(target, 0.004, dark, |c| {
+            reads(c, ground) && reads(c, mix(lane, c, veil)) && shows(c, well) && apart(c)
+        })
+    };
+    let all_tabs = scope(all_tabs_teal(dark), veil_all, &|_| true);
+    let this_tab = scope(this_tab_violet(dark), veil_this, &|c| {
+        (to_lab(c).l - to_lab(all_tabs).l) * if dark { 1.0 } else { -1.0 } >= SCOPE_DL
+    });
+    let design = [
+        mix(lane, all_tabs, veil_all),
+        mix(lane, this_tab, veil_this),
+    ];
+    let on_lanes = |c: Rgb| reads(c, ground) && design.iter().all(|&t| reads(c, t));
+    let steps = ((SECONDARY_T - WORDS_T) * 100.0).round() as usize;
+    let secondary = (0..=steps)
+        .map(|i| mix(fg, ground, SECONDARY_T - 0.01 * i as f32))
+        .find(|&c| on_lanes(c))
+        .unwrap_or(words);
+    let all_tabs_tint = lane_tint(ground, dark, all_tabs, veil_all, words, secondary);
+    let this_tab_tint = lane_tint(ground, dark, this_tab, veil_this, words, secondary);
+    let needs = pushed(needs_magenta(dark), 0.004, dark, |c| {
+        reads(c, ground)
+            && [well, all_tabs_tint, this_tab_tint]
+                .iter()
+                .all(|&on| shows(c, on))
+    });
+    MergedInks {
+        heat: cleared(heat, well, HEAT_SHOWN_FROM, dark),
+        well,
+        needs,
+        needs_text: pushed(needs_words(dark), 0.004, !dark, |c| reads(c, needs)),
+        all_tabs,
+        this_tab,
+        all_tabs_tint,
+        this_tab_tint,
+        secondary,
+        axis: words_floored(fg, ground, AXIS_T, WORD_AA),
+        over_text: floored(over_orange(dark), ground, WORD_AA, dark),
+    }
+}
+
+/// The merged deck's inks under Increase Contrast, from `m` (its inks on
+/// `ground`) and the v2 `words` and `heat_ic` (on a dark ground): every heat
+/// stop clears `NON_TEXT` on the well, the lanes' veils are halved and framing
+/// words take the secondary grey. Every other ink is `m`'s, so none reads
+/// fainter than it does without Increase Contrast.
+fn merged_ic(m: MergedInks, ground: Rgb, words: Rgb, heat_ic: [Rgb; 7]) -> MergedInks {
+    let dark = is_dark(ground);
+    let heat = if dark { heat_ic } else { HEAT_MERGED_LIGHT };
+    let (veil_all, veil_this) = tint_veils(dark);
+    let tint = |ink: Rgb, veil: f32| lane_tint(ground, dark, ink, veil * 0.5, words, m.secondary);
+    MergedInks {
+        heat: cleared(heat, m.well, 0, dark),
+        all_tabs_tint: tint(m.all_tabs, veil_all),
+        this_tab_tint: tint(m.this_tab, veil_this),
+        axis: m.secondary,
+        ..m
     }
 }
 
@@ -555,6 +812,9 @@ pub fn vitals_inks(ground: Rgb, fg: Rgb, accent: Rgb) -> VitalsInks {
     });
     let aterm_ic = stepped(aterm, 0.005, dark, |_| aterm_ab, |c| beyond(c, machine_ic));
     let tab_ic = pushed(tab, 0.005, dark, |c| beyond(c, aterm_ic));
+    let words = words_floored(fg, ground, WORDS_T, WORD_AA);
+    let heat_ic = heat_ramp(ground, NON_TEXT, heat_ic_stops(dark), dark);
+    let merged = merged_inks(ground, fg, track, words, heat);
     VitalsInks {
         dark,
         ground,
@@ -585,11 +845,11 @@ pub fn vitals_inks(ground: Rgb, fg: Rgb, accent: Rgb) -> VitalsInks {
         quiet,
         warn,
         critical,
-        words: words_floored(fg, ground, 0.05, WORD_AA),
+        words,
         words2: words_floored(fg, ground, 0.38, WORD_AA),
         heat,
         heat_text: heat.map(|c| floored(c, ground, WORD_AA, dark)),
-        heat_ic: heat_ramp(ground, NON_TEXT, heat_ic_stops(dark), dark),
+        heat_ic,
         hollow: stepped(neutral(0.12), 0.005, dark, halved, |c| {
             contrast(c, ground) >= NON_TEXT
         }),
@@ -602,6 +862,8 @@ pub fn vitals_inks(ground: Rgb, fg: Rgb, accent: Rgb) -> VitalsInks {
         over: floored(over_orange(dark), ground, NON_TEXT, dark),
         warn_text: floored(warn, ground, WORD_AA, dark),
         critical_text: floored(critical, ground, WORD_AA, dark),
+        merged,
+        merged_ic: merged_ic(merged, ground, words, heat_ic),
     }
 }
 
@@ -775,8 +1037,173 @@ impl VitalsInks {
             moved as f32,
             format!("load has {moved} of 5 stops off the load ramp"),
         );
+        misses.extend(self.merged_floor_misses("merged", &self.merged, HEAT_SHOWN_FROM));
+        misses.extend(self.merged_floor_misses("merged_ic", &self.merged_ic, 0));
         misses
     }
+
+    /// The merged deck's floors `m` misses, named under `set`; heat stops
+    /// from `shown` on must clear `NON_TEXT` on the well.
+    #[cfg(any(test, debug_assertions))]
+    fn merged_floor_misses(&self, set: &str, m: &MergedInks, shown: usize) -> Vec<FloorMiss> {
+        let (g, dark) = (self.ground, self.dark);
+        let away = if dark { 1.0 } else { -1.0 };
+        let l = |c: Rgb| to_lab(c).l;
+        let end = |c: Rgb, far: bool| {
+            from_lab(Lab {
+                l: if far == dark { 1.0 } else { 0.0 },
+                ..to_lab(c)
+            })
+        };
+        let mut misses = Vec::new();
+        let mut want = |held: bool, reached: bool, measured: f32, what: String| {
+            if !held {
+                misses.push(FloorMiss {
+                    what: format!("{set} {what}"),
+                    measured,
+                    out_of_reach: !reached,
+                });
+            }
+        };
+        let pill = end(m.needs_text, false);
+        let words = [
+            (
+                "needs",
+                m.needs,
+                "the ground",
+                g,
+                contrast(end(m.needs, true), g),
+            ),
+            (
+                "needs_text",
+                m.needs_text,
+                "needs",
+                m.needs,
+                contrast(pill, m.needs),
+            ),
+            ("secondary", m.secondary, "the ground", g, f32::INFINITY),
+            ("axis", m.axis, "the ground", g, f32::INFINITY),
+            (
+                "over_text",
+                m.over_text,
+                "the ground",
+                g,
+                contrast(end(m.over_text, true), g),
+            ),
+        ];
+        let scopes = [
+            ("all_tabs", m.all_tabs, m.all_tabs_tint),
+            ("this_tab", m.this_tab, m.this_tab_tint),
+        ];
+        let on_lanes = scopes.iter().flat_map(|&(name, ink, tint)| {
+            let reach = contrast(end(ink, true), g);
+            [
+                (name, ink, "the ground", g, reach),
+                (name, ink, "its tint", tint, reach),
+                ("words", self.words, name, tint, contrast(self.words, g)),
+                (
+                    "secondary",
+                    m.secondary,
+                    name,
+                    tint,
+                    contrast(m.secondary, g),
+                ),
+            ]
+        });
+        for (name, ink, on_name, on, reach) in words.into_iter().chain(on_lanes) {
+            let c = contrast(ink, on);
+            want(
+                c >= WORD_AA,
+                reach >= WORD_AA,
+                c,
+                format!("{name} at {c:.2}:1 on {on_name}, floor {WORD_AA}"),
+            );
+        }
+        let heat = m.heat[shown..]
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (i + shown, c));
+        let fills = heat
+            .map(|(i, c)| (format!("heat {i}"), c, m.well, "the well"))
+            .chain([
+                ("all_tabs".to_owned(), m.all_tabs, m.well, "the well"),
+                ("this_tab".to_owned(), m.this_tab, m.well, "the well"),
+                ("over".to_owned(), self.over, m.well, "the well"),
+                ("needs".to_owned(), m.needs, m.well, "the well"),
+                (
+                    "needs".to_owned(),
+                    m.needs,
+                    m.all_tabs_tint,
+                    "the all-tabs tint",
+                ),
+                (
+                    "needs".to_owned(),
+                    m.needs,
+                    m.this_tab_tint,
+                    "the this-tab tint",
+                ),
+            ]);
+        for (name, ink, on, on_name) in fills {
+            let c = contrast(ink, on);
+            want(
+                c >= NON_TEXT,
+                contrast(end(ink, true), on) >= NON_TEXT,
+                c,
+                format!("{name} at {c:.2}:1 on {on_name}, floor {NON_TEXT}"),
+            );
+        }
+        let dl = (l(m.this_tab) - l(m.all_tabs)) * away;
+        want(
+            dl >= SCOPE_DL,
+            (l(end(m.this_tab, true)) - l(m.all_tabs)) * away >= SCOPE_DL,
+            dl,
+            format!("this_tab {dl:.3} beyond all_tabs in L"),
+        );
+        let ramp: Vec<Rgb> = (0..=24).map(|i| m.heat_at(i as f32 / 24.0)).collect();
+        let others = ramp
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (format!("heat at {i}/24"), c));
+        let room = has_room(g);
+        for (name, other) in others.chain([
+            ("over".to_owned(), self.over),
+            ("all_tabs".to_owned(), m.all_tabs),
+            ("this_tab".to_owned(), m.this_tab),
+        ]) {
+            let d = distance(m.needs, other);
+            want(
+                d >= NEEDS_APART,
+                room,
+                d,
+                format!("needs {d:.3} from {name}"),
+            );
+        }
+        let falls = ramp
+            .windows(2)
+            .filter(|w| (l(w[1]) - l(w[0])) * away < -L_QUANTUM)
+            .count();
+        want(
+            falls == 0,
+            true,
+            falls as f32,
+            format!("heat turns back toward the ground {falls} times"),
+        );
+        misses
+    }
+}
+
+/// The most one sRGB code value moves OkLab lightness: the slack a lightness
+/// order allows between two rounded inks.
+#[cfg(any(test, debug_assertions))]
+const L_QUANTUM: f32 = 0.004;
+
+/// Whether `ground` leaves word inks room for their hues: white or black
+/// clears 10:1 on it, so an ink at the words floor still sits well short of
+/// the lightness end, where every hue meets (on `#999999` magenta ends at
+/// `#69002B` and the orange words at `#6A0100`).
+#[cfg(any(test, debug_assertions))]
+fn has_room(ground: Rgb) -> bool {
+    contrast([0xFF; 3], ground).max(contrast([0; 3], ground)) >= 10.0
 }
 
 /// One Deck floor a set of inks misses ([`VitalsInks::deck_floor_misses`]).
@@ -802,6 +1229,19 @@ mod tests {
     const LIGHT_FG: Rgb = [0x2B, 0x2D, 0x33];
     const LIGHT_ACCENT: Rgb = [0x1A, 0x7F, 0x37];
     const NORD_BAND: Rgb = [0x49, 0x4F, 0x5B];
+
+    #[test]
+    fn equal_inks_hash_equally() {
+        use std::hash::BuildHasher;
+        let state =
+            std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+        let a = vitals_inks(DEFAULT_DARK_BAND, DEFAULT_FG, DEFAULT_ACCENT);
+        let b = vitals_inks(DEFAULT_DARK_BAND, DEFAULT_FG, DEFAULT_ACCENT);
+        assert_eq!(a, b);
+        assert_eq!(state.hash_one(a), state.hash_one(b));
+        let light = vitals_inks(LIGHT_BAND, LIGHT_FG, LIGHT_ACCENT);
+        assert_ne!(state.hash_one(a), state.hash_one(light));
+    }
 
     #[test]
     fn oklab_round_trips_srgb() {
@@ -1247,6 +1687,294 @@ mod tests {
             assert_eq!(found.len(), n, "{start}: {misses:?}");
             assert!(!found[0].out_of_reach, "{start}: {misses:?}");
         }
+    }
+
+    #[test]
+    fn the_floor_check_catches_a_broken_merged_ink() {
+        let good = vitals_inks(DEFAULT_DARK_BAND, DEFAULT_FG, DEFAULT_ACCENT);
+        assert_eq!(
+            good.deck_floor_misses(),
+            [],
+            "CONTROL: the solved inks hold"
+        );
+        let (m, ic) = (good.merged, good.merged_ic);
+        let mut broken = good;
+        broken.merged.needs_text = m.needs;
+        broken.merged.this_tab = m.all_tabs;
+        broken.merged.all_tabs_tint = m.secondary;
+        broken.merged.heat[6] = m.heat[0];
+        broken.merged_ic.needs = ic.heat[6];
+        broken.merged_ic.axis = good.ground;
+        broken.merged_ic.well = ic.heat[0];
+        let misses = broken.deck_floor_misses();
+        for start in [
+            "merged needs_text at 1.00:1 on needs",
+            "merged this_tab 0.000 beyond all_tabs",
+            "merged secondary at 1.00:1 on all_tabs",
+            "merged words at",
+            "merged heat 6 at",
+            "merged heat turns back toward the ground",
+            "merged_ic needs 0.000 from heat at 24/24",
+            "merged_ic axis at 1.00:1 on the ground",
+            "merged_ic heat 0 at 1.00:1 on the well",
+        ] {
+            let found: Vec<_> = misses
+                .iter()
+                .filter(|m| m.what.starts_with(start))
+                .collect();
+            assert!(!found.is_empty(), "{start}: {misses:?}");
+            assert!(found.iter().all(|m| !m.out_of_reach), "{start}: {misses:?}");
+        }
+    }
+
+    const REFERENCE: [(Rgb, Rgb, Rgb); 2] = [
+        (DEFAULT_DARK_BAND, DEFAULT_FG, DEFAULT_ACCENT),
+        ([0xE2, 0xE3, 0xE5], [0x24, 0x29, 0x2F], LIGHT_ACCENT),
+    ];
+
+    /// Grounds from black to white, the built-in themes' kind and a few tinted ones.
+    fn sweep() -> impl Iterator<Item = (Rgb, Rgb)> {
+        let greys = (0..=0xFF_u8).step_by(0x11).map(|v| {
+            let fg = if is_dark([v; 3]) {
+                [0xF0; 3]
+            } else {
+                [0x18; 3]
+            };
+            ([v; 3], fg)
+        });
+        greys.chain([
+            ([0x00, 0x2B, 0x36], [0x83, 0x94, 0x96]),
+            ([0x1E, 0x1E, 0x2E], [0xCD, 0xD6, 0xF4]),
+            (NORD_BAND, [0xEC, 0xEF, 0xF4]),
+            ([0xFD, 0xF6, 0xE3], [0x65, 0x7B, 0x83]),
+            ([0xEF, 0xF1, 0xF5], [0x4C, 0x4F, 0x69]),
+        ])
+    }
+
+    #[test]
+    fn the_merged_inks_are_the_mockups_inks_on_the_mockups_grounds() {
+        let mockups = [
+            "#FF6CB8 #1B1B1E #5EBEB6 #C6B6FF #3A4448 #464551 #C3C4CA #A2A3A9 #FFAE5C #404145",
+            "#B40065 #FFFFFF #03645D #5434C8 #C8D1D3 #CECDDB #474E57 #5E6570 #A24200 #FFFFFF",
+        ];
+        for ((ground, fg, accent), want) in REFERENCE.into_iter().zip(mockups) {
+            let inks = vitals_inks(ground, fg, accent);
+            let m = inks.merged;
+            let want = hexes::<10>(want);
+            let got = [
+                m.needs,
+                m.needs_text,
+                m.all_tabs,
+                m.this_tab,
+                m.all_tabs_tint,
+                m.this_tab_tint,
+                m.secondary,
+                m.axis,
+                m.over_text,
+                m.well,
+            ];
+            let names = [
+                "needs",
+                "needs_text",
+                "all_tabs",
+                "this_tab",
+                "all_tabs_tint",
+                "this_tab_tint",
+                "secondary",
+                "axis",
+                "over_text",
+                "well",
+            ];
+            for i in 0..10 {
+                let d = distance(got[i], want[i]);
+                let why = match (inks.dark, names[i]) {
+                    // The mockup's light violet sits level with its teal; the
+                    // solver steps it SCOPE_DL past, on its own hue.
+                    (false, "this_tab") => {
+                        let (a, b) = (to_lab(got[i]), to_lab(want[i]));
+                        let dl = to_lab(m.all_tabs).l - a.l;
+                        assert!((dl - SCOPE_DL).abs() < 0.005, "{ground:02X?}: {dl}");
+                        let hue = |x: Lab| x.b.atan2(x.a).to_degrees();
+                        assert!((hue(a) - hue(b)).abs() < 1.0, "{a:?} vs {b:?}");
+                        continue;
+                    }
+                    // The mockup lifts its orange words past the fill; the
+                    // fill already reads as words on this ground.
+                    (true, "over_text") => {
+                        assert_eq!(got[i], inks.over);
+                        continue;
+                    }
+                    _ => d <= 0.02,
+                };
+                assert!(
+                    why,
+                    "{ground:02X?} {}: {:02X?} is {d:.3} from the mockup's {:02X?}",
+                    names[i], got[i], want[i]
+                );
+            }
+            if inks.dark {
+                assert_eq!(m.heat, inks.heat, "the dark ramp is the v2 Deck's");
+            } else {
+                assert_eq!(m.heat, HEAT_MERGED_LIGHT, "the light ramp is the design's");
+            }
+        }
+    }
+
+    #[test]
+    fn the_merged_light_stops_are_the_designs_oklch_stops() {
+        let design = [
+            (0.72, 0.045, 250.0),
+            (0.70, 0.05, 250.0),
+            (0.68, 0.045, 235.0),
+            (0.66, 0.06, 100.0),
+            (0.65, 0.11, 92.0),
+            (0.645, 0.145, 85.0),
+            (0.64, 0.165, 78.0),
+        ];
+        for (i, (l, c, h)) in design.into_iter().enumerate() {
+            near(&format!("stop {i}"), HEAT_MERGED_LIGHT[i], oklch(l, c, h));
+        }
+    }
+
+    #[test]
+    fn heat_at_runs_through_the_stops_and_its_lightness_never_turns_back() {
+        let mut grounds: Vec<(Rgb, Rgb)> = REFERENCE.iter().map(|&(g, fg, _)| (g, fg)).collect();
+        grounds.extend(sweep());
+        let mut polarities = [false; 2];
+        for (ground, fg) in grounds {
+            let inks = vitals_inks(ground, fg, DEFAULT_ACCENT);
+            polarities[usize::from(inks.dark)] = true;
+            let away = if inks.dark { 1.0 } else { -1.0 };
+            for m in [inks.merged, inks.merged_ic] {
+                assert_eq!(m.heat_at(0.0), m.heat[0], "{ground:02X?}");
+                assert_eq!(m.heat_at(1.0), m.heat[6], "{ground:02X?}");
+                assert_eq!(m.heat_at(-0.5), m.heat[0], "{ground:02X?}");
+                assert_eq!(m.heat_at(7.0), m.heat[6], "{ground:02X?}");
+                assert_eq!(m.heat_at(f32::NAN), m.heat[0], "{ground:02X?}");
+                for k in 0..=6 {
+                    near(
+                        &format!("{ground:02X?} {k}"),
+                        m.heat_at(k as f32 / 6.0),
+                        m.heat[k],
+                    );
+                }
+                let mut last = m.heat_at(0.0);
+                for i in 1..=600 {
+                    let c = m.heat_at(i as f32 / 600.0);
+                    let rise = (to_lab(c).l - to_lab(last).l) * away;
+                    assert!(
+                        rise >= -L_QUANTUM,
+                        "{ground:02X?} at {i}/600: {last:02X?} → {c:02X?}"
+                    );
+                    assert!(distance(c, last) < 0.01, "{ground:02X?} at {i}/600 jumps");
+                    last = c;
+                }
+            }
+        }
+        assert_eq!(polarities, [true; 2], "CONTROL: both polarities swept");
+    }
+
+    #[test]
+    fn magenta_is_only_needs() {
+        let mut grounds: Vec<(Rgb, Rgb)> = REFERENCE.iter().map(|&(g, fg, _)| (g, fg)).collect();
+        grounds.extend(sweep());
+        let mut least = f32::INFINITY;
+        let (roomy, cramped): (Vec<_>, Vec<_>) =
+            grounds.into_iter().partition(|&(g, _)| has_room(g));
+        assert!(
+            cramped.len() >= 2 && roomy.len() >= 10,
+            "CONTROL: {cramped:02X?}"
+        );
+        for (ground, fg) in roomy {
+            for accent in [DEFAULT_ACCENT, LIGHT_ACCENT, [0xFF, 0x79, 0xC6]] {
+                let inks = vitals_inks(ground, fg, accent);
+                for m in [inks.merged, inks.merged_ic] {
+                    let heat = (0..=60).map(|i| m.heat_at(i as f32 / 60.0));
+                    for other in heat.chain([inks.over, m.over_text, m.all_tabs, m.this_tab]) {
+                        let d = distance(m.needs, other);
+                        least = least.min(d);
+                        assert!(
+                            d >= NEEDS_APART,
+                            "{ground:02X?} {accent:02X?}: needs {:02X?} is {d:.3} from {other:02X?}",
+                            m.needs
+                        );
+                    }
+                }
+            }
+        }
+        assert!(least.is_finite(), "CONTROL: inks compared");
+    }
+
+    #[test]
+    fn increase_contrast_strengthens_what_the_merged_deck_keeps_faint() {
+        for (ground, fg, accent) in REFERENCE {
+            let inks = vitals_inks(ground, fg, accent);
+            let (m, ic) = (inks.merged, inks.merged_ic);
+            for (k, &c) in ic.heat.iter().enumerate() {
+                assert!(contrast(c, ic.well) >= NON_TEXT, "{ground:02X?} heat {k}");
+            }
+            assert!(
+                contrast(m.heat[0], m.well) < NON_TEXT,
+                "CONTROL: calm is faint"
+            );
+            for (base, more) in [
+                (m.all_tabs_tint, ic.all_tabs_tint),
+                (m.this_tab_tint, ic.this_tab_tint),
+            ] {
+                assert!(
+                    distance(more, ground) < distance(base, ground),
+                    "{ground:02X?}"
+                );
+            }
+            assert_eq!(ic.axis, ic.secondary, "{ground:02X?}");
+            assert!(
+                contrast(ic.axis, ground) > contrast(m.axis, ground),
+                "{ground:02X?}"
+            );
+        }
+    }
+
+    #[test]
+    fn increase_contrast_never_makes_a_merged_ink_fainter() {
+        let mut grounds: Vec<(Rgb, Rgb)> = REFERENCE.iter().map(|&(g, fg, _)| (g, fg)).collect();
+        grounds.extend(sweep());
+        let mut moved = 0;
+        for (ground, fg) in grounds {
+            let inks = vitals_inks(ground, fg, DEFAULT_ACCENT);
+            let (m, ic) = (inks.merged, inks.merged_ic);
+            moved += usize::from(m.all_tabs != all_tabs_teal(inks.dark));
+            for (name, base, more) in [
+                ("needs", m.needs, ic.needs),
+                ("all_tabs", m.all_tabs, ic.all_tabs),
+                ("this_tab", m.this_tab, ic.this_tab),
+                ("secondary", m.secondary, ic.secondary),
+                ("axis", m.axis, ic.axis),
+                ("over_text", m.over_text, ic.over_text),
+            ] {
+                assert!(
+                    contrast(more, ground) >= contrast(base, ground),
+                    "{ground:02X?} {name}: {more:02X?} under Increase Contrast, {base:02X?} without"
+                );
+            }
+            assert!(
+                contrast(ic.needs_text, ic.needs) >= contrast(m.needs_text, m.needs),
+                "{ground:02X?} needs_text"
+            );
+            assert_eq!(ic.well, m.well, "{ground:02X?}");
+            for (base, more) in [
+                (m.all_tabs_tint, ic.all_tabs_tint),
+                (m.this_tab_tint, ic.this_tab_tint),
+            ] {
+                assert!(
+                    distance(more, ground) <= distance(base, ground),
+                    "{ground:02X?}: {more:02X?} under Increase Contrast, {base:02X?} without"
+                );
+            }
+        }
+        assert!(
+            moved >= 3,
+            "CONTROL: teal pushed off its target on {moved} grounds"
+        );
     }
 
     #[test]

@@ -140,6 +140,8 @@ fn ensure_native_direction(buffer: &mut Buffer) {
     }
 }
 
+/// The bidi step that produced a backward run already mirrored its
+/// characters, so one whose mirror the font has is skipped, not mirrored again.
 fn rotate_chars(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer, target: Direction) {
     if !target.is_backward() || plan.rtlm_mask == 0 {
         return;

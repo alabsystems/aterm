@@ -691,11 +691,11 @@ VendorID ProductID Product  Built-In\n\
         sys.file(&cached_tool, b"existing cached executable bytes");
         sys.file("/usr/bin/mdfind", b"");
         let mdfind =
-            "alice$ /usr/bin/mdfind -onlyin /Users//alice -0 'kMDItemFSName == \"*.rmeta\"'";
+            "alice$ /usr/bin/mdfind -onlyin /Users//alice -0 'kMDItemFSName == \"CACHEDIR.TAG\"'";
         sys.on(mdfind, Ran::ok(""));
         sys.on(
             mdfind,
-            Ran::ok("/Users//alice/work/demo/target/debug/libdemo.rmeta\0"),
+            Ran::ok("/Users//alice/work/demo/target/CACHEDIR.TAG\0"),
         );
         let before = sys.read_file(std::path::Path::new(&cached_tool)).unwrap();
         assert!(verify_spotlight_policy(&sys, &ctx).unwrap().verified);
@@ -708,6 +708,7 @@ VendorID ProductID Product  Built-In\n\
         let target = "/Users//alice/work/demo/target";
         sys.create_dir_all(std::path::Path::new(&format!("{target}/debug")), 0o755)
             .unwrap();
+        sys.file(&format!("{target}/CACHEDIR.TAG"), b"Signature:");
         let artifact = format!("{target}/debug/libdemo.rmeta");
         sys.file(&artifact, b"artifact used by a build");
         // The person's own project build folder Spotlight indexes is theirs: a note on

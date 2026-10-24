@@ -291,9 +291,11 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
         let ri = (rr - 0.5 * thick).max(0.0);
         (ro * ro, ri * ri, color, base_cov * scale)
     });
+    let mut prev_y1f = 0.0f32;
     for i in 0..bands {
-        let y0f = (extent * i as f32 / bands as f32).round();
+        let y0f = prev_y1f;
         let y1f = (extent * (i + 1) as f32 / bands as f32).round();
+        prev_y1f = y1f;
         if y1f <= y0f {
             continue;
         }
@@ -344,6 +346,7 @@ fn emit_rays(
     if len < 1.0 {
         return 0;
     }
+    let (cxf, cyf) = (env.cx as f32, env.cy as f32);
     let mut emitted_samples = 0usize;
     for k in 0..nrays {
         let ang = if quasar {
@@ -361,9 +364,11 @@ fn emit_rays(
         let maj = dx.abs().max(dy.abs());
         let lm = len * maj;
         let (ux, uy) = (dx / maj, dy / maj);
+        let mut prev_m1 = 0.0f32;
         for j in 0..samples {
-            let m0 = (lm * j as f32 / samples as f32).round();
+            let m0 = prev_m1;
             let m1 = (lm * (j + 1) as f32 / samples as f32).round();
+            prev_m1 = m1;
             if m1 <= m0 {
                 continue;
             }
@@ -373,10 +378,10 @@ fn emit_rays(
             let cov = (fade * (1.0 - 0.65 * sf) * env.intensity).clamp(0.0, 1.0);
             let mm = 0.5 * (m0 + m1);
             if major_x {
-                let xa = env.cx as f32 + ux * m0;
-                let xb = env.cx as f32 + ux * m1;
+                let xa = cxf + ux * m0;
+                let xb = cxf + ux * m1;
                 let (x0, x1) = if xa <= xb { (xa, xb) } else { (xb, xa) };
-                let yc = env.cy as f32 + uy * mm;
+                let yc = cyf + uy * mm;
                 let y0 = (yc - 0.5 * th).floor() as i32;
                 let y1 = ((yc + 0.5 * th).ceil() as i32).max(y0 + 1);
                 let frac = (th / (y1 - y0) as f32).min(1.0);
@@ -389,10 +394,10 @@ fn emit_rays(
                     premul_rgb(env.core, a),
                 );
             } else {
-                let ya = env.cy as f32 + uy * m0;
-                let yb = env.cy as f32 + uy * m1;
+                let ya = cyf + uy * m0;
+                let yb = cyf + uy * m1;
                 let (y0, y1) = if ya <= yb { (ya, yb) } else { (yb, ya) };
-                let xc = env.cx as f32 + ux * mm;
+                let xc = cxf + ux * mm;
                 let x0 = (xc - 0.5 * th).floor() as i32;
                 let x1 = ((xc + 0.5 * th).ceil() as i32).max(x0 + 1);
                 let frac = (th / (x1 - x0) as f32).min(1.0);
@@ -548,11 +553,12 @@ pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, ca
     let col0 = ((env.cx as f32 - r) as i32 / env.cell_w).max(0);
     let col1 = ((env.cx as f32 + r) as i32 / env.cell_w).min(cols - 1);
     let alpha = (150.0 * fade * env.intensity).clamp(0.0, 255.0) as u8;
-    let cxf = env.cx as f32;
+    let (cxf, cyf) = (env.cx as f32, env.cy as f32);
     let mut emitted = 0usize;
     for row in row0..=row1 {
         let ccy = (row * env.cell_h + env.cell_h / 2) as f32;
-        let dy2 = (ccy - env.cy as f32).powi(2);
+        let dy = ccy - cyf;
+        let dy2 = dy * dy;
         if dy2 > max_d2 {
             continue;
         }
@@ -561,7 +567,8 @@ pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, ca
                 return;
             }
             let ccx = (col * env.cell_w + env.cell_w / 2) as f32;
-            let d2 = (ccx - cxf).powi(2) + dy2;
+            let dx = ccx - cxf;
+            let d2 = dx * dx + dy2;
             if d2 < min_d2 || d2 > max_d2 {
                 continue;
             }
@@ -615,7 +622,7 @@ pub fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
     let full_v = hsv2rgb(h, s, 1.0);
     if crate::color_math::relative_luminance_with(table, full_v) >= want {
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
-        let (mut lo_rgb, mut hi_rgb) = (hsv2rgb(h, s, 0.0), full_v);
+        let (mut lo_rgb, mut hi_rgb) = (0x0000_0000, full_v);
         for i in 0..20 {
             let mid = 0.5 * (lo + hi);
             let mid_rgb = hsv2rgb(h, s, mid);
@@ -637,7 +644,7 @@ pub fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
         return hsv2rgb(h, s, 0.5 * (lo + hi));
     }
     let (mut lo, mut hi) = (0.0f32, s);
-    let (mut lo_rgb, mut hi_rgb) = (hsv2rgb(h, 0.0, 1.0), full_v);
+    let (mut lo_rgb, mut hi_rgb) = (0x00FF_FFFF, full_v);
     for i in 0..20 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = hsv2rgb(h, mid, 1.0);

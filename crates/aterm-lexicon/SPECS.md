@@ -190,7 +190,7 @@ The embedded-data table properties (`builtin-lexicon-*`, `tricks-embedded-*`, `t
 over the embedded constants, and they need `toml-schema-decoding` (gap 9) for the decode step.
 `warm-path-allocation-free` waits on the effects lane (gap 8).
 
-## 2. Test → spec map (TSV; all 132)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 Paths are relative to `crates/aterm-lexicon`.

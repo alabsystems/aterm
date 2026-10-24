@@ -331,9 +331,9 @@ impl Rotation {
     /// [`Self::from_aterm_toml`] over the file at `path`: no path or no file is the defaults.
     #[must_use]
     pub fn from_path(path: Option<&std::path::Path>) -> (Self, Vec<String>) {
-        match path.map(std::fs::read_to_string) {
-            Some(Ok(text)) => Self::from_aterm_toml(&text),
-            _ => (Self::default(), Vec::new()),
+        match path.and_then(|p| super::accounts::read_bounded(p, 256 * 1024).ok().flatten()) {
+            Some(text) => Self::from_aterm_toml(&text),
+            None => (Self::default(), Vec::new()),
         }
     }
 }

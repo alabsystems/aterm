@@ -276,7 +276,7 @@ mod tests {
             title: format!("tab-{local_id}"),
             term: term.clone(),
             master: -1,
-            pid: 0,
+            shell_identity: aterm_pty::ShellIdentity::unproven(0),
             ctx,
         }
     }

@@ -433,8 +433,9 @@ impl Client<UnixStream> {
     /// Connect to the broker's Unix socket at `socket_path` (same machine,
     /// unsealed — reachability is scoped by the socket path's permissions).
     pub fn connect(socket_path: impl AsRef<Path>) -> io::Result<Client<UnixStream>> {
-        Ok(Client::from_stream(UnixStream::connect(socket_path)?)
-            .nowait_by(UnixStream::set_nonblocking))
+        let stream = UnixStream::connect(socket_path)?;
+        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&stream))?;
+        Ok(Client::from_stream(stream).nowait_by(UnixStream::set_nonblocking))
     }
 }
 
@@ -501,6 +502,7 @@ fn dial_tcp(addr: impl ToSocketAddrs, timeout: Option<Duration>) -> io::Result<T
         }
     };
     stream.set_nodelay(true)?;
+    astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&stream))?;
     Ok(stream)
 }
 
@@ -3195,16 +3197,22 @@ impl Socket {
 }
 
 impl Closer {
+    /// The closer's duplicate is kept out of every child (`astream_sys::close_on_fork`):
+    /// a child's exec-time close of a copy, under a descriptor scan, drains the socket.
     #[cfg(unix)]
     fn unix(s: &UnixStream) -> io::Result<Closer> {
+        let dup = s.try_clone()?;
+        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&dup))?;
         Ok(Closer {
-            socket: Arc::new(Socket::Unix(s.try_clone()?)),
+            socket: Arc::new(Socket::Unix(dup)),
         })
     }
 
     fn tcp(s: &TcpStream) -> io::Result<Closer> {
+        let dup = s.try_clone()?;
+        astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&dup))?;
         Ok(Closer {
-            socket: Arc::new(Socket::Tcp(s.try_clone()?)),
+            socket: Arc::new(Socket::Tcp(dup)),
         })
     }
 
@@ -3394,6 +3402,7 @@ fn erase<S: AnyStream + 'static>(stream: S, closer: Closer) -> (AnyClient, Close
 #[cfg(unix)]
 fn connect_unix(endpoint: &str) -> io::Result<(AnyClient, Closer)> {
     let s = UnixStream::connect(endpoint)?;
+    astream_sys::close_on_fork(std::os::fd::AsFd::as_fd(&s))?;
     let closer = Closer::unix(&s)?;
     Ok(erase(s, closer))
 }

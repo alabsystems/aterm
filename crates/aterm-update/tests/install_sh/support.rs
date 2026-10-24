@@ -165,10 +165,14 @@ pub fn s(path: &Path) -> &str {
     path.to_str().expect("scratch paths are UTF-8")
 }
 
-/// Where every [`Scratch`] is made.
+/// Where every [`Scratch`] is made: the runtime temporary directory on macOS,
+/// so fixture filesystem walks stay within the running test's sandbox.
 pub fn scratch_root() -> &'static Path {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        let target = std::env::temp_dir();
+        #[cfg(not(target_os = "macos"))]
         let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
         #[cfg(target_os = "linux")]
         if let Err(why) = aterm_update::linux::install_path::refusal(&target) {

@@ -443,3 +443,45 @@ fn the_dashboard_shows_a_card_per_kept_pool_and_none_where_none_is_kept() {
     assert!(!html.contains("Codex CLI"), "only kept pools: {html}");
     assert!(!html.contains('@'), "no email on the page: {html}");
 }
+
+/// A Grok row's background renewal starts on macOS too, now that its sign-in runs under the
+/// no-desk sandbox there (`SignIn::no_desk`): a headless browser installed and the row's email
+/// known, its work is handed off (never run here). CONTROL: a row with no email starts nothing.
+#[test]
+fn a_grok_rows_background_renewal_starts_on_macos() {
+    let bed = Bed::new("grok-renewal");
+    fake_headless_browser(&bed.home);
+    let roster = Roster::parse_for(
+        Cli::Grok,
+        "[[account]]\nlabel = \"grok-1\"\nclass = \"dedicated\"\nemail = \"grok-one@example.com\"\n\n\
+         [[account]]\nlabel = \"grok-2\"\nclass = \"dedicated\"\ndir = \"/x/grok-2\"\n",
+    )
+    .unwrap();
+    let handed = Arc::new(Mutex::new(0usize));
+    let count = Arc::clone(&handed);
+    let spawn = move |_work: Box<dyn FnOnce() + Send>| {
+        *count.lock().unwrap() += 1;
+        Ok(())
+    };
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let renew = |label: &str| {
+        spawn_vendor_renewal(
+            Cli::Grok,
+            &bed.home,
+            &bed.state,
+            &roster,
+            roster.row(label).cloned().unwrap(),
+            NOW,
+            &guard,
+            &spawn,
+        )
+    };
+    assert_eq!(renew("grok-1"), RenewalDispatch::Started);
+    assert_eq!(*handed.lock().unwrap(), 1);
+    assert_eq!(
+        renew("grok-2"),
+        RenewalDispatch::Failed,
+        "CONTROL: no email"
+    );
+    assert_eq!(*handed.lock().unwrap(), 1);
+}

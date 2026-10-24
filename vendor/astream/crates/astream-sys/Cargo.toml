@@ -1,6 +1,6 @@
 [package]
 name = "astream-sys"
-description = "astream's OS cordon: an ordering-only flush (`barrier_sync`, F_BARRIERFSYNC on Apple), the kernel's boot session id (`boot_session`), and the owner-only file rule (`open_nonblocking`, `owner_private`: a regular file of this user's, no group or other bit, no macOS ACL allow entry). Zero dependencies; the only unsafe is two cordoned modules of hand-declared FFI calls (cfg(target_vendor = \"apple\") and cfg(unix)), compiler-enforced by deny(unsafe_code) at the root."
+description = "astream's OS cordon: an ordering-only flush (`barrier_sync`, F_BARRIERFSYNC on Apple), the kernel's boot session id (`boot_session`), sockets kept out of children (`close_on_fork`), and the owner-only file rule (`open_nonblocking`, `owner_private`: a regular file of this user's, no group or other bit, no macOS ACL allow entry). Zero dependencies; the only unsafe is two cordoned modules of hand-declared FFI calls (cfg(target_vendor = \"apple\") and cfg(unix)), compiler-enforced by deny(unsafe_code) at the root."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

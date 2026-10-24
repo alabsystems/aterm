@@ -611,6 +611,11 @@ pub(crate) fn page_work_uncounted<R>(f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// Whether the settings page's work is counted now, outside [`page_work_uncounted`].
+pub(crate) fn page_work_counted() -> bool {
+    !PAGE_WORK_UNCOUNTED.with(Cell::get)
+}
+
 pub(crate) fn settings_page_built() {
     bump_page_work(&SETTINGS_PAGES_BUILT);
 }

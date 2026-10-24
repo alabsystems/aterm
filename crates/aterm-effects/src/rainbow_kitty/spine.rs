@@ -245,9 +245,9 @@ impl Spine {
         };
         if floor > 0.0 {
             self.driven_at = Some(now);
-        }
-        if floor > self.momentum.value(now) {
-            self.momentum.set_value(now, floor);
+            if floor > self.momentum.value(now) {
+                self.momentum.set_value(now, floor);
+            }
         }
     }
 
@@ -317,9 +317,12 @@ impl Spine {
         if self.disp < DISP_SNAP_ZERO {
             self.disp = 0.0;
         }
-        self.disp_peak = (self.disp_peak
-            * (-dt * std::f32::consts::LN_2 / DISP_PEAK_HALF_LIFE_S).exp())
-        .max(self.disp);
+        self.disp_peak = if self.disp >= self.disp_peak {
+            self.disp
+        } else {
+            (self.disp_peak * (-dt * std::f32::consts::LN_2 / DISP_PEAK_HALF_LIFE_S).exp())
+                .max(self.disp)
+        };
         if self.disp_peak < DISP_SNAP_ZERO {
             self.disp_peak = 0.0;
         }
@@ -329,7 +332,12 @@ impl Spine {
             self.key_rise = 0.0;
         }
         if self.disp > 0.0 {
-            self.phase = (self.phase + dt * PHASE_RATE * self.disp).rem_euclid(PHASE_RING);
+            let next_phase = self.phase + dt * PHASE_RATE * self.disp;
+            self.phase = if (0.0..PHASE_RING).contains(&next_phase) {
+                next_phase
+            } else {
+                next_phase.rem_euclid(PHASE_RING)
+            };
         }
     }
 

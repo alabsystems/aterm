@@ -19,6 +19,8 @@ use crate::window::WindowAttributes;
 
 const NORMAL: i32 = 0;
 
+/// The Left arrow's X keycode: evdev's `KEY_LEFT` (105) plus X's offset of 8. The physical
+/// key is read from the keycode alone, whatever the server's keymap.
 const LEFT: u32 = 113;
 
 /// What the application was told, of what these tests look at.

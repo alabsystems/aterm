@@ -1146,6 +1146,25 @@ impl PaneTextCache {
         footer
     }
 
+    /// Publish footer facts and discard a weekly reading selected by an older model.
+    fn note_facts(
+        &mut self,
+        leaf_index: usize,
+        session: u64,
+        facts: &FooterFacts,
+        card: Option<&aterm_phase::LaunchCard>,
+        usage: bool,
+        off: FactMask,
+    ) {
+        if self
+            .footer(leaf_index, session)
+            .note_facts(facts, card, usage, off)
+            && let Some(Some(cached)) = self.panes.get_mut(leaf_index)
+        {
+            cached.weekly.take();
+        }
+    }
+
     /// Leaf `leaf_index`'s footer as this frame gathered it.
     fn footer_mut(&mut self, leaf_index: usize) -> Option<&mut PaneFooter> {
         self.footers.get_mut(leaf_index)
@@ -1350,30 +1369,32 @@ impl BlockCopy {
 }
 
 impl PaneFooter {
-    /// Take in the facts the timeline holds.
+    /// Take in the facts the timeline holds; say whether the shown model changed.
     fn note_facts(
         &mut self,
         facts: &FooterFacts,
         card: Option<&aterm_phase::LaunchCard>,
         usage: bool,
         off: FactMask,
-    ) {
+    ) -> bool {
         if let Some((was, kept, switch, hid)) = &self.from
             && was == facts
             && kept.as_ref() == card
             && *switch == usage
             && *hid == off
         {
-            return;
+            return false;
         }
         let mut shown = facts.filled_from(card);
         with_usage_switch(&mut shown, usage);
         shown.off = off;
         shown.upgrade = self.shown.upgrade.take();
+        let model_changed = shown.model != self.shown.model;
         self.shown = shown;
         self.shown_gen += 1;
         self.fp = fingerprint(Some(facts), card, usage, off);
         self.from = Some((facts.clone(), card.cloned(), usage, off));
+        model_changed
     }
 
     /// The repaint key's term ([`fingerprint`]).
@@ -2590,6 +2611,7 @@ fn live_roster() -> Option<accounts::Roster> {
 #[derive(Clone, Copy)]
 struct Asks {
     args: fn(i32) -> Option<atpkg::caller_shell::ProcArgs>,
+    files: fn(u32) -> Option<Vec<PathBuf>>,
     roster: fn() -> Option<accounts::Roster>,
     home: fn() -> Option<PathBuf>,
     stored_login: fn(u32, &[String], &str) -> bool,
@@ -2648,8 +2670,17 @@ fn live_tap() -> TapSeat {
     }
 }
 
-/// [`process_args`], [`live_roster`], [`aterm_types::dirs::home_dir`] and [`live_tap`].
+/// The process's current descriptor paths, read in process without a subprocess.
+fn process_files(pid: u32) -> Option<Vec<PathBuf>> {
+    if cfg!(test) {
+        return None;
+    }
+    aterm_uds::holders::open_files(pid).ok()
+}
+
+/// [`process_args`], [`process_files`], [`live_roster`], [`aterm_types::dirs::home_dir`] and [`live_tap`].
 const LIVE: Asks = Asks {
+    files: process_files,
     args: process_args,
     roster: live_roster,
     home: aterm_types::dirs::home_dir,
@@ -3008,6 +3039,7 @@ fn resolve_facts_at_with_cwd(
             {
                 sub.weekly = None;
             }
+            let files = u32::try_from(identity.pid).ok().and_then(asks.files);
             let mut resume = None;
             if prog == aterm_phase::Program::Muse
                 && let (Some(args), Some(home)) = (args.as_ref(), home.as_deref())
@@ -3022,10 +3054,18 @@ fn resolve_facts_at_with_cwd(
                 }
                 let muse_pid = u32::try_from(identity.pid).unwrap_or(0);
                 resume = aterm_agent::harness::profile::muse_resume_for(
-                    muse_pid, &args.argv, &args.env, home,
+                    muse_pid,
+                    &args.argv,
+                    &args.env,
+                    home,
+                    files.as_deref(),
                 );
                 non_claude_excerpts = aterm_agent::harness::profile::muse_excerpts_for(
-                    muse_pid, &args.argv, &args.env, home,
+                    muse_pid,
+                    &args.argv,
+                    &args.env,
+                    home,
+                    files.as_deref(),
                 );
             }
             if prog == aterm_phase::Program::Agy
@@ -3041,20 +3081,17 @@ fn resolve_facts_at_with_cwd(
                 ) {
                     sub = read;
                 }
-                let agy_pid = u32::try_from(identity.pid).unwrap_or(0);
                 resume = aterm_agent::harness::profile::agy_resume_for(
-                    agy_pid,
                     &args.argv,
                     &args.env,
                     home,
-                    cwd.as_deref(),
+                    files.as_deref(),
                 );
                 non_claude_excerpts = aterm_agent::harness::profile::agy_excerpts_for(
-                    agy_pid,
                     &args.argv,
                     &args.env,
                     home,
-                    cwd.as_deref(),
+                    files.as_deref(),
                 );
             }
             facts = Some(FooterFacts {
@@ -4938,14 +4975,17 @@ impl App {
                     }
                     let held = timeline.claude_footer().is_some_and(|facts| {
                         let mut texts = ws.claude_footer_texts.borrow_mut();
-                        let footer = texts.footer(leaf_index, session);
-                        footer.note_facts(
+                        texts.note_facts(
+                            leaf_index,
+                            session,
                             facts,
                             timeline.claude_card(),
                             usage,
                             self.fact_mask(session),
                         );
-                        footer.note_upgrade(timeline.upgrade_note());
+                        texts
+                            .footer(leaf_index, session)
+                            .note_upgrade(timeline.upgrade_note());
                         true
                     });
                     (
@@ -5080,7 +5120,9 @@ impl App {
                                 lists.log_owed.push(session);
                             }
                             if let Some(facts) = timeline.claude_footer() {
-                                texts.footer(leaf_index, session).note_facts(
+                                texts.note_facts(
+                                    leaf_index,
+                                    session,
                                     facts,
                                     timeline.claude_card(),
                                     usage,
@@ -5208,7 +5250,9 @@ impl App {
                                 }
                                 timeline.set_claude_footer(pgid, started, Some(facts));
                                 if let Some(facts) = timeline.claude_footer() {
-                                    texts.footer(leaf_index, session).note_facts(
+                                    texts.note_facts(
+                                        leaf_index,
+                                        session,
                                         facts,
                                         timeline.claude_card(),
                                         usage,
@@ -8051,7 +8095,7 @@ fn render_agy_panel_item_row(
     if out.len() < max_cols {
         out.push(blank);
     }
-    if let Some((unwrapped, after_tok_raw)) = aterm_phase::agy::split_agent_token(rest) {
+    if let Some((unwrapped, after_agent)) = aterm_phase::agy::split_agent_panel_item(rest) {
         // Column 4..4+unwrapped.chars().count() matches `agents_panel::agy_agent_row`'s `name`
         // span, and `claude_panel::make_look` leaves `agy_agent` name cells untouched so this
         // full-spectrum bold rainbow in `scratch.cells` is preserved while `claude_panel`
@@ -8063,7 +8107,6 @@ fn render_agy_panel_item_row(
             blank,
             &mut out,
         );
-        let after_agent = after_tok_raw.trim_start();
         if !after_agent.is_empty() {
             let (raw_act, _, elapsed) = split_agy_subagent_suffixes(after_agent);
             let clean_act = raw_act.strip_suffix("...").unwrap_or(raw_act).trim();
@@ -8715,6 +8758,11 @@ pub(crate) mod rig {
     pub(crate) fn claude_home(name: &str, pid: i32, started_at: u64) -> (PathBuf, PathBuf) {
         let root = home_root(name);
         let _ = std::fs::remove_dir_all(&root);
+        claude_home_at(root, pid, started_at)
+    }
+
+    /// Creates a Claude registry fixture within a caller-owned root.
+    pub(crate) fn claude_home_at(root: PathBuf, pid: i32, started_at: u64) -> (PathBuf, PathBuf) {
         let (cwd, claude) = (root.join("work"), root.join("claude"));
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::create_dir_all(claude.join("sessions")).unwrap();
@@ -8764,6 +8812,7 @@ pub(crate) mod rig {
             env_stamp: None,
         };
         let asks = Asks {
+            files: |_| None,
             tap: NO_TAP,
             args: |_| {
                 Some(atpkg::caller_shell::ProcArgs {
@@ -10144,6 +10193,7 @@ mod tests {
             wake: LogWake::new(false),
         };
         let asks = Asks {
+            files: |_| None,
             tap: NO_TAP,
             args: |_| None,
             roster: || None,
@@ -10168,6 +10218,7 @@ mod tests {
             &mut roster,
             &job,
             Asks {
+                files: |_| None,
                 args: recovered_args,
                 ..asks
             },
@@ -10274,6 +10325,7 @@ mod tests {
             wake: LogWake::new(false),
         };
         let asks = Asks {
+            files: |_| None,
             tap: NO_TAP,
             args: |_| args(false),
             roster: || None,
@@ -10294,6 +10346,7 @@ mod tests {
         assert_eq!(provisional.launch_for, None);
 
         let selected = Asks {
+            files: |_| None,
             args: |_| args(true),
             ..asks
         };
@@ -10504,6 +10557,7 @@ mod tests {
         let mut fold = footer::FooterCache::default();
         let mut memo = RosterMemo::default();
         let asks = Asks {
+            files: |_| None,
             tap: NO_TAP,
             args: |_| {
                 let root = super::rig::home_root("footer-subscription-resolve");
@@ -10638,6 +10692,7 @@ mod tests {
         let mut fold = footer::FooterCache::default();
         let mut memo = RosterMemo::default();
         let asks = Asks {
+            files: |_| None,
             tap: NO_TAP,
             args: |_| {
                 let root = crate::test_scratch::process_root("footer-muse-account-switch");
@@ -10823,6 +10878,7 @@ mod tests {
         let mut fold = footer::FooterCache::default();
         let mut memo = RosterMemo::default();
         let asks = Asks {
+            files: |_| None,
             tap: NO_TAP,
             args,
             roster: || None,
@@ -10899,6 +10955,7 @@ mod tests {
             "different project settings need a new gather"
         );
         let unregistered = Asks {
+            files: |_| None,
             args: |pid| {
                 let mut args = args(pid)?;
                 args.argv.push("--new-image".into());
@@ -10913,6 +10970,7 @@ mod tests {
         );
         assert_eq!(CHECKS.get(), 3);
         let changed_home = Asks {
+            files: |_| None,
             args: |pid| {
                 let mut args = args(pid)?;
                 args.env[0].push_str("/another-home");
@@ -10943,6 +11001,7 @@ mod tests {
         let profile =
             aterm_agent::harness::profile::path_in(&root, Some(&claude.to_string_lossy()), &claude);
         let asks = Asks {
+            files: |_| None,
             tap: NO_TAP,
             args: |_| {
                 let root = super::rig::home_root("footer-subscription-expiry");
@@ -11071,6 +11130,7 @@ mod tests {
         const PID: i32 = 4242;
         let (root, claude) = claude_home("footer-account", PID, 1_790_607_848);
         let listed = |args| Asks {
+            files: |_| None,
             tap: NO_TAP,
             args,
             roster: || Some(two_accounts()),
@@ -11078,6 +11138,7 @@ mod tests {
             stored_login: |_, _, _| true,
         };
         let unasked = |args| Asks {
+            files: |_| None,
             tap: NO_TAP,
             args,
             roster: || unreachable!("no login was read: the roster is not asked"),
@@ -11101,6 +11162,7 @@ mod tests {
         };
         assert_eq!(read(listed(nobody)), (Some(None), true), "no row names it");
         let none = Asks {
+            files: |_| None,
             tap: NO_TAP,
             args: on_main,
             roster: || None,
@@ -11130,6 +11192,7 @@ mod tests {
         );
         std::fs::remove_file(claude.join(format!("sessions/{PID}.json"))).unwrap();
         let nothing = Asks {
+            files: |_| None,
             tap: NO_TAP,
             args: |_| unreachable!("no registry row: the process is not read"),
             roster: || unreachable!("no facts: the roster is not asked"),
@@ -11159,6 +11222,7 @@ mod tests {
         )
         .unwrap();
         let asks = Asks {
+            files: |_| None,
             tap: NO_TAP,
             args: |_| Some(args_of(&["HOME=/home/someone"])),
             roster: || None,
@@ -11191,6 +11255,7 @@ mod tests {
         assert_eq!(excerpts.task, None, "no task file named");
         std::fs::remove_file(claude.join(format!("sessions/{PID}.json"))).unwrap();
         let nothing = Asks {
+            files: |_| None,
             tap: NO_TAP,
             args: |_| unreachable!("no registry row: the process is not read"),
             roster: || unreachable!("no facts: the roster is not asked"),
@@ -11209,6 +11274,7 @@ mod tests {
         let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
         timeline.lock().unwrap().note_foreground_group(PID);
         let asks = Asks {
+            files: |_| None,
             tap: NO_TAP,
             args: |_| Some(args_of(&["HOME=/home/someone"])),
             roster: || None,
@@ -11317,6 +11383,7 @@ mod tests {
         const IMAGE: u64 = 1_790_607_848;
         let (root, claude) = claude_home("footer-login", PID, IMAGE);
         let listed = |args| Asks {
+            files: |_| None,
             tap: NO_TAP,
             args,
             roster: || Some(two_accounts()),
@@ -13204,6 +13271,7 @@ mod tests {
             &mut RosterMemo::default(),
             (
                 Asks {
+                    files: |_| None,
                     tap: NO_TAP,
                     args: |_| None,
                     roster: || None,
@@ -13441,6 +13509,7 @@ mod tests {
                 .clone()
         };
         let asks = Asks {
+            files: |_| None,
             tap: NO_TAP,
             args: |_| Some(args_of(&["HOME=/home/someone"])),
             roster: || None,
@@ -14691,8 +14760,8 @@ mod tests {
             rule_80.as_str(),
             "> ",
             rule_80.as_str(),
-            "  ● Agent(self: Codebase Researcher)     Reading file... \u{00B7} 4m36s",
-            "  ● Agent(research: Docs Finder)         Searching web... \u{00B7} 8s",
+            "  ● Agent(self: Codebase (tests) Researcher)     Reading file... \u{00B7} 4m36s",
+            "  ● Agent(research: Docs (API) Finder)         Searching web... \u{00B7} 8s",
             "  ● [17:20:01] sleep 30                  running",
             rule_80.as_str(),
             "  ? for shortcuts                        Gemini 4 Argon \u{00B7} high \u{00B7} 1 task(s) \u{00B7} 2 subagent(s)",
@@ -14718,7 +14787,9 @@ mod tests {
             .collect();
         // Simulate agy coloring the panel's `●` and `Agent(...)` in ANSI blue/green.
         scratch.cells[7][2].fg = [0x40, 0xc0, 0x60];
-        for c in &mut scratch.cells[7][4..36] {
+        for c in
+            &mut scratch.cells[7][4..4 + "Agent(self: Codebase (tests) Researcher)".chars().count()]
+        {
             c.fg = [0x5c, 0x9c, 0xff];
         }
         let original = scratch.cells.clone();
@@ -14737,11 +14808,11 @@ mod tests {
         assert_eq!(panel_read.panel.rows().len(), 2);
         assert_eq!(
             panel_read.panel.rows()[0].name.range(),
-            4..4 + "Codebase Researcher".len()
+            4..4 + "Codebase (tests) Researcher".len()
         );
         assert_eq!(
             panel_read.panel.rows()[1].name.range(),
-            4..4 + "research: Docs Finder".len()
+            4..4 + "research: Docs (API) Finder".len()
         );
         assert!(
             panel_read.ink[0].bullet.is_some() && panel_read.ink[0].name.is_some(),
@@ -14800,11 +14871,11 @@ mod tests {
         assert_eq!(row_str(3), "● Verifier needs approval for RunCommand");
         assert_eq!(
             row_str(7),
-            "  ● Codebase Researcher  Reading file \u{00B7} 4m36s"
+            "  ● Codebase (tests) Researcher  Reading file \u{00B7} 4m36s"
         );
         assert_eq!(
             row_str(8),
-            "  ● research: Docs Finder  Searching web \u{00B7} 8s"
+            "  ● research: Docs (API) Finder  Searching web \u{00B7} 8s"
         );
         assert_eq!(row_str(9), "  ● [17:20:01] sleep 30  running");
         let footer_text = row_str(11);
@@ -14853,11 +14924,20 @@ mod tests {
         );
         let mut rows_25s = rows.clone();
         rows_25s[7] =
-            "  ● Agent(self: Codebase Researcher)  Reading file \u{00B7} 5m01s".to_owned();
-        rows_25s[8] = "  ● Agent(research: Docs Finder)  Searching web \u{00B7} 33s".to_owned();
+            "  ● Agent(self: Codebase (tests) Researcher)  Reading file \u{00B7} 5m01s".to_owned();
+        rows_25s[8] = "  ● Agent(research: Docs (API) Finder)  Working \u{00B7} 33s".to_owned();
         let panel_read_25s =
             crate::claude_panel::read_panel(1, &rows_25s, 6, &scratch, pane_geom, blank)
                 .expect("agy panel after 25s");
+        assert!(matches!(
+            panel_read.agy_flights[1],
+            aterm_agent::harness::flight::Flight::Tool { .. }
+        ));
+        assert_eq!(
+            panel_read_25s.agy_flights[1],
+            aterm_agent::harness::flight::Flight::Model,
+            "parentheses inside the accepted name do not become part of the model activity"
+        );
         track.fold_flown(
             &panel_read_25s.panel,
             &[aterm_agent::harness::agents::Tint::Plain; aterm_phase::agents_panel::PANEL_ROWS_MAX],
@@ -14868,6 +14948,10 @@ mod tests {
             track.dots()[0].state,
             aterm_agent::harness::agents::DotState::Tool,
             "agy tool subagent stays in DotState::Tool (sat=1.0) past QUIET_MS instead of fading to Quiet"
+        );
+        assert_eq!(
+            track.dots()[1].state,
+            aterm_agent::harness::agents::DotState::Running
         );
         assert_eq!(track.dots()[0].sat, 1.0);
         assert_eq!(
@@ -14951,6 +15035,9 @@ mod tests {
             "  └ Gemini Models".into(),
             "    Weekly Limit Remaining                 ████████░░  78%    2026-10-29 09:31 PDT"
                 .into(),
+            "  Claude and GPT models".into(),
+            "    Weekly Limit Remaining                 ██████████  100%   2026-10-31 00:51 PDT"
+                .into(),
             rule.clone(),
             "> ".into(),
             rule,
@@ -14960,6 +15047,65 @@ mod tests {
         let reading = aterm_phase::agy::usage_card_weekly(&rows).expect("agy /usage weekly");
         assert_eq!(reading.text, "weekly 78% left");
         assert_eq!(reading.reset.as_deref(), Some("2026-10-29 09:31 PDT"));
+
+        let mut scratch = RenderInput::empty();
+        scratch.rows = rows.len();
+        scratch.cols = rows.iter().map(String::len).max().expect("rows");
+        scratch.cells = rows.iter().map(|row| row_of(row, [90, 90, 90])).collect();
+        scratch.snapshot_seq = 1;
+        let region = PaneTextRegion {
+            strip: 0,
+            row_off: 0,
+            col_off: 0,
+            rows: scratch.rows,
+            cols: scratch.cols,
+        };
+        let mut cache = PaneTextCache::default();
+        let original = cache.rows(0, 7, &scratch, region);
+        for (model, words, reset) in [
+            (
+                Some("Gemini 3.1 Pro"),
+                "weekly 78% left",
+                "2026-10-29 09:31 PDT",
+            ),
+            (
+                Some("Claude Opus 4.6"),
+                "weekly 100% left",
+                "2026-10-31 00:51 PDT",
+            ),
+            (
+                Some("Gemini 3.1 Pro"),
+                "weekly 78% left",
+                "2026-10-29 09:31 PDT",
+            ),
+            (
+                Some("Claude Opus 4.6"),
+                "weekly 100% left",
+                "2026-10-31 00:51 PDT",
+            ),
+            (None, "weekly 78% left", "2026-10-29 09:31 PDT"),
+        ] {
+            cache.note_facts(
+                0,
+                7,
+                &FooterFacts {
+                    model: model.map(str::to_owned),
+                    ..FooterFacts::default()
+                },
+                None,
+                true,
+                FactMask::default(),
+            );
+            assert_eq!(
+                cache.usage_weekly(0, Some(aterm_phase::Program::Agy)),
+                Some((words, Some(reset))),
+                "unchanged quota rows follow the current model: {model:?}"
+            );
+            assert!(
+                Arc::ptr_eq(&original, &cache.rows(0, 7, &scratch, region)),
+                "a model refresh does not rebuild the unchanged screen rows"
+            );
+        }
 
         fn pdt_offset(zone: Option<&str>, _unix: i64) -> Option<i64> {
             match zone {
@@ -14995,14 +15141,27 @@ mod tests {
     }
 
     #[test]
-    fn agy_resolver_populates_model_effort_from_settings_and_gates_excerpts_on_task() {
+    fn agy_resolver_uses_process_presence_and_keeps_task_fallback() {
         const PID: i32 = 4299;
         thread_local! {
             static HOME_DIR: std::cell::RefCell<PathBuf> = const { std::cell::RefCell::new(PathBuf::new()) };
             static PROC_ENV: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+            static FILE_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            static PROC_FILES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         fn test_home() -> Option<PathBuf> {
             Some(HOME_DIR.with(|h| h.borrow().clone()))
+        }
+        fn test_files(pid: u32) -> Option<Vec<PathBuf>> {
+            assert_eq!(pid, u32::try_from(PID).unwrap());
+            FILE_READS.with(|reads| {
+                assert_eq!(
+                    reads.replace(1),
+                    0,
+                    "resume and excerpts share one observation"
+                );
+            });
+            Some(PROC_FILES.with(|files| files.borrow().clone()))
         }
         fn test_args(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
             Some(atpkg::caller_shell::ProcArgs {
@@ -15012,8 +15171,11 @@ mod tests {
             })
         }
 
-        let (root, _) = claude_home("agy-footer-model", PID, 1_790_607_848);
-        let home = root.join("home");
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-agy-footer-")
+            .tempdir()
+            .expect("private agy home");
+        let home = dir.path().join("home");
         let cfg = home.join(".gemini/antigravity-cli");
         std::fs::create_dir_all(&cfg).unwrap();
         std::fs::write(
@@ -15037,6 +15199,7 @@ mod tests {
                 env.push(extra.to_owned());
             }
             PROC_ENV.with(|e| *e.borrow_mut() = env);
+            FILE_READS.with(|reads| reads.set(0));
 
             let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
             {
@@ -15054,6 +15217,7 @@ mod tests {
                 &mut RosterMemo::default(),
                 (
                     Asks {
+                        files: test_files,
                         tap: NO_TAP,
                         args: test_args,
                         roster: || None,
@@ -15112,15 +15276,24 @@ mod tests {
             ),
         )
         .unwrap();
+        let (unheld_shown, unheld_excerpts) = run_with_env(None);
+        assert!(
+            unheld_excerpts.is_none() && unheld_shown.unwrap().resume.is_none(),
+            "a transcript on disk is not process ownership"
+        );
+        let lock = aterm_agent::harness::upgrade_agy::presence_lock(&cfg, cid);
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::write(&lock, b"").unwrap();
+        PROC_FILES.with(|files| {
+            *files.borrow_mut() = vec![std::fs::canonicalize(&lock).unwrap()];
+        });
         let (resumed_shown, transcript_excerpts) = run_with_env(None);
-        let resumed_shown = resumed_shown.expect("agy footer facts with transcript");
+        let resumed_shown = resumed_shown.expect("agy footer facts with held transcript");
         assert!(
             resumed_shown
                 .resume
                 .as_deref()
-                .is_some_and(|r| r.ends_with(&format!("agy --conversation={cid}"))),
-            "expected agy resume line, got {:?}",
-            resumed_shown.resume
+                .is_some_and(|r| r.ends_with(&format!("agy --conversation={cid}")))
         );
         let transcript_excerpts = transcript_excerpts.expect("agy transcript excerpts");
         assert_eq!(
@@ -15186,7 +15359,12 @@ mod tests {
             Some("weekly 91% left"),
             "live WeeklyFigure for the new agy account is preserved after switch"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        PROC_FILES.with(|files| files.borrow_mut().clear());
+        let (released_shown, released_excerpts) = run_with_env(None);
+        assert!(
+            released_excerpts.is_none() && released_shown.unwrap().resume.is_none(),
+            "released presence is not cached ownership"
+        );
     }
 
     #[test]
@@ -15194,7 +15372,11 @@ mod tests {
         const PID: i32 = 4399;
         thread_local! {
             static HOME_DIR: std::cell::RefCell<PathBuf> = const { std::cell::RefCell::new(PathBuf::new()) };
+            static PROC_FILES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
             static PROC_ENV: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        fn test_files(_: u32) -> Option<Vec<PathBuf>> {
+            Some(PROC_FILES.with(|f| f.borrow().clone()))
         }
         fn test_home() -> Option<PathBuf> {
             Some(HOME_DIR.with(|h| h.borrow().clone()))
@@ -15207,7 +15389,12 @@ mod tests {
             })
         }
 
-        let (root, _) = claude_home("muse-footer-resolver", PID, 1_790_607_848);
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let (root, _) = super::rig::claude_home_at(
+            scratch.path().join("muse-footer-resolver"),
+            PID,
+            1_790_607_848,
+        );
         let home = root.join("home");
         let cfg = home.join(".config/muse");
         std::fs::create_dir_all(&cfg).unwrap();
@@ -15232,6 +15419,9 @@ mod tests {
         std::fs::write(sdir.join("session.jsonl"), session_log).unwrap();
 
         HOME_DIR.with(|h| *h.borrow_mut() = home.clone());
+        PROC_FILES.with(|f| {
+            *f.borrow_mut() = vec![std::fs::canonicalize(sdir.join(".session.lock")).unwrap()]
+        });
         PROC_ENV.with(|e| *e.borrow_mut() = vec![format!("HOME={}", home.display())]);
 
         let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
@@ -15251,6 +15441,7 @@ mod tests {
             &mut RosterMemo::default(),
             (
                 Asks {
+                    files: test_files,
                     tap: NO_TAP,
                     args: test_args,
                     roster: || None,

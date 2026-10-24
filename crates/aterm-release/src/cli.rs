@@ -137,7 +137,7 @@ USAGE
                            and repairs rustup's trust link, audits the whole
                            publishing stack (the toolchains and Apple SDK, the
                            base and develop layers, LibreSSL, the publication
-                           engine, the site checkout, node and firebase-tools,
+                           engine, the site checkout and its deployer key,
                            the Apple identity, a live-tested notary credential,
                            the credentials profile, the channel token) and prints
                            every gap with its remedy. Only a clean pass mints

@@ -431,6 +431,61 @@ fn silent_staller() -> String {
 }
 
 #[test]
+fn a_bundle_with_an_unread_program_inventory_is_never_swapped() {
+    let scratch = Scratch::new();
+    let dest = scratch.mkdir("inventory/dest");
+    let app = scratch.mkdir("inventory/dest/aterm.app");
+    let programs = scratch.mkdir("inventory/dest/aterm.app/Contents/MacOS");
+    let exe = scratch.write("inventory/dest/aterm.app/Contents/MacOS/a\nb", "program");
+    symlink(&exe, &programs.join("linked"));
+    scratch.mkdir("inventory/dest/aterm.app/Contents/MacOS/folder");
+    let stage = scratch.mkdir("inventory/staged");
+    let asked = scratch.join("inventory/asked");
+    let mut lib = Lib::new();
+    let probe = format!(
+        "showed_it_ran() {{ printf '%s\\0' \"$1\" >> {}; }}; ",
+        q(s(&asked))
+    );
+    let failed = lib.call(
+        format!(
+            "( {probe}find() {{ command find \"$@\"; return 1; }}; STAGE={}; \
+             swap_staged_bundle {} )",
+            q(s(&stage)),
+            q(s(&dest))
+        ),
+        &[],
+    );
+    let known = lib.call(
+        format!("( {probe}bundle_showed_it_ran {} )", q(s(&app))),
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    assert_ne!(
+        recs[failed].rc, 0,
+        "a partial inventory is no permission to swap"
+    );
+    assert!(recs[failed].err.contains("could not be inventoried"));
+    assert!(exe.is_file() && stage.is_dir(), "the swap moved nothing");
+    assert_eq!(recs[known].rc, 0, "{}", recs[known].err);
+    let mut expected = s(&exe).as_bytes().to_vec();
+    expected.push(0);
+    assert_eq!(
+        std::fs::read(&asked).unwrap(),
+        expected,
+        "only the complete inventory probes, preserving newlines and excluding links/directories"
+    );
+
+    std::fs::remove_file(&exe).unwrap();
+    let mut lib = Lib::new();
+    let empty = lib.call(format!("may_replace {}", q(s(&app))), &[]);
+    let recs = lib.run(&scratch);
+    assert_eq!(
+        recs[empty].rc, 0,
+        "a known empty program folder is replaceable"
+    );
+}
+
+#[test]
 fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
     let scratch = Scratch::new();
     let silent = silent_staller();

@@ -1667,13 +1667,13 @@ pub enum MailboxCredential {
     Otp(String),
 }
 
-fn is_shell_binary(path: &Path) -> bool {
+pub(super) fn is_shell_binary(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.contains("headless-shell") || n.contains("headless_shell"))
 }
 
-fn browser_cache_roots(home: Option<&Path>) -> Vec<PathBuf> {
+pub(super) fn browser_cache_roots(home: Option<&Path>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME")
         .filter(|v| !v.is_empty())
@@ -1890,12 +1890,44 @@ pub fn vendor_profile_dir(store_dir: &Path, label_key: &str, email: Option<&str>
     store_dir.join(BROWSER_PROFILES_DIR).join(key)
 }
 
+/// The key of a vendor row's browser profile where the row names no email: `<cli>-<label>`
+/// (the label as it is where it already starts so).
+#[must_use]
+pub fn vendor_label_key(cli: super::accounts::Cli, label: &str) -> String {
+    let prefix = format!("{}-", cli.id());
+    if label.starts_with(&prefix) {
+        label.to_owned()
+    } else {
+        format!("{prefix}{label}")
+    }
+}
+
+/// The persistent browser profile of `cli`'s row `label` (with `email`): the one its headless
+/// sign-ins run in and `accounts browser` opens in a window. Claude Code's is under its own
+/// store (`store_dir`, [`resolve_browser_profile_dir`]); every other CLI's is the email's own
+/// under Claude Code's store (`shared_dir`, [`vendor_profile_dir`]), shared by every vendor.
+#[must_use]
+pub fn row_browser_profile(
+    cli: super::accounts::Cli,
+    store_dir: &Path,
+    shared_dir: &Path,
+    label: &str,
+    email: Option<&str>,
+) -> PathBuf {
+    match cli {
+        super::accounts::Cli::Claude => resolve_browser_profile_dir(store_dir, Some(label), email),
+        _ => vendor_profile_dir(shared_dir, &vendor_label_key(cli, label), email),
+    }
+}
+
 /// Run authorization with a persistent store profile or an owned scratch profile.
 /// An authorization error does not make persistent cookies or profile data disposable.
 ///
 /// # Errors
 ///
-/// Scratch allocation failure or the authorization's diagnostic, unchanged.
+/// Scratch allocation failure, a persistent profile another browser or another of aterm's
+/// launches has open ([`super::browser_window::ProfileLock::claim`], its
+/// [`super::browser_window::Refusal::brief`]), or the authorization's diagnostic, unchanged.
 #[cfg(unix)]
 pub(super) fn with_browser_profile(
     store_dir: Option<&Path>,
@@ -1904,10 +1936,12 @@ pub(super) fn with_browser_profile(
     authorize: impl FnOnce(&Path) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
     let temp_dir;
+    let _claimed;
     let profile_dir = if let Some(store) = store_dir {
         let dir = resolve_browser_profile_dir(store, label, email);
         let _ = aterm_types::fs_restricted::ensure_private_dir(dir.parent().unwrap_or(store));
         let _ = aterm_types::fs_restricted::ensure_private_dir(&dir);
+        _claimed = super::browser_window::ProfileLock::claim(&dir).map_err(|why| why.brief())?;
         dir
     } else {
         temp_dir =
@@ -1917,18 +1951,32 @@ pub(super) fn with_browser_profile(
     authorize(&profile_dir)
 }
 
-/// Build the command-line arguments for launching `browser` with `profile_dir`.
+/// Build the command-line arguments for launching `browser` with `profile_dir`: `--headless=new`
+/// unless it is a headless shell, the profile's own flags ([`profile_args`]), the DevTools pipe,
+/// and a blank first page.
 #[must_use]
 pub fn headless_launch_args(browser: &HeadlessBrowser, profile_dir: &Path) -> Vec<OsString> {
     let mut args = Vec::new();
     if !browser.is_headless_shell {
         args.push("--headless=new".into());
     }
+    args.extend(profile_args(profile_dir));
+    args.push("--remote-debugging-pipe".into());
+    args.push("about:blank".into());
+    args
+}
+
+/// The flags every launch on the browser profile `profile_dir` takes, headless or in a window
+/// ([`super::browser_window::window_args`]): the profile itself, the window's size, no first-run
+/// or default-browser prompt, no background work, and the profile's own password store and
+/// mock keychain, so the cookies one launch saved are the ones the next one reads.
+#[must_use]
+pub fn profile_args(profile_dir: &Path) -> Vec<OsString> {
+    let mut args = Vec::new();
     let mut user_data = OsString::from("--user-data-dir=");
     user_data.push(profile_dir);
     args.push(user_data);
     for flag in [
-        "--remote-debugging-pipe",
         "--window-size=1280,900",
         "--no-first-run",
         "--no-default-browser-check",
@@ -1948,8 +1996,62 @@ pub fn headless_launch_args(browser: &HeadlessBrowser, profile_dir: &Path) -> Ve
     if aterm_uds::peer::our_uid() == 0 {
         args.push("--no-sandbox".into());
     }
-    args.push("about:blank".into());
     args
+}
+
+/// How long a headless browser asked to close (`Browser.close`) has to exit by itself before it
+/// is killed: a kill at once kept a renewed session's cookies in 3 of 10 runs (the profile lab,
+/// docs/DESIGN-ai-accounts-multi-cli-2026-10-23.md §5 (h)).
+pub const BROWSER_EXIT_GRACE: Duration = Duration::from_secs(5);
+
+/// A browser this process started over its DevTools pipe. Its caller asks it to close first;
+/// dropped (or [`BrowserChild::close`]d), it is given its grace ([`BROWSER_EXIT_GRACE`]) to exit
+/// and write its profile, and only then killed and reaped.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct BrowserChild {
+    child: aterm_uds::spawnfd::LaneChild,
+    grace: Duration,
+}
+
+#[cfg(unix)]
+impl BrowserChild {
+    /// `child`, given [`BROWSER_EXIT_GRACE`].
+    #[must_use]
+    pub fn new(child: aterm_uds::spawnfd::LaneChild) -> BrowserChild {
+        BrowserChild::with_grace(child, BROWSER_EXIT_GRACE)
+    }
+
+    /// `child`, given `grace`.
+    #[must_use]
+    pub fn with_grace(child: aterm_uds::spawnfd::LaneChild, grace: Duration) -> BrowserChild {
+        BrowserChild { child, grace }
+    }
+
+    /// Waits up to the grace for the browser to exit, then kills it; its exit status.
+    /// # Errors
+    /// The child could not be waited for.
+    pub fn close(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let until = Instant::now() + self.grace;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= until {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = self.child.kill();
+        self.child.wait()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BrowserChild {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
 }
 
 fn strip_tag_block(input: &str, tag: &str) -> String {
@@ -2171,7 +2273,7 @@ pub fn extract_otps_from_email(raw_email: &str, target_email: Option<&str>) -> V
     };
     for line in plain.lines() {
         let trimmed_line = line.trim();
-        if super::open_url::is_mime_boundary_line(trimmed_line) {
+        if super::open_url::is_mime_boundary_line(trimmed_line, &[]) {
             flush_single_digit_run(
                 &mut single_digit_run,
                 &mut single_digit_run_context,
@@ -2449,22 +2551,39 @@ pub fn domain_names(domain: &str, word: &str) -> bool {
 }
 
 /// The `From:` address's domain and the `Date:` (unix seconds) of the mail `raw`: its header
-/// block, or a mailbox API's JSON item (`From`/`from`, an address or `{Address|address}`;
-/// `Date`/`date`/`Created`/`created_at`, RFC 3339 or RFC 2822).
+/// block, or a mailbox API's JSON item (`From`/`from`/`Sender`/`sender`, nested headers, or
+/// `{Address|address|emailAddress}`; `Date`/`date`/`Created`/`created_at`/`receivedDateTime`/
+/// `receivedAt`/`internalDate`, RFC 3339, RFC 2822, or unix epoch).
 #[must_use]
 pub fn mail_from_and_date(raw: &str) -> (Option<String>, Option<i64>) {
     let trimmed = raw.trim_start();
     if trimmed.starts_with('{')
         && let Ok(item) = aterm_json::from_str::<Value>(trimmed)
     {
-        let from = item
-            .get("From")
-            .or_else(|| item.get("from"))
-            .and_then(address_text);
-        let date = ["Date", "date", "Created", "created_at"]
+        let from = ["From", "from", "Sender", "sender"]
             .iter()
-            .find_map(|k| item.get(k).and_then(Value::as_str))
-            .and_then(|d| parse_mail_date(d).or_else(|| parse_rfc3339_any(d)));
+            .find_map(|k| item.get(k).and_then(address_text))
+            .or_else(|| json_header_value(&item, "from"));
+        let date = [
+            "Date",
+            "date",
+            "Created",
+            "created_at",
+            "receivedDateTime",
+            "sentDateTime",
+            "receivedAt",
+            "sentAt",
+            "received_at",
+            "sent_at",
+            "internalDate",
+            "timestamp",
+        ]
+        .iter()
+        .find_map(|k| item.get(k).and_then(parse_json_date_value))
+        .or_else(|| {
+            json_header_value(&item, "date")
+                .and_then(|d| parse_mail_date(&d).or_else(|| parse_rfc3339_any(&d)))
+        });
         return (from.as_deref().and_then(address_domain), date);
     }
     let head = raw
@@ -2498,30 +2617,133 @@ pub fn mail_from_and_date(raw: &str) -> (Option<String>, Option<i64>) {
             last = Some(&mut date);
         }
     }
+    let decoded_date = date.map(|d| super::open_url::decode_rfc2047_words(&d));
     (
         from.as_deref().and_then(address_domain),
-        date.as_deref().and_then(parse_mail_date),
+        decoded_date
+            .as_deref()
+            .and_then(|d| parse_mail_date(d).or_else(|| parse_rfc3339_any(d))),
     )
 }
 
-/// The address a mailbox API's `From` names: a string, an object's `Address`, `address` or
-/// `email`, or the first of an array of either.
-fn address_text(v: &Value) -> Option<String> {
-    v.as_str()
-        .map(str::to_owned)
-        .or_else(|| {
-            ["Address", "address", "email"]
-                .iter()
-                .find_map(|k| v.get(k).and_then(Value::as_str).map(str::to_owned))
-        })
-        .or_else(|| v.as_array()?.first().and_then(address_text))
+fn json_header_value(item: &Value, header_name: &str) -> Option<String> {
+    let containers = [
+        Some(item),
+        item.get("payload"),
+        item.get("Content"),
+        item.get("content"),
+        item.get("data"),
+        item.get("message"),
+        item.get("mail"),
+    ];
+    for container in containers.into_iter().flatten() {
+        let Some(obj) = container.as_object() else {
+            continue;
+        };
+        for (k, v) in obj {
+            if !matches!(k.to_ascii_lowercase().as_str(), "headers" | "header") {
+                continue;
+            }
+            if let Some(hdr_map) = v.as_object() {
+                for (hk, hv) in hdr_map {
+                    if hk.eq_ignore_ascii_case(header_name)
+                        && let Some(s) = address_text(hv)
+                    {
+                        return Some(s);
+                    }
+                }
+            } else if let Some(hdr_arr) = v.as_array() {
+                for entry in hdr_arr {
+                    let Some(entry_obj) = entry.as_object() else {
+                        continue;
+                    };
+                    let matches_name = entry_obj.iter().any(|(ek, ev)| {
+                        matches!(ek.to_ascii_lowercase().as_str(), "name" | "key" | "header")
+                            && ev
+                                .as_str()
+                                .is_some_and(|s| s.trim().eq_ignore_ascii_case(header_name))
+                    });
+                    if matches_name
+                        && let Some((_, ev)) = entry_obj.iter().find(|(ek, _)| {
+                            matches!(ek.to_ascii_lowercase().as_str(), "value" | "values" | "val")
+                        })
+                        && let Some(s) = address_text(ev)
+                    {
+                        return Some(s);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
-/// The domain of the one address in a `From:` value (`Name <a@b.c>` or `a@b.c`).
+fn parse_epoch_timestamp(n: i64) -> Option<i64> {
+    if n >= 100_000_000_000 {
+        Some(n / 1000)
+    } else if n >= 100_000_000 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+fn parse_json_date_value(v: &Value) -> Option<i64> {
+    if let Some(s) = v.as_str() {
+        let trimmed = s.trim();
+        if !trimmed.is_empty()
+            && trimmed.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(n) = trimmed.parse::<i64>()
+            && let Some(ts) = parse_epoch_timestamp(n)
+        {
+            return Some(ts);
+        }
+        return parse_mail_date(trimmed).or_else(|| parse_rfc3339_any(trimmed));
+    }
+    v.as_i64().and_then(parse_epoch_timestamp)
+}
+
+/// The address a mailbox API's `From` names: a string, an object's `Address`, `address`,
+/// `email`, nested `emailAddress`, MailHog's `Mailbox` + `Domain`, or the first of an array.
+fn address_text(v: &Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_owned());
+    }
+    if let Some(obj) = v.as_object() {
+        for k in ["Address", "address", "email"] {
+            if let Some(s) = obj.get(k).and_then(Value::as_str) {
+                return Some(s.to_owned());
+            }
+        }
+        for k in ["emailAddress", "email_address"] {
+            if let Some(nested) = obj.get(k).and_then(address_text) {
+                return Some(nested);
+            }
+        }
+        let mb = ["Mailbox", "mailbox", "local", "localPart", "local_part"]
+            .iter()
+            .find_map(|k| obj.get(*k).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let dom = ["Domain", "domain", "host"]
+            .iter()
+            .find_map(|k| obj.get(*k).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let (Some(m), Some(d)) = (mb, dom) {
+            return Some(format!("{m}@{d}"));
+        }
+    }
+    v.as_array()?.first().and_then(address_text)
+}
+
+/// The domain of the one address in a `From:` value (`Name <a@b.c>`, `a@b.c (Name)`, or `a@b.c`).
 fn address_domain(value: &str) -> Option<String> {
+    let decoded = super::open_url::decode_rfc2047_words(value);
+    let value = decoded.as_str();
     let addr = match (value.rfind('<'), value.rfind('>')) {
         (Some(open), Some(close)) if open < close => &value[open + 1..close],
-        _ => value,
+        _ => value.split('(').next().unwrap_or(value),
     };
     let addr = addr.trim().trim_matches('"');
     let (_, domain) = addr.rsplit_once('@')?;
@@ -3423,6 +3645,25 @@ fn json_summary_allows_target(item: &Value, target_email: Option<&str>) -> bool 
     if saw_recipient { matched } else { true }
 }
 
+fn json_summary_allows_filter(raw_item: &str, filter: &MailFilter<'_>) -> bool {
+    if filter.senders.is_empty() && filter.since.is_none() {
+        return true;
+    }
+    let (from, date) = mail_from_and_date(raw_item);
+    if !filter.senders.is_empty()
+        && let Some(domain) = from.as_deref()
+        && !filter.senders.iter().any(|w| domain_names(domain, w))
+    {
+        return false;
+    }
+    if let (Some(since), Some(at)) = (filter.since, date)
+        && at < since.saturating_sub(MAIL_CLOCK_SLACK_S)
+    {
+        return false;
+    }
+    true
+}
+
 fn fetch_http_mailbox_credential(
     cfg: &MailboxConfig,
     target_email: Option<&str>,
@@ -3477,6 +3718,7 @@ fn fetch_http_mailbox_credential(
                     return Some(cred);
                 }
                 if json_summary_allows_target(item, target_email)
+                    && json_summary_allows_filter(&item_str, &filter)
                     && let Some(msg_id) = json_item_missing_full_body_id(item)
                 {
                     let mut fetched_detail = false;
@@ -3924,6 +4166,24 @@ impl CdpClient {
         }
     }
 
+    /// Takes the events named `method` (of `session`, where one is named) that arrived so far,
+    /// in order, leaving the others.
+    pub fn take_events(&mut self, method: &str, session: Option<&str>) -> Vec<Value> {
+        while let Ok(message) = self.from.try_recv() {
+            self.events.push(message);
+        }
+        let mut taken = Vec::new();
+        self.events.retain(|ev| {
+            let hit = ev.get("method").and_then(Value::as_str) == Some(method)
+                && session.is_none_or(|s| ev.get("sessionId").and_then(Value::as_str) == Some(s));
+            if hit {
+                taken.push(ev.clone());
+            }
+            !hit
+        });
+        taken
+    }
+
     /// Drain buffered CDP events for `session`, returning the first URL (`params.url`,
     /// `params.frame.url`, or `params.frame.unreachableUrl`) matching `predicate`.
     pub fn take_matching_event_url(
@@ -3962,7 +4222,7 @@ impl CdpClient {
 const CODE_INPUT_HELPERS_JS: &str = r#"
   const usableCodeInputs = (inputs) => inputs.filter(input =>
     !input.disabled && !input.readOnly && !input.hidden &&
-    !["hidden", "checkbox", "radio"].includes(input.type));
+    !["hidden", "checkbox", "radio", "password", "submit", "button", "image", "reset"].includes(String(input.type || "").toLowerCase()));
   const codeInputsFor = (explicit, singleChar) => {
     const selected = usableCodeInputs(explicit);
     if (selected.length === 0) return usableCodeInputs(singleChar);
@@ -4078,7 +4338,7 @@ pub fn oauth_step_js(
     return local + s.slice(at);
   }};
   const targetCanon = canonEmail(targetEmail);
-  const hasTargetEmail = (text) => Boolean(targetCanon) && emailsIn(text).some(e => canonEmail(e) === targetCanon);
+  const hasTargetEmail = (text) => Boolean(targetCanon) && emailsIn(text).some(e => canonEmail(e) === targetCanon && (!e.includes("+") || !targetEmail.includes("+") || e === targetEmail));
   const pageEmails = emailsIn(bodyText)
     .filter(e => !e.endsWith("@anthropic.com"));
   const hasForeignAccount = Boolean(targetEmail) && !hasTargetEmail(bodyText) && (
@@ -4116,8 +4376,8 @@ pub fn oauth_step_js(
       return {{ state: "clicked_consent", url: href, target: hrefAttr || text }};
     }}
   }}
-  const explicitOtp = Array.from(document.querySelectorAll("input[autocomplete='one-time-code'], input[name*='code'], input[name*='otp'], input[inputmode='numeric'], input[data-testid*='otp']"));
-  const singleCharBoxes = Array.from(document.querySelectorAll("input[maxlength='1']"));
+  const explicitOtp = Array.from(document.querySelectorAll("input[autocomplete='one-time-code' i], input[name*='code' i], input[name*='otp' i], input[inputmode='numeric' i], input[data-testid*='otp' i]")).filter(visibleControl);
+  const singleCharBoxes = Array.from(document.querySelectorAll("input[maxlength='1']")).filter(visibleControl);
   const otpInputs = codeInputsFor(explicitOtp, singleCharBoxes);
   const otpVal = {otp_json};
   const otpDone = {otp_submitted};
@@ -4132,7 +4392,7 @@ pub fn oauth_step_js(
     }}
     return {{ state: "needs_mailbox", url: href }};
   }}
-  const emailInput = Array.from(document.querySelectorAll("input[type='email'], input[name='email'], input[autocomplete*='email'], input[autocomplete='username']")).find(visibleControl) || null;
+  const emailInput = Array.from(document.querySelectorAll("input[type='email'], input[name*='email' i], input[autocomplete*='email' i], input[autocomplete='username' i]")).filter(el => !el.readOnly && !["hidden", "checkbox", "radio", "password", "submit", "button", "image", "reset"].includes(String(el.type || "").toLowerCase())).find(visibleControl) || null;
   const emailDone = {email_submitted};
   if (emailInput && emailVal && !emailDone) {{
     setNativeValue(emailInput, emailVal);
@@ -4460,12 +4720,18 @@ pub(super) fn webmail_step_js(
     /sign in|log in|authenticate|unlock|verify|continue|next|submit/i);
   const visibleControl = (el) => Boolean(el) && !el.disabled && !el.hidden && el.type !== "hidden" &&
     !el.matches(":disabled") && el.getAttribute("aria-disabled") !== "true";
+  const editableControl = (el) => visibleControl(el) && !el.readOnly &&
+    !["hidden", "checkbox", "radio", "submit", "button", "image", "reset"].includes(String(el.type || "").toLowerCase());
 
-  const userEl = Array.from(document.querySelectorAll("input#username, input[name='username'], input[name='email'], input[name='loginfmt'], input#login_id, input[name='LOGIN_ID'], input#_user, input[name='_user'], input[autocomplete='username'], input[autocomplete*='email'], input[type='email']")).find(visibleControl) || null;
-  const passEl = Array.from(document.querySelectorAll("input#password, input[name='password'], input[name='passwd'], input#_pass, input[name='_pass'], input[type='password']:not(#mailboxPassword):not([name='mailboxPassword'])")).find(visibleControl) || null;
+  const userEl = Array.from(document.querySelectorAll("input#username, input[name='username'], input[name='email'], input[name='loginfmt'], input#login_id, input[name='LOGIN_ID'], input#_user, input[name='_user'], input[autocomplete='username'], input[autocomplete*='email'], input[type='email']")).filter(el => String(el.type || "").toLowerCase() !== "password").find(editableControl) || null;
+  const passEl = Array.from(document.querySelectorAll("input#password, input[name='password'], input[name='passwd'], input#_pass, input[name='_pass'], input[type='password']:not(#mailboxPassword):not([name='mailboxPassword'])")).find(editableControl) || null;
+  const explicitTotp = Array.from(document.querySelectorAll("input#twoFa, input[name='twoFa'], input[name='totp'], input[name='otc'], input[autocomplete='one-time-code'], input[id*='totp' i], input[name*='totp' i], input[name*='otp' i], input[data-testid*='totp' i], input[inputmode='numeric']"));
+  const splitTotp = Array.from(document.querySelectorAll("input[maxlength='1']"));
+  const totpInputs = codeInputsFor(explicitTotp, splitTotp);
+  const mpwEl = Array.from(document.querySelectorAll("input#mailboxPassword, input[name='mailboxPassword']")).find(editableControl) || null;
   const emailVal = {email_json};
   const pwVal = {pw_json};
-  if (userEl && !passEl && emailVal) {{
+  if (userEl && !passEl && !totpInputs.length && !mpwEl && emailVal) {{
     if (!pwVal) {{
       return {{ state: "needs_password", url: href }};
     }}
@@ -4491,9 +4757,6 @@ pub(super) fn webmail_step_js(
     return {{ state: "loading", url: href }};
   }}
 
-  const explicitTotp = Array.from(document.querySelectorAll("input#twoFa, input[name='twoFa'], input[name='totp'], input[name='otc'], input[autocomplete='one-time-code'], input[id*='totp' i], input[name*='totp' i], input[name*='otp' i], input[data-testid*='totp' i], input[inputmode='numeric']"));
-  const splitTotp = Array.from(document.querySelectorAll("input[maxlength='1']"));
-  const totpInputs = codeInputsFor(explicitTotp, splitTotp);
   const totpVal = {totp_json};
   if (totpInputs.length > 0) {{
     if (!totpVal) {{
@@ -4508,7 +4771,6 @@ pub(super) fn webmail_step_js(
     return {{ state: "loading", url: href }};
   }}
 
-  const mpwEl = Array.from(document.querySelectorAll("input#mailboxPassword, input[name='mailboxPassword']")).find(visibleControl) || null;
   const mpwVal = {mpw_json} || pwVal;
   if (mpwEl) {{
     if (!mpwVal) {{
@@ -4560,17 +4822,23 @@ pub(super) fn webmail_step_js(
   }}
 
   const rows = Array.from(document.querySelectorAll("[data-testid*='message-item'], [data-shortcut-target='item-container'], .item-container, [role='listitem'], [role='row'], tr"));
-  const authRows = [];
+  const senderWords = {senders_json};
+  const vendorAuthRows = [];
   const senderRows = [];
+  const authRows = [];
   for (const row of rows) {{
     const rt = String(row.innerText || "").toLowerCase();
-    if (rt.includes("sign in") || rt.includes("verification") || rt.includes("verify") || rt.includes("login") || rt.includes("magic")) {{
-      authRows.push(row);
-    }} else if ({senders_json}.some(word => rt.includes(word))) {{
+    const hasSender = senderWords.some(word => rt.includes(word));
+    const hasAuth = rt.includes("sign in") || rt.includes("sign-in") || rt.includes("verification") || rt.includes("verify") || rt.includes("login") || rt.includes("log in") || rt.includes("magic") || rt.includes("code") || rt.includes("otp") || rt.includes("passcode");
+    if (hasSender && hasAuth) {{
+      vendorAuthRows.push(row);
+    }} else if (hasSender) {{
       senderRows.push(row);
+    }} else if (hasAuth) {{
+      authRows.push(row);
     }}
   }}
-  const candidates = authRows.concat(senderRows);
+  const candidates = vendorAuthRows.concat(senderRows, authRows);
   let clickedRow = false;
   if (candidates.length > 0) {{
     const limit = Math.min(candidates.length, 5);
@@ -5181,15 +5449,7 @@ pub(super) fn authorize_with_headless_browser_config_and_credential(
 
             let child = spawn_with_two_fds(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))
                 .map_err(|_| "could not spawn headless browser")?;
-
-            struct ChildGuard(aterm_uds::spawnfd::LaneChild);
-            impl Drop for ChildGuard {
-                fn drop(&mut self) {
-                    let _ = self.0.kill();
-                    let _ = self.0.wait();
-                }
-            }
-            let _guard = ChildGuard(child);
+            let _guard = BrowserChild::new(child);
             let mut cdp = CdpClient::new(cmd_write, out_read);
             let mut seen_otps = BTreeSet::new();
 
@@ -5324,6 +5584,12 @@ pub struct Gate<'a> {
     /// The flow the sign-in started ([`FlowBound::of`] its first page), which every page and
     /// mailed link must stay within.
     pub bound: Option<&'a FlowBound>,
+    /// The command a person runs to sign the row's browser profile in once (`accounts browser`),
+    /// which a stop on a sign-in page names.
+    pub sign_in_once: Option<&'a str>,
+    /// Whether the row's email may be typed into the vendor's page and its mailbox read for the
+    /// mailed code ([`crate::ai::connector::SignIn::types_email`]).
+    pub types_email: bool,
 }
 
 /// The OAuth flow a vendor sign-in started, as its first page's URL names it: the client, where
@@ -5342,23 +5608,41 @@ pub struct FlowBound {
     pub callback_port: Option<u16>,
 }
 
+fn query_values(url: &str, key: &str) -> Vec<String> {
+    let Some((_, tail)) = url.split_once('?') else {
+        return Vec::new();
+    };
+    let query = tail.split('#').next().unwrap_or("");
+    query
+        .split('&')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (super::open_url::percent_decode(k) == key).then(|| super::open_url::percent_decode(v))
+        })
+        .collect()
+}
+
 /// The decoded value of the query parameter `key` of `url`.
 #[must_use]
 pub fn query_value(url: &str, key: &str) -> Option<String> {
-    let query = url.split_once('?')?.1.split('#').next().unwrap_or("");
-    query.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        (super::open_url::percent_decode(k) == key).then(|| super::open_url::percent_decode(v))
-    })
+    let mut vals = query_values(url, key).into_iter();
+    let first = vals.next()?;
+    vals.all(|v| v == first).then_some(first)
 }
 
 /// The port of `url` where it is a loopback `http://` URL (`127.0.0.1`, `localhost`).
 fn loopback_port(url: &str) -> Option<u16> {
+    if url
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return None;
+    }
     let rest = url
         .strip_prefix("http://127.0.0.1:")
         .or_else(|| url.strip_prefix("http://localhost:"))?;
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+    let port_str = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    port_str.parse::<u16>().ok().filter(|p| *p > 0)
 }
 
 impl FlowBound {
@@ -5376,24 +5660,43 @@ impl FlowBound {
 
     /// Why `url` (a page, or a mailed link) is outside this flow on `hosts`: it names another
     /// client, or hands its login to another place than this flow's, or to a host that is
-    /// neither this machine nor a pinned one.
+    /// neither this machine nor a pinned one, or carries another OAuth state on a flow URL.
     #[must_use]
     pub fn outside(&self, url: &str, hosts: &[&str]) -> Option<String> {
-        if let (Some(started), Some(named)) = (&self.client_id, query_value(url, "client_id"))
-            && *started != named
+        let clients = query_values(url, "client_id");
+        if clients.len() > 1 && clients.windows(2).any(|w| w[0] != w[1]) {
+            return Some("the page is another client's sign-in".to_owned());
+        }
+        if let (Some(started), Some(named)) = (&self.client_id, clients.first())
+            && started != named
         {
             return Some("the page is another client's sign-in".to_owned());
         }
-        let back = query_value(url, "redirect_uri")?;
-        if let Some(started) = &self.redirect_uri
-            && *started != back
+        let backs = query_values(url, "redirect_uri");
+        for back in &backs {
+            if let Some(started) = &self.redirect_uri
+                && started != back
+            {
+                return Some(
+                    "the page hands its login to another place than the sign-in's".to_owned(),
+                );
+            }
+            if loopback_port(back).is_none() && !super::login_drive::pinned(back, hosts) {
+                return Some(
+                    "the page hands its login off this machine and off the vendor's hosts"
+                        .to_owned(),
+                );
+            }
+        }
+        if (!clients.is_empty() || !backs.is_empty())
+            && let Some(started) = &self.state
         {
-            return Some("the page hands its login to another place than the sign-in's".to_owned());
+            let states = query_values(url, "state");
+            if states.iter().any(|named| named != started) {
+                return Some("the page is another sign-in flow's (its state differs)".to_owned());
+            }
         }
-        if loopback_port(&back).is_some() || super::login_drive::pinned(&back, hosts) {
-            return None;
-        }
-        Some("the page hands its login off this machine and off the vendor's hosts".to_owned())
+        None
     }
 }
 
@@ -5416,6 +5719,9 @@ pub enum Step {
     Done,
     /// Only the person can go on from here: why, without the URL or code.
     Stop(String),
+    /// The page wants the person's own sign-in to the vendor's site (another identity provider,
+    /// a password): why, without the URL or code, naming [`Gate::sign_in_once`] where it is set.
+    SignIn(String),
     /// The page is refused: why.
     Refuse(String),
 }
@@ -5456,12 +5762,18 @@ fn code_shaped(token: &str, code: &str) -> bool {
 }
 
 /// The tokens of `text` shaped like `code`, and whether `text` shows `code` itself (as a token,
-/// or with its spacing removed, as a page that boxes each character shows it).
+/// or with its spacing removed, as a page that boxes each character shows it). A word with an
+/// `@` in it is an address, never a code, so its parts are not read as one (a row's email such
+/// as `andy-2024@…` that Kimi's card names).
 fn codes_shown(text: &str, code: &str) -> (bool, bool) {
     let want = code.to_ascii_uppercase();
     let mut shaped = false;
     let mut same = false;
-    for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+    let tokens = text
+        .split_whitespace()
+        .filter(|word| !word.contains('@'))
+        .flat_map(|word| word.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')));
+    for token in tokens {
         if code_shaped(token, code) {
             shaped = true;
             same |= token.eq_ignore_ascii_case(&want);
@@ -5504,22 +5816,33 @@ fn sign_up_page(page: &Page) -> bool {
             "create account",
             "create your account",
             "sign up",
+            "注册账号",
+            "创建账号",
         ]
         .iter()
         .any(|w| page.heading.contains(w))
 }
 
 fn emails_in(text: &str) -> Vec<String> {
-    text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>' | ',' | ';' | '"'))
-        .map(|w| {
-            w.trim_matches(|c: char| !(c.is_ascii_alphanumeric()))
-                .to_ascii_lowercase()
+    text.split(|c: char| {
+        !matches!(
+            c,
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '@' | '.' | '_' | '%' | '+' | '-'
+        )
+    })
+    .map(|w| {
+        w.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            .to_ascii_lowercase()
+    })
+    .filter(|w| {
+        w.split_once('@').is_some_and(|(l, d)| {
+            !l.is_empty()
+                && !d.contains('@')
+                && d.split('.').count() >= 2
+                && d.split('.').all(|part| !part.is_empty())
         })
-        .filter(|w| {
-            w.split_once('@')
-                .is_some_and(|(l, d)| !l.is_empty() && d.contains('.'))
-        })
-        .collect()
+    })
+    .collect()
 }
 
 /// An email as a vendor's account names it: trimmed and lowercased, its `+tag` KEPT, since a
@@ -5528,13 +5851,25 @@ fn exact_email(email: &str) -> String {
     email.trim().to_ascii_lowercase()
 }
 
-/// The words with which a page names the account signed in to it.
-const SIGNED_IN_WORDS: &[&str] = &["signed in as", "logged in as", "continue as", "not you"];
+/// The words with which a page names the account signed in to it, in its text or on a button:
+/// Kimi's device card offers `Switch account` (kimi.ai) or `切换账号` (kimi.com) beside the
+/// account it names.
+const SIGNED_IN_WORDS: &[&str] = &[
+    "signed in as",
+    "logged in as",
+    "continue as",
+    "not you",
+    "switch account",
+    "切换账号",
+];
 
 fn says_signed_in(page: &Page) -> bool {
     let lower = page.text.to_ascii_lowercase();
     SIGNED_IN_WORDS.iter().any(|w| lower.contains(w))
-        || page.buttons.iter().any(|b| b.starts_with("continue as "))
+        || page
+            .buttons
+            .iter()
+            .any(|b| b.starts_with("continue as ") || SIGNED_IN_WORDS.iter().any(|w| b.contains(w)))
 }
 
 /// Whether the page names an account other than the row's as the one signed in: any email it
@@ -5573,9 +5908,45 @@ fn shows_email(page: &Page, gate: &Gate<'_>) -> bool {
             .any(|e| exact_email(&e) == want)
 }
 
+/// Whether a button may ever be pressed: never one that cancels, declines, signs up, signs in
+/// with another provider, or agrees to or accepts anything, or names cookies, terms or a policy,
+/// or allows all (a cookie banner's): a vendor's terms and a site's cookies are the person's to
+/// accept.
 fn pressable(label: &str) -> bool {
     ![
-        "cancel", "deny", "decline", "reject", "not you", "sign up", "create", "with ",
+        "cancel",
+        "deny",
+        "decline",
+        "reject",
+        "revoke",
+        "logout",
+        "log out",
+        "sign out",
+        "signout",
+        "not you",
+        "sign up",
+        "create",
+        "with ",
+        "without ",
+        "switch ",
+        "another ",
+        "agree",
+        "accept",
+        "cookie",
+        "terms",
+        "policy",
+        "allow all",
+        "同意",
+        "接受",
+        "取消",
+        "拒绝",
+        "注册",
+        "退出",
+        "登出",
+        "注销",
+        "切换",
+        "条款",
+        "协议",
     ]
     .iter()
     .any(|w| label.contains(w))
@@ -5597,15 +5968,78 @@ const CONFIRM_LABELS: &[&str] = &[
     "allow",
     "continue",
     "yes",
-    "accept",
 ];
+
+/// The confirm labels of a device card that names the account signed in to it
+/// ([`says_signed_in`]): Kimi's `Log in` (kimi.ai) and `登录` (kimi.com). On any other page they
+/// are a sign-in form's submit, never a confirm.
+const SIGNED_IN_CONFIRM_LABELS: &[&str] = &["log in", "登录"];
+
+/// The device page's confirm button. A page whose text shows the code takes one of
+/// [`CONFIRM_LABELS`], or, on a card that names the account signed in, one of
+/// [`SIGNED_IN_CONFIRM_LABELS`]. A card that shows its code only in its URL (Kimi's) takes only
+/// one of [`SIGNED_IN_CONFIRM_LABELS`], its own `Log in`: its other buttons (a banner's
+/// `Continue` or `Allow all`) are not the card's.
+fn confirm_button(page: &Page, in_text: bool) -> Option<usize> {
+    if !in_text {
+        return button_of(page, SIGNED_IN_CONFIRM_LABELS);
+    }
+    button_of(page, CONFIRM_LABELS).or_else(|| {
+        says_signed_in(page)
+            .then(|| button_of(page, SIGNED_IN_CONFIRM_LABELS))
+            .flatten()
+    })
+}
+
+/// Whether a device page names another code than the CLI printed (`other`) and whether it names
+/// the printed `code` (`same`): its text shows the code (as [`codes_shown`] reads it), or its URL's
+/// `user_code` is the code and the page names the account signed in (Kimi's card shows its code
+/// only in its URL). A `user_code` that differs, or a code-shaped token in a text that does not
+/// show the printed code, is another code.
+fn device_code(page: &Page, code: &str) -> (bool, bool) {
+    let (shaped, shown) = codes_shown(&page.text, code);
+    let in_url = query_values(&page.url, "user_code");
+    let url_other = in_url.iter().any(|named| !named.eq_ignore_ascii_case(code));
+    let url_same = !in_url.is_empty() && !url_other && says_signed_in(page);
+    (url_other || (shaped && !shown), shown || url_same)
+}
+
+/// The tail a stop on a sign-in page carries: the command that signs the row's browser profile
+/// in once, where the gate names one.
+fn sign_in_once_tail(gate: &Gate<'_>) -> String {
+    gate.sign_in_once.map_or_else(String::new, |command| {
+        format!(
+            "; if the row's browser profile is signed out there, sign it in once with `{command}`"
+        )
+    })
+}
+
+/// Whether the page asks to agree to something: a button labelled `agree`, `同意` or `接受`, or
+/// `accept` other than a cookie banner's, or a heading that names terms or a policy (a terms
+/// update whose one button is `Continue`). The vendor's terms are the person's to accept, so
+/// nothing on such a page is pressed; a cookie banner's buttons are never pressed either
+/// ([`pressable`]), but the page beneath it may be.
+fn asks_to_agree(page: &Page) -> bool {
+    page.buttons.iter().any(|b| {
+        ["agree", "同意", "接受"].iter().any(|w| b.contains(w))
+            || b.contains("accept") && !b.contains("cookie")
+    }) || ["terms", "policy", "条款", "协议", "隐私"]
+        .iter()
+        .any(|w| page.heading.contains(w))
+}
+
+/// Whether the page is a bot-protection block page (Cloudflare's `Sorry, you have been
+/// blocked`), which only a person past it can go on from.
+fn block_page(page: &Page) -> bool {
+    let lower = page.text.to_ascii_lowercase();
+    lower.contains("sorry, you have been blocked") && lower.contains("cloudflare")
+}
 
 const CONSENT_LABELS: &[&str] = &[
     "authorize",
     "allow",
     "approve",
     "continue",
-    "accept",
     "confirm",
     "grant access",
 ];
@@ -5639,25 +6073,55 @@ const SUCCESS_WORDS: &[&str] = &[
 
 /// The step one vendor sign-in page calls for (design §6): a pure judgment of the page's host,
 /// text, buttons and inputs. Nothing is pressed off the pinned hosts, on another identity
-/// provider or on a sign-up page; a device page is confirmed once, and only when it shows the
-/// code the CLI printed; a page showing another code, or another account signed in, is refused.
+/// provider, on a sign-up page or on a bot-protection block page; a device page is confirmed once,
+/// and only when it shows the code the CLI printed (in its text, or in its URL on a card naming
+/// the account signed in); a page showing another code, or another account signed in, is
+/// refused; another provider's page or a password asks for the person's sign-in
+/// ([`Step::SignIn`]); where the row's email may not be typed ([`Gate::types_email`]), an email
+/// field or the mailed code's steps wait for the person's sign-in as well.
 #[must_use]
 pub fn vendor_step(page: &Page, gate: &Gate<'_>) -> Step {
+    let step = page_step(page, gate);
+    if !gate.types_email && matches!(step, Step::FillEmail | Step::Mailbox | Step::FillOtp) {
+        return Step::SignIn(format!(
+            "the page asks for the account's email or its mailed code, which this vendor's \
+             sign-in takes only from a person (its form signs a new account up as readily as \
+             it signs one in){}",
+            sign_in_once_tail(gate)
+        ));
+    }
+    step
+}
+
+/// [`vendor_step`] before its [`Gate::types_email`] rule.
+fn page_step(page: &Page, gate: &Gate<'_>) -> Step {
     use crate::ai::connector::Completion;
     let url = page.url.as_str();
     if url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:") {
-        let wanted = gate.bound.and_then(|b| b.callback_port);
-        return match gate.completion {
-            Completion::Loopback if wanted.is_none_or(|port| loopback_port(url) == Some(port)) => {
-                Step::Done
-            }
-            Completion::Loopback => Step::Refuse(
-                "the page went to a local port other than the sign-in's callback".to_owned(),
-            ),
-            Completion::Device => {
-                Step::Refuse("a device sign-in's page went to a local callback".to_owned())
-            }
+        let Some(port) = loopback_port(url) else {
+            return Step::Stop("the sign-in page left https".to_owned());
         };
+        if gate.completion == Completion::Device {
+            return Step::Refuse("a device sign-in's page went to a local callback".to_owned());
+        }
+        let wanted = gate.bound.and_then(|b| b.callback_port);
+        if wanted.is_some_and(|w| w != port) {
+            return Step::Refuse(
+                "the page went to a local port other than the sign-in's callback".to_owned(),
+            );
+        }
+        if let Some(started) = gate.bound.and_then(|b| b.state.as_deref()) {
+            let states = query_values(url, "state");
+            if states.iter().any(|named| named != started) {
+                return Step::Refuse(
+                    "the callback is another sign-in flow's (its state differs)".to_owned(),
+                );
+            }
+        }
+        if !query_values(url, "error").is_empty() {
+            return Step::Refuse("the sign-in callback reported an OAuth error".to_owned());
+        }
+        return Step::Done;
     }
     if url.is_empty()
         || url == "about:blank"
@@ -5670,14 +6134,22 @@ pub fn vendor_step(page: &Page, gate: &Gate<'_>) -> Step {
         return Step::Stop("the sign-in page left https".to_owned());
     };
     if !gate.hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
-        let idp = OTHER_IDPS.contains(&host.as_str())
-            || host.ends_with(".google.com")
-            || host.ends_with(".apple.com");
-        return Step::Stop(if idp {
-            format!("the sign-in went to {host}, another identity provider aterm never signs in to")
+        let idp = OTHER_IDPS.contains(&host.as_str()) || super::browser_window::idp_cookie(&host);
+        return if idp {
+            Step::SignIn(format!(
+                "the sign-in went to {host}, another identity provider aterm never signs in to{}",
+                sign_in_once_tail(gate)
+            ))
         } else {
-            format!("the sign-in left its pinned hosts for {host}")
-        });
+            Step::Stop(format!("the sign-in left its pinned hosts for {host}"))
+        };
+    }
+    if block_page(page) {
+        return Step::Stop(
+            "the vendor's site answered this browser with a bot-protection block page, so only \
+             a person can go on"
+                .to_owned(),
+        );
     }
     if sign_up_page(page) {
         return Step::Stop("the page asks to create an account, which aterm never does".to_owned());
@@ -5705,20 +6177,27 @@ pub fn vendor_step(page: &Page, gate: &Gate<'_>) -> Step {
         };
     }
     if has_field(page, Field::Password) {
-        return Step::Stop("the page asks for a password, which aterm does not hold".to_owned());
+        return Step::SignIn(format!(
+            "the page asks for a password, which aterm does not hold{}",
+            sign_in_once_tail(gate)
+        ));
+    }
+    if asks_to_agree(page) {
+        return Step::Wait;
     }
     if gate.completion == Completion::Device
         && let Some(code) = gate.code
     {
-        let (shaped, same) = codes_shown(&page.text, code);
+        let (other, same) = device_code(page, code);
+        if other {
+            return Step::Refuse("the page shows another code than the CLI printed".to_owned());
+        }
         if same {
             if gate.confirmed {
                 return Step::Wait;
             }
-            return button_of(page, CONFIRM_LABELS).map_or(Step::Wait, Step::Press);
-        }
-        if shaped {
-            return Step::Refuse("the page shows another code than the CLI printed".to_owned());
+            let in_text = codes_shown(&page.text, code).1;
+            return confirm_button(page, in_text).map_or(Step::Wait, Step::Press);
         }
         if has_field(page, Field::Code) && !gate.filled_code {
             return Step::FillCode;
@@ -5733,7 +6212,9 @@ pub fn vendor_step(page: &Page, gate: &Gate<'_>) -> Step {
     {
         return Step::Mailbox;
     }
-    let consent = gate.completion == Completion::Loopback || gate.filled_code || gate.confirmed;
+    let consent = (gate.completion == Completion::Loopback || gate.filled_code || gate.confirmed)
+        && !has_field(page, Field::Email)
+        && !has_field(page, Field::Code);
     if consent
         && gate.pressed < MAX_CONSENT_PRESSES
         && let Some(at) = button_of(page, CONSENT_LABELS)
@@ -5753,13 +6234,13 @@ pub const VENDOR_PAGE_JS: &str = r#"(() => {
   const kind = i => {
     const t = String(i.type || "").toLowerCase(), n = String(i.name || "").toLowerCase();
     const a = String(i.autocomplete || "").toLowerCase(), m = String(i.inputMode || "").toLowerCase();
-    if (t === "email" || n.includes("email") || a.includes("email") || a === "username") return "email";
     if (t === "password") return "password";
+    if (t === "email" || n.includes("email") || a.includes("email") || a === "username") return "email";
     if (a === "one-time-code" || n.includes("code") || n.includes("otp") || m === "numeric" || i.maxLength === 1) return "code";
     return "other";
   };
   const inputs = Array.from(document.querySelectorAll("input")).filter(visible)
-    .filter(i => !["checkbox", "radio", "submit", "button", "image", "reset"].includes(String(i.type || "").toLowerCase()))
+    .filter(i => !i.readOnly && !["checkbox", "radio", "submit", "button", "image", "reset"].includes(String(i.type || "").toLowerCase()))
     .map(kind);
   const h = document.querySelector("h1, h2");
   return {
@@ -5797,6 +6278,8 @@ pub fn vendor_act_js(step: &Step, value: Option<&str>) -> String {
 {SUBMIT_INPUT_HELPERS_JS}
   const visible = el => !el.disabled && !el.hidden && el.type !== "hidden" &&
     el.getAttribute("aria-disabled") !== "true" && el.getClientRects().length > 0;
+  const textInput = el => visible(el) && !el.readOnly &&
+    !["hidden", "checkbox", "radio", "password", "submit", "button", "image", "reset"].includes(String(el.type || "").toLowerCase());
   const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], [role='button']")).filter(visible);
   const verb = "{verb}";
   const value = {value_json};
@@ -5807,14 +6290,14 @@ pub fn vendor_act_js(step: &Step, value: Option<&str>) -> String {
     return {{ ok: true }};
   }}
   if (verb === "email") {{
-    const input = Array.from(document.querySelectorAll("input[type='email'], input[name*='email'], input[autocomplete*='email'], input[autocomplete='username']")).find(visible);
+    const input = Array.from(document.querySelectorAll("input[type='email'], input[name*='email' i], input[autocomplete*='email' i], input[autocomplete='username' i]")).find(textInput);
     if (!input || !value) return {{ ok: false }};
     setNativeValue(input, value);
     return {{ ok: submitInput(input, buttons, /continue|next|sign in|log in|send|submit/i) }};
   }}
   if (verb === "code") {{
-    const explicit = Array.from(document.querySelectorAll("input[autocomplete='one-time-code'], input[name*='code'], input[name*='otp'], input[inputmode='numeric']"));
-    const boxes = Array.from(document.querySelectorAll("input[maxlength='1']"));
+    const explicit = Array.from(document.querySelectorAll("input[autocomplete='one-time-code' i], input[name*='code' i], input[name*='otp' i], input[inputmode='numeric' i]")).filter(textInput);
+    const boxes = Array.from(document.querySelectorAll("input[maxlength='1']")).filter(textInput);
     const filled = fillCodeInputs(codeInputsFor(explicit, boxes), value);
     if (!filled) return {{ ok: false }};
     return {{ ok: submitInput(filled, buttons, /continue|verify|confirm|submit|next|sign in|log in/i) }};
@@ -5871,14 +6354,28 @@ pub const VENDOR_STALL: Duration = Duration::from_secs(90);
 /// another provider, a phone number, a CAPTCHA), so the drive stops there, naming the page,
 /// instead of waiting out its whole budget; a device page already confirmed waits on the CLI,
 /// never on a person, and never stalls.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PageStall {
     seen: Option<(String, Instant)>,
+    within: Duration,
+}
+
+impl Default for PageStall {
+    fn default() -> PageStall {
+        PageStall::within(VENDOR_STALL)
+    }
 }
 
 impl PageStall {
+    /// A stall that stops a page unchanged for `within` (a test's short one; else
+    /// [`VENDOR_STALL`]).
+    #[must_use]
+    pub fn within(within: Duration) -> PageStall {
+        PageStall { seen: None, within }
+    }
+
     /// Notes that the drive decided `step` on `page` at `now`; `Some(why)` once the same page
-    /// has asked nothing of aterm for [`VENDOR_STALL`].
+    /// has asked nothing of aterm for its stall ([`VENDOR_STALL`]).
     pub fn note(
         &mut self,
         page: &Page,
@@ -5896,11 +6393,12 @@ impl PageStall {
         );
         match &self.seen {
             Some((seen, since)) if *seen == key => {
-                (now.saturating_duration_since(*since) >= VENDOR_STALL).then(|| {
+                (now.saturating_duration_since(*since) >= self.within).then(|| {
                     format!(
                         "the sign-in waits on {} for a person: nothing there is aterm's to press \
-                         or fill",
-                        page_place(page, gate)
+                         or fill{}",
+                        page_place(page, gate),
+                        sign_in_once_tail(gate)
                     )
                 })
             }
@@ -5940,14 +6438,55 @@ pub fn page_place(page: &Page, gate: &Gate<'_>) -> String {
 
 /// Drives one vendor sign-in page in `cdp` from `start` ([`vendor_step`] each tick) until the
 /// page approves it, `finished` says the CLI is done, or `deadline`; `mailbox` answers a
-/// [`Step::Mailbox`].
-#[allow(clippy::too_many_lines)]
+/// [`Step::Mailbox`]. A page unchanged for [`VENDOR_STALL`] with nothing of aterm's on it ends
+/// it [`super::login_drive::Approval::NeedsSignIn`] ([`PageStall`]).
 pub fn drive_cdp_vendor(
     cdp: &mut CdpClient,
     start: &str,
     gate: Gate<'_>,
     finished: &dyn Fn() -> bool,
     deadline: Instant,
+    mailbox: impl FnMut(&mut CdpClient, Option<&str>) -> Result<MailboxCredential, &'static str>,
+) -> super::login_drive::Approval {
+    drive_cdp_vendor_within(
+        cdp,
+        start,
+        gate,
+        (finished, deadline),
+        PageStall::default(),
+        mailbox,
+    )
+}
+
+/// What a carried-out `step` on `page` leaves in `gate`: a device page's press is its one
+/// confirm where the page names the printed code ([`device_code`], in its text or, on a
+/// signed-in card, its URL), any other press a consent press; a fill marks its field filled.
+pub(super) fn note_acted(gate: &mut Gate<'_>, page: &Page, step: &Step) {
+    match step {
+        Step::Press(_) => {
+            if gate.completion == crate::ai::connector::Completion::Device
+                && gate.code.is_some_and(|c| device_code(page, c).1)
+            {
+                gate.confirmed = true;
+            } else {
+                gate.pressed += 1;
+            }
+        }
+        Step::FillCode => gate.filled_code = true,
+        Step::FillEmail => gate.filled_email = true,
+        Step::FillOtp => gate.filled_otp = true,
+        _ => {}
+    }
+}
+
+/// [`drive_cdp_vendor`] with `stall` its page stall (a test's short one).
+#[allow(clippy::too_many_lines)]
+pub(super) fn drive_cdp_vendor_within(
+    cdp: &mut CdpClient,
+    start: &str,
+    gate: Gate<'_>,
+    (finished, deadline): (&dyn Fn() -> bool, Instant),
+    mut stall: PageStall,
     mut mailbox: impl FnMut(&mut CdpClient, Option<&str>) -> Result<MailboxCredential, &'static str>,
 ) -> super::login_drive::Approval {
     use super::login_drive::Approval;
@@ -5998,7 +6537,7 @@ pub fn drive_cdp_vendor(
     let mut otp: Option<String> = None;
     let mut page_proved = false;
     let mut mailbox_polls = 0usize;
-    let mut stall = PageStall::default();
+    let mut post_otp_wait_ticks = 0usize;
     let mut last_place: Option<String> = None;
     let result = loop {
         if finished() {
@@ -6038,7 +6577,7 @@ pub fn drive_cdp_vendor(
         let step = vendor_step(&page, &view);
         last_place = Some(page_place(&page, &view));
         if let Some(why) = stall.note(&page, &step, &view, Instant::now()) {
-            break Approval::NeedsYou(why);
+            break Approval::NeedsSignIn(why);
         }
         let value = match step {
             Step::FillCode => gate.code,
@@ -6056,9 +6595,25 @@ pub fn drive_cdp_vendor(
                 break Approval::Approved { page: page_proved };
             }
             Step::Stop(why) => break Approval::NeedsYou(why.clone()),
+            Step::SignIn(why) => break Approval::NeedsSignIn(why.clone()),
             Step::Refuse(why) => break Approval::Refused(why.clone()),
-            Step::Wait => {}
+            Step::Wait => {
+                let lower = page.text.to_ascii_lowercase();
+                let still_wants_mail =
+                    has_field(&page, Field::Code) || MAIL_WORDS.iter().any(|w| lower.contains(w));
+                if gate.filled_otp && mailbox_polls < 3 && still_wants_mail {
+                    post_otp_wait_ticks += 1;
+                    if post_otp_wait_ticks >= 2 {
+                        gate.filled_otp = false;
+                        otp = None;
+                        post_otp_wait_ticks = 0;
+                    }
+                } else {
+                    post_otp_wait_ticks = 0;
+                }
+            }
             Step::Mailbox => {
+                post_otp_wait_ticks = 0;
                 if mailbox_polls >= 3 {
                     break Approval::NeedsYou(
                         "the vendor's sign-in mail did not come, or no mailbox is configured"
@@ -6086,11 +6641,13 @@ pub fn drive_cdp_vendor(
                             json!({"url": link}),
                             step_timeout(),
                         );
+                        gate.filled_otp = true;
                     }
                     Err(why) => break Approval::NeedsYou(why.to_owned()),
                 }
             }
             Step::Press(_) | Step::FillCode | Step::FillEmail | Step::FillOtp => {
+                post_otp_wait_ticks = 0;
                 let acted = cdp
                     .call(
                         Some(&session),
@@ -6102,21 +6659,7 @@ pub fn drive_cdp_vendor(
                     .and_then(|v| v.pointer("/result/value/ok").and_then(Value::as_bool))
                     .unwrap_or(false);
                 if acted {
-                    match step {
-                        Step::Press(_) => {
-                            if gate.completion == crate::ai::connector::Completion::Device
-                                && gate.code.is_some_and(|c| codes_shown(&page.text, c).1)
-                            {
-                                gate.confirmed = true;
-                            } else {
-                                gate.pressed += 1;
-                            }
-                        }
-                        Step::FillCode => gate.filled_code = true,
-                        Step::FillEmail => gate.filled_email = true,
-                        Step::FillOtp => gate.filled_otp = true,
-                        _ => {}
-                    }
+                    note_acted(&mut gate, &page, &step);
                 }
             }
         }
@@ -6143,19 +6686,26 @@ fn in_profile(
 
 /// The headless browser as a vendor sign-in's [`super::login_drive::Approver`]: the persistent
 /// profile of the row's email (else `<cli>-<label>`) under Claude Code's store, shared by every
-/// vendor; the mailbox configured for that email, its inbox rows chosen by the vendor's senders.
+/// vendor ([`row_browser_profile`]); the mailbox configured for that email, its inbox rows chosen
+/// by the vendor's senders.
 #[derive(Debug, Clone)]
 pub struct VendorApprover {
     /// Claude Code's store directory (`accounts::Store::shared_dir`).
     pub shared_dir: PathBuf,
     /// The profile's key where the row names no email.
     pub label_key: String,
+    /// `aterm harness accounts browser <label> --cli <id>`, which a stop on the vendor's sign-in
+    /// page names.
+    pub sign_in_once: String,
     /// The mailbox, where one is configured for the row.
     pub mailbox: Option<MailboxConfig>,
     /// The vendor's sender words.
     pub senders: &'static [&'static str],
     /// `$HOME`, for the browser's location.
     pub home: Option<PathBuf>,
+    /// Whether the row's email may be typed into the vendor's page
+    /// ([`crate::ai::connector::SignIn::types_email`]).
+    pub types_email: bool,
 }
 
 impl VendorApprover {
@@ -6168,12 +6718,7 @@ impl VendorApprover {
         shared_dir: &Path,
         home: Option<&Path>,
     ) -> VendorApprover {
-        let prefix = format!("{}-", cli.id());
-        let label_key = if label.starts_with(&prefix) {
-            label.to_owned()
-        } else {
-            format!("{prefix}{label}")
-        };
+        let label_key = vendor_label_key(cli, label);
         let senders = cli.accounts().mail_senders;
         let mailbox = discover_mailbox_config(home, Some(shared_dir))
             .map(|mut cfg| {
@@ -6185,10 +6730,22 @@ impl VendorApprover {
         VendorApprover {
             shared_dir: shared_dir.to_path_buf(),
             label_key,
+            sign_in_once: format!("aterm harness accounts browser {label} --cli {}", cli.id()),
             mailbox,
             senders,
             home: home.map(Path::to_path_buf),
+            types_email: cli
+                .accounts()
+                .signin
+                .as_ref()
+                .is_some_and(|signin| signin.types_email),
         }
+    }
+
+    /// The browser profile a sign-in of the row with `email` runs in ([`vendor_profile_dir`]).
+    #[must_use]
+    pub fn profile_dir(&self, email: Option<&str>) -> PathBuf {
+        vendor_profile_dir(&self.shared_dir, &self.label_key, email)
     }
 }
 
@@ -6201,6 +6758,20 @@ impl super::login_drive::Approver for VendorApprover {
         use super::login_drive::Approval;
         use aterm_uds::spawnfd::{ChildStdio, LaneCommand, spawn_with_two_fds};
         use std::os::fd::OwnedFd;
+        let profile_dir = self.profile_dir(handoff.email);
+        let _ = aterm_types::fs_restricted::ensure_private_dir(
+            profile_dir.parent().unwrap_or(&self.shared_dir),
+        );
+        let _ = aterm_types::fs_restricted::ensure_private_dir(&profile_dir);
+        let _claimed = match super::browser_window::ProfileLock::claim(&profile_dir) {
+            Ok(claimed) => claimed,
+            Err(why) => {
+                return Approval::NeedsYou(format!(
+                    "the row's browser profile is {}",
+                    why.words(&profile_dir)
+                ));
+            }
+        };
         let Some(browser) = find_headless_browser(self.home.as_deref()) else {
             return Approval::NeedsYou("no headless browser is installed here".to_owned());
         };
@@ -6212,11 +6783,8 @@ impl super::login_drive::Approver for VendorApprover {
         });
         let senders = self.senders;
         let bound = FlowBound::of(handoff.url);
-        let profile_dir = vendor_profile_dir(&self.shared_dir, &self.label_key, handoff.email);
-        let _ = aterm_types::fs_restricted::ensure_private_dir(
-            profile_dir.parent().unwrap_or(&self.shared_dir),
-        );
-        let _ = aterm_types::fs_restricted::ensure_private_dir(&profile_dir);
+        let sign_in_once = self.sign_in_once.as_str();
+        let types_email = self.types_email;
         let ran = in_profile(&profile_dir, |profile_dir| {
             let (cmd_read, cmd_write) =
                 std::io::pipe().map_err(|_| "could not open CDP command pipe")?;
@@ -6229,14 +6797,7 @@ impl super::login_drive::Approver for VendorApprover {
                 .stderr(ChildStdio::Null);
             let child = spawn_with_two_fds(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))
                 .map_err(|_| "could not spawn headless browser")?;
-            struct ChildGuard(aterm_uds::spawnfd::LaneChild);
-            impl Drop for ChildGuard {
-                fn drop(&mut self) {
-                    let _ = self.0.kill();
-                    let _ = self.0.wait();
-                }
-            }
-            let _guard = ChildGuard(child);
+            let _guard = BrowserChild::new(child);
             let mut cdp = CdpClient::new(cmd_write, out_read);
             let mut seen_otps = BTreeSet::new();
             let gate = Gate {
@@ -6252,6 +6813,8 @@ impl super::login_drive::Approver for VendorApprover {
                 filled_email: false,
                 filled_otp: false,
                 bound: Some(&bound),
+                sign_in_once: Some(sign_in_once),
+                types_email,
             };
             outcome = drive_cdp_vendor(
                 &mut cdp,
@@ -6291,7 +6854,7 @@ impl super::login_drive::Approver for VendorApprover {
 
 #[cfg(test)]
 #[path = "headless_vendor_tests.rs"]
-mod vendor_tests;
+pub(super) mod vendor_tests;
 
 #[cfg(test)]
 mod uri_authority_tests {

@@ -328,7 +328,7 @@ pub(crate) fn view_matches(build: &Path, view: &Path, depth: Depth) -> bool {
 pub(crate) fn first_mismatch(build: &Path, view: &Path, depth: Depth) -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        if !is_real_dir(view) {
+        if !is_real_dir(&view_tree(view)) {
             return Some(view.to_path_buf());
         }
         bin_mismatch(build, view)
@@ -441,6 +441,15 @@ pub(crate) fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
+/// The directory that holds the view at `view`: `<name>.noindex` when `view` is its link
+/// ([`aterm_toolchain::layout`]'s Spotlight layout), else `view` itself. Any other link at
+/// the view's name is itself, which no reader takes for a view.
+pub(crate) fn view_tree(view: &Path) -> PathBuf {
+    aterm_toolchain::layout::aside_of(view)
+        .filter(|_| aterm_toolchain::layout::is_linked_aside(view))
+        .unwrap_or_else(|| view.to_path_buf())
+}
+
 /// [`Depth::Shallow`] over `lib/`: every regular file directly in `src` a clone of it in `dst`.
 #[cfg(unix)]
 fn top_files_mismatch(src: &Path, dst: &Path) -> Option<PathBuf> {
@@ -529,6 +538,7 @@ pub(crate) fn refresh_view_with(
     name: &str,
     running: &dyn Fn() -> Option<Vec<PathBuf>>,
 ) -> io::Result<Refreshed> {
+    settle_view_aside(layout, name);
     sweep_view_debris(&view_dir(layout, name));
     #[cfg(unix)]
     if let ViewSource::Linked(checkout) = view_source(layout) {
@@ -539,12 +549,22 @@ pub(crate) fn refresh_view_with(
     let src_bin = build.join("bin");
     let view = view_dir(layout, name);
     layout.ensure_dir(&views_root(layout))?;
-    layout.ensure_dir(&view)?;
-    if view_matches(&build, &view, Depth::Deep) {
+    // A view that is not laid aside yet is laid whole, aside, when it is laid at all.
+    let lay_whole =
+        crate::store::lays_aside(&build) && !aterm_toolchain::layout::is_linked_aside(&view);
+    let absent = std::fs::symlink_metadata(&view).is_err();
+    if !(lay_whole && absent) {
+        layout.ensure_dir(&view_tree(&view))?;
+    }
+    if !absent && view_matches(&build, &view, Depth::Deep) {
         return Ok(bin_plan(&src_bin)?.refreshed(build, false, None));
     }
     if let Some(deferred) = relay_blocked(layout, name, &view, running) {
         return Ok(bin_plan(&src_bin)?.refreshed(build, false, Some(deferred)));
+    }
+    #[cfg(unix)]
+    if lay_whole {
+        return lay_view_aside(layout, &build, &view);
     }
     let pid = std::process::id().to_string();
     for dir in VIEW_DIRS {
@@ -582,6 +602,113 @@ pub(crate) fn refresh_view_with(
     let _ = std::fs::remove_dir_all(&old);
     swap_in(&staged, &live, &old)?;
     Ok(plan.refreshed(build, changed, None))
+}
+
+/// Lay the whole view of `build` at `<view>.noindex` and put it in place behind the link
+/// `view` -> `<view>.noindex` ([`aterm_toolchain::layout`]): where no view stands yet, or over
+/// a plain view this refresh replaces anyway, which nothing runs from ([`relay_blocked`]).
+/// The view is laid at `.<name>.lay-<pid>` and renamed whole to its aside, so an aside is
+/// always complete and nothing runs from one half laid; the plain view goes only once the
+/// link stands, and a crash anywhere leaves what [`settle_view_aside`] puts in order.
+#[cfg(unix)]
+fn lay_view_aside(layout: &Layout, build: &Path, view: &Path) -> io::Result<Refreshed> {
+    let (Some(aside), Some(name)) = (
+        aterm_toolchain::layout::aside_of(view),
+        view.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} names no view", view.display()),
+        ));
+    };
+    let plan = bin_plan(&build.join("bin"))?;
+    // No link names whatever is at the aside's name: no view is laid aside yet.
+    if std::fs::symlink_metadata(&aside).is_ok() {
+        crate::store::remove_tree(&aside)?;
+    }
+    let staged = view.with_file_name(format!(".{name}{LAYING}{}", std::process::id()));
+    if std::fs::symlink_metadata(&staged).is_ok() {
+        crate::store::remove_tree(&staged)?;
+    }
+    if let Err(e) = lay_view(layout, build, &staged).and_then(|()| std::fs::rename(&staged, &aside))
+    {
+        let _ = crate::store::remove_tree(&staged);
+        return Err(e);
+    }
+    let plain = std::fs::symlink_metadata(view).is_ok();
+    let changed = !plain
+        || stock_bytes_mismatch(build, view).is_some()
+        || !same_bin(&view.join("bin"), &aside.join("bin"));
+    let parked = parked_view(view, name);
+    if plain {
+        let _ = std::fs::remove_dir_all(&parked);
+        crate::platform::remove_link(&parked);
+        if let Err(e) = std::fs::rename(view, &parked) {
+            let _ = crate::store::remove_tree(&aside);
+            return Err(e);
+        }
+    }
+    if let Err(e) = crate::store::link_aside(view) {
+        if plain {
+            let _ = std::fs::rename(&parked, view);
+        }
+        let _ = crate::store::remove_tree(&aside);
+        return Err(e);
+    }
+    if let Some(root) = view.parent() {
+        crate::store::sync_dir_ordered(root);
+    }
+    if plain {
+        let _ = std::fs::remove_dir_all(&parked);
+        crate::platform::remove_link(&parked);
+    }
+    Ok(plan.refreshed(build.to_path_buf(), changed, None))
+}
+
+/// `.<name>.old-<pid>` beside the view `view`: where [`lay_view_aside`] parks the plain view it
+/// replaces until the new one's link stands.
+#[cfg(unix)]
+fn parked_view(view: &Path, name: &str) -> PathBuf {
+    view.with_file_name(format!(".{name}{PARKED}{}", std::process::id()))
+}
+
+/// The infix of `.<name>.lay-<pid>`, where [`lay_view_aside`] lays a view before renaming it
+/// whole to `<name>.noindex`.
+const LAYING: &str = ".lay-";
+
+/// The infix of `.<name>.old-<pid>` ([`parked_view`]).
+const PARKED: &str = ".old-";
+
+/// Put the Spotlight layout of the view `name` in order after a crash
+/// ([`lay_view_aside`]): an aside (always complete) with no link at the view's name gets it,
+/// an aside beside a plain view (a lay cut short before the move) goes, and so do a view half
+/// laid and a plain view parked by an earlier lay.
+fn settle_view_aside(layout: &Layout, name: &str) {
+    let view = view_dir(layout, name);
+    crate::store::relink_aside(&view);
+    if let Some(aside) = aterm_toolchain::layout::aside_of(&view)
+        && std::fs::symlink_metadata(&view).is_ok_and(|m| m.is_dir())
+        && std::fs::symlink_metadata(&aside).is_ok()
+    {
+        let _ = crate::store::remove_tree(&aside);
+    }
+    let Ok(entries) = std::fs::read_dir(views_root(layout)) else {
+        return;
+    };
+    let stems = [format!(".{name}{LAYING}"), format!(".{name}{PARKED}")];
+    for entry in entries.flatten() {
+        let debris = entry.file_name().to_str().is_some_and(|n| {
+            stems.iter().any(|stem| {
+                n.strip_prefix(stem.as_str())
+                    .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+            })
+        });
+        if debris {
+            let path = entry.path();
+            let _ = std::fs::remove_dir_all(&path);
+            crate::platform::remove_link(&path);
+        }
+    }
 }
 
 fn swap_in(staged: &Path, at: &Path, old: &Path) -> io::Result<()> {
@@ -767,7 +894,7 @@ fn refresh_linked_view(
 ) -> io::Result<Refreshed> {
     let view = view_dir(layout, name);
     layout.ensure_dir(&views_root(layout))?;
-    layout.ensure_dir(&view)?;
+    layout.ensure_dir(&view_tree(&view))?;
     let src_bin = checkout.join("bin");
     let plan = bin_plan(&src_bin)?;
     if linked_view_matches(checkout, &view, &plan) {
@@ -1803,7 +1930,8 @@ pub fn detach(
         }
         Entry::Link(raw) if p.in_prefix => {
             unlink_checked(&p.path)?;
-            let _ = std::fs::remove_dir_all(view_dir(layout, name));
+            // The view whole: a view laid aside goes with its link.
+            let _ = crate::store::remove_tree(&view_dir(layout, name));
             unrecord(layout, name)?;
             Ok(Detached::Removed {
                 key,
@@ -3671,6 +3799,222 @@ mod tests {
         ));
     }
 
+    /// The view as an atpkg before the Spotlight layout laid it: a real directory at its
+    /// name, from the view this one laid aside.
+    #[cfg(target_os = "macos")]
+    fn make_plain(view: &Path) {
+        let aside = view.with_file_name(format!(
+            "{}.noindex",
+            view.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::remove_file(view).unwrap();
+        std::fs::rename(&aside, view).unwrap();
+        assert!(is_real_dir(view), "PRECONDITION: a plain view");
+    }
+
+    /// The rustup views Spotlight still indexes, by name.
+    #[cfg(target_os = "macos")]
+    fn exposed_views(fx: &Fixture) -> Vec<String> {
+        crate::store::spotlight_exposed_views(&fx.layout.prefix)
+            .into_iter()
+            .map(|v| v.name)
+            .collect()
+    }
+
+    /// A view laid where none stood is laid whole in `<name>.noindex` and only then named by
+    /// its `<name>` link, and every reader goes through the link: the seam, rustup's
+    /// `toolchains/<name>`, a compiler's canonical sysroot, its lease.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_new_view_is_laid_aside_behind_its_link() {
+        let fx = Fixture::new("view-new-aside");
+        let build = fx.install_trust(15698);
+        let view = view_dir(&fx.layout, "trust");
+        let aside = views_root(&fx.layout).join("trust.noindex");
+
+        let attached = attach(&fx.layout, &fx.rustup, "trust").unwrap();
+        assert!(matches!(attached, Attached::Created { .. }), "{attached:?}");
+        assert_eq!(
+            std::fs::read_link(&view).unwrap(),
+            Path::new("trust.noindex")
+        );
+        assert!(is_real_dir(&aside) && is_real_dir(&aside.join("lib/rustlib")));
+        assert!(exposed_views(&fx).is_empty(), "Spotlight skips it");
+        assert_eq!(
+            std::fs::read_link(fx.seam("trust")).unwrap(),
+            view,
+            "rustup's toolchain names the view, not its folder"
+        );
+        let rustc = fx.seam("trust").join("bin").join("rustc");
+        assert!(cloned(&build.join("bin").join("trustc"), &rustc));
+        let sysroot = std::fs::canonicalize(fx.seam("trust")).unwrap();
+        assert_eq!(sysroot, std::fs::canonicalize(&aside).unwrap());
+        assert_eq!(
+            crate::lease::Subject::of_dir(&fx.layout.prefix, &sysroot.join("bin")),
+            crate::lease::Subject::view("trust"),
+            "the sysroot a compiler reports names the view"
+        );
+        let mode = std::fs::symlink_metadata(&aside)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o700);
+        let again = refresh_view_with(&fx.layout, "trust", &|| None).unwrap();
+        assert!(
+            !again.changed && again.deferred.is_none(),
+            "a view current behind its link is current, with no table to read: {again:?}"
+        );
+
+        let r = refresh_view_with(&fx.layout, "trust", &|| {
+            Some(vec![sysroot.join("bin").join("rustc")])
+        })
+        .unwrap();
+        assert!(!r.changed, "nothing to lay: {r:?}");
+        fx.install_trust(15700);
+        let r = refresh_view_with(&fx.layout, "trust", &|| {
+            Some(vec![sysroot.join("bin").join("rustc")])
+        })
+        .unwrap();
+        assert!(
+            matches!(r.deferred, Some(Deferred::InUse(_))),
+            "a compiler running from the folder holds the view: {r:?}"
+        );
+        let r = refresh_view_with(&fx.layout, "trust", &|| Some(Vec::new())).unwrap();
+        assert!(r.changed && r.deferred.is_none(), "{r:?}");
+        assert!(aterm_toolchain::layout::is_linked_aside(&view) && is_real_dir(&aside));
+        assert_eq!(
+            std::fs::read_to_string(rustc).unwrap(),
+            "trustc of build 15700"
+        );
+    }
+
+    /// A view an older atpkg laid plain stays where it is while it matches its build or
+    /// something runs from it, and is laid anew aside where atpkg lays it anyway.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_plain_view_moves_aside_only_when_it_is_laid_again() {
+        let fx = Fixture::new("view-plain");
+        fx.install_trust(9192);
+        attach(&fx.layout, &fx.rustup, "trust").unwrap();
+        let view = view_dir(&fx.layout, "trust");
+        let aside = views_root(&fx.layout).join("trust.noindex");
+        make_plain(&view);
+        let stamps = inode_stamps(&view);
+        assert_eq!(exposed_views(&fx), ["trust"]);
+
+        let r = refresh_view(&fx.layout, "trust").unwrap();
+        assert!(
+            !r.changed && is_real_dir(&view),
+            "a view that matches is left: {r:?}"
+        );
+        assert_eq!(inode_stamps(&view), stamps, "and not one file of it moves");
+
+        let new = fx.install_trust(15698);
+        let running = view.join("bin").join("rustc");
+        let r = refresh_view_with(&fx.layout, "trust", &|| Some(vec![running.clone()])).unwrap();
+        assert!(matches!(r.deferred, Some(Deferred::InUse(_))), "{r:?}");
+        assert!(
+            is_real_dir(&view) && !aside.exists(),
+            "a view in use is never moved"
+        );
+        let r = refresh_view_with(&fx.layout, "trust", &|| None).unwrap();
+        assert_eq!(r.deferred, Some(Deferred::Unknown));
+        assert!(is_real_dir(&view) && !aside.exists());
+        let lease = crate::lease::take(
+            &fx.layout.prefix,
+            &crate::lease::Subject::view("trust").unwrap(),
+            "targo (pid 7) in /w",
+            crate::lease::DEFAULT_WAIT,
+        )
+        .unwrap();
+        let r = refresh_view_with(&fx.layout, "trust", &|| Some(Vec::new())).unwrap();
+        assert!(matches!(r.deferred, Some(Deferred::Leased(_))), "{r:?}");
+        assert!(is_real_dir(&view) && !aside.exists());
+        drop(lease);
+
+        let r = refresh_view_with(&fx.layout, "trust", &|| Some(Vec::new())).unwrap();
+        assert!(r.changed && r.deferred.is_none(), "{r:?}");
+        assert!(aterm_toolchain::layout::is_linked_aside(&view) && is_real_dir(&aside));
+        assert!(exposed_views(&fx).is_empty());
+        assert!(cloned(
+            &new.join("bin").join("trustc"),
+            &view.join("bin").join("rustc")
+        ));
+        assert!(view_matches(&new, &view, Depth::Deep));
+        let debris: Vec<_> = std::fs::read_dir(views_root(&fx.layout))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            debris.len(),
+            2,
+            "the view and its link, nothing parked: {debris:?}"
+        );
+        assert_eq!(
+            std::fs::read_link(fx.seam("trust")).unwrap(),
+            view,
+            "rustup's link is never rewritten"
+        );
+    }
+
+    /// The crash windows of laying a view aside, each put in order by the next refresh: an
+    /// aside with no link gets it, an aside a cut-short lay left beside a plain view goes, and
+    /// so do a view half laid and a plain view parked for the link.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_view_lay_killed_midway_is_put_in_order() {
+        let fx = Fixture::new("view-crash");
+        let build = fx.install_trust(15698);
+        refresh_view(&fx.layout, "trust").unwrap();
+        let view = view_dir(&fx.layout, "trust");
+        let aside = views_root(&fx.layout).join("trust.noindex");
+
+        std::fs::remove_file(&view).unwrap();
+        let r = refresh_view(&fx.layout, "trust").unwrap();
+        assert!(!r.changed, "the whole view gets its link back: {r:?}");
+        assert!(aterm_toolchain::layout::is_linked_aside(&view));
+
+        make_plain(&view);
+        std::fs::create_dir_all(aside.join("lib")).unwrap();
+        let parked = views_root(&fx.layout).join(".trust.old-4242");
+        std::fs::create_dir_all(parked.join("bin")).unwrap();
+        let laying = views_root(&fx.layout).join(".trust.lay-4242");
+        std::fs::create_dir_all(laying.join("lib")).unwrap();
+        let r = refresh_view(&fx.layout, "trust").unwrap();
+        assert!(!r.changed, "{r:?}");
+        assert!(is_real_dir(&view) && view_matches(&build, &view, Depth::Deep));
+        assert!(!aside.exists(), "a lay cut short goes");
+        assert!(!parked.exists(), "a parked view goes");
+        assert!(!laying.exists(), "a view half laid goes");
+
+        let kept = views_root(&fx.layout).join(".trust-dev.old-4242");
+        std::fs::create_dir_all(&kept).unwrap();
+        refresh_view(&fx.layout, "trust").unwrap();
+        assert!(
+            kept.exists(),
+            "another view's parking is that view's to settle"
+        );
+    }
+
+    /// Detaching a view laid aside removes it whole: its link and its folder.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detaching_a_view_laid_aside_removes_its_link_and_folder() {
+        let fx = Fixture::new("view-detach-aside");
+        fx.install_trust(15698);
+        attach(&fx.layout, &fx.rustup, "trust").unwrap();
+        let aside = views_root(&fx.layout).join("trust.noindex");
+        assert!(is_real_dir(&aside));
+        let out = detach(&fx.layout, &fx.rustup, "trust", false).unwrap();
+        assert!(matches!(out, Detached::Removed { .. }), "{out}");
+        assert!(std::fs::symlink_metadata(view_dir(&fx.layout, "trust")).is_err());
+        assert!(
+            std::fs::symlink_metadata(&aside).is_err(),
+            "the folder goes too"
+        );
+    }
+
     /// A stock-name copy an older bundle shipped is not presented.
     #[cfg(unix)]
     #[test]
@@ -4765,7 +5109,7 @@ mod tests {
 
         std::fs::set_permissions(&view, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(!refresh_view(&fx.layout, "trust").unwrap().changed);
-        let mode = std::fs::symlink_metadata(&view)
+        let mode = std::fs::symlink_metadata(view_tree(&view))
             .unwrap()
             .permissions()
             .mode();

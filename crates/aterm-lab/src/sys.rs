@@ -445,6 +445,77 @@ pub fn monotonic_ns() -> u64 {
         .saturating_add(u64::try_from(ts.tv_nsec).unwrap_or(0))
 }
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+}
+
+/// `mach_absolute_time()`: the host tick count every `aos_gpu` stamp shares.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn mach_ticks() -> u64 {
+    // SAFETY: no arguments; it reads the clock.
+    unsafe { mach_absolute_time() }
+}
+
+/// `mach_timebase_info`'s numerator and denominator, or `None` when it fails.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn mach_timebase() -> Option<(u32, u32)> {
+    let mut tb = libc::mach_timebase_info { numer: 0, denom: 0 };
+    // SAFETY: `tb` is writable for one `mach_timebase_info`, which the call does not retain.
+    let rc = unsafe { libc::mach_timebase_info(&raw mut tb) };
+    (rc == 0 && tb.denom != 0).then_some((tb.numer, tb.denom))
+}
+
+/// Block until `pid`, this process's own child, exits (a stop, trap or continue report Darwin's `waitid` gives under `WEXITED` is consumed by `WSTOPPED | WCONTINUED | WNOHANG`, which cannot reap, backing off while nothing is consumed), and leave it unreaped (`WNOWAIT`), so the pid names it until a wait reaps it.
+///
+/// # Errors
+/// `waitid`'s, other than `EINTR` (retried).
+#[cfg(target_os = "macos")]
+pub fn await_exit(pid: u32) -> io::Result<()> {
+    let mut backoff = std::time::Duration::ZERO;
+    loop {
+        let Some(report) = waitid_once(pid, libc::WEXITED | libc::WNOWAIT)? else {
+            continue;
+        };
+        if matches!(
+            report.si_code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        ) {
+            return Ok(());
+        }
+        let consumed = waitid_once(pid, libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG)?;
+        if consumed.is_some_and(|c| c.si_pid != 0) {
+            backoff = std::time::Duration::ZERO;
+        } else {
+            backoff = (backoff * 2).clamp(
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(100),
+            );
+            std::thread::sleep(backoff);
+        }
+    }
+}
+
+/// One `waitid(P_PID, pid, options)`: its report (`si_pid` 0 when `WNOHANG` found none), or `None` when a signal interrupted it; `options` holds `WEXITED` only beside `WNOWAIT`, so it never reaps `pid`.
+#[cfg(target_os = "macos")]
+fn waitid_once(pid: u32, options: libc::c_int) -> io::Result<Option<libc::siginfo_t>> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: `info` is one writable `siginfo_t` that `waitid` does not retain; the pid is the caller's own child, and `options` names `WEXITED` only with `WNOWAIT`, so the child stays unreaped and the pid keeps naming it.
+    let got = unsafe { libc::waitid(libc::P_PID, pid, info.as_mut_ptr(), options) };
+    if got == 0 {
+        // SAFETY: zeroed plain data (a null `si_addr` included), which `waitid` filled or, with nothing to report under `WNOHANG`, left zeroed.
+        return Ok(Some(unsafe { info.assume_init() }));
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::Interrupted {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
 /// Close an owned file descriptor `fd`.
 pub fn close(fd: RawFd) {
     // SAFETY: the caller owns `fd` and does not use it again.
@@ -2510,5 +2581,57 @@ mod tests {
             Ok(vec![9, 12]),
             "pid 1, this process and what the jail does not hold are left out"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn await_exit_waits_through_a_stop_and_a_continue_for_the_exit() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let mut child = aterm_uds::spawnfd::command("/bin/sh")
+            .args(["-c", "kill -STOP $$; exit 7"])
+            .spawn()
+            .expect("sh");
+        let pid = child.id();
+        let spid = i32::try_from(pid).expect("pid");
+        let done = Arc::new(AtomicBool::new(false));
+        let detector = {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                if crate::stop::sleep_unless(Duration::from_mins(1), &done) != Ok(true) {
+                    let _ = kill(spid, libc::SIGKILL);
+                }
+            })
+        };
+        let stopped = waitid_once(pid, libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT)
+            .expect("waitid")
+            .expect("a report");
+        assert_eq!(
+            stopped.si_code,
+            libc::CLD_STOPPED,
+            "the child stopped itself"
+        );
+        let continued = Arc::new(AtomicBool::new(false));
+        let resumer = {
+            let continued = Arc::clone(&continued);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                continued.store(true, Ordering::SeqCst);
+                kill(spid, libc::SIGCONT).expect("SIGCONT");
+            })
+        };
+        await_exit(pid).expect("await_exit");
+        let resumed_first = continued.load(Ordering::SeqCst);
+        resumer.join().expect("the resumer");
+        let status = child.wait().expect("wait");
+        done.store(true, Ordering::SeqCst);
+        crate::stop::ring();
+        detector.join().expect("the hang detector");
+        assert!(
+            resumed_first,
+            "await_exit returned while the child was still stopped"
+        );
+        assert_eq!(status.code(), Some(7), "{status}");
     }
 }

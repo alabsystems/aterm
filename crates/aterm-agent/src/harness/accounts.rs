@@ -4332,8 +4332,9 @@ pub enum Kind {
     Reset,
     /// Another account signed in to the home ([`note_reading`]).
     Epoch,
-    /// A sign-in of another CLI's pool ended without binding a login: its `why` names the
-    /// page's host, the flow and how it ended, never its URL or code.
+    /// A sign-in that bound no login, `accounts browser`'s window included: its `why` names the
+    /// page's host, the flow (`device`, `browser`, `window`) and how it ended, never a URL, code
+    /// or email.
     SignIn,
 }
 

@@ -102,7 +102,7 @@ lives in `aterm-alloc`.
 half (two-state over each `&mut` op) → `sv-ops-refine-vec` → `sv-drain` → `sv-drop-order-upstream`
 (needs the written Upstream model).
 
-## 2. Test → spec map (TSV; the 9 tests left)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 A test that samples several specs is deleted only when all of its listed specs are Certified.

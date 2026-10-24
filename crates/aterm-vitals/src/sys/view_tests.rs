@@ -1487,3 +1487,178 @@ fn sys_net_reports_links_rates_and_tcp_connections_in_both_shapes() {
     assert_eq!(tcp.get("connecting"), Some(&Jv::u(1)));
     assert_eq!(tcp.get("closing_total"), Some(&Jv::u(3)));
 }
+
+/// Seventy one-second sweeps of [`sample`]: past the minute a program's hour needs.
+fn hour_snapshot() -> Snapshot {
+    let mut v = Vitals::new();
+    let mut s = Snapshot::default();
+    for k in 0..=70 {
+        s = v.absorb(&sample(10 + k, &[0, 0, 0, 0], k));
+    }
+    s
+}
+
+#[test]
+fn sys_disk_names_each_programs_hour_with_its_coverage() {
+    let s = hour_snapshot();
+    let w = world();
+    let owner = ctx(&w, Some(&s), true, true);
+    let q = SysQuery::parse("disk scope=global").unwrap();
+    let text = all_text(&render_text(&q, &owner));
+    let programs: Vec<&str> = text.lines().filter(|l| l.starts_with("program ")).collect();
+    assert_eq!(
+        programs,
+        [
+            "program exe=cargo n=1 scope=tab tab=1 write_bytes_per_h=3240000000 covered_s=70",
+            "program exe=Safari n=1 scope=others write_bytes_per_h=1080000000 covered_s=70",
+            "program exe=- n=1 scope=tab tab=1 write_bytes_per_h=1080000000 covered_s=70",
+            "program exe=aterm n=1 scope=aterm write_bytes_per_h=720000000 covered_s=70",
+            "program exe=aterm-helper n=1 scope=aterm write_bytes_per_h=180000000 covered_s=70",
+        ],
+        "{text}"
+    );
+    let mut jq = q.clone();
+    jq.json = true;
+    let j = render_json(&jq, &owner);
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    let first = match j.get("disk").and_then(|d| d.get("programs")) {
+        Some(Jv::Arr(rows)) => rows[0].clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(first.get("exe"), Some(&Jv::s("cargo")));
+    assert_eq!(first.get("tab"), Some(&Jv::u(1)));
+    assert_eq!(first.get("write_bytes_per_h"), Some(&Jv::u(3_240_000_000)));
+    assert_eq!(first.get("covered_s"), Some(&Jv::u(70)));
+
+    // NEGATIVE CONTROL: one second read is no rate: the figure is unavailable, never a zero.
+    let one = snapshot();
+    let c = ctx(&w, Some(&one), true, true);
+    let text = all_text(&render_text(&q, &c));
+    assert!(
+        text.contains(
+            "program exe=cargo n=1 scope=tab tab=1 write_bytes_per_h=unavailable(warming) covered_s=1"
+        ),
+        "{text}"
+    );
+    let j = render_json(&jq, &c);
+    let first = match j.get("disk").and_then(|d| d.get("programs")) {
+        Some(Jv::Arr(rows)) => rows[0].clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(first.get("write_bytes_per_h"), Some(&Jv::why("warming")));
+}
+
+/// A FIGURE AT ITS MINUTE: the covered seconds print rounded down, so a program still warming
+/// never reads `covered_s=60` (a live instance showed 59.6 s printed as 60 beside `warming`).
+/// NEGATIVE CONTROL: at the minute itself the rate is given.
+#[test]
+fn covered_seconds_never_claim_the_minute_a_warming_figure_lacks() {
+    let mut s = hour_snapshot();
+    let w = world();
+    let q = SysQuery::parse("disk scope=global").unwrap();
+    let first_program = |s: &Snapshot| -> String {
+        let owner = ctx(&w, Some(s), true, true);
+        let text = all_text(&render_text(&q, &owner));
+        text.lines()
+            .find(|l| l.starts_with("program "))
+            .expect("a program row")
+            .to_owned()
+    };
+    s.facts.writes_covered_s = 59.6;
+    assert_eq!(
+        first_program(&s),
+        "program exe=cargo n=1 scope=tab tab=1 write_bytes_per_h=unavailable(warming) covered_s=59"
+    );
+    s.facts.writes_covered_s = 60.0;
+    assert_eq!(
+        first_program(&s),
+        "program exe=cargo n=1 scope=tab tab=1 write_bytes_per_h=3780000000 covered_s=60"
+    );
+}
+
+#[test]
+fn a_tab_scoped_caller_sees_its_own_tabs_programs_and_a_withheld_count() {
+    let mut s = hour_snapshot();
+    s.facts.hour_writers.insert(
+        0,
+        crate::writes::ProgramHour {
+            name: "foreign-writer".into(),
+            scope: crate::model::ProcScope::Tab(8),
+            bytes: 1 << 30,
+            n_max: 3,
+        },
+    );
+    let mut w = world();
+    w.target.window_sessions.push(8);
+    let q = SysQuery::parse("disk scope=window").unwrap();
+    let scoped = ctx(&w, Some(&s), false, true);
+    let owner = ctx(&w, Some(&s), true, true);
+    let text = all_text(&render_text(&q, &scoped));
+    assert!(
+        text.contains("program exe=cargo n=1 scope=tab tab=1 "),
+        "{text}"
+    );
+    assert!(!text.contains("foreign-writer"), "{text}");
+    assert!(!text.contains("exe=Safari"), "outside the window: {text}");
+    assert!(
+        text.contains("withheld=1 (program rows outside this tab are the owner's)"),
+        "{text}"
+    );
+    let owner_text = all_text(&render_text(&q, &owner));
+    assert!(
+        owner_text.contains("program exe=foreign-writer n=3 scope=tab local=8 "),
+        "{owner_text}"
+    );
+    assert!(!owner_text.contains("program rows outside"), "{owner_text}");
+    let mut jq = q.clone();
+    jq.json = true;
+    let j = render_json(&jq, &scoped);
+    let disk = j.get("disk").unwrap();
+    assert_eq!(disk.get("programs_withheld"), Some(&Jv::u(1)));
+    let exes = |disk: &Jv| match disk.get("programs") {
+        Some(Jv::Arr(rows)) => rows
+            .iter()
+            .filter_map(|r| match r.get("exe") {
+                Some(Jv::Str(e)) => Some(e.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(exes(disk), ["cargo", "-"]);
+    let owner_j = render_json(&jq, &owner);
+    let owner_disk = owner_j.get("disk").unwrap();
+    assert_eq!(exes(owner_disk), ["foreign-writer", "cargo", "-"]);
+    assert_eq!(owner_disk.get("programs_withheld"), None);
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+}
+
+/// A PANE READS ITS TAB'S PROGRAMS: the hour is kept per tab, under the tab's least pane's key,
+/// so a caller in the second pane of a split tab asking for its pane gets the tab's programs,
+/// not none, and nothing is withheld from it. NEGATIVE CONTROL: a pane of another tab gets none.
+#[test]
+fn a_pane_of_a_split_tab_reads_its_tabs_programs() {
+    let s = hour_snapshot();
+    let mut w = world();
+    w.target.key = 8;
+    w.target.panes = vec![7, 8];
+    w.target.window_sessions = vec![7, 8];
+    let q = SysQuery::parse("disk scope=pane").unwrap();
+    for owner in [true, false] {
+        let text = all_text(&render_text(&q, &ctx(&w, Some(&s), owner, true)));
+        assert!(
+            text.contains("program exe=cargo n=1 scope=tab tab=1 "),
+            "owner={owner}: {text}"
+        );
+        assert!(
+            !text.contains("program rows outside"),
+            "owner={owner}: {text}"
+        );
+    }
+    let mut apart = world();
+    apart.target.key = 9;
+    apart.target.panes = vec![9];
+    apart.target.window_sessions = vec![9];
+    let text = all_text(&render_text(&q, &ctx(&apart, Some(&s), true, true)));
+    assert!(!text.contains("program exe=cargo"), "{text}");
+}

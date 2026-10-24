@@ -37,6 +37,9 @@ aterm-durable = { workspace = true }
 # `aterm init`'s secrets vault step (init_secrets.rs): the vault's local status, its join,
 # and the subscriber's launchd job (docs/DESIGN-secrets-2026-10-20.md §7).
 aterm-secrets = { workspace = true }
+# atpkg's prefix and its store's Spotlight layout contract (`layout`), which `aterm init`'s
+# Rust in Spotlight row reads: std only.
+aterm-toolchain = { workspace = true }
 # The engine every family runs on, re-exported as `converge`
 # (docs/DESIGN-init-system-2026-10-20.md §3): the model, the ordered run and the journal
 # `init` and `here` keep.

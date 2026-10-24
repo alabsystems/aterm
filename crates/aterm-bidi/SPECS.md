@@ -112,7 +112,7 @@ The two table properties, `paragraph-level-p2p3` and `l2-reorder-from-levels` �
 → the fold lemma, then `cell-reorder-fold` → `cell-levels-fold` → `scratch-independence` →
 `no-rtl-is-identity` → `uax9-levels-refine-reference` (needs the Lean `UAX9Ref`).
 
-## 2. Test → spec map (TSV; all 32)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

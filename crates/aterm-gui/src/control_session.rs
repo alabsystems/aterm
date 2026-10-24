@@ -3521,17 +3521,32 @@ pub(super) fn cmd_meta_harness_act_with_clock(
                 let mut mark = point.mark;
                 if face == Some(aterm_agent::harness::acts::TaskFace::Landed) {
                     mark = crate::harness_task::landing_mark(mark, typed_at);
+                    aterm_log::info!(
+                        "task: @{}: landing marked at program turns {}, busy entries {} (counted {}, {}; the typed turn's {typed_at:?}; at rest {})",
+                        ctx.self_id.as_str(),
+                        mark.program_turns,
+                        mark.busy_entries,
+                        point.mark.program_turns,
+                        point.mark.busy_entries,
+                        point.left_at_rest
+                    );
                 }
                 timeline.mark_landing(mark);
             }
         } else if face == Some(aterm_agent::harness::acts::TaskFace::Open)
             && aterm_agent::harness::acts::self_claim_types_turn(act)
         {
-            timeline.note_typed_act(
-                snapshot
-                    .filter(|point| point.left_at_rest)
-                    .map(|point| point.mark),
-            );
+            let at_rest = snapshot
+                .filter(|point| point.left_at_rest)
+                .map(|point| point.mark);
+            if at_rest.is_none() {
+                aterm_log::info!(
+                    "task: @{}: {act} came with the program in a turn: its turn is not owed to a landing ({:?})",
+                    ctx.self_id.as_str(),
+                    snapshot.map(|point| point.mark)
+                );
+            }
+            timeline.note_typed_act(at_rest);
         }
         if let Some(face) = face {
             timeline.queue_self_task(face);
@@ -5048,7 +5063,7 @@ mod tests {
             title: format!("tab-{local_id}"),
             term: term.clone(),
             master: -1,
-            pid: 0,
+            shell_identity: aterm_pty::ShellIdentity::unproven(0),
             ctx,
         }
     }

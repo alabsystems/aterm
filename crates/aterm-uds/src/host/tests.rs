@@ -499,26 +499,3 @@ fn an_os_program_is_spawned_by_its_rows_one_path() {
         assert!(caught.is_err(), "{refused} has no OS path");
     }
 }
-
-/// node is a release host's alone (`ship site`'s firebase-tools, until S17): no dev lane
-/// runs it, since every wasm driver runs in the pinned chrome-headless-shell (init-system
-/// S10), and its refusal names `ship provision`, never an install. The browser it moved to
-/// is a pinned row.
-#[test]
-fn node_is_only_a_release_hosts() {
-    let rows: Vec<&Tool> = TOOLS.iter().filter(|t| t.name == "node").collect();
-    assert_eq!(rows.len(), 1, "one node row");
-    assert_eq!(rows[0].provider, Provider::ReleaseHost);
-    assert_eq!(rows[0].provided_by(), "release host");
-    assert!(
-        rows[0].remedy().contains("ship provision"),
-        "{}",
-        rows[0].remedy()
-    );
-    let browser = tool("chrome-headless-shell");
-    assert!(
-        matches!(browser.provider, Provider::Workspace { when: When::Always }),
-        "{:?}",
-        browser.provider
-    );
-}

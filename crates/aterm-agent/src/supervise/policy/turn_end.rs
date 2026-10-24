@@ -7890,24 +7890,36 @@ pub const RULE_LAND_NUDGE: &str = "land-nudge@v1";
 /// The answer a question gets under Land ([`LAND_ANSWER`]).
 pub const RULE_LAND_ANSWER: &str = "land-answer@v1";
 
-/// What Land types at an episode's first point ([`RULE_LAND`]).
+/// What Land's instruction and nudge say of files no git repository holds ([`NO_REPOSITORY`]).
+macro_rules! no_repository {
+    () => {
+        "Files no git repository holds land where they are once verified."
+    };
+}
+
+/// FILES NO REPOSITORY HOLDS LAND WHERE THEY ARE: [`LAND`]'s and [`LAND_NUDGE`]'s sentence for them. It names the files, not the folder, so a worker whose tab is no repository still pushes the work it did in one; the probe still reads the session's repository at a defense ([`repo_work_suffix`]). It is short so the standing rules keep room on Land's first act with both its clauses ([`VERBATIM_UNITS`]).
+pub const NO_REPOSITORY: &str = no_repository!();
+
+/// What Land types at an episode's first point ([`RULE_LAND`]). Its [`NO_REPOSITORY`] sentence keeps a worker whose files no repository holds from asking a person for a remote to push to: on 2026-10-24 a real model's work in a plain folder answered the words without it with a NEEDS YOU for one in 3 runs of 3 (one a live `spawn agent=codex` worker), and with it with a clean `Nothing left:` in 3 of 3; Land nudges with no bound, so each nudge would have asked again.
 pub const LAND: &str = concat!(
     harness_mark!(),
     " Autopilot is Land: land ALL of this work into the remote main branch, no exceptions. \
      Finish every open item, verify it, commit, merge and push it, and remove your worktrees \
      and merged branches. Leave nothing unlanded, parked on a branch or for later; chew \
-     through every wall with safe, reversible fixes. Start no new work. Put what only a person \
-     can give on a line starting NEEDS YOU: and land the rest. Once it is all on remote main, \
-     defend that in a few lines starting Nothing left:"
+     through every wall with safe, reversible fixes. Start no new work. ",
+    no_repository!(),
+    " Put what only a person can give on a line starting NEEDS YOU: and land the rest. Once it \
+     is all on remote main, defend that in a few lines starting Nothing left:"
 );
 
 /// What a Land nudge types ([`RULE_LAND_NUDGE`]) at every free point after the instruction until the work is landed.
 pub const LAND_NUDGE: &str = concat!(
     harness_mark!(),
     " Still landing: get everything onto the remote main branch, no exceptions, with nothing \
-     unlanded, parked on a branch or for later. Put what only a person can give on a line \
-     starting NEEDS YOU: and land the rest. Once it is all on remote main, defend that in a \
-     few lines starting Nothing left:"
+     unlanded, parked on a branch or for later. ",
+    no_repository!(),
+    " Put what only a person can give on a line starting NEEDS YOU: and land the rest. Once it \
+     is all on remote main, defend that in a few lines starting Nothing left:"
 );
 
 /// What a question gets under Land ([`RULE_LAND_ANSWER`]).
@@ -8070,8 +8082,20 @@ pub const LAND_MARKER_BEFORE: &str = concat!(
      is left, and reply with ATERM-TASK-DONE on a line by itself."
 );
 
+/// RETIRED: [`LAND`]'s words of `a355109905` (FOREVER LAND), before its [`NO_REPOSITORY`] sentence.
+pub const LAND_REMOTE_MAIN_BEFORE: &str = concat!(
+    harness_mark!(),
+    " Autopilot is Land: land ALL of this work into the remote main branch, no exceptions. \
+     Finish every open item, verify it, commit, merge and push it, and remove your worktrees \
+     and merged branches. Leave nothing unlanded, parked on a branch or for later; chew \
+     through every wall with safe, reversible fixes. Start no new work. Put what only a person \
+     can give on a line starting NEEDS YOU: and land the rest. Once it is all on remote main, \
+     defend that in a few lines starting Nothing left:"
+);
+
 /// EVERY LAND INSTRUCTION AN OLDER BUILD TYPED, newest first.
-pub const RETIRED_LANDS: [&str; 4] = [
+pub const RETIRED_LANDS: [&str; 5] = [
+    LAND_REMOTE_MAIN_BEFORE,
     LAND_COMMITTED_BEFORE,
     LAND_ORDINARY_BEFORE,
     LAND_WORDS_BEFORE,
@@ -8106,8 +8130,18 @@ pub const LAND_NUDGE_MARKER_BEFORE: &str = concat!(
      a line by itself."
 );
 
+/// RETIRED: [`LAND_NUDGE`]'s words of `a355109905`, as [`LAND_REMOTE_MAIN_BEFORE`].
+pub const LAND_NUDGE_REMOTE_MAIN_BEFORE: &str = concat!(
+    harness_mark!(),
+    " Still landing: get everything onto the remote main branch, no exceptions, with nothing \
+     unlanded, parked on a branch or for later. Put what only a person can give on a line \
+     starting NEEDS YOU: and land the rest. Once it is all on remote main, defend that in a \
+     few lines starting Nothing left:"
+);
+
 /// EVERY LAND NUDGE AN OLDER BUILD TYPED, newest first.
-pub const RETIRED_LAND_NUDGES: [&str; 4] = [
+pub const RETIRED_LAND_NUDGES: [&str; 5] = [
+    LAND_NUDGE_REMOTE_MAIN_BEFORE,
     LAND_NUDGE_COMMITTED_BEFORE,
     LAND_NUDGE_ORDINARY_BEFORE,
     LAND_NUDGE_WORDS_BEFORE,

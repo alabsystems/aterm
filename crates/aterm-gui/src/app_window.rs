@@ -614,15 +614,16 @@ impl App {
             );
             g.set_hdr_glow(self.config.hdr_glow_or_default());
             g.set_sdr_glow_boost(self.config.cursor_glow_sdr_boost_or_default());
-            // Where a config apply would warm the effect pipelines, the Metal
-            // arm builds what its frames can bind under these switches on a
-            // worker from its mint, handing each over as it lands; a frame
-            // that binds a row before then builds it, which a headless launch
-            // makes a cache hit by warming ahead of its first pixel demand
-            // (`warm_config`). The wgpu arm would build on this thread, so it
-            // warms only on that config apply.
+            // Where a config apply would warm the effect pipelines, a window's
+            // Metal arm builds what its frames can bind under these switches on
+            // a worker from its mint, handing each over as it lands; a frame
+            // that binds a row before then builds it. A headless instance warms
+            // nothing: test suites start many at once, and their concurrent
+            // reads and rewrites of the one Metal shader cache killed one by
+            // SIGBUS (an FS pagein error in MTLCompilerFSCache). The wgpu arm
+            // would build on this thread, so it warms only on that config apply.
             #[cfg(target_os = "macos")]
-            if self.config.warms_effect_pipelines() {
+            if !self.headless && self.config.warms_effect_pipelines() {
                 g.warm_effect_pipelines();
             }
         }

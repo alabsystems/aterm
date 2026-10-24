@@ -5930,6 +5930,7 @@ fn note_cut(
 /// The process watch heard `pid` exit: when it led a stopped drawer's group, that drawer's mark
 /// goes (card engine §3.7, marks retired by liveness). A current drawer's mark stays for its
 /// cut, which drops it.
+#[cfg(unix)]
 fn retire_gone(
     term: &Mutex<Terminal>,
     timeline: &Mutex<crate::session_timeline::SessionTimeline>,
@@ -7901,7 +7902,7 @@ impl crate::App {
             title: term_lock(&session.term).title().to_string(),
             term: session.term.clone(),
             master: session.master,
-            pid: session.pid,
+            shell_identity: session.shell_identity,
             ctx: session.ctx.clone(),
         };
         crate::fabric::register_on_log(&session.ctx, || {

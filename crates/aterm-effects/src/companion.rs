@@ -102,19 +102,20 @@ pub fn cursor_cat_color_key(
     ];
     let pack =
         |rgb: [u8; 3]| (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]);
-    let mut last_bg: Option<([u8; 3], u8)> = None;
+    let mut last_bg_rgb = fallback_bg_rgb;
+    let mut last_band = CatColorKey::background_band(fallback_bg);
     'rows: for row in r0..=r1 {
         let line = cells.get(row).map_or(&[][..], Vec::as_slice);
         for col in c0..=c1 {
             let cell = line.get(col);
             let background_rgb = cell.map_or(fallback_bg_rgb, |cell| cell.bg);
-            let band = match last_bg {
-                Some((prev_rgb, prev_band)) if prev_rgb == background_rgb => prev_band,
-                _ => {
-                    let b = CatColorKey::background_band(pack(background_rgb));
-                    last_bg = Some((background_rgb, b));
-                    b
-                }
+            let band = if background_rgb == last_bg_rgb {
+                last_band
+            } else {
+                let b = CatColorKey::background_band(pack(background_rgb));
+                last_bg_rgb = background_rgb;
+                last_band = b;
+                b
             };
             min_background_band = min_background_band.min(band);
             max_background_band = max_background_band.max(band);

@@ -170,7 +170,7 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
         .cpu
         .as_ref()
         .is_some_and(|c| c.busy.level >= total_cores * 0.98);
-    let tab = input.tab_key.and_then(|k| snap.tab(k));
+    let tab = snap.tab_of(&input.tab_panes);
     let busy_level = snap.cpu.as_ref().map_or(0.0, |c| c.busy.level);
     let lanes: [(Bar, Option<&TrendView>, aterm_vitals::ink::Rgb); 3] = [
         (
@@ -183,7 +183,7 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
             snap.aterm.as_ref().map(|a| &a.cores),
             inks.aterm,
         ),
-        (Bar::Tab, tab.map(|t| &t.scope.cores), inks.tab),
+        (Bar::Tab, tab.as_ref().map(|t| &t.scope.cores), inks.tab),
     ];
     for (i, (bar, trend, ink)) in lanes.iter().enumerate() {
         if *bar == Bar::Tab && !show_tab {
@@ -210,7 +210,17 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
 
     if let Some(m) = snap.mem.as_ref() {
         if fold.memory && mem_w > 0.0 {
-            memory_lanes(&mut p, x, &rows, mem_w, m, snap, tab, show_tab, &mut hits);
+            memory_lanes(
+                &mut p,
+                x,
+                &rows,
+                mem_w,
+                m,
+                snap,
+                tab.as_ref(),
+                show_tab,
+                &mut hits,
+            );
             x += mem_w + gap;
         } else if !fold.minimal {
             // Folded: only the pressure cap, and only at warn or above.
@@ -571,6 +581,40 @@ mod tests {
         for h in &h1 {
             assert!(h2.contains(h), "{h:?} moved");
         }
+    }
+
+    /// A split front tab's CPU lane is the whole tab's: as long as all tabs' (aterm itself idles,
+    /// so both are claude's 1 core and cargo's 2), where the focused pane alone falls short.
+    #[test]
+    fn a_split_tabs_lane_is_the_whole_tab() {
+        let snap = crate::stats_deck::tests::split_tab(7, 8);
+        let fill = |panes: Vec<u64>, ink: fn(&DeckInput<'_>) -> aterm_vitals::ink::Rgb| {
+            let i = DeckInput {
+                tab_panes: panes,
+                tab_count: 2,
+                ..input(&snap)
+            };
+            let want = rgba(ink(&i), 0xFF);
+            let (prims, _) = sill_paint(&GEOM, &i);
+            prims
+                .windows(2)
+                .find_map(|w| match w {
+                    [DrawPrim::ClipPush { w, .. }, DrawPrim::Panel { fill, .. }]
+                        if *fill == want =>
+                    {
+                        Some(*w)
+                    }
+                    _ => None,
+                })
+                .expect("the lane's fill")
+        };
+        let tab = |i: &DeckInput<'_>| i.inks.tab;
+        let all = fill(vec![8, 7], |i| i.inks.aterm);
+        assert!(all > 1.0, "{all}");
+        assert_eq!(fill(vec![8, 7], tab), all);
+        assert_eq!(fill(vec![7, 8], tab), all);
+        let focused = fill(vec![8], tab);
+        assert!(focused < all, "CONTROL: {focused} vs {all}");
     }
 
     #[test]

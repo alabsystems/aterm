@@ -101,6 +101,7 @@ fn an_unrelated_push_keeps_it_dormant_read_at_the_live_main() {
     let bare = trust_repo(&repo, DORMANT_LEDGER);
     push_from_elsewhere(&bare, tmp.path(), None);
     assert_eq!(read(tmp.path(), &repo), Switch::Dormant);
+    // A second read has the commit already: no fetch at all, the same answer.
     assert_eq!(read(tmp.path(), &repo), Switch::Dormant);
 }
 

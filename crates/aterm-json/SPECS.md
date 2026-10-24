@@ -171,7 +171,7 @@ in §5.6) apply to the whole migration.
 (`float-parse-correctly-rounded`, `float-f64-shortest-roundtrip`, `float-f32-shortest`) form a
 separate chain that needs an IEEE model first.
 
-## 2. Test → spec map (TSV; all 25)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 Every file is `crates/aterm-json/tests/json.rs`.

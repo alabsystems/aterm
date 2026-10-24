@@ -12,8 +12,8 @@ use crate::iokit::{
 };
 use crate::machine::{DtCpu, Level, VmPages};
 use crate::{
-    CoreTicks, CpuLayout, GpuClients, GpuReading, LinkReading, MAX_GPU_CLIENTS, MemoryDetail,
-    PATH_CAP, ProcessLimits, TcpCounts, VolumeReading, pressure_of,
+    CoreTicks, CpuLayout, GpuClients, GpuDriver, GpuReading, LinkReading, MAX_GPU_CLIENTS,
+    MemoryDetail, PATH_CAP, ProcessLimits, TcpCounts, VolumeReading, pressure_of,
 };
 
 /// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`, 64-byte `proc_bsdshortinfo`).
@@ -925,6 +925,21 @@ pub(crate) fn gpu() -> Option<GpuReading> {
         reading.unread = Some(crate::Why::Unsupported);
     }
     Some(reading)
+}
+
+/// [`crate::gpu_driver`] on macOS: two text properties of the cached accelerator entry, read per call.
+pub(crate) fn gpu_driver() -> Option<GpuDriver> {
+    let a = accel()?;
+    let text = |key: &CStr| {
+        Cf::string(key)
+            .and_then(|k| Cf::property(a.service, k.0))
+            .and_then(|v| cf_text(v.0))
+            .filter(|t| !t.is_empty())
+    };
+    Some(GpuDriver {
+        bundle: text(c"CFBundleIdentifier"),
+        version: text(c"IOSourceVersion"),
+    })
 }
 
 /// The most queues one client's `AppUsage` gives.

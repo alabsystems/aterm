@@ -195,25 +195,22 @@ impl SpecTable {
             .and_then(|id| self.specs.get(usize::from(*id)))
     }
 
-    /// Register one custom spec for `word` (all surface-hash variants).
-    pub fn insert_custom(&mut self, word: &str, spec: WordEffectSpec) {
+    fn intern_spec(&mut self, spec: WordEffectSpec) -> Option<SpecId> {
         if spec == WordEffectSpec::default() {
-            return;
+            return None;
         }
-        let word = word.trim();
-        if word.is_empty() {
-            return;
-        }
-        let id = if let Some(i) = self.specs.iter().position(|s| *s == spec) {
-            i as SpecId
+        if let Some(i) = self.specs.iter().position(|s| *s == spec) {
+            Some(i as SpecId)
+        } else if self.specs.len() >= usize::from(SpecId::MAX) {
+            // defensive cap; unreachable for sane configs
+            None
         } else {
-            if self.specs.len() >= usize::from(SpecId::MAX) {
-                // defensive cap; unreachable for sane configs
-                return;
-            }
             self.specs.push(spec);
-            (self.specs.len() - 1) as SpecId
-        };
+            Some((self.specs.len() - 1) as SpecId)
+        }
+    }
+
+    fn insert_custom_with_id(&mut self, word: &str, id: SpecId) {
         if is_no_space_surface(word) {
             // CJK path: the scanner hashes the RAW compound.
             self.overrides.insert(form_hash(word), id);
@@ -232,19 +229,23 @@ impl SpecTable {
         }
     }
 
+    /// Register one custom spec for `word` (all surface-hash variants).
+    pub fn insert_custom(&mut self, word: &str, spec: WordEffectSpec) {
+        let word = word.trim();
+        if word.is_empty() {
+            return;
+        }
+        let Some(id) = self.intern_spec(spec) else {
+            return;
+        };
+        self.insert_custom_with_id(word, id);
+    }
+
     /// Overlay another table onto this one.
     pub fn overlay(&mut self, other: SpecTable) {
         let mut remap = Vec::with_capacity(other.specs.len());
         for spec in other.specs {
-            let id = if let Some(index) = self.specs.iter().position(|current| *current == spec) {
-                Some(index as SpecId)
-            } else if self.specs.len() >= usize::from(SpecId::MAX) {
-                None
-            } else {
-                self.specs.push(spec);
-                Some((self.specs.len() - 1) as SpecId)
-            };
-            remap.push(id);
+            remap.push(self.intern_spec(spec));
         }
         for (form_hash, old_id) in other.overrides {
             if let Some(new_id) = remap.get(usize::from(old_id)).copied().flatten() {
@@ -399,12 +400,15 @@ pub fn build_custom(entries: &[RawCustomEntry]) -> (SpecTable, String) {
     let mut cjk: Vec<&str> = Vec::new();
     for e in entries {
         let spec = e.to_spec();
+        let mut spec_id = None;
         for w in &e.words {
             let w = w.trim();
             if w.is_empty() {
                 continue;
             }
-            table.insert_custom(w, spec);
+            if let Some(id) = *spec_id.get_or_insert_with(|| table.intern_spec(spec)) {
+                table.insert_custom_with_id(w, id);
+            }
             if is_no_space_surface(w) {
                 cjk.push(w);
             } else {
@@ -688,7 +692,7 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
     let mut toy_ids = std::collections::BTreeSet::new();
     let mut surfaces = std::collections::BTreeMap::<String, String>::new();
     let mut dispatch_hashes = std::collections::BTreeMap::<u64, String>::new();
-    let mut scanner_surfaces = Vec::<(String, &str)>::new();
+    let mut scanner_surfaces = Vec::<(String, &str, u64)>::new();
     let word_count = raw
         .toy
         .iter()
@@ -725,7 +729,8 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
             ));
         }
 
-        let spec = compile_toy_spec(toy, &context, &mut diagnostics);
+        let spec_id = compile_toy_spec(toy, &context, &mut diagnostics)
+            .and_then(|spec| table.intern_spec(spec));
         let mut spaced = Vec::new();
         let mut cjk = Vec::new();
         for (word_index, word) in toy.words.iter().take(MAX_WORDS_PER_TOY).enumerate() {
@@ -734,35 +739,52 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
                 continue;
             }
             let no_space = is_no_space_surface(word);
-            let normalized = if no_space {
-                let mut key = String::from("cjk:");
+            let mut hashes = [0u64; 5];
+            let (normalized, hashes_len) = if no_space {
+                let mut key = String::with_capacity(4 + word.len());
+                key.push_str("cjk:");
                 key.push_str(word);
-                key
+                hashes[0] = form_hash(word);
+                (key, 1usize)
             } else {
-                let mut key = String::from("word:");
-                key.push_str(&fold(word));
-                key
+                let mut base = fold(word);
+                let base_len = base.len();
+                let mut key = String::with_capacity(5 + base_len);
+                key.push_str("word:");
+                key.push_str(&base);
+                hashes[0] = form_hash(&base);
+                for (i, suffix) in ["'s", "\u{2019}s", "'", "\u{2019}"].into_iter().enumerate() {
+                    base.truncate(base_len);
+                    base.push_str(suffix);
+                    hashes[i + 1] = form_hash(&base);
+                }
+                (key, 5usize)
             };
+            let hashes = &hashes[..hashes_len];
+            let has_override_key = no_space || normalized.len() > "word:".len();
             if let Some(previous) = surfaces.insert(normalized, label.clone()) {
                 diagnostics.push(format!(
                     "{label}: normalized surface duplicates {previous}; dispatch order must not decide behavior"
                 ));
                 continue;
             }
-            let hashes = toy_dispatch_hashes(word);
             if let Some(previous) = hashes.iter().find_map(|hash| dispatch_hashes.get(hash)) {
                 diagnostics.push(format!(
                     "{label}: dispatch key collides with {previous} (including possessive variants); dispatch order must not decide behavior"
                 ));
                 continue;
             }
-            for hash in hashes {
+            for &hash in hashes {
                 dispatch_hashes.insert(hash, label.clone());
             }
-            if let Some(spec) = spec {
-                table.insert_custom(word, spec);
+            if let Some(id) = spec_id
+                && has_override_key
+            {
+                for &hash in hashes {
+                    table.overrides.insert(hash, id);
+                }
             }
-            scanner_surfaces.push((label, word));
+            scanner_surfaces.push((label, word.as_str(), hashes[0]));
             if no_space {
                 cjk.push(word.as_str());
             } else {
@@ -790,13 +812,7 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
                 let mut scanner_chars = Vec::new();
                 let mut scanner_hits = Vec::new();
                 let mut scanner_scratch = aterm_lexicon::ScanScratch::default();
-                for (label, surface) in scanner_surfaces {
-                    let expected_hash = if is_no_space_surface(surface) {
-                        form_hash(surface)
-                    } else {
-                        form_hash(&fold(surface))
-                    };
-                    let expected_end = surface.chars().count();
+                for (label, surface, expected_hash) in scanner_surfaces {
                     lexicon.scan_into_with_scratch(
                         surface,
                         &options,
@@ -804,6 +820,7 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
                         &mut scanner_hits,
                         &mut scanner_scratch,
                     );
+                    let expected_end = scanner_chars.len();
                     let reaches_dispatch = scanner_hits.iter().any(|hit| {
                         hit.start == 0 && hit.end == expected_end && hit.form_hash == expected_hash
                     });
@@ -837,22 +854,6 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
         toy_count: raw.toy.len(),
         word_count,
     })
-}
-
-fn toy_dispatch_hashes(word: &str) -> Vec<u64> {
-    if is_no_space_surface(word) {
-        return vec![form_hash(word)];
-    }
-    let mut base = fold(word);
-    let base_len = base.len();
-    let mut hashes = Vec::with_capacity(5);
-    hashes.push(form_hash(&base));
-    for suffix in ["'s", "\u{2019}s", "'", "\u{2019}"] {
-        base.truncate(base_len);
-        base.push_str(suffix);
-        hashes.push(form_hash(&base));
-    }
-    hashes
 }
 
 fn validate_pack_metadata(raw: &RawToyPackMetadata, diagnostics: &mut Vec<String>) {

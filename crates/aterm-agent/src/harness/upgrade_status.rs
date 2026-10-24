@@ -3520,22 +3520,17 @@ fn read_records(opts: &Opts, now: u64) -> (Vec<Row>, bool, Vec<Unread>) {
             continue;
         };
         let path = entry.path();
-        if path.extension().is_none_or(|x| x != "json") {
+        if path.extension().is_none_or(|x| x != "json")
+            || entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
             continue;
         }
         let Some(session) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
             continue;
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
-                ) =>
-            {
-                continue;
-            }
+        let text = match super::read_record_text(&path) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
             Err(_) => {
                 unread.push(Unread {
                     session,

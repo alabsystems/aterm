@@ -4064,6 +4064,107 @@ fn hex_3d_tokens_multipart_qp_dot_segments_and_subaddressed_profiles_work() {
 }
 
 #[test]
+fn oauth_dot_segments_preserve_empty_path_segments_and_query_data() {
+    let base = "https://claude.ai/base/page";
+    for (target, expected_path) in [
+        ("/a//b/../c", "/a//c"),
+        ("/a//../b", "/a/b"),
+        ("/a//./b", "/a//b"),
+        ("/a//.", "/a//"),
+        ("/a//..", "/a/"),
+        ("/a///b/../../c", "/a//c"),
+        ("/../../approve", "/approve"),
+        ("/a/./", "/a/"),
+        ("/a/../", "/"),
+        ("/a//b", "/a//b"),
+        ("/a/.well-known//b", "/a/.well-known//b"),
+        ("/a/%2e//b", "/a/%2e//b"),
+        ("/a//λ/../c", "/a//c"),
+        (
+            "/a//b/../c?token=x//../y&code=%2e%2e",
+            "/a//c?token=x//../y&code=%2e%2e",
+        ),
+    ] {
+        assert_eq!(
+            resolve_relative_url(base, target),
+            format!("https://claude.ai{expected_path}")
+        );
+    }
+    for (page, expected) in [
+        (
+            r#"<form method="POST" action="../approve?token=s//../q"><button>Allow</button></form>"#,
+            (
+                "POST",
+                "https://claude.ai/a//approve?token=s//../q",
+                Some(""),
+            ),
+        ),
+        (
+            r#"{"approval_url":"/a//../approve?token=s//../q"}"#,
+            ("POST", "https://claude.ai/a/approve?token=s//../q", None),
+        ),
+        (
+            r#"<meta http-equiv="refresh" content="0; url=/a//b/../confirm">"#,
+            ("GET", "https://claude.ai/a//confirm", None),
+        ),
+        (
+            r#"<a href="/a//./allow">Allow</a>"#,
+            ("GET", "https://claude.ai/a//allow", None),
+        ),
+    ] {
+        assert_eq!(
+            parse_html_approval_action(page, "https://claude.ai/a//b/current"),
+            Some((
+                expected.0.to_owned(),
+                expected.1.to_owned(),
+                expected.2.map(str::to_owned)
+            ))
+        );
+    }
+
+    let authorize = "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A9123%2Fcallback&state=dot";
+    let flow = MailboxFlow::new(authorize).unwrap();
+    let mut requests = Vec::new();
+    let outcome = follow_until_page_or_callback(
+        &flow,
+        &mut |method, url, _, body| {
+            assert_eq!((method, body), ("POST", Some("token=private")));
+            requests.push(url.to_owned());
+            match url {
+                "https://claude.ai/a//b/start" => Ok(HttpResponse {
+                    status: 307,
+                    location: Some("../approve?state=dot".to_owned()),
+                    body: String::new(),
+                }),
+                "https://claude.ai/a//approve?state=dot" => Ok(HttpResponse {
+                    status: 200,
+                    location: None,
+                    body: "done".to_owned(),
+                }),
+                other => panic!("wrong OAuth endpoint: {other}"),
+            }
+        },
+        "POST",
+        "https://claude.ai/a//b/start",
+        &mut BTreeMap::new(),
+        Some("token=private"),
+    )
+    .unwrap();
+    let StepOutcome::Page { url, body } = outcome else {
+        panic!("the injected endpoint is a page");
+    };
+    assert_eq!(url, "https://claude.ai/a//approve?state=dot");
+    assert_eq!(body, "done");
+    assert_eq!(
+        requests,
+        [
+            "https://claude.ai/a//b/start",
+            "https://claude.ai/a//approve?state=dot"
+        ]
+    );
+}
+
+#[test]
 fn multipart_mime_boundary_and_consent_negation_hardening() {
     use crate::harness::headless_oauth::extract_otp_from_email;
 
@@ -4163,6 +4264,72 @@ fn multipart_mime_boundary_and_consent_negation_hardening() {
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body, "line1\r\n\r\nline2");
     assert_eq!(cookies.get("sid").map(String::as_str), Some("abc"));
+
+    // Declared boundaries, including all-hyphen names, end only their own encoded part.
+    // Quoted unrelated parameters and folded headers must not hide the real boundary.
+    for boundary in ["-", "---", "quoted:boundary"] {
+        let raw = format!(
+            "To: fixture@example.invalid\r\n\
+             Content-Type: multipart/mixed; name=\"a; boundary=wrong\";\r\n\
+             \tboundary=\"{boundary}\"\r\n\r\n\
+             --{boundary} \t\r\n\
+             Content-Transfer-Encoding: quoted-printable\r\n\r\n\
+             <!--\r\n-->\r\n--not-a-boundary\r\n\
+             https://claude.ai/magic-link?token=3Dqp-tok&state=3D77\r\n\
+             --{boundary}\r\nContent-Transfer-Encoding: 8bit\r\n\r\n\
+             https://claude.ai/magic-link?token=3d8f9a1b2c&state=41bc99\r\n\
+             --{boundary}--\r\n"
+        );
+        assert_eq!(
+            extract_magic_links_from_email(&raw, Some("fixture@example.invalid")),
+            [
+                "https://claude.ai/magic-link?token=qp-tok&state=77",
+                "https://claude.ai/magic-link?token=3d8f9a1b2c&state=41bc99",
+            ],
+            "{boundary}: QP decodes once; the later 8bit token stays exact, with no corrupted duplicate"
+        );
+    }
+
+    let mut base64_link = "https://claude.ai/magic-link?token=base64".to_owned();
+    while !base64_link.len().is_multiple_of(3) {
+        base64_link.push('x');
+    }
+    let encoded = super::encode_base64(base64_link.as_bytes());
+    let raw = format!(
+        "Content-Type: multipart/mixed; boundary=\"---\"\r\n\r\n\
+         -----\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n-------\r\n"
+    );
+    assert_eq!(extract_magic_links_from_email(&raw, None), [base64_link]);
+
+    let nested = concat!(
+        "To: fixture@example.invalid\r\n",
+        "Content-Type: multipart/mixed; boundary=outer\r\n\r\n",
+        "--outer\r\nContent-Type: multipart/alternative;\r\n\tboundary=\"---\"\r\n\r\n",
+        "-----\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nordinary text\r\n",
+        "-----\r\nContent-Transfer-Encoding: 8bit\r\n\r\n",
+        "https://claude.ai/magic-link?token=3d8f9a1b2c&state=41bc99\r\n",
+        "-------\r\n--outer\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n",
+        "-----\r\nYour verification code is: 739=3204\r\n--outer--\r\n",
+    );
+    assert_eq!(
+        extract_magic_links_from_email(nested, Some("fixture@example.invalid")),
+        ["https://claude.ai/magic-link?token=3d8f9a1b2c&state=41bc99"]
+    );
+    assert_eq!(
+        extract_otp_from_email(nested, Some("fixture@example.invalid")).as_deref(),
+        Some("739204"),
+        "a closed inner boundary is ordinary text in a later outer part"
+    );
+
+    let mut too_deep = String::new();
+    for depth in 0..17 {
+        too_deep.push_str(&format!(
+            "Content-Type: multipart/mixed; boundary=n{depth}\r\n\r\n--n{depth}\r\n"
+        ));
+    }
+    too_deep.push_str("Content-Transfer-Encoding: quoted-printable\r\n\r\nkeep=3Dexact");
+    assert_eq!(super::decode_qp_mime_parts(&too_deep), too_deep);
+    assert!(super::decode_mime_base64_parts(&too_deep).is_empty());
 }
 
 #[test]
@@ -4480,6 +4647,37 @@ fn nested_trackers_anchor_ranking_and_mime_otp_isolation() {
         )),
         "CTA anchor text promotes the opaque tracker sign-in link and rejects View in browser / Unsubscribe"
     );
+
+    // Opaque token/state text is not an instruction to cancel the sign-in.
+    for query in [
+        "token=cancel_123",
+        "token=deny_reject_decline_revoke_logout_signout",
+        "token=opaque&state=access_denied",
+        "token=email-preferences&state=unsubscribe",
+    ] {
+        let url = format!("https://claude.ai/magic-link?{query}");
+        let email = format!("To: sol-m27@proton.me\r\n\r\n{url}\r\n");
+        assert_eq!(
+            extract_credential_from_email(&email, Some("sol-m27@proton.me")),
+            Some(MailboxCredential::MagicLink(url)),
+            "opaque query {query}"
+        );
+    }
+    for tail in [
+        "auth/revoke?token=opaque",
+        "magic-link?token=opaque&error=access_denied",
+        "magic-link?token=opaque&action=deny",
+        "magic-link?token=opaque&action=approve&action=cancel",
+        "magic-link?token=opaque&%65rror=denied",
+        "magic-link?token=opaque&%45rror=denied",
+    ] {
+        let email = format!("To: sol-m27@proton.me\r\n\r\nhttps://claude.ai/{tail}\r\n");
+        assert_eq!(
+            extract_credential_from_email(&email, Some("sol-m27@proton.me")),
+            None,
+            "explicit refusal {tail}"
+        );
+    }
 
     // 5. Top-level base64 OTP email must not treat raw 6-digit base64 lines (`482910`) as OTPs.
     // "Your verification code is 739104 " in base64 is "WW91ciB2ZXJpZmljYXRpb24gY29kZSBpcyA3MzkxMDQg"

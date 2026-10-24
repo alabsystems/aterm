@@ -171,7 +171,11 @@ pub(crate) fn rainbow_sweep_at(col: u16, phase: f32) -> f32 {
 /// Fold an unbounded spectrum position onto the sweep's ping-pong `0..1`, for callers that offset a resolved position (the caret's halo rings step outward along the wheel).
 #[inline]
 pub(crate) fn rainbow_sweep_reflect(x: f32) -> f32 {
-    let raw = x.rem_euclid(2.0);
+    let raw = if (0.0..2.0).contains(&x) {
+        x
+    } else {
+        x.rem_euclid(2.0)
+    };
     if raw <= 1.0 { raw } else { 2.0 - raw }
 }
 

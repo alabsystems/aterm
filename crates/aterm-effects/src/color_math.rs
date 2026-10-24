@@ -18,7 +18,9 @@ pub const LIGHT_MUDDY_HUES: (f32, f32) = (36.0 / 360.0, 96.0 / 360.0);
 #[inline]
 pub fn light_spectrum_hue(hue: f32) -> f32 {
     let (b0, b1) = LIGHT_MUDDY_HUES;
-    let h = if hue.is_finite() {
+    let h = if (0.0..1.0).contains(&hue) {
+        hue
+    } else if hue.is_finite() {
         hue.rem_euclid(1.0)
     } else {
         0.0
@@ -38,7 +40,8 @@ pub fn rgb2hsv(rgb: u32) -> (f32, f32, f32) {
     let h = if c == 0.0 {
         0.0
     } else if max == r {
-        60.0 * (((g - b) / c).rem_euclid(6.0))
+        let d = (g - b) / c;
+        60.0 * if d >= 0.0 { d } else { d.rem_euclid(6.0) }
     } else if max == g {
         60.0 * ((b - r) / c + 2.0)
     } else {
@@ -153,10 +156,15 @@ pub(crate) fn lift_keeping_hue(rgb: u32, meets: impl Fn(u32) -> bool) -> u32 {
 /// `darken`, else its peak scaled to full and then tinted toward white; the path's end where
 /// `meets` fails even there.
 fn least_on_hue_path(rgb: u32, darken: bool, meets: impl Fn(u32) -> bool) -> u32 {
+    let end = if darken { 0x0000_0000 } else { 0x00FF_FFFF };
+    if !meets(end) {
+        return end;
+    }
     let chan = |sh: u32| ((rgb >> sh) & 0xff) as f32;
     let (r, g, b) = (chan(16), chan(8), chan(0));
     let peak = r.max(g).max(b);
     let up = if peak > 0.0 { 255.0 / peak } else { 1.0 };
+    let (r_up, g_up, b_up) = (r * up, g * up, b * up);
     let pack = |r: f32, g: f32, b: f32| {
         let q = |c: f32| (c.round().clamp(0.0, 255.0)) as u32;
         (q(r) << 16) | (q(g) << 8) | q(b)
@@ -170,14 +178,10 @@ fn least_on_hue_path(rgb: u32, darken: bool, meets: impl Fn(u32) -> bool) -> u32
             pack(r * s, g * s, b * s)
         } else {
             let u = (t - 0.5) * 2.0;
-            let tint = |c: f32| c * up + (255.0 - c * up) * u;
-            pack(tint(r), tint(g), tint(b))
+            let tint = |c_up: f32| c_up + (255.0 - c_up) * u;
+            pack(tint(r_up), tint(g_up), tint(b_up))
         }
     };
-    let end = path(1.0);
-    if !meets(end) {
-        return end;
-    }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (rgb & 0x00FF_FFFF, end);
     for i in 0..24 {
@@ -319,7 +323,12 @@ pub(crate) fn oklab_distance(a: u32, b: u32) -> f32 {
 #[inline]
 pub fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
     let c = v * s;
-    let hp = (h.rem_euclid(360.0)) / 60.0;
+    let h_deg = if (0.0..360.0).contains(&h) {
+        h
+    } else {
+        h.rem_euclid(360.0)
+    };
+    let hp = h_deg / 60.0;
     let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
     let (r, g, b) = match hp as u32 {
         0 => (c, x, 0.0),

@@ -996,6 +996,14 @@ impl CursorRainbow {
         for _ in 1..8 {
             let mid = 0.5 * (lo + hi);
             let c = solve(mid);
+            if lo_solved.is_some_and(|(lc, _)| lc == c) {
+                lo = mid;
+                continue;
+            }
+            if hi_solved.is_some_and(|(hc, _)| hc == c) {
+                hi = mid;
+                continue;
+            }
             let l = pile_light(&c);
             if l < target {
                 lo = mid;
@@ -1071,16 +1079,12 @@ impl CursorRainbow {
             }
         }
         let mut last_px = field;
-        let mut last_lum = field_peak;
         let peak = scratch.iter().copied().fold(field_peak, |peak, px| {
-            if px == field {
+            if px == field || px == last_px {
                 peak
             } else {
-                if px != last_px {
-                    last_px = px;
-                    last_lum = crate::color_math::relative_luminance_with(table, px) * 255.0;
-                }
-                peak.max(last_lum)
+                last_px = px;
+                peak.max(crate::color_math::relative_luminance_with(table, px) * 255.0)
             }
         });
         self.rim_scratch = scratch;

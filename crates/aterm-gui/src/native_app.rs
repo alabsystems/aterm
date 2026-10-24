@@ -1873,8 +1873,10 @@ pub(crate) enum TextInputEvent {
     KillToEnd,
     /// Delete from the start of the value to the caret (readline Ctrl-U).
     KillToStart,
-    /// Delete the word before the caret (readline Ctrl-W).
+    /// Delete the word before the caret (readline Ctrl-W, ⌥⌫).
     DeleteWordBackward,
+    /// Delete the word after the caret (⌥⌦).
+    DeleteWordForward,
     /// Caret one word left/right (⌥←/⌥→, ⌥B/⌥F) in a Settings text field.
     WordLeft {
         extend: bool,

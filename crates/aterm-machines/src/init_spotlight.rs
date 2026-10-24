@@ -3,11 +3,11 @@
 
 //! Rustup minimal-profile and `rust-docs` cleanup to keep toolchains out of Spotlight.
 
-use crate::init_observe::{LastReading, Reading};
+use crate::init_observe::{LastReading, Reading, TOOLCHAIN_NOTE};
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, User};
 use crate::port::{Cmd, System};
-use aterm_converge::StoodAside;
+use aterm_toolchain::layout;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,29 +35,59 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
         cargo_home: set("CARGO_HOME").unwrap_or_else(|| home.join(".cargo")),
         rustup_home: set("RUSTUP_HOME").unwrap_or_else(|| home.join(".rustup")),
     };
+    let pkg = aterm_toolchain::atpkg_prefix(home, set("XDG_CONFIG_HOME").as_deref());
     Ok(vec![
         Box::new(Profile(rustup.clone())),
         Box::new(NoDocs(rustup, LastReading::default())),
-        Box::new(BuildNoindex::new(user.clone(), home.to_path_buf())),
+        Box::new(BuildNoindex::new(user.clone(), home.to_path_buf(), pkg)),
     ])
 }
 
-/// How long one Spotlight search of a home folder for build folders stands ([`Inventory`]):
-/// it reads every build artifact Spotlight holds there, so a setup run, a check and System
-/// State's reading share one for this long instead of each searching the home folder again.
+/// How long one Spotlight search of a home folder for build folders stands ([`Inventory`]),
+/// found or failed: a setup run, a check and System State's reading share one for this
+/// long instead of each searching the home folder again. Check again searches anew
+/// ([`search_again`]).
 const INVENTORY_AGE: u64 = 5 * 60;
 
+/// The Spotlight query for build folders: the `CACHEDIR.TAG` cargo writes at the top of
+/// each build folder, so the answer is a line per build folder (and per other tool's cache
+/// tag), never one per artifact (a developer's home holds thousands of `.rmeta` files,
+/// over the complete capture).
+const BUILD_MARKER: &str = "kMDItemFSName == \"CACHEDIR.TAG\"";
+
+/// What the comment line of the cache tag cargo writes says of its maker: "# This file is a
+/// cache directory tag created by cargo."
+const MADE_BY_CARGO: &str = "created by cargo";
+
+/// The most a cache tag of cargo's is read for, in bytes: cargo writes under 200.
+const TAG_MAX: u64 = 4096;
+
+/// What one search of a home folder found: the cargo build folders Spotlight indexes, or
+/// why it could not say.
+type Found = Result<BTreeSet<PathBuf>, String>;
+
+/// The process's one [`Inventory`], which every item outside a test reads.
+static SHARED: std::sync::OnceLock<Arc<Inventory>> = std::sync::OnceLock::new();
+
+/// Forget the process's last Spotlight search for build folders, found or failed, so the
+/// next reading of the Rust in Spotlight row searches the home folder again: Check again's,
+/// which the person pressed to see the Mac as it is now.
+pub fn search_again() {
+    if let Some(inventory) = SHARED.get() {
+        inventory.forget();
+    }
+}
+
 /// The last Spotlight search for build folders: the home it searched, when (Unix seconds),
-/// and the `target` and `build` folders it found indexed.
+/// and what it found.
 #[derive(Debug, Default)]
-struct Inventory(Mutex<Option<(PathBuf, u64, BTreeSet<PathBuf>)>>);
+struct Inventory(Mutex<Option<(PathBuf, u64, Found)>>);
 
 impl Inventory {
-    /// The process's one inventory; a test's item keeps its own.
+    /// The process's one inventory ([`SHARED`]); a test's item keeps its own.
     fn shared() -> Arc<Self> {
         #[cfg(not(test))]
         {
-            static SHARED: std::sync::OnceLock<Arc<Inventory>> = std::sync::OnceLock::new();
             SHARED.get_or_init(Arc::default).clone()
         }
         #[cfg(test)]
@@ -66,45 +96,51 @@ impl Inventory {
         }
     }
 
-    /// The folders a search of `home` taken at most [`INVENTORY_AGE`] before `now` found,
-    /// else `search`'s, kept for the next reader. A search that fails is kept by no one.
-    fn read(
-        &self,
-        home: &Path,
-        now: u64,
-        search: impl FnOnce() -> Result<BTreeSet<PathBuf>, String>,
-    ) -> Result<BTreeSet<PathBuf>, String> {
+    /// Drop the search kept, so the next read searches again ([`search_again`]).
+    fn forget(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// What a search of `home` taken at most [`INVENTORY_AGE`] before `now` found, else
+    /// `search`'s, kept for the next reader: a search that failed stands as long as one
+    /// that found, so a home Spotlight cannot answer for is not searched on every read.
+    fn read(&self, home: &Path, now: u64, search: impl FnOnce() -> Found) -> Found {
         let mut kept = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((at_home, at, found)) = kept.as_ref()
             && at_home == home
             && *at <= now
             && now - at < INVENTORY_AGE
         {
-            return Ok(found.clone());
+            return found.clone();
         }
-        let found = search()?;
+        let found = search();
         *kept = Some((home.to_path_buf(), now, found.clone()));
-        Ok(found)
+        found
     }
 }
 
-/// Keep aterm's cargo build cache and tooling cache in `.noindex` folders, and name the
-/// Trust toolchain builds Spotlight still indexes for the person to move. It never moves
-/// them itself: a program someone started from one may still be under macOS's first-exec
-/// check, and syspolicyd crashes when that file's folder is renamed mid-check. A kill
-/// leaves no process and a run changes no folder, so nothing it could read shows that
-/// check is over.
+/// Keep aterm's cargo build cache and tooling cache in `.noindex` folders.
 ///
-/// The person's own project build folders (`target`, `build`) that Spotlight indexes are
-/// theirs, never aterm's to rename or link: the row only counts them in a quiet note
-/// ([`Reading::ProjectsIndexed`]) and lists them in its line, and they are no step, no
-/// change and nothing the run waits on. A failed search for them costs only the note.
+/// atpkg installs each Trust toolchain build as `store/trust/<n>.noindex` with `<n>` a
+/// link to it, and its rustup view as `rustup/<name>.noindex` behind `rustup/<name>`, which
+/// Spotlight never reads ([`layout`]). It lays a plain build or view there itself, never
+/// while it is in use or a program runs from it (a program started from one may still be
+/// under macOS's first-exec check, and syspolicyd crashes when that file's folder is
+/// renamed mid-check). So a plain one left is aterm's own move still to come, and the item
+/// moves nothing: the build in use and its view, which atpkg moves at its next update,
+/// are one quiet note ([`TOOLCHAIN_NOTE`]), and a build no longer in use, which atpkg moves
+/// at its next pass, goes unsaid. Neither is a step or a change.
+///
+/// The person's own cargo build folders that Spotlight indexes, whatever their names, are
+/// theirs, never aterm's to rename or link: the row only counts them in a quiet note and
+/// lists them in its line, and they are no step, no change and nothing the run waits on.
+/// A failed search for them costs only the note.
 #[derive(Debug)]
 struct BuildNoindex {
     user: User,
     home: PathBuf,
-    /// The folders the last apply named for the person to move.
-    aside: Mutex<Option<StoodAside>>,
+    /// atpkg's prefix ([`aterm_toolchain::atpkg_prefix`]): its store and rustup views.
+    pkg: PathBuf,
     /// The last probe's reading, which is System State's.
     reading: LastReading,
     /// The Spotlight search for project build folders, shared for [`INVENTORY_AGE`].
@@ -112,21 +148,14 @@ struct BuildNoindex {
 }
 
 impl BuildNoindex {
-    fn new(user: User, home: PathBuf) -> Self {
+    fn new(user: User, home: PathBuf, pkg: PathBuf) -> Self {
         Self {
             user,
             home,
-            aside: Mutex::new(None),
+            pkg,
             reading: LastReading::default(),
             inventory: Inventory::shared(),
         }
-    }
-
-    fn set_aside(&self, why: Option<StoodAside>) {
-        *self
-            .aside
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = why;
     }
 
     fn caches_parent(&self) -> PathBuf {
@@ -141,44 +170,28 @@ impl BuildNoindex {
         self.home.join("Library/Caches/aterm/tooling.noindex")
     }
 
-    fn trust_store(&self) -> PathBuf {
-        self.home
-            .join("Library/Application Support/aterm/pkg/store/trust")
+    fn store(&self) -> PathBuf {
+        self.pkg.join(layout::STORE_DIR)
     }
 
-    /// Numeric build directories in `store/trust/<build>` not yet symlinked to `<build>.noindex`.
-    fn plain_trust_builds(&self, sys: &dyn System) -> Result<Vec<String>, String> {
-        let store = self.trust_store();
-        let entries = match sys.list_dir(&store) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("{}: {e}", store.display())),
-        };
-        let mut plain = Vec::new();
-        for name in entries {
-            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
-                continue;
-            }
-            let path = store.join(&name);
-            match sys.stat(&path) {
-                Ok(s) if s.dir && !s.symlink => {
-                    let noindex = store.join(format!("{name}.noindex"));
-                    if Self::present(sys, &noindex)? {
-                        return Err(format!(
-                            "both {} and {} exist; left unchanged",
-                            path.display(),
-                            noindex.display()
-                        ));
-                    }
-                    plain.push(name);
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("{}: {e}", path.display())),
-            }
-        }
-        plain.sort();
-        Ok(plain)
+    /// The Trust toolchain atpkg laid where Spotlight still indexes it, by its layout
+    /// contract ([`layout`]): the build in use and the rustup views laid from it, which
+    /// atpkg moves at its next update; and whether an older build is still plain, which
+    /// atpkg moves at its next pass and the row leaves unsaid.
+    fn exposed_toolchain(&self) -> (Vec<PathBuf>, bool) {
+        let builds = layout::spotlight_exposed_builds(&self.pkg);
+        let older = builds.iter().any(|build| !build.active);
+        let mut in_use: Vec<PathBuf> = builds
+            .into_iter()
+            .filter(|build| build.active)
+            .map(|build| build.dir)
+            .collect();
+        in_use.extend(
+            layout::spotlight_exposed_views(&self.pkg)
+                .into_iter()
+                .map(|view| view.dir),
+        );
+        (in_use, older)
     }
 
     fn dir_present(sys: &dyn System, path: &Path) -> Result<bool, String> {
@@ -210,38 +223,20 @@ impl BuildNoindex {
         Ok(missing)
     }
 
-    /// What Spotlight indexes that is the person's to move: the plain Trust toolchain
-    /// builds.
-    fn to_move(&self, sys: &dyn System) -> Result<Vec<PathBuf>, String> {
-        let store = self.trust_store();
-        Ok(self
-            .plain_trust_builds(sys)?
-            .iter()
-            .map(|name| store.join(name))
-            .collect())
-    }
-
     /// `folders`, comma-separated.
     fn listed(folders: &[PathBuf]) -> String {
         let names: Vec<String> = folders.iter().map(|d| d.display().to_string()).collect();
         names.join(", ")
     }
 
-    /// The line that names `folders` for the person to move.
-    fn for_the_person(folders: &[PathBuf]) -> String {
-        format!(
-            "{} stay where Spotlight indexes them, since macOS may still be checking a program \
-             someone started from one; rename each to its .noindex name and link the old name \
-             to it once nothing has been started from it for {} minutes of awake time, or after \
-             a restart",
-            Self::listed(folders),
-            crate::first_exec::minutes(aterm_uds::deadline::FIRST_EXEC_HANG)
-        )
+    /// The row's line on the toolchain aterm is using, which atpkg moves at its next update.
+    fn toolchain_line(in_use: &[PathBuf]) -> String {
+        format!("{TOOLCHAIN_NOTE}: {}", Self::listed(in_use))
     }
 
-    /// The person's own Cargo/Rust `target` or `build` folders under `self.home` that
-    /// Spotlight indexes, from the [`Inventory`] (`None` when Spotlight could not be
-    /// asked, which costs only the row's note).
+    /// The person's own cargo build folders under `self.home` that Spotlight indexes, from
+    /// the [`Inventory`] (`None` when Spotlight could not be asked, which costs only the
+    /// row's note), less any gone since the search.
     fn spotlit_projects(&self, sys: &dyn System) -> Option<Vec<PathBuf>> {
         let indexed = self
             .inventory
@@ -249,9 +244,8 @@ impl BuildNoindex {
             .ok()?;
         let mut out = Vec::new();
         for cand in indexed {
-            let built = |name: &str| Self::present(sys, &cand.join(name));
             if Self::dir_present(sys, &cand).ok()?
-                && (built("CACHEDIR.TAG").ok()? || built("debug").ok()? || built("release").ok()?)
+                && Self::present(sys, &cand.join("CACHEDIR.TAG")).ok()?
             {
                 out.push(cand);
             }
@@ -259,8 +253,25 @@ impl BuildNoindex {
         Some(out)
     }
 
-    /// Ask Spotlight which `target` or `build` folders under `self.home` it indexes.
-    fn search(&self, sys: &dyn System) -> Result<BTreeSet<PathBuf>, String> {
+    /// Whether the cache tag at `tag` is one cargo wrote: a small file whose comment line
+    /// names cargo as its maker. An empty one is none, as a pipe or a device reads.
+    fn tagged_by_cargo(sys: &dyn System, tag: &Path) -> bool {
+        if !sys
+            .stat(tag)
+            .is_ok_and(|s| !s.dir && !s.symlink && s.len > 0 && s.len <= TAG_MAX)
+        {
+            return false;
+        }
+        sys.read_file(tag).is_ok_and(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .any(|line| line.starts_with('#') && line.contains(MADE_BY_CARGO))
+        })
+    }
+
+    /// Ask Spotlight which cargo build folders under `self.home` it indexes: the folders
+    /// holding a [`BUILD_MARKER`] it holds, one line each, that cargo wrote.
+    fn search(&self, sys: &dyn System) -> Found {
         let mdfind_bin = Path::new("/usr/bin/mdfind");
         sys.stat(mdfind_bin)
             .map_err(|e| format!("{}: {e}", mdfind_bin.display()))?;
@@ -268,7 +279,7 @@ impl BuildNoindex {
             "-onlyin",
             &self.home.to_string_lossy(),
             "-0",
-            "kMDItemFSName == \"*.rmeta\"",
+            BUILD_MARKER,
         ]);
         let ran = sys
             .run_complete_stdout(&cmd)
@@ -281,34 +292,38 @@ impl BuildNoindex {
         if !text.is_empty() && !text.ends_with('\0') {
             return Err("Spotlight inventory is not a complete NUL-delimited list".into());
         }
-        let home_prefix = format!("{}/", self.home.to_string_lossy());
+        // The marker sits at the top of its build folder: the folder is its parent, under
+        // the home folder and in no `.noindex` folder.
         let mut candidates = BTreeSet::new();
         for raw in text.split('\0').filter(|p| !p.is_empty()) {
-            if raw.split('/').any(|c| c.ends_with(".noindex")) {
-                continue;
-            }
-            let Some(rel) = raw.strip_prefix(&home_prefix) else {
+            let Some(folder) = Path::new(raw).parent() else {
                 continue;
             };
-            let parts: Vec<&str> = rel.split('/').collect();
-            if parts.len() < 2 {
-                continue;
-            }
-            for target_name in ["target", "build"] {
-                if let Some(idx) = parts[..parts.len() - 1]
-                    .iter()
-                    .position(|c| *c == target_name)
-                {
-                    let mut root = self.home.clone();
-                    for seg in &parts[..=idx] {
-                        root.push(seg);
-                    }
-                    candidates.insert(root);
-                    break;
-                }
+            let kept_out = folder
+                .components()
+                .any(|part| part.as_os_str().to_string_lossy().ends_with(".noindex"));
+            if !kept_out && folder.starts_with(&self.home) && folder != self.home {
+                candidates.insert(folder.to_path_buf());
             }
         }
-        Ok(candidates)
+        // A folder counts when cargo wrote its tag, whatever its name (a `CARGO_TARGET_DIR`
+        // or `--target-dir` names its own), and once: a build folder inside one already
+        // found (a build script's own, under its `OUT_DIR`) is part of it. In path order a
+        // folder's descendants follow it, so the last one kept is the only one a later
+        // folder can sit inside.
+        let mut found = BTreeSet::new();
+        for folder in candidates {
+            if found
+                .last()
+                .is_some_and(|outer: &PathBuf| folder.starts_with(outer))
+            {
+                continue;
+            }
+            if Self::tagged_by_cargo(sys, &folder.join("CACHEDIR.TAG")) {
+                found.insert(folder);
+            }
+        }
+        Ok(found)
     }
 
     /// The row's line on the person's own project folders Spotlight indexes.
@@ -339,7 +354,7 @@ impl Item for BuildNoindex {
             Ok(v) => v,
             Err(why) => return Probe::Unusable { why },
         };
-        let has_store = match Self::dir_present(sys, &self.trust_store()) {
+        let has_store = match Self::dir_present(sys, &self.store()) {
             Ok(v) => v,
             Err(why) => return Probe::Unusable { why },
         };
@@ -348,7 +363,7 @@ impl Item for BuildNoindex {
                 why: format!(
                     "neither {} nor {} exists",
                     self.caches_parent().display(),
-                    self.trust_store().display()
+                    self.store().display()
                 ),
             };
         }
@@ -356,52 +371,48 @@ impl Item for BuildNoindex {
             Ok(missing) => missing,
             Err(why) => return Probe::Unusable { why },
         };
-        let folders = match self.to_move(sys) {
-            Ok(folders) => folders,
-            Err(why) => return Probe::Unusable { why },
-        };
+        let (in_use, older) = self.exposed_toolchain();
         let projects = self.spotlit_projects(sys).unwrap_or_default();
-        let indexed = Reading::BuildsIndexed {
-            projects: projects.len(),
-        };
-        if missing.is_empty() {
-            return if folders.is_empty() {
-                let mut now =
-                    "cargo-build.noindex, tooling.noindex, and trust store builds are .noindex"
-                        .to_owned();
-                if !projects.is_empty() {
-                    self.reading.set(Some(Reading::ProjectsIndexed {
-                        count: projects.len(),
-                    }));
-                    now.push_str(&format!("; {}", Self::projects_line(&projects)));
-                }
-                Probe::Ok { now }
-            } else {
-                self.reading.set(Some(indexed));
-                Probe::Person {
-                    step: "spotlight.build-folders".into(),
-                    how: Self::for_the_person(&folders),
-                }
-            };
+        // What the row only notes: the toolchain aterm is using, which atpkg moves at its
+        // next update, and the person's project folders. Neither is a step or a change. A
+        // plain build no longer in use is atpkg's to move at its next pass.
+        let mut noted = Vec::new();
+        if !in_use.is_empty() {
+            noted.push(Self::toolchain_line(&in_use));
         }
-        self.reading.set(Some(indexed));
+        if !projects.is_empty() {
+            noted.push(Self::projects_line(&projects));
+        }
+        let (projects, toolchain) = (projects.len(), !in_use.is_empty());
+        if missing.is_empty() {
+            let mut now = if in_use.is_empty() && !older {
+                "cargo-build.noindex, tooling.noindex, and the Trust toolchain are .noindex"
+            } else {
+                "cargo-build.noindex and tooling.noindex are .noindex"
+            }
+            .to_owned();
+            if !noted.is_empty() {
+                self.reading.set(Some(Reading::KeptOut {
+                    projects,
+                    toolchain,
+                }));
+                now.push_str(&format!("; {}", noted.join("; ")));
+            }
+            return Probe::Ok { now };
+        }
+        self.reading.set(Some(Reading::BuildsIndexed {
+            projects,
+            toolchain,
+        }));
         let mut from: Vec<String> = missing
             .iter()
             .filter_map(|dir| dir.file_name())
             .map(|name| format!("{} absent", name.to_string_lossy()))
             .collect();
-        let mut to = "cargo-build.noindex and tooling.noindex".to_owned();
-        if !folders.is_empty() {
-            let listed = Self::listed(&folders);
-            from.push(format!("{listed} indexed by Spotlight"));
-            to.push_str(&format!(", with {listed} left for you to move"));
-        }
-        if !projects.is_empty() {
-            from.push(Self::projects_line(&projects));
-        }
+        from.extend(noted);
         Probe::Change {
             from: from.join("; "),
-            to,
+            to: "cargo-build.noindex and tooling.noindex".to_owned(),
         }
     }
 
@@ -409,28 +420,14 @@ impl Item for BuildNoindex {
         self.reading.detail()
     }
 
-    /// Make the missing caches; name the Trust toolchain builds Spotlight indexes for the
-    /// person and stand aside on them ([`StoodAside::Waiting`]), since only they can tell
-    /// when nothing runs from one. The person's own project folders are not its to touch.
+    /// Make the missing caches. Nothing else is its to move: atpkg moves its toolchain
+    /// builds, and the person's own project folders are theirs.
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
-        self.set_aside(None);
-        // Admit the store's inventory before creating any cache directory.
-        let folders = self.to_move(sys)?;
         for dir in self.missing_caches(sys)? {
             sys.create_dir_all(&dir, 0o755)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        if !folders.is_empty() {
-            self.set_aside(Some(StoodAside::Waiting(Self::for_the_person(&folders))));
-        }
         Ok(())
-    }
-
-    fn stood_aside(&self) -> Option<StoodAside> {
-        self.aside
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
     }
 }
 
@@ -736,76 +733,86 @@ mod tests {
         assert!(bare.calls().is_empty(), "{:?}", bare.calls());
     }
 
-    #[test]
-    fn build_noindex_plans_cache_dirs_and_refuses_a_trust_build_beside_its_noindex() {
-        let alice = user("alice", 501);
-        let item = BuildNoindex::new(alice, "/Users//alice".into());
-        let sys = Fake::root();
-        sys.file("/usr/bin/mdfind", b"").on(
-            "alice$ /usr/bin/mdfind -onlyin /Users//alice -0 'kMDItemFSName == \"*.rmeta\"'",
-            Ran::ok(""),
-        );
-        sys.create_dir_all(Path::new("/Users//alice/Library/Caches"), 0o755)
+    const MDFIND: &str =
+        "alice$ /usr/bin/mdfind -onlyin /Users//alice -0 'kMDItemFSName == \"CACHEDIR.TAG\"'";
+    const TARGET: &str = "/Users//alice/work/demo/target";
+    /// The cache tag cargo writes at the top of a build folder.
+    const CARGO_TAG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n# For information about cache directory tags see https://bford.info/cachedir/\n";
+
+    /// A scratch atpkg prefix: the item reads its store and rustup views on disk, by the
+    /// layout contract (`aterm_toolchain::layout`), never through the fake.
+    struct Pkg(aterm_tempfile::TempDir);
+
+    impl Pkg {
+        fn new() -> Self {
+            Self(aterm_tempfile::tempdir().unwrap())
+        }
+
+        fn path(&self) -> &Path {
+            self.0.path()
+        }
+
+        /// `rustup/<name>` or `store/trust/<n>`, with its Rust sysroot.
+        fn plain(&self, at: &str) -> String {
+            let dir = self.path().join(at);
+            std::fs::create_dir_all(dir.join("lib/rustlib")).unwrap();
+            dir.display().to_string()
+        }
+
+        /// `<at>.noindex` with `<at>` a link to it, as atpkg lays one aside.
+        fn aside(&self, at: &str) {
+            let dir = self.path().join(at);
+            let name = dir.file_name().unwrap().to_str().unwrap().to_owned();
+            std::fs::create_dir_all(
+                dir.with_file_name(format!("{name}.noindex"))
+                    .join("lib/rustlib"),
+            )
             .unwrap();
-        sys.create_dir_all(
-            Path::new("/Users//alice/Library/Application Support/aterm/pkg/store/trust"),
-            0o755,
-        )
-        .unwrap();
-        sys.file(
-            "/Users//alice/Library/Application Support/aterm/pkg/store/trust/15698",
-            b"",
-        );
-        sys.stat_of(
-            "/Users//alice/Library/Application Support/aterm/pkg/store/trust/15698",
-            crate::port::Stat {
-                uid: 501,
-                gid: 20,
-                mode: 0o755,
-                dir: true,
-                symlink: false,
-                len: 0,
-            },
-        );
-        let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
-        let planned = engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
-        assert_eq!(planned[0].outcome, Outcome::Planned, "{planned:?}");
-        assert_eq!(
-            Reading::of(&planned[0]),
-            Some(Reading::BuildsIndexed { projects: 0 })
-        );
-        assert!(
-            planned[0]
-                .from
-                .as_deref()
-                .is_some_and(|f| f.contains("cargo-build.noindex absent") && f.contains("15698")),
-            "{planned:?}"
-        );
-        let build = "/Users//alice/Library/Application Support/aterm/pkg/store/trust/15698";
-        let kept = format!("{build}/retained");
-        sys.file(&kept, b"existing toolchain bytes");
-        sys.create_dir_all(Path::new(&format!("{build}.noindex")), 0o755)
-            .unwrap();
-        assert!(matches!(
-            items[0].probe(&sys, &context()),
-            Probe::Unusable { .. }
-        ));
-        assert!(items[0].apply(&sys, &context()).is_err());
-        assert_eq!(
-            sys.read_file(Path::new(&kept)).unwrap(),
-            b"existing toolchain bytes"
-        );
-        assert!(
-            sys.stat(Path::new(
-                "/Users//alice/Library/Caches/aterm/cargo-build.noindex"
-            ))
-            .is_err()
-        );
+            std::os::unix::fs::symlink(format!("{name}.noindex"), &dir).unwrap();
+        }
+
+        /// `store/trust/current`, a link to build `n`.
+        fn current(&self, n: &str) {
+            std::os::unix::fs::symlink(n, self.path().join("store/trust/current")).unwrap();
+        }
+
+        fn items(&self) -> Vec<Box<dyn Item>> {
+            vec![Box::new(BuildNoindex::new(
+                user("alice", 501),
+                "/Users//alice".into(),
+                self.path().to_path_buf(),
+            ))]
+        }
     }
 
-    const MDFIND: &str =
-        "alice$ /usr/bin/mdfind -onlyin /Users//alice -0 'kMDItemFSName == \"*.rmeta\"'";
-    const TARGET: &str = "/Users//alice/work/demo/target";
+    /// A Mac with aterm's caches made and `found`, each a folder holding cargo's cache tag,
+    /// with what Spotlight's search for them answers.
+    fn with_build_folders(found: &[&str]) -> (Fake, Ran) {
+        let sys = Fake::root();
+        for name in ["cargo-build.noindex", "tooling.noindex"] {
+            sys.create_dir_all(
+                &Path::new("/Users//alice/Library/Caches/aterm").join(name),
+                0o755,
+            )
+            .unwrap();
+        }
+        let mut reply = String::new();
+        for folder in found {
+            sys.create_dir_all(Path::new(&format!("{folder}/debug")), 0o755)
+                .unwrap();
+            sys.file(&format!("{folder}/CACHEDIR.TAG"), CARGO_TAG);
+            reply.push_str(&format!("{folder}/CACHEDIR.TAG\0"));
+        }
+        sys.file("/usr/bin/mdfind", b"");
+        (sys, Ran::ok(&reply))
+    }
+
+    /// [`with_build_folders`], whose search finds them.
+    fn spotlit(found: &[&str]) -> Fake {
+        let (sys, found) = with_build_folders(found);
+        sys.on(MDFIND, found);
+        sys
+    }
 
     /// A Mac whose caches the item makes are `made`, with one project `target` of the
     /// person's that Spotlight indexes.
@@ -824,65 +831,23 @@ mod tests {
         }
         sys.create_dir_all(Path::new(&format!("{TARGET}/debug")), 0o755)
             .unwrap();
-        sys.file(&format!("{TARGET}/CACHEDIR.TAG"), b"Signature:");
-        sys.file("/usr/bin/mdfind", b"").on(
-            MDFIND,
-            Ran::ok(&format!("{TARGET}/debug/deps/libdemo.rmeta\0")),
-        );
+        sys.file(&format!("{TARGET}/CACHEDIR.TAG"), CARGO_TAG);
+        sys.file("/usr/bin/mdfind", b"")
+            .on(MDFIND, Ran::ok(&format!("{TARGET}/CACHEDIR.TAG\0")));
         sys
     }
 
+    /// The item on a Mac with no atpkg prefix.
     fn alice_builds() -> Vec<Box<dyn Item>> {
         vec![Box::new(BuildNoindex::new(
             user("alice", 501),
             "/Users//alice".into(),
+            "/Users//alice/Library/Application Support/aterm/pkg".into(),
         ))]
     }
 
-    #[test]
-    fn a_build_folder_a_program_may_still_run_from_is_the_persons_to_move_and_never_planned() {
-        const STORE: &str = "/Users//alice/Library/Application Support/aterm/pkg/store/trust";
-        let run_as = |sys: &Fake, mode: Mode| {
-            engine::run(&alice_builds(), mode, sys, &context(), &mut NoJournal)
-        };
-        let run = |sys: &Fake| run_as(sys, Mode::Apply);
-        let caches = |sys: &Fake| {
-            ["cargo-build.noindex", "tooling.noindex"]
-                .iter()
-                .all(|name| {
-                    sys.stat(&Path::new("/Users//alice/Library/Caches/aterm").join(name))
-                        .is_ok_and(|s| s.dir)
-                })
-        };
-
-        let sys = with_a_spotlit_project(false);
-        sys.create_dir_all(Path::new(STORE), 0o755).unwrap();
-        let build = format!("{STORE}/15698");
-        sys.file(&build, b"").stat_of(
-            &build,
-            crate::port::Stat {
-                uid: 501,
-                gid: 20,
-                mode: 0o755,
-                dir: true,
-                symlink: false,
-                len: 0,
-            },
-        );
-        let planned = run_as(&sys, Mode::Plan);
-        assert_eq!(planned[0].outcome, Outcome::Planned, "{planned:?}");
-        assert_eq!(
-            planned[0].to.as_deref(),
-            Some(
-                format!(
-                    "cargo-build.noindex and tooling.noindex, with {build} left for you to move"
-                )
-                .as_str()
-            ),
-            "the plan promises only what apply makes, and nothing of the person's project"
-        );
-        let rows = run(&sys);
-        assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
+    /// No rename and no link: what the item never does to a folder.
+    fn moved_nothing(sys: &Fake) {
         assert!(
             !sys.calls()
                 .iter()
@@ -890,30 +855,122 @@ mod tests {
             "{:#?}",
             sys.calls()
         );
-        let Some(StoodAside::Waiting(why)) = &rows[0].stood_aside else {
-            panic!("it waits on the person, not on another run's lock: {rows:?}");
-        };
-        assert!(
-            why.starts_with(&format!("{build} stay where Spotlight indexes them"))
-                && why.contains("10 minutes of awake time, or after a restart")
-                && !why.contains(TARGET),
-            "{why}"
-        );
-        assert!(caches(&sys), "the caches new builds use are made");
-        for mode in [Mode::Plan, Mode::Apply] {
-            let rows = run_as(&sys, mode);
-            assert_eq!(rows[0].outcome, Outcome::Person, "{mode:?}: {rows:?}");
-            assert_eq!(rows[0].why.as_deref(), Some(why.as_str()));
-            assert_eq!(rows[0].stood_aside, None);
-        }
+    }
 
-        let bare = Fake::root();
-        bare.create_dir_all(Path::new("/Users//alice/Library/Caches"), 0o755)
+    /// The Rust in Spotlight row these rows read as.
+    fn row_of(rows: &[crate::model::ItemReport]) -> aterm_types::macos_setup::Observation {
+        let refs: Vec<&crate::model::ItemReport> = rows.iter().collect();
+        crate::init_observe::observation(aterm_types::macos_setup::Setting::Spotlight, &refs)
+    }
+
+    /// The item makes aterm's two caches and nothing else: the Trust toolchain build in use,
+    /// left plain in the store, is atpkg's move to make at its next update, so the plan
+    /// names it in its line and promises only the caches, and the build stays as it is.
+    #[test]
+    fn build_noindex_makes_its_caches_and_only_notes_the_toolchain_build_in_use() {
+        let sys = Fake::root();
+        sys.file("/usr/bin/mdfind", b"").on(MDFIND, Ran::ok(""));
+        sys.create_dir_all(Path::new("/Users//alice/Library/Caches"), 0o755)
             .unwrap();
-        bare.file("/usr/bin/mdfind", b"").on(MDFIND, Ran::ok(""));
-        let rows = run(&bare);
+        let pkg = Pkg::new();
+        let build = pkg.plain("store/trust/15698");
+        pkg.current("15698");
+        let items = pkg.items();
+        let planned = engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
+        assert_eq!(planned[0].outcome, Outcome::Planned, "{planned:?}");
+        assert_eq!(
+            Reading::of(&planned[0]),
+            Some(Reading::BuildsIndexed {
+                projects: 0,
+                toolchain: true,
+            })
+        );
+        assert!(
+            planned[0]
+                .from
+                .as_deref()
+                .is_some_and(|f| f.contains("cargo-build.noindex absent") && f.contains(&build)),
+            "{planned:?}"
+        );
+        assert_eq!(
+            planned[0].to.as_deref(),
+            Some("cargo-build.noindex and tooling.noindex"),
+            "the plan promises only what apply makes"
+        );
+        let rows = engine::run(&items, Mode::Apply, &sys, &context(), &mut NoJournal);
         assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
-        assert!(caches(&bare));
+        assert_eq!(rows[0].stood_aside, None);
+        assert!(
+            std::fs::symlink_metadata(&build).is_ok_and(|m| m.is_dir()),
+            "the build stays where atpkg left it"
+        );
+        moved_nothing(&sys);
+        assert!(
+            sys.stat(Path::new(
+                "/Users//alice/Library/Caches/aterm/cargo-build.noindex"
+            ))
+            .is_ok_and(|s| s.dir)
+        );
+    }
+
+    /// A Mac with the Trust toolchain atpkg installed: the build in use, left plain in the
+    /// store, is aterm's own move still to come, a quiet note on an in-place row and never
+    /// Needs you, on every pass ("no user required"), and the stage finishes. A `<n>` that
+    /// is a link to `<n>.noindex`, as atpkg now installs one, is kept out already and noted
+    /// by no one.
+    #[test]
+    fn an_atpkg_toolchain_build_is_a_note_and_never_needs_you() {
+        let sys = with_a_spotlit_project(true);
+        let pkg = Pkg::new();
+        let build = pkg.plain("store/trust/15698");
+        pkg.current("15698");
+        let items = pkg.items();
+        for mode in [Mode::Plan, Mode::Apply, Mode::Apply, Mode::Plan] {
+            let rows = engine::run(&items, mode, &sys, &context(), &mut NoJournal);
+            assert_eq!(rows[0].outcome, Outcome::Ok, "{mode:?}: {rows:?}");
+            assert_eq!(rows[0].stood_aside, None);
+            assert_eq!(
+                Reading::of(&rows[0]),
+                Some(Reading::KeptOut {
+                    projects: 1,
+                    toolchain: true,
+                })
+            );
+            let read = row_of(&rows);
+            assert_eq!(
+                read.standing,
+                aterm_types::macos_setup::Standing::InPlace,
+                "{mode:?}: {read:?}"
+            );
+            assert!(
+                read.note.as_deref().is_some_and(|note| note.starts_with(
+                    "aterm moves the Rust toolchain it is using out of Spotlight at its next \
+                     update; Spotlight indexes 1 of your project build folders"
+                )),
+                "{read:?}"
+            );
+            assert!(
+                read.detail.as_deref().is_some_and(|d| d.contains(&build)),
+                "the build stands behind the note: {read:?}"
+            );
+        }
+        moved_nothing(&sys);
+
+        // atpkg's layout: `<n>.noindex`, with `<n>` a link to it.
+        let linked = spotlit(&[]);
+        let pkg = Pkg::new();
+        pkg.aside("store/trust/15698");
+        pkg.current("15698");
+        let rows = engine::run(
+            &pkg.items(),
+            Mode::Apply,
+            &linked,
+            &context(),
+            &mut NoJournal,
+        );
+        assert_eq!(rows[0].outcome, Outcome::Ok, "{rows:?}");
+        assert_eq!(Reading::of(&rows[0]), None, "nothing to note");
+        assert_eq!(row_of(&rows).note, None);
     }
 
     /// The person's own project `target` that Spotlight indexes is a quiet note on the Rust
@@ -929,7 +986,10 @@ mod tests {
             assert_eq!(rows[0].outcome, Outcome::Ok, "{mode:?}: {rows:?}");
             assert_eq!(
                 Reading::of(&rows[0]),
-                Some(Reading::ProjectsIndexed { count: 1 })
+                Some(Reading::KeptOut {
+                    projects: 1,
+                    toolchain: false,
+                })
             );
             let line = format!(
                 "Spotlight indexes these project build folders of yours, which aterm leaves as they are: {TARGET}"
@@ -938,11 +998,7 @@ mod tests {
                 rows[0].to.as_deref().is_some_and(|to| to.ends_with(&line)),
                 "{rows:?}"
             );
-            let refs: Vec<&crate::model::ItemReport> = rows.iter().collect();
-            let read = crate::init_observe::observation(
-                aterm_types::macos_setup::Setting::Spotlight,
-                &refs,
-            );
+            let read = row_of(&rows);
             assert_eq!(
                 read.standing,
                 aterm_types::macos_setup::Standing::InPlace,
@@ -969,13 +1025,7 @@ mod tests {
             b"existing build bytes"
         );
         assert!(sys.stat(Path::new(TARGET)).unwrap().dir);
-        assert!(
-            !sys.calls()
-                .iter()
-                .any(|c| c.starts_with("rename ") || c.contains("/bin/ln")),
-            "{:#?}",
-            sys.calls()
-        );
+        moved_nothing(&sys);
 
         // Spotlight not answering costs the note, never aterm's own caches.
         let census = |reply| {
@@ -993,9 +1043,7 @@ mod tests {
             .unwrap();
         for unread in [
             census(Ran::exit(1, "census failed")),
-            census(Ran::ok(
-                "/Users//alice/work/demo/target/debug/incomplete.rmeta",
-            )),
+            census(Ran::ok("/Users//alice/work/demo/target/CACHEDIR.TAG")),
             incomplete,
             missing,
         ] {
@@ -1015,6 +1063,58 @@ mod tests {
                     .is_ok_and(|s| s.dir)
             );
         }
+    }
+
+    /// Spotlight is asked for build folders, one line each (the `CACHEDIR.TAG` cargo
+    /// writes at the top of one), never for every artifact: a developer's home holds
+    /// thousands of `.rmeta` files, over the complete capture. A search that fails anyway
+    /// stands its age like one that found, so the home folder is not searched on every
+    /// probe; the next one after it finds again.
+    #[test]
+    fn spotlight_is_asked_for_build_folders_and_a_failed_search_stands_its_age() {
+        let sys = with_a_spotlit_project(true);
+        let items = alice_builds();
+        let searches = |sys: &Fake| sys.calls().iter().filter(|c| c.contains("mdfind")).count();
+        let rows = engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
+        assert_eq!(
+            sys.calls().iter().filter(|c| c.as_str() == MDFIND).count(),
+            1,
+            "{:#?}",
+            sys.calls()
+        );
+        assert_eq!(
+            Reading::of(&rows[0]),
+            Some(Reading::KeptOut {
+                projects: 1,
+                toolchain: false,
+            })
+        );
+
+        let mut big = String::new();
+        let mut n = 0;
+        while big.len() <= aterm_uds::deadline::OUTPUT_KEEP {
+            big.push_str(&format!("/Users//alice/work/p{n:06}/target/CACHEDIR.TAG\0"));
+            n += 1;
+        }
+        let mut over = Fake::root();
+        for name in ["cargo-build.noindex", "tooling.noindex"] {
+            over.create_dir_all(
+                &Path::new("/Users//alice/Library/Caches/aterm").join(name),
+                0o755,
+            )
+            .unwrap();
+        }
+        over.file("/usr/bin/mdfind", b"").on(MDFIND, Ran::ok(&big));
+        let items = alice_builds();
+        for _ in 0..3 {
+            let rows = engine::run(&items, Mode::Plan, &over, &context(), &mut NoJournal);
+            assert_eq!(rows[0].outcome, Outcome::Ok, "{rows:?}");
+            assert_eq!(Reading::of(&rows[0]), None, "the note goes, nothing else");
+        }
+        assert_eq!(searches(&over), 1, "a failed search stands its age too");
+        over.now += INVENTORY_AGE;
+        engine::run(&items, Mode::Plan, &over, &context(), &mut NoJournal);
+        assert_eq!(searches(&over), 2);
     }
 
     /// One search of the home folder stands for every probe for [`INVENTORY_AGE`]: a run's
@@ -1039,11 +1139,144 @@ mod tests {
         );
         assert_eq!(
             Reading::of(&rows[0]),
-            Some(Reading::ProjectsIndexed { count: 1 })
+            Some(Reading::KeptOut {
+                projects: 1,
+                toolchain: false,
+            })
         );
         // A clock that went back reads again.
         sys.now -= 10;
         engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
         assert_eq!(searches(&sys), 3);
+    }
+
+    /// Spotlight's build folders are the folders cargo tagged, whatever their names (a
+    /// `CARGO_TARGET_DIR` or `--target-dir` names its own), each counted once: a build
+    /// folder inside one found (a build script's own under its `OUT_DIR`) is part of it.
+    /// NEGATIVE CONTROL: a folder another tool tagged is no build folder of cargo's, and
+    /// a cargo build folder inside it still counts.
+    #[test]
+    fn a_cargo_build_folder_counts_once_whatever_its_name() {
+        let read = |sys: &Fake| {
+            let rows = engine::run(&alice_builds(), Mode::Plan, sys, &context(), &mut NoJournal);
+            Reading::of(&rows[0])
+        };
+        let projects = |projects| {
+            Some(Reading::KeptOut {
+                projects,
+                toolchain: false,
+            })
+        };
+        assert_eq!(read(&spotlit(&["/Users//alice/brtgt"])), projects(1));
+        let nested = format!("{TARGET}/debug/build/pmt-1/out/target");
+        assert_eq!(read(&spotlit(&[TARGET, &nested])), projects(1));
+        let beside = "/Users//alice/work/demo/target-main";
+        assert_eq!(read(&spotlit(&[TARGET, &nested, beside])), projects(2));
+        let other_tool = "/Users//alice/.cache/pip";
+        let pip = |sys: &Fake| {
+            sys.file(
+                &format!("{other_tool}/CACHEDIR.TAG"),
+                b"Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by pip.\n",
+            );
+        };
+        let sys = spotlit(&[other_tool]);
+        pip(&sys);
+        assert_eq!(read(&sys), None, "nothing of cargo's to note");
+        let inside = format!("{other_tool}/target");
+        let sys = spotlit(&[other_tool, &inside]);
+        pip(&sys);
+        assert_eq!(read(&sys), projects(1));
+    }
+
+    /// The build `store/trust/current` names is the one in use, which atpkg never moves
+    /// until an update makes another current, and the rustup view laid from it moves with
+    /// the next update too: one note says so, never "older". A plain build no longer in
+    /// use, atpkg's to move at its next pass, goes unsaid. With nothing plain left, the row
+    /// says the toolchain is kept out, with no note.
+    #[test]
+    fn only_the_toolchain_in_use_is_noted() {
+        let sys = spotlit(&[]);
+        let read = |pkg: &Pkg| {
+            let rows = engine::run(&pkg.items(), Mode::Plan, &sys, &context(), &mut NoJournal);
+            assert_eq!(rows[0].outcome, Outcome::Ok, "{rows:?}");
+            (row_of(&rows), rows[0].to.clone().unwrap_or_default())
+        };
+        let pkg = Pkg::new();
+        let older = pkg.plain("store/trust/15600");
+        let build = pkg.plain("store/trust/15698");
+        pkg.current("15698");
+        let view = pkg.plain("rustup/trust");
+        let (row, line) = read(&pkg);
+        assert_eq!(row.note.as_deref(), Some(TOOLCHAIN_NOTE), "{row:?}");
+        assert!(
+            line.contains(&build) && line.contains(&view) && !line.contains(&older),
+            "{line}"
+        );
+        assert!(line.contains(&format!("{TOOLCHAIN_NOTE}: ")), "{line}");
+
+        // The build in use laid aside, its view still plain: the view is the note.
+        let pkg = Pkg::new();
+        pkg.plain("store/trust/15600");
+        pkg.aside("store/trust/15698");
+        pkg.current("15698");
+        let view = pkg.plain("rustup/trust");
+        let (row, line) = read(&pkg);
+        assert_eq!(row.note.as_deref(), Some(TOOLCHAIN_NOTE), "{row:?}");
+        assert!(line.contains(&view), "{line}");
+
+        // Both laid aside: the older plain build is no note, and no "kept out" is claimed.
+        let pkg = Pkg::new();
+        pkg.plain("store/trust/15600");
+        pkg.aside("store/trust/15698");
+        pkg.current("15698");
+        pkg.aside("rustup/trust");
+        let (row, line) = read(&pkg);
+        assert_eq!(row.note, None, "{row:?}");
+        assert_eq!(line, "cargo-build.noindex and tooling.noindex are .noindex");
+
+        // Nothing plain: kept out, no note.
+        std::fs::remove_dir_all(pkg.path().join("store/trust/15600")).unwrap();
+        let (row, line) = read(&pkg);
+        assert_eq!(row.note, None, "{row:?}");
+        assert_eq!(
+            line,
+            "cargo-build.noindex, tooling.noindex, and the Trust toolchain are .noindex"
+        );
+    }
+
+    /// Check again searches Spotlight anew ([`search_again`]): a search kept from minutes
+    /// ago, found or failed, would leave the row's note as it was.
+    #[test]
+    fn check_again_searches_spotlight_anew() {
+        let (sys, found) = with_build_folders(&[TARGET]);
+        sys.on(MDFIND, Ran::exit(1, "Spotlight is rebuilding its index"))
+            .on(MDFIND, found);
+        let item = BuildNoindex {
+            inventory: SHARED.get_or_init(Arc::default).clone(),
+            ..BuildNoindex::new(
+                user("alice", 501),
+                "/Users//alice".into(),
+                "/Users//alice/Library/Application Support/aterm/pkg".into(),
+            )
+        };
+        let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
+        let read = || {
+            let rows = engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
+            Reading::of(&rows[0])
+        };
+        let searches = || sys.calls().iter().filter(|c| c.as_str() == MDFIND).count();
+        assert_eq!(read(), None, "the search failed");
+        assert_eq!((read(), searches()), (None, 1), "and stands its age");
+        search_again();
+        assert_eq!(
+            (read(), searches()),
+            (
+                Some(Reading::KeptOut {
+                    projects: 1,
+                    toolchain: false,
+                }),
+                2
+            )
+        );
     }
 }

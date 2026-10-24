@@ -52,6 +52,11 @@ aterm-aos = { workspace = true }
 # release build. Test and debug builds have them without it; a release build
 # without it has none of them and runs exactly the prebuilt codes.
 aos-candidates = []
+# Aos M5a shared-buffer inference (the same design, §12): the int32-exact/v1
+# bag-of-ids MLP job kind, its CPU reference and tone-int v1 in a release
+# build. Test and debug builds have them without it; aterm-gpu's `compute`
+# feature turns it on, and no release binary names it.
+int-bag-mlp = []
 
 [target.'cfg(unix)'.dependencies]
 # Native config-referenced visual feeds are opened O_NONBLOCK/O_NOFOLLOW on

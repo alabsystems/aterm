@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Derived from x11rb-protocol 0.13.2 (MIT OR Apache-2.0, used under Apache-2.0).
+// Derived from x11rb-protocol 0.13.2 src/resource_manager/ (MIT OR Apache-2.0, used under
+// Apache-2.0), rewritten by the aterm project in 2026 as one module.
 
 //! X resource manager (Xrm) database parser and query matcher.
 

@@ -649,8 +649,15 @@ impl InkLedger {
             if dx >= fx {
                 return m;
             }
+            if dx == 0.0 && dy == 0.0 {
+                return d.share;
+            }
             let (dx, dy) = (dx / fx, dy / fy);
-            let e = (dx * dx + dy * dy).sqrt().min(1.0);
+            let d2 = dx * dx + dy * dy;
+            if d2 >= 1.0 {
+                return m;
+            }
+            let e = d2.sqrt();
             let rise = e * e * (3.0 - 2.0 * e);
             m.min(d.share + (1.0 - d.share) * rise)
         })

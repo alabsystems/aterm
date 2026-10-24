@@ -986,8 +986,10 @@ pub(crate) struct SessionHandle {
     pub title: String,
     pub term: Arc<Mutex<Terminal>>,
     pub master: i32,
-    /// The PTY child as spawned, the root of the session's process tree (`0`: none).
-    pub pid: i32,
+    /// The PTY child as the session took it, the root of the session's process tree (pid `0`:
+    /// none): its birth read while the pid provably named it (this process's unreaped child, or
+    /// the leader of the PTY it adopted), so a pid reused since cannot pass for it.
+    pub shell_identity: aterm_pty::ShellIdentity,
     pub ctx: Arc<SessionCtx>,
 }
 
@@ -1847,7 +1849,7 @@ fn handle_over(
         title: format!("tab-{local_id}"),
         term,
         master,
-        pid: 0,
+        shell_identity: aterm_pty::ShellIdentity::unproven(0),
         ctx,
     }
 }

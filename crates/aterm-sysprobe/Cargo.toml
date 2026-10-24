@@ -74,5 +74,12 @@ aterm-uds = { workspace = true }
 # dependencies.
 aterm-vitals = { workspace = true }
 
+# The zombie-write test's stand-in (`src/procs.rs`) finishes its 8 MiB with a
+# durable flush, so the kernel issues the writes from the stand-in itself and
+# counts them in its rusage before it exits. Workspace crate, std-only (its
+# one dependency, astream-sys, has none).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+aterm-durable = { workspace = true }
+
 [lints]
 workspace = true

@@ -17,8 +17,8 @@ mod view;
 #[cfg(test)]
 pub(super) use view::SHEET_TITLE;
 pub(super) use view::{
-    BlocksShared, ListRoom, SharedBlocks, SharedSheet, demo_font_candidate, demo_spec, list_room,
-    themes_page,
+    BlocksShared, ListRoom, SharedBlocks, SharedDemo, SharedSheet, SharedStrip,
+    demo_font_candidate, demo_spec, laid_last, list_laid, list_room, themes_page,
 };
 #[cfg(test)]
 pub(super) use view::{list_blocks, section_items};

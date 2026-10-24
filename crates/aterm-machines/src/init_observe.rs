@@ -41,18 +41,25 @@ pub enum Reading {
     SignedIn,
     /// A rustup toolchain carries rust-docs.
     DocsInstalled,
-    /// A Rust build or tooling cache of aterm's sits where Spotlight indexes it;
-    /// Spotlight also indexes `projects` of the person's own project build folders.
+    /// A Rust build or tooling cache of aterm's sits where Spotlight indexes it, which
+    /// the item makes in place; the notes of [`Self::KeptOut`] go with it.
     BuildsIndexed {
-        /// The person's project build folders Spotlight indexes ([`Self::ProjectsIndexed`]).
+        /// The person's project build folders Spotlight indexes.
         projects: usize,
+        /// The Trust toolchain aterm is using is still where Spotlight indexes it.
+        toolchain: bool,
     },
-    /// aterm's own caches are kept out of Spotlight, and Spotlight indexes `count`
-    /// of the person's own project build folders (`target`, `build`): theirs to
-    /// rename, never aterm's, so the row only notes them ([`projects_note`]).
-    ProjectsIndexed {
-        /// How many.
-        count: usize,
+    /// aterm's caches are kept out of Spotlight, with what the row only notes: `projects`
+    /// of the person's own cargo build folders Spotlight indexes, theirs and never aterm's
+    /// to rename ([`projects_note`]), and whether the Trust toolchain aterm is using (its
+    /// build or the rustup view laid from it) is still where Spotlight indexes it, which
+    /// atpkg moves out at its next update ([`TOOLCHAIN_NOTE`]). Neither is a step or a
+    /// change.
+    KeptOut {
+        /// The person's project build folders Spotlight indexes.
+        projects: usize,
+        /// The Trust toolchain aterm is using is still where Spotlight indexes it.
+        toolchain: bool,
     },
     /// `present` of the `count` repositories are cloned; `signed_in` is whether the
     /// native GitHub credentials verified.
@@ -155,8 +162,14 @@ impl Reading {
             Self::Apps { pinned, wanted } => format!("apps:{pinned}:{wanted}"),
             Self::SignedIn => "signed-in".to_owned(),
             Self::DocsInstalled => "docs-installed".to_owned(),
-            Self::BuildsIndexed { projects } => format!("builds-indexed:{projects}"),
-            Self::ProjectsIndexed { count } => format!("projects-indexed:{count}"),
+            Self::BuildsIndexed {
+                projects,
+                toolchain,
+            } => format!("builds-indexed:{projects}:{}", u8::from(toolchain)),
+            Self::KeptOut {
+                projects,
+                toolchain,
+            } => format!("kept-out:{projects}:{}", u8::from(toolchain)),
             Self::Repositories {
                 present,
                 count,
@@ -188,8 +201,12 @@ impl Reading {
             "docs-installed" => Self::DocsInstalled,
             "builds-indexed" => Self::BuildsIndexed {
                 projects: number()?,
+                toolchain: number()? == 1,
             },
-            "projects-indexed" => Self::ProjectsIndexed { count: number()? },
+            "kept-out" => Self::KeptOut {
+                projects: number()?,
+                toolchain: number()? == 1,
+            },
             "repositories" => Self::Repositories {
                 present: number()?,
                 count: number()?,
@@ -204,13 +221,19 @@ impl Reading {
         parts.next().is_none().then_some(reading)
     }
 
-    /// How many of the person's own project build folders Spotlight indexes, where
-    /// the reading counted them.
-    const fn projects(self) -> Option<usize> {
+    /// What the Rust in Spotlight row only notes, where the reading counted it: the
+    /// person's project build folders, and the toolchain build aterm is using, Spotlight
+    /// indexes.
+    const fn noted(self) -> Option<(usize, bool)> {
         match self {
-            Self::BuildsIndexed { projects } | Self::ProjectsIndexed { count: projects } => {
-                Some(projects)
+            Self::BuildsIndexed {
+                projects,
+                toolchain,
             }
+            | Self::KeptOut {
+                projects,
+                toolchain,
+            } => Some((projects, toolchain)),
             _ => None,
         }
     }
@@ -241,7 +264,7 @@ impl Reading {
             } => "Needs sign-in".to_owned(),
             // A probe that could not go on read no value, and the person's own
             // project folders are no value of the row's.
-            Self::Repositories { .. } | Self::Waits(_) | Self::ProjectsIndexed { .. } => {
+            Self::Repositories { .. } | Self::Waits(_) | Self::KeptOut { .. } => {
                 return None;
             }
         })
@@ -339,11 +362,11 @@ pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
             .filter_map(|row| row.why.clone())
             .collect::<Vec<_>>()
     };
-    let projects = rows.iter().find_map(|row| {
+    let noted = rows.iter().find_map(|row| {
         Reading::of(row)
-            .and_then(Reading::projects)
-            .filter(|count| *count > 0)
-            .map(|count| (count, *row))
+            .and_then(Reading::noted)
+            .filter(|(projects, toolchain)| *projects > 0 || *toolchain)
+            .map(|counts| (counts, *row))
     });
     let note = match standing {
         Standing::Waiting => rows
@@ -353,16 +376,26 @@ pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
                 Some(Reading::Waits(wait)) => Some(wait.note().to_owned()),
                 _ => None,
             }),
-        // The person's own project build folders Spotlight indexes: a quiet note,
-        // never a step of the row's, where nothing else is said under it.
+        // The toolchain build aterm is using, which atpkg moves at its next update, and
+        // the person's own project build folders, Spotlight indexes: a quiet note, never
+        // a step of the row's, where nothing else is said under it.
         Standing::InPlace | Standing::AtLogin | Standing::Differs => {
-            projects.map(|(count, _)| projects_note(count))
+            noted.map(|((projects, toolchain), _)| {
+                [
+                    toolchain.then(|| TOOLCHAIN_NOTE.to_owned()),
+                    (projects > 0).then(|| projects_note(projects)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ")
+            })
         }
         _ => None,
     };
     // In place, the folders themselves stand behind the note: the line of the item
     // that counted them, which names each.
-    let detail = match projects {
+    let detail = match noted {
         Some((_, row))
             if detail.is_empty() && matches!(standing, Standing::InPlace | Standing::AtLogin) =>
         {
@@ -391,6 +424,14 @@ pub fn projects_note(count: usize) -> String {
         "Spotlight indexes {count} of your project build folders; renaming {each} to its .noindex name and linking the old name to it keeps it out"
     )
 }
+
+/// The Rust in Spotlight row's note for the Trust toolchain aterm is using while Spotlight
+/// still indexes it, its build or the rustup view laid from it: atpkg never moves either
+/// while it is in use, and lays them aside at its next update, so the note asks nothing of
+/// the person. A build no longer in use atpkg moves by itself at its next pass, and the
+/// row says nothing of it.
+pub const TOOLCHAIN_NOTE: &str =
+    "aterm moves the Rust toolchain it is using out of Spotlight at its next update";
 
 /// The wanted value in the row's words: [`Setting::wanted`], with the count the
 /// repositories' reading names.
@@ -527,9 +568,22 @@ mod tests {
             },
             Reading::SignedIn,
             Reading::DocsInstalled,
-            Reading::BuildsIndexed { projects: 0 },
-            Reading::BuildsIndexed { projects: 3 },
-            Reading::ProjectsIndexed { count: 1 },
+            Reading::BuildsIndexed {
+                projects: 0,
+                toolchain: false,
+            },
+            Reading::BuildsIndexed {
+                projects: 3,
+                toolchain: true,
+            },
+            Reading::KeptOut {
+                projects: 1,
+                toolchain: false,
+            },
+            Reading::KeptOut {
+                projects: 0,
+                toolchain: true,
+            },
             Reading::Repositories {
                 present: 2,
                 count: 5,
@@ -646,7 +700,10 @@ mod tests {
             ),
             (
                 Setting::Spotlight,
-                &[Reading::BuildsIndexed { projects: 0 }],
+                &[Reading::BuildsIndexed {
+                    projects: 0,
+                    toolchain: false,
+                }],
                 Some("Builds indexed"),
             ),
         ];
@@ -680,23 +737,29 @@ mod tests {
         assert_eq!(observation(Setting::Dock, &[&seven, &one]).now, None);
     }
 
+    /// What Spotlight still indexes that the row cannot change itself is a quiet note,
+    /// never a step: the person's own project build folders, and the toolchain build aterm
+    /// is using, which atpkg moves at its next update.
     #[test]
-    fn the_persons_own_spotlit_project_folders_are_a_note_never_a_step() {
-        let kept = |reading: Reading| ItemReport {
-            detail: Some(reading.token()),
+    fn what_spotlight_still_indexes_is_a_note_never_a_step() {
+        let kept = |projects: usize, toolchain: bool| ItemReport {
+            detail: Some(
+                Reading::KeptOut {
+                    projects,
+                    toolchain,
+                }
+                .token(),
+            ),
             ..row(
                 Outcome::Ok,
                 None,
                 Some(
-                    "cargo-build.noindex, tooling.noindex, and trust store builds are .noindex; Spotlight indexes these project build folders of yours, which aterm leaves as they are: /Users//a/x/target",
+                    "cargo-build.noindex and tooling.noindex are .noindex; Spotlight indexes these project build folders of yours, which aterm leaves as they are: /Users//a/x/target",
                 ),
             )
         };
         let profile = row(Outcome::Ok, None, None);
-        let read = observation(
-            Setting::Spotlight,
-            &[&profile, &kept(Reading::ProjectsIndexed { count: 3 })],
-        );
+        let read = observation(Setting::Spotlight, &[&profile, &kept(3, false)]);
         assert_eq!(read.standing, Standing::InPlace);
         assert_eq!(
             read.note.as_deref(),
@@ -714,29 +777,35 @@ mod tests {
             projects_note(1),
             "Spotlight indexes 1 of your project build folders; renaming it to its .noindex name and linking the old name to it keeps it out"
         );
+        // The toolchain build aterm is using, which atpkg moves: said first, asked of no one.
+        let read = observation(Setting::Spotlight, &[&kept(0, true)]);
+        assert_eq!(read.standing, Standing::InPlace);
+        assert_eq!(
+            read.note.as_deref(),
+            Some("aterm moves the Rust toolchain it is using out of Spotlight at its next update")
+        );
+        let read = observation(Setting::Spotlight, &[&kept(2, true)]);
+        assert_eq!(
+            read.note.as_deref(),
+            Some(
+                "aterm moves the Rust toolchain it is using out of Spotlight at its next update; Spotlight indexes 2 of your project build folders; renaming each to its .noindex name and linking the old name to it keeps it out"
+            )
+        );
         // A change aterm makes says it too; none counted says nothing.
         let read = observation(
             Setting::Spotlight,
-            &[&read_as(Reading::BuildsIndexed { projects: 2 })],
+            &[&read_as(Reading::BuildsIndexed {
+                projects: 2,
+                toolchain: false,
+            })],
         );
         assert_eq!(read.standing, Standing::Differs);
         assert!(
             read.note
                 .is_some_and(|note| note.starts_with("Spotlight indexes 2 "))
         );
-        let read = observation(
-            Setting::Spotlight,
-            &[&kept(Reading::ProjectsIndexed { count: 0 })],
-        );
+        let read = observation(Setting::Spotlight, &[&kept(0, false)]);
         assert_eq!((read.standing, read.note), (Standing::InPlace, None));
-        // A row that needs a person keeps that person's words as its note.
-        let person = ItemReport {
-            detail: Some(Reading::BuildsIndexed { projects: 4 }.token()),
-            why: Some("the trust builds stay where Spotlight indexes them".into()),
-            ..row(Outcome::Person, None, None)
-        };
-        let read = observation(Setting::Spotlight, &[&person]);
-        assert_eq!((read.standing, read.note), (Standing::NeedsYou, None));
     }
 
     #[test]

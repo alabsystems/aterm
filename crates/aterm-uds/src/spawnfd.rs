@@ -87,7 +87,9 @@ pub unsafe fn adopt_inherited_socket(fd: RawFd) -> io::Result<OwnedFd> {
     }
     // SAFETY: the caller admitted exclusive, stable ownership; the checks above only diagnose type/flags. This is the number's one owner, dropped immediately after its close-on-exec copy is made.
     let inherited = unsafe { OwnedFd::from_raw_fd(fd) };
-    inherited.try_clone()
+    let adopted = inherited.try_clone()?;
+    crate::keep_out_of_children(&adopted)?;
+    Ok(adopted)
 }
 
 /// What descriptor `fd` refers to, read from the descriptor itself.

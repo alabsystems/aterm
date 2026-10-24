@@ -1,5 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
+//
+// From the Unicode 16.0.0 Character Database. No generator makes this file: edit it here.
 
 //! Grapheme Break Property tables and break decision matrix.
 

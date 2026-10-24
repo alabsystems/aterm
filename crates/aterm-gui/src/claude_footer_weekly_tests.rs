@@ -128,6 +128,7 @@ fn stored() -> TapSeat {
 /// quiet.
 fn asks(args: fn(i32) -> Option<atpkg::caller_shell::ProcArgs>, seat: fn() -> TapSeat) -> Asks {
     Asks {
+        files: |_| None,
         args,
         roster: || Some(accounts::Roster::default()),
         home: || Some(root()),

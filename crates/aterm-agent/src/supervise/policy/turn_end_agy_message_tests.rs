@@ -125,7 +125,12 @@ fn agys_drawing_is_held_to_its_measured_screens() {
         .map(|r| r.trim())
         .collect::<Vec<_>>()
         .join(" ");
-    let land = act_words(LAND, &[reversible_clause(false), ack_clause(true)], None);
+    // The screen was measured on 2026-10-21, with the words before the no-repository sentence.
+    let land = act_words(
+        LAND_REMOTE_MAIN_BEFORE,
+        &[reversible_clause(false), ack_clause(true)],
+        None,
+    );
     let first = format!("{task}\n\n{fact}");
     let drawn = |first: &str| {
         let mut drawn = head.clone();

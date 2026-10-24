@@ -91,7 +91,7 @@ No spec is blocked by gap 0 alone: every row needs gap 1 (foreign enum carriers)
 `map_logical_key`). `sided-modifier-contract`'s composition corollary cites `logical-key-contract`.
 `numpad-location-gate`, `physical-twin-involution` and `base-layout-key-table` are independent.
 
-## 2. Test → spec map (TSV; all 15)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

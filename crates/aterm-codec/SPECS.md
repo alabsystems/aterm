@@ -180,7 +180,7 @@ gzip-reader-refines-members	equivalence	inflate::stream::GzipReader::{new,read,b
 | 12 | 2 | `crc32-reference`, `crc32-fold`: citing astream-wire's contract |
 | 13 | 2 | closures (`get_or_insert_with`, pump closures) |
 
-## 2. Test → spec map (TSV; all 67)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

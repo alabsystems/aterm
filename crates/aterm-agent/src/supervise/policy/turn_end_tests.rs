@@ -4814,6 +4814,18 @@ fn a_fact_rides_the_continuation_whole_and_never_an_answer() {
     );
 }
 
+/// LAND'S FIRST ACT KEEPS A SHORT STANDING RULE WHOLE with both its clauses (the reversible one and the NEEDS ack): the act that says "commit, merge and push it" must still carry a rule like "never push to main". A longer [`LAND`] would cut it to nothing ([`with_rules`]): the no-repository sentence's first, longer wording left the rules 2 units.
+#[test]
+fn lands_first_act_keeps_a_short_standing_rule_beside_both_its_clauses() {
+    let rule = "never push to main; never touch vendor/.";
+    let text = act_words(LAND, &[DONE_CHECK_REVERSIBLE, NEEDS_ACK], Some(rule));
+    assert!(
+        text.ends_with(&format!("{NEEDS_ACK} (standing rules: {rule})")),
+        "{} units: {text}",
+        text.encode_utf16().count()
+    );
+}
+
 #[test]
 fn the_rules_ride_in_the_continuation() {
     let now = t0();

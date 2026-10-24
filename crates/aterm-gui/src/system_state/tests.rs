@@ -2998,3 +2998,82 @@ fn every_state_keeps_its_words_whole_at_every_display_scale() {
     }
     assert!(cut.is_empty(), "{} kinds:\n{cut:#?}", cut.len());
 }
+
+/// The kitty stands behind the caret as `assets/aterm-rainbow-kitty.png` draws it,
+/// measured by the pixels it draws: its drawn left edge is under the caret, so the caret
+/// covers its haunch, its tail rises past the caret's top, and none of it inks the words.
+#[test]
+fn the_caret_covers_the_kittys_haunch_as_the_brand_image_draws_it() {
+    use crate::widget::{ArtSpan, DrawPrim};
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    for (ground, theme) in [
+        ("dark", aterm_render::Theme::default()),
+        (
+            "light",
+            aterm_render::Theme {
+                fg: 0x0010_1010,
+                bg: 0x00FA_FAFA,
+                ..aterm_render::Theme::default()
+            },
+        ),
+    ] {
+        let roles = crate::settings::Roles::from_theme(theme);
+        for (px, scale) in [(22.0_f32, 1.0_f32), (22.0, 2.0), (16.0, 2.0), (30.0, 3.0)] {
+            let spec = BrandSpec {
+                kitty: true,
+                px,
+                scale,
+            };
+            let mut prims = Vec::new();
+            let rect = LogicalRect::new(8.0, 4.0, 400.0, spec.needed_height());
+            paint_brand(&mut prims, rect, Some(&spec.value()), &roles);
+            let at = format!("{ground} {px}px @{scale}x");
+            let Some((x, y, w, h, art)) = prims.iter().find_map(|prim| match prim {
+                DrawPrim::Image { x, y, w, h, art } => Some((*x, *y, *w, *h, *art)),
+                _ => None,
+            }) else {
+                panic!("{at}: no kitty");
+            };
+            let Some(DrawPrim::Panel {
+                x: caret_x,
+                y: caret_top,
+                w: caret_w,
+                ..
+            }) = prims.last()
+            else {
+                panic!("{at}: the caret is not drawn last");
+            };
+            let Some((words_x, baseline, words)) = prims.iter().find_map(|prim| match prim {
+                DrawPrim::Text { x, baseline, s, .. } => Some((*x, *baseline, s.clone())),
+                _ => None,
+            }) else {
+                panic!("{at}: no words");
+            };
+            let drawn = art.mask().drawn(ArtSpan::BOX).expect("the kitty draws");
+            let (left, top, right) = (x + drawn.left * w, y + drawn.top * h, x + drawn.right * w);
+            assert!(
+                (left - (caret_x + caret_w * 0.5)).abs() < 0.01,
+                "{at}: the kitty's drawn left edge {left} is not at the caret's middle"
+            );
+            assert!(
+                caret_x + caret_w < right,
+                "{at}: the kitty goes on past the caret"
+            );
+            assert!(
+                top < *caret_top,
+                "{at}: the tail rises past the caret's top"
+            );
+            // The words' ink, as the overlap audit reads it: the kitty draws none of it.
+            let words_w =
+                crate::tray_raster::measure_text(&words, px, crate::widget::TextWeight::Regular);
+            let body = 0.7 * px;
+            let over_words = art.mask().drawn(ArtSpan {
+                left: (words_x - x) / w,
+                top: (baseline - body - y) / h,
+                right: (words_x + words_w - x) / w,
+                bottom: (baseline - y) / h,
+            });
+            assert_eq!(over_words, None, "{at}: the kitty inks the words");
+        }
+    }
+}

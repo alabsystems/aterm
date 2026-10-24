@@ -232,7 +232,8 @@ fn restored_titles(world: &World, proc: &Proc) -> Vec<String> {
     session_titles(proc)
 }
 
-/// If A is killed mid-build while L runs and quits, B restores both layouts' tabs.
+/// A is SIGKILLed with its build held, L boots meanwhile and leaves A's take alone, and B
+/// brings back both layouts' tabs.
 #[test]
 fn a_launch_killed_inside_its_event_loop_build_leaves_the_quit_layout_to_the_next() {
     let world = World::new("kill");

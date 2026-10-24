@@ -1302,7 +1302,7 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
     let mut lib = Lib::new();
     lib.step(format!("{FOREIGN_FIND}\n{FAKE_ROOT}\n{ROOT_LAYOUT}"));
     // (label, setup, None for a build)
-    let rows: [(&str, &str, Refusal); 28] = [
+    let rows: [(&str, &str, Refusal); 29] = [
         ("root's alone", "", None),
         (
             "a file of theirs in the checkout",
@@ -1356,6 +1356,11 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
             Some(("co/vendor", "checkout")),
         ),
         ("a link inside it", "ln -s src \"$W/co/alias\"", None),
+        (
+            "a link of theirs inside it",
+            "ln -s src \"$W/co/alias\"; theirs \"$W/co/alias\"",
+            cfg!(target_os = "macos").then_some(("co/alias", "checkout")),
+        ),
         (
             "a link inside it by a path with ..",
             "ln -s ../co/src \"$W/co/up\"",
@@ -1559,7 +1564,7 @@ fn under_root_an_install_folder_on_a_volume_that_ignores_owners_is_skipped_befor
     lib.step(
         "installer_uid() { echo 0; }\n\
          df() { [ -e \"${!#}\" ] || return 1; printf 'Filesystem 512-blocks Used Available Capacity Mounted on\\n%s 1 1 1 1%% /Volumes/X\\n' \"$DEV\"; }\n\
-         mount() { printf '%s\\n' \"$MOUNTS\"; }\n\
+         mount_table() { printf '%s\\n' \"$MOUNTS\"; }\n\
          M=$'/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\\n\
          /dev/disk6s1 on /Volumes/USB (exfat, local, nodev, nosuid, noowners, noatime, nobrowse)\\n\
          /dev/disk6s10 on /Volumes/Back on Up (apfs, local, journaled)\\n\
@@ -1595,6 +1600,12 @@ fn under_root_an_install_folder_on_a_volume_that_ignores_owners_is_skipped_befor
          root_dest_keeps_no_owner \"$TMPDIR/apps\" )",
         &[],
     );
+    // A table not read in time judges nothing, whatever it printed first.
+    let late = lib.call(
+        "( DEV=/dev/disk6s1; macos_mounts() { printf '%s\\n' \"$M\"; return 124; }; \
+         root_dest_keeps_no_owner \"$TMPDIR/apps/new\" )",
+        &[],
+    );
     let recs = lib.run(&scratch);
     for ((dev, skips), call) in rows.iter().zip(calls) {
         assert_eq!(
@@ -1605,6 +1616,7 @@ fn under_root_an_install_folder_on_a_volume_that_ignores_owners_is_skipped_befor
         );
     }
     assert_eq!(recs[account].rc, 1, "the account's own run is not judged");
+    assert_eq!(recs[late].rc, 1, "{}", recs[late].err);
 }
 
 #[cfg(target_os = "macos")]
@@ -2118,6 +2130,17 @@ fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
                 "",
             ),
             ("no_table; folder_failing sealed_entry \"$W/ok/d\"", "$W/ok"),
+            // A table cut off is not read, whatever it printed first.
+            (
+                "eval \"base_$(declare -f macos_mounts)\"; macos_mounts() { base_macos_mounts; return 124; }; \
+                 folder_failing sealed_entry \"$W/ok/d\"",
+                "$W/ok",
+            ),
+            (
+                "eval \"base_$(declare -f macos_mounts)\"; macos_mounts() { base_macos_mounts; return 124; }; \
+                 root_entries_offender \"$W/xt\"",
+                "$W/xt",
+            ),
             // A local volume passes, and a graft shows the device of the
             // volume it is from; a volume no line names, one put over a local
             // one, and an account's disk a forged local line names too each
@@ -2196,6 +2219,103 @@ fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
     }
 }
 
+/// macOS's mount table is what a run of `/sbin/mount` printed, with its status.
+/// A run cut off ends the read at the cut-off even while something it started
+/// outside its process group (as a program in a file system's call that does
+/// not heed SIGKILL lives on) still holds what it printed to.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_mount_table_read_cut_off_ends_at_the_cut_off() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    // Advance only the reader's clock once the escaped holder is ready, so the
+    // outer minute hang detector never races a real minute spent in bounded.
+    // The holder must acknowledge a release written after the read returns;
+    // it kills itself, or expires after 120 seconds if that release never comes.
+    lib.step("VERIFY_WAIT_SECS=60; LINE='/dev/disk1s1 on / (apfs, local, journaled)'");
+    let rows = [
+        (
+            "mount_table() { echo \"$LINE\"; }; macos_mounts",
+            0,
+            "/dev/disk1s1 on / (apfs, local, journaled)",
+        ),
+        (
+            "mount_table() { echo \"$LINE\"; return 3; }; macos_mounts >/dev/null",
+            3,
+            "",
+        ),
+        (
+            r#"(
+                mount_table() {
+                    echo "$LINE"
+                    /usr/bin/perl -e '
+                        use POSIX;
+                        POSIX::setsid() >= 0 or die "setsid: $!";
+                        sub mark {
+                            my ($path, $pid) = @_;
+                            open(my $f, ">", $path) or die "mark: $!";
+                            print $f $pid;
+                            close($f) or die "close: $!";
+                        }
+                        $SIG{ALRM} = sub { mark($ARGV[3], $$); kill 9, $$; die "self kill"; };
+                        alarm 120;
+                        mark($ARGV[0], $$);
+                        until (-e $ARGV[1]) { select(undef, undef, undef, 0.02); }
+                        mark($ARGV[2], $$);
+                        kill 9, $$;
+                        die "self kill";
+                    ' "$TMPDIR/holder" "$TMPDIR/release" "$TMPDIR/released" "$TMPDIR/expired" &
+                    /bin/sleep 120
+                }
+                t="$(
+                    sleep() {
+                        if [ -s "$TMPDIR/holder" ]; then
+                            SECONDS=$((SECONDS + VERIFY_WAIT_SECS))
+                        else
+                            /bin/sleep "$@"
+                        fi
+                    }
+                    macos_mounts 2>/dev/null
+                )"; s=$?
+                holder_deadline=$((SECONDS + 60))
+                until [ -s "$TMPDIR/holder" ]; do
+                    [ "$SECONDS" -lt "$holder_deadline" ] || { echo 'no holder' >&2; exit 1; }
+                    sleep 0.1
+                done
+                holder="$(cat "$TMPDIR/holder")"
+                case "$holder" in ''|*[!0-9]*) echo 'invalid holder' >&2; exit 1 ;; esac
+                : >"$TMPDIR/release"
+                holder_deadline=$((SECONDS + 60))
+                until [ -s "$TMPDIR/released" ] || [ -s "$TMPDIR/expired" ]; do
+                    [ "$SECONDS" -lt "$holder_deadline" ] || { echo 'no release acknowledgment' >&2; exit 1; }
+                    sleep 0.1
+                done
+                [ ! -s "$TMPDIR/expired" ] && [ "$(cat "$TMPDIR/released")" = "$holder" ] || {
+                    echo 'holder expired before the reader released it' >&2; exit 1;
+                }
+                holder_deadline=$((SECONDS + 60))
+                while kill -0 "$holder" 2>/dev/null; do
+                    [ "$SECONDS" -lt "$holder_deadline" ] || { echo 'holder still present' >&2; exit 1; }
+                    sleep 0.1
+                done
+                printf '%s' "$s"
+            )"#,
+            0,
+            "124",
+        ),
+    ];
+    let calls: Vec<usize> = rows.iter().map(|(code, ..)| lib.call(*code, &[])).collect();
+    let recs = lib.run(&scratch);
+    for ((code, rc, out), call) in rows.iter().zip(calls) {
+        assert_eq!(
+            (recs[call].rc, recs[call].out.as_str()),
+            (*rc, *out),
+            "{code}: {}",
+            recs[call].err
+        );
+    }
+}
+
 /// statfs's network and FUSE types are the ones the updater's rule names.
 #[test]
 fn a_root_walks_remote_filesystem_types_are_the_updaters() {
@@ -2267,7 +2387,7 @@ fn under_root_cc_runs_only_from_a_developer_folder_and_sdk_root_alone_can_change
     ));
     let (developer, sdk_root, select) = ("unset DEVELOPER_DIR", "unset SDKROOT", "xcode-select -s");
     // (label, setup, what the build pins or the refusal names)
-    let rows: [(&str, &str, Pinned); 16] = [
+    let rows: [(&str, &str, Pinned); 17] = [
         (
             "root's",
             "export TOOLCHAINS=x",
@@ -2277,6 +2397,15 @@ fn under_root_cc_runs_only_from_a_developer_folder_and_sdk_root_alone_can_change
             "a program of theirs in it",
             "theirs \"$W/dev/usr/bin/clang\"",
             Err(("dev/usr/bin/clang", developer)),
+        ),
+        (
+            "a link of theirs to a program of root's inside it",
+            "ln -s clang \"$W/dev/usr/bin/cc\"; theirs \"$W/dev/usr/bin/cc\"",
+            if cfg!(target_os = "macos") {
+                Err(("dev/usr/bin/cc", developer))
+            } else {
+                Ok(("dev", "dev/SDKs/MacOSX.sdk"))
+            },
         ),
         (
             "an ACL in it",

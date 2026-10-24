@@ -292,6 +292,35 @@ fn a_launch_rotates_off_the_spent_pool_on_the_kept_reading() {
         None,
         "no reading: the launch runs as asked"
     );
+
+    let spent = Recorded::new(Ok(doc(0.0, 0.0, 0.0)));
+    let spent_store = Store::new(dir.path(), "spent");
+    let (reading, _) = current(&spent_store, &spent, NOW, r.low, false).unwrap();
+    let reset = reading
+        .quota
+        .groups
+        .iter()
+        .flat_map(|g| &g.buckets)
+        .filter_map(agy_quota::Bucket::reset_at)
+        .min()
+        .expect("recorded refill");
+    let settled = reset + RESET_SETTLE_S;
+    let asked = Some("gemini-4-argon-high");
+    let before = rotate_launch(asked, &spent_store, &mute, &r, settled - 1)
+        .expect("the unexpired stale reading keeps its policy");
+    assert_eq!(before.got, Got::Stale);
+    assert!(matches!(before.pick, agy_quota::Pick::Wait { .. }));
+    assert_eq!(
+        rotate_launch(asked, &spent_store, &mute, &r, settled),
+        None,
+        "a failed refresh after refill leaves launch availability unknown"
+    );
+    let (shown, got) = current(&spent_store, &mute, settled, r.low, false).unwrap();
+    assert_eq!((got, shown.as_of), (Got::Stale, NOW));
+    assert_eq!(
+        shown.quota, reading.quota,
+        "the old reading remains available for display"
+    );
 }
 
 #[test]
@@ -302,4 +331,37 @@ fn the_model_document_names_agys_default() {
         "claude-opus-5-5-medium"
     );
     assert!(agy_quota::parse_model(r#"{"command":{"name":"usage","data":{}}}"#).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn store_rejects_fifos_and_replaces_them_atomically() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = tmp("fifo");
+    let store = Store::new(dir.path(), "home");
+    std::fs::create_dir_all(dir.path().join(DIR)).unwrap();
+    for path in [
+        store.last_path(),
+        store.history_path(),
+        store.model_path(),
+        store.failed_path(),
+        store.lock_path(),
+    ] {
+        let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+    assert!(store.last().is_none());
+    assert!(store.history().is_empty());
+    assert!(store.kept_default(NOW).is_none());
+    assert!(store.recent_failure(NOW).is_none());
+    let lock = store
+        .try_lock()
+        .expect("non-regular lock file is treated as stale and replaced");
+    drop(lock);
+    let agy = Recorded::new(Ok(doc(0.75, 0.9, 0.9)));
+    let (r, got) = current(&store, &agy, NOW, 0.1, false).unwrap();
+    assert_eq!((got, r.as_of), (Got::Read, NOW));
+    assert_eq!(store.history().len(), 1);
 }

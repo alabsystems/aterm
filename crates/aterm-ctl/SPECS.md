@@ -204,7 +204,7 @@ Pure cores before the effectful specs that cite them:
 - `redial-clock-order`, `redial-after-refusal`, `redial-request-classes`, `redial-resume-request`, `redial-frame-tracker`, `redial-replacement-notes` → `redial-hangup-classification`, `redial-process-start-record`, `redial-ask-once` → `redial-exchange-hangup-before-reply`, `redial-relay-subscription`.
 - `lib-help-rewrite`, `lib-client-help-reply` (pure half) → the binary half of `lib-client-help-reply` (`tests/verb_help_offline.rs`).
 
-## 2. Test → spec map (TSV; all 236)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples. A non-spec test has primary `-` and its §4 action in `also`.
 

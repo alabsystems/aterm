@@ -156,7 +156,7 @@ anchor-table-invariant	table-property	anchors::ANCHORS, anchors::AGY_ANCHORS, an
 guard-regex-contract	round-trip	anchors::guard_regex, anchors::guard_prefix	guard_regex(t) = t with every ' ' mapped to '.' and each of \ . + * ? ( ) | [ ] { } ^ $ prefixed with '\', every other char verbatim; hence it holds no whitespace and, as a regex, matches exactly the strings equal to t up to replacing each space with one arbitrary char. guard_prefix(id,w) = guard_regex(the first min(w, word count) space-separated words of anchor(id)), never a panic for w past the word count.	src/anchors.rs::a_guard_regex_escapes_metacharacters_and_dots_its_spaces	1,3,5	char mapping into a String, split/take/sum
 ```
 
-## 2. Test → spec map (TSV; all 281)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test, or `§4:<action>` for a test that samples no spec. `also` lists another spec the same test samples. Paths are relative to `crates/aterm-phase/`.
 
@@ -164,8 +164,8 @@ guard-regex-contract	round-trip	anchors::guard_regex, anchors::guard_prefix	guar
 file	test	primary	also
 src/anchors.rs	a_guard_regex_escapes_metacharacters_and_dots_its_spaces	guard-regex-contract	
 src/anchors.rs	an_unknown_id_panics	anchor-table-invariant	
-src/anchors.rs	every_literal_anchor_is_in_the_store_claude	§4:move-to-bench	
-src/anchors.rs	every_reset_template_is_whole_in_the_store_claude	§4:move-to-bench	
+benches/vendor_drift.rs	every_literal_anchor_is_in_the_store_claude	§4:move-to-bench	
+benches/vendor_drift.rs	every_reset_template_is_whole_in_the_store_claude	§4:move-to-bench	
 src/anchors.rs	the_reset_templates_are_built_from_the_readers_rows	anchor-table-invariant	
 src/autocompact_tests.rs	a_narrow_offer_with_the_stepper_moved_reads_its_size	autocompact-offer-read	
 src/autocompact_tests.rs	a_position_label_and_an_inline_description_are_read	autocompact-offer-read	
@@ -431,7 +431,7 @@ src/wall.rs	a_walls_line_ink_wrapped_is_read_as_one	wall-wrapped-line
 src/wall.rs	context_is_its_own_wall_and_the_quota_notices_are_none	limit-notice-wall-agree	
 src/wall.rs	every_api_error_family_of_the_283_catalog_classifies	classify-wall-phrase-table	
 src/wall.rs	every_notices_line_runs_on_over_its_wrapped_rows	wall-wrapped-line	
-src/wall.rs	every_wall_phrase_is_in_the_store_claude	§4:move-to-bench	
+benches/vendor_drift.rs	every_wall_phrase_is_in_the_store_claude	§4:move-to-bench	
 src/wall.rs	only_the_usage_kinds_and_a_rate_limit_read_limited	reads-limited-table	
 src/wall.rs	request_timed_out_under_the_gutter_is_unreachable	wall-placement-owner-walk	
 src/wall.rs	the_auto_continues_end_is_read_off_the_vendors_word	auto-continue-lifecycle	
@@ -491,9 +491,9 @@ helpers it alone uses.
 
 | test | why | action |
 |---|---|---|
-| src/anchors.rs::every_literal_anchor_is_in_the_store_claude | A drift canary that depends on the environment. It reads a vendor binary found through `$ATERM_CLAUDE_BIN` or `aterm pkg which` (an fs read and a process), and returns early when there is none. It checks the vendor, not the code. | move-to-bench |
-| src/anchors.rs::every_reset_template_is_whole_in_the_store_claude | A drift canary over a vendor binary (fs and process). It checks the vendor. | move-to-bench |
-| src/wall.rs::every_wall_phrase_is_in_the_store_claude | A drift canary that greps `PHRASES` in a vendor binary found through the environment or `aterm pkg which`. It returns early when there is none. | move-to-bench |
+| benches/vendor_drift.rs::every_literal_anchor_is_in_the_store_claude | A drift canary that depends on the environment. It reads a vendor binary found through `$ATERM_CLAUDE_BIN` or `aterm pkg which` (an fs read and a process), and returns early when there is none. It checks the vendor, not the code. | move-to-bench |
+| benches/vendor_drift.rs::every_reset_template_is_whole_in_the_store_claude | A drift canary over a vendor binary (fs and process). It checks the vendor. | move-to-bench |
+| benches/vendor_drift.rs::every_wall_phrase_is_in_the_store_claude | A drift canary that greps `PHRASES` in a vendor binary found through the environment or `aterm pkg which`. It returns early when there is none. | move-to-bench |
 
 By action: move-to-bench 3.
 

@@ -1663,9 +1663,10 @@ impl PetWorld {
                         break;
                     }
                 }
+                let r_dx = right.map_or(f32::INFINITY, |r_col| (left(r_col) - near.col).abs());
                 let mut leftward = None;
                 let mut c = (home_col - 1).min(hi);
-                while c >= lo {
+                while c >= lo && near.col - left(c) < r_dx {
                     if seat_blocked(c) {
                         let end = c + span_c as i64 - 1;
                         let mut x = c;
@@ -1847,6 +1848,10 @@ impl PetWorld {
             } else {
                 None
             };
+            let row_first_col = ((target.1 - max_distance.min(best_distance) - cov_left - margin)
+                .floor()
+                .max(0.0) as usize)
+                .max(first_col);
             let mut stop_after = |col: f32| {
                 if col > target.1 && col - target.1 > max_distance.min(best_distance) {
                     return true;
@@ -1880,7 +1885,7 @@ impl PetWorld {
             if stop_after(target.1) {
                 continue;
             }
-            for c in first_col..end_col {
+            for c in row_first_col..end_col {
                 if stop_after((self.coverage.col + c) as f32 + margin) {
                     break;
                 }
@@ -2097,7 +2102,10 @@ const fn exclusion_span(rect: PetRect, row: usize, limit: usize) -> Option<(usiz
         }
     }
     let lo = a;
-    let (mut a, mut b) = (0, limit);
+    if lo >= limit {
+        return None;
+    }
+    let (mut a, mut b) = (lo, limit);
     while a < b {
         let mid = a + (b - a) / 2;
         if rect_right > mid as f32 {

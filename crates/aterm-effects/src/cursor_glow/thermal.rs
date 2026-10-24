@@ -215,27 +215,29 @@ impl ForgeBand {
             let l = lum_of(fire_ramp(p));
             (l.max(lum) + 0.05) / (l.min(lum) + 0.05)
         };
-        let lit = |p: f32| {
-            let l = lum_of(fire_ramp(p));
+        let lit_rgb = |rgb: u32| {
+            let l = lum_of(rgb);
             l > lum && (l + 0.05) / (lum + 0.05) >= Self::PAGE_CONTRAST
         };
+        let lit = |p: f32| lit_rgb(fire_ramp(p));
         let bright = lit(Self::TOP).then(|| {
             let lo = if lit(Self::COLD) {
                 Self::COLD
             } else {
-                bisect_edge(Self::COLD, Self::TOP, |p| !lit(p)).1
+                bisect_edge(Self::COLD, Self::TOP, |rgb| !lit_rgb(rgb)).1
             };
             (lo, (lo + Self::MIN_ARC).clamp(Self::HOT, Self::TOP))
         });
-        let deep_ok = |p: f32| {
-            let l = lum_of(fire_ramp(p));
+        let deep_ok_rgb = |rgb: u32| {
+            let l = lum_of(rgb);
             l < lum && (lum + 0.05) / (l + 0.05) >= Self::PAGE_CONTRAST
         };
+        let deep_ok = |p: f32| deep_ok_rgb(fire_ramp(p));
         let deep = deep_ok(0.0).then(|| {
             let hi = if deep_ok(Self::HOT) {
                 Self::HOT
             } else {
-                bisect_edge(0.0, Self::HOT, deep_ok).0
+                bisect_edge(0.0, Self::HOT, deep_ok_rgb).0
             };
             (Self::COLD.min(hi), hi)
         });
@@ -273,13 +275,21 @@ impl ForgeBand {
 /// well under one ramp step; the caller has checked it holds at `lo` and
 /// fails at `hi`.
 #[inline]
-fn bisect_edge(mut lo: f32, mut hi: f32, holds: impl Fn(f32) -> bool) -> (f32, f32) {
+fn bisect_edge(mut lo: f32, mut hi: f32, holds_rgb: impl Fn(u32) -> bool) -> (f32, f32) {
+    let (mut lo_rgb, mut hi_rgb) = (fire_ramp(lo), fire_ramp(hi));
     for _ in 0..16 {
         let mid = 0.5 * (lo + hi);
-        if holds(mid) {
+        let mid_rgb = fire_ramp(mid);
+        if mid_rgb == lo_rgb {
             lo = mid;
+        } else if mid_rgb == hi_rgb {
+            hi = mid;
+        } else if holds_rgb(mid_rgb) {
+            lo = mid;
+            lo_rgb = mid_rgb;
         } else {
             hi = mid;
+            hi_rgb = mid_rgb;
         }
     }
     (lo, hi)

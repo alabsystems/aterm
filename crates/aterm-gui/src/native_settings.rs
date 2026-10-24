@@ -1519,13 +1519,17 @@ pub(crate) struct SettingsViewState {
     /// The chrome the page last drew its list in at each window, text size and bars ([`page`]).
     page_chromes: RefCell<Vec<(ChromeAt, PageChrome)>>,
     page_chrome_memo: RefCell<Option<(ChromeInputs, PageChrome)>>,
-    /// Whether the least bar won the landing ([`page`]), by the inputs, chrome, bar and record of
-    /// the frame that tried it, kept for the frame's inputs and record.
-    least_bars: RefCell<Vec<(LeastAt, bool)>>,
+    /// Where the bar settled ([`page`]) by the inputs, chrome, bar and record of the frame that
+    /// seated it, and by the record it left, kept for the frame's inputs.
+    bar_seats: RefCell<Vec<(BarAt, BarSeat)>>,
     /// The chooser's rows each width built while [`page`] builds the page, which every seat of it shares.
     showcase_blocks: RefCell<Option<Vec<showcase_page::SharedBlocks>>>,
     /// The Customize sheet's rows each width and room built while [`page`] builds the page.
     showcase_sheet: RefCell<Option<Vec<showcase_page::SharedSheet>>>,
+    /// The demo's spec and frame built while [`page`] builds the page.
+    showcase_demo: RefCell<Option<Vec<showcase_page::SharedDemo>>>,
+    /// The strip each width built while [`page`] builds the page.
+    showcase_strip: RefCell<Option<Vec<showcase_page::SharedStrip>>>,
     pinned_place: Cell<Option<PinnedPlace>>,
     measuring_calm: Cell<bool>,
     status_extra: Cell<f32>,
@@ -1534,6 +1538,10 @@ pub(crate) struct SettingsViewState {
     status_slack: Cell<f32>,
     status_bar_most: Cell<Option<f32>>,
     status_overrun: Cell<f32>,
+    /// The lists the seat being built laid out under a status's bar ([`scroll::ListLaid`]).
+    status_lists: RefCell<Option<Vec<scroll::ListLaid>>>,
+    /// How many lists that seat seated under the bar ([`SettingsViewState::note_status_room`]).
+    status_lists_seated: Cell<usize>,
     status_scroll: RefCell<StatusScroll>,
     page_reveal: Option<UiKey>,
     list_carried: Option<UiKey>,
@@ -1713,15 +1721,19 @@ impl SettingsViewState {
             page_chrome_at: Cell::new(None),
             page_chromes: RefCell::new(Vec::new()),
             page_chrome_memo: RefCell::new(None),
-            least_bars: RefCell::new(Vec::new()),
+            bar_seats: RefCell::new(Vec::new()),
             showcase_blocks: RefCell::new(None),
             showcase_sheet: RefCell::new(None),
+            showcase_demo: RefCell::new(None),
+            showcase_strip: RefCell::new(None),
             pinned_place: Cell::new(None),
             measuring_calm: Cell::new(false),
             status_extra: Cell::new(0.0),
             status_slack: Cell::new(0.0),
             status_bar_most: Cell::new(None),
             status_overrun: Cell::new(0.0),
+            status_lists: RefCell::new(None),
+            status_lists_seated: Cell::new(0),
             status_scroll: RefCell::new(StatusScroll::default()),
             page_reveal: None,
             list_carried: None,
@@ -8961,6 +8973,7 @@ fn apply_text_input_event(
         TextInputEvent::KillToEnd => input.kill_to_end(),
         TextInputEvent::KillToStart => input.kill_to_start(),
         TextInputEvent::DeleteWordBackward => input.delete_word_backward(),
+        TextInputEvent::DeleteWordForward => input.delete_word_forward(),
         TextInputEvent::WordLeft { extend } => input.move_word_left(extend),
         TextInputEvent::WordRight { extend } => input.move_word_right(extend),
         TextInputEvent::SelectAll => input.select_all(),
@@ -12572,9 +12585,7 @@ fn plain_bar_layout(
     };
     let undo_under = undo && broken_words(feedback, beside) > broken_words(feedback, full);
     let words_width = if undo_under { full } else { beside };
-    // A STATUS NEVER COVERS THE TOOLBAR'S SEARCH THE KEYBOARD IS ON, the
-    // reload warning's bar under it too: at 178x348 at 2x text the two took
-    // the toolbar out of view.
+    // A status never covers the toolbar's search the keyboard is on, nor the warning's bar.
     let over = if width == SettingsWidth::Compact {
         compact_toolbar_height()
             + if keyboard_on_toolbar_search(state) {
@@ -12998,10 +13009,7 @@ fn compact_status_dock_required(state: &SettingsViewState, viewport: LogicalRect
     )
 }
 
-/// A STATUS DOCKS IN THE TOOLBAR ONLY WHERE THAT LEAVES THE PAGE MORE ROOM than its bars stacked
-/// under the page at their least, which they shorten to for the keyboard's control (R2 of
-/// seat_scroll): docked under the reload warning at 300x360 at 2x text, the toolbar took 336pt of
-/// the window and the Customize sheet's colour wheel went out of view.
+/// Whether a status's bars stacked at their least leave the page more room than docked (R2).
 fn stacked_bars_leave_more_room(state: &SettingsViewState, viewport: LogicalRect) -> bool {
     if state.common.last_focus.is_none() {
         return false;
@@ -13040,9 +13048,7 @@ thread_local! {
     static BARS_WEIGHED: RefCell<Option<BarsWeighed>> = const { RefCell::new(None) };
 }
 
-/// A RENDER WEIGHS ITS STATUS'S BARS ONCE: while open, the bar's height, the dock's decision and
-/// what docking would cost are each laid out once a render for each window, bar height and
-/// measure, which is all of a render's state they read that its seats move.
+/// While open, a render lays its status's bars out once a window, bar height and measure.
 struct BarsShared;
 
 impl BarsShared {
@@ -14078,6 +14084,7 @@ fn page(
 ) -> UiNode {
     let record = state.scroll_record.borrow().clone();
     let _shared = showcase_page::BlocksShared::open(state);
+    let _plans = scroll::PlansShared::open();
     let _words = scroll::KeyboardWords::watch(state.common.last_focus.clone());
     let _status = StatusWordsShared::open();
     let bars_height = settings_status_bars_height(state, width, cx.viewport);
@@ -14089,6 +14096,7 @@ fn page(
         status: bars_height > config_watch_status_bar_height(state) + 0.01,
     };
     let drawn_at = state.page_chrome_at.get();
+    let drawn_chrome = state.page_chrome.get();
     let bar_most = state.status_bar_most.get();
     // What a seat in `chrome` lays the page out by: the rows' and fields' room, and what a
     // status's bar takes of the list.
@@ -14115,10 +14123,75 @@ fn page(
             .set(plain_status_slack(state, width, cx.viewport));
         rooms
     };
+    // The lists each seat of the frame laid out, by chrome and how, and how the last laid it out.
+    let seat_lists = RefCell::new(Vec::new());
+    let seat_laid = Cell::new(None);
+    // What a seat in a chrome under the bar at a most leaves over, seated or told, once a render.
+    let overruns: RefCell<Vec<(PageChrome, Option<f32>, f32)>> = RefCell::new(Vec::new());
+    let overrun_known = |chrome: PageChrome, most: Option<f32>| {
+        let same = |was: Option<f32>| match (was, most) {
+            (Some(was), Some(most)) => (was - most).abs() < 0.001,
+            (was, most) => was == most,
+        };
+        overruns
+            .borrow()
+            .iter()
+            .find(|(was, at, _)| *was == chrome && same(*at))
+            .map(|(_, _, overrun)| *overrun)
+    };
+    // What each seat under a bar left over, which a test build's check of the bar's steps reads.
+    #[cfg(test)]
+    let overruns_seated: RefCell<Vec<(PageChrome, Option<f32>, f32)>> = RefCell::new(Vec::new());
     let seat = |chrome: PageChrome, calm: bool| {
         state.scroll_record.replace(record.clone());
+        state.status_overrun.set(0.0);
+        state.status_lists.replace(Some(Vec::new()));
+        state.status_lists_seated.set(0);
         let rooms = ready(chrome, calm);
+        let _ = showcase_page::laid_last();
         let built = page_children(state, update, packages, messages, harness, cx, width);
+        #[cfg(test)]
+        if !calm {
+            let left = (
+                chrome,
+                state.status_bar_most.get(),
+                state.status_overrun.get(),
+            );
+            if let Some(known) = overrun_known(chrome, left.1) {
+                assert!(
+                    (known - left.2).abs() < 0.01,
+                    "a seat under a bar leaves over what the render was told or seated there: \
+                     {known} told, {} seated, in {chrome:?} under {:?}",
+                    left.2,
+                    left.1
+                );
+            }
+            overruns_seated.borrow_mut().push(left);
+        }
+        #[cfg(test)]
+        let counted = crate::work_counts::page_work_counted();
+        #[cfg(not(test))]
+        let counted = true;
+        let lists = state.status_lists.take().unwrap_or_default();
+        let laid =
+            showcase_page::laid_last().filter(|_| state.status_lists_seated.get() == lists.len());
+        // A seat a test build makes to check another leaves what this frame was told by alone.
+        if counted {
+            seat_laid.set(laid);
+            if !calm && overrun_known(chrome, state.status_bar_most.get()).is_none() {
+                let left = (
+                    chrome,
+                    state.status_bar_most.get(),
+                    state.status_overrun.get(),
+                );
+                overruns.borrow_mut().push(left);
+            }
+        }
+        if let Some(laid) = laid.filter(|_| counted) {
+            let mut seat_lists = seat_lists.borrow_mut();
+            seat_lists.retain(|(was, at, _)| (*was, *at) != (chrome, laid));
+            seat_lists.push((chrome, laid, lists));
+        }
         drop(rooms);
         state.status_extra.set(0.0);
         state.status_slack.set(0.0);
@@ -14152,22 +14225,78 @@ fn page(
         state.measuring_calm.set(false);
         (built, holds, cuts)
     };
-    // HOW THE PAGE LAYS ITS LIST OUT IN `chrome` UNDER THE BAR AT `most`, measured with no seat
-    // built ([`showcase_page::list_room`]), where the page has a measure: a seat the measure
-    // says cannot show what is owed is not built.
-    let laid = |chrome: PageChrome, most: Option<f32>| {
+    // The list's room in `chrome` under the bar at `most`, with `rows` its rows, once a render.
+    let measures: RefCell<Vec<ListMeasure>> = RefCell::new(Vec::new());
+    let measured = |chrome: PageChrome, most: Option<f32>, rows: bool| {
         if !lists_themes(state, width) {
             return None;
         }
-        let was = (state.page_chrome.get(), state.status_bar_most.replace(most));
-        let rooms = ready(chrome, false);
-        let laid = showcase_page::list_room(state, width, cx);
-        drop(rooms);
-        state.status_extra.set(0.0);
-        state.status_slack.set(0.0);
+        let was = (
+            state.page_chrome.get(),
+            state.status_bar_most.replace(most),
+            state.status_overrun.replace(0.0),
+        );
+        let at = (chrome, feedback_bar_height(state, width, cx.viewport));
+        let seen = measures
+            .borrow()
+            .iter()
+            .find(|(seen, _, list)| *seen == at && (!rows || list.is_some()))
+            .map(|(_, laid, list)| (*laid, list.clone().flatten()));
+        let (laid, list) = seen.unwrap_or_else(|| {
+            let rooms = ready(chrome, false);
+            let (laid, list) = if rows {
+                let (laid, list) = showcase_page::list_laid(state, width, cx);
+                (laid, list.map(std::rc::Rc::new))
+            } else {
+                (showcase_page::list_room(state, width, cx), None)
+            };
+            drop(rooms);
+            state.status_extra.set(0.0);
+            state.status_slack.set(0.0);
+            let laid = laid.map(|laid| (laid, state.status_overrun.get()));
+            #[cfg(test)]
+            let counted = crate::work_counts::page_work_counted();
+            #[cfg(not(test))]
+            let counted = true;
+            if counted {
+                let mut measures = measures.borrow_mut();
+                measures.retain(|(seen, _, _)| *seen != at);
+                measures.push((at, laid, rows.then(|| list.clone())));
+            }
+            (laid, list)
+        });
         state.page_chrome.set(was.0);
         state.status_bar_most.set(was.1);
-        laid
+        state.status_overrun.set(was.2);
+        laid.map(|(laid, pinned)| (laid, pinned, list))
+    };
+    let laid = |chrome: PageChrome, most: Option<f32>| {
+        measured(chrome, most, false).map(|(laid, _, _)| laid)
+    };
+    // The rows the page lays its list out with in `chrome` under the bar at `most`: rows measured
+    // under another bar where the page lays them out alike there, else laid out there.
+    let rows_at = |chrome: PageChrome, most: Option<f32>| {
+        let other = measures
+            .borrow()
+            .iter()
+            .any(|((was, _), _, list)| *was == chrome && matches!(list, Some(Some(_))));
+        let (there, pinned, list) = measured(chrome, most, !other)?;
+        let alike = list.or_else(|| {
+            measures.borrow().iter().find_map(|((was, _), laid, list)| {
+                let list = list.clone().flatten()?;
+                (*was == chrome
+                    && laid.is_some_and(|(laid, _)| laid.stops_as(there))
+                    && list.builds_alike_in(there.room()))
+                .then_some(list)
+            })
+        });
+        match alike {
+            Some(list) => Some((there, pinned, list)),
+            None => {
+                let (there, pinned, list) = measured(chrome, most, true)?;
+                Some((there, pinned, list?))
+            }
+        }
     };
     // A page under a bar is built again under it, so a chrome decided
     // without a seat's measures is not seated calm first.
@@ -14176,12 +14305,7 @@ fn page(
         if let Some(chrome) = PAGE_CHROME_HELD.with(Cell::get) {
             return (chrome, (!bars).then(|| seat(chrome, false).0));
         }
-        // A PAGE BACK AT A WINDOW, TEXT SIZE AND BARS IT WAS DRAWN AT DRAWS
-        // ITS LIST IN THE CHROME IT LAST DREW THERE, and a bar that comes or
-        // goes keeps the chrome, whatever the scroll (R1 and R4 of
-        // seat_scroll). Chosen again, a wheel and the text size there and
-        // back at 444x420 seated the Customize sheet under its full chrome,
-        // 7pt lower than the wheel's frame had drawn it under the leanest.
+        // A page back at the window, text size and bars it was drawn at keeps its chrome (R1, R4).
         let same_context = record
             .as_ref()
             .is_some_and(|record| record.same_context(state));
@@ -14321,57 +14445,345 @@ fn page(
         }
         None => decide(),
     };
-    // The page seated under its bar in `chrome`, and whether the bar's least won the landing,
-    // where it was tried; a least bar already decided at the frame's inputs is not tried again.
-    let seat_bar = |chrome: PageChrome, decided: Option<bool>| {
-        state.status_overrun.set(0.0);
-        if decided == Some(true) {
-            state.status_bar_most.set(Some(0.0));
-            return (seat(chrome, false).0, decided);
+    // The bar's height at `most`.
+    let bar_at = |most: Option<f32>| {
+        let was = state.status_bar_most.replace(most);
+        let height = feedback_bar_height(state, width, cx.viewport);
+        state.status_bar_most.set(was);
+        height
+    };
+    // What the bar at `most` takes of a list in `chrome`, and what more it could give back.
+    let bar_takes = |chrome: PageChrome, most: Option<f32>| {
+        let was = (
+            state.page_chrome.replace(chrome),
+            state.status_bar_most.replace(most),
+        );
+        let taken = (
+            plain_status_extra(state, width, cx.viewport),
+            plain_status_slack(state, width, cx.viewport),
+        );
+        state.page_chrome.set(was.0);
+        state.status_bar_most.set(was.1);
+        taken
+    };
+    // THE BAR'S OVERRUN AT `most` TOLD WITH NO SEAT: from `seated`, a list a seat laid out, where
+    // the page lays it out alike there, else from the rows the page lays out there.
+    let overrun_at = |chrome: PageChrome,
+                      seated: Option<(showcase_page::ListRoom, &[scroll::ListLaid])>,
+                      most: Option<f32>| {
+        if let Some(known) = overrun_known(chrome, most) {
+            return Some(known);
         }
-        state.status_bar_most.set(bar_most);
+        let (there, pinned) = if seated.is_some_and(|(_, lists)| lists.len() == 1) {
+            measured(chrome, most, false).map(|(there, pinned, _)| (there, pinned))?
+        } else {
+            rows_at(chrome, most).map(|(there, pinned, _)| (there, pinned))?
+        };
+        let (given, slack) = bar_takes(chrome, most);
+        let list = seated.and_then(|(laid, lists)| match lists {
+            [list] if there.stops_as(laid) => Some((laid, list)),
+            _ => None,
+        });
+        let told = match list {
+            Some((_, list)) if list.builds_alike_in(there.room()) => state
+                .overrun_under(&list.planned(there.room(), given).0, there.room(), slack)
+                .max(pinned),
+            // A keyboard's control taller than the list's room takes the bar by all it takes.
+            Some((laid, list))
+                if given > 0.01
+                    && list.builds_as_wide_in(there.room())
+                    && state
+                        .keyboard_box(list, laid.room())
+                        .is_some_and(|tall| tall > there.room() + slack + 0.01) =>
+            {
+                given + slack
+            }
+            _ => {
+                let (there, pinned, list) = rows_at(chrome, most)?;
+                state
+                    .overrun_under(&list.planned(there.room(), given).0, there.room(), slack)
+                    .max(pinned)
+            }
+        };
+        overruns.borrow_mut().push((chrome, most, told));
+        Some(told)
+    };
+    // Where the frame's bar shortens to, a step told per overrun (`seen` one a seat noted): the
+    // most it is left at and seated at.
+    let descend =
+        |chrome: PageChrome,
+         seen: Option<(f32, f32)>,
+         seated: Option<(showcase_page::ListRoom, &[scroll::ListLaid])>| {
+            let mut most = bar_most;
+            for _ in 0..BAR_STEPS_TOLD {
+                let height = bar_at(most);
+                let over = match seen {
+                    Some((tall, overrun)) if (height - tall).abs() < 0.01 => overrun,
+                    _ => overrun_at(chrome, seated, most)?,
+                };
+                if over <= 0.01 {
+                    return Some((most, most));
+                }
+                let next = Some((height - over).max(0.0));
+                if bar_at(next) >= height - 0.01 {
+                    return Some((next, most));
+                }
+                most = next;
+            }
+            None
+        };
+    // The screen a seat in `chrome` under the bar at `most` would leave, told as its overrun is,
+    // once a render.
+    let screens: RefCell<Vec<ToldScreen>> = RefCell::new(Vec::new());
+    let seated_told = |chrome: PageChrome,
+                       seated: Option<(showcase_page::ListRoom, &[scroll::ListLaid])>,
+                       most: Option<f32>| {
+        let at = (chrome, bar_at(most));
+        let known = screens
+            .borrow()
+            .iter()
+            .find(|(seen, _)| *seen == at)
+            .map(|(_, told)| told.clone());
+        if known.is_some() {
+            return known;
+        }
+        let there = if seated.is_some_and(|(_, lists)| lists.len() == 1) {
+            measured(chrome, most, false)?.0
+        } else {
+            rows_at(chrome, most)?.0
+        };
+        let (given, _) = bar_takes(chrome, most);
+        let list = seated.and_then(|(laid, lists)| match lists {
+            [list] if there.stops_as(laid) && list.builds_alike_in(there.room()) => Some(list),
+            _ => None,
+        });
+        let plan = match list {
+            Some(list) => list.planned(there.room(), given),
+            None => rows_at(chrome, most)?.2.planned(there.room(), given),
+        };
+        let told = state.seated_under(plan.0.clone(), record.clone());
+        #[cfg(test)]
+        let counted = crate::work_counts::page_work_counted();
+        #[cfg(not(test))]
+        let counted = true;
+        if counted {
+            screens.borrow_mut().push((at, told.clone()));
+        }
+        Some(told)
+    };
+    // The bar shortens a step for each overrun a seat notes, from the steps this render told
+    // already: the page seated last, the most it was seated at, and whether any step was told.
+    let settle = |chrome: PageChrome| {
+        let mut from = bar_most;
+        for _ in 0..BAR_STEPS_TOLD {
+            let Some(over) = overrun_known(chrome, from).filter(|over| *over > 0.01) else {
+                break;
+            };
+            let height = bar_at(from);
+            let next = Some((height - over).max(0.0));
+            if bar_at(next) >= height - 0.01 {
+                break;
+            }
+            from = next;
+        }
+        let mut at = from;
+        let mut seated_steps = from == bar_most;
+        let mut told = 0;
+        state.status_bar_most.set(at);
         let mut seated = seat(chrome, false).0;
         loop {
             let overrun = state.status_overrun.replace(0.0);
+            let height = bar_at(at);
+            let next = Some((height - overrun).max(0.0));
+            if seated_steps && (overrun <= 0.01 || bar_at(next) >= height - 0.01) {
+                state
+                    .status_bar_most
+                    .set(if overrun <= 0.01 { at } else { next });
+                return (seated, at, told > 0 || from != bar_most);
+            }
+            let steps = seat_laid
+                .get()
+                .filter(|_| told < BAR_SEATS_TOLD)
+                .and_then(|laid| {
+                    let seats = seat_lists.borrow();
+                    let (_, _, lists) = seats
+                        .iter()
+                        .find(|(was, at, _)| (*was, *at) == (chrome, laid))?;
+                    descend(chrome, Some((height, overrun)), Some((laid, lists)))
+                });
+            match steps {
+                Some((left, last)) if (bar_at(last) - height).abs() < 0.01 => {
+                    state.status_bar_most.set(left);
+                    return (seated, at, true);
+                }
+                Some((_, last)) => {
+                    told += 1;
+                    at = last;
+                    seated_steps = false;
+                }
+                None if seated_steps => at = next,
+                None => {
+                    at = bar_most;
+                    seated_steps = true;
+                }
+            }
+            state.status_bar_most.set(at);
+            seated = seat(chrome, false).0;
+        }
+    };
+    // The bar's steps seated one by one from the frame's bar, to hold the steps told to.
+    #[cfg(test)]
+    let settled_seat_by_seat = |chrome: PageChrome| {
+        let overrun_under = |most: Option<f32>| {
+            let same = |was: Option<f32>| match (was, most) {
+                (Some(was), Some(most)) => (was - most).abs() < 0.001,
+                (was, most) => was == most,
+            };
+            let known = overruns_seated
+                .borrow()
+                .iter()
+                .find(|(was, at, _)| *was == chrome && same(*at))
+                .map(|(_, _, overrun)| *overrun);
+            known.unwrap_or_else(|| {
+                state.status_bar_most.set(most);
+                let _ = seat(chrome, false);
+                state.status_overrun.replace(0.0)
+            })
+        };
+        let mut at = bar_most;
+        loop {
+            let overrun = overrun_under(at);
+            state.status_bar_most.set(at);
             if overrun <= 0.01 {
                 break;
             }
-            let height = feedback_bar_height(state, width, cx.viewport);
-            state.status_bar_most.set(Some((height - overrun).max(0.0)));
-            if feedback_bar_height(state, width, cx.viewport) >= height - 0.01 {
+            let height = bar_at(at);
+            let next = Some((height - overrun).max(0.0));
+            state.status_bar_most.set(next);
+            if bar_at(next) >= height - 0.01 {
                 break;
             }
-            seated = seat(chrome, false).0;
+            at = next;
         }
-        // BEFORE THE FIRST EVENT THE BAR SHORTENS TO ITS LEAST FOR THE
-        // LANDING TOO, where that shows it whole and the keyboard's control no
-        // less (R3 of seat_scroll), tried only where the room the bar gives
-        // back holds the landing: the chooser's head pinned only under a
-        // shorter bar, Tokyo Night at 339x920 at 2× text under the warning and
-        // a status lay off the list's screen.
-        let most = state.status_bar_most.get();
-        if decided.is_some() || most == Some(0.0) || !state.landing_cut() {
-            return (seated, decided);
+        (state.status_bar_most.get(), bar_at(at))
+    };
+    // WHAT THE BAR'S LEAST DOES FOR THE LANDING from `settled`, a screen in `chrome` under the
+    // bar at `most`, told with no seat (R3 of seat_scroll).
+    let least_from = |chrome: PageChrome,
+                      seated: Option<(showcase_page::ListRoom, &[scroll::ListLaid])>,
+                      settled: Option<scroll::ScrollRecord>,
+                      most: Option<f32>| {
+        let read = |read: &dyn Fn(&SettingsViewState) -> bool| {
+            state.reading(settled.clone(), |state| read(state))
+        };
+        if most == Some(0.0) || !state.landing_owed() || !read(&|state| state.landing_cut()) {
+            return LeastFrom::Untried;
         }
-        // The room the bar gives back bounds what its list gains: the list is measured under the
-        // bar's least only where that room could land it.
-        let bar = feedback_bar_height(state, width, cx.viewport);
-        state.status_bar_most.set(Some(0.0));
-        let given = bar - feedback_bar_height(state, width, cx.viewport);
-        state.status_bar_most.set(most);
-        let measured = (given > 0.01 && state.landing_fits(given, false))
+        // The room the bar gives back bounds what its list gains.
+        let given = bar_at(most) - bar_at(Some(0.0));
+        let rooms = (given > 0.01 && read(&|state| state.landing_fits(given, false)))
             .then(|| laid(chrome, most).zip(laid(chrome, Some(0.0))));
         let fits = |keyboard: bool| {
-            measured.is_some_and(|measured| {
+            rooms.is_some_and(|measured| {
                 measured.is_none_or(|(now, least)| {
                     least != now
-                        && state.landing_fits(
-                            least.stops() - now.stops(),
-                            keyboard && least.stops_as(now),
-                        )
+                        && read(&|state| {
+                            state.landing_fits(
+                                least.stops() - now.stops(),
+                                keyboard && least.stops_as(now),
+                            )
+                        })
                 })
             })
         };
+        if !fits(true) {
+            return LeastFrom::Turned { alone: fits(false) };
+        }
+        let left = state.reading(settled.clone(), |state| state.keyboard_left());
+        seated_told(chrome, seated, Some(0.0)).map_or(LeastFrom::Untold, |told| {
+            let lands = state.reading(told.clone(), |state| {
+                !state.landing_cut() && state.keyboard_kept(left.as_ref())
+            });
+            if lands {
+                LeastFrom::Wins(Box::new(told))
+            } else {
+                LeastFrom::Loses
+            }
+        })
+    };
+    // The page seated under its bar in `chrome`, and where the bar settled: whether its least won
+    // the landing, where that was tried. A least told to win is the only seat.
+    let seat_bar = |chrome: PageChrome| {
+        let won = state.landing_owed().then(|| {
+            let seats = seat_lists.borrow();
+            let seated = seats
+                .iter()
+                .rev()
+                .find(|(was, _, _)| *was == chrome)
+                .map(|(_, laid, lists)| (*laid, lists.as_slice()));
+            descend(chrome, None, seated).and_then(|(left, last)| {
+                let told = seated_told(chrome, seated, last)?;
+                let kept = state.reading(told.clone(), |state| state.keyboard_left());
+                matches!(least_from(chrome, seated, told, left), LeastFrom::Wins(_))
+                    .then_some((left, last, kept))
+            })
+        });
+        if let Some((left, last, kept)) = won.flatten() {
+            #[cfg(test)]
+            if BAR_STEPS_SEATED.with(Cell::get) && crate::work_counts::page_work_counted() {
+                let by_seats = unseen(|| settled_seat_by_seat(chrome));
+                assert!(
+                    unseen(|| (bar_at(by_seats.0) - bar_at(left)).abs() < 0.01
+                        && (by_seats.1 - bar_at(last)).abs() < 0.01),
+                    "a bar's told steps leave it where seating it step by step does: told \
+                     {left:?} from {last:?}, seated {by_seats:?} in {chrome:?}"
+                );
+            }
+            state.status_bar_most.set(Some(0.0));
+            let least = seat(chrome, false).0;
+            #[cfg(test)]
+            assert!(
+                !state.landing_cut() && state.keyboard_kept(kept.as_ref()),
+                "a least bar told to win the landing wins it seated"
+            );
+            #[cfg(not(test))]
+            let _ = kept;
+            let settled = BarSeat {
+                seated: last,
+                left,
+                least: Some(true),
+            };
+            return (least, settled);
+        }
+        let (seated, at, told) = settle(chrome);
+        // A test build that asks holds the steps a frame was told to the seats one by one; a
+        // check's own settle is not checked again.
+        #[cfg(test)]
+        if told && BAR_STEPS_SEATED.with(Cell::get) && crate::work_counts::page_work_counted() {
+            let (left, kept) = (
+                state.status_bar_most.get(),
+                state.scroll_record.borrow().clone(),
+            );
+            let by_seats = unseen(|| settled_seat_by_seat(chrome));
+            let height = unseen(|| bar_at(at));
+            assert!(
+                (unseen(|| bar_at(by_seats.0)) - unseen(|| bar_at(left))).abs() < 0.01
+                    && (by_seats.1 - height).abs() < 0.01,
+                "a bar's told steps leave it where seating it step by step does: told {left:?} \
+                 under {height}pt, seated {by_seats:?} in {chrome:?}"
+            );
+            state.scroll_record.replace(kept);
+            state.status_bar_most.set(left);
+        }
+        #[cfg(not(test))]
+        let _ = told;
+        let mut settled = BarSeat {
+            seated: at,
+            left: state.status_bar_most.get(),
+            least: None,
+        };
+        // Before the first event the bar shortens to its least for the landing too (R3).
+        let most = settled.left;
         let left = state.keyboard_left();
         let least = || {
             state.status_bar_most.set(Some(0.0));
@@ -14382,82 +14794,231 @@ fn page(
             }
             (least, lands)
         };
-        if !fits(true) {
-            // Turned away by the keyboard's control alone, it is seated in a test build to check.
-            #[cfg(test)]
-            if fits(false) {
-                unseen(|| {
-                    let (_, lands) = least();
-                    assert!(
-                        !lands,
-                        "a least bar the keyboard's control turns away loses the landing"
-                    );
-                    let _ = seat(chrome, false);
-                });
+        // A least that loses with no seat is seated in a test build to check.
+        #[cfg(test)]
+        let loses = |why: &str| {
+            unseen(|| {
+                let (_, lands) = least();
+                assert!(!lands, "a least bar {why} loses the landing");
+                let _ = seat(chrome, false);
+            });
+        };
+        let told = {
+            let settled_on = state.scroll_record.borrow().clone();
+            let seats = seat_lists.borrow();
+            let seated = seat_laid.get().and_then(|laid| {
+                seats
+                    .iter()
+                    .find(|(was, at, _)| (*was, *at) == (chrome, laid))
+                    .map(|(_, _, lists)| (laid, lists.as_slice()))
+            });
+            least_from(chrome, seated, settled_on, most)
+        };
+        match told {
+            LeastFrom::Untried => return (seated, settled),
+            LeastFrom::Turned { alone } => {
+                #[cfg(test)]
+                if alone {
+                    loses("the keyboard's control turns away");
+                }
+                #[cfg(not(test))]
+                let _ = alone;
+                settled.least = Some(false);
+                return (seated, settled);
             }
-            return (seated, Some(false));
+            LeastFrom::Loses => {
+                #[cfg(test)]
+                loses("told to lose the landing");
+                settled.least = Some(false);
+                return (seated, settled);
+            }
+            LeastFrom::Wins(_) | LeastFrom::Untold => {}
         }
+        settled.least = Some(false);
         match least() {
-            (least, true) => (least, Some(true)),
-            _ => (seat(chrome, false).0, Some(false)),
+            (least, true) => {
+                settled.least = Some(true);
+                (least, settled)
+            }
+            _ => {
+                #[cfg(test)]
+                assert!(
+                    !matches!(told, LeastFrom::Wins(_)),
+                    "a least bar told to win the landing wins it seated"
+                );
+                (seat(chrome, false).0, settled)
+            }
         }
     };
-    // A FRAME AT THE INPUTS, CHROME, BAR AND RECORD OF ONE BEFORE TAKES ITS LEAST BAR'S
-    // DECISION: a least bar that won is seated once, one that lost is not tried.
+    // A frame at the inputs, chrome, bar and record of one before seats its bar where it settled.
     let seat_drawn = |chrome: PageChrome| {
         if !bars {
             return seat(chrome, false).0;
         }
         let at = (inputs.clone(), chrome, bar_most, record.clone());
-        let decided = state
-            .least_bars
+        let known = state
+            .bar_seats
             .borrow()
             .iter()
             .find(|(was, _)| *was == at)
-            .map(|(_, won)| *won);
-        #[cfg(test)]
-        if let Some(won) = decided {
-            LEAST_DECIDED.with(|count| count.set(count.get() + 1));
-            let (_, again) = unseen(|| seat_bar(chrome, None));
-            assert_eq!(
-                again,
-                Some(won),
-                "a least bar decided at these inputs, chrome, bar and record is decided the same again"
+            .map(|(_, settled)| *settled);
+        if let Some(known) = known {
+            #[cfg(test)]
+            {
+                BAR_SEATED.with(|count| count.set(count.get() + 1));
+                let (_, again) = unseen(|| seat_bar(chrome));
+                assert!(
+                    unseen(|| (bar_at(again.left) - bar_at(known.left)).abs() < 0.01)
+                        && again.least == known.least
+                        && unseen(|| (bar_at(again.seated) - bar_at(known.seated)).abs() < 0.01),
+                    "a bar settled at these inputs, chrome, bar and record settles there again: \
+                     {again:?} against {known:?}"
+                );
+            }
+            let won = known.least == Some(true);
+            state
+                .status_bar_most
+                .set(if won { Some(0.0) } else { known.seated });
+            let built = seat(chrome, false).0;
+            state
+                .status_bar_most
+                .set(if won { Some(0.0) } else { known.left });
+            // The record this seat leaves is kept too, so the redraw after it tells no steps again.
+            let left = (
+                at.0.clone(),
+                chrome,
+                bar_most,
+                state.scroll_record.borrow().clone(),
             );
+            let mut seats = state.bar_seats.borrow_mut();
+            if !seats.iter().any(|(was, _)| *was == left) {
+                seats.insert(0, (left, known));
+                seats.truncate(BAR_SEATS_KEPT);
+            }
+            return built;
         }
-        let (seated, tried) = seat_bar(chrome, decided);
-        if let (None, Some(won)) = (decided, tried) {
-            let mut bars = state.least_bars.borrow_mut();
-            bars.retain(|(was, _)| was.0 == at.0 && was.3 == at.3);
-            bars.push((at, won));
+        let (seated, settled) = seat_bar(chrome);
+        let left = (
+            at.0.clone(),
+            chrome,
+            bar_most,
+            state.scroll_record.borrow().clone(),
+        );
+        let mut seats = state.bar_seats.borrow_mut();
+        seats.retain(|(was, _)| was.0 == at.0 && *was != at && *was != left);
+        if left != at {
+            seats.insert(0, (left, settled));
         }
+        seats.insert(0, (at, settled));
+        seats.truncate(BAR_SEATS_KEPT);
         seated
     };
-    let (mut children, mut layout) = match built {
-        Some(built) if !bars => built,
-        _ => seat_drawn(chrome),
+    // A seat's screen in `chrome`, told unseated; none where its list cannot cut the control.
+    let drawn_told = |chrome: PageChrome| {
+        let as_wide = chrome == drawn_chrome
+            && drawn_at.is_some_and(|at| {
+                at.viewport.width == chrome_at.viewport.width
+                    && (at.scale - chrome_at.scale).abs() < 0.001
+            });
+        let uncut = state.common.last_focus.is_none()
+            || laid(chrome, bar_most).is_some_and(|laid| {
+                laid.pins_keyboard()
+                    || (as_wide
+                        && state
+                            .reading(record.clone(), |state| state.keyboard_whole())
+                            .is_some_and(|tall| tall + 0.5 <= laid.stops()))
+            });
+        if uncut {
+            return None;
+        }
+        let seats = seat_lists.borrow();
+        let seated = seats
+            .iter()
+            .rev()
+            .find(|(was, _, _)| *was == chrome)
+            .map(|(_, laid, lists)| (*laid, lists.as_slice()));
+        if !bars {
+            return seated_told(chrome, seated, bar_most);
+        }
+        let (left, last) = descend(chrome, None, seated)?;
+        let told = seated_told(chrome, seated, last)?;
+        match least_from(chrome, seated, told.clone(), left) {
+            LeastFrom::Wins(least) => Some(*least),
+            LeastFrom::Untold => None,
+            _ => Some(told),
+        }
     };
-    // A CHROME THAT CUTS THE KEYBOARD'S CONTROL GIVES WAY TO THE FIRST
-    // RUNG THAT SHOWS IT WHOLE, OR NO LESS THAN THE LAST SCREEN DID (R2 of
-    // seat_scroll), where the window, text size or bars moved, or the
-    // keyboard did: the bars' room given on its own rung first, then the
-    // leaner rungs, then the richer, nearest first. Kept under a reload
-    // warning at 1268x165, the Customize sheet's list had no room left and
-    // its colour well went out of view; recalled at 380x300 under a status,
-    // its leanest chrome left the list 26pt, where the full one lists the
-    // demo and leaves it 123pt; made 380x302 under a status, the colour
-    // wheel showed 28pt of the 32pt the screen before did.
+    let keyboard_moved = record
+        .as_ref()
+        .is_some_and(|record| record.keyboard() != state.common.last_focus.as_ref());
     #[cfg(test)]
     let held = PAGE_CHROME_HELD.with(Cell::get).is_some();
     #[cfg(not(test))]
     let held = false;
-    let keyboard_moved = record
-        .as_ref()
-        .is_some_and(|record| record.keyboard() != state.common.last_focus.as_ref());
-    if (drawn_at != Some(chrome_at) || keyboard_moved)
-        && !held
-        && state.keyboard_short_of(record.as_ref())
-        && state.keyboard_cut()
+    let gives_way = (drawn_at != Some(chrome_at) || keyboard_moved) && !held;
+    // A rung holds what `owed` asks of the keyboard's control only where its list's body, and the
+    // list measured in it, has room for it under the bar's least.
+    let body_holds = |trial: PageChrome, owed: f32| {
+        let was = (
+            state.page_chrome.replace(trial),
+            state.status_bar_most.replace(Some(0.0)),
+        );
+        let body = settings_list_body_height(state, width, cx.viewport);
+        state.page_chrome.set(was.0);
+        state.status_bar_most.set(was.1);
+        owed <= body + 0.5
+    };
+    let holds_owed = |trial: PageChrome, owed: Option<f32>| {
+        owed.is_none_or(|owed| {
+            let held = |laid: showcase_page::ListRoom| owed <= laid.stops() + 0.5;
+            if !body_holds(trial, owed) {
+                #[cfg(test)]
+                assert!(
+                    !unseen(|| laid(trial, Some(0.0))).is_some_and(held),
+                    "a list holds no more than its body"
+                );
+                return false;
+            }
+            laid(trial, Some(0.0)).is_none_or(held)
+        })
+    };
+    // Whether a screen cuts the keyboard's control short of the screen before, and what it owes
+    // the control, as `told` tells it.
+    let gives_from = |told: Option<scroll::ScrollRecord>| {
+        state.reading(told, |state| {
+            (state.keyboard_short_of(record.as_ref()) && state.keyboard_cut())
+                .then(|| state.keyboard_owed(record.as_ref()))
+        })
+    };
+    // A chrome told to cut the keyboard's control is not seated before the rungs it gives way to.
+    let doomed = (gives_way && bars)
+        .then(|| drawn_told(chrome))
+        .flatten()
+        .and_then(gives_from);
+    #[cfg(test)]
+    if let Some(owed) = doomed {
+        unseen(|| {
+            let _ = seat_bar(chrome);
+            let seated = (
+                state.keyboard_short_of(record.as_ref()),
+                state.keyboard_cut(),
+                state.keyboard_owed(record.as_ref()),
+            );
+            assert_eq!(
+                seated,
+                (true, true, owed),
+                "a chrome told to cut the keyboard's control cuts it, short by what it owes"
+            );
+        });
+    }
+    let mut drawn = match built {
+        _ if doomed.is_some() => None,
+        Some(built) if !bars => Some(built),
+        _ => Some(seat_drawn(chrome)),
+    };
+    // A chrome that cuts the keyboard's control gives way to the first rung that shows it (R2).
+    if doomed.is_some()
+        || (gives_way && state.keyboard_short_of(record.as_ref()) && state.keyboard_cut())
     {
         let ladder = PageChrome::ladder(width, cx.viewport);
         let at = ladder
@@ -14465,30 +15026,7 @@ fn page(
             .position(|rung| rung.giving_bar_room() == chrome.giving_bar_room())
             .unwrap_or_default();
         let mut tried = false;
-        let owed = state.keyboard_owed(record.as_ref());
-        // A rung holds what is owed only where its list's body, and the list measured in it, has
-        // room for it under the bar's least.
-        let holds_owed = |trial: PageChrome| {
-            owed.is_none_or(|owed| {
-                let was = (
-                    state.page_chrome.replace(trial),
-                    state.status_bar_most.replace(Some(0.0)),
-                );
-                let body = settings_list_body_height(state, width, cx.viewport);
-                state.page_chrome.set(was.0);
-                state.status_bar_most.set(was.1);
-                let held = |laid: showcase_page::ListRoom| owed <= laid.stops() + 0.5;
-                if owed > body + 0.5 {
-                    #[cfg(test)]
-                    assert!(
-                        !unseen(|| laid(trial, Some(0.0))).is_some_and(held),
-                        "a list holds no more than its body"
-                    );
-                    return false;
-                }
-                laid(trial, Some(0.0)).is_none_or(held)
-            })
-        };
+        let owed = doomed.unwrap_or_else(|| state.keyboard_owed(record.as_ref()));
         let taken = (at..ladder.len())
             .chain((0..at).rev())
             .flat_map(|index| {
@@ -14498,7 +15036,22 @@ fn page(
                 ]
             })
             .flatten()
-            .filter(|trial| *trial != chrome && holds_owed(*trial))
+            .filter(|trial| *trial != chrome && holds_owed(*trial, owed))
+            .filter(|trial| {
+                // A rung its seat's screen, told, says gives way too is not seated.
+                let gives = drawn_told(*trial).is_some_and(|told| gives_from(told).is_some());
+                #[cfg(test)]
+                if gives {
+                    unseen(|| {
+                        let _ = seat_bar(*trial);
+                        assert!(
+                            state.keyboard_short_of(record.as_ref()) && state.keyboard_cut(),
+                            "a rung told to give way cuts the keyboard's control seated"
+                        );
+                    });
+                }
+                !gives
+            })
             .find_map(|trial| {
                 tried = true;
                 let built = seat_drawn(trial);
@@ -14507,11 +15060,16 @@ fn page(
             });
         // A trial seated last: the chrome kept is seated again.
         match taken {
-            Some(taken) => (chrome, (children, layout)) = taken,
-            None if tried => (children, layout) = seat_drawn(chrome),
+            Some((trial, built)) => {
+                chrome = trial;
+                drawn = Some(built);
+            }
+            None if tried => drawn = Some(seat_drawn(chrome)),
             None => {}
         }
     }
+    let (mut children, layout) = drawn.unwrap_or_else(|| seat_drawn(chrome));
+    state.status_lists.replace(None);
     if remembered != Some(chrome) {
         state.page_chrome_memo.replace(Some((inputs, chrome)));
     }
@@ -14980,9 +15538,12 @@ thread_local! {
     /// Whether this thread's renders stack a compact window's statuses under
     /// the page rather than dock them in the toolbar.
     pub(crate) static STATUS_UNDOCKED: Cell<bool> = const { Cell::new(false) };
-    /// How many of this thread's seats under a bar took the least bar's decision from a frame
-    /// before; a test build also decides again, uncounted, and checks it decides the same.
-    pub(crate) static LEAST_DECIDED: Cell<usize> = const { Cell::new(0) };
+    /// How many of this thread's seats under a bar took where it settled from a frame before;
+    /// a test build also settles it again, uncounted, and checks it settles the same.
+    pub(crate) static BAR_SEATED: Cell<usize> = const { Cell::new(0) };
+    /// Whether this thread's renders also seat a bar's told steps one by one to check them, which
+    /// costs the seats telling saves; every seat checks what was told where it lands.
+    pub(crate) static BAR_STEPS_SEATED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// What the page's chrome is held for ([`page`]): its window, text size and bars.
@@ -15001,13 +15562,54 @@ impl ChromeAt {
     }
 }
 
-/// What a least bar is decided at ([`page`]): the page's inputs, chrome, bar and record.
-type LeastAt = (
+/// What a bar is settled at ([`page`]): the page's inputs, chrome, bar and record.
+type BarAt = (
     ChromeInputs,
     PageChrome,
     Option<f32>,
     Option<scroll::ScrollRecord>,
 );
+
+/// A screen told in a chrome under a bar ([`page`]).
+type ToldScreen = ((PageChrome, f32), Option<scroll::ScrollRecord>);
+
+/// A list measured in a chrome under a bar ([`page`]): its room and pinned overrun, and its rows
+/// where they were laid out.
+type ListMeasure = (
+    (PageChrome, f32),
+    Option<(showcase_page::ListRoom, f32)>,
+    Option<Option<std::rc::Rc<scroll::ListLaid>>>,
+);
+
+/// Where a frame's bar settled ([`page`]): the most it was seated at last and the most it was
+/// left at, and whether its least won the landing, where that was tried.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BarSeat {
+    seated: Option<f32>,
+    left: Option<f32>,
+    least: Option<bool>,
+}
+
+/// What the bar's least does for the landing from a screen ([`page`], R3 of seat_scroll).
+enum LeastFrom {
+    /// Not tried: the bar is at its least, or the screen lands the theme in use.
+    Untried,
+    /// Turned away by the room it gives back, `alone` by the keyboard's control.
+    Turned { alone: bool },
+    /// Told with no seat to win, and the screen it leaves.
+    Wins(Box<Option<scroll::ScrollRecord>>),
+    /// Told with no seat to lose.
+    Loses,
+    /// Tried, and not told.
+    Untold,
+}
+
+/// How many of the bar's steps a seat's notes tell ([`page`]), and how many seats they move.
+const BAR_STEPS_TOLD: usize = 16;
+const BAR_SEATS_TOLD: usize = 3;
+
+/// How many bars a page remembers settled for its inputs, chromes and bars ([`page`]).
+const BAR_SEATS_KEPT: usize = 16;
 
 /// How many windows, text sizes and bars a page remembers its chrome at ([`page`]).
 const PAGE_CHROMES_KEPT: usize = 64;
@@ -21166,6 +21768,17 @@ fn compact_row_inline(kind: &EditKind, text_width: f32, with_reset: bool) -> boo
 thread_local! {
     static ROWS_TOO_TALL_TO_STACK: Cell<Option<f32>> = const { Cell::new(None) };
     static FIELD_LIST_ROOM: Cell<Option<f32>> = const { Cell::new(None) };
+    /// The most lines a field wrapped to while [`field_lines_wanted`] counts them.
+    static FIELD_LINES_WANTED: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// `build`, and the most lines a field it laid out wrapped to before [`field_lines_most`] cut it.
+fn field_lines_wanted<R>(build: impl FnOnce() -> R) -> (R, usize) {
+    let outer = FIELD_LINES_WANTED.with(|wanted| wanted.replace(Some(0)));
+    let built = build();
+    let wanted = FIELD_LINES_WANTED.with(Cell::take).unwrap_or_default();
+    FIELD_LINES_WANTED.with(|cell| cell.set(outer.map(|was| was.max(wanted))));
+    (built, wanted)
 }
 
 struct FieldListRoom(Option<f32>);
@@ -22252,7 +22865,9 @@ fn push_field_card(
                         .collect(),
                 );
                 plan.set_control_rows(split.control_rows(rows.clone()));
-                plan.set_control_spans(split.control_spans(rows.clone()));
+                let (spans, words) = split.control_spans(rows.clone());
+                plan.set_control_spans(spans);
+                plan.set_keyboard_words(words);
                 plan.set_note(split.notes_only(rows.clone()));
                 plan.set_ink(split.ink(rows.clone()));
                 plan.set_ink_top(split.ink_top(rows.clone()));
@@ -30038,6 +30653,7 @@ fn word_placeholder_lines(
 ) -> Vec<String> {
     let most = most.max(1);
     let whole = wrap_to_box(plain, room, measure);
+    FIELD_LINES_WANTED.with(|wanted| wanted.set(wanted.get().map(|was| was.max(whole.len()))));
     if whole.len() <= most {
         return whole;
     }

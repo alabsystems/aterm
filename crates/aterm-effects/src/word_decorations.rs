@@ -2634,25 +2634,27 @@ impl WordDecorations {
         (art, host): (&Arc<FxArt>, u64),
         live: &[Option<crate::kitty_pet::PetDepartureSprite>],
     ) {
-        if let Some(slot) = self
-            .pet_depart_tiles
-            .iter_mut()
-            .find(|e| e.as_ref().is_some_and(|(held, ..)| *held == id))
-        {
-            if !slot.as_ref().is_some_and(|(_, held_art, held_host)| {
-                *held_host == host && Arc::ptr_eq(held_art, art)
-            }) {
-                *slot = Some((id, Arc::clone(art), host));
-            }
-            return;
-        }
         let owned = |held: u32| live.iter().flatten().any(|d| d.id == held);
-        if let Some(slot) = self
-            .pet_depart_tiles
-            .iter_mut()
-            .find(|e| e.as_ref().is_none_or(|(held, ..)| !owned(*held)))
-        {
-            *slot = Some((id, Arc::clone(art), host));
+        let mut free_idx = None;
+        for (i, slot) in self.pet_depart_tiles.iter_mut().enumerate() {
+            match slot.as_ref() {
+                Some((held, held_art, held_host)) if *held == id => {
+                    if *held_host != host || !Arc::ptr_eq(held_art, art) {
+                        *slot = Some((id, Arc::clone(art), host));
+                    }
+                    return;
+                }
+                Some((held, ..)) if free_idx.is_none() && !owned(*held) => {
+                    free_idx = Some(i);
+                }
+                None if free_idx.is_none() => {
+                    free_idx = Some(i);
+                }
+                _ => {}
+            }
+        }
+        if let Some(i) = free_idx {
+            self.pet_depart_tiles[i] = Some((id, Arc::clone(art), host));
         }
     }
 
@@ -4566,11 +4568,11 @@ impl WordDecorations {
                     if ep.is_some_and(|e| !e.burst_roll) {
                         continue;
                     }
-                    let age_s = now.saturating_duration_since(occ.appeared).as_secs_f32();
-                    let animating =
-                        !cfg.reduced_motion && now.saturating_duration_since(occ.appeared) < anim;
-                    let width = u64::from(occ.end_col.saturating_sub(occ.start_col) + 1).max(1);
+                    let elapsed = now.saturating_duration_since(occ.appeared);
+                    let animating = !cfg.reduced_motion && elapsed < anim;
                     if animating {
+                        let age_s = elapsed.as_secs_f32();
+                        let width = u64::from(occ.end_col.saturating_sub(occ.start_col) + 1).max(1);
                         let until = occ.appeared + anim;
                         arm_until(&mut active_until, until);
                         let density = cfg.density.clamp(1, 12);
@@ -4604,7 +4606,7 @@ impl WordDecorations {
                             out.push(d);
                         }
                     } else {
-                        let t = now.saturating_duration_since(occ.appeared).as_millis() as u64;
+                        let t = elapsed.as_millis() as u64;
                         let f = if cfg.reduced_motion {
                             (!ep.is_some_and(|e| e.burst_done)).then_some(1.0f32)
                         } else if t < cfg.anim_ms + RESIDUAL_FADE_MS {
@@ -6372,21 +6374,25 @@ fn paper_glow_scale_with(
         return 1.0;
     }
     let floor = PAPER_GLOW_KEEP * (lum_bg + 0.05) / (lum_fg + 0.05);
-    let reads = |g: f32| {
-        let lum =
-            crate::color_math::relative_luminance_with(table, mix_rgb(fg, lit, g)).min(lum_bg);
+    let reads_rgb = |rgb: u32| {
+        let lum = crate::color_math::relative_luminance_with(table, rgb).min(lum_bg);
         (lum_bg + 0.05) / (lum + 0.05) >= floor
     };
-    if reads(amp) {
+    let mut hi_rgb = mix_rgb(fg, lit, amp);
+    if reads_rgb(hi_rgb) {
         return 1.0;
     }
+    let mut lo_rgb = fg & 0x00FF_FFFF;
     let (mut lo, mut hi) = (0.0_f32, amp);
     for _ in 0..12 {
         let mid = 0.5 * (lo + hi);
-        if reads(mid) {
+        let mid_rgb = mix_rgb(fg, lit, mid);
+        if mid_rgb == lo_rgb || (mid_rgb != hi_rgb && reads_rgb(mid_rgb)) {
             lo = mid;
+            lo_rgb = mid_rgb;
         } else {
             hi = mid;
+            hi_rgb = mid_rgb;
         }
     }
     lo / amp
@@ -6642,8 +6648,11 @@ fn emit_rainbow_ink(
     let drift = u64::from(drift_ms.max(1));
     let t = now.saturating_duration_since(occ.appeared).as_millis() as u64;
     let animating = !occ.inert && !cfg.reduced_motion && t < drift;
-    let phase = 360.0 * (t.min(drift) as f32 / drift as f32);
-    let phase = if animating { phase } else { 0.0 };
+    let phase = if animating {
+        360.0 * (t as f32 / drift as f32)
+    } else {
+        0.0
+    };
     let hue_at = |u: f32| {
         hsv2rgb(
             (base_hue + u * span_used + phase).rem_euclid(360.0),
@@ -6651,17 +6660,25 @@ fn emit_rainbow_ink(
             val,
         )
     };
-    let guard_hues = [
-        hue_at(0.0),
-        hue_at(1.0 / 3.0),
-        hue_at(2.0 / 3.0),
-        hue_at(1.0),
-    ];
+    let (guard_hues, guard_len) = if span_used == 0.0 {
+        let h0 = hue_at(0.0);
+        ([h0; 4], 1)
+    } else {
+        (
+            [
+                hue_at(0.0),
+                hue_at(1.0 / 3.0),
+                hue_at(2.0 / 3.0),
+                hue_at(1.0),
+            ],
+            4,
+        )
+    };
     let strength = legible_strength(
         lum_table,
         cfg.ink_strength,
         rgb3_to_u32(base_fg[occ.ink_base]),
-        &guard_hues,
+        &guard_hues[..guard_len],
         lum_bg,
     );
     let denom = f32::from(occ.ink_cells.saturating_sub(1)).max(1.0);
@@ -6676,10 +6693,10 @@ fn emit_rainbow_ink(
     let cols = &base_cols[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
     let fgs = &base_fg[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
     for (i, (&col, &fg_rgb)) in cols.iter().zip(fgs).enumerate() {
-        let target = if cols.len() == 4 {
-            guard_hues[i]
-        } else if i == 0 {
+        let target = if span_used == 0.0 || i == 0 {
             guard_hues[0]
+        } else if cols.len() == 4 {
+            guard_hues[i]
         } else if i + 1 == cols.len() {
             guard_hues[3]
         } else {
@@ -6740,14 +6757,16 @@ fn emit_rainbow_sparkles(
     let p_tau = p * 4.0 * core::f32::consts::TAU;
     let seed_phase = (occ.seed & 0xff) as f32 * 0.013;
     let width_f = f32::from(width);
+    let env_intensity = cfg.intensity * envelope;
     for i in 0..count {
         let u = i as f32 / denom;
         let phase = p_tau + i as f32 * 2.094 + seed_phase;
-        let shimmer = 0.62 + 0.38 * phase.sin().abs();
+        let (sin_p, cos_p) = phase.sin_cos();
+        let shimmer = 0.62 + 0.38 * sin_p.abs();
         let d = WordDecoration {
             row: occ.row,
             col: occ.start_col + (width_f * u).round() as u16,
-            dx: (phase.cos() * 2.0).round() as i8,
+            dx: (cos_p * 2.0).round() as i8,
             dy: -lift + i as i8,
             glyph: if i == 1 {
                 DecoGlyph::Star5
@@ -6756,7 +6775,7 @@ fn emit_rainbow_sparkles(
             },
             blend: DecoBlend::Add,
             color: hsv2rgb((base_hue + 120.0 * i as f32 + 45.0 * p) % 360.0, 0.72, 1.0),
-            alpha: scale_u8(cfg.intensity * envelope * shimmer * 0.82),
+            alpha: scale_u8(env_intensity * shimmer * 0.82),
         };
         *fp = fold_deco(*fp, &d);
         out.push(d);
@@ -6812,7 +6831,12 @@ fn cat_color_context(cells: &[RenderCell], start: u16, end: u16) -> CatColorKey 
     let hi = end.saturating_add(4).min(cells.len().saturating_sub(1));
     for (i, cell) in cells[lo..=hi].iter().enumerate() {
         let col = lo + i;
-        if (start..=end).contains(&col) || cell.wide || cell.ch.is_whitespace() || cell.ch == '\0' {
+        if (start..=end).contains(&col)
+            || cell.wide
+            || cell.ch == ' '
+            || cell.ch == '\0'
+            || cell.ch.is_whitespace()
+        {
             continue;
         }
         for (dst, src) in sum.iter_mut().zip(cell.fg) {
@@ -6908,8 +6932,9 @@ fn cat_color_context_footprint(
             sampled += 1;
             if let Some(cell) = cell
                 && !cell.wide
-                && !cell.ch.is_whitespace()
+                && cell.ch != ' '
                 && cell.ch != '\0'
+                && !cell.ch.is_whitespace()
             {
                 for (dst, src) in fg_sum.iter_mut().zip(cell.fg) {
                     *dst += u32::from(src);
@@ -7023,10 +7048,9 @@ fn band_occupancy(
             if skip_cols.as_ref().is_some_and(|s| s.contains(&c)) {
                 continue;
             }
-            if line
-                .get(c)
-                .is_some_and(|cell| cell.wide || (!cell.ch.is_whitespace() && cell.ch != '\0'))
-            {
+            if line.get(c).is_some_and(|cell| {
+                cell.wide || (cell.ch != ' ' && cell.ch != '\0' && !cell.ch.is_whitespace())
+            }) {
                 occupied += 1;
             }
         }
@@ -7076,6 +7100,9 @@ fn cat_peek_plan(
     let down_band = (trigger + band_rows < rows)
         .then(|| clear_band_occupancy(cells, trigger + 1, trigger + band_rows, c0, c1))
         .flatten();
+    if down_band == Some(0.0) {
+        return Some(PeekDir::Down);
+    }
     if up_band.is_none() && down_band.is_none() {
         return None;
     }

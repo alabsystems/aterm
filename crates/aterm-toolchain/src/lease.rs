@@ -112,7 +112,7 @@ impl Subject {
         }
     }
 
-    /// The subject a toolchain DIRECTORY belongs to — a store build's (`store/<p>/<n>/…`), its exec root's (`compat/<p>/<n>/…`, which is that build's), or a seam view's (`rustup/<name>/…`) — or `None` for a directory atpkg does not manage (a checkout, a hand-made rustup toolchain): nothing of atpkg's ever reclaims one of those.
+    /// The subject a toolchain DIRECTORY belongs to — a store build's (`store/<p>/<n>/…`), its exec root's (`compat/<p>/<n>/…`, which is that build's), or a seam view's (`rustup/<name>/…`, or `rustup/<name>.noindex/…` once laid aside) — or `None` for a directory atpkg does not manage (a checkout, a hand-made rustup toolchain): nothing of atpkg's ever reclaims one of those.
     #[must_use]
     pub fn of_dir(prefix: &Path, dir: &Path) -> Option<Self> {
         let prefixes = [
@@ -138,7 +138,10 @@ impl Subject {
                             .then(|| build.parse().ok().and_then(|b| Self::build(program, b)))
                             .flatten()
                     }
-                    (Some(VIEWS_DIR), Some(name), _) => Self::view(name),
+                    (Some(VIEWS_DIR), Some(name), _) => Self::view(
+                        name.strip_suffix(crate::build_cache::NOINDEX)
+                            .unwrap_or(name),
+                    ),
                     _ => None,
                 };
                 if found.is_some() {
@@ -776,6 +779,17 @@ mod tests {
             std::os::unix::fs::symlink("15698.noindex", p.join("store/trust/15698")).unwrap();
             for dir in [aside, p.join("store/trust/15698/bin")] {
                 assert_eq!(Subject::of_dir(&p, &dir), Some(trust(15698)), "{dir:?}");
+            }
+            // A view laid aside, as rustc reports it and through its link.
+            let view_aside = p.join("rustup/trust-dev.noindex/bin");
+            std::fs::create_dir_all(&view_aside).unwrap();
+            std::os::unix::fs::symlink("trust-dev.noindex", p.join("rustup/trust-dev")).unwrap();
+            for dir in [view_aside, p.join("rustup/trust-dev/bin")] {
+                assert_eq!(
+                    Subject::of_dir(&p, &dir),
+                    Subject::view("trust-dev"),
+                    "{dir:?}"
+                );
             }
         }
         assert_eq!(

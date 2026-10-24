@@ -34,8 +34,8 @@ fn run_to(w: &mut World, until_ms: u64, mut each: impl FnMut(&mut World, u64)) -
 /// The person types a line into the session `reader` reads, through its relay in front of tab 1,
 /// a tick after the session sat still.
 fn typed_into(w: &mut World, reader: u32) {
-    let _ = run_to(w, 2 * TICK_MS, |w, rel| {
-        if rel == 2 * TICK_MS {
+    let _ = run_to(w, 4 * TICK_MS, |w, rel| {
+        if rel == 2 * TICK_MS || rel == 4 * TICK_MS {
             w.typed(1, reader);
         }
     });
@@ -1919,7 +1919,8 @@ fn a_job_parked_in_two_groups_takes_the_block_that_resumes_one() {
 /// reads vim gone before the reader feeds that `D`, when the job keeps a
 /// process substitution in the shell's group (`vim <(tail -f log)`), and when
 /// a child it started in its group lives on adopted (`fg` waits for no
-/// grandchild). vim's own row ends with it.
+/// grandchild). vim's own row ends with it. A swept zombie and a different
+/// process that reused vim's PID prove no live vim either.
 #[test]
 fn a_job_a_command_list_brings_forward_that_quits_at_once_leaves_make_no_status() {
     for (between, extra) in [
@@ -1929,48 +1930,56 @@ fn a_job_a_command_list_brings_forward_that_quits_at_once_leaves_make_no_status(
         (true, "subst"),
         (false, "child"),
     ] {
-        let mut w = World::new();
-        w.run_fg(1, 12, "vim notes", sleeper(1200, "vim"));
-        if extra == "subst" {
-            in_the_shells_group(&mut w, 1100, "tail");
-        }
-        if extra == "child" {
-            let shell = w.tab(1).tab.shell_pid;
-            let mut c = Proc::new(1210, 1200, "tailwind");
-            c.pgid = 1200;
-            c.sid = shell;
-            c.tty = true;
-            w.add(c);
-        }
-        let _ = run_to(&mut w, 4_000, |_, _| {});
-        w.p(1200).state = ProcState::Stopped;
-        w.stop_block(1);
-        let _ = w.tick(TICK_MS);
-        w.run_fg(1, 13, "make && fg", sleeper(1300, "make"));
-        let _ = run_to(&mut w, 4_000, |_, _| {});
-        w.exit(1300, false);
-        w.p(1200).state = ProcState::Sleeping;
-        w.tab(1).tpgid = 1200;
-        let _ = w.tick(TICK_MS);
-        w.exit(1200, false);
-        if extra == "child" {
-            w.p(1210).ppid = 1;
-        }
-        if between {
-            w.tab(1).tpgid = w.tab(1).tab.shell_pid;
+        for fate in ["gone", "zombie", "reused"] {
+            let mut w = World::new();
+            w.run_fg(1, 12, "vim notes", sleeper(1200, "vim"));
+            if extra == "subst" {
+                in_the_shells_group(&mut w, 1100, "tail");
+            }
+            if extra == "child" {
+                let shell = w.tab(1).tab.shell_pid;
+                let mut c = Proc::new(1210, 1200, "tailwind");
+                c.pgid = 1200;
+                c.sid = shell;
+                c.tty = true;
+                w.add(c);
+            }
+            let _ = run_to(&mut w, 4_000, |_, _| {});
+            w.p(1200).state = ProcState::Stopped;
+            w.stop_block(1);
             let _ = w.tick(TICK_MS);
+            w.run_fg(1, 13, "make && fg", sleeper(1300, "make"));
+            let _ = run_to(&mut w, 4_000, |_, _| {});
+            w.exit(1300, false);
+            w.p(1200).state = ProcState::Sleeping;
+            w.tab(1).tpgid = 1200;
+            let _ = w.tick(TICK_MS);
+            w.exit(1200, fate == "zombie");
+            if extra == "child" {
+                w.p(1210).ppid = 1;
+            }
+            if fate == "reused" {
+                let mut other = Proc::new(1200, 1, "other");
+                other.start += 1;
+                other.pgid = 8000;
+                w.add(other);
+            }
+            if between {
+                w.tab(1).tpgid = w.tab(1).tab.shell_pid;
+                let _ = w.tick(TICK_MS);
+            }
+            w.close_block(1, 1);
+            let v = w.tick(TICK_MS);
+            assert_eq!(
+                (
+                    v.row("b13").map(|r| (r.verdict, r.exit)),
+                    v.row("b12").map(|r| r.verdict)
+                ),
+                (Some((Verdict::Exited, None)), Some(Verdict::Exited)),
+                "{between} {extra} {fate}: {:?}",
+                v.rows
+            );
         }
-        w.close_block(1, 1);
-        let v = w.tick(TICK_MS);
-        assert_eq!(
-            (
-                v.row("b13").map(|r| (r.verdict, r.exit)),
-                v.row("b12").map(|r| r.verdict)
-            ),
-            (Some((Verdict::Exited, None)), Some(Verdict::Exited)),
-            "{between} {extra}: {:?}",
-            v.rows
-        );
     }
 }
 
@@ -2418,8 +2427,12 @@ fn a_job_takes_only_lines_one_of_its_processes_could_have_written() {
 /// system call), the lines the tab prints are the command's in front. Hung
 /// beside a `tail -f &` started with it, it takes none of tail's lines; a
 /// command hung with no such socket takes none of a stray writer's (a server
-/// a subshell left behind, no job's); and one aterm may not read (`sudo
-/// mount`) takes none of a background `ping`'s.
+/// a subshell left behind, no job's); one aterm may not read (`sudo mount`)
+/// takes none of a background `ping`'s, read or not, nor the last line of a
+/// `make &` that ended, nor a background job's that turned root's (`exec
+/// sudo`); a hung `git fetch` takes none of the notice zsh
+/// prints as it reaps `make &`; and a polling loop none of `rails server &`'s
+/// log.
 #[test]
 fn a_command_whose_output_a_server_outside_the_tab_writes_takes_its_lines() {
     for parked in [false, true] {
@@ -2510,10 +2523,85 @@ fn a_command_whose_output_a_server_outside_the_tab_writes_takes_its_lines() {
         wire(&v, "b10")
     );
 
-    // `sudo mount` hung, its processes root's, beside `ping -i 5 host &`, which prints.
+    // `sudo mount` hung, its processes root's, beside `ping -i 5 host &`, which prints: also a
+    // `sudo ping` aterm may not read either.
+    for refused in [false, true] {
+        let mut w = World::new();
+        let shell = w.tab(1).tab.shell_pid;
+        w.run_bg(1, sleeper(1400, "ping"));
+        w.p(1400).refused = refused;
+        w.run_fg(
+            1,
+            12,
+            "sudo mount -t nfs srv:/x /mnt",
+            sleeper(1300, "sudo"),
+        );
+        let mut mount = Proc::new(1301, 1300, "mount");
+        mount.pgid = 1300;
+        mount.sid = shell;
+        mount.tty = true;
+        w.add(mount);
+        for p in [1300, 1301] {
+            w.p(p).refused = true;
+        }
+        w.tty_mode(1, true, true);
+        let v = run_to(&mut w, 1_200_000, |w, rel| {
+            if rel % 6_000 == 0 {
+                w.line_from(1, &[1400]);
+            }
+        });
+        assert_ne!(
+            v.row("b12").map(|r| r.class),
+            Some(Class::Running),
+            "{refused}: {}",
+            wire(&v, "b12")
+        );
+    }
+
+    // Hung beside `make &`, which prints until it ends: its last line, read in the pass that
+    // sees it gone (reaped, or a zombie its shell has yet to reap), is make's, also when a pass
+    // judges make first.
+    for zombie in [false, true] {
+        let mut w = World::new();
+        let shell = w.tab(1).tab.shell_pid;
+        w.run_bg(1, sleeper(1400, "make"));
+        let _ = w.observe();
+        w.run_fg(
+            1,
+            12,
+            "sudo mount -t nfs srv:/x /mnt",
+            sleeper(1300, "sudo"),
+        );
+        let mut mount = Proc::new(1301, 1300, "mount");
+        mount.pgid = 1300;
+        mount.sid = shell;
+        mount.tty = true;
+        w.add(mount);
+        for p in [1300, 1301] {
+            w.p(p).refused = true;
+        }
+        w.tty_mode(1, true, true);
+        let v = run_to(&mut w, 1_200_000, |w, rel| {
+            if rel <= 600_000 && rel % 6_000 == 0 {
+                w.line_from(1, &[1400]);
+            }
+            if rel == 600_000 {
+                w.exit(1400, zombie);
+            }
+        });
+        assert_eq!(
+            v.row("b12").map(|r| r.quiet_ms),
+            Some(Some(1_200_000)),
+            "{zombie}: {}",
+            wire(&v, "b12")
+        );
+    }
+
+    // Hung beside `(sleep 600; exec sudo tcpdump) &`, whose subshell turns root's as it runs
+    // tcpdump in its place and prints: none of tcpdump's lines, its first included.
     let mut w = World::new();
     let shell = w.tab(1).tab.shell_pid;
-    w.run_bg(1, sleeper(1400, "ping"));
+    w.run_bg(1, sleeper(1400, "zsh"));
     w.run_fg(
         1,
         12,
@@ -2530,22 +2618,93 @@ fn a_command_whose_output_a_server_outside_the_tab_writes_takes_its_lines() {
     }
     w.tty_mode(1, true, true);
     let v = run_to(&mut w, 1_200_000, |w, rel| {
-        if rel % 6_000 == 0 {
+        if rel == 600_000 {
+            let p = w.p(1400);
+            p.name = "sudo".into();
+            p.exec += 1;
+            p.refused = true;
+        }
+        if rel >= 600_000 && rel % 6_000 == 0 {
+            w.line_from(1, &[1400]);
+        }
+    });
+    assert_eq!(
+        v.row("b12").map(|r| r.quiet_ms),
+        Some(Some(1_200_000)),
+        "{}",
+        wire(&v, "b12")
+    );
+
+    // `git fetch` hung on its peer while `make &` ends: zsh wakes to reap make and prints its
+    // notice, none of the fetch's work.
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    w.run_bg(1, sleeper(1400, "make"));
+    let mut git = sleeper(1300, "git");
+    git.fds.push(tcp_fd(5));
+    w.run_fg(1, 9, "git fetch", git);
+    w.tty_mode(1, true, true);
+    let v = run_to(&mut w, 1_200_000, |w, rel| {
+        if rel < 900_000 && rel % 6_000 == 0 {
+            w.line_from(1, &[1400]);
+        }
+        if rel == 900_000 {
+            w.exit(1400, false);
+            w.line_from(1, &[shell]);
+        }
+    });
+    assert_eq!(
+        v.row("b9").map(|r| r.quiet_ms),
+        Some(Some(1_200_000)),
+        "{}",
+        wire(&v, "b9")
+    );
+
+    // `until pg_isready; do sleep 1; done` beside `rails server &`, which logs: the loop's
+    // short commands come and go, the shell forking and reaping each, and rails writes the lines.
+    let mut w = World::new();
+    w.run_bg(1, sleeper(1400, "rails"));
+    let at = w.at;
+    w.tab(1).tab.block = Some(Block {
+        id: 9,
+        started_ms: at,
+        open: true,
+        command: "until pg_isready; do sleep 1; done".to_owned(),
+        status: None,
+        stopped: false,
+    });
+    w.tty_mode(1, true, true);
+    let v = run_to(&mut w, 1_200_000, |w, rel| {
+        let born = 3_000 + u32::try_from(rel / TICK_MS).unwrap_or(0);
+        w.exit(born - 1, false);
+        let mut p = Proc::new(
+            born,
+            shell,
+            if born % 2 == 0 { "pg_isready" } else { "sleep" },
+        );
+        p.sid = shell;
+        p.tty = true;
+        w.add(p);
+        w.tab(1).tpgid = born;
+        *w.p(shell).counters.syscalls.get_or_insert(0) += 3;
+        if rel % 4_000 == 0 {
             w.line_from(1, &[1400]);
         }
     });
     assert_ne!(
-        v.row("b12").map(|r| r.class),
+        v.row("b9").map(|r| r.class),
         Some(Class::Running),
         "{}",
-        wire(&v, "b12")
+        wire(&v, "b9")
     );
 }
 
 /// A GROUP A PROGRAM MADE FOR ITS CHILDREN IS ITS JOB'S: ninja starts each
 /// step in a group of its own and prints only its `\r` status line; the steps
 /// are the build's members, whose work is its progress, and no step is a row
-/// of its own.
+/// of its own. A stop in such a group is held (no `fg` resumes it), also under
+/// a root that never put a group in front; a job stopped in the group job
+/// control put in front too parks by that stop.
 #[test]
 fn a_group_a_program_made_for_its_children_is_its_jobs() {
     let mut w = World::new();
@@ -2610,6 +2769,53 @@ fn a_group_a_program_made_for_its_children_is_its_jobs() {
         "{}",
         wire(&v, "j1300")
     );
+
+    // The same step under `aterm -e ninja`: the root that made its group never put one in front,
+    // so it does no job control either.
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    w.p(shell).name = "ninja".into();
+    for (pid, ppid, name) in [(2310, shell, "sh"), (2311, 2310, "ssh")] {
+        let mut p = Proc::new(pid, ppid, name);
+        p.pgid = 2310;
+        p.sid = shell;
+        p.tty = true;
+        p.state = ProcState::Stopped;
+        w.add(p);
+    }
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    assert_eq!(
+        v.row("j2310").map(|r| r.verdict),
+        Some(Verdict::Stuck),
+        "{}",
+        wire(&v, "j2310")
+    );
+
+    // Ctrl-Z of `cargo nextest run`, which starts each test in a group of its own and stops them
+    // as it stops: the job parks by nextest's stop, in the group the shell put in front, whatever
+    // pid a test drew below it.
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    w.mark(1);
+    w.run_fg(1, 7, "cargo nextest run", sleeper(1900, "cargo-nextest"));
+    for pid in [1210, 1244] {
+        let mut t = Proc::new(pid, 1900, "aterm_core-1a2b");
+        t.sid = shell;
+        t.tty = true;
+        w.add(t);
+    }
+    let _ = run_to(&mut w, 10_000, |_, _| {});
+    for pid in [1900, 1210, 1244] {
+        w.p(pid).state = ProcState::Stopped;
+    }
+    w.stop_block(1);
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    assert_eq!(
+        v.row("b7").map(|r| r.verdict),
+        Some(Verdict::Parked),
+        "{}",
+        wire(&v, "b7")
+    );
 }
 
 /// A NESTED SHELL'S JOBS ARE ROWS OF THEIR OWN: `bash` run in the tab's zsh
@@ -2669,7 +2875,8 @@ fn a_nested_shells_jobs_are_rows_of_their_own() {
 /// peer reads stuck while sudo's row reads the terminal and the agent's row
 /// runs on its redraws, also when the agent runs in `nvim`'s terminal. A
 /// session in another is a row of its own, and one whose reader in front waits
-/// for the person's keys reads its own terminal's word: fine.
+/// for the person's keys reads its own terminal's word: fine (a shell in
+/// Emacs's buffer at its prompt reads a line).
 #[test]
 fn a_terminal_session_nested_in_the_tabs_is_a_row_of_its_own() {
     // Root's processes: none read (macOS refuses another user's counters), or read without a
@@ -2677,6 +2884,7 @@ fn a_terminal_session_nested_in_the_tabs_is_a_row_of_its_own() {
     for (script, hung, root) in [
         (false, false, 0),
         (true, false, 0),
+        (true, false, 1),
         (false, false, 1),
         (false, false, 2),
         (false, false, 3),
@@ -2840,6 +3048,18 @@ fn a_terminal_session_nested_in_the_tabs_is_a_row_of_its_own() {
     );
     w.tty_mode(1, false, false);
     typed_into(&mut w, 1310);
+    // A key stamped as a pass ends, which zsh reads in the next: one still tick unlatches nothing,
+    // and zsh's line editor at its prompt reads raw keys.
+    let _ = w.tick(TICK_MS);
+    w.advance(TICK_MS);
+    w.typed(1, 1300);
+    let v = w.observe();
+    assert_eq!(
+        v.row("n1310").and_then(|r| r.wait.as_ref().map(|w| w.name)),
+        Some(WaitName::TtyRaw),
+        "{}",
+        wire(&v, "n1310")
+    );
     let mut vim = Proc::new(1311, 1310, "vim");
     vim.sid = 1310;
     vim.tty = true;
@@ -2860,6 +3080,46 @@ fn a_terminal_session_nested_in_the_tabs_is_a_row_of_its_own() {
     assert_ne!(
         v.row("n1310").and_then(|r| r.wait.as_ref().map(|w| w.name)),
         Some(WaitName::TtyRaw),
+        "{}",
+        wire(&v, "n1310")
+    );
+
+    // `ssh` at its passphrase prompt in `script`'s shell, the person typing: a line reader takes
+    // the keys at Enter, so its still ticks unlatch nothing.
+    let mut w = World::new();
+    w.run_fg(1, 5, "script -q log", sleeper(1300, "script"));
+    let mut inner = Proc::new(1310, 1300, "zsh");
+    inner.sid = 1310;
+    inner.tty = true;
+    w.add(inner);
+    w.fronts.insert(1310, 1310);
+    w.terms.insert(
+        1310,
+        TermWord {
+            canonical: false,
+            echo: false,
+            queued: 0,
+        },
+    );
+    w.tty_mode(1, false, false);
+    typed_into(&mut w, 1310);
+    let mut ssh = Proc::new(1311, 1310, "ssh");
+    ssh.sid = 1310;
+    ssh.tty = true;
+    w.add(ssh);
+    w.fronts.insert(1310, 1311);
+    w.terms.insert(
+        1310,
+        TermWord {
+            canonical: true,
+            echo: false,
+            queued: 0,
+        },
+    );
+    let v = run_to(&mut w, 120_000, |w, _| w.typed(1, 1300));
+    assert_eq!(
+        v.row("n1310").and_then(|r| r.wait.as_ref().map(|w| w.name)),
+        Some(WaitName::TtyPassword),
         "{}",
         wire(&v, "n1310")
     );
@@ -2926,20 +3186,22 @@ fn a_terminal_session_nested_in_the_tabs_is_a_row_of_its_own() {
         leaf.tty = true;
         w.add(leaf);
         w.fronts.insert(1310, 1311);
+        // The person types to Codex from the call's first interval on.
         let v = run_to(&mut w, 1_200_000, |w, rel| {
-            if rel % 20_000 == 0 {
+            if rel % 20_000 == 0 || rel == TICK_MS {
                 w.typed(1, 1300);
             }
             if rel == 60_000 {
                 w.p(1311).syscalls_per_s = 0;
             }
-            // The agent writes the call a key of its own.
-            if rel == 111_000 && !emacs {
+            // The agent writes the call keys of its own as the person types to it, twice, the
+            // person's keys to Codex between.
+            if (rel == 80_000 || rel == 200_000) && !emacs {
                 *w.p(1311).counters.syscalls.get_or_insert(0) += 1;
             }
-            // The call's shell wakes (a child's exit) over a pass you typed in: what sits in
+            // The call's shell wakes (a child's exit) over two passes you typed in: what sits in
             // front of its terminal took no key.
-            if rel == 140_000 && !emacs {
+            if (rel == 140_000 || rel == 160_000) && !emacs {
                 *w.p(1310).counters.syscalls.get_or_insert(0) += 1;
             }
         });
@@ -2953,6 +3215,174 @@ fn a_terminal_session_nested_in_the_tabs_is_a_row_of_its_own() {
             row.wire()
         );
     }
+
+    // Emacs's shell at its prompt, the lines the person sends it read: it reads a line, fine.
+    let mut w = World::new();
+    w.run_fg(1, 5, "emacs", sleeper(1300, "emacs"));
+    let mut bash = Proc::new(1310, 1300, "bash");
+    bash.sid = 1310;
+    bash.tty = true;
+    w.add(bash);
+    w.fronts.insert(1310, 1310);
+    w.terms.insert(
+        1310,
+        TermWord {
+            canonical: true,
+            echo: false,
+            queued: 0,
+        },
+    );
+    w.tty_mode(1, false, false);
+    typed_into(&mut w, 1310);
+    let v = run_to(&mut w, 600_000, |_, _| {});
+    assert_eq!(
+        v.row("n1310")
+            .map(|r| (r.verdict, r.wait.as_ref().map(|w| w.name))),
+        Some((Verdict::Fine, Some(WaitName::TtyBuiltinRead))),
+        "{}",
+        wire(&v, "n1310")
+    );
+    // Frozen, the line sent since queues in its terminal: it reads none (by two agreeing passes).
+    w.terms.get_mut(&1310).expect("its word").queued = 20;
+    let _ = w.tick(TICK_MS);
+    let v = w.tick(TICK_MS);
+    assert_ne!(
+        v.row("n1310").and_then(|r| r.wait.as_ref().map(|w| w.name)),
+        Some(WaitName::TtyBuiltinRead),
+        "{}",
+        wire(&v, "n1310")
+    );
+
+    // Emacs's `sh -c` (`C-u M-x compile`, no job control) runs a test that read the lines the
+    // person sent and then hung in sh's own group, on its peer or on a lock with no descriptor to
+    // name: sh reads no line, and the test reads stuck in time (quiet, with no wait to name).
+    for socket in [true, false] {
+        let mut w = World::new();
+        w.run_fg(1, 5, "emacs", sleeper(1300, "emacs"));
+        let mut sh = Proc::new(1310, 1300, "sh");
+        sh.sid = 1310;
+        sh.tty = true;
+        w.add(sh);
+        let mut test = Proc::new(1311, 1310, "python3");
+        test.pgid = 1310;
+        test.sid = 1310;
+        test.tty = true;
+        if socket {
+            test.fds.push(tcp_fd(5));
+        }
+        w.add(test);
+        w.fronts.insert(1310, 1310);
+        w.terms.insert(
+            1310,
+            TermWord {
+                canonical: true,
+                echo: false,
+                queued: 0,
+            },
+        );
+        w.tty_mode(1, false, false);
+        typed_into(&mut w, 1311);
+        let v = run_to(&mut w, 1_200_000, |_, _| {});
+        assert_eq!(
+            v.row("n1310").map(|r| r.verdict),
+            Some(if socket {
+                Verdict::Stuck
+            } else {
+                Verdict::Quiet
+            }),
+            "{socket}: {}",
+            wire(&v, "n1310")
+        );
+    }
+
+    // The person types to Codex as its pty call starts polling and once more as the agent writes
+    // into that call, then waits: two chance wakes, the first from no reading at all, show no
+    // key of the person's reaches the call.
+    let mut w = World::new();
+    w.run_fg(1, 5, "codex", sleeper(1300, "codex"));
+    let mut lead = Proc::new(1310, 1300, "bash");
+    lead.sid = 1310;
+    lead.tty = true;
+    w.add(lead);
+    let mut node = Proc::new(1311, 1310, "node");
+    node.sid = 1310;
+    node.tty = true;
+    node.syscalls_per_s = 50;
+    node.fds.push(tcp_fd(5));
+    w.add(node);
+    w.fronts.insert(1310, 1311);
+    w.terms.insert(
+        1310,
+        TermWord {
+            canonical: false,
+            echo: false,
+            queued: 0,
+        },
+    );
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 1_200_000, |w, rel| {
+        if rel == TICK_MS || rel == 80_000 {
+            w.typed(1, 1300);
+        }
+        if rel == 60_000 {
+            w.p(1311).syscalls_per_s = 0;
+        }
+        if rel == 80_000 {
+            *w.p(1311).counters.syscalls.get_or_insert(0) += 1;
+        }
+    });
+    assert_eq!(
+        v.row("n1310").map(|r| r.verdict),
+        Some(Verdict::Stuck),
+        "{}",
+        wire(&v, "n1310")
+    );
+
+    // Codex opened the person's editor (its Ctrl-G) over its pty call: the keys typed there reach
+    // the editor, also in the passes the call woke in, and none reach the call once Codex is back.
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    w.run_fg(1, 5, "codex", sleeper(1300, "codex"));
+    let mut lead = Proc::new(1310, 1300, "bash");
+    lead.sid = 1310;
+    lead.tty = true;
+    w.add(lead);
+    let mut node = Proc::new(1311, 1310, "node");
+    node.sid = 1310;
+    node.tty = true;
+    node.fds.push(tcp_fd(5));
+    w.add(node);
+    w.fronts.insert(1310, 1311);
+    w.terms.insert(
+        1310,
+        TermWord {
+            canonical: false,
+            echo: false,
+            queued: 0,
+        },
+    );
+    w.tty_mode(1, false, false);
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    let mut vim = Proc::new(1320, 1300, "vim");
+    vim.sid = shell;
+    vim.tty = true;
+    w.add(vim);
+    w.tab(1).tpgid = 1320;
+    let _ = run_to(&mut w, 60_000, |w, rel| {
+        if rel == 20_000 || rel == 40_000 {
+            w.typed(1, 1320);
+            *w.p(1311).counters.syscalls.get_or_insert(0) += 1;
+        }
+    });
+    w.exit(1320, false);
+    w.tab(1).tpgid = 1300;
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    assert_eq!(
+        v.row("n1310").map(|r| r.verdict),
+        Some(Verdict::Stuck),
+        "{}",
+        wire(&v, "n1310")
+    );
 
     // Its opener in the background (of the tab, or of `script`'s shell while `make` runs in
     // front there), the lines a command in front prints are none of a session that only polls.
@@ -3024,40 +3454,57 @@ fn a_terminal_session_nested_in_the_tabs_is_a_row_of_its_own() {
 /// THE SHELL'S OWN PTY IS NO COMMAND'S: an async prompt's worker (pure's and
 /// spaceship's zsh-async, run in a `zpty` the shell opened, a fork that kept
 /// the shell's program) and the `git` it runs belong to no command's row and
-/// leave none behind, also in a zsh run in the tab's. A pty a program other
-/// than the shell opened is a session of its own, the tab's root an agent.
+/// leave none behind, also in a zsh run in the tab's and one swept before the
+/// shell's first mark. A pty a program other than the shell opened is a
+/// session of its own, also one a fork that kept that program leads (Python's
+/// `pty.fork()`), the tab's root an agent.
 #[test]
 fn the_shells_own_pty_is_no_commands() {
+    // One swept before the shell's first mark: no row.
     let mut w = World::new();
     let shell = w.tab(1).tab.shell_pid;
-    w.mark(1);
-    let _ = w.observe();
     let mut worker = Proc::new(1210, shell, "zsh");
     worker.sid = 1210;
     worker.tty = true;
+    worker.forked = true;
     w.add(worker);
-    let mut git = Proc::new(1211, 1210, "git");
-    git.sid = 1210;
-    git.tty = true;
-    w.add(git);
-    w.run_fg(1, 2, "ls", sleeper(1200, "ls"));
     let v = run_to(&mut w, 4_000, |_, _| {});
-    assert_eq!(v.row("b2").map(|r| r.members), Some(2), "{:?}", v.rows);
-    w.exit(1200, false);
-    w.close_block(1, 0);
-    let v = run_to(&mut w, 4_000, |_, _| {});
-    assert!(v.rows.iter().all(|r| r.id == "b2"), "{:?}", v.rows);
+    assert!(v.rows.is_empty(), "{:?}", v.rows);
+
+    let mut w = World::new();
+    w.mark(1);
+    let _ = w.observe();
 
     // A zsh run in the tab's zsh opens its own prompt's worker: still no command's.
     w.run_fg(1, 3, "zsh", sleeper(1200, "zsh"));
     let mut worker = Proc::new(1220, 1200, "zsh");
     worker.sid = 1220;
     worker.tty = true;
+    worker.forked = true;
     w.add(worker);
     let v = run_to(&mut w, 4_000, |_, _| {});
     assert_eq!(
         (v.row("b3").map(|r| r.members), v.row("n1220").is_none()),
         (Some(2), true),
+        "{:?}",
+        v.rows
+    );
+
+    // `python3 tool.py`, whose `pty.fork()` child kept python's program, hung on a silent peer:
+    // a session of the command's, which reads stuck.
+    let mut w = World::new();
+    w.mark(1);
+    w.run_fg(1, 4, "python3 tool.py", sleeper(1200, "python3"));
+    let mut child = Proc::new(1210, 1200, "python3");
+    child.sid = 1210;
+    child.tty = true;
+    child.forked = true;
+    child.fds.push(tcp_fd(5));
+    w.add(child);
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    assert_eq!(
+        v.row("n1210").map(|r| r.verdict),
+        Some(Verdict::Stuck),
         "{:?}",
         v.rows
     );
@@ -4100,4 +4547,347 @@ fn an_agent_calls_class_is_the_command_its_join_names_never_its_shell_wrapper() 
     let row = v.row("a600").expect("the sleep");
     assert_eq!(row.mu_from, Some(MuFrom::Prior), "{}", row.wire());
     assert!(!row.no_progress, "{}", row.wire());
+}
+
+/// `while sleep 2; do date; done` run by tab 1's shell under block `id`: each tick the shell
+/// forks the next short command and reaps the last, and every `date` prints its line.
+fn date_loop(w: &mut World, id: u64) -> impl FnMut(&mut World, u64) + use<> {
+    let shell = w.tab(1).tab.shell_pid;
+    let at = w.at;
+    let t = w.tab(1);
+    if let Some(mut b) = t.tab.block.take() {
+        b.open = false;
+        t.tab.ended = Some(b);
+    }
+    t.tab.block = Some(Block {
+        id,
+        started_ms: at,
+        open: true,
+        command: "while sleep 2; do date; done".to_owned(),
+        status: None,
+        stopped: false,
+    });
+    move |w: &mut World, rel: u64| {
+        let born = 3_000 + u32::try_from(rel / TICK_MS).unwrap_or(0);
+        w.exit(born - 1, false);
+        let mut p = Proc::new(born, shell, if born % 2 == 0 { "date" } else { "sleep" });
+        p.sid = shell;
+        p.tty = true;
+        w.add(p);
+        w.tab(1).tpgid = born;
+        *w.p(shell).counters.syscalls.get_or_insert(0) += 3;
+        w.line_from(1, &[]);
+    }
+}
+
+/// A ZOMBIE WRITES NOTHING: Ctrl-Z of `ninja` leaves its finished steps unreaped, each in the
+/// group ninja made for it. A loop run after takes its own lines, and a `make check &` the one
+/// background job that can print.
+#[test]
+fn a_zombie_writes_nothing() {
+    for sole in [false, true] {
+        let mut w = World::new();
+        let shell = w.tab(1).tab.shell_pid;
+        w.mark(1);
+        w.run_fg(1, 7, "ninja", sleeper(1300, "ninja"));
+        let mut step = Proc::new(1301, 1300, "cc");
+        step.sid = shell;
+        step.tty = true;
+        w.add(step);
+        let _ = run_to(&mut w, 10_000, |w, _| w.line_from(1, &[1300, 1301]));
+        w.p(1300).state = ProcState::Stopped;
+        w.exit(1301, true);
+        w.stop_block(1);
+        w.mark(1);
+        let _ = w.tick(TICK_MS);
+        let (id, v) = if sole {
+            w.run_bg(1, sleeper(1400, "make"));
+            (
+                "j1400",
+                run_to(&mut w, 600_000, |w, _| w.line_from(1, &[1400])),
+            )
+        } else {
+            let each = date_loop(&mut w, 8);
+            ("b8", run_to(&mut w, 600_000, each))
+        };
+        assert_eq!(
+            (v.row(id).map(|r| r.class), v.row("b7").map(|r| r.verdict)),
+            (Some(Class::Running), Some(Verdict::Parked)),
+            "{sole}: {:?}",
+            v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A PROCESS TICKING AT ITS IDLE RATE WROTE NOTHING: a runtime's timers wake it as often over a
+/// tick the tab printed nothing in as over one it printed in. A JVM deadlocked in front takes
+/// none of a `tail -f &`'s lines, and an idle `python3 -m http.server &` leaves a loop run after
+/// it its own.
+#[test]
+fn a_process_ticking_at_its_idle_rate_wrote_nothing() {
+    let mut w = World::new();
+    w.run_bg(1, sleeper(1400, "tail"));
+    let mut java = sleeper(1300, "java");
+    java.syscalls_per_s = 40;
+    w.run_fg(1, 9, "java -jar app.jar", java);
+    w.tty_mode(1, true, true);
+    let v = run_to(&mut w, 1_200_000, |w, rel| {
+        if rel % 60_000 == 0 {
+            w.line_from(1, &[1400]);
+        }
+    });
+    assert_eq!(
+        v.row("b9").map(|r| r.quiet_ms),
+        Some(Some(1_200_000)),
+        "{}",
+        wire(&v, "b9")
+    );
+
+    let mut w = World::new();
+    let mut server = sleeper(1400, "python3");
+    server.syscalls_per_s = 2;
+    server.fds.push(socket_fd(3));
+    w.run_bg(1, server);
+    w.mark(1);
+    let _ = run_to(&mut w, 10_000, |_, _| {});
+    let each = date_loop(&mut w, 9);
+    let v = run_to(&mut w, 600_000, each);
+    assert_eq!(
+        v.row("b9").map(|r| r.class),
+        Some(Class::Running),
+        "{}",
+        wire(&v, "b9")
+    );
+}
+
+/// A NESTED SESSION THE PERSON'S KEYS REACH STAYS SO: once two wakes of its reader at the
+/// person's keys showed it relays them, keys it does not read change nothing. `nvim`'s terminal
+/// keeps its shell's raw read while the person types in another window; `vim` in `script`'s
+/// shell, whose plugins' timers wake it, latches on keys that wake it past that rate; and an `ssh`
+/// in Emacs's shell buffer, whose keys Emacs holds until Enter, latches on two Enters 40 s apart.
+/// An agent's pty call its keys woke by chance twice, two minutes apart, never latches.
+#[test]
+fn a_nested_session_the_persons_keys_reach_stays_so() {
+    let mut w = World::new();
+    w.run_fg(1, 5, "nvim", sleeper(1300, "nvim"));
+    let mut term = Proc::new(1310, 1300, "zsh");
+    term.sid = 1310;
+    term.tty = true;
+    w.add(term);
+    w.fronts.insert(1310, 1310);
+    w.terms.insert(
+        1310,
+        TermWord {
+            canonical: false,
+            echo: false,
+            queued: 0,
+        },
+    );
+    w.tty_mode(1, false, false);
+    typed_into(&mut w, 1310);
+    let v = run_to(&mut w, 60_000, |w, _| w.typed(1, 1300));
+    assert_eq!(
+        v.row("n1310").and_then(|r| r.wait.as_ref().map(|w| w.name)),
+        Some(WaitName::TtyRaw),
+        "{}",
+        wire(&v, "n1310")
+    );
+
+    // `vim` in `script`'s shell, its plugins' timers waking it: the keys wake it past that rate.
+    let mut w = World::new();
+    w.run_fg(1, 5, "script -q log", sleeper(1300, "script"));
+    let mut inner = Proc::new(1310, 1300, "zsh");
+    inner.sid = 1310;
+    inner.tty = true;
+    w.add(inner);
+    let mut vim = Proc::new(1311, 1310, "vim");
+    vim.sid = 1310;
+    vim.tty = true;
+    vim.syscalls_per_s = 5;
+    w.add(vim);
+    w.fronts.insert(1310, 1311);
+    w.terms.insert(
+        1310,
+        TermWord {
+            canonical: false,
+            echo: false,
+            queued: 0,
+        },
+    );
+    w.tty_mode(1, false, false);
+    let _ = run_to(&mut w, 10_000, |_, _| {});
+    typed_into(&mut w, 1311);
+    let v = w.tick(TICK_MS);
+    assert_eq!(
+        v.row("n1310").and_then(|r| r.wait.as_ref().map(|w| w.name)),
+        Some(WaitName::TtyRaw),
+        "{}",
+        wire(&v, "n1310")
+    );
+
+    // A Codex call in a pty of its own, hung with its terminal raw: the person's keys to Codex
+    // wake it by chance twice, two minutes apart, which shows nothing.
+    let mut w = World::new();
+    w.run_fg(1, 5, "codex", sleeper(1300, "codex"));
+    let mut call = Proc::new(1301, 1300, "bash");
+    call.sid = 1301;
+    call.tty = true;
+    w.add(call);
+    let mut test = Proc::new(1302, 1301, "node");
+    test.sid = 1301;
+    test.tty = true;
+    test.fds.push(tcp_fd(5));
+    w.add(test);
+    w.fronts.insert(1301, 1302);
+    w.terms.insert(
+        1301,
+        TermWord {
+            canonical: false,
+            echo: false,
+            queued: 0,
+        },
+    );
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 1_200_000, |w, rel| match rel {
+        100_000 | 220_000 => w.typed(1, 1302),
+        r if r % 10_000 == 0 => w.typed(1, 1300),
+        _ => {}
+    });
+    assert_eq!(
+        v.row("n1301").map(|r| r.verdict),
+        Some(Verdict::Stuck),
+        "{}",
+        wire(&v, "n1301")
+    );
+
+    let mut w = World::new();
+    w.run_fg(1, 5, "emacs", sleeper(1300, "emacs"));
+    let mut sh = Proc::new(1310, 1300, "bash");
+    sh.sid = 1310;
+    sh.tty = true;
+    w.add(sh);
+    let mut ssh = Proc::new(1311, 1310, "ssh");
+    ssh.sid = 1310;
+    ssh.tty = true;
+    ssh.fds.push(tcp_fd(3));
+    w.add(ssh);
+    w.fronts.insert(1310, 1311);
+    w.terms.insert(
+        1310,
+        TermWord {
+            canonical: false,
+            echo: false,
+            queued: 0,
+        },
+    );
+    w.tty_mode(1, false, false);
+    let _ = run_to(&mut w, 80_000, |w, rel| match rel {
+        20_000 | 60_000 => w.typed(1, 1311),
+        r if r > 0 && r % 4_000 == 0 => w.typed(1, 1300),
+        _ => {}
+    });
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    assert_eq!(
+        v.row("n1310")
+            .map(|r| (r.verdict, r.wait.as_ref().map(|w| w.name))),
+        Some((Verdict::Fine, Some(WaitName::TtyRaw))),
+        "{}",
+        wire(&v, "n1310")
+    );
+}
+
+/// A NESTED SESSION'S LINE READ IS ITS LEADER'S ALONE, WAITING ON NOTHING ELSE: a REPL in Emacs's
+/// buffer hung on its socket, or a shell there stuck in the kernel on a dead share, reads that
+/// wait; and a shell there at its prompt beside a background job hung on its peer is no line read.
+#[test]
+fn a_nested_line_read_is_the_leaders_alone_waiting_on_nothing_else() {
+    for (name, hang) in [("python3", 0), ("bash", 1), ("zsh", 2)] {
+        let mut w = World::new();
+        w.run_fg(1, 5, "emacs", sleeper(1300, "emacs"));
+        let mut lead = Proc::new(1310, 1300, name);
+        lead.sid = 1310;
+        lead.tty = true;
+        if hang == 0 {
+            lead.fds.push(tcp_fd(5));
+        }
+        w.add(lead);
+        if hang == 2 {
+            let mut get = curl(1312);
+            get.ppid = 1310;
+            get.sid = 1310;
+            get.tty = true;
+            w.add(get);
+        }
+        w.fronts.insert(1310, 1310);
+        w.terms.insert(
+            1310,
+            TermWord {
+                canonical: true,
+                echo: true,
+                queued: 0,
+            },
+        );
+        w.tty_mode(1, false, false);
+        typed_into(&mut w, 1310);
+        w.p(1310).d_state = hang == 1;
+        let v = run_to(&mut w, 1_200_000, |_, _| {});
+        assert_eq!(
+            v.row("n1310").map(|r| r.verdict),
+            Some(Verdict::Stuck),
+            "{name}: {:?}",
+            v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// THE TAB'S ROOT DOES JOB CONTROL WHILE IT IS THE SHELL A PASS SAW AT ITS PROMPT: in a tab with
+/// no marks, zsh's line editor reading raw keys in front shows it, and a `git pull &` stopped at
+/// its credential prompt parks. After `exec ninja` the root is ninja, which does none: a step it
+/// stopped in a group of its own is held, and the block reads no line of the shell's.
+#[test]
+fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
+    let mut w = World::new();
+    w.tty_mode(1, false, false);
+    let mut git = sleeper(1400, "git");
+    git.state = ProcState::Stopped;
+    w.run_bg(1, git);
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    assert_eq!(
+        v.row("j1400").map(|r| r.verdict),
+        Some(Verdict::Parked),
+        "{}",
+        wire(&v, "j1400")
+    );
+
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    w.mark(1);
+    let _ = w.tick(TICK_MS);
+    let at = w.at;
+    w.tab(1).tab.block = Some(Block {
+        id: 7,
+        started_ms: at,
+        open: true,
+        command: "exec ninja".to_owned(),
+        status: None,
+        stopped: false,
+    });
+    let root = w.p(shell);
+    root.name = "ninja".into();
+    root.exec += 1;
+    for (pid, ppid, name) in [(2310, shell, "sh"), (2311, 2310, "ssh")] {
+        let mut p = Proc::new(pid, ppid, name);
+        p.pgid = 2310;
+        p.sid = shell;
+        p.tty = true;
+        p.state = ProcState::Stopped;
+        w.add(p);
+    }
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    let rows: Vec<String> = v.rows.iter().map(|r| r.wire()).collect();
+    assert!(
+        v.rows.iter().all(|r| r.verdict != Verdict::Parked
+            && r.wait.as_ref().map(|w| w.name) != Some(WaitName::TtyBuiltinRead)),
+        "{rows:?}"
+    );
 }

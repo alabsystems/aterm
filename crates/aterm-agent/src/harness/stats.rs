@@ -22,7 +22,8 @@ use crate::supervise::policy::approval::{
 use crate::supervise::policy::question::{CHOSE_RECOMMENDED, CHOSE_UNMARKED};
 use crate::supervise::policy::reset::KeepWhy;
 use crate::supervise::policy::turn_end::{
-    LAND, LAND_NUDGE, RULE_ANSWER, RULE_LAND, RULE_LAND_ANSWER, is_land_rule,
+    LAND, LAND_NUDGE, LAND_NUDGE_REMOTE_MAIN_BEFORE, LAND_REMOTE_MAIN_BEFORE, RULE_ANSWER,
+    RULE_LAND, RULE_LAND_ANSWER, is_land_rule,
 };
 use crate::supervise::run::LINE_CHARS;
 
@@ -1222,11 +1223,20 @@ fn land_line(r: &JournalRecord) -> Option<LandLine> {
     }
 }
 
+/// Whether a journal line's `said` opens with Land's words as a line clips them: today's, or FOREVER LAND's before their no-repository sentence, which a journal an older build wrote holds.
 fn opens_with_land_words(said: &str) -> bool {
-    const LAND_SAID: &[u8] = LAND.as_bytes().split_at(clip_len(LAND)).0;
-    const NUDGE_SAID: &[u8] = LAND_NUDGE.as_bytes().split_at(clip_len(LAND_NUDGE)).0;
+    const SAID: [&[u8]; 4] = [
+        clipped(LAND),
+        clipped(LAND_NUDGE),
+        clipped(LAND_REMOTE_MAIN_BEFORE),
+        clipped(LAND_NUDGE_REMOTE_MAIN_BEFORE),
+    ];
     let said = said.as_bytes();
-    said.starts_with(LAND_SAID) || said.starts_with(NUDGE_SAID)
+    SAID.iter().any(|words| said.starts_with(words))
+}
+
+const fn clipped(s: &str) -> &[u8] {
+    s.as_bytes().split_at(clip_len(s)).0
 }
 
 const fn clip_len(s: &str) -> usize {

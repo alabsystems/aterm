@@ -125,7 +125,7 @@ variants (`av-drain-unwind`, `av-retain-unwind`) → `av-refines-bounded-vec`, t
 SmallVec: `Inv_SV` → `sv-representation` (the spill preserves `Seq`) → `sv-seq-contracts` →
 `sv-into-iter` → `sv-drop-exactly-once`.
 
-## 2. Test → spec map (TSV; all 57)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 Paths are relative to `crates/aterm-alloc`.

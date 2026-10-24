@@ -1344,7 +1344,7 @@ impl Real {
                 .filter(|k| clears(k) || launcher_env(k))
                 .collect(),
             launch: std::rc::Rc::new(self.step_children()),
-            github: std::sync::Arc::new(crate::github::Launched(self.step_children())),
+            curl: std::sync::Arc::new(crate::github::Launched(self.step_children())),
         };
         let opts = crate::site::Options {
             latest: true,
@@ -1434,14 +1434,16 @@ pub fn site_outcome(
             "alab.systems already committed for the release, but the release could NOT be \
              verified live: the live site could not be fetched (check it by hand)"
         }),
-        Ok(Outcome::NoDeploy) => note(
+        Ok(Outcome::NoDeploy) => note(&format!(
             "alab.systems committed and pushed for the release but NOT deployed: SITE_NO_DEPLOY \
-             asked for no deploy (deploy with the site's deploy.sh)",
-        ),
-        Ok(Outcome::NotDeployed) => note(
-            "alab.systems committed and pushed for the release but NOT deployed: Firebase's \
-             login here is missing or expired (deploy with the site's deploy.sh)",
-        ),
+             asked for no deploy (deploy with: {})",
+            crate::site::DEPLOY_LATER
+        )),
+        Ok(Outcome::NotDeployed) => note(&format!(
+            "alab.systems committed and pushed for the release but NOT deployed: the site's \
+             service-account key is missing here or was refused (deploy with: {})",
+            crate::site::DEPLOY_LATER
+        )),
         Ok(Outcome::Skipped | Outcome::Deferred | Outcome::Planned { .. }) => {
             note("alab.systems left as it is (ship site --latest did not sync)")
         }

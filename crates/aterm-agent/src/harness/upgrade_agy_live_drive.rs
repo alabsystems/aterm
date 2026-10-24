@@ -52,6 +52,14 @@ fn build_record(exe: &Path) -> Option<String> {
     live::build_version(&version, Some(dir)).map(|_| version)
 }
 
+/// The executable a managed twin's wrapper names.
+fn twin_target(twin: &Path) -> Option<PathBuf> {
+    let text = super::super::super::accounts::read_bounded(twin, 64 * 1024)
+        .ok()
+        .flatten()?;
+    super::super::catalog::twin_binary(&text)
+}
+
 /// Returns the [`Move`] owed by `exe` onto `twin`, or `Err` when unprovable ([`Open::Unproved`]).
 pub(super) fn behind(exe: &Path, twin: Option<PathBuf>) -> Result<Option<Move>, &'static str> {
     if !ag::store_build(exe) {
@@ -60,10 +68,7 @@ pub(super) fn behind(exe: &Path, twin: Option<PathBuf>) -> Result<Option<Move>, 
     let Some(twin) = twin else {
         return Ok(None);
     };
-    let Some(build) = std::fs::read_to_string(&twin)
-        .ok()
-        .and_then(|text| super::super::catalog::twin_binary(&text))
-    else {
+    let Some(build) = twin_target(&twin) else {
         return Ok(None);
     };
     let running = build_record(exe).ok_or(super::super::UNREAD_VERSION)?;
@@ -98,6 +103,19 @@ pub(super) fn rotation_due(
     user_home: &Path,
     k: &dyn AgyKernel,
 ) -> Option<Rotation> {
+    let (program, running) = if ag::store_build(exe) {
+        let twin = twin?;
+        let target = std::fs::canonicalize(twin_target(&twin)?).ok()?;
+        if target != std::fs::canonicalize(exe).ok()? {
+            return None;
+        }
+        (twin, build_record(exe)?)
+    } else {
+        (
+            exe.to_path_buf(),
+            build_record(exe).unwrap_or_else(|| "-".to_string()),
+        )
+    };
     let model = ag::argv_model(&args.argv);
     let env = ag::relaunch_env(|n| args.env_var(n), user_home);
     let flags = ag::config_flags(&args.argv);
@@ -105,12 +123,6 @@ pub(super) fn rotation_due(
     let crate::harness::agy_quota::Pick::Rotate { from, to, .. } = &pick else {
         return None;
     };
-    let program = if ag::store_build(exe) {
-        twin?
-    } else {
-        exe.to_path_buf()
-    };
-    let running = build_record(exe).unwrap_or_else(|| "-".to_string());
     Some(Rotation {
         mv: Move {
             running: running.clone(),
@@ -214,8 +226,19 @@ const TRANSCRIPT_BYTES: u64 = 32 << 20;
 /// be read.
 fn transcript_tail(path: &Path) -> Option<(String, bool)> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut f = options.open(path).ok()?;
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let len = meta.len();
     let truncated = len > TRANSCRIPT_BYTES;
     if truncated {
         f.seek(SeekFrom::Start(len - TRANSCRIPT_BYTES)).ok()?;
@@ -273,15 +296,14 @@ pub(super) fn messages_look(config: &Path, conversation: &str, now_ms: u64) -> O
         }
         messages.push(Message {
             id: id.to_owned(),
-            body: std::fs::read_to_string(&path).ok()?,
+            body: super::super::super::accounts::read_bounded(&path, 1024 * 1024)
+                .ok()
+                .flatten()?,
             written_ms: modified_ms(&meta)?,
         });
     }
-    let read = match std::fs::read_to_string(dir.join("read.json")) {
-        Ok(text) => Some(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return None,
-    };
+    let read =
+        super::super::super::accounts::read_bounded(&dir.join("read.json"), 1024 * 1024).ok()?;
     live::wakes(read.as_deref(), &messages, now_ms).ok()
 }
 

@@ -35,6 +35,12 @@ pub(crate) trait ReleaseHost: Send + Sync {
     /// `publish/site.toml` exists and does not parse.
     fn site(&self) -> Result<Option<PathBuf>, String>;
 
+    /// The service-account key `ship site` deploys with, where one is named
+    /// (`crate::site::Env::sa_key`).
+    /// # Errors
+    /// `publish/site.toml` exists and does not parse.
+    fn site_key(&self) -> Result<Option<PathBuf>, String>;
+
     /// The program `name` as aterm's resolver finds it (`aterm_uds::host::find_tool`).
     fn find(&self, name: &str) -> Option<PathBuf>;
 }
@@ -47,7 +53,7 @@ enum Kind {
     Openssl,
     Publication,
     Site,
-    Firebase,
+    SiteKey,
 }
 
 struct LayerItem {
@@ -62,7 +68,7 @@ const ITEMS: [(&str, Kind); 6] = [
     ("release.openssl", Kind::Openssl),
     ("release.publication", Kind::Publication),
     ("release.site", Kind::Site),
-    ("release.firebase", Kind::Firebase),
+    ("release.site-key", Kind::SiteKey),
 ];
 
 fn is_executable(path: &Path) -> bool {
@@ -190,36 +196,50 @@ impl LayerItem {
                 step: self.id.into(),
                 how: "no site checkout is named (SITE_DIR, or publish/site.toml's dir)".into(),
             },
-            Ok(Some(dir)) if !is_executable(&dir.join("deploy.sh")) => Probe::Person {
+            Ok(Some(dir)) if !dir.join("firebase.json").is_file() => Probe::Person {
                 step: self.id.into(),
-                how: format!(
-                    "the site checkout {} has no executable deploy.sh",
-                    dir.display()
-                ),
+                how: format!("the site checkout {} has no firebase.json", dir.display()),
             },
             Ok(Some(dir)) => Probe::Ok {
-                now: format!("{}/deploy.sh", dir.display()),
+                now: format!("{}/firebase.json", dir.display()),
             },
         }
     }
 
-    fn probe_firebase(&self) -> Probe {
-        let missing: Vec<&str> = ["node", "firebase"]
-            .into_iter()
-            .filter(|t| self.host.find(t).is_none())
-            .collect();
-        if missing.is_empty() {
-            Probe::Ok {
-                now: "node and firebase-tools, which deploy.sh runs".into(),
-            }
-        } else {
-            Probe::Person {
+    /// The deployer's key is a file this account can open: opened, never read, so the
+    /// audit holds none of its bytes.
+    fn probe_site_key(&self) -> Probe {
+        match self.host.site_key() {
+            Err(why) => Probe::Unusable { why },
+            Ok(None) => Probe::Person {
                 step: self.id.into(),
-                how: format!(
-                    "no {} for the site's deploy.sh (firebase-tools under node, until S17 \
-                     deploys over Firebase Hosting's REST API)",
-                    missing.join(" or ")
-                ),
+                how: "no service-account key is named for the site deploy (FIREBASE_SA_KEY, or \
+                      publish/site.toml's firebase_sa_key)"
+                    .into(),
+            },
+            Ok(Some(key)) => {
+                let opened = std::fs::File::open(&key)
+                    .and_then(|f| f.metadata())
+                    .map(|m| m.is_file());
+                match opened {
+                    Ok(true) => Probe::Ok {
+                        now: format!("{} is readable", key.display()),
+                    },
+                    Ok(false) => Probe::Person {
+                        step: self.id.into(),
+                        how: format!(
+                            "the site's service-account key {} is not a file",
+                            key.display()
+                        ),
+                    },
+                    Err(e) => Probe::Person {
+                        step: self.id.into(),
+                        how: format!(
+                            "the site's service-account key {} cannot be read: {e}",
+                            key.display()
+                        ),
+                    },
+                }
             }
         }
     }
@@ -241,8 +261,10 @@ impl LayerItem {
             Kind::Site => Remedy::Command(
                 "clone the site repo and name it: SITE_DIR, or publish/site.toml's dir".into(),
             ),
-            Kind::Firebase => Remedy::Command(
-                "install node and the site's pinned firebase-tools on this release host".into(),
+            Kind::SiteKey => Remedy::Command(
+                "put the site deployer's service-account key where publish/site.toml's \
+                 firebase_sa_key names it (or name it: FIREBASE_SA_KEY)"
+                    .into(),
             ),
         }
     }
@@ -283,8 +305,8 @@ impl Item for LayerItem {
             Kind::Develop => "the tools a checkout's tests run".into(),
             Kind::Openssl => "macOS's LibreSSL, which release signing uses".into(),
             Kind::Publication => "the publication engine".into(),
-            Kind::Site => "the site checkout and its deploy.sh".into(),
-            Kind::Firebase => "node and firebase-tools, for the site deploy".into(),
+            Kind::Site => "the site checkout and its firebase.json".into(),
+            Kind::SiteKey => "the site deployer's service-account key".into(),
         }
     }
 
@@ -295,7 +317,7 @@ impl Item for LayerItem {
             Kind::Openssl => self.probe_openssl(),
             Kind::Publication => self.probe_publication(),
             Kind::Site => self.probe_site(),
-            Kind::Firebase => self.probe_firebase(),
+            Kind::SiteKey => self.probe_site_key(),
         }
     }
 
@@ -509,6 +531,13 @@ impl ReleaseHost for System {
         crate::site::Env::from_process(&self.repo, None).map(|env| env.site_dir)
     }
 
+    fn site_key(&self) -> Result<Option<PathBuf>, String> {
+        crate::site::Env::from_process(&self.repo, None).map(|env| match &env.site_dir {
+            Some(dir) => env.sa_key(dir),
+            None => env.firebase_sa_key,
+        })
+    }
+
     fn find(&self, name: &str) -> Option<PathBuf> {
         aterm_uds::host::find_tool(name)
     }
@@ -524,6 +553,7 @@ mod tests {
         develop: Vec<(&'static str, State)>,
         openssl: Option<String>,
         site: Option<PathBuf>,
+        site_key: Option<PathBuf>,
         tools: Vec<&'static str>,
     }
 
@@ -545,6 +575,9 @@ mod tests {
         fn site(&self) -> Result<Option<PathBuf>, String> {
             Ok(self.site.clone())
         }
+        fn site_key(&self) -> Result<Option<PathBuf>, String> {
+            Ok(self.site_key.clone())
+        }
         fn find(&self, name: &str) -> Option<PathBuf> {
             self.tools
                 .contains(&name)
@@ -562,15 +595,10 @@ mod tests {
     fn whole(home: &Path) -> Fake {
         std::fs::create_dir_all(home.join("publication/.git")).unwrap();
         executable(&home.join("publication/bin/pub"));
-        executable(&home.join("site/deploy.sh"));
-        Fake {
-            home: home.to_path_buf(),
-            base: Some(true),
-            develop: vec![("fish", State::Present(home.join("fish")))],
-            openssl: Some("LibreSSL 3.3.6".into()),
-            site: Some(home.join("site")),
-            tools: vec!["gitleaks", "node", "firebase"],
-        }
+        std::fs::create_dir_all(home.join("site")).unwrap();
+        std::fs::write(home.join("site/firebase.json"), "{}").unwrap();
+        std::fs::write(home.join("deployer.json"), "{}").unwrap();
+        whole_keeping(home)
     }
 
     fn closing(home: &Path, checks: &[(&'static str, Check)]) -> crate::ledger::Result<()> {
@@ -611,7 +639,7 @@ mod tests {
         let home = dir.path();
 
         let mut fake = whole(home);
-        fake.tools = vec!["node", "firebase"];
+        fake.tools = Vec::new();
         match line_of(fake, "release.publication") {
             Check::Fail { what, .. } => assert!(what.contains("no gitleaks"), "{what}"),
             other => panic!("{other:?}"),
@@ -623,28 +651,34 @@ mod tests {
             Check::Fail { what, .. } => assert!(what.contains("no site checkout"), "{what}"),
             other => panic!("{other:?}"),
         }
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let deploy = home.join("site/deploy.sh");
-            std::fs::set_permissions(&deploy, std::fs::Permissions::from_mode(0o644)).unwrap();
-            match line_of(whole_keeping(home), "release.site") {
-                Check::Fail { what, .. } => {
-                    assert!(what.contains("has no executable deploy.sh"), "{what}");
-                }
-                other => panic!("{other:?}"),
-            }
+        std::fs::remove_file(home.join("site/firebase.json")).unwrap();
+        match line_of(whole_keeping(home), "release.site") {
+            Check::Fail { what, .. } => assert!(what.contains("has no firebase.json"), "{what}"),
+            other => panic!("{other:?}"),
         }
 
-        for (gone, named) in [("node", "no node"), ("firebase", "no firebase")] {
-            let mut fake = whole(home);
-            fake.tools.retain(|t| *t != gone);
-            match line_of(fake, "release.firebase") {
-                Check::Fail { what, .. } => assert!(what.contains(named), "{gone}: {what}"),
-                other => panic!("{other:?}"),
+        let mut fake = whole(home);
+        fake.site_key = None;
+        match line_of(fake, "release.site-key") {
+            Check::Fail { what, fix } => {
+                assert!(what.contains("no service-account key"), "{what}");
+                assert!(fix.contains("firebase_sa_key"), "{fix}");
             }
+            other => panic!("{other:?}"),
+        }
+        std::fs::remove_file(home.join("deployer.json")).unwrap();
+        match line_of(whole_keeping(home), "release.site-key") {
+            Check::Fail { what, .. } => assert!(what.contains("cannot be read"), "{what}"),
+            other => panic!("{other:?}"),
+        }
+        let mut fake = whole(home);
+        fake.site_key = Some(home.join("site"));
+        match line_of(fake, "release.site-key") {
+            Check::Fail { what, .. } => assert!(what.contains("not a file"), "{what}"),
+            other => panic!("{other:?}"),
         }
         assert!(matches!(
-            line_of(whole(home), "release.firebase"),
+            line_of(whole(home), "release.site-key"),
             Check::Pass(_)
         ));
     }
@@ -656,7 +690,8 @@ mod tests {
             develop: vec![("fish", State::Present(home.join("fish")))],
             openssl: Some("LibreSSL 3.3.6".into()),
             site: Some(home.join("site")),
-            tools: vec!["gitleaks", "node", "firebase"],
+            site_key: Some(home.join("deployer.json")),
+            tools: vec!["gitleaks"],
         }
     }
 

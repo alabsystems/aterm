@@ -90,9 +90,10 @@ pub fn log_path(home: &Path, job: Job) -> PathBuf {
 /// The record that the person turned this login's subscriber off:
 /// `~/.config/aterm/secrets/subscriber-off`. `aterm secrets agent off` writes it, and so does
 /// a `join` or `create` with `--no-agent` where no subscriber runs; every install of the
-/// subscriber removes it ([`install`]), `agent on` among them. aterm's System State reads it
-/// as the person's choice: its Secrets vault row reads Sync off and is no change to make, and
-/// setup installs no subscriber over it.
+/// subscriber removes it ([`install`]), `agent on` among them. aterm's setup, System State's
+/// and `aterm init`'s alike, reads it as the person's choice: its Secrets vault row reads Sync
+/// off, and setup keeps the files as last synced without installing a subscriber. An
+/// explicit `agent on` or a new join can turn the subscriber back on.
 pub fn subscriber_off_path(home: &Path) -> PathBuf {
     secrets_dir(home).join("subscriber-off")
 }

@@ -3062,8 +3062,8 @@ impl App {
             .app(instance)
             .is_some_and(|app| app.kind() == crate::native_app::AppKind::Markdown);
         // System State, like Settings, is a scrolling list with text fields: a
-        // page key moves the list a page of its room, and the readline, word
-        // and Home/End keys edit the field with focus.
+        // page key moves the list a page of its room, and the field keys edit
+        // the field with focus.
         let form_active = settings_active
             || self
                 .native_runtime
@@ -3349,56 +3349,34 @@ impl App {
                         value: None,
                     }))
                 } else {
-                    let readline = form_active
-                        && mods.contains(Modifiers::CTRL)
-                        && !mods.intersects(
-                            Modifiers::SUPER | Modifiers::ALT | Modifiers::HYPER | Modifiers::META,
-                        );
+                    // A form's field edits by the keymap the find bar, the
+                    // rename field and the palette share, Meta read as Alt;
+                    // Ctrl- and ⌘-Home and -End scroll the list instead, and
+                    // the arms below take what the keymap leaves, typed text
+                    // among it.
+                    let field_edit = if form_active
+                        && !(command && matches!(key, Key::Named(NamedKey::Home | NamedKey::End)))
+                    {
+                        let mods = if mods.contains(Modifiers::META) {
+                            *mods | Modifiers::ALT
+                        } else {
+                            *mods
+                        };
+                        crate::app_input::field_edit_action_engine(key, mods, *layout_text)
+                            .and_then(|edit| form_field_input(edit, extend))
+                    } else {
+                        None
+                    };
                     let alt_word = form_active
                         && mods.intersects(Modifiers::ALT | Modifiers::META)
                         && !mods.intersects(Modifiers::CTRL | Modifiers::SUPER | Modifiers::HYPER);
-                    #[cfg(not(target_os = "macos"))]
-                    let alt_word = alt_word || readline;
                     match key {
-                        Key::Character('a' | 'A') if readline => {
-                            Some(AppEvent::TextInput(TextInputEvent::Home { extend }))
-                        }
-                        Key::Character('e' | 'E') if readline => {
-                            Some(AppEvent::TextInput(TextInputEvent::End { extend }))
-                        }
-                        Key::Character('b' | 'B') if readline => {
-                            Some(AppEvent::TextInput(TextInputEvent::Left { extend }))
-                        }
-                        Key::Character('f' | 'F') if readline => {
-                            Some(AppEvent::TextInput(TextInputEvent::Right { extend }))
-                        }
-                        Key::Character('d' | 'D') if readline => {
-                            Some(AppEvent::TextInput(TextInputEvent::Delete))
-                        }
-                        Key::Character('k' | 'K') if readline => {
-                            Some(AppEvent::TextInput(TextInputEvent::KillToEnd))
-                        }
-                        Key::Character('u' | 'U') if readline => {
-                            Some(AppEvent::TextInput(TextInputEvent::KillToStart))
-                        }
-                        Key::Character('w' | 'W') if readline => {
-                            Some(AppEvent::TextInput(TextInputEvent::DeleteWordBackward))
-                        }
-                        Key::Named(NamedKey::ArrowLeft) if alt_word => {
-                            Some(AppEvent::TextInput(TextInputEvent::WordLeft { extend }))
-                        }
-                        Key::Named(NamedKey::ArrowRight) if alt_word => {
-                            Some(AppEvent::TextInput(TextInputEvent::WordRight { extend }))
-                        }
+                        _ if field_edit.is_some() => field_edit.map(AppEvent::TextInput),
                         Key::Character('b' | 'B') if alt_word => {
                             Some(AppEvent::TextInput(TextInputEvent::WordLeft { extend }))
                         }
                         Key::Character('f' | 'F') if alt_word => {
                             Some(AppEvent::TextInput(TextInputEvent::WordRight { extend }))
-                        }
-                        #[cfg(not(target_os = "macos"))]
-                        Key::Named(NamedKey::Backspace) if readline => {
-                            Some(AppEvent::TextInput(TextInputEvent::DeleteWordBackward))
                         }
                         Key::Character('a' | 'A') if command => {
                             Some(AppEvent::TextInput(TextInputEvent::SelectAll))
@@ -3485,12 +3463,6 @@ impl App {
                         }
                         Key::Named(NamedKey::PageUp) => Some(AppEvent::ScrollLines(-8)),
                         Key::Named(NamedKey::PageDown) => Some(AppEvent::ScrollLines(8)),
-                        Key::Named(NamedKey::Home) if form_active && !command => {
-                            Some(AppEvent::TextInput(TextInputEvent::Home { extend }))
-                        }
-                        Key::Named(NamedKey::End) if form_active && !command => {
-                            Some(AppEvent::TextInput(TextInputEvent::End { extend }))
-                        }
                         Key::Named(NamedKey::Home) if markdown_active || command => {
                             Some(AppEvent::ScrollLines(-10_000))
                         }
@@ -9968,6 +9940,28 @@ impl App {
             tab.presentation = presentation;
         }
     }
+}
+
+/// The text input a form's field takes for one edit of the shared field keymap
+/// ([`crate::app_input::field_edit_action_engine`]), Shift extending a caret move;
+/// `None` for typed text, which the form commits as the layout types it.
+fn form_field_input(edit: crate::app_search::SearchEdit, extend: bool) -> Option<TextInputEvent> {
+    use crate::app_search::SearchEdit;
+    Some(match edit {
+        SearchEdit::DeleteBack => TextInputEvent::Backspace,
+        SearchEdit::DeleteForward => TextInputEvent::Delete,
+        SearchEdit::DeleteWordBack => TextInputEvent::DeleteWordBackward,
+        SearchEdit::DeleteWordForward => TextInputEvent::DeleteWordForward,
+        SearchEdit::KillToStart => TextInputEvent::KillToStart,
+        SearchEdit::KillToEnd => TextInputEvent::KillToEnd,
+        SearchEdit::MoveCharLeft => TextInputEvent::Left { extend },
+        SearchEdit::MoveCharRight => TextInputEvent::Right { extend },
+        SearchEdit::MoveWordLeft => TextInputEvent::WordLeft { extend },
+        SearchEdit::MoveWordRight => TextInputEvent::WordRight { extend },
+        SearchEdit::MoveStart => TextInputEvent::Home { extend },
+        SearchEdit::MoveEnd => TextInputEvent::End { extend },
+        SearchEdit::Insert(_) | SearchEdit::MoveTo(_) => return None,
+    })
 }
 
 fn check_held_by_person_message(pid: u32) -> String {

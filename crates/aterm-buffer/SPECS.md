@@ -119,7 +119,7 @@ refines-kernel-family-models	refinement	Surface::{apply,transact,poll,snapshot},
 | 11 (generics) | 1 |
 | 12 (cross-crate citation) | 1 |
 
-## 2. Test → spec map (TSV; all 26)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

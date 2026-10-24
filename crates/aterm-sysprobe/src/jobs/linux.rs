@@ -72,6 +72,12 @@ impl StatLine {
         self.flags & 0x0020_0000 != 0
     }
 
+    /// Whether it ran a program since its fork (`PF_FORKNOEXEC` clear).
+    #[must_use]
+    pub const fn exec(&self) -> bool {
+        self.flags & 0x0000_0040 == 0
+    }
+
     /// Whether it is exiting (`PF_EXITING`, set as its exit starts and never cleared): its exit
     /// closes every descriptor before it is a zombie.
     #[must_use]

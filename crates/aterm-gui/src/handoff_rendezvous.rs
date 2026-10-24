@@ -819,6 +819,7 @@ impl Rendezvous {
             .map_err(|error| RendezvousError::Secret(error.to_string()))?;
         let listener =
             CtlListener::bind(&path).map_err(|error| RendezvousError::Bind(error.to_string()))?;
+        let _ = aterm_uds::keep_out_of_children(&listener);
         let bound = Self {
             path,
             listener,
@@ -1003,6 +1004,7 @@ impl Rendezvous {
             }
             match self.listener.accept() {
                 Ok((stream, _)) => {
+                    let _ = aterm_uds::keep_out_of_children(&stream);
                     stream
                         .set_nonblocking(false)
                         .map_err(|error| RendezvousError::Accept(error.to_string()))?;

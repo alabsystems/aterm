@@ -85,7 +85,7 @@ encode-decode-roundtrip	round-trip	encode::{Encoder::new,Encoder::set_color,Enco
 encode-indexed-and-metadata	round-trip	encode::{Encoder::set_palette,Encoder::set_trns,Encoder::set_source_srgb,Encoder::write_header,Writer::write_image_data}, decode::Reader::info	(a) ∀ palette P of 1..=256 RGB triples, trns t with len(t) ≤ len(P)/3, indices idx of length w*h with every index < len(P)/3: the indexed depth-8 encode succeeds; under IDENTITY the decode returns Indexed with pixels == idx; under EXPAND|STRIP_16 it returns Rgba (Rgb without tRNS) with pixel k == P[idx[k]] ++ [t.get(idx[k]).unwrap_or(255)]. (b) some index ≥ len(P)/3 ⇒ write_image_data returns Err(EncodingError::Parameter(_)) and writes no IDAT. (c) ∀ SrgbRenderingIntent i: an encode with set_source_srgb(i) decodes with Reader::info().srgb == Some(i).	tests/decode_encode.rs::indexed_encoding_round_trips_and_refuses_an_index_past_the_palette, srgb_intent_round_trips	Vec<u8> palette/trns, Option builder fields, iterator max(), enum round-trip, generic Write sink	0,1,2,4,5,7,8,11
 ```
 
-## 2. Test → spec map (TSV; all 32)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 `+bench` marks a test whose leftover quality-metric assertion moves to a bench (§4).

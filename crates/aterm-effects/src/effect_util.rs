@@ -220,19 +220,21 @@ pub(crate) fn push_fx_ramp(
     if x1 <= x0 || y1 <= y0 {
         return;
     }
-    let at = |px: i32| -> (u32, u8) {
-        if left == right {
-            return left;
-        }
-        let t = (px - x) as f32 / w as f32;
-        let lerp = |a: u32, b: u32| (a as f32 + (b as f32 - a as f32) * t).round() as u32;
-        let ch = |sh: u32| lerp((left.0 >> sh) & 0xff, (right.0 >> sh) & 0xff).min(255) << sh;
-        let alpha = lerp(u32::from(left.1), u32::from(right.1)).min(255) as u8;
-        let alpha = if left.1 > 0 { alpha.max(1) } else { 0 };
-        (ch(16) | ch(8) | ch(0), alpha)
+    let ((c0, a0), (c1, a1)) = if left == right {
+        (left, right)
+    } else {
+        let at = |px: i32| -> (u32, u8) {
+            let t = (px - x) as f32 / w as f32;
+            let lerp = |a: u32, b: u32| (a as f32 + (b as f32 - a as f32) * t).round() as u32;
+            let ch = |sh: u32| lerp((left.0 >> sh) & 0xff, (right.0 >> sh) & 0xff).min(255) << sh;
+            let alpha = lerp(u32::from(left.1), u32::from(right.1)).min(255) as u8;
+            let alpha = if left.1 > 0 { alpha.max(1) } else { 0 };
+            (ch(16) | ch(8) | ch(0), alpha)
+        };
+        let end0 = if x0 == x { left } else { at(x0) };
+        let end1 = if x1 == x + w { right } else { at(x1) };
+        (end0, end1)
     };
-    let (c0, a0) = if x0 == x { left } else { at(x0) };
-    let (c1, a1) = if x1 == x + w { right } else { at(x1) };
     let ch = geom.ch as i32;
     let oy = i32::from(geom.origin_y);
     let x0_u = x0 as u16;
@@ -550,7 +552,24 @@ impl std::ops::Deref for StarPieces {
 
 /// Compute the geometry pieces of the 4-point twinkle star of half-length `arm`.
 #[must_use]
+#[inline]
 pub(crate) fn star_pieces(arm: i32, gold: bool) -> StarPieces {
+    const CACHED_ARMS: usize = 16;
+    static CACHE: std::sync::OnceLock<[[StarPieces; 2]; CACHED_ARMS]> = std::sync::OnceLock::new();
+    if (1..=CACHED_ARMS as i32).contains(&arm) {
+        let table = CACHE.get_or_init(|| {
+            std::array::from_fn(|idx| {
+                let a = (idx + 1) as i32;
+                [build_star_pieces(a, false), build_star_pieces(a, true)]
+            })
+        });
+        return table[(arm - 1) as usize][usize::from(gold)];
+    }
+    build_star_pieces(arm, gold)
+}
+
+#[must_use]
+fn build_star_pieces(arm: i32, gold: bool) -> StarPieces {
     let none = StarPiece {
         part: StarPart::Body,
         x: 0,

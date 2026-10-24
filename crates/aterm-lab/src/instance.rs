@@ -702,9 +702,22 @@ pub fn cmd_instance(args: &[String]) -> Res {
     if let Some(home) = &reroute {
         world.rehome(Path::new(home))?;
         let claude = crate::lab::find_claude().map_err(|e| Fail::exit(3, e))?;
-        // the prefix is the caller's own folder, which nothing here removes
-        let laid = crate::reroute_prefix::lay(&world.home, Path::new(&claude), None)
-            .map_err(|e| Fail::die(format!("instance: --reroute-prefix: {e}")))?;
+        // An external prefix survives this world's Drop. Hold an owned one until its
+        // clone prints from its own path, including when a failed probe returns early.
+        let owned = world.home.starts_with(&world.dir);
+        let hold = world.dir.join(crate::lab::HELD).join("reroute");
+        if owned {
+            world.keep();
+        }
+        let laid = crate::reroute_prefix::lay(
+            &world.home,
+            Path::new(&claude),
+            owned.then_some(hold.as_path()),
+        )
+        .map_err(|e| Fail::die(format!("instance: --reroute-prefix: {e}")))?;
+        if owned && !keep {
+            world.release();
+        }
         println!(
             "reroute prefix {}: {} -> {} -> {} ({})",
             laid.prefix.display(),

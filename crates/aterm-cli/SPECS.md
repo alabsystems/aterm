@@ -210,7 +210,7 @@ narrowest are `route-launch-table` and `poll-must-read` (gaps 0 and 3), `window-
 9. `shim-parse-roundtrip` leads to `shim-hop-agrees-with-sh`.
 10. `exit_code` (inside `run-exit-status`) and the `run-output-progress` backlog bound come before the `run-*` liveness specs.
 
-## 2. Test → spec map (TSV; all 132 spec samples)
+## 2. Test → spec map (TSV)
 
 - `primary` is the spec that retires the test. It is the most specific spec, meaning the one with the
   fewest subsumed tests among those that list the test.

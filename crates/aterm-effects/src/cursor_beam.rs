@@ -244,13 +244,17 @@ impl CursorBeamRod {
         let cov_axis =
             (COV_IDLE + (COV_MAX - COV_IDLE) * e) * cfg.intensity * (0.90 + 0.10 * breathe);
         const WHITE: u32 = 0x00FF_FFFF;
-        let lerp = |a: u32, b: u32, t: f32| -> u32 {
-            let m = |sh: u32| {
-                let x = ((a >> sh) & 0xff) as f32;
+        let (cr_f, cg_f, cb_f) = (
+            ((cfg.color >> 16) & 0xff) as f32,
+            ((cfg.color >> 8) & 0xff) as f32,
+            (cfg.color & 0xff) as f32,
+        );
+        let lerp = |b: u32, t: f32| -> u32 {
+            let m = |x: f32, sh: u32| {
                 let y = ((b >> sh) & 0xff) as f32;
                 (x + (y - x) * t).min(255.0) as u32
             };
-            (m(16) << 16) | (m(8) << 8) | m(0)
+            (m(cr_f, 16) << 16) | (m(cg_f, 8) << 8) | m(cb_f, 0)
         };
         let layers: [(f32, f32, u32, f32); 4] = [
             (0.045, 1.00, WHITE, 0.55),   // white-hot axis
@@ -268,7 +272,7 @@ impl CursorBeamRod {
             let w = ((cw * hw * 2.0) as i32).max(1);
             let x = (ax - cw * hw) as i32;
             let color = if mix > 0.0 {
-                lerp(cfg.color, target, mix)
+                lerp(target, mix)
             } else {
                 cfg.color
             };
@@ -298,7 +302,7 @@ impl CursorBeamRod {
         cfg: &BeamRodConfig,
         under: &mut Vec<GlowQuad>,
     ) {
-        use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, light_body_ink, reink_quads};
+        use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, light_body_ink};
         let cw = geom.cw as f32;
         let ax = f32::from(geom.origin_x) + (cc as f32) * cw + cw * 0.10;
         let y = i32::from(geom.origin_y) + cr as i32 * geom.ch as i32;
@@ -329,17 +333,16 @@ impl CursorBeamRod {
                 continue;
             }
             let w = ((cw * hw * 2.0) as i32).max(1);
-            let from = under.len();
-            push_rect(
+            crate::effect_util::push_fx_quad(
                 under,
                 geom,
                 (ax - cw * hw) as i32,
                 y,
                 w,
                 geom.ch as i32,
-                premul_rgb(0x00FF_FFFF, a),
+                premul_rgb(ink, a),
+                a,
             );
-            reink_quads(&mut under[from..], LIGHT_BODY_ALPHA_CAP as u8, |_| ink);
         }
     }
 

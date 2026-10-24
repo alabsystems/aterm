@@ -191,7 +191,7 @@ every effectful shell waits on the platform lane once its pure core is out.
 - `windows-shell-name-pure` → `windows-shell-resolution` → `windows-spawn-target`.
 - `resize-signal-encode` → `windows-session-registry` (d).
 
-## 2. Test → spec map (TSV; all 157)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 A test in §4 has primary `-` and the §4 action in `also`.

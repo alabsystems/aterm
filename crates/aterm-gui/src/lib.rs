@@ -276,6 +276,7 @@ mod consent_warmup;
 mod control;
 mod control_input_ack;
 mod debugger_access;
+mod deck_face;
 mod devtools_helper;
 #[cfg(target_os = "macos")]
 mod devtools_helper_drive;
@@ -23571,38 +23572,6 @@ fn warm_config(headless: bool, zoom: app_config::CarriedZoom) -> WarmConfig {
                         aterm_log::debug!(
                             "startup: the first-frame Metal warm failed ({error}); the first \
                              window compiles its shaders itself"
-                        );
-                    }
-                },
-            );
-        } else if defer_gpu && let Some(warm) = aterm_gpu::begin_shader_cache_warm() {
-            // A headless renderer mints at its first pixel demand, which a measure's
-            // take begins at: compile now what it builds then (the rest a frame can
-            // bind too, where the launch warms its effect pipelines), so after a
-            // shader update a take that begins once this is done builds from the
-            // cache. Nothing waits on it, so it runs at utility, and it submits no GPU
-            // work (`ShaderCacheWarm::run`). No headless frame draws to an f16
-            // swapchain.
-            let rest = config
-                .warms_effect_pipelines()
-                .then(|| aterm_gpu::PresentKnobs {
-                    bloom: config.cursor_trail_bloom_or_default(),
-                    shimmer: config.cursor_fire_shimmer_or_default(),
-                    hdr_glow: false,
-                    sdr_glow: config.cursor_glow_sdr_boost_or_default() > 0.0,
-                });
-            let knobs = aterm_gpu::FirstFrameKnobs {
-                hdr_glow: false,
-                ..knobs
-            };
-            let _ = crate::qos::spawn_lane_thread(
-                "aterm-metal-cache-warm",
-                crate::qos::Role::Background,
-                move || {
-                    if let Err(error) = warm.run(knobs, rest) {
-                        aterm_log::debug!(
-                            "startup: the headless Metal warm failed ({error}); the first \
-                             pixel demand compiles its shaders itself"
                         );
                     }
                 },

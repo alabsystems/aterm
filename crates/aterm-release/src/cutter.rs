@@ -51,7 +51,7 @@ const RELINK: &str = "run it as `targo --unverified ship <verb>` from a clean ch
 
 static RUNNING: OnceLock<Stamp> = OnceLock::new();
 
-/// Judge this process.
+/// Judge this process. `main` calls it first, before any step moves a checkout.
 pub fn judge_at_start() {
     RUNNING.get_or_init(|| match std::env::current_exe() {
         Ok(exe) => judge(&exe, Path::new(BUILT_IN)),

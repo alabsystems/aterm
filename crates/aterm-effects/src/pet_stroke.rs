@@ -188,6 +188,8 @@ mod tests {
         assert!(!detector.sample(start + Duration::from_secs(2), Some((1.8, 0.0)), 4.0));
     }
 
+    /// `cooldown_due` comes from when `sample` last returned true, not the detector's own
+    /// deadline, so `CooldownCannotBeBypassed` holds that deadline to the responses it emitted.
     #[test]
     fn real_stroke_detector_transitions_conform_and_reject_negative_controls() {
         use std::collections::{BTreeMap, BTreeSet};

@@ -56,15 +56,18 @@ impl Reading {
         if now < self.as_of || now - self.as_of >= ttl {
             return false;
         }
-        let refilled = self
-            .quota
+        !self.refill_passed(now)
+    }
+
+    /// Whether a spent bucket's recorded refill has passed its settling interval.
+    fn refill_passed(&self, now: i64) -> bool {
+        self.quota
             .groups
             .iter()
             .flat_map(|g| g.buckets.iter())
             .filter(|b| b.spent())
             .filter_map(agy_quota::Bucket::reset_at)
-            .any(|at| now >= at + RESET_SETTLE_S);
-        !refilled
+            .any(|at| now >= at + RESET_SETTLE_S)
     }
 }
 
@@ -132,7 +135,9 @@ impl Store {
     /// agy's default model as last read, while under [`FRESH_OPEN_S`] old at `now`.
     #[must_use]
     pub fn kept_default(&self, now: i64) -> Option<String> {
-        let text = std::fs::read_to_string(self.model_path()).ok()?;
+        let text = super::accounts::read_bounded(&self.model_path(), 64 * 1024)
+            .ok()
+            .flatten()?;
         let (at, model) = text.trim().split_once(' ')?;
         let at: i64 = at.parse().ok()?;
         (now >= at && now - at < FRESH_OPEN_S && !model.is_empty()).then(|| model.to_owned())
@@ -155,7 +160,9 @@ impl Store {
     /// The last failed read, `(unix seconds, why)`, while under [`FAIL_BACKOFF_S`] old at `now`.
     #[must_use]
     pub fn recent_failure(&self, now: i64) -> Option<(i64, String)> {
-        let text = std::fs::read_to_string(self.failed_path()).ok()?;
+        let text = super::accounts::read_bounded(&self.failed_path(), 64 * 1024)
+            .ok()
+            .flatten()?;
         let (at, why) = text.trim().split_once(' ')?;
         let at: i64 = at.parse().ok()?;
         (now >= at && now - at < FAIL_BACKOFF_S).then(|| (at, why.to_owned()))
@@ -178,7 +185,9 @@ impl Store {
     /// The last reading, if one was kept and still parses.
     #[must_use]
     pub fn last(&self) -> Option<Reading> {
-        let text = std::fs::read_to_string(self.last_path()).ok()?;
+        let text = super::accounts::read_bounded(&self.last_path(), 256 * 1024)
+            .ok()
+            .flatten()?;
         let v: Value = aterm_json::from_str(&text).ok()?;
         let o = v.as_object()?;
         if o.get("schema").and_then(Value::as_u64) != Some(1) {
@@ -210,28 +219,28 @@ impl Store {
     }
 
     fn append_history(&self, reading: &Reading) -> std::io::Result<()> {
-        use std::io::Write as _;
         let path = self.history_path();
-        let mut line = history_line(reading);
-        line.push('\n');
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?
-            .write_all(line.as_bytes())?;
-        let text = std::fs::read_to_string(&path)?;
-        let lines: Vec<&str> = text.lines().collect();
+        let line = history_line(reading);
+        let prior = super::accounts::read_bounded(&path, 2 * 1024 * 1024)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let mut lines: Vec<&str> = prior.lines().collect();
+        lines.push(&line);
         if lines.len() > 2 * HISTORY_KEEP {
-            let kept = lines[lines.len() - HISTORY_KEEP..].join("\n") + "\n";
-            super::upgrade_models::write_atomic(&path, &kept)?;
+            lines.drain(..lines.len() - HISTORY_KEEP);
         }
-        Ok(())
+        let mut kept = lines.join("\n");
+        kept.push('\n');
+        super::upgrade_models::write_atomic(&path, &kept)
     }
 
     /// Every sample of the history, oldest first.
     #[must_use]
     pub fn history(&self) -> Vec<Sample> {
-        std::fs::read_to_string(self.history_path())
+        super::accounts::read_bounded(&self.history_path(), 2 * 1024 * 1024)
+            .ok()
+            .flatten()
             .map(|text| text.lines().filter_map(Sample::parse).collect())
             .unwrap_or_default()
     }
@@ -249,9 +258,10 @@ impl Store {
                 .ok()
         };
         if take().is_none() {
-            let stale = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
+            let stale = std::fs::symlink_metadata(&path)
                 .ok()
+                .filter(std::fs::Metadata::is_file)
+                .and_then(|m| m.modified().ok())
                 .and_then(|t| t.elapsed().ok())
                 .is_none_or(|age| age.as_secs() >= LOCK_STALE_S);
             if !stale {
@@ -560,6 +570,11 @@ pub fn rotate_launch(
         return None;
     }
     let (reading, got) = current(store, source, now, rotation.low, false).ok()?;
+    // Keep the prior window visible, but an unsuccessful refresh after its refill cannot
+    // establish availability for a launch or keep it waiting on a reset that already passed.
+    if got == Got::Stale && reading.refill_passed(now) {
+        return None;
+    }
     let (model, named) = match asked {
         Some(m) => (m.to_owned(), true),
         None => {

@@ -251,6 +251,14 @@ pub fn login(
                 host,
             };
         }
+        Approval::NeedsSignIn(why) => {
+            rpc.deadline = Instant::now() + Duration::from_secs(5);
+            cancel(&mut rpc);
+            return Drove {
+                outcome: Outcome::NeedsSignIn(why),
+                host,
+            };
+        }
         Approval::Refused(why) => {
             rpc.deadline = Instant::now() + Duration::from_secs(5);
             cancel(&mut rpc);

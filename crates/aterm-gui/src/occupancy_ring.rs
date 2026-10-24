@@ -53,7 +53,7 @@ impl RingFile {
             .unwrap_or_default()
     }
 
-    /// Append `row`.
+    /// Append `row`, then trim to the newest [`RING_ROWS`] where the file holds twice that.
     /// # Errors
     /// The directory could not be made, or the append, the flush or the trim failed.
     pub(crate) fn append(&mut self, row: &RingRow) -> std::io::Result<()> {

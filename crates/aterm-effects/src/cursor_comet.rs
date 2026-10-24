@@ -299,7 +299,9 @@ impl CursorComet {
             (radius * rx, (cov_core * cov_x).min(COV_CAP), color)
         });
         let slab = ((ch * 0.125) as i32).max(2);
-        let wobble = |ym: f32| 1.0 + 0.05 * (ym * 0.55 / ch.max(1.0) * 10.0 + phase * 1.3).sin();
+        let wob_freq = 0.55 / ch.max(1.0) * 10.0;
+        let wob_phase = phase * 1.3;
+        let wobble = |ym: f32| 1.0 + 0.05 * (ym * wob_freq + wob_phase).sin();
 
         let (cxi, cyi) = (cx as i32, cy as i32);
         for &(r, cov, color) in &discs {
@@ -312,6 +314,9 @@ impl CursorComet {
             let r_i = r as i32;
             let mut dy = -r_i;
             while dy < r_i {
+                if cyi + dy >= cell_y1 {
+                    break;
+                }
                 let h = slab.min(r_i - dy);
                 let (y0, y1) = ((cyi + dy).max(cell_y0), (cyi + dy + h).min(cell_y1));
                 if y1 > y0 {
@@ -377,7 +382,6 @@ impl CursorComet {
         let cov_base = cov_core * (0.35 + 0.65 * e);
         for i in 0..GLINTS {
             let fi = i as f32;
-            let ang = fi / GLINTS as f32 * std::f32::consts::TAU + phase * 0.55;
             let tw = 0.5 + 0.5 * (phase * 2.0 + fi * 2.4).sin();
             if tw < 0.55 {
                 continue;
@@ -386,8 +390,10 @@ impl CursorComet {
             if cov == 0 {
                 continue;
             }
-            let gx = (cx + ang.cos() * glint_r) as i32;
-            let gy = (cy + ang.sin() * glint_r * 0.9) as i32;
+            let ang = fi / GLINTS as f32 * std::f32::consts::TAU + phase * 0.55;
+            let (sin_a, cos_a) = ang.sin_cos();
+            let gx = (cx + cos_a * glint_r) as i32;
+            let gy = (cy + sin_a * glint_r * 0.9) as i32;
             let spark = premul_rgb(ICE_WHITE, cov);
             push_rect(out, geom, gx - arm, gy, 2 * arm + 1, 1, spark);
             push_rect(out, geom, gx, gy - arm, 1, arm, spark);
@@ -417,13 +423,38 @@ fn ring_row(
 ) {
     let ym = y as f32 + h as f32 * 0.5 - cy;
     let ym2 = ym * ym;
+    let d2_0 = discs[0].0 * discs[0].0 - ym2;
+    if d2_0 <= 0.0 {
+        return;
+    }
     let wob = wobble(ym);
-    let hw = discs.map(|(r, _, _)| {
-        let d2 = r * r - ym2;
-        if d2 > 0.0 { d2.sqrt() * wob } else { 0.0 }
-    });
-    let x_edges = hw.map(|w| ((cx - w).round() as i32, (cx + w).round() as i32));
+    let hw0 = d2_0.sqrt() * wob;
+    if hw0 < 1.0 {
+        return;
+    }
+    let hw = [
+        hw0,
+        {
+            let d2 = discs[1].0 * discs[1].0 - ym2;
+            if d2 > 0.0 { d2.sqrt() * wob } else { 0.0 }
+        },
+        {
+            let d2 = discs[2].0 * discs[2].0 - ym2;
+            if d2 > 0.0 { d2.sqrt() * wob } else { 0.0 }
+        },
+        {
+            let d2 = discs[3].0 * discs[3].0 - ym2;
+            if d2 > 0.0 { d2.sqrt() * wob } else { 0.0 }
+        },
+    ];
     let cx_round = cx.round() as i32;
+    let x_edges = hw.map(|w| {
+        if w == 0.0 {
+            (cx_round, cx_round)
+        } else {
+            ((cx - w).round() as i32, (cx + w).round() as i32)
+        }
+    });
     for i in 0..discs.len() {
         let premul = ring_premul[i];
         if hw[i] < 1.0 || premul == 0 {
@@ -458,14 +489,13 @@ const fn ice_ramp(color: u32, t: f32) -> u32 {
     let t = t.clamp(0.0, 1.0);
     if t < 0.45 {
         lerp_rgb(lerp_rgb(color, 0x0000_0000, 0.50), color, t / 0.45)
-    } else if t < 0.78 {
-        lerp_rgb(color, lerp_rgb(color, ICE_WHITE, 0.55), (t - 0.45) / 0.33)
     } else {
-        lerp_rgb(
-            lerp_rgb(color, ICE_WHITE, 0.55),
-            ICE_WHITE,
-            (t - 0.78) / 0.22,
-        )
+        let whitened = lerp_rgb(color, ICE_WHITE, 0.55);
+        if t < 0.78 {
+            lerp_rgb(color, whitened, (t - 0.45) / 0.33)
+        } else {
+            lerp_rgb(whitened, ICE_WHITE, (t - 0.78) / 0.22)
+        }
     }
 }
 

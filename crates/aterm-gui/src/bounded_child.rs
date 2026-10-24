@@ -28,6 +28,8 @@ pub(crate) struct Ran {
 
 type ReaderWork = Box<dyn FnOnce() + Send + 'static>;
 
+/// A reader started before the child. Dropping its input without a pipe
+/// cancels it, so a second reader that cannot start leaves no child running.
 struct Reader<R> {
     input: SyncSender<Option<R>>,
     output: Receiver<Vec<u8>>,
@@ -92,6 +94,9 @@ fn end(child: &mut aterm_uds::spawnfd::Child) {
     }
 }
 
+/// Keeps the direct child owned through setup errors and unwinds. An uncut
+/// command (no `cap`, such as a bus install) gets no kill request: even on an
+/// exceptional exit from its caller it is waited for.
 struct RunningChild {
     child: aterm_uds::spawnfd::Child,
     bounded: bool,

@@ -6637,7 +6637,7 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
         title: format!("tab-{local_id}"),
         term,
         master,
-        pid: 0,
+        shell_identity: aterm_pty::ShellIdentity::unproven(0),
         ctx,
     }
 }

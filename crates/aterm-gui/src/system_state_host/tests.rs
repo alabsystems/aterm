@@ -1739,6 +1739,46 @@ fn a_status_due_before_the_next_tick_is_asked_for_and_owes_no_wake_until_the_tic
     );
 }
 
+/// A System State page in a minimized, hidden (Cmd-H) or fully covered window
+/// (winit's Occluded, which `on_occlusion_changed` records) is no page anyone can
+/// see: the village does not walk there and the window is not redrawn for it, and
+/// the page counts as shown again once the window is back on screen.
+#[test]
+fn a_page_in_an_occluded_window_is_not_shown() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+    let (_, instance, _view) = page(&mut app);
+    assert!(app.commit_glassless_native_frame(wid));
+    fresh(&mut app, running());
+    assert!(
+        !app.system_state_shown_views(instance).is_empty(),
+        "in front, it is shown"
+    );
+    app.on_occlusion_changed(wid, true);
+    let shown = !app.system_state_shown_views(instance).is_empty();
+    let seen = app.system_state_seen_views(instance);
+    let walked = (0..8)
+        .filter(|_| app.native_runtime.tick_system_state(false, shown, &seen))
+        .count();
+    assert_eq!(
+        (shown, seen.len(), walked),
+        (false, 0, 0),
+        "(shown, views seen, walk steps asking a repaint in 8 ticks) of a page in an \
+         occluded window"
+    );
+    assert!(
+        app.system_state_showing_windows().is_empty(),
+        "nothing to redraw"
+    );
+    app.on_occlusion_changed(wid, false);
+    assert!(
+        !app.system_state_shown_views(instance).is_empty(),
+        "back on screen, it is shown"
+    );
+    assert_eq!(app.system_state_showing_windows(), [wid]);
+}
+
 /// A walking tick redraws only the windows that show the page: one where the
 /// page is a background tab is left alone, and one that shows the page in an
 /// unfocused split pane is redrawn with the window that shows it in front.
@@ -1897,7 +1937,8 @@ fn a_page_key_moves_the_list_a_page_of_its_room() {
 }
 
 /// The vault's address field takes the keys a Settings field takes: the
-/// readline keys, ⌥←/→ by word, and Home/End, where they reached nothing.
+/// readline keys, ⌥←/→ by word, and Home/End, where they reached nothing,
+/// and the find bar's ⌥⌫/⌥⌦ by word and ⌘⌫/⌘←/⌘→ to the edges.
 #[test]
 fn the_vault_address_takes_the_text_keys_a_settings_field_takes() {
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
@@ -1936,12 +1977,71 @@ fn the_vault_address_takes_the_text_keys_a_settings_field_takes() {
     assert_eq!(field(&app).1, end..end, "Ctrl-E");
     assert!(app.native_input_event(wid, &key(Key::Named(NamedKey::ArrowLeft), Modifiers::ALT)));
     assert_eq!(field(&app).1, end - 3..end - 3, "⌥← to the word's start");
+    assert!(app.native_input_event(wid, &ctrl('e')));
+    assert!(app.native_input_event(wid, &key(Key::Named(NamedKey::ArrowLeft), Modifiers::META)));
+    assert_eq!(field(&app).1, end - 3..end - 3, "Meta-← as ⌥←");
     assert!(app.native_input_event(wid, &key(Key::Named(NamedKey::Home), Modifiers::empty())));
     assert_eq!(field(&app).1, 0..0, "Home");
     assert!(app.native_input_event(wid, &key(Key::Named(NamedKey::End), Modifiers::empty())));
     assert_eq!(field(&app).1, end..end, "End");
+    assert!(app.native_input_event(wid, &key(Key::Named(NamedKey::Home), Modifiers::SUPER)));
+    assert_eq!(
+        field(&app).1,
+        end..end,
+        "⌘-Home scrolls the list, not the caret"
+    );
     assert!(app.native_input_event(wid, &ctrl('w')));
     assert_eq!(field(&app).0, "vault.example/one ", "Ctrl-W");
     assert!(app.native_input_event(wid, &ctrl('u')));
     assert_eq!(field(&app).0, "", "Ctrl-U");
+    app.dispatch_native_view_event(
+        wid,
+        view,
+        AppEvent::TextInput(crate::native_app::TextInputEvent::Commit(
+            "one two three".into(),
+        )),
+    )
+    .unwrap();
+    let named = |named, mods| key(Key::Named(named), mods);
+    assert!(app.native_input_event(wid, &named(NamedKey::Backspace, Modifiers::ALT)));
+    assert_eq!(field(&app).0, "one two ", "⌥⌫");
+    assert!(app.native_input_event(wid, &ctrl('h')));
+    assert_eq!(field(&app).0, "one two", "Ctrl-H");
+    assert!(app.native_input_event(wid, &named(NamedKey::ArrowLeft, Modifiers::SUPER)));
+    assert_eq!(field(&app).1, 0..0, "⌘←");
+    assert!(app.native_input_event(wid, &named(NamedKey::Delete, Modifiers::ALT)));
+    assert_eq!(field(&app), (" two".to_owned(), 0..0), "⌥⌦");
+    assert!(app.native_input_event(wid, &named(NamedKey::ArrowRight, Modifiers::SUPER)));
+    assert_eq!(field(&app).1, 4..4, "⌘→");
+    assert!(app.native_input_event(wid, &named(NamedKey::Backspace, Modifiers::SUPER)));
+    assert_eq!(field(&app).0, "", "⌘⌫");
+}
+
+/// A focused window macOS reports occluded (the screen locked, the display asleep, a
+/// screen saver up: the key window stays key) shows nothing, so System State is not in
+/// front there: the sign-outs, the access dialogs and the debugger step, which all read
+/// `system_state_frontmost`, wait for a page someone sees.
+#[test]
+fn an_occluded_focused_window_is_not_in_front_for_on_screen_steps() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+    app.windows.get_mut(&wid).unwrap().focused = true;
+    let (_, _instance, _view) = page(&mut app);
+    assert!(app.commit_glassless_native_frame(wid));
+    fresh(&mut app, running());
+    assert!(
+        app.system_state_frontmost(),
+        "precondition: the page is in front"
+    );
+    app.on_occlusion_changed(wid, true);
+    assert!(
+        !app.system_state_frontmost(),
+        "an occluded window puts the sign-outs and macOS prompts on a screen nobody sees"
+    );
+    app.on_occlusion_changed(wid, false);
+    assert!(
+        app.system_state_frontmost(),
+        "back on screen, it is in front"
+    );
 }

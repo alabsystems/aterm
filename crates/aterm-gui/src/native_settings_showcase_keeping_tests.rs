@@ -3682,6 +3682,21 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             vec![Status, Press(BACKGROUND_WELL), Again, Warning],
         ),
         (follow, at((300, 360), 2), vec![Status, Again, Warning]),
+        // Wheeled off follow-system, at 197x316 at 2× text its switch split from its row (R2).
+        (
+            following,
+            at((1_048, 364), 2),
+            vec![
+                Wheel(-8),
+                Status,
+                Warning,
+                Window((1_136, 886)),
+                Text,
+                Window((197, 316)),
+                Text,
+                Again,
+            ],
+        ),
         // A walk at any window size: the pack row, taller than the room a
         // status leaves, owed more of it than a stop's screen shows (R2).
         (
@@ -3698,6 +3713,20 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Wheel(1),
                 Wheel(-1),
                 Window((1_240, 151)),
+            ],
+        ),
+        // A chrome told to cut the keyboard's control owes it what its own seat's screen does.
+        (
+            field,
+            at((273, 187), 1),
+            vec![
+                Text,
+                Press(BACKGROUND_WELL),
+                Warning,
+                Window((1_263, 816)),
+                Status,
+                Text,
+                Window((1_371, 214)),
             ],
         ),
         // Random walks: back at the wheel's window and bars, the list where
@@ -3789,18 +3818,25 @@ fn sweep(scenario: Scenario, taken: Walks) {
         Walks::Control(seed) => walks.extend(random_walks(seed, 6, 18)),
         Walks::Opening | Walks::Reviewed => {}
     }
+    let walked = walks.len();
     walks.extend(
         reviewed()
             .into_iter()
             .filter(|(seen, _, _)| *seen == scenario)
             .map(|(_, start, steps)| (start, steps)),
     );
+    let reviewed_from = &walks[walked..];
     let found = Mutex::new(Findings::default());
     on_n_workers(
         KEEPING_WORKERS,
         &walks,
         "keeping walks",
         |(start, steps)| {
+            // The walks reviews found also seat a bar's told steps one by one.
+            let reviewed = reviewed_from
+                .iter()
+                .any(|(was, seen)| was == start && seen == steps);
+            BAR_STEPS_SEATED.with(|seated| seated.set(reviewed));
             let walked = walk(&sweep, *start, steps);
             let mut found = found.lock().unwrap_or_else(PoisonError::into_inner);
             found.faults.extend(walked.faults);
@@ -4201,10 +4237,11 @@ fn the_keeping_rules_hold_off_the_list_on_nord() {
     );
 }
 
-/// A redraw takes the least bar's decision; a test build decides again, uncounted, to check it.
+/// A redraw seats its bar where the frame before left it settled; a test build settles it again,
+/// uncounted, to check it.
 #[test]
-fn a_redraw_takes_the_least_bar_a_frame_at_its_inputs_and_record_decided() {
-    let taken = || LEAST_DECIDED.with(std::cell::Cell::get);
+fn a_redraw_seats_its_bar_where_the_frame_before_settled_it() {
+    let taken = || BAR_SEATED.with(std::cell::Cell::get);
     let sweep = Sweep::new(Scenario {
         keyboard: Keyboard::Pack,
         theme: "Nord",
@@ -4226,7 +4263,7 @@ fn a_redraw_takes_the_least_bar_a_frame_at_its_inputs_and_record_decided() {
     assert_eq!(
         taken() - before,
         3,
-        "each redraw of the settled page took the least bar's decision"
+        "each redraw of the settled page seated its bar where the frame before settled it"
     );
 }
 
@@ -4273,12 +4310,14 @@ enum Then {
     Redraw,
 }
 
-/// The page work of each frame of a walk from `start`, the first the page opened at.
+/// The page work of each frame of a walk from `start`, the first the page opened at, its bar's
+/// told steps also seated one by one, uncounted, to check them.
 fn page_work(
     scenario: Scenario,
     start: Drawn,
     frames: &[Then],
 ) -> Vec<(String, crate::work_counts::SettingsPageWork)> {
+    BAR_STEPS_SEATED.with(|seated| seated.set(true));
     let sweep = Sweep::new(scenario);
     let (mut runtime, instance, view) = sweep.opened(start);
     let _ = crate::work_counts::take_settings_page_work();
@@ -4291,6 +4330,21 @@ fn page_work(
     for then in frames {
         let frame = match *then {
             Then::Step(step) => {
+                let event = match step {
+                    Step::Wheel(lines) => Some(AppEvent::ScrollAt {
+                        lines,
+                        key: UiKey::new(LIST),
+                    }),
+                    Step::Up => Some(AppEvent::StepFocus(-1)),
+                    Step::Down => Some(AppEvent::StepFocus(1)),
+                    Step::Type => {
+                        Some(AppEvent::TextInput(TextInputEvent::Commit("o".to_string())))
+                    }
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    let _ = dispatch(&mut runtime, instance, view, event);
+                }
                 drawn = drawn.after(step);
                 let _ = draw(&mut runtime, instance, view, drawn);
                 format!("{step} to {drawn}")
@@ -4305,35 +4359,117 @@ fn page_work(
     work
 }
 
-/// A FRAME BUILDS THE THEMES PAGE NO MORE OFTEN, AND LAYS ITS BARS OUT NO MORE, THAN 006cded90b
-/// DID FOR THE SAME INPUT, before the give-way: a redraw, one under a status, a live resize with the
-/// keyboard on a sheet's control, a status coming and going in a compact window under the warning
-/// and the keyboard on a theme's row each build `[pages, lists measured, docks, bars]` at most.
-#[test]
-fn a_frame_builds_the_themes_page_no_more_often_than_before_the_give_way() {
-    let nord = |keyboard| Scenario {
+/// A walk from a start, each frame held to at most `[pages, lists measured, docks, bars]`.
+type WorkWalk = (Scenario, Drawn, Vec<(Option<Then>, [usize; 4])>);
+
+/// The walks [`these_frames_build_the_themes_page_and_its_bars_no_more_than_006cded90b`] holds.
+fn work_walks() -> Vec<WorkWalk> {
+    use Step::{Again, Down, Status, Type, Warning, Wheel, Window};
+    let on = |keyboard, theme| Scenario {
         keyboard,
-        theme: "Nord",
-        in_use: "Nord",
+        theme,
+        in_use: theme,
     };
-    let status = |window, scale| Drawn {
-        status: true,
+    let nord = |keyboard| on(keyboard, "Nord");
+    let at = |window, scale, warning, status| Drawn {
+        warning,
+        status,
         ..Drawn::bare(window, scale)
     };
-    let walks = [
+    let status = |window, scale| at(window, scale, false, true);
+    let step = |step| Some(Then::Step(step));
+    let redraw = Some(Then::Redraw);
+    let mocha = || nord(Keyboard::On("settings/showcase/card/catppuccin-mocha"));
+    vec![
+        (
+            nord(Keyboard::Filter),
+            at((300, 360), 2, true, true),
+            vec![
+                (None, [2, 5, 13, 9]),
+                (redraw, [1, 0, 9, 6]),
+                (redraw, [1, 0, 9, 6]),
+                (redraw, [1, 0, 9, 6]),
+                (step(Again), [1, 4, 13, 9]),
+                (redraw, [1, 0, 9, 6]),
+            ],
+        ),
+        (
+            nord(Keyboard::Filter),
+            at((300, 360), 2, true, true),
+            vec![
+                (None, [2, 5, 13, 9]),
+                (step(Window((299, 360))), [2, 5, 13, 9]),
+                (step(Window((298, 360))), [2, 5, 13, 9]),
+                (step(Window((297, 360))), [2, 5, 13, 9]),
+                (redraw, [1, 0, 9, 6]),
+                (redraw, [1, 0, 9, 6]),
+            ],
+        ),
+        (
+            nord(Keyboard::On("settings/search")),
+            status((444, 292), 1),
+            vec![
+                (None, [4, 2, 8, 6]),
+                (redraw, [1, 0, 8, 5]),
+                (redraw, [1, 0, 8, 5]),
+                (redraw, [1, 0, 8, 5]),
+                (step(Again), [1, 2, 8, 6]),
+                (redraw, [1, 0, 8, 5]),
+            ],
+        ),
+        (
+            nord(Keyboard::On(IMPORT)),
+            at((1_411, 151), 1, true, false),
+            vec![
+                (None, [5, 5, 0, 0]),
+                (step(Window((1_410, 151))), [5, 5, 0, 0]),
+                (step(Window((1_409, 151))), [5, 5, 0, 0]),
+                (step(Window((1_408, 151))), [5, 5, 0, 0]),
+                (redraw, [1, 0, 0, 0]),
+                (redraw, [1, 0, 0, 0]),
+            ],
+        ),
+        (
+            mocha(),
+            status((244, 440), 1),
+            vec![
+                (None, [7, 7, 0, 4]),
+                (step(Wheel(3)), [2, 1, 0, 3]),
+                (redraw, [1, 0, 0, 3]),
+                (step(Down), [1, 6, 0, 5]),
+                (redraw, [1, 0, 0, 3]),
+                (step(Type), [2, 1, 0, 3]),
+                (redraw, [1, 0, 0, 3]),
+                (step(Again), [2, 1, 0, 3]),
+                (step(Window((243, 440))), [7, 4, 0, 5]),
+                (step(Window((242, 440))), [7, 4, 0, 5]),
+            ],
+        ),
+        (
+            mocha(),
+            status((230, 420), 2),
+            vec![
+                (None, [2, 3, 5, 4]),
+                (step(Window((229, 420))), [2, 3, 5, 4]),
+                (step(Window((228, 420))), [2, 3, 5, 4]),
+                (step(Window((227, 420))), [2, 3, 5, 4]),
+                (redraw, [1, 0, 4, 3]),
+                (redraw, [1, 0, 4, 3]),
+            ],
+        ),
         (
             nord(Keyboard::Off),
             Drawn::bare((864, 500), 1),
-            vec![(None, [1, 0, 0, 0]), (Some(Then::Redraw), [1, 0, 0, 0])],
+            vec![(None, [1, 0, 0, 0]), (redraw, [1, 0, 0, 0])],
         ),
         (
             nord(Keyboard::Pack),
             status((864, 500), 1),
             vec![
-                (None, [2, 0, 0, 3]),
-                (Some(Then::Step(Step::Again)), [1, 0, 0, 3]),
-                (Some(Then::Redraw), [1, 0, 0, 3]),
-                (Some(Then::Redraw), [1, 0, 0, 2]),
+                (None, [2, 1, 0, 3]),
+                (step(Again), [1, 1, 0, 3]),
+                (redraw, [1, 0, 0, 2]),
+                (redraw, [1, 0, 0, 2]),
             ],
         ),
         (
@@ -4341,32 +4477,32 @@ fn a_frame_builds_the_themes_page_no_more_often_than_before_the_give_way() {
             status((444, 420), 1),
             vec![
                 (None, [3, 2, 0, 3]),
-                (Some(Then::Step(Step::Again)), [1, 2, 0, 3]),
-                (Some(Then::Redraw), [1, 2, 0, 3]),
-                (Some(Then::Redraw), [1, 0, 0, 2]),
+                (step(Again), [1, 2, 0, 3]),
+                (redraw, [1, 0, 0, 2]),
+                (redraw, [1, 0, 0, 2]),
             ],
         ),
         (
             nord(Keyboard::Sheet("settings/control/background")),
             status((444, 420), 2),
             vec![
-                (None, [2, 1, 7, 4]),
-                (Some(Then::Step(Step::Window((443, 420)))), [3, 0, 6, 3]),
-                (Some(Then::Step(Step::Window((442, 420)))), [3, 0, 6, 3]),
-                (Some(Then::Redraw), [2, 0, 6, 3]),
-                (Some(Then::Redraw), [2, 0, 6, 3]),
+                (None, [1, 4, 7, 4]),
+                (step(Window((443, 420))), [2, 2, 6, 3]),
+                (step(Window((442, 420))), [2, 2, 6, 3]),
+                (redraw, [1, 0, 6, 3]),
+                (redraw, [1, 0, 6, 3]),
             ],
         ),
         (
-            nord(Keyboard::On("settings/showcase/card/catppuccin-mocha")),
+            mocha(),
             Drawn::bare((244, 440), 1),
             vec![
                 (None, [6, 0, 0, 0]),
-                (Some(Then::Step(Step::Warning)), [2, 4, 0, 0]),
-                (Some(Then::Step(Step::Status)), [1, 7, 6, 4]),
-                (Some(Then::Redraw), [1, 2, 6, 4]),
-                (Some(Then::Redraw), [1, 2, 6, 4]),
-                (Some(Then::Step(Step::Status)), [1, 0, 0, 0]),
+                (step(Warning), [1, 7, 0, 0]),
+                (step(Status), [1, 8, 6, 4]),
+                (redraw, [1, 0, 4, 3]),
+                (redraw, [1, 0, 4, 3]),
+                (step(Status), [1, 2, 0, 0]),
             ],
         ),
         (
@@ -4374,16 +4510,51 @@ fn a_frame_builds_the_themes_page_no_more_often_than_before_the_give_way() {
             Drawn::bare((300, 360), 1),
             vec![
                 (None, [3, 0, 4, 0]),
-                (Some(Then::Step(Step::Status)), [2, 3, 7, 4]),
-                (Some(Then::Step(Step::Again)), [2, 0, 6, 4]),
-                (Some(Then::Redraw), [2, 0, 6, 4]),
-                (Some(Then::Redraw), [2, 0, 6, 3]),
-                (Some(Then::Step(Step::Status)), [1, 0, 4, 0]),
+                (step(Status), [1, 6, 7, 4]),
+                (step(Again), [1, 2, 6, 4]),
+                (redraw, [1, 0, 6, 3]),
+                (redraw, [1, 0, 6, 3]),
+                (step(Status), [1, 0, 4, 0]),
             ],
         ),
-    ];
+        (
+            nord(Keyboard::Row("Dracula")),
+            at((244, 440), 2, true, true),
+            vec![
+                (None, [2, 5, 9, 7]),
+                (step(Window((243, 440))), [2, 5, 9, 7]),
+            ],
+        ),
+        (
+            on(Keyboard::Row("Catppuccin Latte"), "GitHub Light"),
+            at((300, 360), 2, true, true),
+            vec![
+                (None, [2, 5, 13, 9]),
+                (step(Window((299, 360))), [2, 5, 13, 9]),
+            ],
+        ),
+        (
+            mocha(),
+            at((244, 440), 1, true, false),
+            vec![
+                (None, [7, 6, 0, 0]),
+                (step(Window((243, 440))), [7, 6, 0, 0]),
+            ],
+        ),
+        (
+            nord(Keyboard::On(IMPORT)),
+            Drawn::bare((244, 440), 1),
+            vec![(None, [6, 0, 0, 0]), (step(Status), [1, 6, 0, 5])],
+        ),
+    ]
+}
+
+/// THESE FRAMES BUILD THE THEMES PAGE, AND LAY OUT ITS DOCKS AND BARS, NO MORE THAN 006cded90b
+/// DID AT THE SAME INPUTS: each frame at most this branch's work, a redraw measuring no list.
+#[test]
+fn these_frames_build_the_themes_page_and_its_bars_no_more_than_006cded90b() {
     let mut over = Vec::new();
-    for (scenario, start, frames) in walks {
+    for (scenario, start, frames) in work_walks() {
         let thens = frames
             .iter()
             .filter_map(|(then, _)| *then)

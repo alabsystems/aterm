@@ -31,6 +31,13 @@ dev-seams = []
 # wgpu/naga on macOS or Linux. A no-op elsewhere, where wgpu is required. Code
 # gates on `cfg(wgpu_arm)` (build.rs).
 wgpu-oracle = ["dep:wgpu"]
+# Aos M5a shared-buffer inference (docs/DESIGN-aos-hosted-execution-2026-10-21.md
+# §12): `aterm_gpu::compute`, finite int32-exact/v1 jobs on macOS, compared bit
+# for bit with aterm-effects' CPU reference. Off unless a command line names it
+# (the doctest stage is `targo --unverified test -p aterm-gpu --features compute
+# --doc`); test builds compile the module without it, and the release cutter
+# names no feature, so no release binary compiles it. A no-op off macOS.
+compute = ["dep:aterm-effects", "aterm-effects/int-bag-mlp"]
 
 [dependencies]
 aterm-core = { path = "../aterm-core", default-features = false }
@@ -66,6 +73,10 @@ aterm-objc = { workspace = true }
 # Optional: the first-party Metal renderer is the macOS backend; wgpu compiles
 # here only as the differential oracle (`wgpu-oracle`).
 wgpu = { version = "29", optional = true, default-features = false, features = ["metal", "wgsl"] }
+# `compute`'s job kind, its layout tables and its CPU reference (`int_bag_mlp`):
+# the same package as the dev-dependency below, which reaches aterm-gpu through
+# no edge.
+aterm-effects = { workspace = true, optional = true }
 
 # The native cells that present on wgpu (Windows, the BSDs): named directly
 # because `renderer::WindowTarget` (`HasWindowHandle + HasDisplayHandle`) bounds

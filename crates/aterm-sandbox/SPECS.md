@@ -92,7 +92,7 @@ sandbox-job-write-protocol	contract	windows::apply_to_job, windows::apply_ui_res
 `sandbox-windows-apply-noop` (composes the gate) and `sandbox-job-write-protocol` (composes `job-fold`
 and `presets`).
 
-## 2. Test → spec map (TSV; all 16)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

@@ -152,6 +152,12 @@ impl FleetRoster {
             if let Some(browser) = &acct.browser {
                 out.push_str(&format!("browser = {}\n", toml_quote(browser)));
             }
+            if let Some(region) = acct.vendor.region {
+                out.push_str(&format!("region = {}\n", toml_quote(region.as_str())));
+            }
+            if let Some(flow) = acct.vendor.flow {
+                out.push_str(&format!("flow = {}\n", toml_quote(flow.as_str())));
+            }
             out.push('\n');
         }
         out
@@ -3257,6 +3263,34 @@ struct AutoRenewGuard {
     in_flight: bool,
     last_attempt: BTreeMap<String, Instant>,
     mailbox_mtime: Option<std::time::SystemTime>,
+    /// The rows whose last background renewal stopped where only a person can go on
+    /// ([`super::cli::Renewal::NeedsPerson`]), and since when: none is tried again in the
+    /// background before [`PERSON_BACKOFF`] has passed.
+    parked: BTreeMap<String, Instant>,
+}
+
+/// How long a row whose background renewal stopped for a person is left alone by the
+/// background before it is tried again: a renewal that stops so (accounts.x.ai's block page,
+/// a page that waits on a person) starts a live device sign-in every time it runs.
+const PERSON_BACKOFF: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Notes how a background renewal of `label` ended: one that stopped for a person
+/// ([`super::cli::Renewal::NeedsPerson`]) parks the row until [`PERSON_BACKOFF`] has passed
+/// since `now`; any other end unparks it.
+fn note_background_end(
+    state: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    label: &str,
+    renewal: super::cli::Renewal,
+    now: Instant,
+) {
+    let mut guard = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if renewal == super::cli::Renewal::NeedsPerson {
+        guard.parked.insert(label.to_owned(), now);
+    } else {
+        guard.parked.remove(label);
+    }
 }
 
 static AUTO_RENEW_GUARD: std::sync::LazyLock<std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>> =
@@ -3296,9 +3330,12 @@ impl AutoRenewPermit {
         }
         if guard.in_flight
             || (!ignore_cooldown
-                && guard.last_attempt.get(label).is_some_and(|last| {
+                && (guard.last_attempt.get(label).is_some_and(|last| {
                     now.saturating_duration_since(*last) < Duration::from_secs(900)
-                }))
+                }) || guard
+                    .parked
+                    .get(label)
+                    .is_some_and(|since| now.saturating_duration_since(*since) < PERSON_BACKOFF)))
         {
             return None;
         }
@@ -4398,7 +4435,9 @@ fn spawn_row_renewal(
 /// [`spawn_row_renewal`] for another CLI's row: its renewal ([`super::cli::renew_one_for`]: the
 /// vendor's own sign-in under the machine's sign-in lock, its page approved headlessly) started
 /// in the background, where a headless browser is installed, the row has an email and the CLI
-/// opens no browser of its own here ([`crate::ai::connector::SignIn::opens_browser_here`]).
+/// has a sign-in (one that opens the desk's browser runs under
+/// [`super::login_drive::NO_DESK`] there, [`crate::ai::connector::SignIn::no_desk`]). A row
+/// whose last one stopped for a person waits [`PERSON_BACKOFF`] ([`note_background_end`]).
 #[allow(clippy::too_many_arguments)]
 fn spawn_vendor_renewal(
     cli: accounts::Cli,
@@ -4411,30 +4450,24 @@ fn spawn_vendor_renewal(
     spawn_renewal: &SpawnRenewal,
 ) -> RenewalDispatch {
     if next_row.email.is_none()
-        || cli
-            .accounts()
-            .signin
-            .as_ref()
-            .is_none_or(crate::ai::connector::SignIn::opens_browser_here)
+        || cli.accounts().signin.as_ref().is_none()
         || super::headless_oauth::find_headless_browser(Some(home)).is_none()
     {
         return RenewalDispatch::Failed;
     }
-    let Some(permit) = AutoRenewPermit::claim_with_mailbox(
-        renew_guard,
-        &format!("{}:{}", cli.id(), next_row.label),
-        Instant::now(),
-        false,
-        None,
-    ) else {
+    let key = format!("{}:{}", cli.id(), next_row.label);
+    let Some(permit) =
+        AutoRenewPermit::claim_with_mailbox(renew_guard, &key, Instant::now(), false, None)
+    else {
         return RenewalDispatch::Held;
     };
     let store = accounts::Store::at_for(state_dir, cli, home);
     let own_dir = file_roster.row(&next_row.label).and_then(|r| r.dir.clone());
+    let parker = std::sync::Arc::clone(renew_guard);
     start_auto_renew(
         permit,
         move || {
-            let _ = super::cli::renew_one_for(
+            let renewal = super::cli::renew_one_for(
                 cli,
                 now,
                 &super::cli::LiveAccounts,
@@ -4444,6 +4477,7 @@ fn spawn_vendor_renewal(
                 &mut io::sink(),
                 &mut io::sink(),
             );
+            note_background_end(&parker, &key, renewal, Instant::now());
         },
         spawn_renewal,
     )
@@ -5246,6 +5280,22 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let reparsed = FleetRoster::from_toml(&fleet.to_toml(), "captured.toml").unwrap();
         assert_eq!(reparsed.accounts, fleet.accounts);
 
+        let mut kimi_fleet = fleet.clone();
+        for acct in &mut kimi_fleet.accounts {
+            acct.vendor.region = Some(Region::Global);
+        }
+        let reparsed_kimi =
+            FleetRoster::from_toml_for(Cli::Kimi, &kimi_fleet.to_toml(), "kimi.toml").unwrap();
+        assert_eq!(reparsed_kimi.accounts, kimi_fleet.accounts);
+
+        let mut codex_fleet = fleet.clone();
+        for acct in &mut codex_fleet.accounts {
+            acct.vendor.flow = Some(Flow::Device);
+        }
+        let reparsed_codex =
+            FleetRoster::from_toml_for(Cli::Codex, &codex_fleet.to_toml(), "codex.toml").unwrap();
+        assert_eq!(reparsed_codex.accounts, codex_fleet.accounts);
+
         let duplicates = "email,computer,claude\none@example.test,m8,1\ntwo@example.test,m8,1\n";
         let fleet = parse_accounting_csv(duplicates, "captured.csv").unwrap();
         assert_eq!(fleet.accounts[0].label, "m8");
@@ -5774,6 +5824,36 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             .expect("the original account can retry after its cooldown");
         drop(permit);
         assert!(!state.lock().unwrap().in_flight);
+    }
+
+    /// A background renewal that stopped for a person (a block page, a page that waits on
+    /// one) parks its row: no background renewal of it starts again past the 15-minute cooldown
+    /// until [`PERSON_BACKOFF`] has passed, and a renewal by hand still may. Any other end
+    /// unparks it. CONTROL: a renewal that failed otherwise is tried again after the cooldown.
+    #[test]
+    fn a_background_renewal_that_stopped_for_a_person_is_left_alone_for_its_backoff() {
+        use super::super::cli::Renewal;
+        use std::sync::{Arc, Mutex};
+        let state = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let now = Instant::now();
+        let after_cooldown = now + Duration::from_secs(901);
+        drop(AutoRenewPermit::claim(&state, "grok:grok-1", now, false).expect("admitted"));
+        note_background_end(&state, "grok:grok-1", Renewal::NeedsPerson, now);
+        assert!(AutoRenewPermit::claim(&state, "grok:grok-1", after_cooldown, false).is_none());
+        let by_hand = AutoRenewPermit::claim(&state, "grok:grok-1", after_cooldown, true);
+        assert!(by_hand.is_some(), "a renewal by hand is no background one");
+        drop(by_hand);
+        let past = now + PERSON_BACKOFF;
+        drop(AutoRenewPermit::claim(&state, "grok:grok-1", past, false).expect("backed off"));
+        note_background_end(&state, "grok:grok-1", Renewal::Renewed, past);
+        assert!(state.lock().unwrap().parked.is_empty(), "unparked");
+
+        drop(AutoRenewPermit::claim(&state, "kimi:kimi-1", now, false).expect("admitted"));
+        note_background_end(&state, "kimi:kimi-1", Renewal::Failed, now);
+        assert!(
+            AutoRenewPermit::claim(&state, "kimi:kimi-1", after_cooldown, false).is_some(),
+            "CONTROL: another failure waits out the cooldown alone"
+        );
     }
 
     #[test]

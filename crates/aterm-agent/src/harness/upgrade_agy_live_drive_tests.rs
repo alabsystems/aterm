@@ -425,7 +425,7 @@ fn message_body(id: &str, priority: &str) -> String {
 }
 
 struct LiveRig {
-    dir: ScratchDir,
+    dir: aterm_tempfile::TempDir,
     opts: Opts,
     kernel: LiveKernel,
     asked: crate::harness::FakeInstanceLog,
@@ -476,9 +476,12 @@ fn change_on_disk(generated: &Path, what: Between) {
 
 impl LiveRig {
     #[allow(clippy::too_many_lines)]
-    fn new(name: &str, knobs: Knobs) -> LiveRig {
-        let dir = scratch(name);
-        let base = std::fs::canonicalize(&*dir).expect("canonical scratch");
+    fn new(knobs: Knobs) -> LiveRig {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("agyl-")
+            .tempdir()
+            .expect("private live fixture");
+        let base = std::fs::canonicalize(dir.path()).expect("canonical scratch");
         let home = base.join("agy-home");
         let config = home.join(".gemini/antigravity-cli");
         std::fs::create_dir_all(config.join(ag::PRESENCE)).expect("presence");
@@ -562,7 +565,7 @@ impl LiveRig {
             let generated = generated.clone();
             let record = state.join("upgrade").join(format!("agy-{TAB}.json"));
             let knobs = knobs.clone();
-            crate::harness::fake_instance(&base.join("t.sock"), TOKEN, move |line| {
+            crate::harness::fake_instance(&dir.path().join("t.sock"), TOKEN, move |line| {
                 let verb = line
                     .split_whitespace()
                     .find(|w| !w.starts_with('@'))
@@ -751,13 +754,13 @@ impl LiveRig {
 
 impl Drop for LiveRig {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&*self.dir);
+        let _ = std::fs::remove_dir_all(self.dir.path());
     }
 }
 
 #[test]
 fn an_idle_agy_behind_is_restarted_onto_the_new_build_and_nothing_is_typed() {
-    let rig = LiveRig::new("idle", Knobs::default());
+    let rig = LiveRig::new(Knobs::default());
     let r = rig.visit();
     assert_eq!(r.step, "done:resumed", "{r:?}");
     assert_eq!(
@@ -829,13 +832,10 @@ fn an_idle_agy_behind_is_restarted_onto_the_new_build_and_nothing_is_typed() {
 
 #[test]
 fn the_hosts_step_adopts_and_its_carry_types_nothing() {
-    let rig = LiveRig::new(
-        "host",
-        Knobs {
-            hand_back: true,
-            ..Knobs::default()
-        },
-    );
+    let rig = LiveRig::new(Knobs {
+        hand_back: true,
+        ..Knobs::default()
+    });
     let r = rig.visit();
     assert_eq!(r.step, "adopted", "{r:?}");
     assert_eq!(r.pid, NEW);
@@ -849,13 +849,10 @@ fn the_hosts_step_adopts_and_its_carry_types_nothing() {
 #[test]
 fn a_restart_left_in_flight_is_carried_as_the_harnesss_own() {
     let ready = Arc::new(AtomicBool::new(false));
-    let rig = LiveRig::new(
-        "slow-shell",
-        Knobs {
-            shell_slow: Some(Arc::clone(&ready)),
-            ..Knobs::default()
-        },
-    );
+    let rig = LiveRig::new(Knobs {
+        shell_slow: Some(Arc::clone(&ready)),
+        ..Knobs::default()
+    });
     let r = rig.visit();
     assert_eq!(r.step, "wait:shell-prompt", "{r:?}");
     assert!(
@@ -871,13 +868,10 @@ fn a_restart_left_in_flight_is_carried_as_the_harnesss_own() {
 
 #[test]
 fn a_relaunch_that_never_holds_the_lock_started_fresh() {
-    let mut rig = LiveRig::new(
-        "lockless",
-        Knobs {
-            lockless: true,
-            ..Knobs::default()
-        },
-    );
+    let mut rig = LiveRig::new(Knobs {
+        lockless: true,
+        ..Knobs::default()
+    });
     rig.opts.timings.agy_lock = Duration::from_millis(50);
     let r = rig.visit();
     assert_eq!(r.step, "refused:started-fresh", "{r:?}");
@@ -885,7 +879,7 @@ fn a_relaunch_that_never_holds_the_lock_started_fresh() {
 }
 
 fn holds(name: &str, knobs: Knobs, want: &str) {
-    let rig = LiveRig::new(name, knobs);
+    let rig = LiveRig::new(knobs);
     let r = rig.visit();
     assert_eq!(r.step, want, "{name}: {r:?}");
     assert!(rig.asked("signal").is_empty(), "{name}: signalled");
@@ -894,7 +888,7 @@ fn holds(name: &str, knobs: Knobs, want: &str) {
 }
 
 fn restarts(name: &str, knobs: Knobs) {
-    let rig = LiveRig::new(name, knobs);
+    let rig = LiveRig::new(knobs);
     let r = rig.visit();
     assert_eq!(r.step, "done:resumed", "{name}: {r:?}");
 }
@@ -1109,13 +1103,10 @@ fn the_build_the_order_and_the_launch_hold_the_restart() {
             "current",
         );
     }
-    let rig = LiveRig::new(
-        "remote",
-        Knobs {
-            argv: Some(vec!["--remote-control".to_string()]),
-            ..Knobs::default()
-        },
-    );
+    let rig = LiveRig::new(Knobs {
+        argv: Some(vec!["--remote-control".to_string()]),
+        ..Knobs::default()
+    });
     let r = rig.visit();
     assert!(r.step.starts_with("skip:argv:"), "{r:?}");
     assert!(rig.asked("signal").is_empty() && rig.record().is_none());
@@ -1172,13 +1163,10 @@ fn a_change_before_the_signal_or_its_refusal_takes_the_claim_back() {
         },
         "wait:changed-before-signal",
     );
-    let rig = LiveRig::new(
-        "refused",
-        Knobs {
-            signal_refused: true,
-            ..Knobs::default()
-        },
-    );
+    let rig = LiveRig::new(Knobs {
+        signal_refused: true,
+        ..Knobs::default()
+    });
     let r = rig.visit();
     assert_eq!(r.step, "wait:signal-held", "{r:?}");
     assert!(rig.asked("turn").is_empty() && rig.record().is_none());
@@ -1186,7 +1174,7 @@ fn a_change_before_the_signal_or_its_refusal_takes_the_claim_back() {
 
 #[test]
 fn a_claim_that_cannot_be_written_signals_nothing() {
-    let blocked = LiveRig::new("claim-write-refused", Knobs::default());
+    let blocked = LiveRig::new(Knobs::default());
     let record =
         crate::harness::upgrade_drive::state_dir(&blocked.opts).join(format!("{}.json", key(TAB)));
     std::fs::create_dir_all(&record).expect("a directory at the claim path");
@@ -1259,19 +1247,16 @@ fn a_launch_that_set_its_own_environment_is_not_restarted() {
 
 #[test]
 fn the_tab_is_due_while_its_build_is_behind() {
-    let behind = LiveRig::new("due", Knobs::default());
+    let behind = LiveRig::new(Knobs::default());
     let tabs = LiveRig::tabs();
     let due = |rig: &LiveRig, tabs: &[LiveTab]| {
         live::upgrade_due_with(&rig.opts, tabs, Some(rig.twin.clone()), &rig.kernel)
     };
     assert_eq!(due(&behind, &tabs), Some(Due::Yes));
-    let current = LiveRig::new(
-        "due-current",
-        Knobs {
-            twin: Some(Twin::Same),
-            ..Knobs::default()
-        },
-    );
+    let current = LiveRig::new(Knobs {
+        twin: Some(Twin::Same),
+        ..Knobs::default()
+    });
     assert_eq!(due(&current, &tabs), Some(Due::No));
     let other = vec![LiveTab {
         sid: TAB.to_string(),
@@ -1636,7 +1621,7 @@ fn real_restarts(s: &State, rigs: &(LiveRig, LiveRig)) -> bool {
 }
 
 fn real_claim_relaunches() -> bool {
-    let rig = LiveRig::new("tier1-claim", Knobs::default());
+    let rig = LiveRig::new(Knobs::default());
     let args = rig.kernel.args(TUI).expect("argv");
     let snap = snapshot(
         &rig.opts,
@@ -1683,14 +1668,11 @@ fn tier1_the_real_agy_quiet_upgrade_conforms_to_the_model() {
         .collect();
     assert_eq!(dead, BTreeSet::from(MUTANTS), "the model's whole Buggy set");
     let rigs = (
-        LiveRig::new("tier1-alone", Knobs::default()),
-        LiveRig::new(
-            "tier1-shared",
-            Knobs {
-                shared: Some(Shared::Lockless),
-                ..Knobs::default()
-            },
-        ),
+        LiveRig::new(Knobs::default()),
+        LiveRig::new(Knobs {
+            shared: Some(Shared::Lockless),
+            ..Knobs::default()
+        }),
     );
     let claim_relaunches = real_claim_relaunches();
     assert!(
@@ -1800,13 +1782,23 @@ fn an_idle_agy_on_a_spent_pool_is_relaunched_on_the_quota_pick() {
         quota_to: Some("claude-opus-5-5-medium"),
         ..Knobs::default()
     };
-    let rig = LiveRig::new("quota", knobs.clone());
+    let rig = LiveRig::new(knobs.clone());
     let tabs = LiveRig::tabs();
     assert_eq!(
         live::upgrade_due_with(&rig.opts, &tabs, Some(rig.twin.clone()), &rig.kernel),
         Some(Due::Yes),
         "a rotation owed is due though the build is current"
     );
+    let rotation = live::rotation_due(
+        &rig.kernel.exe,
+        &rig.kernel.args(TUI).expect("running launch"),
+        Some(rig.twin.clone()),
+        &rig.opts.home,
+        &rig.kernel,
+    )
+    .expect("the exact current twin can rotate");
+    assert_eq!(rotation.mv.target, VERSION);
+    assert_eq!(rotation.mv.twin, rig.twin);
     let r = rig.visit();
     assert_eq!(r.step, "done:resumed", "{r:?}");
     assert_eq!(
@@ -1834,13 +1826,10 @@ fn an_idle_agy_on_a_spent_pool_is_relaunched_on_the_quota_pick() {
         "{}",
         st.outcome
     );
-    let kept = LiveRig::new(
-        "quota-kept",
-        Knobs {
-            twin: Some(Twin::Same),
-            ..Knobs::default()
-        },
-    );
+    let kept = LiveRig::new(Knobs {
+        twin: Some(Twin::Same),
+        ..Knobs::default()
+    });
     assert_eq!(
         kept.visit().step,
         "current",
@@ -1850,4 +1839,28 @@ fn an_idle_agy_on_a_spent_pool_is_relaunched_on_the_quota_pick() {
         live::upgrade_due_with(&kept.opts, &tabs, Some(kept.twin.clone()), &kept.kernel),
         Some(Due::No)
     );
+    let older = LiveRig::new(Knobs {
+        twin: Some(Twin::Older),
+        quota_to: Some("claude-opus-5-5-medium"),
+        ..Knobs::default()
+    });
+    assert_eq!(
+        live::rotation_due(
+            &older.kernel.exe,
+            &older.kernel.args(TUI).expect("running launch"),
+            Some(older.twin.clone()),
+            &older.opts.home,
+            &older.kernel,
+        ),
+        None,
+        "a quota move must not disguise an older executable as the current build"
+    );
+    assert_eq!(
+        live::upgrade_due_with(&older.opts, &tabs, Some(older.twin.clone()), &older.kernel),
+        Some(Due::No)
+    );
+    assert_eq!(older.visit().step, "current");
+    assert!(older.asked("signal").is_empty());
+    assert!(older.asked("turn").is_empty());
+    assert!(older.record().is_none());
 }

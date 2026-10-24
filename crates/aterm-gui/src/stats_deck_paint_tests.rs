@@ -8,6 +8,7 @@ use crate::stats_paint::HitKind;
 use crate::stats_paint::tests::{job_row, zombies};
 use aterm_vitals::explain::WhyFacts;
 use aterm_vitals::explain::fixtures::{self, spotlight_1032};
+use aterm_vitals::fixtures::DeckScene;
 use aterm_vitals::jobs::{Findings, JobsView, Verdict};
 use aterm_vitals::model::{
     AccountIx, Busiest, CapBasis, ClusterView, CoreView, CpuView, DiskFacts, GpuSample, GpuView,
@@ -40,6 +41,8 @@ pub(crate) enum Scene {
     Worst,
     /// Worst-case scene ([`Scene::Worst`]) restricted to valid CPU and memory overflow slots.
     Costly,
+    /// One of the merged deck's mockup scenes, in its own window ([`super::deck_fixtures`]).
+    Merged(DeckScene),
 }
 
 struct Rng(u64);
@@ -266,6 +269,9 @@ fn jobs(counts: &[(Verdict, usize)], zombie_count: u32) -> JobsView {
 
 /// `sc` as one snapshot at [`AT`].
 pub(crate) fn scene(sc: Scene) -> Snapshot {
+    if let Scene::Merged(m) = sc {
+        return aterm_vitals::fixtures::snapshot(m);
+    }
     let worst = matches!(sc, Scene::Worst | Scene::Costly);
     let trouble = sc == Scene::Trouble || worst;
     let mut st = story(trouble);
@@ -283,7 +289,8 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
                 h[30] = None;
             }
         }
-        Scene::Calm | Scene::Trouble | Scene::HarnessOff => {}
+        // A merged scene is returned whole above.
+        Scene::Calm | Scene::Trouble | Scene::HarnessOff | Scene::Merged(_) => {}
     }
     let tab_label = if worst { LONG_TAB } else { "Tab 2" };
     let mut s = Snapshot {
@@ -440,6 +447,8 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
     };
     match sc {
         Scene::Calm => f.disk = Some(watch),
+        // Returned whole above.
+        Scene::Merged(_) => {}
         Scene::HarnessOff => f.disk = None,
         Scene::FirstRun => {
             f.disk = Some(DiskFacts {
@@ -622,7 +631,6 @@ pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
     let long = snap.tab(FRONT).is_some_and(|t| t.label == LONG_TAB);
     DeckInput {
         snap: Some(snap),
-        tab_key: Some(FRONT),
         tab_panes: vec![FRONT],
         tab_label: if long { LONG_TAB } else { "Tab 2" }.into(),
         tab_count: 2,
@@ -633,6 +641,18 @@ pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
         form,
         contrast: false,
         locale: MAC,
+    }
+}
+
+/// `sc`'s input: a merged scene's from its own window, v2's from [`scene_input`].
+fn input_of(sc: Scene, snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
+    match sc {
+        Scene::Merged(m) => super::deck_fixtures::DeckContext::of(m).input(
+            Some(snap),
+            form,
+            super::tests::dark_inks(),
+        ),
+        _ => scene_input(snap, form),
     }
 }
 
@@ -652,7 +672,7 @@ fn geom(w: f64, s: f64, form: DeckForm) -> DeckGeom {
 
 fn laid(sc: Scene, w: f64, s: f64, form: DeckForm, m: &FaceMetrics, draw: bool) -> Laid {
     let snap = scene(sc);
-    let input = scene_input(&snap, form);
+    let input = input_of(sc, &snap, form);
     let words = DeckWords::new(&input, m);
     lay(&geom(w, s, form), &input, &words, m, draw)
 }
@@ -692,6 +712,9 @@ fn swept(check: Check) -> Vec<&'static str> {
         Scene::Trouble,
         Scene::FirstRun,
         Scene::HarnessOff,
+        Scene::Merged(DeckScene::Busy),
+        Scene::Merged(DeckScene::Calm),
+        Scene::Merged(DeckScene::Absent),
     ];
     FOUND
         .get_or_init(|| {
@@ -738,7 +761,7 @@ fn sweep(
             .into_iter()
             .map(|(sc, snap, face, m, s, form)| {
                 scope.spawn(move || {
-                    let input = scene_input(snap, form);
+                    let input = input_of(sc, snap, form);
                     let words = DeckWords::new(&input, m);
                     let mut failed: Vec<(Check, String)> = Vec::new();
                     for w in sweep_widths() {
@@ -1533,27 +1556,14 @@ fn strip_col(strip: Strip) -> Col {
 #[test]
 fn hit_map() {
     let m = FaceMetrics::helvetica_neue();
-    for (w, s) in [(1119.0, 2.0), (900.0, 2.0), (550.0, 2.0), (350.0, 1.0)] {
-        let p = plan::plan_full(w, &m);
-        let at = format!("Full {:?} at {w} pt, {s}×", p.kind);
-        let laid = laid(Scene::Calm, w, s, DeckForm::Full, &m, true);
-        let hits = &laid.hits;
-        let mut cols = vec![p.name, strip_col(p.strip)];
-        cols.extend([p.pct, p.bar, p.amount, p.details].into_iter().flatten());
-        let scopes = p.aterm.zip(p.tab);
-        for (i, &res) in DECK_RESOURCES.iter().enumerate() {
-            check_row(hits, s, res, p.rows, i as u32, &cols, scopes, &at);
-        }
-        let header = hit_at(hits, p.strip.x + 20.0, 6.0, s);
-        assert_eq!(header, Some(HitKind::Header), "{at}");
-        let cores = match p.cores {
-            CoresAt::Block { at, .. } => hit_at(hits, at.x + 2.0, 40.0, s),
-            CoresAt::Row(room) => {
-                let y = p.rows.top(DECK_RESOURCES.len() as u32) + p.rows.cell / 2.0;
-                hit_at(hits, room.x + 2.0, y, s)
-            }
-        };
-        assert_eq!(cores, Some(HitKind::Cores), "{at}");
+    let scenes = [
+        Scene::Calm,
+        Scene::Merged(DeckScene::Busy),
+        Scene::Merged(DeckScene::Calm),
+        Scene::Merged(DeckScene::Absent),
+    ];
+    for sc in scenes {
+        hit_map_of(sc, &m);
     }
     let header_names = laid(Scene::Calm, 1119.0, 2.0, DeckForm::Full, &m, true)
         .hits
@@ -1561,42 +1571,6 @@ fn hit_map() {
         .find(|h| h.kind == HitKind::Header)
         .map(|h| h.instrument());
     assert_eq!(header_names, Some(Instrument::HowToRead));
-    for (w, s) in [(1119.0, 2.0), (750.0, 2.0), (450.0, 1.0)] {
-        let p = plan::plan_folded(w, &m);
-        let at = format!("Folded {:?} at {w} pt, {s}×", p.blocks[0].kind);
-        let laid = laid(Scene::Calm, w, s, DeckForm::Folded, &m, true);
-        let hits = &laid.hits;
-        for (bi, b) in p.blocks.iter().enumerate() {
-            let mut cols = vec![b.name, strip_col(b.strip)];
-            cols.extend([b.pct, b.bar, b.amount, b.details].into_iter().flatten());
-            let scopes = b.aterm.zip(b.tab);
-            for (res, r) in DECK_RESOURCES
-                .iter()
-                .copied()
-                .skip(bi * 4)
-                .take(4)
-                .zip(0_u32..)
-            {
-                check_row(hits, s, res, b.rows, r, &cols, scopes, &at);
-            }
-            if bi == 1 {
-                let y = b.rows.top(3) + b.rows.cell / 2.0;
-                assert_eq!(
-                    hit_at(hits, b.name.x + 1.0, y, s),
-                    Some(HitKind::Cores),
-                    "{at}"
-                );
-            }
-        }
-        let y = p.blocks[0].rows.top(1) + 4.0;
-        let gutter = (p.blocks[0].at.end() + p.blocks[1].at.x) / 2.0;
-        assert_eq!(hit_at(hits, gutter, y, s), None, "{at}: the gutter");
-        assert_eq!(
-            hit_at(hits, p.blocks[0].strip.x + 20.0, 5.0, s),
-            Some(HitKind::Header),
-            "{at}"
-        );
-    }
     let w = folded_width(BlockKind::Slim, &m);
     let laid = laid(Scene::Trouble, w, 2.0, DeckForm::Folded, &m, true);
     let head = laid.head.as_ref().expect("a header");
@@ -1626,6 +1600,89 @@ fn hit_map() {
     }
 }
 
+/// Every row's columns, its scope bars, the header and the cores name their instruments in
+/// `sc`, Full and Folded.
+fn hit_map_of(sc: Scene, m: &FaceMetrics) {
+    for (w, s) in [(1119.0, 2.0), (900.0, 2.0), (550.0, 2.0), (350.0, 1.0)] {
+        let p = plan::plan_full(w, m);
+        let at = format!("{sc:?}: Full {:?} at {w} pt, {s}×", p.kind);
+        let laid = laid(sc, w, s, DeckForm::Full, m, true);
+        let hits = &laid.hits;
+        let mut cols = vec![p.name, strip_col(p.strip)];
+        cols.extend([p.pct, p.bar, p.amount, p.details].into_iter().flatten());
+        let scopes = p.aterm.zip(p.tab);
+        for (i, &res) in DECK_RESOURCES.iter().enumerate() {
+            check_row(hits, s, res, p.rows, i as u32, &cols, scopes, &at);
+        }
+        let header = hit_at(hits, p.strip.x + 20.0, 6.0, s);
+        assert_eq!(header, Some(HitKind::Header), "{at}");
+        let cores = match p.cores {
+            CoresAt::Block { at, .. } => hit_at(hits, at.x + 2.0, 40.0, s),
+            CoresAt::Row(room) => {
+                let y = p.rows.top(DECK_RESOURCES.len() as u32) + p.rows.cell / 2.0;
+                hit_at(hits, room.x + 2.0, y, s)
+            }
+        };
+        assert_eq!(cores, Some(HitKind::Cores), "{at}");
+    }
+    for (w, s) in [(1119.0, 2.0), (750.0, 2.0), (450.0, 1.0)] {
+        let p = plan::plan_folded(w, m);
+        let at = format!("{sc:?}: Folded {:?} at {w} pt, {s}×", p.blocks[0].kind);
+        let laid = laid(sc, w, s, DeckForm::Folded, m, true);
+        let hits = &laid.hits;
+        for (bi, b) in p.blocks.iter().enumerate() {
+            let mut cols = vec![b.name, strip_col(b.strip)];
+            cols.extend([b.pct, b.bar, b.amount, b.details].into_iter().flatten());
+            let scopes = b.aterm.zip(b.tab);
+            for (res, r) in DECK_RESOURCES
+                .iter()
+                .copied()
+                .skip(bi * 4)
+                .take(4)
+                .zip(0_u32..)
+            {
+                check_row(hits, s, res, b.rows, r, &cols, scopes, &at);
+            }
+            if bi == 1 {
+                let y = b.rows.top(3) + b.rows.cell / 2.0;
+                assert_eq!(
+                    hit_at(hits, b.name.x + 1.0, y, s),
+                    Some(HitKind::Cores),
+                    "{at}"
+                );
+            }
+        }
+        let y = p.blocks[0].rows.top(1) + 4.0;
+        let gutter = (p.blocks[0].at.end() + p.blocks[1].at.x) / 2.0;
+        assert_eq!(hit_at(hits, gutter, y, s), None, "{at}: the gutter");
+        // The header names How to read, except where a row's state is said over the point
+        // (busy's disk): there it is that row's, as the Trouble check below holds.
+        let x = p.blocks[0].strip.x + 20.0;
+        let header = hit_at(hits, x, 5.0, s);
+        let snap = scene(sc);
+        let stated = laid
+            .head
+            .iter()
+            .flat_map(|h| &h.labels)
+            .filter(|l| l.label == Label::State && l.x <= x)
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+            .map(|l| {
+                let res = DECK_RESOURCES
+                    .iter()
+                    .copied()
+                    .find(|&r| {
+                        words::state(r, &snap, &MAC).is_some_and(|st| l.text.starts_with(&st.label))
+                    })
+                    .expect("the label says a row's state");
+                row_hit(res, Bar::Global)
+            });
+        assert!(
+            header == Some(HitKind::Header) || stated.is_some_and(|row| header == row),
+            "{at}: {header:?}, the state said there {stated:?}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
 fn deck_gallery() {
@@ -1640,6 +1697,9 @@ fn deck_gallery() {
         ("trouble", Scene::Trouble),
         ("firstrun", Scene::FirstRun),
         ("harness_off", Scene::HarnessOff),
+        ("merged_busy", Scene::Merged(DeckScene::Busy)),
+        ("merged_calm", Scene::Merged(DeckScene::Calm)),
+        ("merged_absent", Scene::Merged(DeckScene::Absent)),
     ];
     let mut written = Vec::new();
     for (name, sc) in scenes {
@@ -1654,7 +1714,7 @@ fn deck_gallery() {
             for form in [DeckForm::Full, DeckForm::Folded] {
                 for (ground, inks) in [("dark", super::tests::dark_inks()), ("light", light_inks())]
                 {
-                    let mut input = scene_input(&snap, form);
+                    let mut input = input_of(sc, &snap, form);
                     input.inks = inks;
                     let g = geom(w, s, form);
                     let (prims, _) = deck_paint(&g, &input);
@@ -1679,5 +1739,5 @@ fn deck_gallery() {
             }
         }
     }
-    assert_eq!(written.len(), 4 * 5 * 2 * 2);
+    assert_eq!(written.len(), scenes.len() * 5 * 2 * 2);
 }

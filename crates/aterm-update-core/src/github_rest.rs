@@ -163,12 +163,43 @@ impl Token {
 pub trait Spawn: Send + Sync {
     /// Run `command` to its end.
     /// # Errors
-    /// The spawn's, or reading or waiting.
+    /// The spawn's, marked by [`unstarted`] (the child never ran, so it sent nothing), or
+    /// reading or waiting.
     fn run(
         &self,
         command: &mut Command,
         stdin: Option<&[u8]>,
     ) -> std::io::Result<std::process::Output>;
+}
+
+/// A [`Spawn::run`] error raised before the child started ([`unstarted`]).
+#[derive(Debug)]
+struct NotStarted(std::io::Error);
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for NotStarted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// `e`, a failure to start a child, marked so [`never_started`] knows it: its kind and its
+/// message are `e`'s.
+#[must_use]
+pub fn unstarted(e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), NotStarted(e))
+}
+
+/// Whether `e` is a [`Spawn::run`] failure raised before the child started ([`unstarted`]),
+/// so nothing it would have sent went anywhere.
+#[must_use]
+pub fn never_started(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<NotStarted>())
 }
 
 /// The production [`Spawn`].
@@ -189,7 +220,7 @@ impl Spawn for Direct {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn()?;
+        let mut child = command.spawn().map_err(unstarted)?;
         if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
             let _ = pipe.write_all(bytes);
         }
@@ -534,6 +565,20 @@ fn last_block(dump: &str) -> Vec<(String, String)> {
     headers
 }
 
+/// The REST lane's curl for `url`, with `args` before it: [`curl_command`]'s `/usr/bin/curl`
+/// (`-q` first, so no curlrc is read; `--` before the URL), with every variable that changes
+/// what curl reads or trusts ([`VENDOR_ENV_SCRUB`]) and the GitHub token's variables removed.
+/// The caller adds its stdio. Every GitHub request here is one, and so is each of the release's
+/// Firebase Hosting requests (`ship site`), whose bearer token rides stdin the same way.
+#[must_use]
+pub fn curl(args: &[&str], url: &str) -> Command {
+    let mut command = curl_command(args, url);
+    for var in VENDOR_ENV_SCRUB.iter().chain(&TOKEN_ENV) {
+        command.env_remove(var);
+    }
+    command
+}
+
 /// `file` as `--upload-file` takes it.
 fn upload_path(file: &Path) -> std::path::PathBuf {
     if file.is_absolute() {
@@ -694,10 +739,7 @@ impl Client {
             args.extend(["-H", "@-"].map(String::from));
         }
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        let mut command = curl_command(&argv, url);
-        for var in VENDOR_ENV_SCRUB.iter().chain(&TOKEN_ENV) {
-            command.env_remove(var);
-        }
+        let command = curl(&argv, url);
         Ok(Prepared {
             command,
             stdin: self.token.as_ref().map(Token::header_line),
@@ -857,11 +899,7 @@ impl Client {
         if let (Some((dest, _)), Some(cap)) = (to, cap.as_deref()) {
             args.extend(["-o", dest, "--max-filesize", cap]);
         }
-        let mut command = curl_command(&args, url);
-        for var in VENDOR_ENV_SCRUB.iter().chain(&TOKEN_ENV) {
-            command.env_remove(var);
-        }
-        command
+        curl(&args, url)
     }
 
     /// The bytes of the asset at `asset_path`, streaming.

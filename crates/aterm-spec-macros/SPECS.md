@@ -96,18 +96,18 @@ composes all three. `step-evidence-refuses-nesting` uses `evidence-window-state-
 `probe-preserves-semantics` uses `macro-expansion-shape` plus the panic-freedom half of
 `evidence-window-state-machine`. `registry-collects-each-submit-once` is independent of the rest.
 
-## 2. Test → spec map (TSV; all 9)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 All paths are under `crates/aterm-spec-macros/`.
 
 ```tsv
 file	test	primary	also
-tests/derive_and_attrs.rs	probe_preserves_behaviour_of_every_awkward_fn_shape	probe-preserves-semantics	macro-expansion-shape
-tests/derive_and_attrs.rs	probe_records_the_anchor_id_the_record_carries	anchor-entry-id	evidence-window-state-machine, probed-call-records-its-anchors
-tests/derive_and_attrs.rs	every_anchor_of_a_multi_anchored_fn_is_recorded_by_one_call	probed-call-records-its-anchors	anchor-entry-id
-tests/derive_and_attrs.rs	a_const_fn_anchor_reports_itself_unprobed_rather_than_lying	anchor-entry-id	macro-expansion-shape
-tests/derive_and_attrs.rs	a_nested_window_panics_instead_of_lending_the_outer_step_its_evidence	step-evidence-refuses-nesting	evidence-window-state-machine
+tests/anchors/suite.rs	probe_preserves_behaviour_of_every_awkward_fn_shape	probe-preserves-semantics	macro-expansion-shape
+tests/anchors/suite.rs	probe_records_the_anchor_id_the_record_carries	anchor-entry-id	evidence-window-state-machine, probed-call-records-its-anchors
+tests/anchors/suite.rs	every_anchor_of_a_multi_anchored_fn_is_recorded_by_one_call	probed-call-records-its-anchors	anchor-entry-id
+tests/anchors/suite.rs	a_const_fn_anchor_reports_itself_unprobed_rather_than_lying	anchor-entry-id	macro-expansion-shape
+tests/anchors/suite.rs	a_nested_window_panics_instead_of_lending_the_outer_step_its_evidence	step-evidence-refuses-nesting	evidence-window-state-machine
 ```
 
 ## 3. Coverage

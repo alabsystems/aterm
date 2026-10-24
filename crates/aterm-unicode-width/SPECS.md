@@ -62,7 +62,7 @@ UW3-facade-equals-reference-width	table-property	<char as UnicodeWidthChar>::wid
 aterm-grapheme `S7` and `S5` (owned there) → `UW1` → `UW2` (needs S7, and S5 restricted to
 U+0020..U+007E) → `UW3` (needs all of S5).
 
-## 2. Test → spec map (TSV; all 3)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

@@ -213,6 +213,148 @@ const fn fnv1a32(bytes: &[u8]) -> u32 {
     h
 }
 
+/// The asset's verified quantized contents, before dequantization; [`ToneModel::from_bytes`] and tone-int's derivation read it.
+#[derive(Clone, Debug)]
+pub struct RawTone<'a> {
+    emb_scale: f32,
+    w1_scale: f32,
+    w2_scale: f32,
+    emb: &'a [u8],
+    w1: &'a [u8],
+    w2: &'a [u8],
+    b1: [f32; HIDDEN],
+    b2: [f32; TONE_COUNT],
+}
+
+impl<'a> RawTone<'a> {
+    /// The embedding scale, finite and positive.
+    #[inline]
+    pub const fn emb_scale(&self) -> f32 {
+        self.emb_scale
+    }
+
+    /// The first layer's scale, finite and positive.
+    #[inline]
+    pub const fn w1_scale(&self) -> f32 {
+        self.w1_scale
+    }
+
+    /// The output layer's scale, finite and positive.
+    #[inline]
+    pub const fn w2_scale(&self) -> f32 {
+        self.w2_scale
+    }
+
+    /// The `BUCKETS × EMBED` embedding table, row-major, one two's-complement i8 per byte.
+    #[inline]
+    pub const fn emb(&self) -> &'a [u8] {
+        self.emb
+    }
+
+    /// The `EMBED × HIDDEN` first-layer weights, row-major, one two's-complement i8 per byte.
+    #[inline]
+    pub const fn w1(&self) -> &'a [u8] {
+        self.w1
+    }
+
+    /// The `HIDDEN × TONE_COUNT` output weights, row-major, one two's-complement i8 per byte.
+    #[inline]
+    pub const fn w2(&self) -> &'a [u8] {
+        self.w2
+    }
+
+    /// The first layer's biases, each finite.
+    #[inline]
+    pub const fn b1(&self) -> &[f32; HIDDEN] {
+        &self.b1
+    }
+
+    /// The output layer's biases, each finite.
+    #[inline]
+    pub const fn b2(&self) -> &[f32; TONE_COUNT] {
+        &self.b2
+    }
+}
+
+/// Verify a weight asset (length, magic, checksum, dimensions, scales and finite biases) and view its quantized contents.
+pub fn raw(bytes: &[u8]) -> Result<RawTone<'_>, ToneModelError> {
+    if bytes.len() < HEADER_LEN {
+        return Err(ToneModelError::Truncated);
+    }
+    if bytes.len() != ASSET_LEN {
+        // Magic first for a friendlier error on foreign files.
+        if bytes.get(..8) != Some(&MAGIC[..]) {
+            return Err(ToneModelError::BadMagic);
+        }
+        return Err(ToneModelError::BadLength);
+    }
+    if bytes.get(..8) != Some(&MAGIC[..]) {
+        return Err(ToneModelError::BadMagic);
+    }
+    let payload_end = ASSET_LEN - 4;
+    let stored = u32::from_le_bytes(
+        bytes[payload_end..]
+            .try_into()
+            .map_err(|_| ToneModelError::Truncated)?,
+    );
+    if fnv1a32(&bytes[..payload_end]) != stored {
+        return Err(ToneModelError::BadChecksum);
+    }
+    let u32_at = |off: usize| -> u32 {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&bytes[off..off + 4]);
+        u32::from_le_bytes(b)
+    };
+    let f32_at = |off: usize| -> f32 {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&bytes[off..off + 4]);
+        f32::from_le_bytes(b)
+    };
+    if u32_at(8) as usize != BUCKETS
+        || u32_at(12) as usize != EMBED
+        || u32_at(16) as usize != HIDDEN
+        || u32_at(20) as usize != TONE_COUNT
+    {
+        return Err(ToneModelError::DimensionMismatch);
+    }
+    let emb_scale = f32_at(24);
+    let w1_scale = f32_at(28);
+    let w2_scale = f32_at(32);
+    for s in [emb_scale, w1_scale, w2_scale] {
+        if !s.is_finite() || s <= 0.0 {
+            return Err(ToneModelError::BadScale);
+        }
+    }
+    let (emb, rest) = bytes[HEADER_LEN..].split_at(EMB_LEN);
+    let (w1, rest) = rest.split_at(W1_LEN);
+    let (w2, _) = rest.split_at(W2_LEN);
+    let floats = |out: &mut [f32], at: usize| -> Result<(), ToneModelError> {
+        for (k, slot) in out.iter_mut().enumerate() {
+            let x = f32_at(at + k * 4);
+            if !x.is_finite() {
+                return Err(ToneModelError::BadScale);
+            }
+            *slot = x;
+        }
+        Ok(())
+    };
+    let b1_at = HEADER_LEN + EMB_LEN + W1_LEN + W2_LEN;
+    let mut b1 = [0.0f32; HIDDEN];
+    floats(&mut b1, b1_at)?;
+    let mut b2 = [0.0f32; TONE_COUNT];
+    floats(&mut b2, b1_at + HIDDEN * 4)?;
+    Ok(RawTone {
+        emb_scale,
+        w1_scale,
+        w2_scale,
+        emb,
+        w1,
+        w2,
+        b1,
+        b2,
+    })
+}
+
 /// The loaded (dequantized) classifier.
 #[derive(Clone, Debug)]
 pub struct ToneModel {
@@ -226,95 +368,18 @@ pub struct ToneModel {
 impl ToneModel {
     /// Decode and verify a weight asset.
     pub fn from_bytes(bytes: &[u8]) -> Result<ToneModel, ToneModelError> {
-        if bytes.len() < HEADER_LEN {
-            return Err(ToneModelError::Truncated);
-        }
-        if bytes.len() != ASSET_LEN {
-            // Magic first for a friendlier error on foreign files.
-            if bytes.get(..8) != Some(&MAGIC[..]) {
-                return Err(ToneModelError::BadMagic);
-            }
-            return Err(ToneModelError::BadLength);
-        }
-        if bytes.get(..8) != Some(&MAGIC[..]) {
-            return Err(ToneModelError::BadMagic);
-        }
-        let payload_end = ASSET_LEN - 4;
-        let stored = u32::from_le_bytes(
-            bytes[payload_end..]
-                .try_into()
-                .map_err(|_| ToneModelError::Truncated)?,
-        );
-        if fnv1a32(&bytes[..payload_end]) != stored {
-            return Err(ToneModelError::BadChecksum);
-        }
-        let u32_at = |off: usize| -> u32 {
-            let mut b = [0u8; 4];
-            b.copy_from_slice(&bytes[off..off + 4]);
-            u32::from_le_bytes(b)
-        };
-        let f32_at = |off: usize| -> f32 {
-            let mut b = [0u8; 4];
-            b.copy_from_slice(&bytes[off..off + 4]);
-            f32::from_le_bytes(b)
-        };
-        if u32_at(8) as usize != BUCKETS
-            || u32_at(12) as usize != EMBED
-            || u32_at(16) as usize != HIDDEN
-            || u32_at(20) as usize != TONE_COUNT
-        {
-            return Err(ToneModelError::DimensionMismatch);
-        }
-        let emb_scale = f32_at(24);
-        let w1_scale = f32_at(28);
-        let w2_scale = f32_at(32);
-        for s in [emb_scale, w1_scale, w2_scale] {
-            if !s.is_finite() || s <= 0.0 {
-                return Err(ToneModelError::BadScale);
-            }
-        }
-        let mut off = HEADER_LEN;
-        let emb: Vec<f32> = bytes[off..off + EMB_LEN]
-            .iter()
-            .map(|&b| f32::from(b as i8) * emb_scale)
-            .collect();
-        off += EMB_LEN;
+        let raw = raw(bytes)?;
         let deq_row = |scale: f32, byte: u8| f32::from(byte as i8) * scale;
-        let w1: [[f32; HIDDEN]; EMBED] = std::array::from_fn(|r| {
-            let base = off + r * HIDDEN;
-            std::array::from_fn(|c| deq_row(w1_scale, bytes[base + c]))
-        });
-        off += W1_LEN;
-        let w2: [[f32; TONE_COUNT]; HIDDEN] = std::array::from_fn(|r| {
-            let base = off + r * TONE_COUNT;
-            std::array::from_fn(|c| deq_row(w2_scale, bytes[base + c]))
-        });
-        off += W2_LEN;
-        fn floats<const N: usize>(
-            bytes: &[u8],
-            off: &mut usize,
-        ) -> Result<[f32; N], ToneModelError> {
-            let mut v = [0.0f32; N];
-            for (k, slot) in v.iter_mut().enumerate() {
-                let mut b = [0u8; 4];
-                b.copy_from_slice(&bytes[*off + k * 4..*off + k * 4 + 4]);
-                let x = f32::from_le_bytes(b);
-                if !x.is_finite() {
-                    return Err(ToneModelError::BadScale);
-                }
-                *slot = x;
-            }
-            *off += N * 4;
-            Ok(v)
-        }
-        let b1 = floats::<HIDDEN>(bytes, &mut off)?;
-        let b2 = floats::<TONE_COUNT>(bytes, &mut off)?;
         Ok(ToneModel {
-            emb,
-            w1,
-            b1,
-            w2,
-            b2,
+            emb: raw.emb.iter().map(|&b| deq_row(raw.emb_scale, b)).collect(),
+            w1: std::array::from_fn(|r| {
+                std::array::from_fn(|c| deq_row(raw.w1_scale, raw.w1[r * HIDDEN + c]))
+            }),
+            b1: raw.b1,
+            w2: std::array::from_fn(|r| {
+                std::array::from_fn(|c| deq_row(raw.w2_scale, raw.w2[r * TONE_COUNT + c]))
+            }),
+            b2: raw.b2,
         })
     }
 
@@ -326,6 +391,20 @@ impl ToneModel {
 
     /// Compute the raw output logits into `s.logits` directly from `chars`, returning `false` when fewer than [`MIN_NGRAMS`] character n-grams were emitted.
     fn compute_logits_chars(
+        &self,
+        chars: impl IntoIterator<Item = char>,
+        s: &mut ToneScratch,
+    ) -> bool {
+        if !self.pre_activations_chars(chars, s) {
+            return false;
+        }
+        self.logits_from_pre_activations(s);
+        true
+    }
+
+    /// Fill `s.hid` with the hidden pre-activations of `chars`, returning `false` when fewer than [`MIN_NGRAMS`] character n-grams were emitted.
+    #[inline]
+    fn pre_activations_chars(
         &self,
         chars: impl IntoIterator<Item = char>,
         s: &mut ToneScratch,
@@ -352,6 +431,12 @@ impl ToneModel {
                 *h += e * w;
             }
         }
+        true
+    }
+
+    /// Apply tanh to `s.hid` in place and compute the output logits into `s.logits`.
+    #[inline]
+    fn logits_from_pre_activations(&self, s: &mut ToneScratch) {
         for h in &mut s.hid {
             *h = h.tanh();
         }
@@ -361,7 +446,18 @@ impl ToneModel {
                 *l += h * w;
             }
         }
-        true
+    }
+
+    /// The f32 path's hidden pre-activations and output logits for `text`, or `None` when it abstains; tone-int's fidelity tests read them.
+    #[cfg(test)]
+    pub(crate) fn trace(&self, text: &str) -> Option<([f32; HIDDEN], [f32; TONE_COUNT])> {
+        let mut s = ToneScratch::default();
+        if !self.pre_activations_chars(text.chars(), &mut s) {
+            return None;
+        }
+        let pre = s.hid;
+        self.logits_from_pre_activations(&mut s);
+        Some((pre, s.logits))
     }
 
     /// Softmax scores in [`Tone::ALL`] order, or `None` when the text is too short ([`MIN_NGRAMS`]).
@@ -463,12 +559,15 @@ pub fn encode_model(emb: &[f32], w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32])
     out
 }
 
-/// The shipped weights (`data/tone_model.atn`, from `targo --unverified run -p aterm-effects --example tone_train`), loaded once.
+/// The shipped weight asset, `data/tone_model.atn` (from `targo --unverified run -p aterm-effects --example tone_train`).
+pub const ASSET: &[u8] = include_bytes!("../data/tone_model.atn");
+
+/// The shipped weights ([`ASSET`]), loaded once.
 #[inline]
 pub fn builtin() -> Option<&'static ToneModel> {
     static MODEL: OnceLock<Option<ToneModel>> = OnceLock::new();
     MODEL
-        .get_or_init(|| ToneModel::from_bytes(include_bytes!("../data/tone_model.atn")).ok())
+        .get_or_init(|| ToneModel::from_bytes(ASSET).ok())
         .as_ref()
 }
 

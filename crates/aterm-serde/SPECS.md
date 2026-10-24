@@ -115,7 +115,7 @@ In parallel, `ser-128-default-unsupported` → `ser-std-shape`.
 (their round trip is the last proof). `size-hint-cautious` has no dependency: its core stands
 alone, and its composed half sits under `de-std-shape` and `content-buffer-transparent`.
 
-## 2. Test → spec map (TSV; 190 of the 191 tests)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 A test is deleted only when its primary spec and every spec under `also` are Certified.

@@ -272,15 +272,12 @@ where
         .clamp(0, (grid_w - w).max(0));
 
     if ahead.probe == Probe::Blind {
-        let behind_covers_caret = cols == 0 || {
+        let shift_behind = ahead.covers_caret && cols > 0 && {
             let (b_first, b_last) = cell_span(behind_x, w, cw, cols);
-            (b_first..=b_last).contains(&caret_col)
+            !(b_first..=b_last).contains(&caret_col)
         };
-        return if ahead.covers_caret && !behind_covers_caret {
-            seat(query, behind_x, rest.y, caret_row, caret_left, 0, false)
-        } else {
-            seat(query, rest.x, rest.y, caret_row, caret_left, 0, false)
-        };
+        let x = if shift_behind { behind_x } else { rest.x };
+        return seat(query, x, rest.y, caret_row, caret_left, 0, false);
     }
 
     let behind = census(behind_x, w, caret_row, caret, cols, cw, &ink);
@@ -577,7 +574,7 @@ impl PetShade {
 /// fox's white chin lilac, a bright star on the `2` of `main +2` and a green
 /// one in its gap, and the bed's top feather tinting the segment's bottom
 /// 3-4 px (yellow to olive, its grey bar to violet).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct KeepOut {
     /// Every box: the word icons' and the lettered or filled cells'.
     boxes: Vec<(i32, i32, i32, i32)>,
@@ -586,6 +583,24 @@ pub struct KeepOut {
     /// Each lettered row's span, first lettered or filled cell to last, a
     /// row tall ([`Self::behind_text`]).
     rows: Vec<(i32, i32, i32, i32)>,
+}
+
+impl Clone for KeepOut {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            boxes: self.boxes.clone(),
+            cells: self.cells.clone(),
+            rows: self.rows.clone(),
+        }
+    }
+
+    #[inline]
+    fn clone_from(&mut self, source: &Self) {
+        self.boxes.clone_from(&source.boxes);
+        self.cells.clone_from(&source.cells);
+        self.rows.clone_from(&source.rows);
+    }
 }
 
 impl KeepOut {
@@ -638,18 +653,30 @@ impl KeepOut {
     #[inline]
     #[must_use]
     pub fn behind_text(&self, (x, y): (f32, f32), band: (f32, f32), pad: f32, feather: f32) -> f32 {
+        if self.rows.is_empty() {
+            return 1.0;
+        }
         let feather = feather.max(1.0);
-        self.rows.iter().fold(1.0f32, |k, &(x0, x1, y0, y1)| {
+        let mut k = 1.0f32;
+        for &(x0, x1, y0, y1) in &self.rows {
+            let (x0, x1) = (x0 as f32 - pad, x1 as f32 + pad);
+            let dx = (x - x0).min(x1 - x);
+            if dx <= 0.0 {
+                continue;
+            }
             let ch = (y1 - y0) as f32;
             let (b0, b1) = (y0 as f32 + band.0 * ch - pad, y0 as f32 + band.1 * ch + pad);
-            let (x0, x1) = (x0 as f32 - pad, x1 as f32 + pad);
-            let d = (x - x0).min(x1 - x).min(y - b0).min(b1 - y);
+            let d = dx.min(y - b0).min(b1 - y);
             if d <= 0.0 {
-                return k;
+                continue;
+            }
+            if d >= feather {
+                return 0.0;
             }
             let u = (d / feather).min(1.0);
-            k.min(1.0 - u * u * (3.0 - 2.0 * u))
-        })
+            k = k.min(1.0 - u * u * (3.0 - 2.0 * u));
+        }
+        k
     }
 
     /// The boxes, window pixels.
@@ -696,14 +723,21 @@ impl KeepOut {
     #[inline]
     #[must_use]
     pub fn ceiling(&self, x: f32, row_top: f32, free: f32, ease: f32) -> f32 {
+        if self.boxes.is_empty() || ease <= 0.0 || !ease.is_finite() {
+            return free;
+        }
         let above = row_top - 1.0;
-        let d = self
-            .boxes
-            .iter()
-            .filter(|b| (b.2 as f32) <= above && above < b.3 as f32)
-            .map(|b| (b.0 as f32 - x).max(x - b.1 as f32).max(0.0))
-            .fold(f32::INFINITY, f32::min);
-        if !d.is_finite() || d >= ease {
+        let mut d = ease;
+        for &(x0, x1, y0, y1) in &self.boxes {
+            if (y0 as f32) <= above && above < y1 as f32 {
+                let dx = (x0 as f32 - x).max(x - x1 as f32);
+                if dx <= 0.0 {
+                    return row_top;
+                }
+                d = d.min(dx);
+            }
+        }
+        if d >= ease {
             return free;
         }
         let u = (d / ease.max(1.0)).clamp(0.0, 1.0);

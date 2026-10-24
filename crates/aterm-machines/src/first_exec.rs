@@ -17,19 +17,32 @@ const MODE: u32 = 0o644;
 
 /// Record in `home`, just before a program under it starts, that it has not shown it ran:
 /// [`EXEC_STAMP`] with the awake-clock reading, and no [`RAN`]. Both are readable by all.
-/// An earlier uninstall's mark ([`crate::agent::reclaim::KEPT`]) goes too: the folder is in
-/// use again, so its reclaim job leaves it, unless the job read the mark just before and is
-/// emptying the folder now.
+/// Cancel an earlier uninstall's mark ([`crate::agent::reclaim::KEPT`]) before checking its
+/// reclaim claim. The job claims that mark atomically before it empties the folder: either
+/// cancellation wins, or the claim refuses this start until the job finishes.
 ///
 /// # Errors
-/// The stamp cannot be written, or a proof or mark cannot be removed; the program should not
-/// start.
+/// The reclaim claim is present or cannot be checked, the stamp cannot be written, or a
+/// proof or mark cannot be removed; the program must not start.
 pub fn stamp(sys: &dyn System, home: &Path) -> std::io::Result<()> {
-    for stale in [RAN, crate::agent::reclaim::KEPT] {
-        match sys.remove(&home.join(stale)) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
+    match sys.remove(&home.join(crate::agent::reclaim::KEPT)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let claim = home.join(crate::agent::reclaim::CLAIM);
+    match sys.stat(&claim) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("{} is held by an uninstall's reclaim job", claim.display()),
+            ));
         }
+    }
+    match sys.remove(&home.join(RAN)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
     }
     let at = sys.awake_ms().map(|ms| ms.to_string()).unwrap_or_default();
     sys.write_file(&home.join(EXEC_STAMP), at.as_bytes(), MODE)
@@ -247,6 +260,41 @@ mod tests {
         stamp(&sys, home).unwrap();
         assert!(sys.written(&mark.to_string_lossy()).is_none());
         assert_eq!(hold_left(&sys, home), Some(FIRST_EXEC_HANG));
+
+        let claim = home.join(crate::agent::reclaim::CLAIM);
+        let sys = Fake::root();
+        sys.file(&mark.to_string_lossy(), b"1-9");
+        sys.file(&claim.to_string_lossy(), b"1-9");
+        sys.file(&home.join(RAN).to_string_lossy(), b"old proof");
+        assert_eq!(
+            stamp(&sys, home).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "a claim that won before cancellation forbids a new exec"
+        );
+        assert!(sys.written(&mark.to_string_lossy()).is_none());
+        assert!(
+            sys.written(&home.join(EXEC_STAMP).to_string_lossy())
+                .is_none()
+        );
+        assert_eq!(
+            sys.written(&home.join(RAN).to_string_lossy()),
+            Some(b"old proof".to_vec())
+        );
+
+        let sys = Fake::root();
+        sys.stat_fails(
+            &claim.to_string_lossy(),
+            std::io::ErrorKind::PermissionDenied,
+        );
+        assert_eq!(
+            stamp(&sys, home).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "an unread claim is no proof that reclamation has finished"
+        );
+        assert!(
+            sys.written(&home.join(EXEC_STAMP).to_string_lossy())
+                .is_none()
+        );
     }
 
     #[test]

@@ -725,7 +725,6 @@ fn a_self_claims_short_landing_its_fence_refused_is_marked_at_the_successor() {
         let worker = ctx.self_id.as_str().to_string();
         mark_session_task(&ctx, 0, &TaskMark::new(TaskState::Working)).expect("unfenced");
         prove_self_claim(&ctx, &home, thread);
-        let hang = Instant::now() + Duration::from_secs(60);
         ctx.fabric.set_fence_wait(Duration::from_millis(1));
         let _ = ctx.fabric.fence_hold(false);
         ctx.timeline
@@ -733,6 +732,7 @@ fn a_self_claims_short_landing_its_fence_refused_is_marked_at_the_successor() {
             .unwrap_or_else(PoisonError::into_inner)
             .queue_self_task(TaskFace::Landed);
         parent.apply_harness_fact(&worker, HarnessFact::SelfTask(TaskFace::Landed));
+        let hang = Instant::now() + Duration::from_secs(60);
         while crate::harness_task::landing_in_flight(&worker) {
             assert!(Instant::now() < hang, "the landing's thread never ended");
             std::thread::sleep(Duration::from_millis(10));
@@ -779,6 +779,7 @@ fn a_self_claims_short_landing_its_fence_refused_is_marked_at_the_successor() {
             prove_self_claim(&ctx, &home, thread);
             app.session_factory.edge_inbox.push(id);
             let _ = app.observe_session_statuses(Instant::now());
+            let hang = Instant::now() + Duration::from_secs(60);
             while crate::harness_task::landing_in_flight(&worker) {
                 assert!(Instant::now() < hang, "the landing's thread never ended");
                 std::thread::sleep(Duration::from_millis(10));
@@ -807,6 +808,7 @@ fn a_self_claims_short_landing_its_fence_refused_is_marked_at_the_successor() {
         drop(control);
 
         let (next, next_ctx) = successor(&rec);
+        let hang = Instant::now() + Duration::from_secs(60);
         while task(&next_ctx).state != TaskState::Done {
             assert!(
                 Instant::now() < hang,

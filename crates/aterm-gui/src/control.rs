@@ -3060,6 +3060,7 @@ fn bind_control_listener_within(
         |path| CtlListener::bind(path),
         std::thread::sleep,
     )?;
+    let _ = aterm_uds::keep_out_of_children(&listener);
     Some(BoundControl::bound(listener, token, sock_path))
 }
 

@@ -937,25 +937,9 @@ pub const TOOLS: &[Tool] = &[
          runs it (row 19)",
     ),
     release_host(
-        "node",
-        &[],
-        "`ship site`'s firebase-tools runs on it until S17's REST deploy; no check runs it, every \
-         wasm driver runs in the pinned chrome-headless-shell (row 17)",
-    ),
-    release_host(
-        "firebase",
-        &[],
-        "`ship site` deploys through firebase-tools until S17's REST deploy (row 17)",
-    ),
-    release_host(
         "pub",
         &[],
         "the publication engine (`~/publication`): `ship check --export` and `ship release` (row 33)",
-    ),
-    release_host(
-        "deploy.sh",
-        &[],
-        "the site repo's deploy script, which `ship site` runs (row 34)",
     ),
     missing(
         guest(

@@ -100,7 +100,7 @@ effects.
 `cast-slice-bytes-round-trip` (free). `bytes-of-view` and `zeroed-is-all-zero-bits` are independent of
 the cast chain. `zeroed-is-all-zero-bits`'s `bytes_of` corollary uses `bytes-of-view`.
 
-## 2. Test → spec map (TSV; all 7)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

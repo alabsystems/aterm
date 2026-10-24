@@ -1,0 +1,15 @@
+
+To sign in, open this URL in your browser:
+
+  https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ
+
+2026-10-24T08:31:26.512345Z ERROR failed to get default browser, falling back to Safari
+  (Could not open browser automatically — open the URL above manually.)
+
+Confirm this code in your browser:
+
+  WMRT-8KQZ
+
+Only continue with a code you requested. Don't share it with anyone.
+
+Waiting for authorization...

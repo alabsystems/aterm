@@ -790,6 +790,86 @@ pub(crate) fn the_screen_busy_again_continues_a_running_vendor_turn() {
 }
 
 #[test]
+fn a_late_end_follows_every_continuation_to_its_dated_segment() {
+    for ended in [1_500, 4_000, 6_500, 9_000] {
+        for close_last in [false, true] {
+            let mut r = Rig::bound();
+            r.see(Verdict::Busy);
+            let mut turns = vec![r.turn()];
+            r.tx(prompt("v1"));
+            for rest in [1_500, 4_000, 6_500] {
+                r.now = rest;
+                r.see(Verdict::Idle);
+                r.wait(1_000);
+                r.now += 300;
+                let recs = r.see(Verdict::Busy);
+                let previous = *turns.last().expect("the previous screen turn");
+                let previous_id = previous.to_string();
+                let next = r.turn();
+                assert!(recs.iter().any(|rec| {
+                    rec.node == next && rec.f.get_str(Key::Cont) == Some(previous_id.as_str())
+                }));
+                turns.push(next);
+            }
+            r.now = 9_000;
+            if close_last {
+                r.see(Verdict::Idle);
+                r.wait(1_000);
+            }
+            let target = turns[match ended {
+                1_500 => 0,
+                4_000 => 1,
+                6_500 => 2,
+                _ => 3,
+            }];
+            let recs = r.tx_at(END, WALL0 + ended);
+            let numbers = recs
+                .iter()
+                .find(|rec| rec.f.get(Key::VdurMs).is_some())
+                .expect("the vendor totals are attributed");
+            assert_eq!(numbers.node, target, "end={ended}, closed={close_last}");
+            assert_eq!(numbers.f.get_u(Key::TokIn), Some(900));
+            assert_eq!(r.tr.tx_view().mapped, Some(target));
+            assert_eq!(r.tr.tx_view().dropped, 0);
+            let closes = ops(&recs, Op::Close, Lvl::Turn);
+            if ended == 9_000 && !close_last {
+                assert_eq!(closes.len(), 1);
+                assert_eq!(closes[0].node, target);
+                assert_eq!(r.tr.turn(), None);
+            } else {
+                assert!(closes.is_empty(), "a prior end closes no later segment");
+                assert_eq!(r.tr.turn(), (!close_last).then_some(turns[3]));
+            }
+            r.ordered();
+        }
+    }
+
+    let mut r = Rig::bound();
+    r.see(Verdict::Busy);
+    let first = r.turn();
+    r.tx(prompt("v1"));
+    for rest in [1_500, 4_000, 6_500] {
+        r.now = rest;
+        r.see(Verdict::Idle);
+        r.wait(1_000);
+        r.now += 300;
+        r.see(Verdict::Busy);
+    }
+    let current = r.turn();
+    r.log.set_byte_budget(0);
+    assert!(
+        !r.log
+            .window()
+            .any(|rec| rec.node == first && rec.op == Op::Open)
+    );
+    let recs = r.tx_at(END, WALL0 + 1_500);
+    assert!(!recs.iter().any(|rec| rec.f.get(Key::VdurMs).is_some()));
+    assert!(ops(&recs, Op::Close, Lvl::Turn).is_empty());
+    assert_eq!(r.tr.turn(), Some(current));
+    assert_eq!(r.tr.tx_view().dropped, 1, "unknown ancestry is counted");
+}
+
+#[test]
 pub(crate) fn a_row_at_the_watermark_is_never_applied_again() {
     let mut r = Rig::bound();
     r.see(Verdict::Busy);

@@ -515,6 +515,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     state: RunState::Unknown,
                     session_leader: None,
                     has_tty: None,
+                    exec: None,
                     runnable_ns: None,
                     peak_footprint: None,
                     read_at: None,

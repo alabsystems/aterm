@@ -657,8 +657,13 @@ impl Sim {
 
         let victim = *healthy.last().expect("a healthy member");
         let victim_port = self.world.insts[victim].port;
-        aterm_net::fleet_member::write_key_file(&self.world.insts[victim].state(), &[0x22; 20])
-            .map_err(|e| Fail::die(format!("rotate m{victim:02}'s key: {e}")))?;
+        let state = self.world.insts[victim].state();
+        aterm_net::fleet_member::write_held(&state, aterm_net::fleet_member::Began::Here, |book| {
+            book.write_key(&[0x22; 20])
+        })
+        .map_err(|e| e.to_string())
+        .and_then(|written| written.map_err(|e| e.to_string()))
+        .map_err(|e| Fail::die(format!("rotate m{victim:02}'s key: {e}")))?;
         let rebound = crate::wait_until(world::HANG, || {
             matches!(
                 probe::wrong_secret(victim_port, &self.secret),

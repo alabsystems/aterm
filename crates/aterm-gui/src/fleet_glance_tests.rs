@@ -391,11 +391,16 @@ fn the_book_says_whether_this_mac_knows_only_its_issuer() {
         "a peer named by hand is read too"
     );
     let m7 = peer("m7", Via::Issuer).node.expect("an issuer's node");
-    aterm_net::fleet_member::write_issuer_book(&dir, &m7, &[]).expect("the copy written");
+    let keep = |issuer: &str| {
+        aterm_net::fleet_member::hold_book(&dir).and_then(|book| {
+            book.keep_issuer_book(Some((issuer, &[])))
+                .map_err(|e| e.to_string())
+        })
+    };
+    keep(&m7).expect("the copy written");
     let shared = book(vec![peer("m7", Via::Issuer)]);
     assert_eq!(shared.issuer_label, None, "its issuer shares its book");
-    aterm_net::fleet_member::write_issuer_book(&dir, &"ff".repeat(16), &[])
-        .expect("another issuer's copy written");
+    keep(&"ff".repeat(16)).expect("another issuer's copy written");
     let stale = book(vec![peer("m7", Via::Issuer)]);
     assert_eq!(
         stale.issuer_label.as_deref(),

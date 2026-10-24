@@ -292,7 +292,7 @@ fn a_kinfo_answer_gives_a_zombies_parent_group_and_state() {
     put(
         &mut b,
         darwin::KINFO_FLAG_AT,
-        &darwin::P_CONTROLT.to_ne_bytes(),
+        &(darwin::P_CONTROLT | darwin::P_EXEC).to_ne_bytes(),
     );
     b[darwin::KINFO_STAT_AT] = 5;
     put(&mut b, darwin::KINFO_PID_AT, &6302u32.to_ne_bytes());
@@ -314,10 +314,11 @@ fn a_kinfo_answer_gives_a_zombies_parent_group_and_state() {
     );
     assert_eq!(k.start_us, 1_760_000_000_250_000);
     assert_eq!((k.tty, k.tpgid), (Some(0x1000_0003), Some(6301)));
-    assert!(k.session_leader);
+    assert!(k.session_leader && k.exec);
     assert_eq!(k.comm, "node");
     put(&mut b, darwin::KINFO_FLAG_AT, &0u32.to_ne_bytes());
-    assert_eq!(darwin::kinfo(&b).unwrap().tty, None);
+    let k = darwin::kinfo(&b).unwrap();
+    assert_eq!((k.tty, k.exec), (None, false));
     assert_eq!(darwin::kinfo(&b[..100]), None);
 }
 
@@ -447,6 +448,9 @@ fn a_stat_line_gives_every_field_past_any_command_name() {
         (3, 150, 50, 20, 10)
     );
     assert_eq!((s.threads, s.start), (3, 123_456));
+    assert!(s.exec());
+    let fork = linux::parse_stat(&STAT.replacen(" 4194560 ", " 4194624 ", 1)).unwrap();
+    assert!(!fork.exec(), "PF_FORKNOEXEC");
     let s = linux::parse_stat("9 (d) R 1 9 9 0 -1 0 0 0 0 0 1 2 0 0 20 0 1 0 7 0 0").unwrap();
     assert_eq!((s.tty_nr, s.tpgid), (0, 0));
     let far = STAT.replacen(" 34817 ", " -2147448832 ", 1);
@@ -958,6 +962,38 @@ fn a_stopped_child_and_a_zombie_child_read_their_states() {
         (RunState::Zombie, std::process::id())
     );
     child.wait().expect("reaped");
+}
+
+/// A FORK THAT KEPT ITS PARENT'S PROGRAM RAN NONE OF ITS OWN: the sweep reads `exec` off the
+/// kernel's flag (macOS `P_EXEC`, Linux `PF_FORKNOEXEC`), which a shell's own session lacks (zsh's
+/// `zpty` worker) and a program a fork ran (`sleep`) has.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_fork_that_kept_its_parents_program_ran_none_of_its_own() {
+    let mut sleep = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep starts");
+    // SAFETY: the child calls only `pause`, async-signal-safe, until the SIGKILL below.
+    let fork = unsafe { libc::fork() };
+    assert!(fork >= 0, "fork: {}", std::io::Error::last_os_error());
+    if fork == 0 {
+        loop {
+            // SAFETY: async-signal-safe, with no state of the parent's touched.
+            unsafe { libc::pause() };
+        }
+    }
+    let sweep = crate::processes().expect("a sweep");
+    let exec = |pid: u32| sweep.procs.iter().find(|p| p.pid == pid).map(|p| p.exec);
+    let read = (exec(sleep.id()), exec(fork.cast_unsigned()));
+    // SAFETY: our own child, killed and reaped once.
+    unsafe {
+        libc::kill(fork, libc::SIGKILL);
+        libc::waitpid(fork, std::ptr::null_mut(), 0);
+    }
+    sleep.kill().expect("kill");
+    sleep.wait().expect("reaped");
+    assert_eq!(read, (Some(Some(true)), Some(Some(false))));
 }
 
 /// The job probe's CPU times are nanoseconds: a spinning child, stopped so

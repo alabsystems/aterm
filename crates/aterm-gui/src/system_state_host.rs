@@ -485,14 +485,13 @@ impl App {
         }
     }
 
-    /// The windows whose active tab's visible plan has a System State leaf,
-    /// focused or not, so a page in an unfocused split pane is among them. A
-    /// window where the page is a background tab is not: switching to that tab
-    /// draws the page as it stands then.
+    /// The windows on screen whose active tab's visible plan has a System
+    /// State leaf, focused or not, so a page in an unfocused split pane is
+    /// among them. A window where the page is a background tab is not:
+    /// switching to that tab draws the page as it stands then; nor is an
+    /// occluded one ([`Self::system_state_on_screen`]).
     fn system_state_showing_windows(&self) -> Vec<crate::WindowId> {
-        self.windows
-            .keys()
-            .copied()
+        self.system_state_on_screen()
             .filter(|wid| {
                 self.active_visible_leaf_plan(*wid).is_some_and(|plan| {
                     plan.leaves.iter().any(|leaf| {
@@ -640,12 +639,15 @@ impl App {
         self.system_state_host.next_tick = None;
     }
 
-    /// Whether a System State view is the visible, active view of a focused
-    /// window with no overlay: the only time a setup run's access steps may put
-    /// a macOS gesture on screen (design §6).
+    /// Whether a System State view is the visible, active view of a focused,
+    /// on-screen window with no overlay: the only time a setup run's access
+    /// steps, the sign-outs and the debugger step may put a macOS gesture on
+    /// screen (design §6). A focused window macOS reports occluded (the screen
+    /// locked or asleep, a screen saver up) stays key but shows nothing.
     pub(crate) fn system_state_frontmost(&self) -> bool {
         self.windows.iter().any(|(wid, window)| {
             crate::os_window_focused(window)
+                && !window.occluded
                 && window.overlay.is_none()
                 && self
                     .active_native_view(*wid)
@@ -660,16 +662,25 @@ impl App {
         })
     }
 
-    /// The views of `instance` that are a leaf of some window's active tab's
-    /// visible plan, focused or not: every view of it someone can see, the
-    /// windows [`Self::system_state_showing_windows`] redraws.
+    /// The windows someone can see: a minimized, hidden or fully covered
+    /// window (occluded) shows nothing, as Settings' `settings_view_on_screen`
+    /// reads it.
+    fn system_state_on_screen(&self) -> impl Iterator<Item = crate::WindowId> + '_ {
+        self.windows
+            .iter()
+            .filter(|(_, window)| !window.occluded)
+            .map(|(wid, _)| *wid)
+    }
+
+    /// The views of `instance` that are a leaf of some on-screen window's
+    /// active tab's visible plan, focused or not: every view of it someone can
+    /// see, the windows [`Self::system_state_showing_windows`] redraws.
     fn system_state_seen_views(
         &self,
         instance: crate::native_app::AppInstanceId,
     ) -> Vec<crate::tab_model::ViewId> {
-        self.windows
-            .keys()
-            .filter_map(|wid| self.active_visible_leaf_plan(*wid))
+        self.system_state_on_screen()
+            .filter_map(|wid| self.active_visible_leaf_plan(wid))
             .flat_map(|plan| plan.leaves.into_iter().map(|leaf| leaf.view))
             .filter(|view| {
                 matches!(self.view_store.get(*view),
@@ -679,18 +690,17 @@ impl App {
     }
 
     /// The views of `instance` that are the visible, active view of some
-    /// window, focused or not.
+    /// on-screen window, focused or not.
     fn system_state_shown_views(
         &self,
         instance: crate::native_app::AppInstanceId,
     ) -> Vec<crate::tab_model::ViewId> {
-        self.windows
-            .keys()
+        self.system_state_on_screen()
             .filter_map(|wid| {
-                self.active_native_view(*wid).and_then(|(current, view)| {
+                self.active_native_view(wid).and_then(|(current, view)| {
                     (current == instance
                         && self
-                            .active_visible_leaf_plan(*wid)
+                            .active_visible_leaf_plan(wid)
                             .is_some_and(|plan| plan.leaf(view).is_some()))
                     .then_some(view)
                 })

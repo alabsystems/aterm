@@ -270,7 +270,7 @@ pub fn export(e: &Export<'_>) -> Result<String, Error> {
     ))
 }
 
-/// Generates trait impls.
+/// Generates trait impls, the free export, and the descriptor record for an exported struct `name`.
 pub fn class(name: &str, docs: &str) -> String {
     let symbol = free_symbol(name);
     format!(

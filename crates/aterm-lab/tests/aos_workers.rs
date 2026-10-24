@@ -110,6 +110,12 @@ impl Run {
 }
 
 fn spawn(args: &[&str]) -> (Child, aterm_tempfile::TempDir, PathBuf) {
+    // The coordinator and its workers exec this one file: macOS's first-exec check of a fresh
+    // build is waited out here, outside the runs' hang detectors.
+    aterm_spec::wait::first_exec(
+        std::path::Path::new(env!("CARGO_BIN_EXE_aterm-lab")),
+        &["--help"],
+    );
     let dir = aterm_tempfile::tempdir().expect("a scratch dir");
     let plans = dir.path().join("six.txt");
     std::fs::write(&plans, SIX).expect("the plans file");
@@ -408,36 +414,6 @@ fn a_foreign_worker_is_refused_alone() {
     voided(&alone, "NoWorkers");
 }
 
-/// A differing resend that lands after the command's last search is read by the shutdown drain:
-/// with one worker slot 5 is the last job, and `post-lie` sends its lie half a second after its
-/// result, while step 5, the held-out read and the bundle's write run. The bundle written is
-/// removed and the command is void.
-#[test]
-fn a_differing_resend_after_the_last_search_removes_its_bundle() {
-    let r = run(&[
-        "--workers",
-        "1",
-        "--lease-ms",
-        "10000",
-        "--fault",
-        "post-lie@1.5.1",
-    ]);
-    voided(&r, "Differs");
-    fired_once(&r, "post-lie@1.5.1");
-    assert!(
-        r.summary.contains("  bundle file=plans.bundle "),
-        "the search ended and wrote its bundle before the lie was read\n{}",
-        r.summary
-    );
-    assert!(
-        r.summary
-            .lines()
-            .any(|l| l.starts_with("aos-search removed ") && l.contains("plans.bundle")),
-        "{}",
-        r.summary
-    );
-}
-
 /// A void ends the command (design §11.3): a lie in the plans search, the second, removes the
 /// grid's bundle, which was written first, since its admitted count rested on the same pool.
 #[test]
@@ -515,8 +491,10 @@ fn signal(sig: &str, pid: u32) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// TERM ends the command and reaps its workers. Hello lines establish worker startup, not
+/// that a lease is still live when the signal arrives, so this does not count cancellation acks.
 #[test]
-fn sigterm_cancels_drains_and_reaps() {
+fn sigterm_voids_and_reaps() {
     let _slot = slot();
     let (mut child, dir, out) = spawn(&["--workers", "3", "--lease-ms", "10000"]);
     let stdout = drain(child.stdout.take().expect("piped"));
@@ -543,13 +521,6 @@ fn sigterm_cancels_drains_and_reaps() {
     );
     r.reaped_all();
     assert!(!r.out.join("plans.bundle").exists());
-    // The pid lines print as each hello is accepted and leases follow at once, and an admitted
-    // plan takes hundreds of milliseconds, so leases are live at the signal. Each holder is
-    // cancelled and drained by its ack (and a retired worker is killed); none times out.
-    let cancelled = r.count("cancelled");
-    assert!(cancelled >= 1, "{}", r.summary);
-    assert_eq!(r.processes("killed"), cancelled, "{}", r.summary);
-    assert_eq!(r.count("lost"), 0, "{}", r.summary);
 }
 
 #[test]

@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use aterm_uds::spawnfd::{Child, Command};
 
+use crate::site::hosting::{self, Failed, Released};
 use crate::site::pages::{self, Difference};
 use crate::site::{
-    Disagreement, Env, Failure, Guard, Launch, Options, Outcome, Ran, Refusal, Stop, World,
+    DEPLOY_LATER, Disagreement, Env, Failure, Guard, Launch, Options, Outcome, Refusal, Stop, World,
 };
 use crate::template::Tree;
 
@@ -185,24 +186,33 @@ enum EngineFault {
     OptimiseNothing,
 }
 
-/// A deploy as the site's `deploy.sh` would end.
+/// A deploy as Firebase Hosting's REST API would end it ([`hosting::deploy`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Deploy {
-    /// public/ goes live.
+    /// The plan goes live.
     #[default]
     Ok,
     /// Goes live, but the CDN still serves the old engine.js.
     Stale,
     /// Goes live, but the live engine names a commit no repo holds.
     Ghost,
-    /// Firebase's expired login.
-    AuthErr,
-    /// No firebase-tools at all.
-    NoCli,
-    /// An unrelated failure.
-    Fail,
-    /// A failure whose words name no login problem.
-    OddFail,
+    /// No service-account key could be read.
+    NoKey,
+    /// Google's token endpoint refused the key.
+    Refused,
+    /// An upload failed: nothing released.
+    Unreleased,
+    /// `releases.create` failed after the finalize.
+    ReleaseFails,
+}
+
+/// What one deploy was handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Deployed {
+    /// The plan's paths, in order.
+    files: Vec<String>,
+    key: Option<PathBuf>,
+    message: String,
 }
 
 /// What the sync asked of the world.
@@ -219,10 +229,7 @@ enum Call {
         sources: PathBuf,
     },
     Optimise,
-    Deploy(PathBuf),
-    Firebase {
-        account: Option<String>,
-    },
+    Deploy(Deployed),
 }
 
 /// How the fixture world starts the sync's children: as they are, except that a signal
@@ -267,7 +274,6 @@ struct Fake {
     home: PathBuf,
     engine: EngineFault,
     deploy: Deploy,
-    firebase_ok: bool,
     git: Git,
     signals: Rc<Signals>,
     calls: Vec<Call>,
@@ -284,11 +290,11 @@ impl Fake {
             .collect()
     }
 
-    fn deploys(&self) -> Vec<PathBuf> {
+    fn deploys(&self) -> Vec<Deployed> {
         self.calls
             .iter()
             .filter_map(|c| match c {
-                Call::Deploy(p) => Some(p.clone()),
+                Call::Deploy(d) => Some(d.clone()),
                 _ => None,
             })
             .collect()
@@ -393,32 +399,62 @@ impl World for Fake {
         Ok(())
     }
 
-    fn deploy(&mut self, site: &Path, _out: &mut dyn std::io::Write) -> Ran {
-        self.calls.push(Call::Deploy(site.to_path_buf()));
-        let fail = |log: &str| Ran {
-            code: 1,
-            log: log.into(),
-        };
+    fn deploy(
+        &mut self,
+        plan: &hosting::Plan,
+        key: Option<&Path>,
+        message: &str,
+        _out: &mut dyn std::io::Write,
+    ) -> Result<Released, Failed> {
+        self.calls.push(Call::Deploy(Deployed {
+            files: plan.files.iter().map(|f| f.path.clone()).collect(),
+            key: key.map(Path::to_path_buf),
+            message: message.into(),
+        }));
+        let version = "sites/fixture-site/versions/v1".to_string();
         match self.deploy {
-            Deploy::AuthErr => {
-                return fail(
-                    "==> Deploying site…\nError: Authentication Error: Your credentials are no \
-                     longer valid. Please run firebase login --reauth\n",
-                );
+            Deploy::NoKey => {
+                return Err(Failed::Credential(
+                    "no service-account key is named (FIREBASE_SA_KEY, or publish/site.toml's \
+                     firebase_sa_key)"
+                        .into(),
+                ));
             }
-            Deploy::NoCli => {
-                return fail(
-                    "firebase-tools is not installed. Run:  npm install -g firebase-tools\n",
-                );
+            Deploy::Refused => {
+                return Err(Failed::Credential(
+                    "the token endpoint refused the service-account key deployer@fixture: HTTP \
+                     400: invalid_grant: Invalid JWT Signature."
+                        .into(),
+                ));
             }
-            Deploy::Fail => return fail("Error: HTTP Error: 500, Internal Server Error\n"),
-            Deploy::OddFail => return fail("Error: An unexpected error has occurred.\n"),
+            Deploy::Unreleased => {
+                return Err(Failed::NotReleased {
+                    why: "uploading /index.html (ab12): HTTP 503: backend unavailable".into(),
+                    version: Some(version),
+                });
+            }
+            Deploy::ReleaseFails => {
+                return Err(Failed::Release {
+                    why: "HTTP 500: internal error".into(),
+                    version,
+                });
+            }
             Deploy::Ok | Deploy::Stale | Deploy::Ghost => {}
         }
         let engine = self.live.join("assets/term/engine.js");
         let old_engine = std::fs::read(&engine).ok();
         let _ = std::fs::remove_dir_all(&self.live);
-        copy_tree(&site.join("public"), &self.live);
+        for f in &plan.files {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(
+                &mut aterm_codec::inflate::stream::GzipReader::new(f.gz.as_slice()),
+                &mut bytes,
+            )
+            .unwrap();
+            let path = self.live.join(&f.path[1..]);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
         if let (Deploy::Stale, Some(old)) = (self.deploy, old_engine) {
             std::fs::write(&engine, old).unwrap();
         }
@@ -429,23 +465,12 @@ impl World for Fake {
             )
             .unwrap();
         }
-        Ran {
-            code: 0,
-            log: "Done.\n".into(),
-        }
-    }
-
-    fn firebase_refuses(
-        &mut self,
-        _site: &Path,
-        account: Option<&str>,
-        _key: Option<&Path>,
-    ) -> Option<String> {
-        self.calls.push(Call::Firebase {
-            account: account.map(str::to_string),
-        });
-        (!self.firebase_ok)
-            .then(|| "Error: Authentication Error: Your credentials are no longer valid.".into())
+        Ok(Released {
+            release: "sites/fixture-site/releases/r1".into(),
+            version,
+            files: plan.files.len(),
+            uploaded: plan.files.len(),
+        })
     }
 
     fn sleep(&mut self, _secs: u64) {}
@@ -602,13 +627,7 @@ impl Lab {
             let _ = std::fs::remove_dir_all(d);
         }
         copy_tree(&fixture("public"), &self.site.join("public"));
-        let deploy = self.site.join("deploy.sh");
-        std::fs::write(&deploy, "#!/bin/sh\n# fixture; never run\nexit 64\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&deploy, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        std::fs::copy(fixture("firebase.json"), self.site.join("firebase.json")).unwrap();
         self.git.ok(
             &self.root,
             &[
@@ -656,9 +675,9 @@ impl Lab {
             verify_retries: 2,
             verify_sleep: 0,
             today: TODAY.into(),
-            firebase_account: Some("owner@example.invalid".into()),
+            firebase_site: Some("fixture-site".into()),
             firebase_sa_key: None,
-            firebase_sa_key_in_site: None,
+            firebase_sa_key_in_site: Some("../deployer.json".into()),
             author: Some(("Andrew Yates (pub)".into(), "pub@example.invalid".into())),
             subject_prefix: "site: ".into(),
             wasm_pin: Some(PIN.into()),
@@ -684,7 +703,6 @@ impl Lab {
             home: self.root.join("home"),
             engine: EngineFault::None,
             deploy: Deploy::Ok,
-            firebase_ok: true,
             git: self.git.clone(),
             signals: Rc::default(),
             calls: Vec::new(),
@@ -742,6 +760,36 @@ impl Lab {
             self.git
                 .ok(&self.origin, &["config", "--unset", "receive.maxInputSize"]);
         }
+    }
+}
+
+/// Every file under `site`'s public/ as the site serves it (`/` and its path), sorted.
+fn public_files(site: &Path) -> Vec<String> {
+    let public = site.join("public");
+    let mut found = Vec::new();
+    let mut dirs = vec![public.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                let rel = path.strip_prefix(&public).unwrap().to_string_lossy();
+                found.push(format!("/{rel}"));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// The one deploy a sync of `lab` hands Hosting: public/ as it is now, the key
+/// publish/site.toml names under the site checkout, released for the public commit.
+fn the_deploy(lab: &Lab) -> Deployed {
+    Deployed {
+        files: public_files(&lab.site),
+        key: Some(lab.site.canonicalize().unwrap().join("../deployer.json")),
+        message: format!("ship site: {SLUG} @ {}", &lab.public_sha[..12]),
     }
 }
 
@@ -961,7 +1009,13 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
     want.sort();
     assert_eq!(committed, want);
     assert_eq!(lab.status(), "");
-    assert_eq!(world.deploys(), std::slice::from_ref(&lab.site));
+    assert_eq!(world.deploys(), [the_deploy(&lab)]);
+    assert!(
+        world.deploys()[0]
+            .files
+            .contains(&"/releases.html".to_string()),
+        "the plan is public/ as committed, the sync's new pages among it"
+    );
     assert!(!lab.owed_marker().exists(), "shipped: nothing is owed");
     assert!(
         world
@@ -1088,6 +1142,30 @@ fn a_dry_run_plans_and_changes_nothing() {
             "{out}"
         );
         assert!(world.builds().is_empty() && world.deploys().is_empty());
+        assert!(
+            out.contains(
+                "hosting plan: site fixture-site; config cleanUrls, headers, \
+                 trailingSlashBehavior;"
+            ),
+            "{out}"
+        );
+        for planned in [
+            "/releases.html",
+            "/install.sh",
+            "/index.html",
+            "/assets/releases.css",
+        ] {
+            assert!(
+                out.lines()
+                    .any(|l| l.trim_start().starts_with(&format!("{planned} "))
+                        && l.contains("gzipped, sha256 ")),
+                "{planned} is in the plan with its size and hash\n{out}"
+            );
+        }
+        assert!(
+            out.contains("engine's rebuilt files are not in this plan"),
+            "{out}"
+        );
         assert_eq!(lab.status(), "");
         assert_eq!(lab.head(), before);
         assert!(!lab.site.join("public/releases.html").exists());
@@ -1127,18 +1205,18 @@ fn no_usable_site_checkout_touches_nothing() {
         Ok(Outcome::NoCheckout(why)) => assert!(why.contains("site checkout not found"), "{why}"),
         other => panic!("{other:?}\n{out}"),
     }
-    std::fs::remove_file(lab.site.join("deploy.sh")).unwrap();
+    std::fs::remove_file(lab.site.join("firebase.json")).unwrap();
     let (ended, out) = lab.run(&mut world);
     match &ended {
         Ok(Outcome::NoCheckout(why)) => {
-            assert!(why.contains("has no executable deploy.sh"), "{why}");
+            assert!(why.contains("has no firebase.json"), "{why}");
             assert!(!why.contains("not found"), "{why}");
         }
         other => panic!("{other:?}\n{out}"),
     }
     assert_eq!(crate::site::report(&ended), 3);
     assert!(world.calls.is_empty(), "{:?}", world.calls);
-    assert_eq!(lab.status(), "D web/site/deploy.sh");
+    assert_eq!(lab.status(), "D web/site/firebase.json");
     let (ended, _) = lab.sync(
         &Options {
             skip: true,
@@ -1152,53 +1230,56 @@ fn no_usable_site_checkout_touches_nothing() {
 }
 
 #[test]
-fn a_missing_firebase_login_commits_and_pushes_but_never_hides_a_real_failure() {
+fn a_missing_or_refused_key_commits_and_pushes_but_never_hides_a_real_failure() {
     at_once(
         [
-            (Deploy::AuthErr, true, false),
-            (Deploy::NoCli, true, false),
-            (Deploy::Fail, true, true),
-            (Deploy::OddFail, false, false),
-            (Deploy::OddFail, true, true),
+            (Deploy::NoKey, None),
+            (Deploy::Refused, None),
+            (
+                Deploy::Unreleased,
+                Some("the live site still serves its previous release"),
+            ),
+            (Deploy::ReleaseFails, Some("whether the live site switched")),
         ],
-        a_missing_firebase_login_case,
+        a_key_case,
     );
 }
 
-fn a_missing_firebase_login_case((deploy, firebase_ok, want_failure): (Deploy, bool, bool)) {
+fn a_key_case((deploy, failure): (Deploy, Option<&str>)) {
     let lab = Lab::new();
     let mut world = lab.fake("releases-fat.json");
     world.deploy = deploy;
-    world.firebase_ok = firebase_ok;
     let (ended, out) = lab.run(&mut world);
-    if want_failure {
-        assert_eq!(failed_child(ended, &out).0, "deploy.sh", "{deploy:?}");
-        assert_eq!(
-            world.count(|c| *c
-                == Call::Firebase {
-                    account: Some("owner@example.invalid".into())
-                }),
-            1,
-            "{deploy:?}: the login was asked, with deploy.sh's account"
-        );
-    } else {
-        assert_eq!(ended, Ok(Outcome::NotDeployed), "{deploy:?}\n{out}");
-        assert_eq!(
-            out.lines().last(),
-            Some(
-                format!(
-                    "SITE NOT DEPLOYED — committed and pushed; deploy later with: (cd {} && \
-                     ./deploy.sh)",
-                    lab.site.display()
-                )
-                .as_str()
-            )
-        );
-        assert!(
-            lab.owed_marker().is_file(),
-            "{deploy:?}: the commit stays owed"
-        );
+    match failure {
+        Some(said) => {
+            let (child, why) = failed_child(ended, &out);
+            assert_eq!(child, "firebase hosting", "{deploy:?}");
+            assert!(why.contains(said), "{deploy:?}: {why}");
+            assert!(
+                why.contains(DEPLOY_LATER),
+                "{deploy:?}: the rerun is named: {why}"
+            );
+            assert!(
+                why.contains("sites/fixture-site/versions/v1"),
+                "{deploy:?}: {why}"
+            );
+        }
+        None => {
+            assert_eq!(ended, Ok(Outcome::NotDeployed), "{deploy:?}\n{out}");
+            let last = out.lines().last().unwrap_or_default();
+            assert!(
+                last.starts_with("SITE NOT DEPLOYED — committed and pushed, but ")
+                    && last.ends_with(&format!("; deploy later with: {DEPLOY_LATER}"))
+                    && last.contains("nothing was published"),
+                "{deploy:?}: {last}"
+            );
+        }
     }
+    assert_eq!(world.deploys(), [the_deploy(&lab)], "{deploy:?}");
+    assert!(
+        lab.owed_marker().is_file(),
+        "{deploy:?}: the commit stays owed"
+    );
     assert_eq!(
         lab.head(),
         lab.origin_main(),
@@ -1208,6 +1289,140 @@ fn a_missing_firebase_login_case((deploy, firebase_ok, want_failure): (Deploy, b
         world.count(|c| matches!(c, Call::Live(_))),
         0,
         "{deploy:?}: no live claim"
+    );
+}
+
+#[test]
+fn redeploy_deploys_the_committed_site_when_nothing_changed() {
+    let lab = Lab::new();
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.run(&mut world);
+    deployed(&ended, &out);
+    world.calls.clear();
+    let (ended, out) = lab.run(&mut world);
+    assert_eq!(ended, Ok(Outcome::Synced { deployed: false }), "{out}");
+    assert!(world.deploys().is_empty());
+    let head = lab.head();
+    let (ended, out) = lab.sync(
+        &Options {
+            redeploy: true,
+            ..Options::default()
+        },
+        &lab.env(),
+        &mut world,
+    );
+    deployed(&ended, &out);
+    assert!(out.contains("--redeploy: nothing changed"), "{out}");
+    assert_eq!(world.deploys(), [the_deploy(&lab)]);
+    assert_eq!(lab.head(), head, "no commit");
+}
+
+#[test]
+fn a_firebase_json_the_deploy_cannot_express_is_refused_first() {
+    let lab = Lab::new();
+    for (text, named) in [
+        (
+            r#"{"hosting": {"public": "public", "rewrites": [{"source": "**", "function": "app"}]}}"#,
+            "function",
+        ),
+        (
+            r#"{"hosting": {"public": "public", "ignore": ["**/*.{map,log}"]}}"#,
+            "hosting.ignore",
+        ),
+    ] {
+        std::fs::write(lab.site.join("firebase.json"), text).unwrap();
+        let mut world = lab.fake("releases-fat.json");
+        let (ended, out) = lab.run(&mut world);
+        let why = refused(ended, &out, Refusal::Hosting);
+        assert!(why.contains(named), "{why}");
+        assert!(world.calls.is_empty(), "{:?}", world.calls);
+        assert_eq!(
+            lab.status(),
+            "M web/site/firebase.json",
+            "nothing else touched"
+        );
+    }
+}
+
+#[test]
+fn a_file_under_public_the_deploy_cannot_take_is_refused_first() {
+    let key = hosting::key::tests::key_json("https://oauth2.googleapis.com/token");
+    for (case, named) in [("link", "not a regular file"), ("key", "private key")] {
+        let lab = Lab::new();
+        let public = lab.site.join("public");
+        let planted = public.join(if case == "link" {
+            "alias.html"
+        } else {
+            "deployer.json"
+        });
+        if case == "link" {
+            std::os::unix::fs::symlink("index.html", &planted).unwrap();
+        } else {
+            std::fs::write(&planted, &key).unwrap();
+        }
+        lab.git
+            .commit_all(&lab.site_root, "site: a file the deploy cannot take");
+        lab.git
+            .ok(&lab.site_root, &["push", "-q", "origin", "main"]);
+        let (head, origin) = (lab.head(), lab.origin_main());
+        let mut world = lab.fake("releases-fat.json");
+        let (ended, out) = lab.run(&mut world);
+        let why = refused(ended, &out, Refusal::Hosting);
+        assert!(why.contains(named), "{case}: {why}");
+        assert!(world.calls.is_empty(), "{case}: {:?}", world.calls);
+        assert_eq!(
+            (lab.head(), lab.origin_main()),
+            (head, origin),
+            "{case}: nothing committed or pushed"
+        );
+        assert_eq!(lab.status(), "", "{case}: nothing written");
+
+        std::fs::remove_file(&planted).unwrap();
+        lab.git.commit_all(&lab.site_root, "site: the file is gone");
+        lab.git
+            .ok(&lab.site_root, &["push", "-q", "origin", "main"]);
+        let mut world = lab.fake("releases-fat.json");
+        let (ended, out) = lab.run(&mut world);
+        deployed(&ended, &out);
+    }
+}
+
+#[test]
+fn firebase_jsons_site_and_the_configured_site_must_agree() {
+    let lab = Lab::new();
+    let with_site = |site: &str| {
+        let mut doc: aterm_json::Value =
+            aterm_json::from_str(&read(&fixture("firebase.json"))).unwrap();
+        let hosting = doc.as_object_mut().unwrap().get_mut("hosting").unwrap();
+        hosting
+            .as_object_mut()
+            .unwrap()
+            .insert("site".into(), site.into());
+        std::fs::write(lab.site.join("firebase.json"), doc.to_string()).unwrap();
+    };
+    with_site("other-site");
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.run(&mut world);
+    let why = refused(ended, &out, Refusal::Hosting);
+    assert!(
+        why.contains("\"other-site\"") && why.contains("\"fixture-site\""),
+        "{why}"
+    );
+    assert!(world.calls.is_empty(), "{:?}", world.calls);
+    assert_eq!(
+        lab.status(),
+        "M web/site/firebase.json",
+        "nothing else touched"
+    );
+
+    let mut env = lab.env();
+    env.firebase_site = None;
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.sync(&Options::default(), &env, &mut world);
+    deployed(&ended, &out);
+    assert!(
+        out.contains("deploying to Firebase Hosting site other-site"),
+        "firebase.json's site, as firebase-tools deploys to it: {out}"
     );
 }
 
@@ -1253,7 +1468,7 @@ fn an_interrupt_starts_nothing_further() {
     );
     assert!(world.deploys().is_empty());
     assert_eq!(
-        world.count(|c| matches!(c, Call::Live(_) | Call::Firebase { .. })),
+        world.count(|c| matches!(c, Call::Live(_) | Call::Deploy(_))),
         0
     );
     assert_eq!(
@@ -1641,7 +1856,7 @@ fn a_site_dir_with_spaces_syncs() {
     assert_eq!(lab.status(), "");
     let (ended, out) = lab.run(&mut world);
     deployed(&ended, &out);
-    assert_eq!(world.deploys(), std::slice::from_ref(&lab.site));
+    assert_eq!(world.deploys(), [the_deploy(&lab)]);
     assert_eq!(lab.head(), lab.origin_main());
 }
 
@@ -1931,7 +2146,7 @@ fn a_failed_pull_and_its_remedy_end_in_a_deploy_and_an_owed_commit_is_shipped_on
 
 #[test]
 fn an_undeployed_sync_commit_is_deployed_by_the_next_run() {
-    at_once([Deploy::Ok, Deploy::AuthErr], |first| {
+    at_once([Deploy::Ok, Deploy::Refused, Deploy::Unreleased], |first| {
         let lab = Lab::new();
         let mut world = lab.fake("releases-fat.json");
         world.deploy = first;
@@ -1940,7 +2155,11 @@ fn an_undeployed_sync_commit_is_deployed_by_the_next_run() {
             ..Options::default()
         };
         let (ended, out) = lab.sync(&opts, &lab.env(), &mut world);
-        assert!(ended.is_ok(), "{ended:?}\n{out}");
+        assert_eq!(
+            ended.is_ok(),
+            first != Deploy::Unreleased,
+            "{first:?}: {ended:?}\n{out}"
+        );
         assert!(lab.owed_marker().is_file(), "{first:?}");
         world.deploy = Deploy::Ok;
         world.calls.clear();

@@ -99,7 +99,7 @@ echo-limit	render::echo_limit	∀ rows: u16: result = max(rows / 4, 1), the most
 answer-byte	tui::answer_byte	The byte a key answers with: the ASCII it types with no chord, DEL for Backspace, ESC for Escape, BEL for `C-g`; none for any other key.	Gap 1 (`&Key`, a `#[non_exhaustive]` enum over `NamedKey` and `char`, and `Option<char>`); its classes are `save-answer`, `discard-answer` and `cancel-answer` (§1).
 ```
 
-## 3. Test → spec map (all 28)
+## 3. Test → spec map
 
 No test is deleted. Each one also reaches code the proofs do not (a wrapper over an enum or a
 struct, a trait object, or another crate's parser), so each stays until that code is provable.

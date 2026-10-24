@@ -250,6 +250,8 @@ impl Server {
             std::fs::remove_file(&config.socket)?;
         }
         let listener = UnixListener::bind(&config.socket)?;
+        // The keeper spawns every session's program: keep its sockets out of them all.
+        aterm_uds::keep_out_of_children(&listener)?;
         prove_socket_is_ours(dir, &config.socket)?;
         listener.set_nonblocking(true)?;
         sys::raise_nofile();
@@ -386,6 +388,7 @@ impl Server {
                 Ok((s, _)) => s,
                 Err(_) => return,
             };
+            let _ = aterm_uds::keep_out_of_children(&stream);
             let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
             let _ = stream.set_write_timeout(Some(IO_TIMEOUT));

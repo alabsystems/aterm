@@ -1025,7 +1025,7 @@ impl Password {
                 }
                 self.replace(SecretBytes::new(Vec::new()));
             }
-            TextInputEvent::Delete => {
+            TextInputEvent::Delete | TextInputEvent::DeleteWordForward => {
                 if self.anchor == self.head {
                     self.anchor = (self.head + 1).min(self.count());
                 }
@@ -1412,6 +1412,7 @@ impl SystemStateApp {
             | TextInputEvent::KillToEnd
             | TextInputEvent::KillToStart
             | TextInputEvent::DeleteWordBackward
+            | TextInputEvent::DeleteWordForward
             | TextInputEvent::Undo
             | TextInputEvent::Redo => true,
             TextInputEvent::Left { .. }
@@ -1460,6 +1461,7 @@ impl SystemStateApp {
             TextInputEvent::KillToEnd => self.url.kill_to_end(),
             TextInputEvent::KillToStart => self.url.kill_to_start(),
             TextInputEvent::DeleteWordBackward => self.url.delete_word_backward(),
+            TextInputEvent::DeleteWordForward => self.url.delete_word_forward(),
             TextInputEvent::SelectAll => self.url.select_all(),
             TextInputEvent::Undo => {
                 self.url.undo();

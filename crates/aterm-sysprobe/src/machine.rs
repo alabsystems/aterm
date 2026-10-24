@@ -619,6 +619,28 @@ pub fn gpu() -> Option<GpuReading> {
     }
 }
 
+/// The GPU driver's identity: the accelerator entry's `CFBundleIdentifier` and `IOSourceVersion`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GpuDriver {
+    /// The driver kext's bundle identifier (such as `com.apple.AGXG17G`), where the entry gives it.
+    pub bundle: Option<String>,
+    /// The driver's source version (such as `360.34.5`), where the entry gives it.
+    pub version: Option<String>,
+}
+
+/// Read the GPU driver's identity afresh, or `None` where no accelerator entry is found (always off macOS).
+#[must_use]
+pub fn gpu_driver() -> Option<GpuDriver> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::gpu_driver()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// One GPU user client: a process's connection to the accelerator, with the GPU time its queues
 /// ran.
 #[derive(Clone, Debug, PartialEq, Eq)]

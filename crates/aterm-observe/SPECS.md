@@ -87,7 +87,7 @@ aterm-regex `step-budget-contract`, `pikevm-linear-cost`, `step-cost-lower-bound
 `obs-terminal-watch-arm-eval` and the grid model, together with `observe-verdict-trichotomy`, then give
 `watch-rows-match-latch` and `watch-rows-gone-latch`.
 
-## 2. Test → spec map (TSV; all 11)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples. All
 tests are in `crates/aterm-observe/src/lib.rs`, `mod tests`.

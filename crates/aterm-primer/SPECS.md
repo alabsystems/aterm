@@ -136,7 +136,7 @@ cli-remove	contract	agents_report_with_xdg, rewrite, remove_block, read_skill	re
 status-line	contract	status_line, status_line_with_xdg	∀ home, xdg, σ: status_line_with_xdg(home, xdg) == join(", ", one row per a ∈ AF), read-only. Row = a.name + " " + w, w ∈ {"not detected" for NotDetected, "absent" for NoFile or Absent, "installed" for Current, "stale" for Stale, "newer" for Newer, "ERROR: " + e}. When Det(a), the row is followed, ∀ s ∈ skills_for(a.name) with skill_status ≠ Ok(Current), by " (skill " + doc_label(s.path) + " " + w' + ")", w' ∈ {"absent", "stale", "yours, left alone", "ERROR: " + e}. When no error message contains '\n', the line contains no '\n'.	-	0,1,3,7,8	MEDIUM-HARD: read-only fs, map/collect/join, continue in a loop, write! to String
 ```
 
-## 2. Test → spec map (TSV; all 38)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 A test is deleted only when its primary and every `also` spec are proved. The two tests of §4

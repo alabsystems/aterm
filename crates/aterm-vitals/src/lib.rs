@@ -8,6 +8,8 @@
 pub mod delegated;
 pub mod events;
 pub mod explain;
+#[cfg(any(test, debug_assertions))]
+pub mod fixtures;
 pub mod gpu_clients;
 pub mod history;
 pub mod ink;
@@ -19,6 +21,7 @@ pub mod ring;
 pub mod sys;
 pub mod trend;
 pub mod words;
+pub mod writes;
 
 pub use gpu_clients::{GpuClientRow, GpuClientsSample, GpuSplit};
 pub use history::{Filling, FreeHistory, Rates};
@@ -34,3 +37,4 @@ pub use model::{
 pub use peaks::{DailyMax, PeakRow, Peaks, PlanDay, PlanWeek};
 pub use ring::{Bucket, BucketRing, Cell};
 pub use trend::{History, Motion, Trend, TrendView};
+pub use writes::{ProgramHour, WriteHour};

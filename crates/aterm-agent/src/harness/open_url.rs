@@ -183,14 +183,12 @@ pub fn percent_encode(input: &str) -> String {
 pub fn extract_query_param(url: &str, key: &str) -> Option<String> {
     let (_, query) = url.split_once('?')?;
     let query = query.split('#').next().unwrap_or(query);
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=')
-            && percent_decode(k) == key
-        {
-            return Some(percent_decode(v));
-        }
-    }
-    None
+    let mut values = query.split('&').filter_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (percent_decode(k) == key).then(|| percent_decode(v))
+    });
+    let first = values.next()?;
+    values.all(|v| v == first).then_some(first)
 }
 
 /// Extract the hinted email (`login_hint` or `email`) from an OAuth authorize URL.
@@ -244,7 +242,136 @@ pub(super) fn split_header_body(s: &str) -> Option<(&str, &str)> {
     }
 }
 
-pub(super) fn is_mime_boundary_line(line: &str) -> bool {
+fn multipart_boundary(headers: &str) -> Option<String> {
+    let value = unfold_rfc5322_headers(headers)
+        .into_iter()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("content-type")
+                .then(|| value.trim().to_owned())
+        })?;
+    let (media, params) = value.split_once(';')?;
+    if !media.trim().to_ascii_lowercase().starts_with("multipart/") {
+        return None;
+    }
+    let mut bytes = params.bytes().peekable();
+    while bytes.peek().is_some() {
+        let mut name = Vec::new();
+        for byte in bytes.by_ref() {
+            if byte == b'=' || byte == b';' {
+                if byte == b';' {
+                    name.clear();
+                    continue;
+                }
+                break;
+            }
+            name.push(byte);
+        }
+        while bytes.peek().is_some_and(u8::is_ascii_whitespace) {
+            bytes.next();
+        }
+        let mut val = Vec::new();
+        if bytes.peek() == Some(&b'"') {
+            bytes.next();
+            loop {
+                match bytes.next()? {
+                    b'"' => break,
+                    b'\\' => val.push(bytes.next()?),
+                    byte => val.push(byte),
+                }
+            }
+            while bytes.peek().is_some_and(u8::is_ascii_whitespace) {
+                bytes.next();
+            }
+            if bytes.next().is_some_and(|byte| byte != b';') {
+                return None;
+            }
+        } else {
+            for byte in bytes.by_ref() {
+                if byte == b';' {
+                    break;
+                }
+                val.push(byte);
+            }
+            while val.last().is_some_and(u8::is_ascii_whitespace) {
+                val.pop();
+            }
+        }
+        if String::from_utf8(name)
+            .ok()?
+            .trim()
+            .eq_ignore_ascii_case("boundary")
+        {
+            let boundary = String::from_utf8(val).ok()?;
+            return ((1..=70).contains(&boundary.len())
+                && !boundary.ends_with(' ')
+                && boundary
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"'()+_,-./:=? ".contains(&b)))
+            .then_some(boundary);
+        }
+    }
+    None
+}
+
+/// Active declared delimiters at each header/body transition. Only real header blocks
+/// contribute parameters; text in a part cannot declare a boundary. Nested multiparts keep
+/// their ancestors until a closing delimiter or an outer boundary ends them.
+fn mime_boundary_contexts(input: &str) -> Option<Vec<(usize, Vec<String>)>> {
+    let mut active: Vec<String> = Vec::new();
+    let mut contexts = vec![(0, Vec::new())];
+    let mut header_start = Some(0);
+    let mut offset = 0;
+    for line in input.split_inclusive('\n') {
+        let next = offset + line.len();
+        let after_dashes = line.strip_prefix("--");
+        if let Some((at, boundary)) =
+            active.iter().enumerate().rev().find(|(_, boundary)| {
+                after_dashes.is_some_and(|s| s.starts_with(boundary.as_str()))
+            })
+        {
+            let closed = after_dashes.is_some_and(|s| s[boundary.len()..].starts_with("--"));
+            active.truncate(at + usize::from(!closed));
+            contexts.push((next, active.clone()));
+            header_start = (!closed).then_some(next);
+        } else if line.trim_end_matches(['\r', '\n']).is_empty()
+            && let Some(start) = header_start.take()
+        {
+            if let Some(boundary) = multipart_boundary(&input[start..offset]) {
+                // Bound malformed nesting, without guessing how an encoded body ends.
+                if active.len() == 16 {
+                    return None;
+                }
+                active.push(boundary);
+            }
+            contexts.push((next, active.clone()));
+        }
+        offset = next;
+    }
+    Some(contexts)
+}
+
+fn mime_boundaries_at(contexts: &[(usize, Vec<String>)], offset: usize) -> &[String] {
+    contexts
+        .get(
+            contexts
+                .partition_point(|(at, _)| *at <= offset)
+                .saturating_sub(1),
+        )
+        .map_or(&[], |(_, boundaries)| boundaries.as_slice())
+}
+
+pub(super) fn is_mime_boundary_line(line: &str, declared: &[String]) -> bool {
+    if !declared.is_empty() {
+        return line.strip_prefix("--").is_some_and(|tail| {
+            declared
+                .iter()
+                .any(|boundary| tail.starts_with(boundary.as_str()))
+        });
+    }
+    // Headerless MIME fragments from mailbox JSON have no boundary parameter. Keep their
+    // existing delimiter heuristic, including ordinary divider and comment-line exclusions.
     let trimmed = line.trim_end_matches(['\r', '\n', ' ', '\t']);
     let Some(after_dashes) = trimmed.strip_prefix("--") else {
         return false;
@@ -286,19 +413,22 @@ fn part_opening_boundary(before_header: &str) -> Option<&str> {
         if trimmed.is_empty() {
             return None;
         }
-        if is_mime_boundary_line(trimmed) {
+        if is_mime_boundary_line(trimmed, &[]) {
             return Some(trimmed);
         }
     }
     None
 }
 
-fn is_part_end_boundary(line: &str, open_boundary: Option<&str>) -> bool {
+fn is_part_end_boundary(line: &str, open_boundary: Option<&str>, declared: &[String]) -> bool {
+    if !declared.is_empty() {
+        return is_mime_boundary_line(line, declared);
+    }
     let trimmed = line.trim_end_matches(['\r', '\n', ' ', '\t']);
     if let Some(bound) = open_boundary {
         trimmed == bound || trimmed.strip_prefix(bound) == Some("--")
     } else {
-        is_mime_boundary_line(trimmed)
+        is_mime_boundary_line(trimmed, &[])
     }
 }
 
@@ -698,6 +828,9 @@ pub(super) fn extract_rfc5322_subject(raw_email: &str) -> Option<String> {
 }
 
 pub(super) fn decode_mime_base64_parts(raw_email: &str) -> String {
+    let Some(contexts) = mime_boundary_contexts(raw_email) else {
+        return String::new();
+    };
     let mut decoded_parts = String::new();
     let mut search_from = 0usize;
     while let Some(rel) = find_ascii_ci(&raw_email[search_from..], "content-transfer-encoding") {
@@ -731,17 +864,18 @@ pub(super) fn decode_mime_base64_parts(raw_email: &str) -> String {
             .trim_matches('"')
             .to_ascii_lowercase()
             .starts_with("base64");
+        let declared = mime_boundaries_at(&contexts, pos);
         let open_bound = part_opening_boundary(&raw_email[..pos]);
         if is_b64
             && let Some((hdr_rest, body_start)) = split_header_body(from_hdr)
             && !hdr_rest
                 .lines()
-                .any(|l| is_part_end_boundary(l, open_bound))
+                .any(|line| is_part_end_boundary(line, open_bound, declared))
         {
             let mut body_end = body_start.len();
             let mut offset = 0usize;
             for line in body_start.split_inclusive('\n') {
-                if is_part_end_boundary(line, open_bound) {
+                if is_part_end_boundary(line, open_bound, declared) {
                     body_end = offset;
                     break;
                 }
@@ -764,6 +898,9 @@ pub(super) fn decode_qp_mime_parts(input: &str) -> String {
     if find_ascii_ci(input, "quoted-printable").is_none() {
         return input.to_owned();
     }
+    let Some(contexts) = mime_boundary_contexts(input) else {
+        return input.to_owned();
+    };
     let mut out = String::with_capacity(input.len());
     let mut cursor = 0usize;
     let mut search_from = 0usize;
@@ -798,18 +935,19 @@ pub(super) fn decode_qp_mime_parts(input: &str) -> String {
             .trim_matches('"')
             .to_ascii_lowercase()
             .starts_with("quoted-printable");
+        let declared = mime_boundaries_at(&contexts, pos);
         let open_bound = part_opening_boundary(&input[..pos]);
         if is_qp
             && let Some((hdr_rest, body_start)) = split_header_body(from_hdr)
             && !hdr_rest
                 .lines()
-                .any(|l| is_part_end_boundary(l, open_bound))
+                .any(|line| is_part_end_boundary(line, open_bound, declared))
         {
             let body_offset = pos + (from_hdr.len() - body_start.len());
             let mut body_end = body_start.len();
             let mut offset = 0usize;
             for line in body_start.split_inclusive('\n') {
-                if is_part_end_boundary(line, open_bound) {
+                if is_part_end_boundary(line, open_bound, declared) {
                     body_end = offset;
                     break;
                 }
@@ -852,6 +990,58 @@ fn contains_matching_email(text: &str, target: &str) -> bool {
     })
 }
 
+fn same_base_mailbox_different_tag(addr: &str, target: &str) -> bool {
+    let Some((la, da)) = addr.trim().split_once('@') else {
+        return false;
+    };
+    let Some((lt, dt)) = target.trim().split_once('@') else {
+        return false;
+    };
+    if !da.eq_ignore_ascii_case(dt) || la.eq_ignore_ascii_case(lt) {
+        return false;
+    }
+    let base_a = la.split('+').next().unwrap_or(la);
+    let base_t = lt.split('+').next().unwrap_or(lt);
+    !base_a.is_empty() && base_a.eq_ignore_ascii_case(base_t)
+}
+
+fn contains_conflicting_plus_sibling(text: &str, target: &str) -> bool {
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '<' | '>' | ',' | ';' | '"' | '\'' | '(' | ')' | '[' | ']' | ':'
+            )
+    })
+    .filter(|tok| tok.contains('@'))
+    .any(|tok| {
+        let cleaned = tok.trim_matches('.');
+        same_base_mailbox_different_tag(cleaned, target)
+    })
+}
+
+fn is_primary_recipient_key(key_lower: &str) -> bool {
+    matches!(
+        key_lower,
+        "to" | "tofull"
+            | "to_full"
+            | "torecipients"
+            | "to_recipients"
+            | "recipients"
+            | "recipient"
+            | "cc"
+            | "ccfull"
+            | "cc_full"
+            | "ccrecipients"
+            | "cc_recipients"
+            | "bcc"
+            | "bccfull"
+            | "bcc_full"
+            | "bccrecipients"
+            | "bcc_recipients"
+    )
+}
+
 fn unfold_rfc5322_headers(head: &str) -> Vec<String> {
     let mut unfolded: Vec<String> = Vec::new();
     for line in head.lines() {
@@ -867,12 +1057,10 @@ fn unfold_rfc5322_headers(head: &str) -> Vec<String> {
     unfolded
 }
 
-fn json_value_matches_email(val: &Value, target: &str) -> bool {
+fn json_value_any_email(val: &Value, pred: &dyn Fn(&str) -> bool) -> bool {
     match val {
-        Value::String(s) => contains_matching_email(s, target),
-        Value::Array(items) => items
-            .iter()
-            .any(|item| json_value_matches_email(item, target)),
+        Value::String(s) => pred(s),
+        Value::Array(items) => items.iter().any(|item| json_value_any_email(item, pred)),
         Value::Object(map) => {
             let mut mailbox_part: Option<&str> = None;
             let mut domain_part: Option<&str> = None;
@@ -892,7 +1080,7 @@ fn json_value_matches_email(val: &Value, target: &str) -> bool {
             if let (Some(mb), Some(dom)) = (mailbox_part, domain_part)
                 && !mb.is_empty()
                 && !dom.is_empty()
-                && contains_matching_email(&format!("{mb}@{dom}"), target)
+                && pred(&format!("{mb}@{dom}"))
             {
                 return true;
             }
@@ -916,11 +1104,19 @@ fn json_value_matches_email(val: &Value, target: &str) -> bool {
                         | "envelope-to"
                         | "targets"
                         | "value"
-                ) && json_value_matches_email(v, target)
+                ) && json_value_any_email(v, pred)
             })
         }
         _ => false,
     }
+}
+
+fn json_value_matches_email(val: &Value, target: &str) -> bool {
+    json_value_any_email(val, &|s| contains_matching_email(s, target))
+}
+
+fn json_value_contains_conflicting_plus_sibling(val: &Value, target: &str) -> bool {
+    json_value_any_email(val, &|s| contains_conflicting_plus_sibling(s, target))
 }
 
 fn is_json_recipient_key(key_lower: &str) -> bool {
@@ -992,28 +1188,41 @@ fn json_value_is_nonempty(val: &Value) -> bool {
     }
 }
 
-pub(super) fn check_json_recipients(
+fn check_json_recipients_inner(
     obj: &aterm_json::Map,
     target: &str,
     depth: usize,
-) -> (bool, bool) {
+    in_envelope: bool,
+) -> (bool, bool, bool, bool) {
     if depth > 6 {
-        return (false, false);
+        return (false, false, false, false);
     }
     let mut saw_recipient = false;
-    let mut matched = false;
+    let mut primary_matched = false;
+    let mut envelope_matched = false;
+    let mut conflicting_plus = false;
     for (k, val) in obj {
         let key = k.to_ascii_lowercase();
         if is_json_recipient_key(&key) && json_value_is_nonempty(val) {
             saw_recipient = true;
-            if json_value_matches_email(val, target) {
-                matched = true;
+            if !in_envelope && is_primary_recipient_key(&key) {
+                if json_value_matches_email(val, target) {
+                    primary_matched = true;
+                }
+                if json_value_contains_conflicting_plus_sibling(val, target) {
+                    conflicting_plus = true;
+                }
+            } else if json_value_matches_email(val, target) {
+                envelope_matched = true;
             }
         } else if matches!(key.as_str(), "headers" | "header") {
             if let Some(hdr_map) = val.as_object() {
-                let (s, m) = check_json_recipients(hdr_map, target, depth + 1);
+                let (s, pm, em, cp) =
+                    check_json_recipients_inner(hdr_map, target, depth + 1, in_envelope);
                 saw_recipient |= s;
-                matched |= m;
+                primary_matched |= pm;
+                envelope_matched |= em;
+                conflicting_plus |= cp;
             } else if let Some(hdr_arr) = val.as_array() {
                 for item in hdr_arr {
                     let Some(item_obj) = item.as_object() else {
@@ -1026,16 +1235,25 @@ pub(super) fn check_json_recipients(
                                 .then(|| hv.as_str())
                                 .flatten()
                         })
-                        .unwrap_or("");
-                    if is_json_recipient_key(&hdr_name.trim().to_ascii_lowercase())
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    if is_json_recipient_key(&hdr_name)
                         && let Some((_, hv)) = item_obj.iter().find(|(hk, _)| {
                             matches!(hk.to_ascii_lowercase().as_str(), "value" | "values" | "val")
                         })
                         && json_value_is_nonempty(hv)
                     {
                         saw_recipient = true;
-                        if json_value_matches_email(hv, target) {
-                            matched = true;
+                        if !in_envelope && is_primary_recipient_key(&hdr_name) {
+                            if json_value_matches_email(hv, target) {
+                                primary_matched = true;
+                            }
+                            if json_value_contains_conflicting_plus_sibling(hv, target) {
+                                conflicting_plus = true;
+                            }
+                        } else if json_value_matches_email(hv, target) {
+                            envelope_matched = true;
                         }
                     }
                 }
@@ -1045,12 +1263,37 @@ pub(super) fn check_json_recipients(
             "envelope" | "content" | "payload" | "data" | "message" | "mail"
         ) && let Some(sub_obj) = val.as_object()
         {
-            let (s, m) = check_json_recipients(sub_obj, target, depth + 1);
+            let (s, pm, em, cp) = check_json_recipients_inner(
+                sub_obj,
+                target,
+                depth + 1,
+                in_envelope || key == "envelope",
+            );
             saw_recipient |= s;
-            matched |= m;
+            primary_matched |= pm;
+            envelope_matched |= em;
+            conflicting_plus |= cp;
         }
     }
-    (saw_recipient, matched)
+    (
+        saw_recipient,
+        primary_matched,
+        envelope_matched,
+        conflicting_plus,
+    )
+}
+
+pub(super) fn check_json_recipients(
+    obj: &aterm_json::Map,
+    target: &str,
+    depth: usize,
+) -> (bool, bool) {
+    let (saw, primary_matched, envelope_matched, conflicting_plus) =
+        check_json_recipients_inner(obj, target, depth, false);
+    (
+        saw,
+        primary_matched || (envelope_matched && !conflicting_plus),
+    )
 }
 
 pub(super) fn email_matches_target(raw_email: &str, target: &str) -> bool {
@@ -1071,6 +1314,8 @@ pub(super) fn email_matches_target(raw_email: &str, target: &str) -> bool {
     }
     let head = split_header_body(raw_email).map_or(raw_email, |(h, _)| h);
     let mut saw_recipient_header = false;
+    let mut saw_envelope_match = false;
+    let mut saw_conflicting_plus_sibling = false;
     for line in unfold_rfc5322_headers(head) {
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim().to_ascii_lowercase();
@@ -1079,16 +1324,26 @@ pub(super) fn email_matches_target(raw_email: &str, target: &str) -> bool {
                 if decoded_v.contains('@') {
                     saw_recipient_header = true;
                 }
-                if contains_matching_email(&decoded_v, target_trimmed) {
-                    return true;
+                if is_primary_recipient_key(&key) {
+                    if contains_matching_email(&decoded_v, target_trimmed) {
+                        return true;
+                    }
+                    if contains_conflicting_plus_sibling(&decoded_v, target_trimmed) {
+                        saw_conflicting_plus_sibling = true;
+                    }
+                } else if contains_matching_email(&decoded_v, target_trimmed) {
+                    saw_envelope_match = true;
                 }
             } else if key == "received" && v.to_ascii_lowercase().contains("for ") {
                 let decoded_v = decode_rfc2047_words(v);
                 if contains_matching_email(&decoded_v, target_trimmed) {
-                    return true;
+                    saw_envelope_match = true;
                 }
             }
         }
+    }
+    if saw_envelope_match && !saw_conflicting_plus_sibling {
+        return true;
     }
     if saw_recipient_header {
         return false;
@@ -1101,8 +1356,32 @@ fn is_non_auth_link(url: &str) -> bool {
     let (without_query, has_query) = lower
         .split_once('?')
         .map_or((lower.as_str(), false), |(p, q)| (p, !q.is_empty()));
-    if has_negative_url_keyword(&lower)
-        || lower.contains("email-preferences")
+    let after_scheme = without_query
+        .strip_prefix("https://")
+        .or_else(|| without_query.strip_prefix("http://"))
+        .unwrap_or(without_query);
+    let (host_port, raw_path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
+    // Tokens and state are opaque: only a path or an explicit response/action
+    // field says this link refuses a sign-in.
+    let negative_query = lower.split_once('?').is_some_and(|(_, query)| {
+        query
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .split('&')
+            .any(|pair| {
+                let Some((key, value)) = pair.split_once('=') else {
+                    return false;
+                };
+                let key = percent_decode(key).to_ascii_lowercase();
+                key == "error"
+                    || (matches!(key.as_str(), "action" | "decision" | "response")
+                        && is_negative_form_token(&percent_decode(value)))
+            })
+    });
+    if has_negative_url_keyword(raw_path)
+        || negative_query
+        || raw_path.contains("email-preferences")
         || [
             ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".css", ".js", ".woff", ".woff2",
             ".ttf", ".eot", ".otf", ".webp", ".avif",
@@ -1112,11 +1391,6 @@ fn is_non_auth_link(url: &str) -> bool {
     {
         return true;
     }
-    let after_scheme = without_query
-        .strip_prefix("https://")
-        .or_else(|| without_query.strip_prefix("http://"))
-        .unwrap_or(without_query);
-    let (host_port, raw_path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
     let host = host_port.split(':').next().unwrap_or(host_port);
     if matches!(
         host,
@@ -1979,32 +2253,40 @@ fn normalize_dot_segments(path_and_query: &str) -> String {
     let (raw_path, query) = path_and_query
         .split_once('?')
         .map_or((path_and_query, None), |(p, q)| (p, Some(q)));
-    if !raw_path.contains("/.") {
-        return path_and_query.to_owned();
-    }
-    let trailing_slash = raw_path.len() > 1
-        && (raw_path.ends_with('/') || raw_path.ends_with("/.") || raw_path.ends_with("/.."));
-    let mut stack: Vec<&str> = Vec::new();
-    for seg in raw_path.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                stack.pop();
-            }
-            s => stack.push(s),
+    // RFC 3986 §5.2.4 removes complete dot segments; empty segments keep their slashes.
+    let mut input = raw_path;
+    let mut output = String::with_capacity(path_and_query.len());
+    while !input.is_empty() {
+        if let Some(rest) = input
+            .strip_prefix("../")
+            .or_else(|| input.strip_prefix("./"))
+        {
+            input = rest;
+        } else if let Some(rest) = input.strip_prefix("/.")
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            input = if rest.is_empty() { "/" } else { rest };
+        } else if let Some(rest) = input.strip_prefix("/..")
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            input = if rest.is_empty() { "/" } else { rest };
+            output.truncate(output.rfind('/').unwrap_or(0));
+        } else if matches!(input, "." | "..") {
+            input = "";
+        } else {
+            let slash = usize::from(input.starts_with('/'));
+            let end = input[slash..]
+                .find('/')
+                .map_or(input.len(), |at| slash + at);
+            output.push_str(&input[..end]);
+            input = &input[end..];
         }
     }
-    let normalized_path = if stack.is_empty() {
-        "/".to_owned()
-    } else if trailing_slash {
-        format!("/{}/", stack.join("/"))
-    } else {
-        format!("/{}", stack.join("/"))
-    };
-    match query {
-        Some(q) => format!("{normalized_path}?{q}"),
-        None => normalized_path,
+    if let Some(query) = query {
+        output.push('?');
+        output.push_str(query);
     }
+    output
 }
 
 fn resolve_relative_url(base_url: &str, target: &str) -> String {

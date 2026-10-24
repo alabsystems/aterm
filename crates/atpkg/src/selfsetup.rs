@@ -428,16 +428,29 @@ fn strerror(code: i32) -> String {
 
 /// The programs in `app` aterm's tools may have started: each file in `Contents/MacOS` but a
 /// link, since an older toolset's `aterm-cli` starts its siblings (`atpkg` for `pkg`).
-fn bundle_programs(app: &Path) -> Vec<PathBuf> {
-    let mut programs: Vec<PathBuf> = std::fs::read_dir(app.join("Contents/MacOS"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| is_executable_file(path))
-        .collect();
+/// # Errors
+/// The directory, an entry in it or an entry's metadata cannot be read. A missing directory
+/// holds no programs; any other unread inventory proves nothing about their first starts.
+fn bundle_programs(app: &Path) -> Result<Vec<PathBuf>, String> {
+    let dir = app.join("Contents/MacOS");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read {}: {e}", dir.display())),
+    };
+    let mut programs = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("cannot read an entry in {}: {e}", dir.display()))?
+            .path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            programs.push(path);
+        }
+    }
     programs.sort();
-    programs
+    Ok(programs)
 }
 
 /// The errors of an exec the kernel refuses as no program it can run here (its format or CPU
@@ -469,7 +482,15 @@ fn bundle_unproven(
     proven: Option<&Path>,
     hang: Duration,
 ) -> Option<String> {
-    for program in bundle_programs(app) {
+    let programs = match bundle_programs(app) {
+        Ok(programs) => programs,
+        Err(why) => {
+            return Some(format!(
+                "{why}; whether every program has finished its first start cannot be told"
+            ));
+        }
+    };
+    for program in programs {
         if proven == Some(program.as_path()) {
             continue;
         }

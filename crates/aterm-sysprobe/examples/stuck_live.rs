@@ -323,6 +323,7 @@ fn sweep_proc(p: &ProcessReading) -> SweepProc {
         state: state(p.state),
         session_leader: p.session_leader,
         has_tty: p.has_tty,
+        exec: p.exec,
     }
 }
 

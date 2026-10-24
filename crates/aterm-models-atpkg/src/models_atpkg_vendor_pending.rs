@@ -6,6 +6,8 @@
 use aterm_spec::derive::*;
 
 /// Model of the two vendor-head slots moving from idle to in-flight, ready, and offered or retried.
+/// `Buggy = 1` permits one fault (`fault_used`), which keeps the mutant's state space finite for
+/// the non-vacuity sweep.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_vendor_pending_check_model() -> Model {

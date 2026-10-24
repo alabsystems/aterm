@@ -85,30 +85,19 @@ pub(crate) fn lens_scene(sc: Scene) -> Snapshot {
     }
     let f = &mut s.facts;
     f.disk_rates.rate60 = Some(16e9 / 3600.0);
-    f.writers = (0..9)
-        .map(|_| Writer {
-            name: "rustc".into(),
-            bytes_per_s: 31e6 / 9.0,
-            scope: ProcScope::Tab(3),
-        })
-        .chain([
-            Writer {
-                name: "cargo".into(),
-                bytes_per_s: 5.1e6,
-                scope: ProcScope::Tab(3),
-            },
-            Writer {
-                name: "aterm".into(),
-                bytes_per_s: 1.7e6,
-                scope: ProcScope::Aterm,
-            },
-            Writer {
-                name: "claude".into(),
-                bytes_per_s: 0.2e6,
-                scope: ProcScope::Tab(FRONT),
-            },
-        ])
-        .collect();
+    let writer = |name: &str, bytes_per_s: f64, scope, n| Writer {
+        name: name.into(),
+        bytes_per_s,
+        scope,
+        n,
+        bytes: bytes_per_s as u64,
+    };
+    f.writers = vec![
+        writer("rustc", 31e6, ProcScope::Tab(3), 9),
+        writer("cargo", 5.1e6, ProcScope::Tab(3), 1),
+        writer("aterm", 1.7e6, ProcScope::Aterm, 1),
+        writer("claude", 0.2e6, ProcScope::Tab(FRONT), 1),
+    ];
     if let Some(d) = f.disk.as_mut() {
         d.hogs = vec![
             Hog {
@@ -366,7 +355,6 @@ fn disk_forms(snap: &Snapshot, lw: f64, lh: f64) -> Vec<Vec<(String, usize, usiz
     let c = Ctx {
         snap,
         m: &m,
-        tab_key: Some(FRONT),
         panes: &[FRONT],
         tab_label: "Tab 2",
         loc: LOC,
@@ -444,7 +432,6 @@ fn a_chart_says_one_hour_ago_in_the_singular() {
         under: DAY,
         min_span: 1.0,
         mark: None,
-        gap: "asleep, not read",
     };
     let said = |n: usize, bucket_ms: i64| {
         trace_said(
@@ -474,6 +461,19 @@ fn a_chart_says_one_hour_ago_in_the_singular() {
 }
 
 #[test]
+fn a_chart_says_an_unread_span_once() {
+    let trace = Trace {
+        vals: vec![Some(5.0), None, None, Some(7.0)],
+        under: HOUR,
+        min_span: 1.0,
+        mark: None,
+    };
+    let said = trace_said("Used", "GiB", &trace, (0, 60_000), &LOC);
+    assert!(said.ends_with(" Not read from 16:01 to 16:03."), "{said}");
+    assert!(!said.contains(", not read"), "{said}");
+}
+
+#[test]
 fn the_disk_lens_says_its_reading() {
     let snap = lens_scene(Scene::Calm);
     let laid = heard(&snap, pinned(Instrument::Disk));
@@ -488,7 +488,7 @@ fn the_disk_lens_says_its_reading() {
     assert!(
         chart.starts_with("GB free over the last 24 hours: ")
             && chart.contains(" gigabytes 24 hours ago, 890 now.")
-            && chart.contains(", asleep.")
+            && chart.contains(" Not read from 21:20 to 01:30. ")
             && chart.ends_with("aterm freed 41 gigabytes at 09:12."),
         "{chart}"
     );
@@ -557,6 +557,47 @@ fn the_scope_filters_the_lists() {
     assert!(well(&global, "Biggest now").contains("WindowServer"));
 }
 
+/// "This tab"'s lists (busiest, biggest, writers, jobs) take a process of any of its panes.
+#[test]
+fn a_split_tabs_lists_take_every_pane() {
+    let snap = lens_scene(Scene::Calm);
+    let m = FaceMetrics::helvetica_neue();
+    let c = Ctx {
+        panes: &[4, 1],
+        bar: Bar::Tab,
+        ..two_columns(&snap, &m)
+    };
+    assert!(c.in_scope(ProcScope::Tab(4)) && c.in_scope(ProcScope::Tab(1)));
+    assert!(!c.in_scope(ProcScope::Tab(5)) && !c.in_scope(ProcScope::Aterm));
+}
+
+/// A program in both panes of a split front tab is one row of "this tab": rustc ×2 with both
+/// panes' cores, not two rows that each read "rustc in Tab 1".
+#[test]
+fn a_split_tabs_program_is_one_row() {
+    let snap = crate::stats_deck::tests::split_tab_running(7, 8, ["rustc", "rustc"]);
+    let input = DeckInput {
+        tab_panes: vec![8, 7],
+        tab_label: "Tab 1".into(),
+        tab_count: 2,
+        ..input(&snap, dark_inks())
+    };
+    let laid = lay_lens(
+        &shell(1024.0, 250.0, 2.0),
+        &input,
+        &Lens {
+            bar: Bar::Tab,
+            ..pinned(Instrument::Cpu)
+        },
+        &FaceMetrics::helvetica_neue(),
+        false,
+    );
+    assert_eq!(
+        well(&laid, "Busiest now in Tab 1"),
+        "rustc \u{d7}2 in Tab 1, 3.0 cores"
+    );
+}
+
 #[test]
 fn chips_say_whose_a_row_is() {
     let inks = dark_inks();
@@ -573,10 +614,15 @@ fn chips_say_whose_a_row_is() {
         line_tab: 0.0,
         boxes: Vec::new(),
     };
-    assert_eq!(chip_ink(&pen, ProcScope::Tab(FRONT), Some(FRONT)), inks.tab);
-    assert_eq!(chip_ink(&pen, ProcScope::Tab(3), Some(FRONT)), inks.aterm);
-    assert_eq!(chip_ink(&pen, ProcScope::Aterm, Some(FRONT)), inks.aterm);
-    assert_eq!(chip_ink(&pen, ProcScope::Other, Some(FRONT)), inks.machine);
+    assert_eq!(chip_ink(&pen, ProcScope::Tab(FRONT), &[FRONT]), inks.tab);
+    assert_eq!(chip_ink(&pen, ProcScope::Tab(3), &[FRONT]), inks.aterm);
+    assert_eq!(
+        chip_ink(&pen, ProcScope::Tab(3), &[FRONT, 3]),
+        inks.tab,
+        "a split tab's other pane is this tab's"
+    );
+    assert_eq!(chip_ink(&pen, ProcScope::Aterm, &[FRONT]), inks.aterm);
+    assert_eq!(chip_ink(&pen, ProcScope::Other, &[FRONT]), inks.machine);
 }
 
 #[test]
@@ -767,7 +813,6 @@ fn cpu_for(snap: &Snapshot, panes: &[u64]) -> LensLaid {
 
 fn cpu_lens(snap: &Snapshot, panes: &[u64], lw: f64, draw: bool) -> LensLaid {
     let input = DeckInput {
-        tab_key: panes.first().copied(),
         tab_panes: panes.to_vec(),
         tab_label: "Tab 1".into(),
         ..input(snap, dark_inks())
@@ -785,7 +830,6 @@ fn two_columns<'d>(snap: &'d Snapshot, m: &'d FaceMetrics) -> Ctx<'d> {
     Ctx {
         snap,
         m,
-        tab_key: Some(1),
         panes: &[1],
         tab_label: "Tab 1",
         loc: LOC,
@@ -1166,18 +1210,18 @@ fn why_nows_one_line_form_draws_the_cause_mark() {
 fn the_keys_step_and_copy_the_instruments() {
     let snap = lens_scene(Scene::Calm);
     assert_eq!(
-        lens_sentence(&snap, Instrument::Disk, Some(FRONT), &LOC),
-        words::row_sentence(Resource::Disk, &snap, Some(FRONT), &LOC)
+        lens_sentence(&snap, Instrument::Disk, &[FRONT], &LOC),
+        words::row_sentence(Resource::Disk, &snap, &[FRONT], &LOC)
     );
     assert_eq!(
-        lens_sentence(&snap, Instrument::HowToRead, None, &LOC),
+        lens_sentence(&snap, Instrument::HowToRead, &[], &LOC),
         how_to_read_words(Platform::MacOs)
     );
     assert!(
         lens_sentence(
             &snap,
             Instrument::HowToRead,
-            None,
+            &[],
             &Locale {
                 platform: Platform::Linux,
                 ..LOC

@@ -51,13 +51,13 @@ pub use procs::{
 
 pub use caps::{Cap, CapSource, Caps, Why};
 pub use machine::{
-    Capacity, Cluster, Commit, CoreTicks, CpuLayout, GpuClient, GpuClients, GpuReading,
+    Capacity, Cluster, Commit, CoreTicks, CpuLayout, GpuClient, GpuClients, GpuDriver, GpuReading,
     LinkCounters, LinkKind, LinkReading, MAX_GPU_CLIENTS, MAX_LINKS, MachineWords, MemoryDetail,
     Probe, ProcessLimits, TcpCounts, Throttle, ThrottleLevel, VmCounters, VolumeReading,
     WorkqueueLimits, capacity, caps, counts_toward_machine, cpu_layout, creator_of, gpu,
-    gpu_clients, layout_by_rank, level_names, load_average, machine_words, memory_detail,
-    net_links, net_links_into, pid_counts, process_limits, tcp_counts, tcp_counts_into, volume,
-    withdrawn_cores, workqueue_limits,
+    gpu_clients, gpu_driver, layout_by_rank, level_names, load_average, machine_words,
+    memory_detail, net_links, net_links_into, pid_counts, process_limits, tcp_counts,
+    tcp_counts_into, volume, withdrawn_cores, workqueue_limits,
 };
 
 /// Whether this Mac's kernel offers the hypervisor Virtualization.framework runs on

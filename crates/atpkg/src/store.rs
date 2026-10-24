@@ -1187,7 +1187,9 @@ fn scratch_siblings(build_dir: &Path) -> Vec<(Scratch, PathBuf)> {
         .collect()
 }
 
-pub use aterm_toolchain::layout::{ExposedBuild, spotlight_exposed_builds};
+pub use aterm_toolchain::layout::{
+    ExposedBuild, ExposedView, spotlight_exposed_builds, spotlight_exposed_views,
+};
 
 /// Whether a stage lays the tree `tree` aside, in `<build>.noindex` behind a `<build>` link
 /// ([`aterm_toolchain::layout`]'s Spotlight layout): on macOS, a tree that ships a Rust sysroot.

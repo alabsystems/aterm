@@ -212,7 +212,8 @@ pub(super) fn chunk_cells_to_rows(
     while cell_offset < cells.len() {
         let chunk_end = (cell_offset + usize::from(new_cols)).min(cells.len());
         let actual_end = adjust_chunk_boundary(cells, cell_offset, chunk_end);
-        // SAFETY: Each chunk row is returned with the same `new_pages` owner.
+        // SAFETY: Each chunk row is appended to `new_rows` and returned with
+        // the same `new_pages` owner in the enclosing reflow result.
         let mut row = unsafe { Row::new(new_cols, new_pages) };
         copy_cells_to_row(
             &mut row,

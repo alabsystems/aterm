@@ -8,6 +8,8 @@
 #[cfg(target_os = "macos")]
 mod abrew_admission;
 #[cfg(target_os = "macos")]
+mod aos_gpu_bench;
+#[cfg(target_os = "macos")]
 mod aos_phase;
 #[cfg(target_os = "macos")]
 mod aos_repair;
@@ -231,9 +233,10 @@ against a local API stub (Anthropic, Responses, Gemini or Meta). A lab is fully 
 
 usage: targo --unverified lab <command> [tag] [args]
        (tag: the first word when it names a lab that is up, else $LAB_TAG or \"lab\" and the word is an argument;
-       up, down, ps, crash and sleep take any first word as the tag; a verb that brings up its own lab defaults to a
-       tag of its own)
-  up [tag]                       start the stub, a black-hole proxy, the egress witness and a jailed private headless aterm
+       up takes one optional tag beside --window; down, ps, crash and sleep take any first word as the tag;
+       a verb that brings up its own lab defaults to a tag of its own)
+  up [tag] [--window]            start the stub, a black-hole proxy, the egress witness and a jailed private aterm
+                                 (headless by default; --window opens one real window in the same jail)
                                  (env: LAB_SURVEY=1 LAB_TRUST=1 LAB_FIRST_RUN=1 LAB_RESTORE=1 LAB_CLOCK=1
                                  LAB_HARNESS_KEYS='continue = false' LAB_ATERM_TOML LAB_COLS LAB_LINES LAB_SCALE
                                  LAB_PROXY=dead LAB_CLAUDE LAB_CODEX LAB_GEMINI LAB_AGY LAB_MUSE
@@ -416,6 +419,8 @@ Outside any lab (no jail, no stub):
                                  run Aos M4's candidate search under the pinned policy, or verify a bundle FILE offline (`--help` for details)
   aos-workers-bench --plans FILE --out DIR [--lab PATH] [--faults] [--rounds N]
                                  design §11.8's pre-registered M5b measurement: six aos-search arms in a Williams order, gates and criteria in DIR/record.txt (~60 min, ~70 with --faults; `--help` for details)
+  aos-gpu-bench --harness PATH --out DIR [--rounds N]
+                                 design §12.9's pre-registered M5a measurement: four aos_gpu arms (F I T G) in a Williams order, gates and criteria in DIR/record.md (~25 min; `--help` for details)
   aos-phase TRACE --build BUILD [--plan PLAN_HEX]
                                  re-derive a windowed aos-repair run's measured phase from its kept trace (`--help` for details)
   resource-attribution [--aterm PATH]
@@ -609,6 +614,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "aos-repair" => aos_repair::cmd_aos_repair(args),
         "aos-search" => aos_search::cmd_aos_search(args),
         "aos-workers-bench" => aos_workers_bench::cmd_aos_workers_bench(args),
+        "aos-gpu-bench" => aos_gpu_bench::cmd_aos_gpu_bench(args),
         "aos-phase" => aos_phase::cmd_aos_phase(args),
         "presence-flap" => presence::cmd_presence_flap(args),
         "meta-keys" => meta_keys::cmd_meta_keys(args),

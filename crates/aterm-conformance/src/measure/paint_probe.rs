@@ -28,6 +28,7 @@ const CAT_SLOT: Duration = Duration::from_millis(250);
 const CAT_TAIL: Duration = Duration::from_secs(1);
 const PLANE_DECAY: Duration = Duration::from_secs(1);
 const COMPANION_STILLS: usize = 3;
+/// The companion plane's caret row and column, zero-based (`ESC [10;10H`).
 const PLANE_CARET: &str = "9";
 
 const COMPANION_PLANE: &str = r"printf '\033[2J\033[10;10H'; sleep 30";

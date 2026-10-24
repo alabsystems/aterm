@@ -92,7 +92,7 @@ share the N1 model. Together they give the crate-doc contract: E(C) emits exactl
 nothing from any other arm. `cfgif-linear-recursion-depth` reuses the same induction over
 `@__arms`.
 
-## 2. Test → spec map (TSV; all 6)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

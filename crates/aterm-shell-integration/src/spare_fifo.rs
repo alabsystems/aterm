@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
-use aterm_uds::process::{Birth, pid_alive, read_birth};
+use aterm_uds::process::{Birth, ProcessPresence, process_presence, read_birth};
 
 /// `<pid>-<birth>-<sid>`: the name of session `sid`'s hold FIFO, owned by this process. Its birth
 /// ([`read_birth`], 0 where none reads) tells this process from a later one given its pid.
@@ -26,10 +26,18 @@ pub fn name(sid: &str) -> String {
     format!("{owner}-{sid}")
 }
 
-/// Release every FIFO in `dir` whose owner has ended (its pid no longer reads the birth the name
-/// records), with its `<sid>` link while that still names it: what a launch does in its control
-/// dir, so that a spare whose owner died waiting stops waiting.
+/// Release every FIFO in `dir` whose owner has ended or whose pid now has a different birth,
+/// with its `<sid>` link while that still names it. An unread identity alone releases nothing.
+/// What a launch does in its control dir, so a spare whose owner died waiting stops waiting.
 pub fn sweep_dead(dir: &Path) {
+    sweep_dead_with(dir, read_birth, process_presence);
+}
+
+fn sweep_dead_with(
+    dir: &Path,
+    birth_of: impl Fn(i32) -> Option<Birth>,
+    presence: impl Fn(i32) -> ProcessPresence,
+) {
     use std::os::unix::fs::FileTypeExt as _;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -39,7 +47,9 @@ pub fn sweep_dead(dir: &Path) {
         let Some((pid, birth, sid)) = name.to_str().and_then(name_parts) else {
             continue;
         };
-        if !entry.file_type().is_ok_and(|t| t.is_fifo()) || owner_alive(pid, birth) {
+        if !entry.file_type().is_ok_and(|t| t.is_fifo())
+            || !owner_ended(pid, birth, &birth_of, &presence)
+        {
             continue;
         }
         drop(release(&entry.path(), &dir.join(sid)));
@@ -54,17 +64,18 @@ pub fn sweep_dead(dir: &Path) {
 /// and exits. A write-only, non-blocking wake is refused (`ENXIO`) while no reader holds the FIFO,
 /// which is the instant a shell spends between reading the end and opening it again: that shell
 /// would then wait for ever on a FIFO nobody can name.
+/// If the wake cannot open, both names stay for a later sweep.
 fn release(path: &Path, link: &Path) -> Option<std::fs::File> {
     let wake = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
-        .ok();
+        .ok()?;
     if std::fs::read_link(link).is_ok_and(|to| Some(to.as_os_str()) == path.file_name()) {
         let _ = std::fs::remove_file(link);
     }
     let _ = std::fs::remove_file(path);
-    wake
+    Some(wake)
 }
 
 /// `(pid, birth, sid)` of a FIFO's name, its sid `s-<hex>` of at most 64 characters.
@@ -78,14 +89,29 @@ fn name_parts(name: &str) -> Option<(u32, u64, &str)> {
         .then_some((pid, birth, sid))
 }
 
-/// Whether the FIFO's owner `pid` still runs: its pid reads the birth the name records. A zombie,
-/// a process that is ending, and another user's process read none, and none of them is the owner
-/// (the folder is this user's). A name with no birth (0) asks only whether the pid answers.
-fn owner_alive(pid: u32, birth: u64) -> bool {
-    if birth == 0 {
-        return pid_alive(pid);
+/// Positive evidence that the owner ended or its pid was reused. Identity reads can fail for a
+/// live owner (on Linux, even descriptor exhaustion): absence requires a separate kernel answer.
+fn owner_ended(
+    pid: u32,
+    birth: u64,
+    birth_of: &impl Fn(i32) -> Option<Birth>,
+    presence: &impl Fn(i32) -> ProcessPresence,
+) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
     }
-    i32::try_from(pid).ok().and_then(read_birth) == Some(Birth(birth))
+    if birth != 0
+        && let Some(now) = birth_of(pid)
+    {
+        return now != Birth(birth);
+    }
+    matches!(
+        presence(pid),
+        ProcessPresence::Exited | ProcessPresence::Absent
+    )
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]

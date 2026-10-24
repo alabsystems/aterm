@@ -4,9 +4,10 @@
 //! Tests for the vendor sign-in driver: the line grammars over recorded transcripts
 //! (`fixtures/signin/`: Kimi Code 2.3.1's `login --region global` and Codex 0.164.0's
 //! `login --device-auth`, recorded in a scratch home and cancelled, their codes fabricated; Grok
-//! Build 1.0.67's `login --device-auth`, written from its source, its email at example.com), the
-//! host pins, the child's environment and the driven child itself (this test binary run in place
-//! as the CLI).
+//! Build 1.0.67's `login --device-auth`, written from its source, its email at example.com, and
+//! 1.0.70's under the no-desk sandbox, recorded so and cancelled, its code fabricated), the host
+//! pins, the child's environment and the driven child itself (this test binary run in place as
+//! the CLI).
 
 use std::cell::RefCell;
 use std::ffi::OsString;
@@ -16,6 +17,7 @@ use crate::ai::connector::{CODEX_SIGNIN, GROK_SIGNIN, Hosts, KIMI_SIGNIN};
 
 const KIMI: &str = include_str!("fixtures/signin/kimi-2.3.1-login-global.stderr");
 const GROK: &str = include_str!("fixtures/signin/grok-1.0.67-device-auth.stderr");
+const GROK_NO_DESK: &str = include_str!("fixtures/signin/grok-1.0.70-device-auth-no-desk.stderr");
 const CODEX: &str = include_str!("fixtures/signin/codex-0.164.0-device-auth.stdout");
 
 fn lines_grammar(signin: &SignIn, flow: Flow) -> (&'static Grammar, Completion, &'static Hosts) {
@@ -209,7 +211,9 @@ fn kimis_child_runs_with_telemetry_and_updates_off_in_its_staging_home_and_no_op
 /// The CLI as this test binary run in place: where its `KIMI_CODE_HOME` (which only the driver
 /// hands it) holds a `.stand-in` script (`<transcript> <exit>`), it checks it was run as `kimi
 /// login --region global` (after `--`), prints that transcript to its standard error, writes the
-/// login file into that home when it exits 0, and exits; anywhere else it is an empty test.
+/// login file into that home when it exits 0, and exits; `hold` writes its pid to `pid` there,
+/// prints Kimi's transcript and waits a minute before it exits 0. Anywhere else it is an empty
+/// test.
 #[test]
 fn signin_stand_in() {
     let Some(which) = std::env::var_os("KIMI_CODE_HOME")
@@ -220,8 +224,9 @@ fn signin_stand_in() {
     };
     let home = std::path::PathBuf::from(std::env::var_os("KIMI_CODE_HOME").unwrap_or_default());
     let mut words = which.split_whitespace();
-    let transcript = match words.next() {
-        Some("kimi") => KIMI.to_owned(),
+    let first = words.next();
+    let transcript = match first {
+        Some("kimi" | "hold") => KIMI.to_owned(),
         Some("off-pin") => KIMI.replace("www.kimi.ai", "www.kimi.ai.example.com"),
         _ => String::new(),
     };
@@ -230,6 +235,12 @@ fn signin_stand_in() {
     if argv != ["login", "--region", "global"] {
         eprintln!("the stand-in was run as {argv:?}");
         std::process::exit(3);
+    }
+    if first == Some("hold") {
+        std::fs::write(home.join("pid"), std::process::id().to_string()).expect("pid");
+        eprint!("{transcript}");
+        std::thread::sleep(Duration::from_secs(60));
+        std::process::exit(0);
     }
     if code == 0 {
         std::fs::create_dir_all(home.join("credentials")).expect("mkdir");
@@ -258,10 +269,19 @@ impl Approver for &Seen {
 
 fn stand_in_drive(script: &str) -> (Drove, Handed) {
     let tmp = aterm_tempfile::tempdir().expect("tmp");
-    let staging = tmp.path().join("sol+1");
+    let seen = Seen::default();
+    let drove = stand_in_drive_in(tmp.path(), script, &mut &seen);
+    let handed = seen.handed.borrow().clone();
+    (drove, handed)
+}
+
+/// The Kimi stand-in driven in `root/sol+1`, its page handed to `approver`.
+fn stand_in_drive_in(root: &Path, script: &str, approver: &mut dyn Approver) -> Drove {
+    let tmp = root;
+    let staging = tmp.join("sol+1");
     std::fs::create_dir_all(&staging).expect("staging");
     std::fs::write(staging.join(".stand-in"), script).expect("script");
-    let path = opener_free_path(&tmp.path().join("store")).expect("PATH");
+    let path = opener_free_path(&tmp.join("store")).expect("PATH");
     let env = child_env(
         Cli::Kimi,
         &KIMI_SIGNIN,
@@ -283,8 +303,7 @@ fn stand_in_drive(script: &str) -> (Drove, Handed) {
     ]
     .map(OsString::from)
     .to_vec();
-    let seen = Seen::default();
-    let drove = drive(
+    drive(
         &Spec {
             program: &exe,
             lead: &lead,
@@ -297,10 +316,8 @@ fn stand_in_drive(script: &str) -> (Drove, Handed) {
             email: Some("kimi-one@example.com"),
             hang: Duration::from_secs(60),
         },
-        &mut &seen,
-    );
-    let handed = seen.handed.borrow().clone();
-    (drove, handed)
+        approver,
+    )
 }
 
 #[test]
@@ -397,4 +414,419 @@ fn an_opener_free_child_finds_its_bare_program_and_its_env_interpreter_and_no_op
     let (_, path, dir) =
         child_program(Path::new("/abs/kimi"), Some(&given), true, &store, &var).expect("child");
     assert_eq!((path, dir.is_none()), (given, true));
+}
+
+/// Grok Build 1.0.70's lines under the no-desk sandbox (its failed browser open between the URL
+/// and the code's lead) still name its URL and code, and say it is done only once it signed in.
+#[test]
+fn grok_1_0_70s_sandboxed_lines_still_name_its_url_and_code() {
+    let (grok, _, hosts) = lines_grammar(&GROK_SIGNIN, Flow::Device);
+    let scan = scanned(grok, GROK_NO_DESK);
+    let url = scan.url.as_deref().expect("grok's url");
+    assert_eq!(
+        url,
+        "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ"
+    );
+    assert!(pinned(url, hosts.of(None).expect("fixed")));
+    assert_eq!(scan.code.as_deref(), Some("WMRT-8KQZ"));
+    assert!(!scan.done && scan.email.is_none(), "{scan:?}");
+    let mut done = scan.clone();
+    done.feed(grok, "\r\u{1b}[K\u{2713} Signed in as grok-one@example.com");
+    assert!(done.done);
+    assert_eq!(done.email.as_deref(), Some("grok-one@example.com"));
+}
+
+/// The approver found the row's profile signed out.
+struct SignedOut;
+
+impl Approver for SignedOut {
+    fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+        Approval::NeedsSignIn("the page waits on a person to sign in".to_owned())
+    }
+}
+
+/// An approver asking for a sign-in once ends the child at once and the sign-in
+/// `needs-sign-in`. CONTROL: one that approves ends it signed in.
+#[cfg(unix)]
+#[test]
+fn an_approver_asking_for_a_sign_in_once_ends_the_child_needs_sign_in() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let drove = stand_in_drive_in(tmp.path(), "hold 0", &mut SignedOut);
+    assert_eq!(
+        drove.outcome,
+        Outcome::NeedsSignIn("the page waits on a person to sign in".to_owned())
+    );
+    assert_eq!(drove.why(Flow::Device), "www.kimi.ai device needs-sign-in");
+    let pid: i32 = std::fs::read_to_string(tmp.path().join("sol+1/pid"))
+        .expect("the stand-in's pid")
+        .parse()
+        .expect("a pid");
+    // SAFETY: signal 0 only asks whether this test's own child still exists.
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    if alive {
+        // SAFETY: the child is this test's own stand-in, left running by a broken driver.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(!alive, "the child was ended");
+
+    let (drove, _) = stand_in_drive("kimi 0");
+    assert!(
+        matches!(drove.outcome, Outcome::SignedIn { .. }),
+        "CONTROL: {drove:?}"
+    );
+}
+
+/// Whether this process can look LaunchServices' database up: a Mach name lookup, which sends
+/// LaunchServices nothing and so opens nothing.
+#[cfg(target_os = "macos")]
+fn launch_services_reachable() -> bool {
+    unsafe extern "C" {
+        static bootstrap_port: core::ffi::c_uint;
+        fn bootstrap_look_up(
+            bp: core::ffi::c_uint,
+            name: *const core::ffi::c_char,
+            sp: *mut core::ffi::c_uint,
+        ) -> core::ffi::c_int;
+    }
+    let mut port: core::ffi::c_uint = 0;
+    // SAFETY: `bootstrap_port` is the task's bootstrap port, set before `main`; the name is a
+    // valid C string and `port` a valid out-pointer.
+    unsafe {
+        bootstrap_look_up(
+            bootstrap_port,
+            c"com.apple.lsd.mapdb".as_ptr(),
+            &raw mut port,
+        ) == 0
+    }
+}
+
+/// Grok Build as this test binary run in place: where its `GROK_HOME` (which only the driver
+/// hands it) holds `.stand-in`, it writes `ran` there, checks it was run as `grok login
+/// --device-auth` (after `--`), prints 1.0.70's sandboxed lines, and says it signed in (exit 0)
+/// only where LaunchServices cannot be looked up, as under [`NO_DESK`]; where it can, it exits 1.
+/// Anywhere else it is an empty test.
+#[cfg(target_os = "macos")]
+#[test]
+fn grok_stand_in() {
+    let Some(home) = std::env::var_os("GROK_HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.join(".stand-in").is_file())
+    else {
+        return;
+    };
+    std::fs::write(home.join("ran"), "").expect("marker");
+    let argv: Vec<String> = std::env::args().skip_while(|a| a != "--").skip(1).collect();
+    if argv != ["login", "--device-auth"] {
+        eprintln!("the stand-in was run as {argv:?}");
+        std::process::exit(3);
+    }
+    eprint!("{GROK_NO_DESK}");
+    if launch_services_reachable() {
+        std::process::exit(1);
+    }
+    eprintln!("\r\u{1b}[K\u{2713} Signed in as grok-one@example.com");
+    std::process::exit(0);
+}
+
+/// A Grok row's staging home and store, its stand-in armed.
+#[cfg(target_os = "macos")]
+struct GrokBed {
+    tmp: aterm_tempfile::TempDir,
+    staging: PathBuf,
+    store: crate::harness::accounts::Store,
+    roster: crate::harness::accounts::Roster,
+}
+
+#[cfg(target_os = "macos")]
+impl GrokBed {
+    fn new() -> GrokBed {
+        let tmp = aterm_tempfile::tempdir().expect("tmp");
+        let staging = tmp.path().join("grok-1+1");
+        std::fs::create_dir_all(&staging).expect("staging");
+        std::fs::write(staging.join(".stand-in"), "").expect("arm");
+        let store = crate::harness::accounts::Store::at_for(
+            &tmp.path().join("state"),
+            Cli::Grok,
+            tmp.path(),
+        );
+        let roster = crate::harness::accounts::Roster::parse_for(
+            Cli::Grok,
+            "[[account]]\nlabel = \"grok-1\"\nclass = \"dedicated\"\nemail = \"grok-one@example.com\"\n",
+        )
+        .expect("grok's roster");
+        GrokBed {
+            tmp,
+            staging,
+            store,
+            roster,
+        }
+    }
+
+    fn lead() -> Vec<OsString> {
+        [
+            "harness::login_drive::tests::grok_stand_in",
+            "--exact",
+            "--nocapture",
+            "--",
+        ]
+        .map(OsString::from)
+        .to_vec()
+    }
+
+    /// Its sign-in through [`sign_in_with`], the sandbox `no_desk`.
+    fn sign_in(&self, no_desk: Option<&Path>) -> (Drove, Handed) {
+        let route = GROK_SIGNIN.route(None).expect("grok's route");
+        let req = Request {
+            cli: Cli::Grok,
+            route,
+            row: self.roster.row("grok-1").expect("the row"),
+            staging: &self.staging,
+            store: &self.store,
+            hosts: route.hosts.of(None).expect("fixed"),
+        };
+        let exe = std::env::current_exe().expect("test exe");
+        let seen = Seen::default();
+        let drove = sign_in_with(
+            &req,
+            (&exe, &GrokBed::lead()),
+            None,
+            no_desk,
+            &vars(&[]),
+            &mut &seen,
+            Duration::from_secs(60),
+        );
+        let handed = seen.handed.borrow().clone();
+        (drove, handed)
+    }
+
+    /// The same child driven plainly, as a CLI whose `no_desk` is empty runs.
+    fn plain(&self) -> Drove {
+        let (grammar, completion, hosts) = lines_grammar(&GROK_SIGNIN, Flow::Device);
+        let path = opener_free_path(&self.tmp.path().join("store")).expect("PATH");
+        let env = child_env(
+            Cli::Grok,
+            &GROK_SIGNIN,
+            &self.staging,
+            path.path().as_os_str(),
+            &vars(&[]),
+        );
+        let exe = std::env::current_exe().expect("test exe");
+        let seen = Seen::default();
+        drive(
+            &Spec {
+                program: &exe,
+                lead: &GrokBed::lead(),
+                args: &child_args(GROK_SIGNIN.route(None).expect("route"), None),
+                env: &env,
+                cwd: &self.staging,
+                grammar,
+                completion,
+                hosts: hosts.of(None).expect("fixed"),
+                email: Some("grok-one@example.com"),
+                hang: Duration::from_secs(60),
+            },
+            &mut &seen,
+        )
+    }
+}
+
+/// Under the no-desk sandbox a sign-in child cannot look LaunchServices up, so a CLI that opens
+/// the default browser through the OS opens nothing, and it still prints its page and code: the
+/// stand-in signs in only there. CONTROL: the same child run plainly reaches LaunchServices and
+/// exits 1.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_no_desk_child_cannot_reach_launch_services_and_a_plain_one_can() {
+    assert_eq!(
+        no_desk_argv(Path::new("/opt/grok/bin/grok"), &[OsString::from("login")]),
+        ["-p", NO_DESK, "/opt/grok/bin/grok", "login"].map(OsString::from)
+    );
+    let bed = GrokBed::new();
+    let (drove, handed) = bed.sign_in(Some(Path::new(SANDBOX_EXEC)));
+    assert_eq!(
+        drove.outcome,
+        Outcome::SignedIn {
+            email: Some("grok-one@example.com".to_owned()),
+            page: false
+        }
+    );
+    assert_eq!(
+        handed,
+        [(
+            Some("accounts.x.ai".to_owned()),
+            Some("WMRT-8KQZ".to_owned())
+        )]
+    );
+    assert_eq!(
+        bed.plain().outcome,
+        Outcome::Exited(Some(1)),
+        "CONTROL: run plainly, it reaches LaunchServices"
+    );
+}
+
+/// A no-desk CLI's sign-in runs nothing where its sandbox is missing or is not a file: `NotRun`,
+/// naming why, and the stand-in never ran. CONTROL: with the sandbox there, it ran.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_no_desk_sign_in_without_its_sandbox_runs_nothing() {
+    let bed = GrokBed::new();
+    let missing = bed.tmp.path().join("no-sandbox-exec");
+    let a_dir = bed.tmp.path().to_path_buf();
+    for no_desk in [None, Some(missing.as_path()), Some(a_dir.as_path())] {
+        let (drove, handed) = bed.sign_in(no_desk);
+        let Outcome::NotRun(why) = &drove.outcome else {
+            panic!("{no_desk:?}: {drove:?}");
+        };
+        assert!(
+            why.starts_with("Grok Build opens this machine's default browser through the OS")
+                && why.ends_with("is not here; nothing was run"),
+            "{why}"
+        );
+        assert!(handed.is_empty() && !bed.staging.join("ran").exists());
+    }
+    let (drove, _) = bed.sign_in(Some(Path::new(SANDBOX_EXEC)));
+    assert!(bed.staging.join("ran").is_file(), "CONTROL: {drove:?}");
+}
+
+/// A no-desk CLI's sign-in runs nothing where its sandbox cannot apply here (as `sandbox-exec`
+/// cannot under another sandbox, exiting 71 before its child starts): `NotRun`, naming that, and
+/// the stand-in never ran, where it once said "exited 71". CONTROL: the real sandbox passes its
+/// try.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_no_desk_sign_in_whose_sandbox_cannot_apply_runs_nothing_and_says_so() {
+    let bed = GrokBed::new();
+    let refusing = Path::new("/usr/bin/false");
+    let (drove, handed) = bed.sign_in(Some(refusing));
+    let Outcome::NotRun(why) = &drove.outcome else {
+        panic!("{drove:?}");
+    };
+    assert!(
+        why.contains("cannot run here: /usr/bin/false exited 1 on a try")
+            && why.contains("another sandbox")
+            && why.ends_with("nothing was run"),
+        "{why}"
+    );
+    assert!(handed.is_empty() && !bed.staging.join("ran").exists());
+    assert_eq!(sandbox_refusal(Path::new(SANDBOX_EXEC)), None, "CONTROL");
+}
+
+/// A no-desk CLI that is not installed runs nothing and says it is not installed, where the
+/// sandbox once failed to start it and the sign-in "exited 71". CONTROL: the stand-in, a file,
+/// runs.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_no_desk_cli_that_is_not_installed_is_named_so() {
+    let bed = GrokBed::new();
+    let route = GROK_SIGNIN.route(None).expect("grok's route");
+    let req = Request {
+        cli: Cli::Grok,
+        route,
+        row: bed.roster.row("grok-1").expect("the row"),
+        staging: &bed.staging,
+        store: &bed.store,
+        hosts: route.hosts.of(None).expect("fixed"),
+    };
+    let seen = Seen::default();
+    let drove = sign_in_with(
+        &req,
+        (Path::new("no-such-grok-cli"), &[]),
+        None,
+        Some(Path::new(SANDBOX_EXEC)),
+        &vars(&[("PATH", "/usr/bin:/bin")]),
+        &mut &seen,
+        Duration::from_secs(60),
+    );
+    let Outcome::NotRun(why) = &drove.outcome else {
+        panic!("{drove:?}");
+    };
+    assert!(
+        why.contains("`no-such-grok-cli` is not installed here"),
+        "{why}"
+    );
+    let (drove, _) = bed.sign_in(Some(Path::new(SANDBOX_EXEC)));
+    assert!(bed.staging.join("ran").is_file(), "CONTROL: {drove:?}");
+}
+
+/// OVER SSH a sign-in the person runs (`accounts login`) opens no browser on this machine's
+/// desk, which is not theirs: Grok Build's runs under the no-desk sandbox, and Kimi Code's gets
+/// the opener-free `PATH` (held while it runs). Grok's refuses where the sandbox is missing.
+/// CONTROL: at the desk each runs plainly with this process's `PATH`.
+#[cfg(target_os = "macos")]
+#[test]
+fn over_ssh_a_persons_sign_in_opens_no_browser_on_this_machines_desk() {
+    use std::ffi::OsStr;
+    let bed = GrokBed::new();
+    let home = bed.tmp.path().join("home");
+    let parent = vars(&[("PATH", "/usr/bin:/bin"), ("TERM", "xterm")]);
+    let sandbox = Some(Path::new(SANDBOX_EXEC));
+    let route = GROK_SIGNIN.route(None).expect("grok's route");
+    let grok = Request {
+        cli: Cli::Grok,
+        route,
+        row: bed.roster.row("grok-1").expect("the row"),
+        staging: &bed.staging,
+        store: &bed.store,
+        hosts: route.hosts.of(None).expect("fixed"),
+    };
+    let path_of = |cmd: &aterm_uds::spawnfd::Command| {
+        cmd.get_envs()
+            .find(|(k, _)| *k == OsStr::new("PATH"))
+            .and_then(|(_, v)| v.map(OsStr::to_os_string))
+    };
+    let (cmd, held) = login_command(&grok, &home, &parent, (true, sandbox)).expect("over SSH");
+    assert_eq!(cmd.get_program(), OsStr::new(SANDBOX_EXEC));
+    let args: Vec<OsString> = cmd.get_args().map(OsStr::to_os_string).collect();
+    assert_eq!(args[..2], [OsString::from("-p"), OsString::from(NO_DESK)]);
+    let verb: Vec<OsString> = child_args(route, None)
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    assert_eq!(args[3..], verb[..], "{args:?}");
+    let held = held.expect("Grok Build's opener-free PATH too");
+    assert_eq!(path_of(&cmd), Some(held.path().as_os_str().to_os_string()));
+    let missing = bed.tmp.path().join("no-sandbox-exec");
+    let refused = login_command(&grok, &home, &parent, (true, Some(&missing)));
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|why| why.contains("over SSH") && why.contains("is not here")),
+        "{:?}",
+        refused.map(|_| ())
+    );
+    let (desk, _) = login_command(&grok, &home, &parent, (false, sandbox)).expect("at the desk");
+    assert_ne!(desk.get_program(), OsStr::new(SANDBOX_EXEC), "CONTROL");
+    assert_eq!(path_of(&desk), Some(OsString::from("/usr/bin:/bin")));
+
+    let roster = crate::harness::accounts::Roster::parse_for(
+        Cli::Kimi,
+        "[[account]]\nlabel = \"kimi-1\"\nclass = \"dedicated\"\nemail = \"kimi-one@example.com\"\nregion = \"global\"\n",
+    )
+    .expect("kimi's roster");
+    let kimi_store = crate::harness::accounts::Store::at_for(
+        &bed.tmp.path().join("state"),
+        Cli::Kimi,
+        bed.tmp.path(),
+    );
+    let route = KIMI_SIGNIN.route(None).expect("kimi's route");
+    let kimi = Request {
+        cli: Cli::Kimi,
+        route,
+        row: roster.row("kimi-1").expect("the row"),
+        staging: &bed.staging,
+        store: &kimi_store,
+        hosts: route.hosts.of(Some(Region::Global)).expect("global"),
+    };
+    let (cmd, held) = login_command(&kimi, &home, &parent, (true, sandbox)).expect("over SSH");
+    let held = held.expect("an opener-free PATH, held");
+    assert_eq!(path_of(&cmd), Some(held.path().as_os_str().to_os_string()));
+    assert!(!held.path().join("open").exists());
+    assert_ne!(
+        cmd.get_program(),
+        OsStr::new(SANDBOX_EXEC),
+        "kimi needs no sandbox"
+    );
+    let (desk, held) = login_command(&kimi, &home, &parent, (false, sandbox)).expect("desk");
+    assert!(held.is_none(), "CONTROL");
+    assert_eq!(path_of(&desk), Some(OsString::from("/usr/bin:/bin")));
 }

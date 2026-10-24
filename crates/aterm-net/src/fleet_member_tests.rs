@@ -54,6 +54,16 @@ impl Drop for State {
     }
 }
 
+fn write_key(dir: &Path, secret: &[u8]) -> Result<(), String> {
+    hold_book(dir)?.write_key(secret).map_err(|e| e.to_string())
+}
+
+fn keep_copy(dir: &Path, issuer: &str, copies: &[Peer]) -> Result<(), String> {
+    hold_book(dir)?
+        .keep_issuer_book(Some((issuer, copies)))
+        .map_err(|e| e.to_string())
+}
+
 fn code() -> JoinCode {
     let mut secret = [0u8; SECRET_LEN];
     for (at, byte) in secret.iter_mut().enumerate() {
@@ -244,12 +254,12 @@ fn a_code_that_is_not_whole_is_refused_by_what_is_wrong() {
 #[test]
 fn the_key_and_the_node_id_are_written_as_their_readers_read_them() {
     let state = State::new("key");
-    write_key_file(state.dir(), &[0x3e; SECRET_LEN]).unwrap();
+    write_key(state.dir(), &[0x3e; SECRET_LEN]).unwrap();
     assert_eq!(read_key_file(state.dir()).unwrap(), secret(0x3e));
     let meta = std::fs::metadata(state.dir().join(KEY_FILE)).unwrap();
     assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     assert!(
-        write_key_file(state.dir(), &[1; 8]).is_err(),
+        write_key(state.dir(), &[1; 8]).is_err(),
         "no fleet takes 8 bytes"
     );
 
@@ -354,7 +364,7 @@ fn the_state_directory_is_made_private_and_a_symlink_refused() {
     let linked = state.dir().join("linked");
     std::os::unix::fs::symlink(&fresh, &linked).unwrap();
     assert!(ensure_private_dir(&linked).is_err());
-    assert!(write_key_file(&linked, &[2; SECRET_LEN]).is_err());
+    assert!(write_key(&linked, &[2; SECRET_LEN]).is_err());
     assert!(
         !fresh.join(KEY_FILE).exists(),
         "nothing written through the link"
@@ -573,19 +583,52 @@ fn a_leave_goes_on_unlocked_only_where_no_edit_could_lock() {
     let dir = state.dir();
     let lock = dir.join(PEERS_LOCK);
     std::fs::create_dir(&lock).unwrap();
-    assert_eq!(with_book_held(dir, |_| 7), Ok(7), "a lock that is no file");
+    assert_eq!(leave_held(dir, |_| 7), Ok(7), "a lock that is no file");
     std::fs::remove_dir(&lock).unwrap();
     let linked = dir.parent().unwrap().join("linked-state");
     std::os::unix::fs::symlink(dir, &linked).unwrap();
-    assert_eq!(with_book_held(&linked, |_| 7), Ok(7), "a symlink");
+    assert_eq!(leave_held(&linked, |_| 7), Ok(7), "a symlink");
     let none = dir.join("none");
-    assert_eq!(with_book_held(&none, |_| 7), Ok(7), "no directory");
-    assert!(!none.exists(), "nor is one made");
+    let made = leave_held(&none, |_| {
+        let bits = std::fs::metadata(&none).unwrap().permissions().mode() & 0o777;
+        let other = BookLock::take(&none, Duration::ZERO)
+            .err()
+            .map(|e| e.kind());
+        (bits, other)
+    });
+    assert_eq!(
+        made,
+        Ok((0o700, Some(io::ErrorKind::WouldBlock))),
+        "no directory: made as an init makes it, then locked"
+    );
+    let file = dir.join("a-file");
+    std::fs::write(&file, b"x").unwrap();
+    let dangling = dir.join("dangling");
+    std::os::unix::fs::symlink(dir.join("nowhere"), &dangling).unwrap();
+    let unwritable = dir.join("unwritable");
+    std::fs::create_dir(&unwritable).unwrap();
+    mode(&unwritable, 0o500);
+    for (odd, what) in [
+        (file.clone(), "a file in its place"),
+        (file.join("state"), "beneath a file"),
+        (dangling.join("state"), "beneath a link to nothing"),
+        (
+            unwritable.join("state"),
+            "in a directory this user cannot write",
+        ),
+    ] {
+        let left = leave_held(&odd, |leaving| {
+            leaving.remove(KEY_FILE).map_err(|e| e.kind())
+        });
+        assert_eq!(left, Ok(Ok(false)), "{what}: none any writer makes");
+        assert!(!odd.is_dir(), "{what}");
+    }
+    mode(&unwritable, 0o700);
     mode(dir, 0o750);
-    let held = with_book_held(dir, |narrowed| {
+    let held = leave_held(dir, |leaving| {
         let bits = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
         let other = BookLock::take(dir, Duration::ZERO).err().map(|e| e.kind());
-        (narrowed, bits, other)
+        (leaving.narrowed(), bits, other)
     });
     assert_eq!(
         held,
@@ -594,7 +637,7 @@ fn a_leave_goes_on_unlocked_only_where_no_edit_could_lock() {
     );
     let other = BookLock::take(dir, Duration::ZERO).unwrap();
     mode(dir, 0o750);
-    let refused = with_book_held(dir, |_| ()).unwrap_err();
+    let refused = leave_held(dir, |_| ()).unwrap_err().to_string();
     assert!(refused.contains("(750), and is 0700 now"), "{refused}");
     drop(other);
 
@@ -638,7 +681,7 @@ fn leave_with_no_descriptor_free() {
     // SAFETY: `setrlimit` reads the struct this frame owns: a soft limit under the hard one.
     let set = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
     assert_eq!(set, 0);
-    let ran = with_book_held(Path::new(&dir), |_| ());
+    let ran = leave_held(Path::new(&dir), |_| ());
     println!("leave: {}", if ran.is_ok() { "ran" } else { "refused" });
 }
 
@@ -948,7 +991,7 @@ fn a_peer_is_proven_only_by_the_key_its_entry_binds() {
             keyed(0xa1, a.key(), [10, 0, 0, 7], 7100),
         ],
     );
-    write_issuer_book(
+    keep_copy(
         state.dir(),
         i.node(),
         &[
@@ -978,7 +1021,7 @@ fn a_peer_is_proven_only_by_the_key_its_entry_binds() {
     };
     write_book(state.dir(), &[issuer, manual("m7", 7100)]);
     let at_m7 = copy(keyed(0xc3, n.key(), [10, 0, 0, 7], 7100));
-    write_issuer_book(state.dir(), i.node(), std::slice::from_ref(&at_m7)).unwrap();
+    keep_copy(state.dir(), i.node(), std::slice::from_ref(&at_m7)).unwrap();
     let mut read = read_peers(state.dir()).unwrap();
     with_copies(&mut read, [at_m7.clone(), copy(manual("m7.local", 7100))]);
     assert_eq!(
@@ -1123,14 +1166,14 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
     let issuing = Issuing::proving(secret(5), issuer_state.dir(), issuer(0x11), i.clone());
 
     let member = State::new("recheck-member");
-    write_key_file(member.dir(), &[5; SECRET_LEN]).unwrap();
+    write_key(member.dir(), &[5; SECRET_LEN]).unwrap();
     let me = identity(&node_of(0x77), 7);
     let issuer_at = |port, key| Peer {
         key,
         ..issuer_entry(0x11, port)
     };
     write_book(member.dir(), &[issuer_at(issuing.port, Some(i.key()))]);
-    write_issuer_book(member.dir(), i.node(), &[copy(entry.clone())]).unwrap();
+    keep_copy(member.dir(), i.node(), &[copy(entry.clone())]).unwrap();
     let grants = [
         DriveGrant {
             node: n.node().to_owned(),
@@ -1210,7 +1253,7 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
         "and refuses by itself from then"
     );
 
-    write_issuer_book(member.dir(), i.node(), &[copy(entry.clone())]).unwrap();
+    keep_copy(member.dir(), i.node(), &[copy(entry.clone())]).unwrap();
     write_book(member.dir(), &[issuer_at(closed_port(), Some(i.key()))]);
     let refused = driver_as_of(
         as_of(&n).as_ref(),
@@ -1355,6 +1398,7 @@ impl Issuing {
             lifetime: HANG,
         };
         let (state, issuer) = (state.to_path_buf(), Arc::new(issuer));
+        let secret = listening.secret.clone();
         let serving = std::thread::spawn({
             let running = Arc::clone(&running);
             move || {
@@ -1384,7 +1428,7 @@ impl Issuing {
                             serve_join(
                                 stream,
                                 (from, proof.as_ref()),
-                                &state,
+                                (&state, &secret),
                                 move || Ok(issuer),
                                 1_760_000_000_000,
                             )
@@ -1436,7 +1480,9 @@ fn issuer(node: u8) -> Issuer {
 }
 
 fn issue(state: &Path) {
-    write_private(state, CODE_FILE, format!("{}\n", code().text()).as_bytes()).unwrap();
+    let book = hold_book(state).unwrap();
+    book.write_code(&code()).unwrap();
+    book.write_key(&[5; SECRET_LEN]).unwrap();
 }
 
 fn join_over(port: u16, secret: &FleetSecret, reg: &Registration) -> Result<Joined, String> {
@@ -1581,7 +1627,7 @@ fn a_join_answers_with_the_member_as_the_book_records_it() {
         let outcome = serve_join(
             &mut stream,
             (from, None),
-            state.dir(),
+            (state.dir(), &secret(5)),
             || Ok(issuer(0x11)),
             7,
         )
@@ -1633,7 +1679,7 @@ fn a_registration_binds_only_the_key_its_connection_proved() {
         let outcome = serve_join(
             &mut stream,
             (from, proved),
-            state.dir(),
+            (state.dir(), &secret(5)),
             || Ok(issuer(0x11)),
             7,
         )
@@ -1708,7 +1754,7 @@ fn a_keyless_move_never_moves_where_a_key_is_bound_from() {
         serve_join(
             &mut stream,
             (IpAddr::from(from), proved.as_ref()),
-            state.dir(),
+            (state.dir(), &secret(5)),
             || Ok(issuer(0x11)),
             7,
         )
@@ -2332,7 +2378,7 @@ fn a_member_that_names_anothers_place_takes_neither_its_copy_nor_its_key() {
                 ..issuer_entry(0x11, 7100)
             }],
         );
-        write_issuer_book(state.dir(), i.node(), &copies).unwrap();
+        keep_copy(state.dir(), i.node(), &copies).unwrap();
         for (ring, read) in [
             (Keyring::read(state.dir()), "the kept copy"),
             (
@@ -2362,7 +2408,7 @@ fn a_copy_is_read_only_beside_the_issuer_it_came_from() {
     assert!(read_issuer_book(state.dir(), &issuer).is_empty(), "no file");
     let mut written = copies.clone();
     written.push(manual("not-a-copy", 7100));
-    write_issuer_book(state.dir(), &issuer, &written).unwrap();
+    keep_copy(state.dir(), &issuer, &written).unwrap();
     assert_eq!(read_issuer_book(state.dir(), &issuer), copies);
     assert!(
         read_issuer_book(state.dir(), &other).is_empty(),
@@ -4722,7 +4768,7 @@ fn a_connect_failure_is_read_by_its_kind() {
 #[test]
 fn an_access_list_that_lets_others_in_is_not_private() {
     let state = State::new("acl");
-    write_key_file(state.dir(), &[0x3e; SECRET_LEN]).unwrap();
+    write_key(state.dir(), &[0x3e; SECRET_LEN]).unwrap();
     let key = state.dir().join(KEY_FILE);
     let chmod = |args: &[&std::ffi::OsStr]| {
         let ran = aterm_uds::spawnfd::command("/bin/chmod")
@@ -4756,7 +4802,7 @@ fn an_access_list_that_lets_others_in_is_not_private() {
     ]);
     assert_eq!(word(), Some("key-mode"), "nor through its directory");
     assert!(ensure_private_dir(state.dir()).is_err());
-    assert!(write_key_file(state.dir(), &[0x3f; SECRET_LEN]).is_err());
+    assert!(write_key(state.dir(), &[0x3f; SECRET_LEN]).is_err());
     chmod(&["-N".as_ref(), state.dir().as_os_str()]);
     assert_eq!(word(), None);
 }

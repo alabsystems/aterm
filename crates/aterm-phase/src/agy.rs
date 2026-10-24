@@ -211,6 +211,14 @@ pub fn unwrap_agent_token(token: &str) -> Option<&str> {
     rest.is_empty().then_some(name)
 }
 
+/// Split an `agy` subagent panel item into its display name and activity at the
+/// double-space separator used by the agents-panel row grammar.
+#[must_use]
+pub fn split_agent_panel_item(item: &str) -> Option<(&str, &str)> {
+    let (name, state) = split_agent_token(item)?;
+    (state.is_empty() || state.starts_with("  ")).then(|| (name, crate::text::trim_start(state)))
+}
+
 fn frame(rows: &[String]) -> Option<Frame> {
     (1..rows.len())
         .rev()

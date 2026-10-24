@@ -499,9 +499,8 @@ mod tests {
         assert!(parse("live", true, false, any).is_err_and(|e| e.contains("runs no stuck check")));
     }
 
-    /// The held stand-in needs a development build and a pid of a live process of this user
-    /// (the only kind a start is read for, so any other would count nowhere); `held -` needs no
-    /// pid. This process is one of this user's; pid 1 (launchd, root's) is not.
+    /// `held_now` holds no program the kernel reads as past its start (this process, which runs
+    /// this test) and none left unread (pid 0, which is never read; pid 1, launchd, root's).
     #[test]
     fn held_now_holds_no_program_the_kernel_reads_started_or_cannot_read() {
         assert!(
@@ -516,6 +515,9 @@ mod tests {
         }
     }
 
+    /// The held stand-in needs a development build and a pid of a live process of this user
+    /// (the only kind a start is read for, so any other would count nowhere); `held -` needs no
+    /// pid. This process is one of this user's; pid 1 (launchd, root's) is not.
     #[test]
     fn the_held_stand_in_needs_a_development_build_and_a_pid() {
         let any = |_| true;

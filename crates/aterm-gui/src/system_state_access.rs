@@ -725,6 +725,7 @@ impl App {
     /// then: one under a retired key ends at the next settle as one adopted at
     /// launch does, and the vault join's ends now if a status has read the
     /// Secrets row.
+    #[cfg(unix)]
     pub(crate) fn rearm_retired_keys(&mut self) {
         self.access_steps.retired = false;
         self.access_steps.join_pending_retired = false;

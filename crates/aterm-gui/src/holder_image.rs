@@ -160,6 +160,7 @@ impl DrawerGroups {
     }
 
     /// The mark whose drawer led `pid`'s group, if any.
+    #[cfg(any(unix, test))]
     pub(crate) fn led_by(&self, pid: i32) -> Option<u64> {
         self.0.iter().find(|&&(p, _)| p == pid).map(|&(_, t)| t)
     }
@@ -938,6 +939,10 @@ pub(crate) mod hold_hook {
         /// The byte arm without its cut after an OSC 133 C.
         pub(crate) no_c_cut: bool,
         /// The parse stage drops the process watch's exits, so no stopped drawer's mark retires.
+        #[cfg_attr(
+            not(unix),
+            expect(dead_code, reason = "only the unix gather loop reads it")
+        )]
         pub(crate) no_retire: bool,
     }
 
@@ -983,6 +988,7 @@ pub(crate) mod hold_hook {
     }
 
     /// Whether `session` runs the no-retire mutant.
+    #[cfg(unix)]
     pub(crate) fn no_retire(session: u64) -> bool {
         knobs(session).no_retire
     }

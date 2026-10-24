@@ -61,8 +61,9 @@ pub(super) fn behind(exe: &Path, twin: Option<PathBuf>) -> Result<Option<Move>, 
     let Some(twin) = twin else {
         return Ok(None);
     };
-    let Some(build) = std::fs::read_to_string(&twin)
+    let Some(build) = super::super::super::accounts::read_bounded(&twin, 64 * 1024)
         .ok()
+        .flatten()
         .and_then(|text| super::super::catalog::twin_binary(&text))
     else {
         return Ok(None);
@@ -190,7 +191,10 @@ pub(super) fn log_look(lock: &Path, pid: u32, started_ms: u64) -> Result<(), Ope
                 _ => return Err(Open::Unreadable),
             },
         }
-        let text = std::fs::read_to_string(&sub_log).map_err(|_| Open::Unreadable)?;
+        let text = super::super::super::accounts::read_bounded(&sub_log, LOG_BYTES)
+            .ok()
+            .flatten()
+            .ok_or(Open::Unreadable)?;
         live::open_work(&text, from_us)?;
     }
     Ok(())
@@ -274,7 +278,10 @@ pub(super) fn claim_record(
 
 /// Whether `lock`'s body still names `pid` (the session's `.session.lock`).
 fn lock_names(lock: &Path, pid: u32) -> bool {
-    std::fs::read_to_string(lock).is_ok_and(|body| mz::lock_pid(&body) == Some(pid))
+    super::super::super::accounts::read_bounded(lock, 64 * 1024)
+        .ok()
+        .flatten()
+        .is_some_and(|body| mz::lock_pid(&body) == Some(pid))
 }
 
 /// THE QUIET FLOW'S STEP for tab `opts.only_sid` over the host's roster `tabs` (the module's steps 1–6), the twin `twin` and the kernel `k`.

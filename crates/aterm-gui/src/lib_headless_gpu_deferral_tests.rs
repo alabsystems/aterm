@@ -10,11 +10,10 @@ fn only_a_headless_launch_that_may_use_a_gpu_defers_the_device() {
 }
 
 /// A headless boot's `warm_config` claims no first-frame Metal warm, so its first pixel
-/// demand mints without waiting on a warm thread; it claims the headless warm instead,
-/// which fills the shader cache that mint builds from and which nothing waits on.
+/// demand mints without waiting on a warm thread.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_headless_boot_warms_the_shader_cache_and_claims_no_first_frame_warm() {
+fn a_headless_boot_claims_no_first_frame_warm() {
     let dir = aterm_tempfile::tempdir().expect("scratch dir");
     crate::test_env::scoped("XDG_CONFIG_HOME", dir.path(), || {
         let warm = super::warm_config(true, crate::app_config::CarriedZoom::default());
@@ -23,10 +22,6 @@ fn a_headless_boot_warms_the_shader_cache_and_claims_no_first_frame_warm() {
     assert!(
         !aterm_gpu::first_frame_warm_began(),
         "a headless boot claimed the first-frame Metal warm"
-    );
-    assert!(
-        aterm_gpu::shader_cache_warm_began(),
-        "a headless boot that may use a GPU warms ahead of its first pixel demand"
     );
 }
 

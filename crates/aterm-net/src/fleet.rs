@@ -1009,7 +1009,10 @@ pub fn serve<H, E>(
     while running.load(Ordering::Acquire) {
         live.cut_overdue(listening.lifetime);
         let (tcp, peer) = match listener.accept() {
-            Ok(accepted) => accepted,
+            Ok(accepted) => {
+                let _ = aterm_uds::keep_out_of_children(&accepted.0);
+                accepted
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // A readiness error backs off like an accept error below, so neither busy-loops.
                 if wait_listener_readable(listener, ACCEPT_POLL).is_err()

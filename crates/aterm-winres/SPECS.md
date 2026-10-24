@@ -80,7 +80,7 @@ The specs are independent. The only shared lemma is the `disp` model, which WR3 
 use and which can stay an uninterpreted function of the path. WR4 and WR3 together give the
 companion invariant in WR4.
 
-## 2. Test → spec map (TSV; all 6)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test
 samples. A test is deleted only when its primary and every `also` spec are proved.

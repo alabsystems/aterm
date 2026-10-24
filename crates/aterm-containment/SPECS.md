@@ -153,7 +153,7 @@ Merge note: the chunk's specs had no duplicates across files. The one cross-file
 process gets the minimal capabilities", is a corollary of `mode-global-write-once` plus `policy-monotone-minimal`;
 it is stated once, in the former.
 
-## 2. Test → spec map (TSV; all 195)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists other specs the same test samples. A primary of
 `§4` means the test is not a spec sample; its action is in §4.

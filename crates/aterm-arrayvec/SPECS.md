@@ -87,7 +87,7 @@ No spec is blocked by gap 0 alone. Gaps 1 and 11 block all ten, so the cheapest 
 is a **monomorphised, length-only** slice of a spec (concrete `T` and `N`; Vec-style
 carriers are length-only today, audit §7 row 1), which needs gaps 0 and 2 only.
 
-## 2. Test → spec map (TSV; all 6)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that only this test (or this test most directly) samples. `also`
 lists the other specs it samples. Each test is deleted only when its primary and every

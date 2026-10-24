@@ -32,10 +32,19 @@ pub struct Record {
 /// What `ps` prints for a zombie's `comm` and `args`.
 pub const DEFUNCT: &str = "<defunct>";
 
-/// `pid`'s record; `None` when no process has that pid (or the platform has no reader here).
+/// `pid`'s record; `None` when it is gone or its record cannot be read.
+/// Use [`record_read`] when absence must be distinguished from an unread record.
 #[must_use]
 pub fn record(pid: u32) -> Option<Record> {
-    imp::record(pid)
+    record_read(pid).ok().flatten()
+}
+
+/// `pid`'s record, distinguishing a definite absence from a failed read.
+/// # Errors
+/// An invalid pid, an unavailable platform reader, a kernel read error other than `ESRCH`,
+/// or a short or malformed record. A successful empty read and `ESRCH` mean no such process.
+pub fn record_read(pid: u32) -> std::io::Result<Option<Record>> {
+    imp::record_read(pid)
 }
 
 /// Every process's record; `None` where the table cannot be read.
@@ -323,12 +332,23 @@ mod imp {
         (rc == 0).then_some(len)
     }
 
-    pub(super) fn record(pid: u32) -> Option<Record> {
-        let pid = c_int::try_from(pid).ok()?;
-        let mut mib = [libc::CTL_KERN, KERN_PROC, KERN_PROC_PID, pid];
+    pub(super) fn record_read(pid: u32) -> std::io::Result<Option<Record>> {
+        let native_pid = c_int::try_from(pid).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+        let mut mib = [libc::CTL_KERN, KERN_PROC, KERN_PROC_PID, native_pid];
         let mut buf = [0u8; KINFO_SIZE];
-        let n = sysctl_into(&mut mib, &mut buf).ok()?;
-        (n == KINFO_SIZE).then(|| parse(&buf)).flatten()
+        let n = match sysctl_into(&mut mib, &mut buf) {
+            Ok(n) => n,
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match n {
+            0 => Ok(None),
+            KINFO_SIZE => parse(&buf)
+                .filter(|record| record.pid == pid)
+                .map(Some)
+                .ok_or_else(|| std::io::ErrorKind::InvalidData.into()),
+            _ => Err(std::io::ErrorKind::InvalidData.into()),
+        }
     }
 
     pub(super) fn records() -> Option<Vec<Record>> {
@@ -398,8 +418,8 @@ mod imp {
         None
     }
 
-    pub(super) fn record(_pid: u32) -> Option<Record> {
-        None
+    pub(super) fn record_read(_pid: u32) -> std::io::Result<Option<Record>> {
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 
     pub(super) fn records() -> Option<Vec<Record>> {

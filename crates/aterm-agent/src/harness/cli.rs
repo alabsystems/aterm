@@ -82,6 +82,8 @@ USAGE:
                                                  enroll this machine's default login as a renewable row
                                                  (`--cli codex` reads the email from its app server)
     aterm harness accounts login <label>         run Claude Code's sign-in flow and record auth status
+    aterm harness accounts browser <label> [--cli <id>]
+                                                 open the row's own browser profile for a person to sign in once
     aterm harness accounts renew [--due | <label>...] [--on <host>,... | --here]
                                                  renew logins via staging sign-in (and over ssh)
     aterm harness accounts use <label> | --auto  pin an account or return to automatic rotation
@@ -316,6 +318,24 @@ VERBS:
     under `CLAUDE_SECURESTORAGE_CONFIG_DIR` and records `signed in` (exit 0) or the failure
     (exit 1). With no terminal on stdin it prints the command, runs nothing, and exits 0.
     Refuses a row with `email` (use `accounts renew`).
+  - `accounts browser <label> [--cli <id>]`
+    Opens the row's own browser profile (the one its headless sign-ins use, under
+    `<state>/accounts/browsers/`) in a window at the vendor's sign-in page, for a person to
+    sign in to the vendor's site once as the row's account. Its password manager is off. It
+    waits until you press Enter (or Ctrl-C) here or quit that browser, then closes it gently
+    so its cookies are saved. Then it opens the profile headlessly once more: it removes
+    Google's and the other identity providers' cookies (their keychain there is a mock one,
+    so any program of yours could read them), and asks whether the vendor keeps its session
+    there (kimi.ai's and kimi.com's; for the others the next renewal checks it), exiting 1
+    where it does not. It records only the page's host, how the window ended and that answer.
+    Renewals then approve the CLI's page in that profile headlessly. Refuses without a
+    terminal on stdin, over SSH, while another sign-in holds the machine's sign-in lock or
+    another browser or one of aterm's own sign-ins has the profile open, and for a row
+    without `email` (or a Kimi row without `region`). Needs a
+    Chromium that opens a window: Google Chrome for Testing or Chromium in /Applications or
+    ~/Applications, unzipped into aterm's browser cache, or named in $ATERM_BROWSER. It
+    never opens your own browser or its profiles (a row's `browser` key names one of those,
+    for Claude Code's at-the-desk renewals).
   - `accounts renew [--due | <label>...] [--on <host>,... | --here]`
     Signs in rows with `email` through a staging dir (`<label>+<n>`), checks that the
     account email matches, and binds the row in `<state>/accounts/logins.json` so sessions
@@ -374,13 +394,22 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     (`unchecked`); another email is a wrong account and nothing live changes. The ledger
     keeps the host, flow and outcome, never the URL or code.
   - `accounts login <label> --cli <id>` runs that sign-in on this terminal for the person
-    to approve (`proved_by = \"unchecked\"`).
+    to approve (`proved_by = \"unchecked\"`); over SSH it opens no browser on this machine and
+    the CLI prints its URL for you to open.
+  - `accounts browser <label> --cli <id>` is that window for the pool's row, at kimi.ai or
+    kimi.com by the row's region, accounts.x.ai, or auth.openai.com. A renewal whose page
+    waits on a person for 90 s stops `needs-sign-in` and names it. A Kimi row's email is never
+    typed on Kimi's pages (its form signs a new account up as readily as it signs one in). A
+    background renewal that stopped for a person leaves its row alone for 6 hours.
+  - On macOS Grok Build's sign-in runs under `sandbox-exec` with LaunchServices, Apple
+    events and the pasteboard denied, so it opens no browser on the desk and its background
+    renewal runs there too.
   - A Codex worker aterm starts takes the pool's pin, else its fresh active row, else the
     next one (`next:`), once each row's usage was read in its own home (Codex's app server);
     `[harness] accounts = \"off\"` keeps only the pin, and a login kept in the OS keyring
     picks none. No running session of these CLIs is moved, and a Kimi launch or move is held
-    (`unmeasured`) until a lab pass measures its home. `stats --cli <id>` lists each row's
-    condition, login and usage; `ledger accounts --cli <id>` reads the pool's ledger.
+    (`unmeasured`) until a lab pass measures its home. `ledger accounts --cli <id>` reads the
+    pool's ledger.
 
 FLEET ACCOUNTS (off unless this machine names a source):
   - Opt in with `[fleet] accounts_source = \"<source>\"` in aterm.toml, by running
@@ -716,6 +745,11 @@ pub enum AccountsCmd {
     },
     /// `accounts login <label>`: the vendor's sign-in flow for that account, waited for, and — after a flow that exits 0 — what its new login then answers recorded.
     Login {
+        /// The label as typed.
+        label: String,
+    },
+    /// `accounts browser <label>`: the row's own browser profile opened in a window at the vendor's sign-in page, for a person to sign in once ([`run_accounts_browser`]).
+    Browser {
         /// The label as typed.
         label: String,
     },
@@ -1369,6 +1403,16 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 ["login", label] => AccountsCmd::Login {
                     label: (*label).to_string(),
                 },
+                ["browser", label] => AccountsCmd::Browser {
+                    label: (*label).to_string(),
+                },
+                ["browser", ..] => {
+                    return Err(
+                        "accounts browser takes one label: `aterm harness accounts browser \
+                         <label> [--cli <id>]`"
+                            .to_string(),
+                    );
+                }
                 ["use"] if auto => AccountsCmd::Auto,
                 ["use", label] if !auto => AccountsCmd::Use {
                     label: (*label).to_string(),
@@ -1405,8 +1449,8 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                         "accounts takes nothing (or `list`), `stats`, `sync [<source>] [--machine <mN>]`, \
                          `serve [<source>] [--bind <addr:port>] [--machine <mN>]`, `add <label> \
                          [--shared] [--email <e>] [--browser <b>]`, `adopt-default <label> \
-                         --email <e>`, `login <label>`, `renew [--due | <label>…] [--on \
-                         <host>,…]` or `use <label> | --auto`, not {other:?}"
+                         --email <e>`, `login <label>`, `browser <label>`, `renew [--due | \
+                         <label>…] [--on <host>,…]` or `use <label> | --auto`, not {other:?}"
                     ));
                 }
             };
@@ -1627,6 +1671,7 @@ fn accounts_of(
         | AccountsCmd::AdoptDefault { .. }
         | AccountsCmd::Renew { .. }
         | AccountsCmd::Login { .. }
+        | AccountsCmd::Browser { .. }
         | AccountsCmd::Use { .. }
         | AccountsCmd::Auto
         | AccountsCmd::Stats { .. }
@@ -1635,8 +1680,8 @@ fn accounts_of(
     if let Some(verb) = verb {
         return Err(format!(
             "accounts {verb} is Claude Code's alone in this build: {}'s pool takes `list`, \
-             `add`, `adopt-default`, `login`, `renew`, `use`, `stats` and `sync` (Claude Code's \
-             dashboard shows every pool)",
+             `add`, `adopt-default`, `login`, `browser`, `renew`, `use`, `stats` and `sync` \
+             (Claude Code's dashboard shows every pool)",
             cli.connector().product
         ));
     }
@@ -4693,6 +4738,33 @@ pub trait AccountsHost {
         let _ = home;
         None
     }
+
+    /// The Chromium `accounts browser` opens a row's profile in ([`super::browser_window::find_window_browser`]); `None` where none is installed.
+    fn window_browser(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// `accounts browser` ([`run_accounts_browser`]): `profile` opened in `browser` at `url` in a window, waited for until the person presses Enter or Ctrl-C here, quits the browser, or [`super::login_drive::HANG`] runs out ([`super::browser_window::run_window`]).
+    fn open_window(
+        &self,
+        browser: &Path,
+        profile: &Path,
+        url: &str,
+    ) -> Result<super::browser_window::WindowEnd, String> {
+        let _ = (browser, profile, url);
+        Err("this host opens no window".to_string())
+    }
+
+    /// After `accounts browser`'s window ([`run_accounts_browser`]): `profile` opened headlessly once more, in a headless shell where one is installed, else in the window's `browser` ([`super::browser_window::tidy_profile`]), to drop every identity provider's cookies and to ask whether `session` (the vendor's origin and its web session's key) is kept there.
+    fn tidy_profile(
+        &self,
+        browser: &Path,
+        profile: &Path,
+        session: Option<(&str, &str)>,
+    ) -> Result<super::browser_window::Tidied, String> {
+        let _ = (browser, profile, session);
+        Err("this host opens no browser".to_string())
+    }
 }
 
 /// What opens a renewal's sign-in page ([`AccountsHost::renew_flow`]).
@@ -4815,10 +4887,123 @@ impl AccountsHost for LiveAccounts {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
-        terminal_run(super::login_drive::login_command(req, &home, &|name| {
-            std::env::var_os(name)
-        }))
+        let (cmd, _path) = super::login_drive::login_command(
+            req,
+            &home,
+            &|name| std::env::var_os(name),
+            (
+                self.under_ssh(),
+                Some(Path::new(super::login_drive::SANDBOX_EXEC)),
+            ),
+        )?;
+        terminal_run(cmd)
     }
+
+    fn window_browser(&self) -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        super::browser_window::find_window_browser(home.as_deref())
+    }
+
+    fn open_window(
+        &self,
+        browser: &Path,
+        profile: &Path,
+        url: &str,
+    ) -> Result<super::browser_window::WindowEnd, String> {
+        window_until_enter(|ended| {
+            super::browser_window::run_window(
+                browser,
+                profile,
+                url,
+                super::login_drive::HANG,
+                WINDOW_GRACE,
+                ended,
+            )
+        })
+    }
+
+    fn tidy_profile(
+        &self,
+        browser: &Path,
+        profile: &Path,
+        session: Option<(&str, &str)>,
+    ) -> Result<super::browser_window::Tidied, String> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let headless = super::headless_oauth::find_headless_browser(home.as_deref())
+            .filter(|found| found.is_headless_shell)
+            .unwrap_or_else(|| super::headless_oauth::HeadlessBrowser {
+                path: browser.to_path_buf(),
+                is_headless_shell: false,
+            });
+        super::browser_window::tidy_profile(&headless, profile, session, TIDY_WITHIN)
+    }
+}
+
+/// How long `accounts browser`'s headless pass after its window ([`AccountsHost::tidy_profile`]) may take.
+const TIDY_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long `accounts browser`'s window has to exit after its hangup before its process group is killed.
+const WINDOW_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Set by [`window_until_enter`]'s own SIGINT handler.
+#[cfg(unix)]
+static WINDOW_INTERRUPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn note_window_interrupt(_: libc::c_int) {
+    WINDOW_INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Runs `wait` with the end it polls: [`super::browser_window::WindowEnd::Done`] once a line (Enter) or the end of stdin is read, [`super::browser_window::WindowEnd::Interrupted`] once Ctrl-C is pressed. Ctrl-C reaches this process alone (the window is in its own process group), through a handler of its own, and the action it replaced is put back afterwards, as [`ignoring_interrupts`] puts back its own.
+#[cfg(unix)]
+fn window_until_enter<T>(
+    wait: impl FnOnce(&dyn Fn() -> Option<super::browser_window::WindowEnd>) -> T,
+) -> T {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    WINDOW_INTERRUPTED.store(false, Ordering::SeqCst);
+    let entered = Arc::new(AtomicBool::new(false));
+    let reader = Arc::clone(&entered);
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+        reader.store(true, Ordering::SeqCst);
+    });
+    // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty mask, no flags).
+    let mut note: libc::sigaction = unsafe { std::mem::zeroed() };
+    note.sa_sigaction = note_window_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: as above.
+    let mut was: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid disposition for SIGINT whose handler only stores to an atomic; `was` receives the one it replaces.
+    let set = unsafe { libc::sigaction(libc::SIGINT, &note, &mut was) } == 0;
+    struct Restore(Option<libc::sigaction>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(was) = &self.0 {
+                // SAFETY: puts back the whole action this scope replaced.
+                unsafe { libc::sigaction(libc::SIGINT, was, std::ptr::null_mut()) };
+            }
+        }
+    }
+    let _restore = Restore(set.then_some(was));
+    let ended = || {
+        if WINDOW_INTERRUPTED.load(Ordering::SeqCst) {
+            Some(super::browser_window::WindowEnd::Interrupted)
+        } else if entered.load(Ordering::SeqCst) {
+            Some(super::browser_window::WindowEnd::Done)
+        } else {
+            None
+        }
+    };
+    wait(&ended)
+}
+
+#[cfg(not(unix))]
+fn window_until_enter<T>(
+    wait: impl FnOnce(&dyn Fn() -> Option<super::browser_window::WindowEnd>) -> T,
+) -> T {
+    wait(&|| None)
 }
 
 /// `<program> auth login --claudeai --email <email>` as a renewal runs it ([`AccountsHost::renew_flow`]): the login made under the staging home alone ([`accounts::HOME_ENV`] = `home`) with [`accounts::LOGIN_ENV`] removed (set, it would name the keychain item instead, and the new login would land in a live session's), and the page opened as `browser` says: the account's profile through the argv0 opener, Claude Code's default, or, over SSH, nothing (the opener with no profile: the paste-code flow).
@@ -6430,6 +6615,10 @@ pub(super) enum Renewal {
     AuthFailed,
     WrongAccount,
     Failed,
+    /// Another CLI's sign-in stopped where only a person can go on (its page waits on one, or a
+    /// block page, or its time ran out), so a background renewal of the row waits for one
+    /// ([`super::accounts_sync`]'s backoff).
+    NeedsPerson,
 }
 
 impl Renewal {
@@ -7006,6 +7195,10 @@ fn drove_words(outcome: &super::login_drive::Outcome) -> String {
         }
         Outcome::Refused(why) => format!("the page was refused: {}", super::one_line(why, 160)),
         Outcome::NeedsYou(why) => format!("it stopped: {}", super::one_line(why, 160)),
+        Outcome::NeedsSignIn(why) => format!(
+            "it stopped on the vendor's sign-in page: {}",
+            super::one_line(why, 240)
+        ),
         Outcome::Failed => "the CLI said its sign-in failed".to_string(),
         Outcome::Hung => format!(
             "the page was not approved within {} minutes",
@@ -7270,19 +7463,6 @@ pub(super) fn renew_one_for(
         "renewing `{label}`: {}",
         sign_in_words(cli, plan.route, plan.hosts)
     );
-    if cli
-        .accounts()
-        .signin
-        .as_ref()
-        .is_some_and(crate::ai::connector::SignIn::opens_browser_here)
-    {
-        let _ = writeln!(
-            out,
-            "{} also opens its page in this machine's default browser, which aterm cannot stop: \
-             leave that window alone; the headless browser approves the page",
-            c.product
-        );
-    }
     let _ = out.flush();
     let drove = host.vendor_sign_in(&super::login_drive::Request {
         cli,
@@ -7338,6 +7518,15 @@ pub(super) fn renew_one_for(
                 drove_words(other),
                 if recorded { "" } else { " (not even that)" }
             );
+            if matches!(other, Outcome::NeedsSignIn(_)) {
+                let _ = writeln!(
+                    out,
+                    "NEEDS YOU: sign `{label}` in once in its own browser profile: run `aterm \
+                     harness accounts browser {label} --cli {id}` at this machine's desk, then \
+                     `aterm harness accounts renew {label} --cli {id}`",
+                    id = cli.id()
+                );
+            }
             if matches!(other, Outcome::NeedsYou(_) | Outcome::Hung) {
                 let _ = writeln!(
                     out,
@@ -7349,6 +7538,9 @@ pub(super) fn renew_one_for(
             }
             return match other {
                 Outcome::Exited(code) => Renewal::authentication_failed(*code),
+                Outcome::NeedsYou(_) | Outcome::NeedsSignIn(_) | Outcome::Hung => {
+                    Renewal::NeedsPerson
+                }
                 _ => Renewal::Failed,
             };
         }
@@ -7415,8 +7607,9 @@ fn run_accounts_renew_for(
                 let _ = writeln!(
                     err,
                     "aterm harness accounts renew: `{label}` has no email, so its sign-in could \
-                     not be checked; add `email = \"…\"` to its row (or sign it in with `aterm \
-                     harness accounts login {label} --cli {}`); nothing was run",
+                     not be checked; add `email = \"…\"` to its row (and `region`, on a Kimi \
+                     Code row), or sign it in with `aterm harness accounts login {label} --cli \
+                     {}`; nothing was run",
                     cli.id()
                 );
                 return ExitCode::from(1);
@@ -7559,6 +7752,271 @@ fn run_accounts_login_for(
     }
 }
 
+/// `accounts browser <label> [--cli <id>]` (design §6): the row's own browser profile ([`super::headless_oauth::row_browser_profile`], the one its headless sign-ins run in) opened in a window at the vendor's sign-in page ([`crate::ai::connector::Accounts::sign_in_page`]) for a person to sign in to the vendor's site once, under the machine's sign-in lock ([`AccountsHost::open_window`]). It runs only at this machine's desk: a terminal on stdin, no SSH, a window browser ([`AccountsHost::window_browser`]) and no other browser holding the profile. The profile is claimed for the window ([`super::browser_window::ProfileLock`]), its password manager turned off first, and after the window opened headlessly once more ([`AccountsHost::tidy_profile`]) to drop every identity provider's cookies and ask whether the vendor's web session is kept there ([`crate::ai::connector::Accounts::web_session_key`]). The ledger keeps the page's host, how the window ended and that answer, never a URL, code or email; nothing else is written but the profile. Exit 0 where the vendor keeps its session there, or, for a vendor whose session aterm cannot see, once the person was done (or quit the browser); exit 1 where the identity providers' cookies could not be removed.
+fn run_accounts_browser(
+    cli: Cli,
+    env: &Env,
+    host: &dyn AccountsHost,
+    label: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    use super::browser_window::WindowEnd;
+    let refuse = |err: &mut dyn Write, what: &str| {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts browser: {what}; nothing was opened"
+        );
+        ExitCode::from(1)
+    };
+    let Some((path, file_roster)) = accounts_read_roster_for(cli, env, err) else {
+        return ExitCode::from(1);
+    };
+    let Some(row) = file_roster.row(label).cloned() else {
+        return refuse(
+            err,
+            &format!(
+                "`{}` is not in the roster ({})",
+                super::one_line(label, 80),
+                path.display()
+            ),
+        );
+    };
+    let Some(email) = row.email.clone() else {
+        return refuse(
+            err,
+            &format!(
+                "`{label}` has no email, so nothing could check the account signed in; add \
+                 `email = \"…\"` to its row"
+            ),
+        );
+    };
+    let Some(page) = cli.accounts().sign_in_page.of(row.vendor.region) else {
+        return refuse(
+            err,
+            &format!(
+                "{label}: the row names no `region`, so the vendor's site is not known; add \
+                 `region = \"global\"` (kimi.ai) or `\"mainland-cn\"` (kimi.com) to its row"
+            ),
+        );
+    };
+    if let Some(why) = no_window_desk() {
+        return refuse(err, why);
+    }
+    if !host.stdin_is_terminal() {
+        return refuse(
+            err,
+            "not run: stdin is not a terminal (the window waits for you to sign in and press \
+             Enter here). Run it in a terminal at this machine's desk",
+        );
+    }
+    if host.under_ssh() {
+        return refuse(
+            err,
+            "not run: this runs over SSH, so the window would open on this machine's desk, not \
+             yours",
+        );
+    }
+    let Some(browser) = host.window_browser() else {
+        let cache = super::headless_oauth::browser_cache_roots(env.home.as_deref())
+            .into_iter()
+            .find(|root| root.extension().is_some_and(|e| e == "noindex"))
+            .map_or_else(
+                || "aterm's browser cache".to_string(),
+                |root| format!("{}/", root.display()),
+            );
+        return refuse(
+            err,
+            &format!(
+                "no Chromium that opens a window is installed here: put Google Chrome for \
+                 Testing or Chromium in /Applications or ~/Applications, unzip a Chrome for \
+                 Testing archive into {cache} (as is, or in a `chrome-<version>-<platform>/` \
+                 folder), or name one in $ATERM_BROWSER"
+            ),
+        );
+    };
+    let Some(store) = env.accounts_store_for(cli) else {
+        let _ = writeln!(err, "aterm harness accounts browser: {}", no_home_for(cli));
+        return ExitCode::from(1);
+    };
+    let _lock = match store.signin_within() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return refuse(err, &format!("{label}: held: {}", accounts::SIGNIN_HELD)),
+        Err(e) => {
+            return refuse(
+                err,
+                &format!("{label}: the sign-in lock could not be taken ({e})"),
+            );
+        }
+    };
+    let profile = super::headless_oauth::row_browser_profile(
+        cli,
+        &store.dir,
+        &store.shared_dir(),
+        label,
+        Some(&email),
+    );
+    for dir in [profile.parent(), Some(profile.as_path())]
+        .into_iter()
+        .flatten()
+    {
+        if let Err(e) = aterm_types::fs_restricted::ensure_private_dir(dir) {
+            return refuse(
+                err,
+                &format!("{label}: its browser profile's folder could not be made ({e})"),
+            );
+        }
+    }
+    let _claimed = match super::browser_window::ProfileLock::claim(&profile) {
+        Ok(claimed) => claimed,
+        Err(why) => {
+            return refuse(
+                err,
+                &format!("{label}: its browser profile is {}", why.words(&profile)),
+            );
+        }
+    };
+    if let Err(e) = super::browser_window::quiet_password_manager(&profile) {
+        return refuse(
+            err,
+            &format!("{label}: its browser's password manager could not be turned off ({e})"),
+        );
+    }
+    let site = super::login_drive::https_host(page).unwrap_or_else(|| "no-page".to_string());
+    let _ = writeln!(
+        out,
+        "opening `{label}`'s own browser profile at {page} in {} (a window apart from your own \
+         browser; it may open behind this one)",
+        super::browser_window::browser_name(&browser)
+    );
+    let _ = writeln!(
+        out,
+        "sign in there as {}, the row's account; create no account and accept no new terms for \
+         it, and save no password there (its password manager is off)",
+        super::one_line(&email, 80)
+    );
+    let _ = writeln!(
+        out,
+        "once the window closes, aterm removes the cookies of Google and the other identity \
+         providers from that profile, so only {site}'s own sign-in stays in it"
+    );
+    let _ = writeln!(
+        out,
+        "press Enter here when you are signed in (Ctrl-C, or quitting that browser, ends it too)"
+    );
+    let _ = out.flush();
+    let end = match host.open_window(&browser, &profile, page) {
+        Ok(end) => end,
+        Err(why) => {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts browser: {label}: the window did not open: {}",
+                super::one_line(&why, 160)
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let origin = super::browser_window::origin_of(page);
+    let session = cli
+        .accounts()
+        .web_session_key
+        .zip(origin.as_deref())
+        .map(|(key, origin)| (origin, key));
+    let tidied = host.tidy_profile(&browser, &profile, session);
+    let now = host.now();
+    let state = match &tidied {
+        Ok(t) => match t.session {
+            Some(true) => "session-kept",
+            Some(false) => "no-session",
+            None => "session-unknown",
+        },
+        Err(_) => "untidied",
+    };
+    let event = accounts::Event::new(now, accounts::Kind::SignIn, label)
+        .because(&format!("{site} window {} {state}", end.word()));
+    let recorded = accounts_transact_logins(&store, now, err, |_, _| Ok(vec![event])).is_ok();
+    let flag = cli_flag(cli);
+    let unrecorded = if recorded {
+        ""
+    } else {
+        " (and the window was not recorded)"
+    };
+    let tidied = match tidied {
+        Ok(tidied) => tidied,
+        Err(why) => {
+            let _ = writeln!(
+                out,
+                "{label}: the window closed ({}){unrecorded}",
+                end.word()
+            );
+            let _ = writeln!(
+                err,
+                "aterm harness accounts browser: {label}: its profile could not be opened again \
+                 to remove the identity providers' cookies ({}), so a Google or other sign-in may \
+                 be left in it; quit any browser on it and run `aterm harness accounts browser \
+                 {label}{flag}` again",
+                super::one_line(&why, 160)
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let dropped = match tidied.dropped {
+        0 => "it holds no identity provider's cookies".to_string(),
+        1 => "1 identity provider's cookie was removed from it".to_string(),
+        n => format!("{n} identity providers' cookies were removed from it"),
+    };
+    let (said, signed_in) = match tidied.session {
+        Some(true) => (format!("{site} keeps its session in it"), true),
+        Some(false) => (
+            format!("{site} keeps no session in it, so nothing was signed in there"),
+            false,
+        ),
+        None => (
+            format!(
+                "aterm cannot see from here whether {site} signed you in; the renewal checks it"
+            ),
+            matches!(end, WindowEnd::Done | WindowEnd::Quit),
+        ),
+    };
+    let _ = writeln!(
+        out,
+        "{label}: the window closed ({}); {dropped}; {said}{unrecorded}",
+        end.word()
+    );
+    if signed_in {
+        let _ = writeln!(
+            out,
+            "next: aterm harness accounts renew {label}{flag}   ({})",
+            if cli == Cli::Claude {
+                "a headless renewal signs in through this profile"
+            } else {
+                "its page is approved in this profile, headlessly"
+            }
+        );
+        ExitCode::SUCCESS
+    } else {
+        let _ = writeln!(
+            out,
+            "next: sign in there, then press Enter: aterm harness accounts browser {label}{flag}"
+        );
+        ExitCode::from(1)
+    }
+}
+
+/// Why no sign-in window can open on this machine's desk: a host that is neither macOS nor Linux, or a Linux session with no display (`DISPLAY`, `WAYLAND_DISPLAY`).
+fn no_window_desk() -> Option<&'static str> {
+    if !cfg!(unix) {
+        return Some("not run: a sign-in window opens on macOS and Linux only");
+    }
+    let shown = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    if cfg!(target_os = "linux") && !shown("DISPLAY") && !shown("WAYLAND_DISPLAY") {
+        return Some(
+            "not run: this session has no display (no DISPLAY or WAYLAND_DISPLAY) to open the window on",
+        );
+    }
+    None
+}
+
 fn claude_profile_of(
     home: Option<&Path>,
     config: Option<&str>,
@@ -7613,6 +8071,9 @@ pub fn run_accounts(
             run_accounts_renew(env, host, (labels, *due, on.as_deref()), out, err)
         }
         AccountsCmd::Login { label } => run_accounts_login(env, host, label, out, err),
+        AccountsCmd::Browser { label } => {
+            run_accounts_browser(Cli::Claude, env, host, label, out, err)
+        }
         AccountsCmd::Use { label } => run_accounts_use(Cli::Claude, env, Some(label), out, err),
         AccountsCmd::Auto => run_accounts_use(Cli::Claude, env, None, out, err),
         AccountsCmd::Stats { json } => run_accounts_stats(env, *json, out),
@@ -7719,6 +8180,7 @@ pub fn run_accounts_of(
             run_accounts_renew_for(cli, env, host, (labels, *due, on.as_deref()), out, err)
         }
         AccountsCmd::Login { label } => run_accounts_login_for(cli, env, host, label, out, err),
+        AccountsCmd::Browser { label } => run_accounts_browser(cli, env, host, label, out, err),
         AccountsCmd::Sync {
             source,
             machine,
@@ -7734,7 +8196,7 @@ pub fn run_accounts_of(
             let _ = writeln!(
                 err,
                 "aterm harness accounts: {}'s pool takes `list`, `add`, `adopt-default`, \
-                 `login`, `renew`, `use`, `stats` and `sync` in this build",
+                 `login`, `browser`, `renew`, `use`, `stats` and `sync` in this build",
                 cli.connector().product
             );
             ExitCode::from(1)

@@ -2392,6 +2392,32 @@ struct InkMark {
     node: usize,
     words: Option<String>,
     rect: LogicalRect,
+    /// An image's art and its whole box: it inks only the pixels it draws
+    /// ([`drawn_within`]), never the transparent rest of the box.
+    art: Option<(crate::widget::ImageArt, LogicalRect)>,
+}
+
+/// The part of `cross` that `mark` inks: an image's drawn pixels there, or
+/// all of it for any other mark.
+fn drawn_within(mark: &InkMark, cross: LogicalRect) -> Option<LogicalRect> {
+    let Some((art, frame)) = mark.art else {
+        return Some(cross);
+    };
+    if frame.width <= 0.0 || frame.height <= 0.0 {
+        return None;
+    }
+    let drawn = art.mask().drawn(crate::widget::ArtSpan {
+        left: (cross.x - frame.x) / frame.width,
+        top: (cross.y - frame.y) / frame.height,
+        right: (cross.right() - frame.x) / frame.width,
+        bottom: (cross.bottom() - frame.y) / frame.height,
+    })?;
+    Some(LogicalRect::new(
+        frame.x + drawn.left * frame.width,
+        frame.y + drawn.top * frame.height,
+        (drawn.right - drawn.left) * frame.width,
+        (drawn.bottom - drawn.top) * frame.height,
+    ))
 }
 
 fn ink_marks(
@@ -2404,6 +2430,7 @@ fn ink_marks(
     let mut clips = vec![clip];
     for prim in prims {
         let current = *clips.last().unwrap_or(&clip);
+        let mut art = None;
         let (words, rect) = match prim {
             DrawPrim::ClipPush { x, y, w, h } => {
                 clips.push(
@@ -2453,11 +2480,26 @@ fn ink_marks(
                 }
             }
             DrawPrim::BandIcon { x, y, size, .. } => (None, LogicalRect::new(*x, *y, *size, *size)),
-            DrawPrim::Image { x, y, w, h, .. } => (None, LogicalRect::new(*x, *y, *w, *h)),
+            DrawPrim::Image {
+                x,
+                y,
+                w,
+                h,
+                art: image,
+            } => {
+                let frame = LogicalRect::new(*x, *y, *w, *h);
+                art = Some((*image, frame));
+                (None, frame)
+            }
             _ => continue,
         };
         if let Some(rect) = rect.intersect(current).filter(|rect| !rect.is_empty()) {
-            out.push(InkMark { node, words, rect });
+            out.push(InkMark {
+                node,
+                words,
+                rect,
+                art,
+            });
         }
     }
 }
@@ -2518,11 +2560,11 @@ fn merge_icon_strokes(marks: &mut Vec<InkMark>, start: usize) {
     while merged {
         merged = false;
         'pairs: for a in start..marks.len() {
-            if marks[a].words.is_some() {
+            if marks[a].words.is_some() || marks[a].art.is_some() {
                 continue;
             }
             for b in a + 1..marks.len() {
-                if marks[b].words.is_some() {
+                if marks[b].words.is_some() || marks[b].art.is_some() {
                     continue;
                 }
                 let (one, other) = (marks[a].rect, marks[b].rect);
@@ -3404,6 +3446,7 @@ impl CompiledUi {
                         node: index,
                         words: None,
                         rect,
+                        art: None,
                     });
                 }
             }
@@ -3417,7 +3460,13 @@ impl CompiledUi {
                 if a.node == b.node && repaints(a, b) {
                     continue;
                 }
-                let Some(cross) = a.rect.intersect(b.rect) else {
+                // An image inks only the pixels it draws, not its whole box.
+                let Some(cross) = a
+                    .rect
+                    .intersect(b.rect)
+                    .and_then(|cross| drawn_within(a, cross))
+                    .and_then(|cross| drawn_within(b, cross))
+                else {
                     continue;
                 };
                 if cross.width < INK_OVERLAP_LEAST || cross.height < INK_OVERLAP_LEAST {

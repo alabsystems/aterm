@@ -53,12 +53,12 @@ pub fn store_of(exe: &Path) -> Option<(PathBuf, String, u64)> {
 /// (a store executable, [`store_of`]), activated, with its `bin/` shim, its
 /// `agents/` twin and the reroute stubs, then run the clone once
 /// (`--version`): macOS assesses a new file at its first exec, and the first
-/// measured launch must not pay it. A `hold` directory, which holds the
-/// caller's scratch, is made and stamped on the awake clock
+/// measured launch must not pay it. A `hold` directory holds the caller's
+/// scratch from before cloning, is stamped on the awake clock
 /// ([`aterm_uds::deadline::stamp_exec`]) just before that exec, and removed
-/// once the clone showed it ran: it printed anything, or ended with an exit
-/// status. A clone killed before it printed, or a run that could not be
-/// started or read, leaves it: macOS may still be assessing the clone. A
+/// once the clone showed it ran by printing. A clone that printed nothing,
+/// or a run that could not be started or read, leaves it: macOS may still
+/// be assessing the clone. A
 /// caller whose `home` nothing removes passes none.
 /// # Errors
 /// `source` is no store build's executable; the scratch prefix is the owner's
@@ -97,6 +97,10 @@ pub fn lay(home: &Path, source: &Path, hold: Option<&Path>) -> Result<Laid, Stri
         .and_then(Path::parent)
         .ok_or("the source has no build directory")?;
     let build_dir = layout.build_dir(&program, build);
+    if let Some(hold) = hold {
+        std::fs::create_dir_all(hold)
+            .map_err(|e| format!("cannot hold {}: {e}", hold.display()))?;
+    }
     clone_tree(from, &build_dir).map_err(|e| {
         format!(
             "cannot clone {} into {}: {e}",
@@ -151,17 +155,17 @@ pub fn lay(home: &Path, source: &Path, hold: Option<&Path>) -> Result<Laid, Stri
             .map_err(|e| format!("cannot hold {}: {e}", hold.display()))?;
         aterm_uds::deadline::stamp_exec(hold);
     }
-    let out = aterm_uds::spawnfd::command(&exe)
-        .arg("--version")
+    let mut cmd = aterm_uds::spawnfd::command(&exe);
+    cmd.arg("--version")
         .env_clear()
         .env("HOME", &home)
         .env("PATH", "/usr/bin:/bin")
         .env("DISABLE_AUTOUPDATER", "1")
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::null());
+    let out = aterm_uds::deadline::output_within(&mut cmd, aterm_uds::deadline::FIRST_EXEC_HANG)
         .map_err(|e| format!("cannot run {}: {e}", exe.display()))?;
     if let Some(hold) = hold
-        && (out.status.code().is_some() || !out.stdout.is_empty() || !out.stderr.is_empty())
+        && (!out.stdout.is_empty() || !out.stderr.is_empty())
     {
         let _ = std::fs::remove_dir_all(hold);
     }
@@ -343,13 +347,13 @@ mod tests {
     /// signal at its `--version` (a Ctrl-C at the terminal reaches it, as it
     /// shares the lab's process group) is no proof it ran, so the hold made
     /// and stamped before its exec stays for the caller's abort to keep the
-    /// scratch. NEGATIVE CONTROL: one that ended on its own, or printed only
-    /// an error, showed it ran: `lay` fails, and the hold goes.
+    /// scratch. A silent normal exit also keeps it. NEGATIVE CONTROL: one
+    /// that printed only an error showed it ran: `lay` fails, and the hold goes.
     #[test]
     fn a_clone_killed_before_it_printed_keeps_its_hold() {
         for (what, body, kept) in [
             ("killed, silent", "#!/bin/sh\nkill -9 $$\n", true),
-            ("ended on its own", "#!/bin/sh\nexit 3\n", false),
+            ("ended silently", "#!/bin/sh\nexit 3\n", true),
             (
                 "an error, then killed",
                 "#!/bin/sh\necho no >&2\nkill -9 $$\n",
@@ -363,11 +367,16 @@ mod tests {
             std::fs::create_dir(&home).unwrap();
             let hold = root.join("held/reroute");
             let failed = lay(&home, &source, Some(&hold)).unwrap_err();
-            assert!(failed.contains("printed no version"), "{what}: {failed}");
             assert_eq!(
                 aterm_uds::deadline::exec_stamp(&hold).is_some(),
                 kept,
                 "{what}: {failed}"
+            );
+            let clone = atpkg::store::default_prefix(&home)
+                .join("store/claude/1000002000001000304/bin/claude");
+            assert_eq!(
+                std::fs::read(&clone).unwrap(),
+                std::fs::read(&source).unwrap()
             );
         }
     }

@@ -121,7 +121,7 @@ built on, and are kept because the tests sample their consequences.
 No spec is blocked by gap 0 alone: every one needs at least `char`/`&str` as a carrier (gap 1).
 The cheapest set is gaps {0,1}: S16; then {0,1,3}: S6, S7.
 
-## 2. Test → spec map (TSV; all 119)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 

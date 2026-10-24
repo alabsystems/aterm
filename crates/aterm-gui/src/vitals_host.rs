@@ -3071,8 +3071,8 @@ impl crate::App {
         );
     }
 
-    /// One tab's load step for its chip's meter.
-    pub(crate) fn chip_load(&self, tab_count: usize, focus: crate::tab_model::ViewId) -> u8 {
+    /// One tab's load step for its chip's meter: all its panes'.
+    pub(crate) fn chip_load(&self, tab_count: usize, tab: &crate::tab_model::Tab) -> u8 {
         if tab_count < 2 || !self.stats_bars_form().shown() {
             return 0;
         }
@@ -3080,14 +3080,9 @@ impl crate::App {
             return 0;
         };
         let capacity = snap.total_cores().unwrap_or(0) as f32;
-        self.view_store
-            .get(focus)
-            .copied()
-            .and_then(crate::tab_model::View::terminal_session)
-            .and_then(|session| snap.tab(session))
-            .map_or(0, |tab| {
-                crate::tab_bar::chip_load_step(tab.scope.cores.level, capacity)
-            })
+        snap.tab_of(&self.tab_sessions(tab)).map_or(0, |tab| {
+            crate::tab_bar::chip_load_step(tab.scope.cores.level, capacity)
+        })
     }
 
     /// Hands each native strip its chips' load steps and the meters' inks after a reading.
@@ -3108,7 +3103,7 @@ impl crate::App {
                 .tab_set
                 .tabs()
                 .iter()
-                .map(|tab| self.chip_load(n, tab.focus))
+                .map(|tab| self.chip_load(n, tab))
                 .collect();
             crate::toolbar::set_chip_loads(handle, &loads, [inks.tab, inks.aterm]);
         }
@@ -3292,7 +3287,7 @@ impl crate::App {
         }
     }
 
-    /// This window's front tab: its session id and label (`Tab 2`).
+    /// This window's front tab: its focused pane's session id and its label (`Tab 2`).
     pub(crate) fn deck_tab(&self, wid: crate::WindowId) -> (Option<u64>, String) {
         let Some(ws) = self.windows.get(&wid) else {
             return (None, "Tab".into());
@@ -3312,8 +3307,9 @@ impl crate::App {
     }
 
     /// The sessions of this window's front tab ([`Self::tab_sessions`]): the
-    /// tab Why now takes as "this tab", as `sys why` takes its caller's
-    /// (a tab split into panes is one, [`aterm_vitals::model::TabRoot::tab`]).
+    /// tab the deck, its lens and Why now take as "this tab", as `sys why`
+    /// takes its caller's (a tab split into panes is one,
+    /// [`aterm_vitals::model::TabRoot::tab`]).
     pub(crate) fn deck_tab_panes(&self, wid: crate::WindowId) -> Vec<u64> {
         self.windows
             .get(&wid)

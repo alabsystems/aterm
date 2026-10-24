@@ -86,6 +86,37 @@ pub fn sleep(d: Duration) -> Result<(), Stopped> {
     }
 }
 
+/// Wait `d`, or less when `done` is set (and [`ring`] rung) or an interrupt arrives: `Ok(true)` when `done` ended it.
+///
+/// # Errors
+/// The run was interrupted before `done` was set.
+pub fn sleep_unless(d: Duration, done: &AtomicBool) -> Result<bool, Stopped> {
+    let end = Instant::now() + d;
+    let (lock, cv) = bell();
+    let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        if done.load(Ordering::SeqCst) {
+            return Ok(true);
+        }
+        check()?;
+        let now = Instant::now();
+        if now >= end {
+            return Ok(false);
+        }
+        g = cv
+            .wait_timeout(g, end - now)
+            .unwrap_or_else(|p| p.into_inner())
+            .0;
+    }
+}
+
+/// Wake every [`sleep`] and [`sleep_unless`] to look again.
+pub fn ring() {
+    let (lock, cv) = bell();
+    let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
+    cv.notify_all();
+}
+
 /// Wait until the wall clock reads `t` (seconds since the epoch).
 ///
 /// # Errors
@@ -143,6 +174,34 @@ mod tests {
         let (code, out) = probe(TEST, "control");
         assert_eq!(code, Some(0), "{out}");
         assert!(out.contains("PROBE hup=caught term=caught"), "{out}");
+    }
+
+    #[test]
+    fn a_ring_after_done_ends_the_wait_and_the_deadline_ends_it_otherwise() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = Arc::new(AtomicBool::new(false));
+        let t = Instant::now();
+        assert_eq!(
+            super::sleep_unless(Duration::from_millis(30), &done),
+            Ok(false)
+        );
+        assert!(t.elapsed() >= Duration::from_millis(30));
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let _ = tx.send(super::sleep_unless(Duration::from_mins(10), &done));
+            });
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        done.store(true, Ordering::SeqCst);
+        super::ring();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_mins(1)),
+            Ok(Ok(true)),
+            "the ring woke the waiter within the one-minute hang detector (its own deadline is 10 minutes)"
+        );
     }
 
     fn hard_exit_act() {

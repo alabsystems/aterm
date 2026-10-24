@@ -99,6 +99,7 @@ impl KeeperClient {
     /// The dial failing, the keeper failing the identity check (a [`NotThisBuild`] inside `PermissionDenied`), or the check not running (trustd not answering within `timeout` among the reasons).
     pub fn connect(path: &Path, identity: &Identity, timeout: Duration) -> io::Result<Self> {
         let stream = CtlStream::connect(path)?;
+        aterm_uds::keep_out_of_children(&stream)?;
         identity.check(&stream, timeout).map_err(check_failed)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;

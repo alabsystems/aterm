@@ -49,6 +49,10 @@
 //!   `Closer::set_write_timeout`), which XNU answers on a socket the peer already
 //!   shut down: then there is nothing left to bound, and the refusal is no error. A
 //!   refusal on a live socket is kept.
+//! - [`close_on_fork`]: keep a socket out of every child the process forks or spawns
+//!   (`FD_CLOFORK`). On Apple a descriptor scan of a child being spawned drains the
+//!   parent's copy of the socket for good; astream-broker marks every socket it
+//!   creates (listeners, accepted and dialled connections, and their duplicates).
 //! - [`install_sighup_handler`] and [`sighup_generation`]: a process-wide `SIGHUP`
 //!   handler that only counts the signals (Apple; elsewhere `Unsupported` and a
 //!   count of zero). Only the broker's revocation file installs it, so that a
@@ -71,7 +75,8 @@
 //! (`cfg(target_vendor = "apple")`): `fcntl(F_BARRIERFSYNC)` behind [`barrier_sync`],
 //! `fsync` behind [`full_sync`] in a test's debug process,
 //! `sysctlbyname("kern.bootsessionuuid")` behind [`boot_session`], `poll` behind
-//! `socket_hung_up`, and `signal(SIGHUP)` behind [`install_sighup_handler`]. `owner`
+//! `socket_hung_up`, `fcntl(F_GETFD)` and `fcntl(F_SETFD)` behind [`close_on_fork`],
+//! and `signal(SIGHUP)` behind [`install_sighup_handler`]. `owner`
 //! (`cfg(unix)`): `geteuid` behind [`euid`] and [`owner_private`], and on Apple
 //! `acl_get_fd_np`, `acl_get_entry`, `acl_get_tag_type` and `acl_free` behind
 //! [`owner_private`] and [`owner_private_dir`]; the per-OS `O_NONBLOCK` and
@@ -125,6 +130,16 @@ macro_rules! apple_ffi {
     (sysctlbyname($name:expr, $oldp:expr, $oldlenp:expr, $newp:expr, $newlen:expr)) => {
         // SAFETY: NUL-terminated name, writable buffer, and length pointer are valid for the duration of the call.
         unsafe { sysctlbyname($name, $oldp, $oldlenp, $newp, $newlen) }
+    };
+    (fd_flags($fd:expr)) => {
+        // SAFETY: `F_GETFD` reads one descriptor's flags and touches no memory; the
+        // descriptor is retained by a BorrowedFd for the call.
+        unsafe { fcntl($fd, F_GETFD) }
+    };
+    (set_fd_flags($fd:expr, $flags:expr)) => {
+        // SAFETY: `F_SETFD` sets one descriptor's flags from an int and touches no memory;
+        // the descriptor is retained by a BorrowedFd for the call.
+        unsafe { fcntl($fd, F_SETFD, $flags) }
     };
     (install_sighup($sig:expr, $handler:expr)) => {
         // SAFETY: `SIGHUP` is a valid standard POSIX signal number and `$handler` is an
@@ -245,6 +260,33 @@ pub const fn decode_boot_id_u128_be(hi: u64, lo: u64) -> [u8; 16] {
 #[must_use]
 pub fn socket_hung_up(socket: std::os::fd::BorrowedFd<'_>) -> bool {
     apple::socket_hung_up(socket)
+}
+
+/// Keep `socket` out of every child this process forks or spawns (`FD_CLOFORK`, on
+/// top of the close-on-exec it already has).
+///
+/// Apple: a socket is DRAINED, for good, when one of its descriptors is closed while
+/// another thread or process is inside a call on that same descriptor — a
+/// `proc_pidfdinfo` from any same-user inspector (lsof, a descriptor scan) or an
+/// `fstat` is enough. Every later blocking read on the socket's other descriptors then
+/// answers `EBADF` at once, and a drained LISTENER hands the drain to every connection
+/// it accepts afterwards. A child holds a copy of each of its parent's descriptors
+/// until its `exec` closes it, so a scan of a child being spawned drains the parent's
+/// sockets; a descriptor marked here is never copied into a child. Non-Apple targets
+/// have no such drain and return `Ok(())` without a call.
+///
+/// # Errors
+/// The `fcntl(2)` errno of reading or setting the descriptor's flags.
+pub fn close_on_fork(socket: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        apple::close_on_fork(socket)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = socket;
+        Ok(())
+    }
 }
 
 /// Install the process-wide Apple `SIGHUP` handler once. Success means installation

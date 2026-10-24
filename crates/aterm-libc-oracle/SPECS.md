@@ -148,7 +148,7 @@ lemma, `tail`, and `up`. Then `repr-c-layout` → `layout-validate` → `shim-st
 `shape-records` → `shape-diff-symmetric-difference`. `cli-parse` + `run-precondition-could-not-run` +
 `report-exit-code-precedence` + `report-json-shape` → `binary-exit-codes`.
 
-## 2. Test to spec map (TSV; all 73)
+## 2. Test to spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 Paths are relative to `crates/aterm-libc-oracle/`.

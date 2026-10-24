@@ -1116,8 +1116,8 @@ fn pool_login_verb(
     };
     let done = match facts::pool_for(&machine, cli) {
         None => Done::Refused(format!(
-            "this machine keeps no `{}`: add a row with `aterm harness accounts add <label> \
-             --cli {id} --email <email>`, then run `aterm ai login {id}`",
+            "this machine keeps no `{}`: run `aterm harness accounts add <label> --cli {id} \
+             --email <e>` (kimi also `--region <r>`), then run this again",
             cli.accounts().roster_file
         )),
         Some(pool) => {
