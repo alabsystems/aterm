@@ -834,7 +834,9 @@ impl ScrollPlan {
             .then_some(seat)
     }
 
-    /// THE SEAT THAT SHOWS WHAT THE STOPS CANNOT (the final check of 2026-10-20, F1).
+    /// THE SEAT THAT SHOWS WHAT THE STOPS CANNOT: where the stop screen from `top` cuts
+    /// span `span` of stop `index` and the room could hold it, the screen nudged off its
+    /// stops to show it whole, else a bare seat.
     pub(super) fn seat_span(&self, index: usize, top: usize, span: (f32, f32)) -> Option<Seat> {
         if span.1 - span.0 > self.room + 0.01 || self.foot == ListFoot::Whole {
             return None;

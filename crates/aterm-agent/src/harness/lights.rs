@@ -493,7 +493,7 @@ mod tests {
         );
     }
 
-    /// THE 2.1.301 FOOTERS (measured 2026-10-15 by `aterm-lab footers`: the real
+    /// THE 2.1.301 FOOTERS (measured by `aterm-lab footers`: the real
     /// Claude Code in the lab's private headless aterm, a subscriber login,
     /// model opus at the top effort level): each mode the launch's shift+tab
     /// cycle shows reads as that mode, idle, with the mode row under the rule
@@ -548,10 +548,10 @@ mod tests {
         }
     }
 
-    /// THE 2.1.307 AND 2.1.308 FOOTERS (measured 2026-10-21 and 2026-10-22 by
-    /// `aterm-lab footers` in the lab's private headless aterm at 80x24, model
-    /// opus at the top effort level; docs/measured/claude-code-2.1.307-2026-10-21.md
-    /// and docs/measured/claude-code-2.1.308-2026-10-21.md): each reads as the
+    /// THE 2.1.307 AND 2.1.308 FOOTERS (measured by `aterm-lab footers` in the
+    /// lab's private headless aterm at 80x24, model opus at the top effort
+    /// level; docs/measured/claude-code-2.1.307-2026-10-21.md and
+    /// docs/measured/claude-code-2.1.308-2026-10-21.md): each reads as the
     /// mode and turn it was captured in, the mode row under the composer's
     /// rule, with the vendor's `← for agents` hint gone from the rows drawn
     /// past its first 10 s and the bypass row's effort tag wrapped onto a row

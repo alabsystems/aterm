@@ -25,18 +25,18 @@ pub struct Verb {
 pub const VERBS: &[Verb] = &[
     Verb {
         name: "pack",
-        synopsis: "pack <program> --checkout <dir> [--triple T] [--build N] [--merge-from PKG] [--toolchain BIN] [--out DIR] [--trust-repo DIR] [--unsigned] [--upload]",
+        synopsis: "pack <program> --checkout <dir> [--triple T] [--build N] [--merge-from PKG] [--toolchain BIN] [--out DIR] [--trust-repo DIR] [--unsigned | --upload]",
         does: "build, gate, stage and sign one program for one target",
     },
     Verb {
         name: "pack-bundle",
-        synopsis: "pack-bundle <program> --sysroot <dir> [--src-repo DIR] [--build N] [--version V] [--triple T] [--hello-sysroot DIR | --no-hello] [--donor-root DIR]… [--keep-target T]… [--merge-from PKG] [--out DIR] [--trust-repo DIR] [--allow-dirty] [--no-smoke] [--no-strip] [--unsigned] [--upload]",
+        synopsis: "pack-bundle <program> --sysroot <dir> [--src-repo DIR] [--build N] [--version V] [--triple T] [--hello-sysroot DIR | --no-hello] [--donor-root DIR]… [--keep-target T]… [--merge-from PKG] [--out DIR] [--trust-repo DIR] [--allow-dirty] [--no-smoke] [--no-strip] [--unsigned | --upload]",
         does: "stage, prove, relocate, gate and sign a sysroot bundle (trust, trust-mc)",
     },
     Verb {
         name: "pack-package",
         synopsis: artifact::package::SYNOPSIS,
-        does: "pack, gate and sign a prebuilt package tree (codex-alab)",
+        does: "pack, gate and sign a prebuilt package tree (codex, built in codex-alab)",
     },
     Verb {
         name: "build-local",
@@ -55,7 +55,7 @@ pub const VERBS: &[Verb] = &[
     },
     Verb {
         name: "index",
-        synopsis: "index [--baseline QUAD-DIR | --first CHANNEL --index-build N] [--pin P=B]… [--target-pin T:P=B[,…]]… [--yank …] [--unyank …] [--min-build N [--lower-min-build]] [--retire P]… [--retire-target T[:P]]… [--allow-triple-drop P=T --reason …] [--valid-until TS] [--out DIR] [--pack-dir DIR | --upload]",
+        synopsis: "index [--baseline QUAD-DIR | --first CHANNEL --index-build N] [--pin P=B]… [--target-pin T:P=B[,…]]… [--yank P@B|P@V]… [--unyank P@B|P@V]… [--min-build N [--lower-min-build]] [--retire P]… [--retire-target T[:P]]… [--allow-triple-drop P=T --reason …] [--valid-until TS] [--out DIR] [--pack-dir DIR | --upload]",
         does: "sign the next index as a delta over the verified head; --upload publishes it",
     },
     Verb {
@@ -76,7 +76,7 @@ pub const VERBS: &[Verb] = &[
     Verb {
         name: "lane",
         synopsis: "lane run <alab|linux> [--dry-run] [--sha256 HEX] [--log FILE] [--triple T]… | lane install <alab|linux> [--allow-dirty] [--no-arm] [--keyless] | lane disarm <alab|linux>",
-        does: "run, install or disarm an unattended lane",
+        does: "run, install or disarm an unattended lane (--triple and --keyless: linux only; a run without --dry-run needs its installed unit's --sha256)",
     },
 ];
 

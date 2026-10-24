@@ -37,6 +37,15 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
+    /// The first confirmation of an entry this process posts or adopts at wall clock `unix_ms`:
+    /// `unix_ms` × 2²⁰, saturating (an entry made past about the year 2527 starts exhausted). An
+    /// earlier process that held the same id started it at an earlier millisecond's value and
+    /// moved it by one per accepted report, so while the wall clock moves forward between the two
+    /// and no entry takes 2²⁰ reports per millisecond, no observation made there matches here.
+    pub(crate) const fn first_confirmation(unix_ms: u64) -> u64 {
+        unix_ms.saturating_mul(1 << 20)
+    }
+
     /// A fresh accepted report invalidates every older observation of this entry.
     pub(crate) const fn confirm(&mut self) {
         self.confirmation = self.confirmation.saturating_add(1);

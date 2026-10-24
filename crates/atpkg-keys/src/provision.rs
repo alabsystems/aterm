@@ -1056,53 +1056,101 @@ pub fn plan(pre: Preflight, seed: &MasterSeed, now: u64) -> Result<Planned, Stri
     })
 }
 
+/// A [`write_pins`] failure.
+#[derive(Debug)]
+pub struct PinsError {
+    pub message: String,
+    /// This run's bytes may have reached the anchor file, which may now name the planned master.
+    pub landed: bool,
+}
+
+impl std::fmt::Display for PinsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<PinsError> for String {
+    fn from(e: PinsError) -> Self {
+        e.message
+    }
+}
+
 /// Write `pins.rs` and verify the written file.
-pub fn write_pins(planned: &Planned) -> Result<(), String> {
+pub fn write_pins(planned: &Planned) -> Result<(), PinsError> {
+    write_pins_with_sync(planned, sync_parent)
+}
+
+fn write_pins_with_sync(
+    planned: &Planned,
+    sync: impl FnOnce(&str) -> std::io::Result<()>,
+) -> Result<(), PinsError> {
+    let unwritten = |message| PinsError {
+        message,
+        landed: false,
+    };
     if let Some(text) = &planned.pins_text {
-        let current = read_bytes(&planned.paths.pins)
-            .map_err(|e| concat(&["re-read ", &planned.paths.pins, ": ", &e.to_string()]))?;
+        let current = read_bytes(&planned.paths.pins).map_err(|e| {
+            unwritten(concat(&[
+                "re-read ",
+                &planned.paths.pins,
+                ": ",
+                &e.to_string(),
+            ]))
+        })?;
         if current != planned.pins_src.as_bytes() {
-            return Err(concat(&[
+            return Err(unwritten(concat(&[
                 &planned.paths.pins,
                 " CHANGED ON DISK since this run read it (something else edited it — a \
                  `git checkout`, a rebase, an editor, another agent). This run's edit was \
                  computed against the older bytes, so writing it now would silently revert \
                  that change. NOTHING HAS BEEN WRITTEN. Read `git diff` over the anchor \
                  file, then run this command again against what the file says now.",
-            ]));
+            ])));
         }
-        write_bytes_atomic(&planned.paths.pins, text.as_bytes())
-            .map_err(|e| concat(&["write ", &planned.paths.pins, ": ", &e.to_string()]))?;
+        crate::fsio::write_bytes_atomic_with_sync(&planned.paths.pins, text.as_bytes(), sync)
+            .map_err(|e| PinsError {
+                message: concat(&["write ", &planned.paths.pins, ": ", &e.error.to_string()]),
+                landed: e.renamed,
+            })?;
     }
     #[cfg(test)]
     crate::fsio::window::reached("anchor file written", &planned.paths.pins);
+    let after = |message| PinsError {
+        message,
+        landed: planned.pins_text.is_some(),
+    };
     let raw = read_bytes(&planned.paths.pins).map_err(|e| {
-        concat(&[
+        after(concat(&[
             "re-read ",
             &planned.paths.pins,
             " to verify the write: ",
             &e.to_string(),
-        ])
+        ]))
     })?;
-    let back = String::from_utf8(raw)
-        .map_err(|_| concat(&[&planned.paths.pins, " is not valid UTF-8 after writing"]))?;
+    let back = String::from_utf8(raw).map_err(|_| {
+        after(concat(&[
+            &planned.paths.pins,
+            " is not valid UTF-8 after writing",
+        ]))
+    })?;
     if let Some(text) = &planned.pins_text
         && back != *text
     {
-        return Err(concat(&[
+        return Err(after(concat(&[
             &planned.paths.pins,
             " does not hold the bytes that were just written — `git diff` it before doing \
              anything else",
-        ]));
+        ])));
     }
     let damaged = |e: String| {
-        concat(&[
+        after(concat(&[
             "after writing, ",
             &e,
             " — the anchor file may be damaged; `git diff` ",
             &planned.paths.pins,
             " before doing anything else",
-        ])
+        ]))
     };
     verify_members(&back, MASTER_ANCHOR, &planned.master_after).map_err(damaged)
 }
@@ -2157,8 +2205,9 @@ mod tests {
 
         let planned = plan(pre, &seed_of(PAPER), NOW).unwrap();
         let err = write_pins(&planned).unwrap_err();
-        assert!(err.contains("CHANGED ON DISK"), "{err}");
-        assert!(err.contains("NOTHING HAS BEEN WRITTEN"), "{err}");
+        assert!(err.message.contains("CHANGED ON DISK"), "{err}");
+        assert!(err.message.contains("NOTHING HAS BEEN WRITTEN"), "{err}");
+        assert!(!err.landed, "a refused write leaves the anchor unarmed");
         assert_eq!(
             std::fs::read_to_string(&paths.pins).unwrap(),
             concurrent,
@@ -2173,6 +2222,67 @@ mod tests {
             after.contains(REPLACEMENT),
             "the concurrent edit was not reverted: {after}"
         );
+    }
+
+    #[test]
+    fn write_pins_says_whether_a_failed_write_reached_the_anchor() {
+        let dir = scratch("failed-write");
+        let paths = paths_in(&dir);
+        write_fixture(&paths);
+        let pre = preflight(Verb::Setup, "m3", &paths).unwrap();
+        let planned = plan(pre, &seed_of(PAPER), NOW).unwrap();
+        let saved = dir.join("pins-before-rename.rs");
+        let (pins, backup) = (paths.pins.clone(), saved.clone());
+        let err = crate::fsio::window::with(
+            "temp name drawn",
+            move |_| {
+                std::fs::rename(&pins, &backup).unwrap();
+                std::fs::create_dir(&pins).unwrap();
+            },
+            || write_pins(&planned),
+        )
+        .unwrap_err();
+        std::fs::remove_dir(&paths.pins).unwrap();
+        std::fs::rename(&saved, &paths.pins).unwrap();
+        assert!(
+            !err.landed,
+            "a refused rename did not publish this run's bytes: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&paths.pins).unwrap(), PINS_FIXTURE);
+
+        for restore_original in [false, true] {
+            write_fixture(&paths);
+            let pre = preflight(Verb::Setup, "m3", &paths).unwrap();
+            let planned = plan(pre, &seed_of(PAPER), NOW).unwrap();
+            let expected = planned.pins_text.as_deref().unwrap();
+            let err = write_pins_with_sync(&planned, |pins| {
+                assert_eq!(std::fs::read_to_string(pins).unwrap(), expected);
+                if restore_original {
+                    std::fs::write(pins, PINS_FIXTURE).unwrap();
+                }
+                Err(std::io::Error::other("injected parent sync failure"))
+            })
+            .unwrap_err();
+            assert!(
+                err.landed,
+                "an actual rename is reported even after restoration: {err}"
+            );
+            assert!(
+                err.message.contains("injected parent sync failure"),
+                "{err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&paths.pins).unwrap(),
+                if restore_original {
+                    PINS_FIXTURE
+                } else {
+                    expected
+                },
+            );
+        }
+        assert!(!std::path::Path::new(&paths.roster).exists());
+        assert!(!std::path::Path::new(&paths.key).exists());
+        assert!(!std::path::Path::new(&paths.machine_pub).exists());
     }
 
     #[test]
@@ -2347,8 +2457,8 @@ mod tests {
             || write_pins(&planned),
         );
         assert!(
-            landed.is_err(),
-            "a foreign edit after the write is reported"
+            landed.is_err_and(|e| e.landed),
+            "a foreign edit after the write is reported, and this run's bytes landed"
         );
         std::fs::write(&paths.pins, PINS_FIXTURE).unwrap();
 
@@ -2373,10 +2483,11 @@ mod tests {
         no_write.pins_text = None;
         let err = write_pins(&no_write).unwrap_err();
         assert!(
-            err.contains("holds 0 keys but 1 were intended")
-                || err.contains("holds 1 keys but 2 were intended"),
+            err.message.contains("holds 0 keys but 1 were intended")
+                || err.message.contains("holds 1 keys but 2 were intended"),
             "{err}"
         );
+        assert!(!err.landed, "a run with nothing to write wrote nothing");
     }
 
     #[test]

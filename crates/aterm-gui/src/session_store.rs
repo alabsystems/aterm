@@ -1803,6 +1803,7 @@ fn handle_over(
         typed: Default::default(),
         bells: Default::default(),
         screen_moves: Default::default(),
+        job_feed: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),

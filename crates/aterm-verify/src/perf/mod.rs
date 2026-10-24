@@ -19,7 +19,8 @@
 //! ([`fabric`], [`aos`]) are headless but just as unjudgeable — their numbers
 //! are a disk's fsync, or a shared desk's scheduler, before they are aterm's —
 //! so they too run only when named and report MEASURED (fabric writing a
-//! ledger entry under `docs/measured/`, aos a summary and its JSON).
+//! ledger entry under `docs/measured/fabric/`, aos a summary, and its JSON with
+//! `--json-out`).
 //!
 //! `--no-windows` (the house switch for an agent sharing the owner's desktop)
 //! turns every lane that opens a window into a named skip and runs the rest.
@@ -191,7 +192,7 @@ impl Lane {
         match self {
             Lane::Throughput => "Terminal::process MB/s over a ~32 MiB mixed VT workload",
             Lane::Pathological => "Terminal::process MB/s per hostile-input corpus",
-            Lane::ScrollScrub => "scrollback scrub read-path rates over a 100k-line tiered fill",
+            Lane::ScrollScrub => "scrollback scrub read-path rates over a 120k-line tiered fill",
             Lane::Search => "search index build, cached query and retained memory",
             Lane::Restore => "serialize -> fresh engine -> replay rate",
             Lane::CrashRestore => {
@@ -212,7 +213,7 @@ impl Lane {
             Lane::Start => "fresh-process real-window startup timing of one aterm",
             Lane::Compare => "paired ABBA startup A/B of two aterm binaries",
             Lane::Cat => "cat 150 MB ascii + unicode, aterm vs the pinned ghostty tip",
-            Lane::Scroll => "windowed 100k-line scrub + jump-to-top frame pacing",
+            Lane::Scroll => "windowed 120k-line scrub + jump-to-top frame pacing",
             Lane::Vte => "vtebench's default suite, aterm vs the pinned ghostty tip",
             Lane::Fabric => {
                 "fabric post->deliver latency, burst throughput, request/reply ping-pong, attach \
@@ -247,9 +248,17 @@ impl Lane {
             }
             Lane::Start => "macOS, a built aterm (--binary)",
             Lane::Compare => "macOS, two built aterm binaries (--baseline, --candidate)",
-            Lane::Cat => "macOS on the M4-class bench box (or --dev-smoke), curl",
-            Lane::Vte => "macOS on the M4-class bench box (or --dev-smoke), curl, git",
-            Lane::Scroll => "macOS on the M4-class bench box (or --dev-smoke)",
+            Lane::Cat => {
+                "macOS on the M4-class bench box (or --dev-smoke), targo (release build of \
+                 aterm), curl"
+            }
+            Lane::Vte => {
+                "macOS on the M4-class bench box (or --dev-smoke), targo (release builds of aterm \
+                 and vtebench), curl, git"
+            }
+            Lane::Scroll => {
+                "macOS on the M4-class bench box (or --dev-smoke), targo (release build of aterm)"
+            }
             Lane::Fabric => {
                 "unix, targo (builds aterm and its fabric_bench bench: test, or opt-test with \
                  --profile opt)"
@@ -591,7 +600,8 @@ const OPTIONS: &[OptSpec] = &[
         flag: "--horizon-ms",
         value: Some("N,N,..."),
         lanes: &[Lane::Fabric],
-        help: "the ordered arm's horizons, one run each (default aterm's 100)",
+        help: "the ordered arm's horizons, one run each (default aterm's 100); needs \
+               --durability naming ordered",
     },
     OptSpec {
         flag: "--passes",
@@ -656,7 +666,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Cli, String> {
                 let lane = Lane::from_name(name).ok_or_else(|| {
                     format!("unknown lane `{name}` (`verify perf --list` names them)")
                 })?;
-                // An arena lane has no baseline: after `--record` it just runs.
+                // An arena or measured lane has no baseline: after `--record` it just runs.
                 if recording && lane.kind() == Kind::Floor {
                     cli.record.push(lane);
                 }
@@ -726,7 +736,8 @@ fn usage() -> String {
          medians to crates/aterm-verify/perf/golden/perf-trend.tsv (commit it: that is the\n\
          history the trend reads). `--record` rewrites, from this run, the baseline of every floor lane\n\
          named after it; an arena or measured lane named there just runs.\n\
-         Exit: 0 nothing failed (a SKIP names its fix) · 1 a lane failed · 2 usage.\n\
+         Exit: 0 nothing failed (a SKIP names its fix) · 1 a lane failed · 2 usage · 3 a lane\n\
+         could not run (a COULD NOT RUN names its fix).\n\
          \n\
          Options:\n",
     );
@@ -752,7 +763,7 @@ fn list() -> String {
             Kind::Arena => {
                 "ARENA lanes (only when named; real windows, minutes; measured, never judged: \
                  cat, scroll and vte write a docs/measured/arena entry, start and compare print \
-                 a summary)\n"
+                 a summary, and JSON with --json-out)\n"
             }
             Kind::Measured => {
                 "MEASURED lanes (only when named; headless, real processes, minutes; measured, \

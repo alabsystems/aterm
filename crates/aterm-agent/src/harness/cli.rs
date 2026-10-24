@@ -80,9 +80,9 @@ USAGE:
     aterm harness accounts use <label> | --auto  pin an account or return to automatic rotation
     aterm harness accounts sync [<source>] [--machine <mN>] [--json]
                                                  sync accounts.toml and fleet-accounts.toml from <source>
-                                                 or `[fleet] accounts_source` (no default source)
+                                                 or the source this machine configured (no default)
     aterm harness accounts serve [<source>] [--bind <addr:port>] [--machine <mN>]
-                                                 serve LAN account dashboard and fleet-accounts.toml
+                                                 serve account dashboard and fleet-accounts.toml
     aterm harness upgrade [<sid>] [--dry-run] [--json]
                                                  move live Claude Code sessions onto a newer build/model
     aterm harness upgrade [<sid>] --status [--json]
@@ -99,11 +99,13 @@ OPTIONS:
     --state <path>      harness state directory (default: $ATERM_HARNESS_STATE, else
                         <aterm state>/harness/claude-harness)
     --config <path>     aterm.toml to read; accounts.toml sits beside it (default:
-                        $XDG_CONFIG_HOME/aterm/aterm.toml, else ~/.config/aterm/aterm.toml)
-    --sock <path>       limits: control socket (default: resolved socket)
+                        $XDG_CONFIG_HOME/aterm/aterm.toml, else %APPDATA%\\aterm\\aterm.toml on
+                        Windows, else ~/.config/aterm/aterm.toml)
+    --sock <path>       limits, upgrade: control socket (default: resolved socket)
     --apply <class>     disk: safelist class to remove (`cargo-targets`, `claude-stale-versions`;
                         `atpkg-gc` and `claude-purge` are report-only and name the owning command)
     --dry-run           upgrade: print each session's next step without typing or signalling
+                        (`disk --apply` and `upgrade models set` ignore it and still act)
     --status            upgrade: print recorded upgrades without sweeping
     --now               upgrade <sid>: move at first pause (still requires idle, empty draft,
                         no box/hold/child, and no keystroke in the last 20 s)
@@ -119,7 +121,7 @@ OPTIONS:
     --machine <mN>      accounts sync, serve: override machine id (`m8`, `m14`, \u{2026})
     --bind <addr:port>  accounts serve: listen address (default `127.0.0.1:8741`)
     --json              emit JSON
-    -h, --help          print help (`aterm harness <verb> --help` for one verb)
+    -h, --help, help    print help (`aterm harness <verb> --help` for one verb)
 ";
 
 const HELP_USAGE: &str = "\
@@ -166,8 +168,10 @@ macOS/Windows cloud folders). `claude-stale-versions` are the installed Claude C
 versions other than the live one that no lock or running process holds.
 
 THRESHOLDS (`watch:`):
-  - `warn`: max(`disk.warn_free_gib` [default 40 GiB], 8% volume [<=64 GiB], 2 * `room`)
-  - `floor`: max(`disk.auto_free_gib` [default 10 GiB; <=0 turns it off], 5% [<=32 GiB], `room`)
+  - `warn`: max(`disk.warn_free_gib` [default min(40 GiB, 20% volume)], 8% volume [<=64 GiB],
+    2 * `room`)
+  - `floor`: max(`disk.auto_free_gib` [default min(10 GiB, 10% volume)], 5% [<=32 GiB], `room`);
+    <=0 turns off the window's pass and `--apply`'s tiers 1 and 4
   - `emergency`: max(4 GiB, 1% volume [<=8 GiB]), capped at `floor`; or <50,000 free inodes
   - `room`: the 2nd-largest daily 2h fall of free space over 7 days (clamped to
     [min(16 GiB, 5%), 10% <=256 GiB]), or `disk.room_gib`.
@@ -192,7 +196,8 @@ const HELP_TAP: &str = "\
 `tap` is the statusLine command aterm adds to Claude Code relaunch lines while
 `[harness] usage_tap = true` (the default). Claude Code pipes its usage JSON to
 `<aterm> harness tap` after each reply and every 10 s; `tap` writes
-`<state>/rl/<tab>-<pid>.json` (0600), prints `5h <p>% \u{b7} 7d <p>%`, and exits 0.
+`<aterm state>/harness/claude-harness/rl/<tab>-<pid>.json` (0600; `--state` and
+`$ATERM_HARNESS_STATE` do not move it), prints `5h <p>% \u{b7} 7d <p>%`, and exits 0.
 It is added only on the machine's own login (the default one, the roster's lone one, or,
 where `accounts.toml` lists two or more accounts, any login it lists or one a renewal moved
 one of its rows away from; one row's tap follows only its current login) in the default
@@ -219,10 +224,12 @@ keeps writing readings until it is relaunched.
 ";
 
 const HELP_LEDGER: &str = "\
-`ledger` prints the newest rows (default 20) of a harness jsonl ledger (`--json`: verbatim):
-  - `ledger [@<sid>] [<n>]`: supervisor approval decisions (`<aterm state>/drive/<sid>.jsonl`)
+`ledger` prints the newest rows (default 20, at most 4096) of a harness jsonl ledger
+(`--json`: verbatim):
+  - `ledger [@<sid>] [<n>]`: supervisor approval decisions (`<aterm state>/drive/<sid>.jsonl`;
+    `self.jsonl` with neither `@<sid>` nor a parent session)
   - `ledger disk [<n>]`: disk reports, removal intents, removals, and refusals
-    (`<state>/disk.jsonl`)
+    (`<state>/disk.jsonl`, always verbatim)
   - `ledger upgrade [<n>]`: live upgrade steps and owner requests (`<state>/upgrade/ledger.jsonl`)
   - `ledger accounts [<n>]`: account walls, samples, rotations, pins, and auth checks
     (`<state>/accounts/ledger.jsonl`)
@@ -236,13 +243,14 @@ machine's default login), and optional `email` and `browser`. An invalid roster 
 refused whole (exit 1). The report prints no credential or email.
 
 REPORT & ROTATION (`[harness] accounts = \"early\" | \"wall\" | \"off\"`):
-  Prints `active: <label>, N of M sessions on it`; a row per account with its condition
-  (`not-enrolled`, `signed-out`, `limited until <time>`, `low`, `usable`, or `unseen`), its
-  mark (`active`, `active:unproven`, `pinned`, or `-`), and `offer:`, `credits:`,
-  `warned:`, `on:` and `login:` where they apply; then `next:` and `not next:`.
+  Prints `active: <label>, N of M sessions on it`; a row per account with its class, its
+  condition (`not-enrolled`, `signed-out`, `limited until <time>`, `low`, `usable`, or
+  `unseen`), its mark (`active`, `active:unproven`, `pinned`, or `-`), `offer:`, `credits:`
+  and `warned:` where they apply, `on:` (its sessions, or `-`), and `login:` where it
+  applies; then `next:` and `not next:`.
   - Under `early` (default), the supervisor rotates sessions at turn end off a limited or
-    `low` account (>=90% 5h or >=98% week, with >15m to reset), and probes `/usage` on idle
-    full-screen sessions (at most once per 3m per account).
+    `low` account (>=90% 5h or >=98% week with >15m to reset, or carried by usage credits),
+    and probes `/usage` on idle full-screen sessions (at most once per 3m per account).
   - Under `wall`, sessions rotate only when a turn ends on a usage limit.
   - Under `off`, limits are still recorded, but the supervisor never rotates sessions.
 
@@ -262,16 +270,18 @@ VERBS:
   - `accounts adopt-default <label> --email <e> [--browser <b>]`
     Lists the machine's default login (no `dir`) as a renewable row.
   - `accounts login <label>`
-    Runs `CLAUDE_CONFIG_DIR='<dir>' claude auth login` in a terminal, then checks once
-    with `claude auth status --json` (20 s cap) under `CLAUDE_SECURESTORAGE_CONFIG_DIR`
-    and records `signed in` (exit 0) or the failure (exit 1). Refuses a row with `email`
-    (use `accounts renew`).
+    Runs `CLAUDE_CONFIG_DIR='<dir>' claude auth login` (plain `claude auth login` for the
+    default row) in a terminal, then checks once with `claude auth status --json` (20 s cap)
+    under `CLAUDE_SECURESTORAGE_CONFIG_DIR` and records `signed in` (exit 0) or the failure
+    (exit 1). With no terminal on stdin it prints the command, runs nothing, and exits 0.
+    Refuses a row with `email` (use `accounts renew`).
   - `accounts renew [--due | <label>...] [--on <host>,... | --here]`
     Signs in rows with `email` through a staging dir (`<label>+<n>`), checks that the
     account email matches, and binds the row in `<state>/accounts/logins.json` so sessions
-    move at their next idle turn end (`wrong-account` deletes the staging dir and changes
-    nothing). Then runs `ssh -t <host> aterm harness accounts renew --due --here` on each
-    host in `--on` (or `[harness] hosts` under `--due`; none with `--here`).
+    move at their next idle turn end (the reply names a `[harness]` switch that stops this;
+    `wrong-account` deletes the staging dir and changes nothing live, though a bound row
+    records the attempt). Then runs `ssh -t <host> aterm harness accounts renew --due --here`
+    on each host in `--on` (or `[harness] hosts` under `--due`; none with `--here`).
   - `accounts use <label> | --auto`
     Pins an enrolled account that is not signed out (clearing its recorded walls), or
     clears the pin (`--auto`).
@@ -285,8 +295,8 @@ VERBS:
     this machine configured. With neither it reads nothing and exits 1. It waits at most
     10 s for the accounts lock, then fails and syncs nothing.
   - `accounts serve [<source>] [--bind <addr:port>] [--machine <mN>]`
-    Serves the LAN account rotation dashboard and `fleet-accounts.toml` (default
-    `127.0.0.1:8741`) from the same source.
+    Serves the account rotation dashboard and `fleet-accounts.toml` from the same source,
+    on `127.0.0.1:8741` unless `--bind` names another address (a LAN one shares it).
 
 FLEET ACCOUNTS (off unless this machine names a source):
   - Opt in with `[fleet] accounts_source = \"<source>\"` in aterm.toml, by running
@@ -317,8 +327,8 @@ MODES:
     `wait:notice-shown` before the move).
   - Cooperative mode (`[harness] upgrade_ask = true`): types a readiness notice asking the
     agent to finish background work and confirm. It repeats every 30m, up to 4 notices,
-    then rests 2h (then 4h, 8h) and re-arms (`rearmed:<why>`). It never types into a
-    session at a usage limit.
+    then rests 2h (then 4h, 8h, and 24h from the fourth unanswered round in a row) and
+    re-arms (`rearmed:<why>`). It never types into a session at a usage limit.
 
 THE LADDER (activity delays, never disables):
   - <20m behind (`prefer`): screen still 20 s, no human input within `[harness] human_grace_s`.
@@ -335,12 +345,15 @@ SCOPE & EXIT CODES:
     the newest model of the same family, or the next one up the priority list.
   - Muse Code (`muse resume <uuid>`) and agy (`agy --conversation=<uuid>`) are moved by the
     window in quiet mode only; Codex and Gemini CLI are never moved live.
-  - Hand-run sweeps exit 0, 1 (`[harness] enabled` off, or the sweep lock cannot be made),
-    2 (no home directory), or 75 (`step=busy:another-sweep`).
+  - Hand-run sweeps exit 0, 1 (`[harness] enabled` off without `--dry-run`, or the sweep
+    lock cannot be made), 2 (no home directory), or 75 (`step=busy:another-sweep`);
+    `--status` exits 1 when upgrade records or session files cannot be read whole.
 ";
 
 const HELP_UPGRADE_STATUS: &str = "\
 `upgrade --status` prints recorded upgrades for live sessions without sweeping:
+  - `phase=`: the round's phase (`pending`, `announced:<notices>`, `exiting`, `relaunched`,
+    `failed:<why>`).
   - `pending_for=`, `wait=`, `wait_for=`: time behind and the current wait (among them
     `settling`, `awaiting-ready`, `ready-unrecorded`, `superseded`, `background`, `draft`,
     `attended`, `held`, `terminal:<owner>`, `not-idle:busy`, `not-idle:waiting`,
@@ -352,15 +365,18 @@ const HELP_UPGRADE_STATUS: &str = "\
     look), or `overdue` (>6h behind, >1h past a usage-limit reset, or a notice refused for 90m).
   - `held_by=`: child processes (`<pid>(<name>:<age>),...` or `-`).
   - `release=`: release line owed after an abandoned notice (`gave-up`, `void`, `skipped`,
-    `deferred`, `retargeted`, or `-`).
+    `deferred`, `retargeted`, `model-dropped`, the reason a round stopped after its notice,
+    or `-`).
   - `rung=`: ladder rung (`prefer`, `settled`, `keys-only`, `land`, or `-`).
   - `looked=`, `by=`, `point=`, `guard=`, `watch_at=`: last host look, build, idle point,
-    loop guard (`wall`, `settle`, `no-background-wait`, `act-untaken`, `not-idle`), and
-    next watch deadline (`due` or `-`).
+    the supervisor's withholding guard word (such as `wall`, `settle`, `no-background-wait`,
+    `act-untaken`, `not-idle`, `stall`, `prompt`), and next watch deadline (`due` or `-`).
   - `cause=`, `told=`, `refused=`: wait class (`own-work`, `person`, `limit`, `limit-passed`,
-    `notice`, `unreached`, `unrecorded`, `unclassified`), surfaced alert kind (`agent-down`,
-    `relaunch-stuck`, `hung-exit`, `harness-stuck`, `no-progress`, or `-`), and fence
-    refusals (`<n>/<span>`).
+    `tab-unread`, `under-way`, `notice`, `queued`, `unreached`, `build-fails`, `next-point`,
+    `unrecorded`, `unclassified`, or `-`), surfaced alert kind (`agent-down`,
+    `relaunch-stuck`, `hung-exit`, `harness-stuck`, `no-progress`, `no-terminal`,
+    `build-fails`, `refused-launch`, `repeating-stop`, `suspended`, `typed-draft`,
+    `limit-passed`, `unwatched`, `own-work`, or `-`), and fence refusals (`<n>/<span>`).
   - `--json` adds `attention` (`quiet`, `fault`, `digest`, `interrupt`), `attention_kind`,
     `cause`, `cause_words`, and `waits` (last 24 wait transitions).
 ";
@@ -4010,8 +4026,9 @@ fn upgrade_line_with(
 }
 
 /// What `accounts use` says once the owner's word is recorded.
-pub const ACCOUNTS_USE_RECORDED: &str = "recorded: the supervisor moves Claude Code sessions to \
-                                         it at their next turn end, and continues one waiting at its limit";
+pub const ACCOUNTS_USE_RECORDED: &str = "recorded: unless `[harness] accounts = \"off\"`, the \
+                                         supervisor moves Claude Code sessions to it at their next \
+                                         turn end, and continues one waiting at its limit";
 
 const ACCOUNTS_ADD_LINE: &str = "aterm harness accounts add <label>";
 
@@ -5565,7 +5582,8 @@ fn run_accounts_use(
         .map(|events| match events.first() {
             Some(event) => format!(
                 "{}: no longer pinned\nrecorded: it stays the active account; a session leaves \
-                 it only at a usage limit, for the account the report names `next`",
+                 it at a usage limit (under `early` also once it is `low`; under `off` never), \
+                 for the account the report names `next`",
                 event.account
             ),
             None => "no pin holds: nothing to end".to_string(),

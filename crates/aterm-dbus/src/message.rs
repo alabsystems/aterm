@@ -367,7 +367,8 @@ const fn required(m: &Message) -> std::result::Result<(), &'static str> {
     Err(missing)
 }
 
-/// The header's length ([`MAX_ARRAY_BYTES`]).
+/// The header's length: the 16 bytes up to the fields' content, the fields (at most
+/// [`MAX_ARRAY_BYTES`]), and the padding to the body's 8-byte boundary.
 #[cfg_attr(trust_verify, trust::requires(fields <= 67108864))]
 #[cfg_attr(trust_verify, trust::ensures(result >= 16 && result % 8 == 0))]
 #[inline]

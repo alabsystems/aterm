@@ -734,9 +734,9 @@ impl LazyBuffer {
     }
 
     /// Everything staged, moved out whole: a width change's job materializes it on the reflow
-    /// worker (`PendingScrollbackReflow`), where [`drain_all`](Self::drain_all) under the
-    /// caller's lock took 61 ms for the 99,871 rows a flood left staged (the desk,
-    /// 2026-10-22). The pool and the arrival count stay.
+    /// worker (`PendingScrollbackReflow`) rather than by [`drain_all`](Self::drain_all) under
+    /// the caller's lock, which takes 61 ms for the 99,871 rows a flood leaves staged (measured
+    /// at the desk). The pool and the arrival count stay.
     pub(crate) fn take_staged(&mut self) -> Self {
         Self {
             lines: std::mem::take(&mut self.lines),

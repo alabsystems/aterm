@@ -4,8 +4,8 @@
 # aterm-cap: spec recovery from its 7 unit tests
 
 > Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming the 5 tests it
-> deleted are gone, among them the 3 source scans of `tests/mint_reachability.rs` (d6c146e948 holds
-> the mint seal by type instead). §3 counts what is left; other counts were taken before.
+> deleted are gone, among them the 3 mint-reachability source scans (d6c146e948 deleted their file
+> and holds the mint seal by type instead). §3 counts what is left; other counts were taken before.
 
 > Status 2026-10-16: this is the crate's migration worklist. Each of the 4 specs below is
 > proved through Trust/Clean about the compiled Rust function (for the mint seal, about the
@@ -13,7 +13,7 @@
 > in §4 sampled no spec and are deleted.
 
 Source: `crates/aterm-cap` (read only). I read every `#[test]`: `src/lib.rs` had 4 in
-`mod tests`, and `tests/mint_reachability.rs` (since deleted) had 3 source-scan tests, 7 in all.
+`mod tests`, and the mint-reachability test file (since deleted) had 3 source-scan tests, 7 in all.
 I also read the code each one reaches and the mint call sites the scan inspected. Nothing was
 compiled or run. The claims below come from reading the code.
 
@@ -90,7 +90,7 @@ src/lib.rs	require_gates_on_tier	require-gate	cap-grant-tier, cap-satisfies-is-t
 ## 3. Coverage
 
 - 7 original tests read. 5 mapped to one of the 4 specs and 2 were not spec samples (§4). 2
-  remain, both `lib.rs` spec samples: the 3 integration tests of `tests/mint_reachability.rs`
+  remain, both `lib.rs` spec samples: the 3 mint-reachability integration tests
   and both §4 tests are deleted.
 - `mint-launcher-only` has no test in this crate. The type holds clauses (a) and (d) at compile
   time, and `Guard`, with its own tests in `crates/aterm-census/src/guards/mint.rs`, checks (b)

@@ -66,9 +66,9 @@ pub(crate) mod fixtures {
     }
 
     /// codex 0.163.0's question dialog in the composer's place, under the
-    /// message that asked for it (measured 2026-10-16,
-    /// `aterm-lab`'s `codexs_question_dialog_is_no_composer`): its pointer
-    /// at column 2.
+    /// message that asked for it (the rows `aterm-lab`'s
+    /// `codexs_question_dialog_is_no_composer` measured): its pointer at
+    /// column 2.
     pub(crate) fn codex_0_163_question() -> Vec<String> {
         rows(&[
             "› QUESTION: plan the database migration",

@@ -799,7 +799,7 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         worked_doubt: Duration::ZERO,
         record_turn: None,
         credits: None,
-        repo: None,
+        repo: aterm_agent::harness::repo_work::RepoRead::Clean,
         fact: None,
     }
 }

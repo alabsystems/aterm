@@ -435,7 +435,7 @@ impl Window {
         Some(x11_or_wayland!(match self; Window(w) => w.primary_monitor()?; as MonitorHandle))
     }
 
-    /// LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6,
+    /// LOCAL PATCH (aterm; docs/AUDIT-third-party-2026-10-15.md, winit-core step 6,
     /// the Linux half): the window's X11 or Wayland handles, which `window::Window` hands out
     /// through first-party `aterm_types::native_window::HasNativeWindow`.
     #[inline]

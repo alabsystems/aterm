@@ -9,12 +9,12 @@ license.workspace = true
 repository.workspace = true
 publish = false
 description = "aterm's models of the native chrome (tabs, panes, settings, documents) (ty_model!), for their crates' Tier-1 tests and spec-check"
-# The Tier-0 tests compile as ONE suite (tests/suite.rs): a tests/*.rs that is neither
-# the suite nor a `mod` of it compiles into nothing.
+# No tests of its own: `aterm-models` sweeps these models, and the crates they model
+# hold their code to them in conformance tests. A tests/*.rs added here compiles into nothing.
 autotests = false
 
 [lib]
-# No unit tests and no doctests live in src/: the models' tests are tests/suite.rs.
+# No unit tests and no doctests live in src/.
 test = false
 doctest = false
 

@@ -275,7 +275,8 @@ impl MomentumTrace {
         })
     }
 
-    /// Reads the trace on `epoch`.
+    /// Reads the trace on `epoch`, replays its log from its checkpoint, and checks the replay
+    /// reached the recorded head.
     /// # Errors
     /// Any of [`Self::read`]'s, then [`TraceFault::Broken`], [`TraceFault::UnknownCode`],
     /// [`TraceFault::Restore`], [`TraceFault::Refused`], [`TraceFault::State`] or

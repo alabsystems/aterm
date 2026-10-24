@@ -230,7 +230,7 @@ pub(crate) fn call_main<T>(
     }
 }
 
-/// Posts a closure to the main thread and waits up to `timeout` for its reply.
+/// Posts a closure to the main thread and waits up to `within` for its reply.
 pub(crate) fn call_main_within<T>(
     proxy: &EventLoopProxy<Wake>,
     within: std::time::Duration,
@@ -240,7 +240,7 @@ pub(crate) fn call_main_within<T>(
     recv_within(&rx, within).map_err(MainHopError::Reason)
 }
 
-/// Returns a [`MainHopError`] if the main thread is stalled or shutting down.
+/// Returns the refusal for a main-thread hop: the client hung up (unless its input is committed), the main thread is stalled, or (macOS) aterm is showing a modal dialog.
 pub(crate) fn main_thread_refusal() -> Option<MainHopError> {
     // A verb committed to finishing input it began is the one exception
     // ([`crate::control::CommittedInput`]: a `turn` whose text is typed still
@@ -540,7 +540,7 @@ fn prepare_image_target(
     Ok((target, Some(path)))
 }
 
-/// Handles `image`, rendering the target session's terminal framebuffer to a PNG file.
+/// Handles `image`, capturing the client frame of the window showing the target session (the front window by default) as a PNG file, or inline with `--bytes`.
 pub(crate) fn cmd_image(
     proxy: &EventLoopProxy<Wake>,
     rest: &str,
@@ -584,7 +584,8 @@ pub(crate) fn cmd_image(
                     aterm_containment::mode_or_containment(),
                     "path escapes images/ subdir or names a nested target",
                 );
-                return "ERR path: give a bare filename (no '/'), or omit it to auto-name one\n"
+                return "ERR path: give a bare filename in images/ (not `auto`, `.capture-locks` or \
+                        a symlink), or omit it to auto-name one\n"
                     .into();
             }
         };
@@ -803,7 +804,8 @@ pub(crate) fn cmd_window(
                     aterm_containment::mode_or_containment(),
                     "path escapes images/ subdir or names a nested target",
                 );
-                return "ERR path: give a bare filename (no '/'), or omit it to auto-name one\n"
+                return "ERR path: give a bare filename in images/ (not `auto`, `.capture-locks` or \
+                        a symlink), or omit it to auto-name one\n"
                     .into();
             }
         }
@@ -950,6 +952,7 @@ mod window_target_refusal_tests {
             ("FACT-MENU path", Fact::Path),
             ("fact-menu  branch", Fact::Branch),
             ("fact-menu usage", Fact::Usage),
+            ("fact-menu account", Fact::Account),
         ] {
             assert_eq!(
                 super::fact_menu_operand(words),
@@ -964,7 +967,7 @@ mod window_target_refusal_tests {
                 .expect_err(refused);
             assert!(
                 refusal.starts_with(
-                    "ERR usage: open fact-menu <model | effort | path | branch | context | usage>"
+                    "ERR usage: open fact-menu <model | effort | path | branch | context | usage | account>"
                 ),
                 "{refused}: {refusal}"
             );
@@ -1611,8 +1614,10 @@ fn video_frames_for_instance<'a>(
             match v.parse::<usize>() {
                 Ok(n) if n >= 1 => count = n.min(VIDEO_FRAMES_MAX),
                 _ => {
-                    return format!("ERR video frames: bad count '{t}' (1..={VIDEO_FRAMES_MAX})\n")
-                        .into();
+                    return format!(
+                        "ERR video frames: bad count '{t}' (1 or more; at most {VIDEO_FRAMES_MAX} are listed)\n"
+                    )
+                    .into();
                 }
             }
         } else {
@@ -1736,7 +1741,7 @@ fn recv_video_reply(
     }
 }
 
-/// Handles `video <seconds> ...`, recording the front window's swapchain frames to an MP4 file.
+/// Handles `video [<seconds>] ...` (and `status`, `stop`, `frames`), recording the front window's presented frames to `frame_NNNN.png` files plus an `index.json`.
 pub(crate) fn cmd_video(
     proxy: &EventLoopProxy<Wake>,
     rest: &str,
@@ -1886,7 +1891,7 @@ fn open_target(trimmed: &str) -> Result<(crate::app_introspect::AuxTarget, bool)
         Some((t, r)) if r.trim() == "close" => (t, true),
         Some(_) => {
             return Err(format!(
-                "ERR usage: open <{OPEN_TARGETS}> [close] | open app <…>\n"
+                "ERR usage: open <{OPEN_TARGETS}> [close] | open fact-menu <fact> | open app <…>\n"
             ));
         }
         None => (trimmed, false),
@@ -1905,7 +1910,7 @@ fn fact_menu_operand(trimmed: &str) -> Option<Result<Option<crate::claude_lights
     }
     let operand = words.next().map(str::to_ascii_lowercase);
     let usage = || {
-        "ERR usage: open fact-menu <model | effort | path | branch | context | usage> | open fact-menu close\n"
+        "ERR usage: open fact-menu <model | effort | path | branch | context | usage | account> | open fact-menu close\n"
             .to_string()
     };
     if words.next().is_some() {
@@ -2028,7 +2033,7 @@ fn settings_section_usage() -> String {
         .join(" | ")
 }
 
-/// Handles `settings ...`, reading or mutating settings overlay state.
+/// Handles `settings ...`: open, close or toggle the Settings tab, show a section, or set/unset an `aterm.toml` key.
 pub(crate) fn cmd_settings_overlay(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let t = rest.trim();
     let (word, tail) = match t.split_once(char::is_whitespace) {
@@ -2099,7 +2104,7 @@ fn settings_field_wire_reply(completion: Result<String, String>) -> String {
     }
 }
 
-/// Returns a pre-hop refusal for retired or unknown `invoke <name>` menu actions.
+/// Returns a pre-hop refusal for a retired `invoke <name>`, or for a person-only action ([`crate::menu::InvokeAuthority::PersonOnly`]) without the person stand-in.
 pub(crate) fn invoke_refusal(name: &str) -> Option<String> {
     // A RETIRED name answers with what to use instead, before any hop.
     if let Some(instead) = crate::menu::retired_invoke_name(name) {
@@ -2110,7 +2115,10 @@ pub(crate) fn invoke_refusal(name: &str) -> Option<String> {
         && !person_invoke_act(name))
     .then(|| {
         let at = match action {
-            crate::menu::MenuAction::ToggleStatsLens => "View \u{25b8} Stats Lens, \u{2318}I",
+            crate::menu::MenuAction::ToggleStatsLens if cfg!(target_os = "macos") => {
+                "View \u{25b8} Stats Lens, \u{2318}I"
+            }
+            crate::menu::MenuAction::ToggleStatsLens => "View \u{25b8} Stats Lens",
             _ => "Agents \u{25b8} Take Over This Tab / Hand Back This Tab",
         };
         format!("ERR denied: {name} is the person's own act at the window ({at})\n")
@@ -2474,7 +2482,7 @@ pub(crate) fn cmd_tone(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// Parsed `trail` control query (`Status` or `Log(n)`).
+/// Parsed `trail` control query (`Status`, or `Admissions(n)`: the last `n` admission records, all when `n` is omitted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrailForm {
     Admissions(Option<usize>),
@@ -2995,7 +3003,7 @@ pub(crate) struct PendingWorker {
     seed: crate::task_launch::TaskSeed,
 }
 
-/// Additional booking options (`split`, `raise`, `connected`, `task`) for [`crate::App::book_spawn`].
+/// Placement options (`cwd`, `split`, `raise`, `admission`) for [`crate::App::book_spawn`].
 pub(crate) struct SpawnBooking {
     pub(crate) cwd: Option<String>,
     pub(crate) split: Option<crate::pane::SplitDir>,
@@ -3059,7 +3067,7 @@ impl crate::App {
                   split, raise, theme and a worker's task — and `reply` its answer; \
                   a struct would only rename the Wake's fields"
     )]
-    /// Synchronously spawns a session aimed at `aim` (used by unit tests).
+    /// Handles `Wake::SpawnSession`: validates the theme, aim and worker, then books the tab or split off the event loop and replies once it lands.
     pub(crate) fn spawn_session_aimed(
         &mut self,
         aim: SpawnAim,
@@ -3124,7 +3132,7 @@ impl crate::App {
         }))
     }
 
-    /// Validates window, theme, working directory, and worker prerequisites before booking a spawn.
+    /// Resolves the host window and, for a worker, checks that this instance can launch it, before booking a spawn.
     pub(crate) fn resolve_spawn(
         &self,
         aim: SpawnAim,
@@ -3523,7 +3531,7 @@ pub(crate) fn cmd_close(
     }
 }
 
-/// Handles `chrome`, dumping the frontmost window's native macOS toolbar and window state.
+/// Handles `chrome`, dumping the front window's native chrome (toolbar, menu bar or menu model), the drawn autopilot chips, the status-item menu and the presence line.
 pub(crate) fn cmd_chrome(proxy: &EventLoopProxy<Wake>) -> String {
     let lines = match call_main(proxy, |tx| Wake::ReadChrome { reply: tx }) {
         Ok(lines) => lines,

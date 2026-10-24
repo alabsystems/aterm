@@ -3053,7 +3053,7 @@ fn the_fire_typing_halo_is_the_forges_warm_light() {
     };
     let shipped = fire_typing_halo(4, halo_rows(false), &|_| {});
     let unwarmed = fire_typing_halo(4, halo_rows(false), &|fx| fx.momentum_unwarmed = true);
-    // Round 2's halo: warmed toward the rod's amber (#ff9632).
+    // The control: a halo warmed toward the rod's amber (#ff9632).
     let amber = fire_typing_halo(4, halo_rows(false), &|fx| {
         fx.momentum_fire_ember = Some(0x00FF_9632);
     });
@@ -3062,7 +3062,7 @@ fn the_fire_typing_halo_is_the_forges_warm_light() {
     let (_, _, _, a_hue) = chroma(&amber);
     assert!(top > 0.0, "fixture: the halo is lit");
     // An ember's orange-red, never the tan a dim gold or amber makes of a
-    // dark page's blue-grey (2026-10-23).
+    // dark page's blue-grey.
     assert!(
         hue <= 25.0,
         "the fire's typing halo burns hue {hue:.1} degrees, a tan"
@@ -3321,15 +3321,15 @@ fn dark_lift(p: u32) -> f32 {
         .sum()
 }
 
-/// THE KEPT FLAME RISES IN THE GAPS, NOT OVER THE LETTERS (2026-10-22, fire
-/// dark under a line of text: a muddy haze over the letters in bands, each
-/// letter outlined dark in it). Typed as `echo the quick brown fox` under a
-/// line of text, quick and slower, over the newest eight cells and the
-/// caret's: the brightest blank cell (a word's gap, the caret's) lays at
-/// least three times the light over the baseline that the brightest
-/// letter's counters carry, every letter keeps the row's bar (6.2:1) in the
-/// composed frame, and the blaze rings no letter of the row. Negative
-/// control: laid as round 3 laid it, one crest along the line
+/// THE KEPT FLAME RISES IN THE GAPS, NOT OVER THE LETTERS (fire dark under a
+/// line of text: one crest along the line lays a muddy haze over the letters
+/// in bands, each letter outlined dark in it). Typed as
+/// `echo the quick brown fox` under a line of text, quick and slower, over
+/// the newest eight cells and the caret's: the brightest blank cell (a
+/// word's gap, the caret's) lays at least three times the light over the
+/// baseline that the brightest letter's counters carry, every letter keeps
+/// the row's bar (6.2:1) in the composed frame, and the blaze rings no
+/// letter of the row. Negative control: laid as one crest along the line
 /// ([`CursorGlow::fire_kept_crest`]), its letters' counters carry at least
 /// half the gaps' light and the blaze rings them.
 #[test]
@@ -3386,18 +3386,18 @@ fn the_kept_flame_rises_in_the_gaps_not_over_the_letters() {
     }
 }
 
-/// UNDER A KEPT LETTER THE FLAME EASES IN OVER PIXELS (2026-10-22, fire dark
-/// under a line of text: a two-pixel line of gold beads along the baseline,
-/// where the flame's hold over the letters gave way to the air's in one
-/// pixel). Typed as `echo the quick brown fox` under a line of text, quick
-/// and slower, over the newest eight cells' letters with no descender: down
-/// every pixel column under the baseline the light changes from one pixel
-/// row to the next by at most a fifth of the brightest light the flame lays
-/// in that band ([`CursorGlow::FIRE_DARK_CAP_EASE_PX`] and the roots laid a
-/// pixel a slab), and every letter keeps the row's bar. Negative control:
-/// capped as round 3 capped it ([`CursorGlow::fire_kept_cap_hard`]) a step
-/// of over a fifth; and laid wholly as round 3 laid it (one crest along the
-/// line, so a core under every letter) a step of half or more.
+/// UNDER A KEPT LETTER THE FLAME EASES IN OVER PIXELS (fire dark under a line
+/// of text: a hold over the letters that gives way to the air's in one pixel
+/// draws a two-pixel line of gold beads along the baseline). Typed as
+/// `echo the quick brown fox` under a line of text, quick and slower, over
+/// the newest eight cells' letters with no descender: down every pixel
+/// column under the baseline the light changes from one pixel row to the
+/// next by at most a fifth of the brightest light the flame lays in that
+/// band ([`CursorGlow::FIRE_DARK_CAP_EASE_PX`] and the roots laid a pixel a
+/// slab), and every letter keeps the row's bar. Negative control: capped
+/// hard ([`CursorGlow::fire_kept_cap_hard`]) a step of over a fifth; and
+/// laid as one crest along the line ([`CursorGlow::fire_kept_crest`], so a
+/// core under every letter) a step of half or more.
 #[test]
 fn under_a_kept_letter_the_flame_eases_in_over_pixels() {
     let g = tall_geom();

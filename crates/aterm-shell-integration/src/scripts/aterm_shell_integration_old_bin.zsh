@@ -1,5 +1,4 @@
-# aterm_shell_integration_old_bin.zsh - AN OLDER SCRIPT'S `~/.aterm/bin`, taken off
-# (2026-10-19; its own file since 2026-10-20).
+# aterm_shell_integration_old_bin.zsh - AN OLDER SCRIPT'S `~/.aterm/bin`, taken off PATH.
 #
 # Copyright 2026 Andrew Yates
 # Author: Andrew Yates

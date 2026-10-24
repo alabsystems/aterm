@@ -409,6 +409,11 @@ impl Judged {
         self.said.get(sid)
     }
 
+    /// Every session whose loop told a word this window still holds ([`Self::tell`]).
+    pub(crate) fn told_sids(&self) -> Vec<String> {
+        self.said.keys().cloned().collect()
+    }
+
     /// Seed rows left by a predecessor's ring (oldest first), taken once before this window's first row.
     pub(crate) fn seed_rows(&mut self, rows: Vec<RingRow>) {
         if std::mem::replace(&mut self.seeded, true) {
@@ -1212,6 +1217,16 @@ pub(crate) fn told(sid: &str, said: Option<OccupancySaid>) {
         .unwrap_or_else(PoisonError::into_inner)
         .get_or_insert_with(Judged::default)
         .tell(sid, said);
+}
+
+/// Every session whose loop told this window a word ([`Judged::told_sids`]).
+pub(crate) fn told_sids() -> Vec<String> {
+    BOARD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(Judged::told_sids)
+        .unwrap_or_default()
 }
 
 /// Take the board at `now_unix_ms` (the disk look's, of `kind`).

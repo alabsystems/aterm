@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tape item codec ([`super::frame`], [`EffectRecord`], [`Item::Note`], [`Mark`], [`End`]).
-//! Stateful [`Stamp`], [`Encoder`], [`Decoder`], [`super::delta`], [`KINDS`], [`super::recover`].
+//! Tape item codec ([`super::frame`], [`EffectRecord`], [`Item::Note`], [`Mark`], [`End`],
+//! [`Stamp`], [`Encoder`], [`Decoder`], [`super::delta`], [`KINDS`], [`super::recover`]).
 
 use std::collections::HashMap;
 use std::io::ErrorKind;

@@ -14,9 +14,11 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
                                          secrets, subscriber and server, and on an admin
                                          whether the approver runs
   aterm secrets join [<url>|<path>] [--name <host>] [--password-stdin]
-        [--no-agent] [--no-wait]         join a vault (neither: the ALab vault), waiting up
-                                         to 10 min for approval unless --no-wait, and
-                                         install the subscriber unless --no-agent
+        [--no-agent] [--no-wait]         join a vault (neither: the ALab vault; a trailing
+                                         #<signer key> pins its signer, else confirm the
+                                         fingerprint at a terminal), waiting up to 10 min
+                                         for approval unless --no-wait, and install the
+                                         subscriber unless --no-agent
   aterm secrets sync                     fetch and apply the latest version now
   aterm secrets watch                    the subscriber (agent on installs it): apply each
                                          new version; on an admin of a <url> vault, also
@@ -27,9 +29,10 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
 admin (a machine in [admins]):
   aterm secrets create <url>|<path> [--import <dir>] [--name <host>]
         [--no-agent]                     a new vault with a join password, this machine its
-                                         first admin (--import: each file in <dir> goes into
-                                         [everyone]); for a <url>, also install the
-                                         subscriber where it does not run, unless --no-agent
+                                         first admin (--import: each regular file in <dir>
+                                         with a valid entry name goes into [everyone]); for
+                                         a <url>, also install the subscriber where it does
+                                         not run, unless --no-agent
   aterm secrets edit                     the vault text in $VISUAL or $EDITOR (else vi);
                                          saving publishes it
   aterm secrets set <name> [--for <host|code>...] [--file <path>]
@@ -64,12 +67,14 @@ server and services:
         [--pin <vault>=<key>] [--store <dir>] [--hold <1-60 secs>] [--no-keep-awake]
                                          serve vaults (defaults: 0.0.0.0:7484, the store
                                          ~/.config/aterm/secrets/served, long-polls held
-                                         50 s). A vault the store lacks takes its first
-                                         version only from this machine, unless --pin names
-                                         the key that signs it (alab's is built in). On
-                                         macOS it keeps the Mac from idle sleep, and on
-                                         every address at port 7484 it advertises the
-                                         ALab vault's .local name
+                                         50 s; a relative --store is under ~). A vault the
+                                         store lacks takes its first version only from this
+                                         machine, unless --pin names the key that signs it
+                                         (alab's is built in). On macOS only, it keeps the
+                                         Mac from idle sleep unless --no-keep-awake, and
+                                         advertises <name>.local over mDNS: by default, on
+                                         every address at port 7484, the ALab vault's name
+                                         (--no-advertise: none)
   aterm secrets agent [on|off|status] [--program <path>]
                                          the subscriber as a launchd or systemd user job
                                          (--program: the aterm it runs, else this aterm)
@@ -203,7 +208,8 @@ enum Password {
 /// How `set` fills an entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Fill {
-    /// `--if-absent`: written only where no such file exists.
+    /// `--if-absent`: written only where the machine has no file of its own (none, or one
+    /// still holding what the vault wrote).
     if_absent: bool,
     /// `--with <anchor>`: filled only where that entry is not the machine's own.
     with: Option<String>,
@@ -329,7 +335,8 @@ fn serve_settings(f: &Flags) -> Result<ServeSettings, String> {
         && !crate::text::valid_machine_name(name)
     {
         return Err(format!(
-            "--advertise {name}: a host label of lowercase letters, digits and -"
+            "--advertise {name}: a host label of lowercase letters, digits and -, not machines, \
+             admins, everyone or join"
         ));
     }
     let answers_default_url = listen.ip().is_unspecified() && listen.port() == crate::DEFAULT_PORT;
@@ -1850,7 +1857,9 @@ mod unix {
         ))
     }
 
-    /// Ensure [`put_in_approver`] is installed when configuring a vault with a join queue.
+    /// `password <action>`: show the join password, set or generate one, open the vault, or
+    /// turn either off; after set, new or open on a `<url>` vault, the approver goes in unless
+    /// `--no-agent` ([`approver_here`]).
     pub(super) fn password(
         paths: &Paths,
         action: Password,

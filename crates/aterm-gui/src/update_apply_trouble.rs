@@ -800,10 +800,9 @@ mod tests {
         );
     }
 
-    /// THE STAND-DOWN HAS A HORIZON (2026-09-14, audit OBS-5): a scheduled retry
-    /// that knows its wait says it at planning precision; one that does not keeps
-    /// the bare promise; and a wait under any other promise is dropped, not
-    /// rendered into a contradiction.
+    /// THE STAND-DOWN HAS A HORIZON: a scheduled retry that knows its wait says it at
+    /// planning precision; one that does not keeps the bare promise; and a wait under
+    /// any other promise is dropped, not rendered into a contradiction.
     #[test]
     fn a_scheduled_retry_says_how_long_when_it_knows() {
         use std::time::Duration;
@@ -825,9 +824,9 @@ mod tests {
         );
     }
 
-    /// THE 2026-09-14 INCIDENT, AT THE WORDS. A hand-built, ad-hoc-signed
-    /// `/Applications/aterm.app` refused six automatic applies of v0.85.0 over ~8 h
-    /// because it cannot be the rollback source the swap installs.
+    /// A ROLLBACK-SOURCE REFUSAL, AT THE WORDS (a recorded reason, six applies refused): a
+    /// hand-built, ad-hoc-signed `/Applications/aterm.app` cannot be the rollback source
+    /// the swap installs, and the sentence names that installed copy and the remedy.
     #[test]
     fn observability_audit_a_rollback_source_refusal_names_the_installed_copy_and_the_remedy() {
         let reason = "installed bundle failed pre-park verification: the installed bundle at \

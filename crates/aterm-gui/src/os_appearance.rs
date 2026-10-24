@@ -306,8 +306,7 @@ mod desktop {
 
     /// The portal's reading if it is running, asked in-process
     /// (`portal_settings`, which never starts it): no `gdbus` child, and no
-    /// wait for a portal that cannot start (200 ms of a Linux window's launch
-    /// before, 2026-10-20).
+    /// wait (200 ms of a Linux window's launch) for a portal that cannot start.
     #[cfg(target_os = "linux")]
     fn read_running_portal() -> Option<Appearance> {
         crate::portal_settings::read(APPEARANCE_NAMESPACE, COLOR_SCHEME_KEY, READ_BOUND)

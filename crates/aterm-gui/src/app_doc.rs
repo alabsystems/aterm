@@ -25,7 +25,7 @@ use crate::{App, WindowId};
 pub(crate) enum DocNames {
     /// Its `doc=` id.
     Id(u64),
-    /// Resolved file paths for the URI (as given, codec-decoded, and canonicalized).
+    /// The file's URI spellings: as given, the codec's, and the realpath one the store keys by.
     Uri(Vec<String>),
 }
 

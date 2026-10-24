@@ -423,7 +423,7 @@ fn setup_without_a_terminal_refuses_and_writes_nothing() {
     let err = stderr_of(&out);
     assert!(err.contains("/dev/tty"), "{err}");
     assert!(
-        err.contains("nothing was written and no phrase was shown"),
+        err.contains("no phrase was shown — no master exists"),
         "the refusal must state that no master exists: {err}"
     );
     assert_eq!(
@@ -786,7 +786,7 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
 
 #[test]
 fn a_mistyped_retype_reshows_the_phrase_and_a_correct_one_arms() {
-    const RETYPE_PROMPT: &str = "retype the phrase FROM YOUR PAPER (echo off; spaces ignored; Ctrl-C aborts, nothing is armed): ";
+    const RETYPE_PROMPT: &str = "retype the phrase FROM YOUR PAPER (echo off; spaces ignored; an empty line or Ctrl-C aborts, nothing is armed): ";
     let tmp = scratch("setup-retype-mismatch");
     let dir = tmp.path().to_path_buf();
     std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).expect("unarmed fixture");

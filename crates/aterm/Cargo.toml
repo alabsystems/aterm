@@ -80,10 +80,7 @@ aterm-log = { path = "../aterm-log" }    # the log facade (the update verb recor
 aterm-uds = { workspace = true }
 
 # `aterm link` — the fabric bridge. A LIBRARY like every other verb, so the one
-# Mach-O carries it: before 2026-09-10 this crate lived outside the workspace
-# and path-depended on a sibling astream checkout, so no release ever shipped
-# the bridge and turning the fabric on meant building two repositories by hand.
-# Its astream crates come from the vendor/astream submodule (see
+# Mach-O carries it. Its astream crates come from the vendor/astream submodule (see
 # vendor/README-astream.md), and none of them carries a cipher tree.
 #
 # Unix only: the bridge is Unix-domain sockets and descriptors inherited at fixed numbers

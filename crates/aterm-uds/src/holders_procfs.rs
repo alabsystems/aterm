@@ -103,8 +103,10 @@ pub(super) fn table(proc: &Path, pid: u32) -> Table {
     }
 }
 
-/// Every pid under `proc` that runs as effective uid `me`, judged by its directory's owner
-/// and, for a directory `me` does not own, its status ([`super::ours_by_owner`]).
+/// Every pid under `proc` that runs as effective uid `me`: its directory's owner. The kernel
+/// keeps `/proc/<pid>` the effective uid's when the process is non-dumpable and gives root only
+/// the entries inside (`task_dump_owner` spares a `0555` directory; measured in the Linux
+/// guest, 2026-10-23, `docs/measured/linux-lane-2026-10-23.md`).
 ///
 /// # Errors
 ///
@@ -114,13 +116,7 @@ pub(super) fn uid_pids_in(proc: &Path, me: u32) -> io::Result<Vec<u32>> {
         .flatten()
         .filter_map(|entry| {
             let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
-            let owner = std::fs::metadata(entry.path()).ok()?.uid();
-            let effective = || {
-                crate::process::read_proc_text(&entry.path().join("status"))
-                    .ok()
-                    .and_then(|status| crate::process::procfs::effective_uid(&status))
-            };
-            super::ours_by_owner(owner, me, effective).then_some(pid)
+            (std::fs::metadata(entry.path()).ok()?.uid() == me).then_some(pid)
         })
         .collect())
 }
@@ -625,6 +621,31 @@ mod tests {
         );
     }
 
+    /// A pid is the uid its directory's owner names, which the kernel keeps the effective
+    /// uid's, dumpable or not (`live_tests` holds that on the kernel): no `status` is read, so
+    /// one naming another uid moves nothing. NEGATIVE CONTROL: judge a directory `me` does not
+    /// own by its status's `Uid:` line, and the other uid is handed this uid's process.
+    #[test]
+    fn a_process_is_the_uid_its_directorys_owner_names() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let proc = tmp.path().join("proc");
+        process(&proc, 301, 'S', 1, Some(&[]), tmp.path());
+        std::fs::create_dir(proc.join("self")).unwrap();
+        let other = me().wrapping_add(1);
+        let status = proc.join("301/status");
+        let text = std::fs::read_to_string(&status).unwrap();
+        std::fs::write(
+            &status,
+            format!("{text}Uid:\t{other}\t{other}\t{other}\t{other}\n"),
+        )
+        .unwrap();
+        assert_eq!(uid_pids_in(&proc, me()).unwrap(), [301]);
+        assert!(
+            uid_pids_in(&proc, other).unwrap().is_empty(),
+            "a status names no owner"
+        );
+    }
+
     /// A read held past the deadline returns `TimedOut`, and one that finishes returns its
     /// result.
     #[test]
@@ -645,5 +666,124 @@ mod tests {
             Err(std::io::Error::other("its own"))
         });
         assert_eq!(failed.expect_err("its error").to_string(), "its own");
+    }
+}
+
+/// The kernel's own `/proc`, which the fake trees above stand in for.
+#[cfg(all(test, target_os = "linux"))]
+mod live_tests {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use super::{PROC, Table, table};
+
+    /// The hang detector for a child's exec.
+    const HANG: Duration = Duration::from_secs(60);
+
+    /// A running copy of `/bin/sleep`, killed and reaped when it drops, so a failed assertion
+    /// or a hang detector leaves nothing running (and nothing holding the test's output open).
+    struct Sleeper(crate::spawnfd::Child);
+
+    impl Sleeper {
+        /// A copy of `/bin/sleep` at `copy` with `mode`, run with `held` as its stdin and no
+        /// other stdio, returned once its exec is done: the kernel names the task after the
+        /// copy (`comm`) only after it has settled the task's dumpability (`begin_new_exec`).
+        fn start(copy: &Path, mode: u32, held: &Path) -> Self {
+            std::fs::copy("/bin/sleep", copy).expect("copy /bin/sleep");
+            std::fs::set_permissions(copy, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            let file = std::fs::File::open(held).expect("open the held file");
+            let sleeper = Self(
+                crate::spawnfd::command(copy)
+                    .arg("600")
+                    .stdin(crate::spawnfd::Stdio::from(file))
+                    .stdout(crate::spawnfd::Stdio::null())
+                    .stderr(crate::spawnfd::Stdio::null())
+                    .spawn()
+                    .expect("spawn the copy"),
+            );
+            let name = copy.file_name().expect("a file name").as_encoded_bytes();
+            let comm = format!("{PROC}/{}/comm", sleeper.id());
+            let started = Instant::now();
+            while !std::fs::read(&comm).is_ok_and(|c| c.trim_ascii_end() == name) {
+                assert!(
+                    started.elapsed() < HANG,
+                    "{} was never exec'd",
+                    copy.display()
+                );
+                std::thread::yield_now();
+            }
+            sleeper
+        }
+
+        fn id(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A child holding a file is its holder and names it; the same program exec'd from a copy
+    /// this uid may run but not read, which the kernel makes non-dumpable (as `ssh-agent`
+    /// makes itself) and so gives root its table, is sealed, not unreadable, and still this
+    /// uid's by its directory's owner, which the kernel keeps its effective uid's. A kernel
+    /// that keeps such an exec dumpable (`fs.suid_dumpable = 1`) seals nothing: COULD NOT
+    /// RUN. NEGATIVE CONTROL: the readable copy, the same program on the same file, is listed
+    /// and holds it.
+    #[test]
+    fn the_kernels_tables_name_a_holder_and_seal_a_non_dumpable_one() {
+        crate::host::could_not_run_as_root("a program this uid may run but not read");
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let (held, unheld) = (dir.join("held"), dir.join("unheld"));
+        std::fs::write(&held, b"held").unwrap();
+        std::fs::write(&unheld, b"").unwrap();
+        let me = std::process::id();
+
+        let open = Sleeper::start(&dir.join("readable-sleep"), 0o755, &held);
+        let sealed = Sleeper::start(&dir.join("sealed-sleep"), 0o111, &held);
+        let (o, s) = (open.id(), sealed.id());
+        let owner = |p: String| std::fs::metadata(p).map(|m| m.uid()).ok();
+        if owner(format!("{PROC}/{s}/fd")) != Some(0) {
+            let setting = std::fs::read_to_string("/proc/sys/fs/suid_dumpable")
+                .map_or_else(|e| format!("unread: {e}"), |v| v.trim().to_owned());
+            crate::host::could_not_run(format!(
+                "this kernel kept a program this uid may run but not read dumpable, so its table \
+                 stays this uid's and nothing is sealed (fs.suid_dumpable = {setting}; 1 keeps \
+                 such an exec dumpable, 0 and 2 do not)"
+            ));
+        }
+
+        let scan = super::super::scan_file_holders(&held, &[me]).expect("scan");
+        assert!(scan.holds(o), "the readable copy: {scan:?}");
+        assert!(
+            !scan.sealed.contains(&o) && !scan.unreadable.contains(&o),
+            "{scan:?}"
+        );
+        assert!(scan.sealed.contains(&s), "the non-dumpable copy: {scan:?}");
+        assert!(!scan.holds(s) && !scan.unreadable.contains(&s), "{scan:?}");
+        let other = super::super::scan_file_holders(&unheld, &[me]).expect("scan");
+        assert!(!other.holds(o), "a file it does not hold: {other:?}");
+        assert!(matches!(table(Path::new(PROC), o), Table::Listed(_)));
+        assert!(matches!(table(Path::new(PROC), s), Table::Sealed));
+        let files = super::super::open_files(o).expect("its open files");
+        assert!(files.contains(&held), "{files:?}");
+        assert_eq!(
+            super::super::open_files(s).map_err(|e| e.kind()),
+            Err(ErrorKind::PermissionDenied)
+        );
+        assert_eq!(
+            owner(format!("{PROC}/{s}")),
+            Some(crate::peer::our_uid()),
+            "a non-dumpable process's directory stays its effective uid's"
+        );
+        let ours = super::super::uid_pids().expect("listing");
+        assert!(ours.contains(&o) && ours.contains(&s), "{ours:?}");
     }
 }

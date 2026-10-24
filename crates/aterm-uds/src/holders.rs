@@ -797,48 +797,16 @@ pub fn uid_pids() -> io::Result<Vec<u32>> {
     pids_of_uid(unsafe { libc::geteuid() })
 }
 
-/// List every live process PID whose effective uid is `uid` ([`ours_by_owner`]). Root's
-/// listing also holds every non-dumpable process, whose directory the kernel makes root's.
+/// List every live process PID whose effective uid is `uid`: the pids whose `/proc/<pid>`
+/// directory `uid` owns. The kernel keeps that directory the effective uid's, dumpable or not,
+/// and gives root only a non-dumpable process's files inside it, so root's listing holds no
+/// other uid's non-dumpable process.
 ///
 /// # Errors
 /// Returns an error if `/proc` cannot be read.
 #[cfg(target_os = "linux")]
 pub fn pids_of_uid(uid: u32) -> io::Result<Vec<u32>> {
     procfs::uid_pids_in(std::path::Path::new(procfs::PROC), uid)
-}
-
-/// Whether the process whose `/proc/<pid>` directory `owner` owns runs as effective uid `me`.
-/// The kernel gives a dumpable process's directory its effective uid, and a non-dumpable
-/// one's (`prctl(PR_SET_DUMPABLE, 0)`, as ssh-agent sets) to root, so a directory `me` does not
-/// own is judged by `effective`, its status's effective uid, read only then.
-#[cfg(any(target_os = "linux", test))]
-fn ours_by_owner(owner: u32, me: u32, effective: impl FnOnce() -> Option<u32>) -> bool {
-    owner == me || effective() == Some(me)
-}
-
-#[cfg(test)]
-mod owner_tests {
-    use super::ours_by_owner;
-
-    /// A process is this uid's when it owns its directory, or, behind the root-owned
-    /// directory of a non-dumpable process, when its status names this effective uid; the
-    /// status is read only for a directory of another owner. NEGATIVE CONTROL: judge by the
-    /// directory's owner alone, and the non-dumpable process of this uid is left out.
-    #[test]
-    fn a_non_dumpable_process_is_this_uids_by_its_effective_uid() {
-        let unread = || -> Option<u32> { panic!("a directory this uid owns reads no status") };
-        assert!(ours_by_owner(501, 501, unread), "its own directory");
-        assert!(
-            ours_by_owner(0, 501, || Some(501)),
-            "non-dumpable, this uid's"
-        );
-        assert!(!ours_by_owner(0, 501, || Some(0)), "root's own");
-        assert!(
-            !ours_by_owner(0, 501, || None),
-            "a status that does not read"
-        );
-        assert!(!ours_by_owner(502, 501, || Some(502)), "another user's");
-    }
 }
 
 /// List every live process PID owned by this user SID.

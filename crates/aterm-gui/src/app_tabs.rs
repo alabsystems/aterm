@@ -5726,6 +5726,7 @@ impl App {
         self.spare_poke();
         if let Some(stable) = stable {
             self.resume_stories.remove(stable.as_str());
+            self.end_occupancy_lines_of(stable.as_str());
             if tasked {
                 crate::task_launch::retire_task_file(&stable);
             }

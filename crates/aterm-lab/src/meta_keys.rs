@@ -1059,9 +1059,8 @@ mod tests {
         cases.iter().map(|c| c.what.as_str()).collect()
     }
 
-    /// On the U.S. layout the rows are the ones measured on 2026-10-19, read off
-    /// the layout: each Option dead key as ESC and its letter, the control's
-    /// composition and Option chord.
+    /// On the U.S. layout the rows are the measured ones, read off the layout: each
+    /// Option dead key as ESC and its letter, the control's composition and Option chord.
     #[test]
     fn the_us_rows_come_from_the_us_layout() {
         let r = rows(&us(), &us());

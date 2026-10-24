@@ -14,6 +14,11 @@ pub const FOREIGN_CELL_TARGETS: [&str; 4] = [
     "wasm32-unknown-unknown",
 ];
 
+/// The std targets `--linux` adds to stable: the Linux lane's guest agent
+/// (`crates/aterm-vz-agent`) is a static musl binary cross-built for this one
+/// (STOCK EXCEPTION: Trust has no Linux std; docs/DESIGN-vz-guest-2026-10-23.md §6).
+pub const LINUX_LANE_TARGETS: [&str; 1] = ["aarch64-unknown-linux-musl"];
+
 pub use crate::rustup::{ClauseError, WasmClause, wasm_clause, wasm_pin, wasm_pin_wanted};
 
 /// The wasm32 target the pin carries.
@@ -287,12 +292,16 @@ fn observe(homes: &Homes, rustup: &dyn Rustup, pin: Option<&str>) -> Seen {
     }
 }
 
-/// What this row asks stable for on this host: the foreign cells' stds, and on macOS the
-/// shipped binary's x86_64 slice first.
-fn stable_targets() -> Vec<&'static str> {
+/// What this row asks stable for on this host: the foreign cells' stds, on macOS the
+/// shipped binary's x86_64 slice first, and with `linux` (`--linux`) the Linux lane's
+/// [`LINUX_LANE_TARGETS`] last.
+fn stable_targets(linux: bool) -> Vec<&'static str> {
     let mut targets: Vec<&str> = FOREIGN_CELL_TARGETS.to_vec();
     if cfg!(target_os = "macos") {
         targets.insert(0, "x86_64-apple-darwin");
+    }
+    if linux {
+        targets.extend(LINUX_LANE_TARGETS);
     }
     targets
 }
@@ -304,9 +313,10 @@ pub fn lacks_rustup(homes: &Homes) -> bool {
     homes.find_rustup().is_none()
 }
 
-/// What this machine lacks of the row, read only: empty when it is in place.
-pub fn missing(homes: &Homes, rustup: &dyn Rustup, pin: Option<&str>) -> Vec<String> {
-    plan(&observe(homes, rustup, pin), pin, &stable_targets())
+/// What this machine lacks of the row, read only: empty when it is in place. `linux`
+/// (`--linux`) holds stable to the Linux lane's targets too.
+pub fn missing(homes: &Homes, rustup: &dyn Rustup, pin: Option<&str>, linux: bool) -> Vec<String> {
+    plan(&observe(homes, rustup, pin), pin, &stable_targets(linux))
         .iter()
         .flat_map(argv)
         .map(|a| a.join(" "))
@@ -314,7 +324,7 @@ pub fn missing(homes: &Homes, rustup: &dyn Rustup, pin: Option<&str>) -> Vec<Str
 }
 
 /// Acquire what this machine lacks; each step is said, and a step that fails is said with
-/// why.
+/// why. `linux` (`--linux`) adds the Linux lane's stable targets.
 ///
 /// # Errors
 /// Returns an error naming every step that failed or the unreadable pin.
@@ -323,6 +333,7 @@ pub fn run(
     homes: &Homes,
     rustup: &dyn Rustup,
     init: Option<&Path>,
+    linux: bool,
     report: &mut dyn FnMut(&str),
 ) -> Result<Vec<String>, String> {
     let mut failed = Vec::new();
@@ -335,7 +346,7 @@ pub fn run(
     };
     let seen = observe(homes, rustup, pin.as_deref());
     let mut acquired = Vec::new();
-    'steps: for step in plan(&seen, pin.as_deref(), &stable_targets()) {
+    'steps: for step in plan(&seen, pin.as_deref(), &stable_targets(linux)) {
         for mut a in argv(&step) {
             let tool = match a.remove(0).as_str() {
                 "rustup-init" => match init {
@@ -431,6 +442,27 @@ mod tests {
             ]
         );
         assert_eq!(plan(&provisioned(), None, TARGETS), []);
+    }
+
+    #[test]
+    fn only_linux_asks_stable_for_the_guest_agents_musl_std() {
+        assert!(
+            !stable_targets(false).contains(&"aarch64-unknown-linux-musl"),
+            "{:?}",
+            stable_targets(false)
+        );
+        let linux = stable_targets(true);
+        assert_eq!(linux.last(), Some(&"aarch64-unknown-linux-musl"));
+        let mut s = provisioned();
+        s.stable_targets = stable_targets(false)
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        assert_eq!(plan(&s, None, &stable_targets(false)), []);
+        assert_eq!(
+            plan(&s, None, &linux),
+            [Step::StableTargets(names(&["aarch64-unknown-linux-musl"]))]
+        );
     }
 }
 
@@ -613,7 +645,7 @@ mod stateful {
         let homes = homes(tmp.path());
         let rustup = FakeRustup::default();
         assert!(lacks_rustup(&homes));
-        let refused = run(&repo(), &homes, &rustup, None, &mut |_| {}).unwrap_err();
+        let refused = run(&repo(), &homes, &rustup, None, false, &mut |_| {}).unwrap_err();
         assert!(
             refused.contains("no pinned rustup-init was fetched"),
             "{refused}"
@@ -621,7 +653,7 @@ mod stateful {
         assert!(rustup.calls().is_empty(), "{:#?}", rustup.calls());
         let init = tmp.path().join("scratch/download/rustup-init");
         stub(&init);
-        let acquired = run(&repo(), &homes, &rustup, Some(&init), &mut |_| {}).unwrap();
+        let acquired = run(&repo(), &homes, &rustup, Some(&init), false, &mut |_| {}).unwrap();
         assert!(!acquired.is_empty());
         assert!(!lacks_rustup(&homes));
         let calls = rustup.calls();
@@ -658,9 +690,12 @@ mod stateful {
         rustup
             .run(&homes, &bin, &add, None)
             .expect("the pin was installed by name");
-        assert_eq!(missing(&homes, &rustup, Some(&pin)), Vec::<String>::new());
         assert_eq!(
-            run(&repo(), &homes, &rustup, None, &mut |_| {}),
+            missing(&homes, &rustup, Some(&pin), false),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            run(&repo(), &homes, &rustup, None, false, &mut |_| {}),
             Ok(Vec::new())
         );
     }
@@ -694,14 +729,14 @@ mod stateful {
         }
         stub(&homes.cargo_home.join("bin/rustup"));
         assert_eq!(
-            missing(&homes, &rustup, Some(&pin)),
+            missing(&homes, &rustup, Some(&pin), false),
             [
                 "rustup component add --toolchain stable clippy".to_string(),
                 format!("rustup target add --toolchain {pin} wasm32-unknown-unknown"),
             ],
             "the read-only probe names what a run adds"
         );
-        run(&repo(), &homes, &rustup, None, &mut |_| {}).unwrap();
+        run(&repo(), &homes, &rustup, None, false, &mut |_| {}).unwrap();
         let calls = rustup.calls();
         position(
             &calls,
@@ -715,7 +750,24 @@ mod stateful {
             "{calls:#?}"
         );
         assert!(rustup.0.borrow().auto_installed.is_empty());
-        assert_eq!(missing(&homes, &rustup, Some(&pin)), Vec::<String>::new());
+        assert_eq!(
+            missing(&homes, &rustup, Some(&pin), false),
+            Vec::<String>::new()
+        );
+
+        // `--linux` holds the same machine to the guest agent's musl std as well, and
+        // adds it to stable alone.
+        let musl = "rustup target add --toolchain stable aarch64-unknown-linux-musl";
+        assert_eq!(
+            missing(&homes, &rustup, Some(&pin), true),
+            [musl.to_string()]
+        );
+        let acquired = run(&repo(), &homes, &rustup, None, true, &mut |_| {}).unwrap();
+        assert_eq!(acquired, [musl.to_string()]);
+        assert_eq!(
+            missing(&homes, &rustup, Some(&pin), true),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

@@ -1,5 +1,9 @@
 // Copyright (c) 2018 Yevhenii Reizner and the ttf-parser authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// Derived from ttf-parser 0.25.1 src/tables/cff/cff1.rs and modified by the aterm
+// project in 2026.
+// See ../../../LICENSE-MIT and ../../../LICENSE-APACHE for the upstream licenses.
 
 //! Compact Font Format (CFF) table implementation.
 

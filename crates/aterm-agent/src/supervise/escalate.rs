@@ -227,6 +227,66 @@ impl Escalation {
 }
 
 impl<C: Ctl> Session<'_, C> {
+    /// Pace needs metadata recovery separately from the policy's own deadline.
+    fn arm_needs_retry(&mut self) {
+        self.needs_pending = true;
+        self.needs_retry_at = Some(
+            self.fx.mono()
+                + self
+                    .setup
+                    .redecide_after_skip
+                    .max(Duration::from_millis(100)),
+        );
+    }
+
+    /// A needs write retains cleanup before transport, and waits from the
+    /// completion of any refusal or lost request before another attempt.
+    fn request_needs(&mut self, args: &[&str]) -> Result<CtlReply, Fail> {
+        self.arm_needs_retry();
+        let reply = self.call(args);
+        if !matches!(&reply, Ok(r) if r.ok()) {
+            self.arm_needs_retry();
+        }
+        reply
+    }
+
+    /// Retry only needs metadata on an unchanged point. The session's fresh
+    /// Autopilot word may require cleanup instead of restoring an entry.
+    pub(super) fn retry_needs(
+        &mut self,
+        screen: &Screen,
+        opts: &SuperviseOpts,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        // A refused or lost policy read also waits before another attempt.
+        self.arm_needs_retry();
+        if self.needs_not_ours() {
+            return self.needs_down(
+                screen.seq,
+                "another supervisor holds the needs entry",
+                review,
+            );
+        }
+        if self.turn_end.needs_key() == 0 {
+            return self.sync_needs(screen, opts, review);
+        }
+        let allowed = match self.autopilot_allows_busy(opts) {
+            Ok(allowed) => allowed,
+            Err(why) => {
+                self.arm_needs_retry();
+                return Err(why);
+            }
+        };
+        if self.autopilot(opts) == Autopilot::Off {
+            return self.needs_down(screen.seq, "the session's autopilot is off", review);
+        }
+        if !allowed {
+            self.arm_needs_retry();
+            return Ok(());
+        }
+        self.sync_needs(screen, opts, review)
+    }
+
     /// Escalate via `meta set attention <text>` on the worker (bounded to the server cap) and append `ESCALATED seq=<n> attention=<reply>`.
     pub(super) fn escalate(
         &mut self,
@@ -433,7 +493,11 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         if self.needs_not_ours() {
-            return Ok(());
+            return self.needs_down(
+                screen.seq,
+                "another supervisor holds the needs entry",
+                review,
+            );
         }
         let seq = screen.seq;
         let key = self.turn_end.needs_key();
@@ -445,7 +509,7 @@ impl<C: Ctl> Session<'_, C> {
             };
             return self.needs_down(seq, why, review);
         }
-        if self.needs_told == Some(key) {
+        if self.needs_told == Some(key) && !self.needs_pending {
             self.retell_standing(key);
             return Ok(());
         }
@@ -457,18 +521,23 @@ impl<C: Ctl> Session<'_, C> {
         let mut text = needs_attention_text(program, &needs);
         let owner = format!("owner={NEEDS_ATTENTION_OWNER}");
         let kind = format!("kind={}", aterm_types::needs::AttentionKind::Ask.word());
+        self.arm_needs_retry();
         self.tell_needs(key, &needs, &text);
-        let mut r = self.call(&["meta", "set", "attention", &owner, &kind, &text])?;
+        let mut r = self.request_needs(&["meta", "set", "attention", &owner, &kind, &text])?;
         if let Some(cap) = refused_cap(&r, &text) {
             text = fit_bytes(&text, cap);
             self.tell_needs(key, &needs, &text);
-            r = self.call(&["meta", "set", "attention", &owner, &kind, &text])?;
+            r = self.request_needs(&["meta", "set", "attention", &owner, &kind, &text])?;
         }
         if r.lost() {
             return Ok(());
         }
-        self.needs_told = Some(key);
-        self.needs_told_text = text;
+        if r.ok() {
+            self.needs_told = Some(key);
+            self.needs_told_text = text;
+            self.needs_pending = false;
+            self.needs_retry_at = None;
+        }
         let first = needs.first().map_or("", String::as_str);
         review.note(&format!(
             "{NEEDS} seq={seq} count={} attention={} {}",
@@ -486,12 +555,18 @@ impl<C: Ctl> Session<'_, C> {
         why: &str,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
-        if self.needs_told.is_none() {
+        if self.needs_told.is_none() && !self.needs_pending {
+            self.needs_retry_at = None;
+            if self.needs_heard.is_some() {
+                self.tell_needs(0, &[], "");
+            }
             return Ok(());
         }
         if self.needs_not_ours() {
             self.needs_told = None;
             self.needs_told_text.clear();
+            self.needs_pending = false;
+            self.needs_retry_at = None;
             if self.needs_heard.is_some() {
                 self.tell_needs(0, &[], "");
             }
@@ -499,12 +574,20 @@ impl<C: Ctl> Session<'_, C> {
         }
         self.tell_needs(0, &[], "");
         let owner = format!("owner={NEEDS_ATTENTION_OWNER}");
-        let r = self.call(&["meta", "unset", "attention", &owner])?;
-        if r.lost() {
+        let r = self.request_needs(&["meta", "unset", "attention", &owner])?;
+        if !r.ok() {
+            if !r.lost() {
+                review.note(&format!(
+                    "SKIPPED seq={seq} needs attention={} {why}; take-down still owed",
+                    reply_word(&r)
+                ));
+            }
             return Ok(());
         }
         self.needs_told = None;
         self.needs_told_text.clear();
+        self.needs_pending = false;
+        self.needs_retry_at = None;
         review.note(&format!(
             "CLEARED seq={seq} {CLEARED_NEEDS} attention={} {why}",
             reply_word(&r)

@@ -530,6 +530,65 @@ fn unrelated_digest_changes_do_not_invalidate_an_observed_entry() {
     assert!(c.digest_entry(other_id).is_some());
 }
 
+/// Each successor adopts the open entry past every confirmation an earlier process issued, so
+/// an observation made before a relaunch never settles it, however many relaunches follow; one
+/// made on the successor does.
+#[test]
+fn an_observation_from_before_a_relaunch_never_settles_the_adopted_entry() {
+    let now = Instant::now();
+    let (mut c, mut g) = fresh(now);
+    let (id, _) = later_reply(&notice(&mut c, &mut g, SETUP, 0, now));
+    let mut file: Vec<LogLine> = Vec::new();
+    for generation in 1..=2 {
+        let at = generation * DAY_MS;
+        let stale = observed_confirmation(&c, id);
+        let (again, how) = later_reply(&notice(&mut c, &mut g, SETUP, at, now));
+        assert_eq!(again, id);
+        assert!(how == "duplicate" || how == "restated", "{how}");
+        file.extend(
+            c.drain_new_for_persist()
+                .iter()
+                .map(LogLine::encode)
+                .filter_map(|l| LogLine::decode(&l).ok()),
+        );
+        let mut log = MessageLog::empty();
+        log.replay_all(file.iter().cloned());
+        c = MessageCenter::new(log, now);
+        assert_eq!(c.adopt_digest(wall(at), now), 1);
+        g = WireGate::default();
+
+        let gone = notice(&mut c, &mut g, &settle_line(id, stale), at, now);
+        assert_eq!(gone.reply, "OK settled=- how=gone", "relaunch {generation}");
+        assert!(
+            c.digest_entry(id).is_some(),
+            "the entry repeated since the observation stays open"
+        );
+    }
+    let observed = observed_confirmation(&c, id);
+    let settled = notice(&mut c, &mut g, &settle_line(id, observed), 2 * DAY_MS, now);
+    assert_eq!(settled.reply, format!("OK settled={id} how=resolved-ok"));
+}
+
+/// A process whose posting never reached the log mints the same id again after the relaunch; an
+/// observation of the lost entry does not settle the new one.
+#[test]
+fn an_observation_never_settles_a_later_process_entry_under_the_same_id() {
+    let now = Instant::now();
+    let (mut parent, mut g) = fresh(now);
+    let (id, _) = later_reply(&notice(&mut parent, &mut g, SETUP, 0, now));
+    let lost = observed_confirmation(&parent, id);
+
+    let (mut successor, mut g) = fresh(now);
+    let (again, _) = later_reply(&notice(&mut successor, &mut g, SETUP, DAY_MS, now));
+    assert_eq!(
+        again, id,
+        "the successor reuses the id the log never recorded"
+    );
+    let gone = notice(&mut successor, &mut g, &settle_line(id, lost), DAY_MS, now);
+    assert_eq!(gone.reply, "OK settled=- how=gone");
+    assert!(successor.digest_entry(id).is_some());
+}
+
 #[test]
 fn notice_settle_requires_a_complete_observation() {
     assert!(matches!(

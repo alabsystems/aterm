@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `card [seed=<u64>|seed=off]`: THE HARNESS CARD'S CONSTELLATION, PINNED, in a debug or test build
-//! (`docs/DESIGN-card-engine-2026-10-19.md` §7), so the card two builds draw over the same screen
+//! (`docs/DESIGN-card-engine-2026-10-19.md` §4.8), so the card two builds draw over the same screen
 //! can be compared pixel for pixel — an A/B of the card engine in a private headless instance
 //! (`targo --unverified lab instance --pre 'card seed=42' --image …`) — when each card's stars
 //! would otherwise be seeded by its session and its process, which no two runs share.

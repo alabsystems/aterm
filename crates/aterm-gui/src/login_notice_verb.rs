@@ -25,7 +25,7 @@ const LABEL: &str = "main";
 /// verb shows the words the loop would.
 const SAMPLE_RESET: &str = "Oct 23 at 9am (America/Los_Angeles)";
 
-/// What the verb asks: the list, a notice to raise, the raised one's end, or the tab's login back.
+/// What the verb asks: the list, a notice to raise, the disk-full alert, the raised ones' end, or the tab's login back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Asked {
     List,
@@ -85,7 +85,7 @@ pub(crate) fn list_line() -> String {
     format!("OK notices={}\n", notices.join(","))
 }
 
-/// The verb's control-thread half: the list here, a raise or an end on the main thread.
+/// The verb's control-thread half: the list here, every other form on the main thread.
 pub(crate) fn cmd(
     proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
     rest: &str,

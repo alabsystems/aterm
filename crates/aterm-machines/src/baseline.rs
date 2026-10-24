@@ -141,7 +141,8 @@ pub fn check_only(only: &[String]) -> Result<(), String> {
     }
 }
 
-/// Return `text` keeping only `schema`, `users`, and the tables named in `only`.
+/// Return `text` keeping only `schema`, `users`, and the tables named in `only` (unchanged when
+/// `only` is empty).
 /// # Errors
 /// The parser's message.
 pub fn keep_only(text: &str, only: &[String]) -> Result<String, String> {

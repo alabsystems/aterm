@@ -1410,17 +1410,20 @@ impl<C: Ctl> Session<'_, C> {
         reading: &TurnEndReading,
         host: Option<&Arc<dyn IdleHost>>,
         worked: bool,
-    ) -> Option<crate::harness::repo_work::RepoWork> {
+    ) -> crate::harness::repo_work::RepoRead {
+        use crate::harness::repo_work::RepoRead;
         let tail = reading.said_tail.as_deref();
         if !(super::super::policy::turn_end::says_done(tail)
             || reading.finished_record == Some(true))
         {
-            return None;
+            return RepoRead::Clean;
         }
         if !worked && self.turn_end.landing_words_read(tail) {
-            return None;
+            return RepoRead::Clean;
         }
-        let host = host?;
+        let Some(host) = host else {
+            return RepoRead::Clean;
+        };
         let mark = said_mark(tail);
         let now = self.fx.mono();
         if let Some((_, _, found)) = self.repo_seen.as_ref().filter(|(m, at, _)| {
@@ -1429,6 +1432,7 @@ impl<C: Ctl> Session<'_, C> {
             return found.clone();
         }
         let found = host.repo_work();
+        self.repo_unread_unsaid |= found.is_unread();
         self.repo_seen = Some((mark, now, found.clone()));
         found
     }
@@ -2259,6 +2263,7 @@ impl<C: Ctl> Session<'_, C> {
         let withheld = std::mem::take(&mut self.decided_withheld);
         self.say_wall_refused(review);
         self.say_sleep_unknown(seq, review);
+        self.say_repo_unread(seq, review);
         self.sync_exception(seq, review);
         self.task_edge(&point.screen, opts, review)?;
         if self.turn_end.exchange_at_wall() {
@@ -2954,7 +2959,7 @@ impl<C: Ctl> Session<'_, C> {
             format!("the worker has not read the input written to it (input={word})")
         } else if self.input_undrawn(seq, now) {
             "the worker has not drawn the input it read (the screen has not moved since it was \
-             unread)"
+             seen undrawn)"
                 .to_string()
         } else {
             self.input_unread_at = None;

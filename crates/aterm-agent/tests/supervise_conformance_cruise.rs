@@ -133,7 +133,7 @@ fn point(
         worked_doubt: Duration::ZERO,
         record_turn: None,
         credits: None,
-        repo: dirty.then(finding),
+        repo: aterm_agent::harness::repo_work::RepoRead::of_found(dirty.then(finding)),
         fact: None,
     }
 }

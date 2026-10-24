@@ -857,6 +857,401 @@ fn a_lost_request_tells_the_host_nothing_twice() {
 }
 
 #[test]
+fn a_refused_needs_entry_retries_until_acknowledged() {
+    let (host, m) = told_at_one_point(
+        vec![err("attention owners full (max 8): unset one first")],
+        3,
+    );
+    let entry = left_entry();
+    let put_up = format!("set attention owner=needs kind=ask {entry}");
+    assert_eq!(m.needs_calls, [put_up.as_str(), put_up.as_str()]);
+    assert_eq!(m.needs_attention.as_deref(), Some(entry.as_str()));
+    assert_eq!(host.told(), [(vec![NEED.to_string()], entry)]);
+}
+
+fn needs_point(s: &mut Session<'_, Mock>, seq: u64, need: &str) -> Screen {
+    let screen = Screen {
+        seq,
+        rows: said(&[
+            "Carrying on with the permitted work.",
+            &format!("NEEDS YOU: {need}"),
+        ]),
+        ..s.screen().expect("the point")
+    };
+    let point = s.turn_of(screen.clone());
+    let opts = SuperviseOpts {
+        policy: owners_policy(),
+        ..auto(30)
+    };
+    let _ = s
+        .turn_end_at_point(&point, Some(Duration::from_secs(720)), &opts)
+        .expect("decided");
+    screen
+}
+
+#[test]
+fn an_unacknowledged_needs_write_is_cleared_or_relinquished() {
+    for (applied, behind) in [(false, false), (true, false), (true, true)] {
+        for hosted in [false, true] {
+            let mut m = Mock::new(vec![idle_screen()]);
+            m.autopilot = Some("cruise");
+            m.needs_replies.push_back(if applied {
+                replaced("aterm (pid 10) went away before it answered (exit 75)")
+            } else {
+                err("attention owners full (max 8): unset one first")
+            });
+            let host = Arc::new(Hears::default());
+            let mut notes = Notes::default();
+            let opts = auto(30);
+            {
+                let mut s = session(&mut m, None);
+                s.set_clock(TEST_NOW, PDT);
+                s.set_zone_lookup(test_zones);
+                if hosted {
+                    s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+                }
+                let first = needs_point(&mut s, 101, NEED);
+                s.task_edge(&first, &opts, &mut notes)
+                    .expect("set attempted");
+                if applied {
+                    // The server stored the write before its reply was lost.
+                    s.ctl.needs_attention = Some(left_entry());
+                }
+                if behind {
+                    s.claim = claim::Claim::Behind {
+                        holder: "another".to_string(),
+                        tried: Instant::now(),
+                    };
+                }
+                let cleared = needs_point(&mut s, 102, "nothing");
+                for _ in 0..2 {
+                    s.task_edge(&cleared, &opts, &mut notes)
+                        .expect("need resolved");
+                }
+            }
+            assert_eq!(m.needs_calls.len(), if behind { 1 } else { 2 });
+            assert_eq!(m.needs_attention, behind.then(left_entry));
+            if !behind {
+                assert_eq!(m.needs_calls[1], "unset attention owner=needs");
+            }
+            assert_eq!(
+                host.told(),
+                if hosted {
+                    vec![
+                        (vec![NEED.to_string()], left_entry()),
+                        (Vec::new(), String::new()),
+                    ]
+                } else {
+                    Vec::new()
+                },
+                "applied={applied}, behind={behind}, hosted={hosted}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_refused_needs_clear_remains_owed_until_acknowledged() {
+    let mut m = Mock::new(vec![idle_screen()]);
+    m.autopilot = Some("cruise");
+    m.needs_replies = [ok("OK\n"), err("denied"), ok("OK\n")].into();
+    let mut notes = Notes::default();
+    {
+        let mut s = session(&mut m, None);
+        s.set_clock(TEST_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        let first = needs_point(&mut s, 101, NEED);
+        s.task_edge(&first, &auto(30), &mut notes).expect("set");
+        let cleared = needs_point(&mut s, 102, "nothing");
+        for _ in 0..3 {
+            s.task_edge(&cleared, &auto(30), &mut notes)
+                .expect("clear attempted");
+        }
+    }
+    assert_eq!(
+        m.needs_calls.len(),
+        3,
+        "set, refused clear, acknowledged clear"
+    );
+    assert_eq!(m.needs_attention, None);
+    assert_eq!(
+        notes
+            .noted
+            .iter()
+            .filter(|l| l.starts_with("CLEARED "))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn an_uncertain_replacement_cannot_reuse_the_prior_needs_acknowledgement() {
+    for replacement in [Some("a launch date"), None] {
+        let mut m = Mock::new(vec![idle_screen()]);
+        m.autopilot = Some("cruise");
+        m.needs_replies = [
+            ok("OK\n"),
+            replaced("aterm (pid 10) went away before it answered (exit 75)"),
+            ok("OK\n"),
+        ]
+        .into();
+        let mut notes = Notes::default();
+        {
+            let mut s = session(&mut m, None);
+            s.set_clock(TEST_NOW, PDT);
+            s.set_zone_lookup(test_zones);
+            let first = needs_point(&mut s, 101, NEED);
+            s.task_edge(&first, &auto(30), &mut notes)
+                .expect("first set");
+            let other = needs_point(&mut s, 102, replacement.unwrap_or("nothing"));
+            s.task_edge(&other, &auto(30), &mut notes)
+                .expect("replacement attempted");
+            // The replacement or clear reached the server, but its reply did not.
+            s.ctl.needs_attention =
+                replacement.map(|need| format!("claude needs you: {need} — carrying on"));
+            let back = needs_point(&mut s, 103, NEED);
+            for _ in 0..2 {
+                s.task_edge(&back, &auto(30), &mut notes)
+                    .expect("original need restored");
+            }
+        }
+        assert_eq!(m.needs_calls.len(), 3, "replacement={replacement:?}");
+        assert_eq!(m.needs_calls[0], m.needs_calls[2]);
+        assert_eq!(m.needs_attention, Some(left_entry()));
+    }
+}
+
+#[test]
+fn unchanged_points_retry_needs_metadata_without_redeciding_the_policy() {
+    for clear in [false, true] {
+        for provider_wait in [false, true] {
+            for zero_pause in [false, true] {
+                let mut m = Mock::new(vec![idle_screen()]);
+                m.autopilot = Some("cruise");
+                m.key_releases = Some(0);
+                m.stall_sleep = Some(Duration::from_secs(60));
+                if clear {
+                    m.needs_replies.push_back(ok("OK\n"));
+                }
+                m.needs_replies.extend([
+                    err("attention owners full (max 8): unset one first"),
+                    err("attention owners full (max 8): unset one first"),
+                    ok("OK\n"),
+                ]);
+                let mut notes = Notes::default();
+                let point_number;
+                let after_number;
+                let (expected_due, actual_due);
+                {
+                    let mut s = virtual_session(&mut m, None);
+                    s.set_clock(TEST_NOW, PDT);
+                    s.set_zone_lookup(test_zones);
+                    if zero_pause {
+                        s.setup.redecide_after_skip = Duration::ZERO;
+                    }
+                    let first = needs_point(&mut s, 101, NEED);
+                    s.task_edge(&first, &auto(30), &mut notes).expect("set");
+                    let point = if clear {
+                        let cleared = needs_point(&mut s, 101, "nothing");
+                        s.task_edge(&cleared, &auto(30), &mut notes)
+                            .expect("clear attempted");
+                        cleared
+                    } else {
+                        first
+                    };
+                    // This is the one current frame throughout the wait: a freed
+                    // metadata slot produces no new content or policy point.
+                    s.ctl.screens[0] = point.rows.clone();
+                    let now = s.fx.mono();
+                    expected_due = provider_wait.then_some(now + Duration::from_secs(60));
+                    if let Some(at) = expected_due {
+                        s.set_wait(at, "the provider's own reset", WaitKind::Retry);
+                    }
+                    point_number = s.turn_end.point_number();
+                    let mut deadline = now + Duration::from_millis(450);
+                    let end = s
+                        .wait_for_next(s.turn_of(point), &auto(30), &[], &mut deadline, &mut notes)
+                        .expect("the unchanged wait");
+                    assert!(matches!(end, Some(End::Timeout(_))), "the wait timed out");
+                    after_number = s.turn_end.point_number();
+                    actual_due = s.turn_end_due.as_ref().map(|d| d.at);
+                }
+                let evidence = format!(
+                    "clear={clear} provider_wait={provider_wait} zero_pause={zero_pause}\n{:#?}\n{:#?}",
+                    m.requests, notes.noted
+                );
+                let retry_from = usize::from(clear);
+                assert_eq!(m.needs_calls.len(), retry_from + 3, "{evidence}");
+                assert_eq!(m.needs_attention, (!clear).then(left_entry), "{evidence}");
+                for pair in m.needs_times[retry_from..].windows(2) {
+                    assert!(
+                        pair[1].saturating_duration_since(pair[0]) >= Duration::from_millis(100),
+                        "each rejection waits before another request, even with a zero pause: {evidence}"
+                    );
+                }
+                assert_eq!(actual_due, expected_due, "{evidence}");
+                assert_eq!(after_number, point_number, "{evidence}");
+                assert!(
+                    !m.requests
+                        .iter()
+                        .any(|r| claim::is_input(&r.split_whitespace().collect::<Vec<_>>())),
+                    "metadata recovery submits no input: {evidence}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unchanged_needs_retries_stop_after_acknowledgement_off_or_handoff() {
+    for stop in ["acknowledged", "off", "another"] {
+        let mut m = Mock::new(vec![idle_screen()]);
+        m.autopilot = Some("cruise");
+        m.key_releases = Some(0);
+        m.stall_sleep = Some(Duration::from_secs(60));
+        if stop != "acknowledged" {
+            m.needs_replies.push_back(err("attention owners full"));
+        }
+        let mut notes = Notes::default();
+        {
+            let mut s = virtual_session(&mut m, None);
+            s.set_clock(TEST_NOW, PDT);
+            s.set_zone_lookup(test_zones);
+            let point = needs_point(&mut s, 101, NEED);
+            s.task_edge(&point, &auto(30), &mut notes).expect("set");
+            s.ctl.screens[0] = point.rows.clone();
+            if stop == "off" {
+                s.ctl.autopilot = Some("off");
+            } else if stop == "another" {
+                s.claim = claim::Claim::Behind {
+                    holder: "another".to_string(),
+                    tried: s.fx.mono(),
+                };
+                s.ctl.needs_attention = Some("another controller's entry".to_string());
+            }
+            let mut deadline = s.fx.mono() + Duration::from_millis(450);
+            let end = s
+                .wait_for_next(s.turn_of(point), &auto(30), &[], &mut deadline, &mut notes)
+                .expect("the unchanged wait");
+            assert!(
+                if stop == "off" {
+                    end.is_none()
+                } else {
+                    matches!(end, Some(End::Timeout(_)))
+                },
+                "{stop}: Off returns to its park; the other unchanged waits time out"
+            );
+            assert!(!s.needs_pending, "{stop}: pending retry was retired");
+        }
+        assert_eq!(
+            m.needs_calls.len(),
+            if stop == "off" { 2 } else { 1 },
+            "{stop}: {:#?}",
+            m.requests
+        );
+        if stop == "off" {
+            assert_eq!(m.needs_calls[1], "unset attention owner=needs");
+        }
+        let expected = match stop {
+            "acknowledged" => Some(left_entry()),
+            "another" => Some("another controller's entry".to_string()),
+            _ => None,
+        };
+        assert_eq!(m.needs_attention, expected, "{stop}");
+    }
+}
+
+#[test]
+fn failed_retry_policy_reads_keep_needs_paced_without_admitting_input() {
+    for round_trip in [ROUND_TRIP, Duration::from_millis(200)] {
+        let mut m = Mock::new(vec![idle_screen()]);
+        m.autopilot = Some("cruise");
+        m.key_releases = Some(0);
+        m.stall_sleep = Some(Duration::from_secs(60));
+        m.needs_replies.push_back(err("attention owners full"));
+        let mut notes = Notes::default();
+        {
+            let mut s = virtual_session(&mut m, None);
+            s.set_clock(TEST_NOW, PDT);
+            s.set_zone_lookup(test_zones);
+            let point = needs_point(&mut s, 101, NEED);
+            s.task_edge(&point, &auto(30), &mut notes)
+                .expect("set attempted");
+            s.ctl.screens[0] = point.rows.clone();
+            s.ctl.round_trip = round_trip;
+            s.ctl.verb_replies.insert(
+                "meta",
+                [err("denied"), replaced("the policy read was not served")].into(),
+            );
+            let provider_due = s.fx.mono() + Duration::from_secs(60);
+            s.set_wait(provider_due, "the provider's own reset", WaitKind::Retry);
+            let mut deadline = s.fx.mono() + Duration::from_secs(2);
+            let end = s.wait_for_next(s.turn_of(point), &auto(30), &[], &mut deadline, &mut notes);
+            assert!(
+                matches!(end, Err(Fail::Lost(_))),
+                "the lost read ends this look"
+            );
+            assert!(s.needs_pending);
+            assert!(s.needs_retry_at.is_some_and(|at| at > s.fx.mono()));
+            assert_eq!(s.turn_end_due.as_ref().map(|d| d.at), Some(provider_due));
+        }
+        assert_eq!(
+            m.needs_calls.len(),
+            1,
+            "only the original set: {:#?}",
+            m.requests
+        );
+        assert!(
+            !m.requests
+                .iter()
+                .any(|r| claim::is_input(&r.split_whitespace().collect::<Vec<_>>())),
+            "an unread policy admits no input: {:#?}",
+            m.requests
+        );
+    }
+}
+
+#[test]
+fn slow_needs_metadata_never_starves_an_existing_look() {
+    let mut m = Mock::new(vec![idle_screen()]);
+    m.autopilot = Some("cruise");
+    m.key_releases = Some(0);
+    m.stall_sleep = Some(Duration::from_secs(60));
+    m.needs_replies = std::iter::repeat_with(|| err("attention owners full"))
+        .take(10)
+        .collect();
+    let mut notes = Notes::default();
+    {
+        let mut s = virtual_session(&mut m, None);
+        s.set_clock(TEST_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        let point = needs_point(&mut s, 101, NEED);
+        s.task_edge(&point, &auto(30), &mut notes)
+            .expect("set attempted");
+        s.ctl.screens[0] = point.rows.clone();
+        // A slow control reply crosses both deadlines. The existing look
+        // stays first even when every rejection itself outlasts retry pacing.
+        s.ctl.round_trip = Duration::from_millis(200);
+        s.look_at = Some(s.fx.mono() + Duration::from_millis(50));
+        let mut deadline = s.fx.mono() + Duration::from_secs(2);
+        let end = s
+            .wait_for_next(s.turn_of(point), &auto(30), &[], &mut deadline, &mut notes)
+            .expect("the unchanged wait");
+        assert!(
+            end.is_none(),
+            "the existing look runs before another metadata retry"
+        );
+        assert!(s.look_at.is_none(), "the existing look was consumed");
+    }
+    assert_eq!(
+        m.needs_calls.len(),
+        1,
+        "the existing look was not delayed by metadata: {:#?}",
+        m.requests
+    );
+}
+
+#[test]
 fn a_set_that_moves_under_the_same_entry_is_told() {
     let (a, b, c) = (
         NEED,
@@ -952,7 +1347,7 @@ fn a_lost_request_leaves_the_window_told_what_stands() {
         "{:#?}",
         m.needs_calls
     );
-    assert_eq!(m.needs_calls, [put_up.as_str(), down, down, down]);
+    assert_eq!(m.needs_calls, [put_up.as_str(), down, down, &put_up, down]);
     assert_eq!(
         needs_doors(&run),
         [
@@ -962,10 +1357,11 @@ fn a_lost_request_leaves_the_window_told_what_stands() {
             "ctl unset".to_string(),
             "ctl unset".to_string(),
             format!("host {entry:?}"),
+            "ctl set".to_string(),
             "host \"\"".to_string(),
             "ctl unset".to_string(),
         ],
-        "told again with no request, before the loop's end takes it down"
+        "the current need is sent again after uncertain clears, before final cleanup"
     );
     let host = Arc::new(Hears::default());
     let (m, _) = heard_with(
@@ -988,7 +1384,10 @@ fn a_lost_request_leaves_the_window_told_what_stands() {
         m.needs_calls
     );
     let other_up = format!("set attention owner=needs kind=ask {other_entry}");
-    assert_eq!(m.needs_calls, [put_up.as_str(), &other_up, &other_up, down]);
+    assert_eq!(
+        m.needs_calls,
+        [put_up.as_str(), &other_up, &other_up, &put_up, down]
+    );
     let host = Arc::new(Hears::default());
     let (m, _) = heard_with(
         three(NEED, "nothing"),
@@ -1000,6 +1399,8 @@ fn a_lost_request_leaves_the_window_told_what_stands() {
             ok("OK\n"),
             lost(),
             lost(),
+            err("attention too long (max 40 bytes)"),
+            ok("OK\n"),
         ],
     );
     let cut = m.needs_calls[1]
@@ -1010,9 +1411,10 @@ fn a_lost_request_leaves_the_window_told_what_stands() {
     assert_eq!(
         host.told(),
         [
-            (vec![NEED.to_string()], entry),
+            (vec![NEED.to_string()], entry.clone()),
             (vec![NEED.to_string()], cut.clone()),
             gone.clone(),
+            (vec![NEED.to_string()], entry),
             (vec![NEED.to_string()], cut),
             gone,
         ],

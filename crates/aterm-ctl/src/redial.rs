@@ -563,8 +563,8 @@ pub(crate) fn not_asked_again_note(request_parts: &[String]) -> String {
         }
         (_, Some(_)) => {
             "`await block` and `await consent` wait for a change after they were armed, and it \
-             may have happened during the update — read the session (`status`, `text`) before \
-             waiting again"
+             may have happened during the update — read the session (`status`, `text`; \
+             `privacy` for `await consent`) before waiting again"
                 .to_owned()
         }
         _ if old_process_anchor(request_parts).is_some_and(|a| a.starts_with("ticket=")) => {
@@ -1258,7 +1258,7 @@ pub(crate) struct FirstLeg<'a, 'b> {
     pub(crate) listener: Option<ListenerId>,
 }
 
-/// Relay a `subscribe` push stream to `out` across server replacements (the module rule).
+/// Relay a `subscribe` push stream to `out` across server replacements.
 pub(crate) fn relay_subscription(
     first: FirstLeg<'_, '_>,
     request: &str,

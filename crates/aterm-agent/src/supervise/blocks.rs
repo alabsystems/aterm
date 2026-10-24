@@ -459,7 +459,7 @@ mod tests {
         assert!(view_rows(&tools, View::Messages).is_empty());
     }
 
-    /// ONE READER OF "A CALL" (H6-HARNESS-1, 2026-10-08): every row
+    /// ONE READER OF "A CALL": every row
     /// aterm-phase's [`super::super::phase::is_tool_call`] takes for a call
     /// opens a tool block here — the rows Claude Code 2.1.294 draws for an
     /// MCP call (verbose output) and for a shell-mode command among them,

@@ -19,7 +19,7 @@ use aterm_net::fleet_member::{
 };
 use aterm_uds::atomic_file::ConfigFile;
 
-/// `aterm fleet --help`'s membership half (the dispatcher prints it).
+/// The whole `aterm fleet --help` (`fleet_cli` prints it), and each verb's `--help`.
 pub(crate) const USAGE: &str = "\
 aterm fleet — this machine's membership in a fleet: the aterms of one LAN that
 hold one secret, each reading the others at the level they allow
@@ -34,38 +34,45 @@ USAGE:
                          stdin when piped, from F, or typed at the terminal
                          unshown; never an argument
   aterm fleet peers [--timeout S]
-                         the machines this one knows, each checked at once
-                         (3 s; --timeout up to 10): on a member, its issuer's
-                         book of members too
+                         the machines this one knows (its book and aterm.toml's
+                         [[fleet.peers]] host = \"<host[:port]>\" entries), each
+                         checked at once (3 s; --timeout up to 10): on a
+                         member, its issuer's book of members too
   aterm fleet peers add <host[:port]> | rm <host[:port]|node>
   aterm fleet allow facts|content
   aterm fleet allow drive --from <host|node> [--from …]
                          what a peer may do here: read facts or content, or
-                         (drive, on this Mac alone) drive its sessions from the
-                         nodes named, nobody else; facts|content takes it back
-  aterm fleet leave      remove this machine's secret, code, book and [fleet] keys
+                         (drive, granted here alone, never by a join) drive its
+                         sessions from the nodes named, nobody else;
+                         facts|content takes it back
+  aterm fleet leave      remove this machine's secret, join code, books and
+                         [fleet] listen/allow/drive_from (its node key stays)
 
 Start a fleet with `init` on one machine and `join` on each other. --allow is
 what a peer may read here: facts (programs, agent states, roles, task records
-and models; no text a person or a program wrote, the default) or content (the
-tab titles, cwds, prompts, an agent's newest words as well). --port is this
-machine's fleet port: init's is 7100, join's the issuer's (the port its code
-names), and either keeps the port [fleet] listen already names. --host is the
-name the others dial this machine by (on a Mac the HostName an administrator
-set, else its Bonjour name, <LocalHostName>.local). Machines reach each other
-on loopback, private (10/8, 172.16/12, 192.168/16, fc00::/7) or link-local
-addresses only.
+and models; no text a person or a program wrote) or content (the tab titles,
+cwds, branches, prompts, an agent's newest words, and a shell's command line
+and last rows as well); without --allow, either keeps the level [fleet] allow
+names, else facts (a join into another fleet turns drive into content). --port
+is this machine's fleet port: init's is 7100, join's the issuer's (the port its
+code names), and either keeps the port [fleet] listen already names. --host is
+the name the others dial this machine by: $HOSTNAME when set, else on a Mac the
+HostName an administrator set, else its Bonjour name (<LocalHostName>.local),
+else the OS host name. Machines reach each other on loopback, private (10/8,
+172.16/12, 192.168/16, fc00::/7) or link-local addresses only.
 `allow drive` is the level above content: the nodes it names, each proved by
 the node key this machine's book binds, run `aterm ctl --host <this Mac> …`
-here (sessions' status, text, turns, holds and workers; `aterm help workers`),
+here (spawn and await task; any session's status, text, screen, result, turn,
+key, send and hold; close of a worker that node spawned; `aterm help workers`),
 and nobody else does; no join and no remote call turns it on.
-`init --rotate` mints the issuer a new secret (every member joins again; the
-book keeps each until then). Read the fleet with `aterm ctl survey --fleet`
-(or `--host <h>`) on any machine of it: a member asks its issuer's book of
-members under the same deadline, so it reads every member, as the issuer
-does. An issuer running an older aterm shares no book: the read then says so
-and reaches only the peers this machine knows (update aterm on the issuer).
-See `aterm help fleet`.
+`init --rotate` mints the issuer a new secret, keeping the host and port its
+code names unless --host or --port names others (every member joins again;
+the book keeps each until then). Read the fleet with `aterm ctl survey --fleet`
+on any machine of it (`--host <h>` reads one machine): a member asks its
+issuer's book of members under the same deadline, so it reads every member, as
+the issuer does. An issuer running an older aterm shares no book: the read then
+says so and reaches only the peers this machine knows (update aterm on the
+issuer). See `aterm help fleet`.
 ";
 
 const PEER_CHECK_WITHIN: Duration = aterm_ctl::FLEET_WITHIN;
@@ -547,8 +554,9 @@ fn init(places: &Places, args: &[String]) -> Result<String, Failure> {
         "On each other machine, with that file copied there (it is the secret: AirDrop, scp, \
          a USB stick — not a chat; delete each copy once that machine has joined):\n  aterm \
          fleet join --code-file <file>    (or: aterm fleet join < <file>)\n  add --allow \
-         content to let this fleet read that machine's tab titles, cwds, prompts and an \
-         agent's words: facts, the default, is programs, states and roles alone\n{FOLLOWS} \
+         content to let this fleet read that machine's tab titles, cwds, branches, prompts, \
+         an agent's words and a shell's command line and rows: facts, the default, is \
+         programs, agent states, roles, task records and models alone\n{FOLLOWS} \
          Members dial {}.\n",
         member::host_port(&code.host, port)
     ));
@@ -738,8 +746,9 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
     );
     if allow == FleetScope::Facts.word() {
         out.push_str(
-            "  allow      facts: the fleet reads programs, states and roles here, no tab title, \
-             cwd, prompt or agent's words; [fleet] allow = \"content\" in aterm.toml lets it\n",
+            "  allow      facts: the fleet reads programs, agent states, roles, task records and \
+             models here, no tab title, cwd, prompt, agent's words or shell's command line; \
+             [fleet] allow = \"content\" in aterm.toml lets it\n",
         );
     }
     if grants_gone {
@@ -751,9 +760,8 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
     }
     out.push_str(&format!(
         "  issuer     {} at {issuer_at} recorded this machine ({} peers in its book){}\n\
-         {FOLLOWS}\nOn a Mac this was aterm's first connection into the LAN: the \
-         local-network consent macOS asked for (if it did) covers the survey's reads \
-         too.\n",
+         {FOLLOWS}\nOn a Mac, the local-network consent macOS asks for at aterm's first \
+         connection into the LAN covers the survey's reads too.\n",
         aterm_codec::tty::one_line(&joined.issuer.host, 80),
         joined.peers,
         if issuer_key.is_some() {

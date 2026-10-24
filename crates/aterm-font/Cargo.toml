@@ -17,7 +17,7 @@
 # 0.20.1 (https://github.com/harfbuzz/rustybuzz, by the HarfBuzz developers and
 # Yevhenii Reizner, MIT; see `LICENSE-RUSTYBUZZ`). aterm-render shapes every run
 # with it, and its replay of the TF.1 shaping corpus lives there
-# (tests/font_oracle.rs, `shaping_answers_hold`).
+# (crates/aterm-render/tests/font_oracle.rs, `shaping_answers_hold`).
 #
 # Its automatic hinter, `src/autohint/` (TF.4, the `hint` feature), is a
 # modified subset of skrifa 0.46.2, read-fonts 0.43.2 and font-types 0.12.4

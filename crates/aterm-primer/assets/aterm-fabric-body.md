@@ -1,4 +1,4 @@
-<!-- aterm skill v7 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v8 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # The aterm fabric: inbox, outbox and the halt
 
@@ -90,16 +90,16 @@ worker (Claude Code, Gemini CLI, agy or Muse Code) goes as its first prompt, not
 `hold=1` means driving this session was halted: every verb that types into it answers
 `ERR halted reason=<r> origin=<person|remote|local|fleet>` (`reason=` is what to quote) until
 the hold lifts. Reads, `post`, `inbox seen`, `meta set` and `lease` still work. While any
-tab is held, `invoke`, `tab`, `pane`, `hwkey`, `pointer` and `confirm` are halted across
-that aterm.
+tab is held, `invoke`, `tab`, `pane`, `hwkey`, `pointer`, `confirm`, `askpass` and `open
+menu|tab-menu|overview|autopilot-menu|fact-menu` are halted across that aterm.
 
 - `origin=person` (`reason=taken-over`): the person at the window took the tab over (Take
   Over). Only their Hand Back lifts it (`hold <sid> off` answers `OK hold=1` and lifts
   nothing). Wait, or `post` them a note.
 - `origin=remote`: another Mac's node holds the session over the fleet (`status
-  hold_by=remote`; `aterm help fleet`, DRIVE). Only that Mac's `aterm ctl --host <h> hold
-  <sid> off`, or the local person's Take Over / Hand Back, lifts it (`hold <sid> off` here
-  answers `OK hold=1`).
+  hold_by=remote`; `aterm help fleet`, READING & DRIVING ACROSS THE FLEET). Only that Mac's
+  `aterm ctl --host <h> hold <sid> off`, or the local person's Take Over / Hand Back, lifts
+  it (`hold <sid> off` here answers `OK hold=1`).
 - `origin=local`: the Owner's `aterm ctl hold <sid> on|off`; lifting it undoes whoever set it.
 - `origin=fleet`: a person's bus halt, lifted only with `aterm fabric halt --cap-file
   <their cap> off` (`hold off` answers `ERR denied`). `reason=fabric-lost` is a lost

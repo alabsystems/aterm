@@ -19,16 +19,18 @@ aterm conn — session connections: standing pull/push wiring between sessions.
 
 A connection src -> dst lets src act on dst as a person at its terminal:
 push = type into its PTY and signal its foreground job, pull = read its
-rendered screen. Kinds: pull | push | both.
+rendered screen. Kinds: pull | push | both. Bare `conn` and `ls` also list
+edges minted by `aterm ctl grant`; a pair with neither pull nor push ops
+shows `other`.
 
 USAGE:
     aterm conn [--sock PATH | --pid PID] [<subverb> ...]
 
 SUBVERBS:
-    (none)              this session's connections: \u{21e5} it drives the peer,
-                        \u{21e4} the peer drives it, \u{21c6} both ways at the same kind
-    ls [--json]         every connection in the instance, one line per
-                        src -> dst pair (--json: the `flows --json` object)
+    (none)              this session's connections: \u{21e5} it acts on the peer,
+                        \u{21e4} the peer acts on it, \u{21c6} both ways at the same kind
+    ls [--json]         every src -> dst pair with an edge in the instance,
+                        one line each (--json: the `flows --json` object)
     add <sel> [--kind pull|push|both] [--to-me | --from <sel2>]
                         connect @self -> <sel> (take control of it), or set
                         that connection to exactly --kind (default both).
@@ -42,27 +44,29 @@ SUBVERBS:
                         spawn a session connected (both) with --of:
                         controlled = --of drives it; controller = it drives
                         --of, its shell given ATERM_OBSERVE_SESSION_ID.
-                        --tab lands beside --of; --window (default) needs a
-                        GUI. --of defaults to @self; outside aterm, name it
+                        --tab opens it as the last tab of --of's window;
+                        --window (default) needs a GUI. --of defaults to
+                        @self; outside aterm, name it
     show <sel>          raise the session's window and select its tab
-    map                 open the GUI Overview (every session; was the connection map)
+    map                 open the GUI Overview (every session)
     help                this help
 
 SELECTORS:
     @self               this session ($ATERM_PARENT_SESSION_ID)
     @<sid>              a session id (`aterm ctl ls`)
     @<local-id>         the <local> column of `aterm ctl ls` (per instance)
-    Titles are not selectors. Outside an aterm session a subverb that needs
-    @self, named or implied, refuses and names $ATERM_PARENT_SESSION_ID.
+    Titles are not selectors, nor is @. (the active tab). Outside an aterm
+    session a subverb that needs @self, named or implied, refuses and names
+    $ATERM_PARENT_SESSION_ID.
     Without --sock/--pid, conn targets this session's instance, else the
-    latest, as `aterm ctl` does.
+    latest; every selector names a session in that instance.
 
 DRIVING A PEER (aterm ctl):
     aterm ctl @<sid> turn 'message'     submit it, return the settled screen
     aterm ctl @<sid> text               read its screen
 
 Each subverb is an `aterm ctl` verb: connect (add, set), disconnect (rm),
-flows (ls), spawn connected= (spawn), raise (show), open connections (map).
+flows (ls), spawn connected= (spawn), raise (show), open overview (map).
 ";
 
 const CONN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
@@ -575,7 +579,7 @@ fn render_ls_rows(pairs: &[FlowPair], index: &[SessionRow]) -> Vec<String> {
 
 fn cmd_status(wire: &ConnWire, self_sid: Option<&str>) -> io::Result<ExitCode> {
     let sid = self_sid.ok_or_else(|| {
-        usage("not inside an aterm session ($ATERM_PARENT_SESSION_ID unset); every connection: aterm conn ls")
+        usage("not inside an aterm session ($ATERM_PARENT_SESSION_ID unset or empty); every connection: aterm conn ls")
     })?;
     let edges = require_ok(wire.request(&[
         format!("@{sid}"),
@@ -650,7 +654,7 @@ fn cmd_ls(wire: &ConnWire, args: &[String]) -> io::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-const NO_IMPLIED_DRIVER: &str = "not inside an aterm session ($ATERM_PARENT_SESSION_ID unset); name the driving session with --from <sel>";
+const NO_IMPLIED_DRIVER: &str = "not inside an aterm session ($ATERM_PARENT_SESSION_ID unset or empty); name the driving session with --from <sel>";
 
 fn resolve_pair(
     spec: &PairSpec,
@@ -675,6 +679,9 @@ fn refusal(status: &str, src: Option<&str>, dst: &str) -> Option<String> {
         ("ERR self-loop", _) => format!("@{dst} cannot connect to itself"),
         ("ERR no such connection", Some(src)) => format!("no connection @{src} -> @{dst}"),
         ("ERR denied", _) => "denied: aterm conn needs owner access to this instance".to_string(),
+        ("ERR headless: use place=tab", _) => {
+            "a headless instance opens no windows; use --tab".to_string()
+        }
         _ => return None,
     })
 }
@@ -769,7 +776,7 @@ fn cmd_spawn(wire: &ConnWire, self_sid: Option<&str>, args: &[String]) -> io::Re
     let spec = parse_spawn_args(args)?;
     if spec.of.is_none() && self_sid.is_none() {
         return Err(usage(
-            "conn spawn outside an aterm session requires --of <sel> ($ATERM_PARENT_SESSION_ID unset)",
+            "conn spawn outside an aterm session requires --of <sel> ($ATERM_PARENT_SESSION_ID unset or empty)",
         ));
     }
     let of_tok = spec.of.clone().unwrap_or_else(|| "@self".to_string());

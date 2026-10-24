@@ -41,9 +41,11 @@ impl ProcLink {
 pub enum DeclarerRefusal {
     /// The connection carries no kernel peer (the bridge, a relay).
     NoPeer,
-    /// The peer's proven ancestry never meets this session's PTY child: another session's.
+    /// The peer's proven ancestry never meets this session's PTY child: another session's, or
+    /// none's.
     OtherSession,
-    /// The peer's ancestry does not hold up (a parent born after its child: a reused pid).
+    /// The peer's ancestry does not hold up (a parent born after its child: a reused pid), or it
+    /// meets the tab but not the agent it hosts.
     NotInTree,
 }
 

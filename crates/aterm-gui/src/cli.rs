@@ -106,12 +106,38 @@ macro_rules! shell_flag_help {
     };
 }
 
+/// The `--headless` lines of [`HELP_HEAD`]: the descriptor flags and the signal quit are Unix's.
+#[cfg(unix)]
+macro_rules! headless_flag_help {
+    () => {
+        concat!(
+            "        --headless                 No window: engine + control socket only; says so on\n",
+            "                                   stderr. SIGTERM, SIGINT or SIGHUP quits cleanly, a\n",
+            "                                   second at once; an ignored signal stays ignored.\n",
+            "        --lifeline-fd <n>          With --headless: quit when descriptor <n> (a pipe's\n",
+            "                                   read end) reaches EOF, i.e. its launcher exited.\n",
+            "        --ready-fd <n>             With --headless: write one byte down descriptor <n>\n",
+            "                                   (a pipe's write end, 3+) and close it once the control\n",
+            "                                   socket listens (closed empty if the socket is disabled).\n",
+        )
+    };
+}
+#[cfg(not(unix))]
+macro_rules! headless_flag_help {
+    () => {
+        concat!(
+            "        --headless                 No window: engine + control socket only; says so on\n",
+            "                                   stderr.\n",
+        )
+    };
+}
+
 const HELP_TITLE: &str = "aterm-gui — a fast, hardened terminal\n";
 const HELP_HEAD: &str = concat!(
     "\n",
     "USAGE:\n",
-    "    aterm-gui [OPTIONS]\n",
-    "    aterm-gui [-d <dir>] -e <command> [args...]\n\n",
+    "    aterm --window [OPTIONS]\n",
+    "    aterm --window [-d <dir>] -e <command> [args...]\n\n",
     "OPTIONS:\n",
     "    -e, --command <cmd> [args...]  Run <cmd> instead of the shell; the window closes when\n",
     "                                   it exits. Takes the rest of the command line.\n",
@@ -134,21 +160,15 @@ const HELP_HEAD: &str = concat!(
     "        --control-sock <path>      Bind the control socket at <path> (0 or off: none);\n",
     "                                   clients connect with --sock <path>.\n",
     "        --no-control-sock          Disable the control socket.\n",
-    "        --headless                 No window: engine + control socket only; says so on\n",
-    "                                   stderr. SIGTERM, SIGINT or SIGHUP quits cleanly, a\n",
-    "                                   second at once; an ignored signal stays ignored.\n",
-    "        --lifeline-fd <n>          With --headless: quit when descriptor <n> (a pipe's\n",
-    "                                   read end) reaches EOF, i.e. its launcher exited.\n",
-    "        --ready-fd <n>             With --headless: write one byte to descriptor <n> (3+)\n",
-    "                                   and close it once the control socket listens (closed\n",
-    "                                   empty if the socket is disabled).\n",
+    headless_flag_help!(),
     "        --columns <n>              Initial width in columns (20..=500).\n",
     "        --lines <n>                Initial height in rows (5..=300).\n",
     "        --shell-integration        OSC 133/633 command marks (the default; a no-op).\n",
     "        --no-shell-integration     Start shells without shell integration.\n",
     "        --verbose                  Verbose diagnostics on stderr.\n",
-    "        --diagnose                 Print diagnostics (version, build, renderer,\n",
-    "                                   capabilities, config, env) and exit.\n",
+    "        --diagnose                 Print diagnostics (version, build, compiler, renderer,\n",
+    "                                   shell integration, agent primer, privacy, config,\n",
+    "                                   capabilities, ATERM_* env) and exit.\n",
     "        --list-actions             List bindable [keybindings] action names and exit.\n",
     "        --validate-config          Check aterm.toml (unknown keys, unaccepted values,\n",
     "                                   parse errors); exits 1 only if the file fails to load.\n",
@@ -162,7 +182,9 @@ const HELP_HEAD: &str = concat!(
     "                                   (or the configured font) and exit.\n",
     "        --list-themes              List built-in and custom colour themes and exit.\n",
     "    -h, --help                     Print this help and exit.\n",
-    "    -V, --version                  Print the version and exit.\n\n",
+    "    -V, --version                  Print the version and exit.\n",
+    "    A flag that prints and exits answers as soon as it is read and ignores the flags\n",
+    "    after it: give launch flags first (aterm --window --font-px 20 --show-config).\n\n",
 );
 
 /// The macOS KEYS section: the common Cmd chords, which the menu bar and `on_key` own (macOS
@@ -175,7 +197,7 @@ const KEYS_HELP: &str = concat!(
     "    Cmd-click         Open hyperlink, URL (http/https/mailto) or file:line citation;\n",
     "                      Cmd-Option-click where the program tracks the mouse.\n",
     "    Option-drag       Rectangular selection (a plain one where the program tracks the mouse).\n",
-    "    Cmd-F             Find (screen + scrollback): type, Enter/Shift-Enter, Esc.\n",
+    "    Cmd-F             Find (screen + scrollback): Up/Down step, Enter accepts, Esc cancels.\n",
     "    Cmd-S / Cmd-R     Search forward / backward (Emacs style); repeat to step, wrapping.\n",
     "    Cmd-,             Settings tab (its Manual page edits aterm.toml).\n",
     "    Cmd-N / Cmd-T     New window (same process) / new tab (same window).\n",
@@ -183,8 +205,9 @@ const KEYS_HELP: &str = concat!(
     "    Cmd-Shift-T       Reopen most recently closed tab.\n",
     "    Cmd-Shift-] / [   Next / previous tab (wraps).   Cmd-1..9  Nth tab.\n",
     "    Cmd-Shift-P       Command Palette (every action, searchable).\n",
-    "    Cmd-Opt-Arrow     Focus pane in that direction (no menu item).\n",
-    "    The menu bar shows the rest (splits, moving tabs, and more) with their chords.\n\n",
+    "    Cmd-Opt-Arrow     Focus pane in that direction.   Cmd-Shift-Enter  Zoom pane (toggle).\n",
+    "    Cmd-Up / Cmd-Down Scrollback top / live.   (These three have no menu item.)\n",
+    "    The menu bar shows the rest with their chords; --list-keybinds lists the built-ins.\n\n",
 );
 
 /// The non-macOS KEYS section, generated from
@@ -238,20 +261,22 @@ const HELP_TAIL: &str = concat!(
     "  Appearance  font_px, font_family, theme (name, or dark:<name>,light:<name>),\n",
     "              foreground, background, cursor_color, selection_color,\n",
     "              selection_foreground, palette [array of #RRGGBB], window_theme,\n",
-    "              tab_strip_rows.\n",
+    "              tab_strip_rows, window_padding, background_opacity,\n",
+    "              minimum_contrast, scrollbar.\n",
     "  Window/Tabs tab_status, tab_status_quiet_after_ms, tab_status_dwell_ms,\n",
     "              tab_status_badge, tab_connection_badge, spare_shell,\n",
-    "              spare_shell_needs_person.\n",
+    "              spare_shell_needs_person, windowing_behavior, restore_session,\n",
+    "              tab_menu_chord.\n",
     "  Cursor      serious_mode (mute sound/decorative effects), motion, cursor_style,\n",
     "              cursor_blink, cursor_momentum_glow, cursor_trail_style (default\n",
     "              rainbow kitty pet; off on Windows), cursor_trail_color/_accent/\n",
     "              _intensity/_radius/_ms/_length/_ring, cursor_trail_bloom\n",
     "              (+_strength/_radius).\n",
-    "  Sound       trail_sounds (master), trail_sound_volume, trail_sound_style\n",
-    "              (auto | music box | warm pluck | glitter | ice chime | droplet |\n",
-    "              pew | zap | tick | crackle | mechanical | typewriter | marimba |\n",
-    "              felt), tone_melody, trail_sound_bed, trail_sound_riff, bell_sound,\n",
-    "              sparkle_words.profanity.bonk[_detonation].\n",
+    "  Sound       trail_sounds (master; the synth is macOS-only), trail_sound_volume,\n",
+    "              trail_sound_style (auto | music box | warm pluck | glitter |\n",
+    "              ice chime | droplet | pew | zap | tick | crackle | mechanical |\n",
+    "              typewriter | marimba | felt), tone_melody, trail_sound_bed,\n",
+    "              trail_sound_riff, bell_sound, sparkle_words.profanity.bonk[_detonation].\n",
     "  Text        ligatures, font_features, bidi, ambiguous_width, text_blending\n",
     "              (linear-corrected | linear), font_thicken (macOS), stem_gamma,\n",
     "              font_hinting (Linux/Windows: full | light | off), font_subpixel\n",
@@ -259,7 +284,8 @@ const HELP_TAIL: &str = concat!(
     "              font_weight, font_weight_dark_nudge, font_family_bold/_italic/\n",
     "              _bold_italic, font_synthetic_style, fallback_fonts [ordered],\n",
     "              symbol_font, emoji_font, line_height, font_size_scale.\n",
-    "  Behaviour   gpu, scrollback_lines, columns, lines, copy_on_select,\n",
+    "  Behaviour   gpu, shell, shell_args, scrollback_lines, columns, lines,\n",
+    "              copy_on_select, confirm_multiline_paste, right_click,\n",
     "              option_as_meta, search_history_lines, focus_boost (Windows;\n",
     "              default on), conpty (Windows: bundled | inbox | auto | path),\n",
     "              desktop_alerts (aterm's own needs-you alerts as system\n",
@@ -268,6 +294,7 @@ const HELP_TAIL: &str = concat!(
     "              allow_osc52_query, secure_keyboard_entry (macOS) (default off);\n",
     "              allow_palette_reconfigure (default on).\n",
     "  Keys        [keybindings] \"chord\"=\"action\"; [key_sequences] \"chord\"=raw bytes.\n",
+    "  More        aterm --window --write-config (a commented starter), aterm help config.\n",
 );
 
 const CONFIG_PATH_SLOT: &str = "<aterm.toml>";
@@ -838,7 +865,12 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
             "--list-actions" => {
                 let names: String = crate::keybinding::ACTION_NAMES
                     .iter()
-                    .map(|name| format!("{name}\n"))
+                    .flat_map(|name| match name.split_once("..") {
+                        Some(("switch_tab_1", "switch_tab_9")) => (1..=9)
+                            .map(|n| format!("switch_tab_{n}\n"))
+                            .collect::<Vec<_>>(),
+                        _ => vec![format!("{name}\n")],
+                    })
                     .collect();
                 answer_and_exit(&argv, &names, 0);
             }

@@ -668,10 +668,11 @@ fn help_short_catalog() -> String {
     let json_verbs = json_verbs().collect::<Vec<_>>().join("/");
     let mut body = format!(
         "# Framing: one \"OK …\"/\"ERR …\" status line, or \"OK <count>\" + <count> content lines \
-         (\"OK <nbytes>\" + raw bytes for cast, temporal, doc read, inbox get); empty content = no \
-         data, never an error\n\
-         # --json on {json_verbs} = structured output · \"@<sid> <verb>\" = run it on that session \
-         (an @ that names nothing, as \"@$W\" with $W empty, is refused)\n\
+         (\"OK <nbytes>\" + raw bytes for cast, temporal, doc read, inbox get, but not cast \
+         frames|drift or temporal status); empty content = no data, never an error\n\
+         # --json on {json_verbs} = structured output · \"@<sid> <verb>\" = aim it at that session \
+         (an app-level verb: its instance's front window; an @ that names nothing, as \"@$W\" with \
+         $W empty, is refused)\n\
          # help <verb> = the full entry · help --full = the complete catalog · help --json = the \
          catalog as JSON\n"
     );
@@ -710,18 +711,23 @@ fn help_full_catalog() -> String {
         .join("/");
     let header = &format!(
         r#"# Framing: every reply is one STATUS line ("OK …" / "ERR …"), or "OK <count>" then <count>
-# CONTENT lines, or, for the bytes verbs (cast, temporal, doc read, inbox get), "OK <nbytes>"
-# then exactly that many raw bytes. `aterm ctl` prints the content without its OK line, so
-# EMPTY output means NO DATA, never an error (errors are always "ERR …").
-# "--json" on {json_verbs} gives structured output; any other verb answers
-# "ERR json: not supported for <verb>" or reads "--json" as an ordinary argument, so do not
-# probe with it (`send --json` types it).
-# Cross-session: prefix a verb with "@<selector>" (@self, @<sid>, @<n>, or @. for the active
-# tab; e.g. "@s-ab12 text"). An "@" that names nothing (an empty $W in "@$W") is refused,
-# never read as the active tab. Same user only; `aterm ctl` reads the per-launch token
-# itself. On an owner connection, a sid that ANOTHER aterm instance hosts is relayed to it,
-# so every session of every instance is addressable here: `sessions` lists this instance's,
-# the client-side `aterm ctl ls` every instance's.
+# CONTENT lines, or, for the bytes verbs (cast, temporal, doc read, inbox get; not
+# `cast frames|drift` or `temporal status`), "OK <nbytes>" then exactly that many raw bytes.
+# `aterm ctl` prints the content without its OK line, so EMPTY output means NO DATA, never
+# an error (errors are always "ERR …").
+# "--json" (or a bare "json") on {json_verbs} gives structured output; any other verb
+# answers "ERR json: not supported for <verb>" or reads "--json" as an ordinary argument
+# (`send --json` types it; `version --json` answers "ERR usage: version"), so do not probe
+# with it.
+# Cross-session: prefix a verb with "@<selector>" (@<sid>, @<n>, or @. for the active tab;
+# e.g. "@s-ab12 text"; `aterm ctl` also expands @self to the sid of the session it runs in).
+# `subscribe` takes its targets after the verb instead ("subscribe @s-ab12 screen"). An "@"
+# that names nothing (an empty $W in "@$W") is refused, never read as the active tab. Same
+# user only; `aterm ctl` reads the per-launch token itself. On an owner connection, a sid
+# that ANOTHER aterm instance hosts is relayed to it (not a `spawn agent=` with its task
+# frame: send that to the hosting instance), so every session of every instance is
+# addressable here: `sessions` lists this instance's, the client-side `aterm ctl ls` every
+# instance's.
 # TARGETING RULE: the @<sid> selects WHERE the verb runs. SESSION verbs (text/screen/
 # image/turn/send/…) act on that session. APP-LEVEL verbs (window/chrome/controls/open/
 # settings/invoke/…) act on the FRONT window of the instance hosting it: `@<sid> window`
@@ -742,6 +748,7 @@ fn help_full_catalog() -> String {
 # NATIVE TAB APPS (open in the front window; a document already open is focused):
 #   open app settings /about              About inside the Settings tab
 #   open app settings /updates            Software Update inside the Settings tab
+#   open app system-state                 System State: the setup plan and its progress
 #   open app markdown file:///abs/doc.md  read one bounded, local UTF-8 file
 #   open app editor file:///abs/doc.md    edit that file through a read/write grant
 #   inspect app/v1 tabs                   discover stable native view ids
@@ -3656,9 +3663,10 @@ fn retired_verb_error(verb: &str) -> Option<String> {
              agent=claude -` starts a worker)\n"
         )),
         "dial" | "dial-list" | "dial-token" => Some(format!(
-            "ERR verb {verb} was removed with the network drive: a fleet reads other machines \
-             (`aterm fleet init` on one machine, `aterm fleet join` on each other, then \
-             `aterm ctl survey --fleet`)\n"
+            "ERR verb {verb} was removed with the network drive: a fleet replaced it (`aterm \
+             fleet init` on one machine, `aterm fleet join` on each other; `aterm ctl survey \
+             --fleet` reads them, and `aterm ctl --host <h> …` drives one that ran `aterm fleet \
+             allow drive --from <node>`)\n"
         )),
         _ => None,
     }
@@ -7673,7 +7681,7 @@ fn peek_push_peer(stream: &CtlStream) -> std::io::Result<usize> {
     stream.read_nonblocking(&mut byte)
 }
 
-const SUBSCRIBE_USAGE: &str = "ERR usage: subscribe [@<sel>[,<sel>]|@*] <streams> \
+const SUBSCRIBE_USAGE: &str = "ERR usage: subscribe [@<sel>[,@<sel>...]|@*] <streams> \
                                [since=<seq>] [since-turn=<id>] [since-block=<id>] \
                                [since-log=<seq> log-ep=<e>] [every-frame]\n";
 
@@ -9219,7 +9227,7 @@ fn json_ask(form: &Resolved, verb: &str, rest: &str) -> JsonAsk {
     }
 }
 
-/// Whether `rest` carries the `--json` / `json` flag ([`aterm_types::control_verbs::json_flag`], the rule [`json_ask`] reads).
+/// Whether `rest` carries the `--json` / `json` flag ([`aterm_types::control_verbs::json_flag`], the rule [`json_ask`] reads), and `rest` with every such token removed.
 pub(crate) fn take_json_flag(rest: &str) -> (bool, String) {
     use aterm_types::control_verbs::json_flag;
     let kept = rest

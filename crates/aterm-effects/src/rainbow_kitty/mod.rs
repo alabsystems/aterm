@@ -1155,10 +1155,12 @@ impl Engine {
         caret_move: Option<(u16, u16)>,
         add: impl Fn(&mut [u16], &mut usize, u16),
     ) -> usize {
+        let cohorts = self.ribbon.cohorts();
+        if cohorts.is_empty() || out.is_empty() {
+            return 0;
+        }
         let mut n = 0usize;
-        let focus = self
-            .ribbon
-            .cohorts()
+        let focus = cohorts
             .iter()
             .max_by_key(|coh| (self.caret_known && coh.row == self.caret.0, coh.alive_at))
             .map(|coh| coh.row);
@@ -1181,32 +1183,39 @@ impl Engine {
             {
                 add(out, &mut n, row);
             }
+            if n == out.len() {
+                return n;
+            }
         }
-        for coh in self.ribbon.cohorts() {
+        for coh in cohorts {
             add(out, &mut n, coh.row);
             if n == out.len() {
                 return n;
             }
         }
-        for coh in self.ribbon.cohorts() {
-            let Some(row) = back(coh.row) else {
-                break;
-            };
-            add(out, &mut n, row);
-            if n == out.len() {
-                return n;
+        if carry > 0 {
+            for coh in cohorts {
+                let Some(row) = back(coh.row) else {
+                    break;
+                };
+                add(out, &mut n, row);
+                if n == out.len() {
+                    return n;
+                }
             }
         }
-        for coh in self.ribbon.cohorts() {
-            let Some(row) = ahead(coh.row) else {
-                continue;
-            };
-            add(out, &mut n, row);
-            if n == out.len() {
-                return n;
+        if lead.is_some() {
+            for coh in cohorts {
+                let Some(row) = ahead(coh.row) else {
+                    continue;
+                };
+                add(out, &mut n, row);
+                if n == out.len() {
+                    return n;
+                }
             }
         }
-        for coh in self.ribbon.cohorts() {
+        for coh in cohorts {
             for nb in [coh.row.checked_sub(1), coh.row.checked_add(1)] {
                 if n == out.len() {
                     return n;
@@ -1497,6 +1506,9 @@ impl Engine {
         rows: &[RowSample<'_>],
         park: Option<((u16, u16), (u16, u16))>,
     ) {
+        if self.events.is_empty() && park.is_none() {
+            return;
+        }
         let pane_col0 = self.pane.map_or(0, |(c0, _)| c0);
         let found = self
             .events

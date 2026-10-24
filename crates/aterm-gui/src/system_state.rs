@@ -810,14 +810,6 @@ impl NativeAppModel for SystemStateApp {
             None,
         );
         let switch_w = crate::native_ui::switch_least_width().max(82.0);
-        let switch_under = inner - switch_w - 12.0 < 60.0;
-        let label_w = if switch_under {
-            inner
-        } else {
-            inner - switch_w - 12.0
-        };
-        let names = Setting::ALL.map(|setting| wrap_lines(setting.label(), label_w, None));
-        let switch_h = if switch_under { 6.0 + 34.0 + 4.0 } else { 8.0 };
         let line = line_pitch();
         let title_lines = wrap_lines("System State", inner, None);
         let title_h = if title_lines.len() > 1 {
@@ -825,7 +817,8 @@ impl NativeAppModel for SystemStateApp {
         } else {
             40.0
         };
-        let row_h = |lines: usize| (lines as f32 * line + switch_h).max(38.0);
+        let wordmark_w = crate::native_ui::native_button_label_width("aterm · ALab").ceil();
+        let brand_fits = inner - 12.0 - 48.0 >= wordmark_w;
         let results: Vec<String> = self
             .status
             .rows_for(Some(&reviewed_plan))
@@ -833,32 +826,47 @@ impl NativeAppModel for SystemStateApp {
             .collect();
         let total = Setting::ALL.len() + results.len();
         let start = view.scroll.min(total.saturating_sub(1));
+        let help_words = "Choose your Mac settings, then Apply.";
+        let face_warnings = [
+            "Click, type or scroll to stop automatic Apply.",
+            "Click or scroll to stop automatic Apply.",
+            "Click to stop automatic Apply.",
+            "Click to stop.",
+        ];
+        let countdown_warnings = [
+            "30 s to Apply. Click, type or scroll to stop.",
+            "30 s to Apply. Click or scroll to stop.",
+            "30 s to Apply. Click to stop.",
+            "30 s. Click to stop.",
+        ];
+        let lines_of = |words: &str| wrap_lines(words, inner, None).len();
+        // Every fit holds the shortest warning whole, whatever the state, so fields stay still.
+        let least_help = lines_of(countdown_warnings[countdown_warnings.len() - 1]);
+        let most_help = [help_words, face_warnings[0], countdown_warnings[0]]
+            .map(lines_of)
+            .into_iter()
+            .fold(3, usize::max);
         struct Fit {
             shown: usize,
             title: bool,
             help_lines: usize,
-            wants: f32,
+            two_rows: bool,
         }
-        let two_rows = names
-            .windows(2)
-            .map(|pair| row_h(pair[0].len()) + row_h(pair[1].len()))
-            .fold(0.0, f32::max)
-            + line;
-        let one_row = row_h(1) + line;
         let fits = [
-            (3, true, 3, two_rows),
-            (2, true, 3, two_rows),
-            (1, true, 3, two_rows),
-            (0, true, 3, one_row),
-            (0, false, 3, one_row),
-            (0, false, 2, one_row),
-            (0, false, 1, one_row),
+            (3, true, most_help, true),
+            (2, true, most_help, true),
+            (1, true, most_help, true),
+            (0, true, most_help, false),
+            (0, false, most_help, false),
+            (0, false, 3, false),
+            (0, false, 2, false),
+            (0, false, 1, false),
         ]
-        .map(|(shown, title, help_lines, wants)| Fit {
-            shown,
+        .map(|(shown, title, help_lines, two_rows)| Fit {
+            shown: if brand_fits { shown } else { shown.min(2) },
             title,
-            help_lines,
-            wants,
+            help_lines: help_lines.max(least_help),
+            two_rows,
         });
         let room = |fit: &Fit, rows: usize| {
             let optional = [vault_h + 6.0, restore_h + 6.0, 48.0 + 6.0];
@@ -895,12 +903,61 @@ impl NativeAppModel for SystemStateApp {
                 4
             }
         };
-        let fit = fits
-            .iter()
-            .find(|fit| room(fit, rows_at(fit)) >= fit.wants)
-            .unwrap_or(&fits[fits.len() - 1]);
+        // Where a column of whole buttons leaves no checklist row, the grid's cut faces do.
+        let mut candidates: Vec<(&Fit, usize)> =
+            fits.iter().map(|fit| (fit, rows_at(fit))).collect();
+        if let Some(&(last, 4)) = candidates.last() {
+            candidates.push((last, 2));
+        }
+        let row_h = |switch_h: f32, lines: usize| (lines as f32 * line + switch_h).max(38.0);
+        struct Arrangement {
+            under: bool,
+            label_w: f32,
+            switch_h: f32,
+            names: [Vec<String>; Setting::ALL.len()],
+            fit: usize,
+        }
+        let beside_w = inner - switch_w - 12.0;
+        let arrange = |under: bool| {
+            let label_w = if under { inner } else { beside_w };
+            let switch_h = if under { 6.0 + 34.0 + 4.0 } else { 8.0 };
+            let names = Setting::ALL.map(|setting| wrap_lines(setting.label(), label_w, None));
+            let heights = names.each_ref().map(|name| row_h(switch_h, name.len()));
+            let two_rows = heights
+                .windows(2)
+                .map(|pair| pair[0] + pair[1])
+                .fold(0.0, f32::max)
+                + line;
+            let fit = candidates
+                .iter()
+                .position(|(fit, rows)| {
+                    room(fit, *rows)
+                        >= if fit.two_rows {
+                            two_rows
+                        } else {
+                            row_h(switch_h, 1) + line
+                        }
+                })
+                .unwrap_or(candidates.len() - 1);
+            Arrangement {
+                under,
+                label_w,
+                switch_h,
+                names,
+                fit,
+            }
+        };
+        let beside_holds_words = Setting::ALL.iter().all(|setting| {
+            aterm_grapheme::pieces(setting.label(), aterm_grapheme::BreakKind::is_word_boundary)
+                .iter()
+                .all(|piece| line_fits(piece.text, beside_w))
+        });
+        let under = arrange(true);
+        let beside = beside_holds_words.then(|| arrange(false));
+        let (fit, button_rows) = candidates[beside
+            .as_ref()
+            .map_or(under.fit, |beside| beside.fit.min(under.fit))];
         let shown = fit.shown;
-        let button_rows = rows_at(fit);
         let share = match button_rows {
             1 => one_row_share,
             2 => grid_share,
@@ -909,40 +966,36 @@ impl NativeAppModel for SystemStateApp {
         let pending = self.pending() && !self.clock.interacted();
         let on_face = label_fits(counting, share)
             && room(fit, button_rows) + (button_rows - 1) as f32 * 44.0 >= 0.0;
-        let warnings: &[&str] = if on_face {
-            &[
-                "Click, type or scroll to stop automatic Apply.",
-                "Click or scroll to stop automatic Apply.",
-                "Click to stop automatic Apply.",
-                "Click to stop.",
-            ]
+        let warnings = if on_face {
+            face_warnings
         } else {
-            &[
-                "30 s to Apply. Click, type or scroll to stop.",
-                "30 s to Apply. Click or scroll to stop.",
-                "30 s to Apply. Click to stop.",
-                "30 s. Click to stop.",
-            ]
+            countdown_warnings
         };
         let compose = |warning: Option<&str>| match (warning, &summary) {
             (Some(warning), Some(summary)) => format!("{warning} {summary}"),
             (Some(warning), None) => warning.to_owned(),
             (None, Some(summary)) => summary.clone(),
-            (None, None) => "Choose your Mac settings, then Apply.".to_owned(),
+            (None, None) => help_words.to_owned(),
         };
-        let warning = pending.then(|| {
+        // A result follows the warning only where the warning keeps its words beside it.
+        let mut guidance = if pending {
             warnings
                 .iter()
-                .copied()
-                .find(|warning| {
-                    wrapped_lines(&compose(Some(warning)), inner, Some(fit.help_lines))
-                        .join(" ")
-                        .starts_with(warning.trim_end_matches('.'))
+                .find_map(|warning| {
+                    let lines = wrapped_lines(&compose(Some(warning)), inner, Some(fit.help_lines));
+                    if lines.join(" ").starts_with(warning.trim_end_matches('.')) {
+                        Some(lines)
+                    } else {
+                        let lines = wrap_lines(warning, inner, None);
+                        (lines.len() <= fit.help_lines).then_some(lines)
+                    }
                 })
-                .unwrap_or(warnings[warnings.len() - 1])
-        });
-        let words = compose(warning);
-        let mut guidance = wrapped_lines(&words, inner, Some(fit.help_lines));
+                .unwrap_or_else(|| {
+                    wrapped_lines(warnings[warnings.len() - 1], inner, Some(fit.help_lines))
+                })
+        } else {
+            wrapped_lines(&compose(None), inner, Some(fit.help_lines))
+        };
         if pending
             && !on_face
             && let Some(first) = guidance.first_mut()
@@ -950,7 +1003,7 @@ impl NativeAppModel for SystemStateApp {
         {
             *first = format!("{}{rest}", self.clock.seconds());
         }
-        let (help, help_h) = text_lines(
+        let (mut help, mut help_h) = text_lines(
             if summary.is_some() {
                 "system-state/summary"
             } else {
@@ -959,9 +1012,57 @@ impl NativeAppModel for SystemStateApp {
             guidance,
             StyleRef::Secondary,
         );
-        let rows_room = (room(fit, button_rows) - line).max(34.0);
+        // On a page too short for its parts the guidance keeps the lines its fit holds, so the
+        // fields below it stay still from state to state.
+        if room(fit, button_rows) < 0.0 {
+            help_h = fit.help_lines as f32 * line;
+            help = help.layout(
+                Layout::column()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(help_h)),
+            );
+        }
         let room = (room(fit, button_rows) + fit.help_lines as f32 * line - help_h).max(34.0);
+        let rows_room = (room - line).max(34.0);
         let lines_in = |height: f32| ((height / line).floor() as usize).max(1);
+        // The switch stands beside a name only where its column holds every word, and the page
+        // then shows as many rows from its top.
+        let shows = |arrangement: &Arrangement| {
+            let cap = lines_in(rows_room - arrangement.switch_h);
+            let fill = |room: f32| {
+                let mut used = 0.0;
+                arrangement
+                    .names
+                    .iter()
+                    .enumerate()
+                    .take_while(|(index, name)| {
+                        used += row_h(arrangement.switch_h, name.len().min(cap));
+                        *index == 0 || used <= room
+                    })
+                    .count()
+            };
+            if total == Setting::ALL.len() && fill(room) == total {
+                total
+            } else {
+                fill(room - line)
+            }
+        };
+        let Arrangement {
+            under: switch_under,
+            label_w,
+            switch_h,
+            names,
+            ..
+        } = match beside {
+            Some(beside)
+                if beside.fit < under.fit
+                    || beside.fit == under.fit && shows(&beside) >= shows(&under) =>
+            {
+                beside
+            }
+            _ => under,
+        };
+        let row_h = |lines: usize| row_h(switch_h, lines);
         let mut rows = Vec::new();
         for (index, (setting, name)) in Setting::ALL.iter().zip(names).enumerate() {
             let key = format!("system-state/setting/{index}");
@@ -1066,7 +1167,7 @@ impl NativeAppModel for SystemStateApp {
             end
         };
         let mut end = page_end(room);
-        let scroll_caption = if start > 0 || end < total {
+        let scroll_caption = if (start > 0 || end < total) && rows[start].1 + line <= room {
             end = page_end((room - line).max(34.0));
             let range = format!("{}–{end}", start + 1);
             let captions = [
@@ -1208,7 +1309,9 @@ impl NativeAppModel for SystemStateApp {
             )
             .layout(
                 Layout::default()
-                    .width(Length::Fixed(132.0))
+                    .width(Length::Fixed(
+                        wordmark_w.max(132.0).min(inner - 12.0 - 48.0),
+                    ))
                     .height(Length::Fill),
             ),
             UiNode::new(
@@ -1232,7 +1335,22 @@ impl NativeAppModel for SystemStateApp {
         }
         if fit.title {
             children.push(if title_lines.len() > 1 {
-                text_lines("system-state/title", title_lines, StyleRef::Hero).0
+                let (lines, height) =
+                    text_lines("system-state/title/lines", title_lines, StyleRef::Hero);
+                UiNode::new(
+                    "system-state/title",
+                    UiContent::Group(GroupSpec {
+                        label: Some("System State".to_owned()),
+                        role: SemanticRole::Text,
+                        style: StyleRef::Plain,
+                    }),
+                )
+                .layout(
+                    Layout::column()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(height)),
+                )
+                .children(vec![lines.paint_only_tree()])
             } else {
                 text("system-state/title", "System State", StyleRef::Hero, 40.0)
             });
@@ -1611,25 +1729,41 @@ fn elided(line: &str, width: f32) -> String {
     });
     let cut = kept.checked_sub(1).map_or(0, |at| ends[at]);
     let pieces = aterm_grapheme::pieces(line, aterm_grapheme::BreakKind::is_word_boundary);
-    let word_end = cut == line.len()
-        || line[cut..].starts_with(|c: char| {
-            c.is_whitespace()
-                || stop(c)
+    let hangul = |c: char| matches!(c, '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}' | '\u{AC00}'..='\u{D7AF}');
+    // A piece boundary ends a word unless it falls between two Hangul syllables of one word.
+    let boundary = |at: usize| {
+        pieces
+            .iter()
+            .any(|piece| piece.at == at || piece.at + piece.text.len() == at)
+            && !line[..at]
+                .chars()
+                .next_back()
+                .zip(line[at..].chars().next())
+                .is_some_and(|(before, after)| hangul(before) && hangul(after))
+    };
+    // A cut ends a word where the stops and closing marks after it lead to a space, the end or
+    // a word boundary, so "26.1" and "can’t" are not cut short.
+    let word_end = |at: usize| {
+        let rest = line[at..].trim_start_matches(|c: char| {
+            stop(c)
                 || matches!(
                     c,
                     ')' | ']' | '}' | '’' | '”' | '"' | '!' | '?' | '」' | '』' | '）'
                 )
-        })
-        || pieces
-            .iter()
-            .any(|piece| piece.at == cut || piece.at + piece.text.len() == cut);
-    let stem = if word_end {
+        });
+        rest.is_empty()
+            || rest.starts_with(char::is_whitespace)
+            || boundary(at)
+            || boundary(line.len() - rest.len())
+    };
+    let stem = if word_end(cut) {
         &line[..cut]
     } else {
         pieces
             .iter()
             .map(|piece| piece.at + piece.text.len())
             .take_while(|&end| end < cut)
+            .filter(|&end| word_end(end))
             .last()
             .map_or(&line[..cut], |end| &line[..end])
     };
@@ -2484,6 +2618,24 @@ mod tests {
 
     #[test]
     fn a_short_page_keeps_the_checklist_apply_and_the_vault_fields_in_view() {
+        short_pages(1.0);
+    }
+
+    #[test]
+    fn a_short_page_keeps_them_in_view_at_a_large_text_size() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        for scale in [1.5, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            short_pages(scale);
+        }
+        let _ = install_preferences(AppearancePreferences::default());
+    }
+
+    fn short_pages(scale: f32) {
         use crate::native_ui::LogicalRect;
         let compile = compile_view;
         let rect = |compiled: &crate::native_ui::CompiledUi, key: &str| {
@@ -2571,31 +2723,48 @@ mod tests {
                         + app.status.rows_for(Some(&app.reviewed_plan())).count();
                     for scroll in 0..total {
                         let compiled = compile(app, scroll, page);
-                        let at = format!("a {state} {width}×{height} page scrolled to {scroll}");
-                        let one_row = matches!(
-                            (
-                                rect(&compiled, "system-state/apply"),
-                                rect(&compiled, "system-state/check"),
-                            ),
-                            (Some(apply), Some(check)) if apply.y == check.y
+                        let at = format!(
+                            "a {state} {width}×{height} page scrolled to {scroll} at {scale}×"
                         );
-                        let lift = if one_row {
-                            0
-                        } else if width < 182.0 {
-                            132
-                        } else {
-                            44
+                        let button_ys: Option<Vec<f32>> = buttons
+                            .iter()
+                            .map(|key| compiled.semantic(&UiKey::new(*key)).map(|node| node.rect.y))
+                            .collect();
+                        let button_rows = button_ys.map_or(4, |mut ys| {
+                            ys.dedup();
+                            ys.len()
+                        });
+                        let line = line_pitch();
+                        let least = wrap_lines("30 s. Click to stop.", width - 24.0, None).len();
+                        let fixed = |rows: usize| {
+                            24.0 + least as f32 * line + 12.0 + 80.0 + rows as f32 * 44.0 - 8.0
                         };
+                        let under = scroll >= Setting::ALL.len()
+                            || compiled
+                                .semantic(&UiKey::new(format!("system-state/setting/{scroll}")))
+                                .is_some_and(|node| node.rect.x < 13.0);
+                        let one_row = (line + if under { 44.0 } else { 8.0 }).max(38.0) + line;
+                        let height_f = height as f32;
                         assert!(
                             whole(&compiled, page, "system-state/help/0")
                                 || whole(&compiled, page, "system-state/summary/0"),
                             "the guidance in {at}"
                         );
-                        if height >= 172 + lift {
-                            for key in ["system-state/url", "system-state/password"]
-                                .into_iter()
-                                .chain(buttons)
-                            {
+                        if height_f >= fixed(button_rows) {
+                            for key in ["system-state/url", "system-state/password"] {
+                                assert!(whole(&compiled, page, key), "{key} in {at}");
+                            }
+                            for key in buttons {
+                                assert!(
+                                    compiled.paint.iter().any(|node| node.key.as_str() == key
+                                        && !node.clipped()
+                                        && node.rect.bottom() <= page.bottom()),
+                                    "{key} in {at}"
+                                );
+                            }
+                        }
+                        if height_f >= fixed(4) + one_row {
+                            for key in buttons {
                                 assert!(whole(&compiled, page, key), "{key} in {at}");
                             }
                         }
@@ -2606,13 +2775,7 @@ mod tests {
                                 "Apply's countdown in its name in {at}"
                             );
                         }
-                        let switch_w = crate::native_ui::switch_least_width().max(82.0);
-                        let under = if width - 36.0 - switch_w < 60.0 {
-                            26
-                        } else {
-                            0
-                        };
-                        if height >= 230 + lift + under {
+                        if height_f >= fixed(button_rows.min(2)) + one_row {
                             let key = if scroll < Setting::ALL.len() {
                                 format!("system-state/setting/{scroll}")
                             } else {
@@ -2626,7 +2789,8 @@ mod tests {
                                 );
                             }
                         }
-                        if width >= 624.0
+                        if scale == 1.0
+                            && width >= 624.0
                             && height >= 334
                             && scroll + 1 < Setting::ALL.len()
                             && !state.contains("report")
@@ -2635,7 +2799,7 @@ mod tests {
                             let key = format!("system-state/setting/{}", scroll + 1);
                             assert!(whole(&compiled, page, &key), "{key} in {at}");
                         }
-                        if width >= 480.0 && height >= 334 {
+                        if scale == 1.0 && width >= 480.0 && height >= 334 {
                             assert!(
                                 whole(&compiled, page, "system-state/title"),
                                 "title in {at}"
@@ -2662,7 +2826,7 @@ mod tests {
                 }
             }
             let short = LogicalRect::new(0.0, 0.0, width, 334.0);
-            if width >= 300.0 {
+            if scale == 1.0 && width >= 300.0 {
                 assert!(
                     whole(
                         &compile(&plain, 0, short),
@@ -2672,7 +2836,7 @@ mod tests {
                     "the scroll caption in a {width}×334 page"
                 );
             }
-            if width >= 624.0 {
+            if scale == 1.0 && width >= 624.0 {
                 assert!(rect(&compile(&reported, 0, short), "system-state/summary/2").is_some());
                 assert!(rect(&compile(&plain, 0, short), "system-state/help/1").is_none());
                 let tall = LogicalRect::new(0.0, 0.0, width, 740.0);
@@ -2743,8 +2907,7 @@ mod tests {
         rest.split('"').next().unwrap()
     }
 
-    #[test]
-    fn a_taller_page_never_shows_less() {
+    fn reported_app() -> SystemStateApp {
         let mut reported = SystemStateApp::new(Plan::default());
         reported.publish(SetupStatus {
             busy: false,
@@ -2762,47 +2925,88 @@ mod tests {
             ],
             ..SetupStatus::default()
         });
-        for width in [
+        reported
+    }
+
+    /// The optional parts a page scrolled to its top shows (whole button faces counted as one),
+    /// its guidance's lines and how many checklist rows it shows.
+    fn page_shows(
+        compiled: &crate::native_ui::CompiledUi,
+        page: crate::native_ui::LogicalRect,
+    ) -> (Vec<&'static str>, usize, usize) {
+        let shown = |key: &str| compiled.semantic(&UiKey::new(key)).is_some();
+        let mut parts: Vec<&'static str> = [
+            "system-state/brand",
+            "system-state/title",
+            "system-state/vault-help",
+            "system-state/restore-help",
+        ]
+        .into_iter()
+        .filter(|key| shown(key))
+        .collect();
+        if ["apply", "cancel", "check", "restore"]
+            .iter()
+            .all(|key| whole(compiled, page, &format!("system-state/{key}")))
+        {
+            parts.push("faces");
+        }
+        let lines = (0..)
+            .take_while(|line| shown(&format!("system-state/summary/{line}")))
+            .count();
+        let rows = compiled
+            .semantic(&UiKey::new("system-state/rows"))
+            .map_or(0, |node| {
+                let (_, range) = node.label.rsplit_once("rows 1–").unwrap();
+                range.split(' ').next().unwrap().parse::<usize>().unwrap()
+            });
+        (parts, lines, rows)
+    }
+
+    #[test]
+    fn a_taller_page_never_shows_less() {
+        taller_pages(&[
             196.0, 300.0, 360.0, 480.0, 624.0, 720.0, 740.0, 830.0, 999.0, 1400.0,
-        ] {
+        ]);
+    }
+
+    #[test]
+    fn a_taller_page_never_shows_less_at_any_text_size() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        for scale in [1.0, 1.5, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            taller_pages(&[
+                150.0, 182.0, 240.0, 300.0, 360.0, 480.0, 624.0, 720.0, 999.0,
+            ]);
+        }
+        let _ = install_preferences(AppearancePreferences::default());
+    }
+
+    fn taller_pages(widths: &[f32]) {
+        let (send, _receive) = mpsc::channel();
+        let mut offered = SystemStateApp::new(Plan::default());
+        offered.offer(Request::new(Plan::default(), send));
+        let plain = SystemStateApp::new(Plan::default());
+        let reported = reported_app();
+        for (&width, app) in widths
+            .iter()
+            .flat_map(|width| [(width, &reported), (width, &plain), (width, &offered)])
+        {
             let page = crate::native_ui::LogicalRect::new(0.0, 0.0, width, 1100.0);
-            let compiled = compile_view(&reported, 0, page);
-            let result = (0..3)
-                .filter(|line| {
-                    compiled
-                        .semantic(&UiKey::new(format!("system-state/summary/{line}")))
-                        .is_some()
-                })
-                .count();
+            let (_, result, _) = page_shows(&compile_view(app, 0, page), page);
             let mut before: Option<(Vec<&str>, usize, usize)> = None;
             for height in (166..=1100).step_by(2) {
                 let page = crate::native_ui::LogicalRect::new(0.0, 0.0, width, height as f32);
-                let compiled = compile_view(&reported, 0, page);
-                let shown = |key: &str| compiled.semantic(&UiKey::new(key)).is_some();
-                let parts: Vec<&str> = [
-                    "system-state/brand",
-                    "system-state/title",
-                    "system-state/vault-help",
-                    "system-state/restore-help",
-                ]
-                .into_iter()
-                .filter(|key| shown(key))
-                .collect();
-                let lines = (0..3)
-                    .filter(|line| shown(&format!("system-state/summary/{line}")))
-                    .count();
+                let (parts, lines, rows) = page_shows(&compile_view(app, 0, page), page);
                 if parts.contains(&"system-state/title") {
                     assert_eq!(
                         lines, result,
                         "the result under the title at {width}×{height}"
                     );
                 }
-                let rows = compiled
-                    .semantic(&UiKey::new("system-state/rows"))
-                    .map_or(0, |node| {
-                        let (_, range) = node.label.rsplit_once("rows 1–").unwrap();
-                        range.split(' ').next().unwrap().parse::<usize>().unwrap()
-                    });
                 if let Some((parts_before, lines_before, rows_before)) = &before {
                     for part in parts_before {
                         assert!(parts.contains(part), "{part} at {width}×{height}");
@@ -2815,6 +3019,45 @@ mod tests {
                 before = Some((parts, lines, rows));
             }
         }
+    }
+
+    #[test]
+    fn a_wider_page_never_shows_less() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let plain = SystemStateApp::new(Plan::default());
+        let reported = reported_app();
+        for scale in [1.0, 1.5, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            for height in [166, 216, 274, 334, 430, 600, 800, 1000] {
+                for app in [&plain, &reported] {
+                    let mut before: Option<(Vec<&str>, usize)> = None;
+                    for width in (128..=720).step_by(2) {
+                        let page = crate::native_ui::LogicalRect::new(
+                            0.0,
+                            0.0,
+                            width as f32,
+                            height as f32,
+                        );
+                        let (parts, _, rows) = page_shows(&compile_view(app, 0, page), page);
+                        let at = format!("{width}×{height} and {scale}×");
+                        if let Some((parts_before, rows_before)) = &before {
+                            for part in parts_before {
+                                assert!(parts.contains(part), "{part} at {at}");
+                            }
+                            if parts == *parts_before {
+                                assert!(rows >= *rows_before, "the checklist at {at}");
+                            }
+                        }
+                        before = Some((parts, rows));
+                    }
+                }
+            }
+        }
+        let _ = install_preferences(AppearancePreferences::default());
     }
 
     #[test]
@@ -2922,9 +3165,7 @@ mod tests {
                                 .collect::<Vec<_>>()
                                 .join(" ");
                             let inner = width as f32 - 24.0;
-                            if line_fits("30 s. Click to stop.…", inner) {
-                                assert!(guided.contains("to stop"), "how to stop {at}: {guided:?}");
-                            }
+                            assert!(guided.contains("to stop"), "how to stop {at}: {guided:?}");
                             if line_fits("Click, type or scroll to stop automatic Apply.…", inner)
                             {
                                 assert!(
@@ -2939,6 +3180,35 @@ mod tests {
                                         .is_some()
                                 })
                                 .count();
+                            let forms = if line.starts_with(&format!("{seconds} s")) {
+                                [
+                                    "30 s to Apply. Click, type or scroll to stop.",
+                                    "30 s to Apply. Click or scroll to stop.",
+                                    "30 s to Apply. Click to stop.",
+                                    "30 s. Click to stop.",
+                                ]
+                            } else {
+                                [
+                                    "Click, type or scroll to stop automatic Apply.",
+                                    "Click or scroll to stop automatic Apply.",
+                                    "Click to stop automatic Apply.",
+                                    "Click to stop.",
+                                ]
+                            };
+                            let shown = forms
+                                .iter()
+                                .position(|form| {
+                                    let form = form.replacen("30 s", &format!("{seconds} s"), 1);
+                                    guided.starts_with(form.trim_end_matches('.'))
+                                })
+                                .unwrap_or_else(|| panic!("the warning {at}: {guided:?}"));
+                            if let Some(fuller) = shown.checked_sub(1) {
+                                assert!(
+                                    wrap_lines(forms[fuller], inner, None).len() > lines,
+                                    "{:?} fits {at}: {guided:?}",
+                                    forms[fuller]
+                                );
+                            }
                             let frame = (
                                 lines,
                                 face.contains('('),
@@ -2969,16 +3239,30 @@ mod tests {
 
     #[test]
     fn a_settings_name_is_never_cut() {
-        names_are_whole();
+        names_are_whole(1.0);
     }
 
     #[test]
     fn a_settings_name_is_never_cut_in_the_ui_face() {
         crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
-        names_are_whole();
+        names_are_whole(1.0);
     }
 
-    fn names_are_whole() {
+    #[test]
+    fn a_settings_name_is_never_cut_at_a_large_text_size() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        for scale in [1.5, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            names_are_whole(scale);
+        }
+        let _ = install_preferences(AppearancePreferences::default());
+    }
+
+    fn names_are_whole(scale: f32) {
         let plain = SystemStateApp::new(Plan::default());
         let mut checking = SystemStateApp::new(Plan::default());
         checking.publish(SetupStatus {
@@ -2993,43 +3277,75 @@ mod tests {
         let off = SystemStateApp::new(Plan::from(aterm_types::macos_setup::Selection::none()));
         let squeeze = |words: &str| words.split_whitespace().collect::<String>();
         for width in 128..=800 {
-            let page = crate::native_ui::LogicalRect::new(0.0, 0.0, width as f32, 4_000.0);
+            let page = crate::native_ui::LogicalRect::new(0.0, 0.0, width as f32, 12_000.0);
             for app in [&plain, &checking, &off] {
                 let compiled = compile_view(app, 0, page);
                 for (index, setting) in Setting::ALL.iter().enumerate() {
-                    let words: String = (0..)
+                    let audits: Vec<String> = (0..)
                         .map_while(|line| {
                             compiled.text_fit_audit_line(&UiKey::new(format!(
                                 "system-state/setting/{index}/label/{line}"
                             )))
                         })
+                        .collect();
+                    let lines: Vec<&str> = audits
+                        .iter()
                         .map(|audit| {
                             assert!(!audit.contains("overflow=true"), "{audit} at {width}");
                             assert!(!audit.contains("……"), "{audit} at {width}");
-                            painted(&audit).to_owned()
+                            painted(audit)
                         })
                         .collect();
-                    assert!(
-                        squeeze(&words).starts_with(&squeeze(setting.label())),
-                        "{words:?} at {width}"
-                    );
+                    let words = lines.join(" ");
+                    let inner = width as f32 - 24.0;
+                    if aterm_grapheme::pieces(
+                        setting.label(),
+                        aterm_grapheme::BreakKind::is_word_boundary,
+                    )
+                    .iter()
+                    .all(|piece| line_fits(piece.text, inner))
+                    {
+                        assert!(words.starts_with(setting.label()), "{lines:?} at {width}");
+                    } else {
+                        assert!(
+                            squeeze(&words).starts_with(&squeeze(setting.label())),
+                            "{lines:?} at {width}"
+                        );
+                    }
                     let (_, current, desired) =
                         app.setting_station_state(*setting, &app.reviewed_plan());
+                    let full = format!("Current: {current} → Desired: {desired}");
+                    let short = format!("Current: {current}");
                     let state = words.split_once(" · ").map_or("", |(_, state)| state);
                     assert!(
-                        [
-                            String::new(),
-                            format!("Current: {current} → Desired: {desired}"),
-                            format!("Current: {current}"),
-                        ]
-                        .contains(&state.to_owned()),
+                        ["", full.as_str(), short.as_str()].contains(&state),
                         "{words:?} at {width}"
                     );
+                    let last = lines[lines.len() - 1];
+                    let bare = last.split_once(" · ").map_or(last, |(bare, _)| bare);
+                    let (_, room) = audits[audits.len() - 1].split_once(" available=").unwrap();
+                    let room: f32 = room.split(' ').next().unwrap().parse().unwrap();
+                    let fuller = if state == short {
+                        Some(full.as_str())
+                    } else if state.is_empty() && !bare.ends_with('…') {
+                        Some(short.as_str())
+                    } else {
+                        None
+                    };
+                    if let Some(fuller) = fuller {
+                        assert!(
+                            !line_fits(&format!("{bare} · {fuller}"), room),
+                            "{words:?} at {width}"
+                        );
+                    }
                 }
             }
         }
         let page = crate::native_ui::LogicalRect::new(0.0, 0.0, 1_400.0, 4_000.0);
-        for app in [&plain, &checking, &off] {
+        for app in [&plain, &checking, &off]
+            .into_iter()
+            .filter(|_| scale == 1.0)
+        {
             let compiled = compile_view(app, 0, page);
             for index in 0..Setting::ALL.len() {
                 let words: String = (0..)
@@ -3149,6 +3465,28 @@ mod tests {
             wrap_lines("Sign out of Messages", 600.0, None),
             vec!["Sign out of Messages"]
         );
+        for line in [
+            "requires macOS 26.1 or later",
+            "Moved 1,234 files today",
+            "Range 1–5 shown",
+            "You can’t apply this",
+            "The vault isn’t open",
+            "시스템 설정을 확인하세요",
+        ] {
+            let words: Vec<&str> = line.split(' ').collect();
+            let stems: Vec<String> = (1..=words.len())
+                .map(|count| words[..count].join(" "))
+                .collect();
+            for width in 10..=400 {
+                let cut = elided(line, width as f32);
+                let stem = cut.strip_suffix('…').unwrap();
+                assert!(
+                    stems.iter().any(|whole| whole == stem)
+                        || words[0].starts_with(stem) && stem.len() < words[0].len(),
+                    "{cut:?} at {width}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3189,6 +3527,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_page_wraps_only_the_results_it_can_show() {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let page = crate::native_ui::LogicalRect::new(0.0, 0.0, 720.0, 500.0);
+        let cost = |count: usize| {
+            let mut app = SystemStateApp::new(Plan::default());
+            app.publish(SetupStatus {
+                busy: false,
+                rows: (0..count)
+                    .map(|at| SetupStatusRow {
+                        name: format!("Row {at}"),
+                        status: "error".into(),
+                        detail: format!("ERR{at} {}", "extended diagnostic ".repeat(12)),
+                    })
+                    .collect(),
+                ..SetupStatus::default()
+            });
+            let before = crate::tray_raster::font_store_visits();
+            compile_view(&app, 100, page);
+            crate::tray_raster::font_store_visits() - before
+        };
+        let few = cost(200);
+        let many = cost(2_000);
+        assert!(many < few * 2, "{many} font-store visits against {few}");
     }
 
     #[test]
@@ -3262,6 +3626,47 @@ mod tests {
                         whole(&compiled, page, "system-state/title"),
                         "the title at {width} and {scale}×"
                     );
+                    let help = (0..)
+                        .map_while(|line| {
+                            compiled
+                                .text_fit_audit_line(&UiKey::new(format!(
+                                    "system-state/help/{line}"
+                                )))
+                                .map(|audit| painted(&audit).to_owned())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    assert_eq!(
+                        help, "Choose your Mac settings, then Apply.",
+                        "the help at {width} and {scale}×"
+                    );
+                    let title = compiled
+                        .semantic(&UiKey::new("system-state/title"))
+                        .unwrap();
+                    assert_eq!(title.label, "System State");
+                    assert!(
+                        compiled
+                            .semantic(&UiKey::new("system-state/title/lines/0"))
+                            .is_none()
+                    );
+                    if compiled
+                        .semantic(&UiKey::new("system-state/brand"))
+                        .is_some()
+                    {
+                        assert!(
+                            whole(&compiled, page, "system-state/wordmark"),
+                            "the wordmark at {width} and {scale}×"
+                        );
+                        let banner = compiled
+                            .paint
+                            .iter()
+                            .find(|node| node.key.as_str() == "system-state/rainbow")
+                            .unwrap();
+                        assert!(
+                            banner.rect.width >= 47.0,
+                            "the banner at {width} and {scale}×"
+                        );
+                    }
                 }
             }
         }
@@ -3279,7 +3684,7 @@ mod tests {
                 ..AppearancePreferences::default()
             });
             for width in (128..=480).step_by(4) {
-                for height in [286, 334, 500, 742] {
+                for height in [194, 210, 226, 242, 258, 270, 286, 334, 500, 742] {
                     let page =
                         crate::native_ui::LogicalRect::new(0.0, 0.0, width as f32, height as f32);
                     for scroll in [0, 9] {
@@ -3290,11 +3695,27 @@ mod tests {
                             let caption = compiled
                                 .semantic(&UiKey::new("system-state/scroll-caption"))
                                 .unwrap();
-                            assert_eq!(
-                                painted(&audit),
-                                caption.label,
-                                "{audit} at {width}×{height} and {scale}×"
+                            let at = format!("{width}×{height} and {scale}×");
+                            assert_eq!(painted(&audit), caption.label, "{audit} at {at}");
+                            assert!(
+                                whole(&compiled, page, "system-state/scroll-caption"),
+                                "{audit} at {at}"
                             );
+                            let rows = compiled.semantic(&UiKey::new("system-state/rows")).unwrap();
+                            let (_, range) = rows.label.rsplit_once("rows ").unwrap();
+                            let (range, total) = range.split_once(" of ").unwrap();
+                            let (_, end) = range.split_once('–').unwrap();
+                            let forms = [
+                                format!("{range} of {total} · Scroll for more"),
+                                format!("{range} of {total}"),
+                                format!("{range}/{total}"),
+                                format!("{end}/{total}"),
+                            ];
+                            let fullest = forms
+                                .iter()
+                                .find(|form| line_fits(form, width as f32 - 24.0))
+                                .unwrap_or(&forms[3]);
+                            assert_eq!(&caption.label, fullest, "{at}");
                         }
                     }
                 }

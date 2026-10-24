@@ -269,7 +269,7 @@ impl EditOutcome {
 pub enum AwaitKey {
     /// One ticket's outcome.
     Ticket(Ticket),
-    /// Canonical file URI, done when no `edit`-opened view of it remains.
+    /// The file's URI, done when no `edit`-opened view of it remains.
     Uri(String),
 }
 

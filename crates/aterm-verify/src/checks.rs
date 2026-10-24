@@ -138,7 +138,9 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::WholeTree,
         needs: &["chrome-headless-shell", "rustup"],
         also: "stable's wasm32",
-        runs: "both web modules (dev) in headless Chromium: their host boundary, then the CPU replay (STOCK EXCEPTION)",
+        runs: "both web modules (dev) in headless Chromium: their host boundary, then the CPU \
+               replay; with test when aterm-wasm, aterm-gpu-web or aterm-wasm-abi is selected \
+               (STOCK EXCEPTION)",
     },
     Spec {
         check: Check::WasmGlue,
@@ -174,7 +176,8 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::WholeTree,
         needs: &["ty", "ay"],
         also: "",
-        runs: "spec-check (ty over every registered model, ay over the proof bundles)",
+        runs: "spec-check (ty over every registered model, ay over the proof bundles; their \
+               minutes-class obligations only under release)",
     },
     Spec {
         check: Check::Checkers,
@@ -231,7 +234,7 @@ pub const CHECKS: [Spec; 19] = [
         stages: &[StageId::CodexAlabProof],
         reach: Reach::WholeTree,
         needs: &["codex"],
-        also: "a packaged codex-alab (--package, LAB_CODEX, or the managed codex)",
+        also: "a packaged codex-alab ($LAB_CODEX, or the managed codex)",
         runs: "lab codex-alab-proof (alone; by hand): the native harness end to end on the real package",
     },
     Spec {
@@ -242,8 +245,8 @@ pub const CHECKS: [Spec; 19] = [
         needs: &["rosetta", "limactl"],
         also: "network for the first provision",
         runs: "lab linux proof (alone; by hand): Linux tests on aarch64 and x86_64 (Rosetta), aterm-gui under \
-               Xvfb, weston, Mutter, Xwayland in a lima VM (STOCK EXCEPTION), and LW.4's recorded baseline \
-               replayed",
+               Xvfb, weston, Mutter, Xwayland in a lima VM (STOCK EXCEPTION), and the recorded Linux \
+               baseline replayed",
     },
 ];
 
@@ -499,10 +502,13 @@ pub fn list_table() -> String {
     out.push('\n');
     out.push_str(&tools_table());
     out.push_str(
-        "\ndev      fmt census lint test doc: the bare command, on the change cone;\n\
-         \x20        gpu-oracle too when the cone holds aterm-gpu, wasm-smoke when it\n\
-         \x20        holds aterm-wasm or aterm-gpu-web (any crate either builds on) or\n\
-         \x20        aterm-wasm-abi (their wasm32-only host boundary)\n\
+        "\nEvery check needs targo: without it verify runs none (COULD NOT RUN, exit 3).\n\
+         \n\
+         dev      fmt census lint test doc: the bare command, on the change cone\n\
+         \x20        any run with test (but release) adds gpu-oracle when its selection\n\
+         \x20        (the cone, -p or --all) holds aterm-gpu, and wasm-smoke when it holds\n\
+         \x20        aterm-wasm or aterm-gpu-web (on the cone: a change to any crate either\n\
+         \x20        builds on) or aterm-wasm-abi (their wasm32-only host boundary)\n\
          release  what `ship release` requires: --all implied, --app required, a skip is exit 3\n\
          perf     not a check: the performance lanes, `verify perf --list`\n",
     );
@@ -526,7 +532,7 @@ mod tests {
         ] {
             assert!(test.contains(want), "{want} in {test}");
         }
-        // S11: the embedded verifier's tests run in the Linux guest, so the dev test check
+        // The embedded verifier's tests run in the Linux guest, so the dev test check
         // needs neither of its tools on a Mac.
         assert!(
             !test.contains("python3") && !test.contains("openssl3"),

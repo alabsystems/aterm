@@ -217,7 +217,8 @@ impl World {
             .expect("a scripted tab")
     }
 
-    /// Runs `p` as the foreground job of tab `key` under OSC 133 block `id`.
+    /// Runs `p` as the foreground job of tab `key` under OSC 133 block `id`; the block it
+    /// replaces is the tab's ended one, closed, as the host's feed keeps it.
     pub fn run_fg(&mut self, key: u64, id: u64, command: &str, mut p: Proc) {
         let shell = self.tab(key).tab.shell_pid;
         p.ppid = shell;
@@ -227,12 +228,17 @@ impl World {
         self.add(p);
         let at = self.at;
         let t = self.tab(key);
+        if let Some(mut b) = t.tab.block.take() {
+            b.open = false;
+            t.tab.ended = Some(b);
+        }
         t.tab.block = Some(Block {
             id,
             started_ms: at,
             open: true,
             command: command.to_owned(),
             status: None,
+            stopped: false,
         });
         t.tpgid = pgid;
     }
@@ -254,6 +260,15 @@ impl World {
             b.status = Some(status);
         }
         t.tpgid = t.tab.shell_pid;
+    }
+
+    /// Ctrl-Z: the open block ends in a stop (`D` with 128 plus the host's SIGTSTP, which the
+    /// host decodes), and the shell has the terminal again.
+    pub fn stop_block(&mut self, key: u64) {
+        self.close_block(key, 148);
+        if let Some(b) = self.tab(key).tab.block.as_mut() {
+            b.stopped = true;
+        }
     }
 
     /// Starts an agent (`claude`, `agent` pid) in front of tab `key`.
@@ -320,6 +335,12 @@ impl World {
         t.tab.line_output_ms = Some(at);
         t.tab.output_ms = Some(at);
         t.tab.output_bytes += 40;
+    }
+
+    /// Tab `key`'s shell wrote one of its own OSC 133 marks now.
+    pub fn mark(&mut self, key: u64) {
+        let at = self.at;
+        self.tab(key).tab.shell_ms = Some(at);
     }
 
     /// Tab `key`'s program redrew with a CR and no line feed now.
@@ -479,7 +500,8 @@ impl World {
         }
     }
 
-    /// Held processes owned by `UID` (tab descendants of pid 100 or coalition members).
+    /// Held processes owned by `UID`; one is aterm's when it descends from pid 100 or is a
+    /// coalition member.
     fn held(&self) -> Vec<aterm_vitals::jobs::HeldProc> {
         self.procs
             .values()

@@ -21,7 +21,7 @@ use crate::supervise::tape::core::TapeValue;
 use crate::supervise::tape::doors;
 use crate::supervise::tape::header::Roots;
 
-/// How the approval policy looks at the machine ([module docs](self)).
+/// How the approval policy looks at the machine.
 pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
     /// A name in a folder on the way to the absolute path `comps` that differs from the drawn one.
     /// # Errors
@@ -223,7 +223,7 @@ impl PolicyProbe for NoLook {
     }
 }
 
-/// How a probe's request is written ([module docs](self)).
+/// How a probe's request is written.
 struct Requests<'a> {
     path: &'a dyn Fn(&Path) -> Vec<u8>,
     seed: u64,

@@ -21,7 +21,7 @@ use crate::session_timeline::{
 use crate::turn_ledger::TurnBy;
 use crate::{SessionCtx, term_lock};
 
-/// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0> window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> … supervisor=<holder|-> autopilot=<off|cruise|land|-> path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|theirs|-> pause=<unix s|-> task_state=<working|done|exited|stalled|-> task_rev=<n>`.
+/// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0> nonce=<hex32> window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> … supervisor=<holder|-> autopilot=<off|cruise|land|-> path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|theirs|-> pause=<unix s|-> task_state=<working|done|exited|stalled|-> task_rev=<n>`.
 pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wake>>) -> String {
     let (snapshot, frozen, posture) = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
@@ -319,7 +319,12 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
         if let Some(v) = t.strip_prefix("ttl=") {
             match v.parse::<u64>() {
                 Ok(n) if n >= 1 => ttl_ms = n.min(LEASE_TTL_MAX_MS),
-                _ => return format!("ERR lease acquire: bad ttl '{t}' (1..={LEASE_TTL_MAX_MS})\n"),
+                _ => {
+                    return format!(
+                        "ERR lease acquire: bad ttl '{t}' (a positive ms count, capped at \
+                         {LEASE_TTL_MAX_MS})\n"
+                    );
+                }
             }
         } else if let Some(v) = t.strip_prefix("holder=") {
             if v.is_empty() || v.len() > 64 || !v.chars().all(|c| c.is_ascii_graphic()) {
@@ -724,7 +729,8 @@ pub(crate) fn cmd_await(
 
     const USAGE: &str = "ERR usage: await idle <ms> | seq [<n>] | match <re> [rows <a> <b>] | \
                          gone <re> [rows <a> <b>] | block | frame | inbox since=<id>|re=<off> \
-                         [kinds=<k,...>] [topic=<t>] | agent <word>[,<word>...] [since=<rev>] | \
+                         [kinds=<k|hold,...>] [topic=<t>] | \
+                         agent <word>[,<word>...] [since=<rev>] | \
                          task [@<sel>[:<rev>][,...]] [any|all] [since=<rev>] | \
                          log <need|open=<lvl>|close=<lvl>|kind=<k>>[,...] [since=<seq> ep=<e>] | \
                          sys <predicate> | \
@@ -2122,7 +2128,7 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
     Ok(o.cause)
 }
 
-/// `turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] [submit_window=<ms>] [presses=<n>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] <text>` — one complete human turn against the target session: type `<text>`, submit it with a real keypress, block until the app's response settles, and return the settled screen — `OK <rows> turn submitted=<0|1> status=<settled|timeout|hangup|submitted> seq=<n> id=<n> dur_ms=<n> hash=<hex16>[ trimmed=<k>]` then `<rows>` text rows (the same rows `text` prints).
+/// `turn [<options>] <text>` (the options: [`TURN_USAGE`]) — one complete human turn against the target session: type `<text>`, submit it with a real keypress, block until the app's response settles, and return the settled screen — `OK <rows> turn submitted=<0|1> status=<settled|timeout|hangup|submitted> seq=<n> id=<n> dur_ms=<n> hash=<hex16>[ typed=<n> pasted=<n>][ yielded_ms=<ms>][ pressed=<n>][ task_rev=<n>][ agent_rev=<n>][ frame=open][ trimmed=<k>]` then `<rows>` text rows (the same rows `text` prints).
 pub(crate) fn cmd_turn(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -3310,7 +3316,7 @@ fn harness_act_request(rest: &str) -> Option<Result<HarnessActRequest<'_>, &'sta
     Some(parsed.ok_or(HARNESS_ACT_USAGE))
 }
 
-/// `meta set harness_act <act> [until_us=<n>]` — an agent that supervises itself records an act it took on the session (the native harness contract §5, law 5: who is driving a session is seen per session).
+/// `meta set harness_act <act> [until_us=<n>]` — an agent that supervises itself records an act it took on the session, so who is driving a session is seen per session.
 pub(crate) fn cmd_meta_harness_act(
     ctx: &SessionCtx,
     snapshot: Option<HarnessActSnapshot>,
@@ -3517,7 +3523,7 @@ fn meta_status(
     )
 }
 
-/// `meta`'s `autopilot_by=` and `autopilot_since=` (design §11.7.2): who set the Autopilot pair — `human:chip`, `human:border`, `human:menu`, `human:settings`, `human:every`, `ctl`, `harness`, `bridge`, `aterm` (the timer's fire), a session's sid (its edge connection), `-` for none attributable ([`crate::session_timeline::AutopilotSetBy::word`]) — and when, unix seconds.
+/// `meta`'s `autopilot_by=` and `autopilot_since=` (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.7.2): who set the Autopilot pair — `human:chip`, `human:border`, `human:menu`, `human:settings`, `human:every`, `ctl`, `harness`, `bridge`, `aterm` (the timer's fire), a session's sid (its edge connection), `-` for none attributable ([`crate::session_timeline::AutopilotSetBy::word`]) — and when, unix seconds.
 pub(crate) fn autopilot_by_fields(meta: &crate::session_timeline::SessionMeta) -> (String, String) {
     match (meta.autopilot_set_by, meta.autopilot.is_some()) {
         (Some(set_by), _) => (set_by.word(), set_by.since_ms.div_euclid(1000).to_string()),
@@ -3659,7 +3665,7 @@ pub(crate) fn cmd_brief_closed_query(
     text
 }
 
-/// `brief [<node>] [budget=<tokens>] [since=<seq> ep=<epoch>]`: the target session's token-budgeted rollup for an AI reader (design §7.4), from its session log; `brief all [budget=]` is the instance's, every session's in turn within one budget (Owner-only, escalated by `control::argument_escalation`, like `sessions`).
+/// `brief [<node>] [budget=<tokens>] [since=<seq> ep=<epoch>]`: the target session's token-budgeted rollup for an AI reader (`docs/DESIGN-session-log-2026-10-15.md` §7.4), from its session log; `brief all [budget=]` is the instance's, every session's in turn within one budget (Owner-only, escalated by `control::argument_escalation`, like `sessions`).
 pub(crate) fn cmd_brief_with_jobs(
     ctx: &SessionCtx,
     store: &Store,
@@ -3719,7 +3725,7 @@ fn brief_all(store: &Store, budget: Option<usize>) -> String {
     crate::session_log::render_brief_all(&parts, budget)
 }
 
-/// `cast` -> `OK <nbytes>\n` then the session's full asciicast v2 recording as the body (design A.5.1 / B.7).
+/// `cast` -> `OK <nbytes>\n` then the session's full asciicast v2 recording as the body.
 pub(crate) fn cmd_cast(cast: &Mutex<crate::cast::CastRecorder>) -> String {
     const HEAD_SLOT: &str = "OK 18446744073709551615\n";
     let snapshot = {
@@ -3897,7 +3903,7 @@ fn cast_drift_with(
     report.render(ms, None)
 }
 
-/// `temporal [tick] [trim]` -> `OK <nbytes>[ trimmed=<k>]\n` then the session's screen RECONSTRUCTED at logical `tick` (default: the latest recorded instant) — with `trim`, minus its trailing all-blank rows (the `text trim` rule; the byte count on the header is the trimmed body's) — the read half of the hydratable temporal spine (design Addendum B / B.9), the endpoint the `TemporalRecorder` producer feeds.
+/// `temporal [tick] [trim]` -> `OK <nbytes>[ trimmed=<k>]\n` then the session's screen RECONSTRUCTED at logical `tick` (default: the latest recorded instant) — with `trim`, minus its trailing all-blank rows (the `text trim` rule; the byte count on the header is the trimmed body's) — the read half of the hydratable temporal spine (`docs/design/HIERARCHICAL_SESSIONS.md` Addendum B), the endpoint the `TemporalRecorder` producer feeds.
 pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str) -> String {
     const USAGE: &str = "ERR usage: temporal [status | <tick>] [trim]  (tick = µs since \
                          session start; `temporal status` reports the reachable range)\n";
@@ -4281,7 +4287,7 @@ pub(super) fn raise_target(store: &Store, rest: &str) -> Result<u64, String> {
     }
 }
 
-/// `raise <sid>` -> raise the window hosting that session and select its tab — the wire twin of the status item's Go / map Enter (design §6; no shipping verb can do this: `tab` drives only the front window, `focus` is a PTY focus event).
+/// `raise <sid>` -> raise the window hosting that session and select its tab — the wire twin of the status item's Go / map Enter (`@<sid> tab` drives that window's tabs without raising it; `focus` is a PTY focus event).
 pub(crate) fn cmd_raise(
     proxy: &EventLoopProxy<Wake>,
     store: &Store,
@@ -4461,7 +4467,7 @@ pub(crate) fn ledger_typed_input(
     }
 }
 
-/// The session log's `by=` for a request on `scope` against `target` (design §2.5): who the connection is, never a parameter.
+/// The session log's `by=` for a request on `scope` against `target` (`docs/DESIGN-session-log-2026-10-15.md` §2.5): who the connection is, never a parameter.
 pub(crate) fn log_actor(scope: Scope, target: &SessionCtx) -> aterm_slog::Actor {
     use aterm_slog::Actor;
     match scope {
@@ -4919,6 +4925,7 @@ mod tests {
             typed: Default::default(),
             bells: Default::default(),
             screen_moves: Default::default(),
+            job_feed: Default::default(),
             update_parked: Default::default(),
             watchers: observed.watchers,
             frame: Default::default(),
@@ -5844,6 +5851,7 @@ mod tests {
             typed: Default::default(),
             bells: Default::default(),
             screen_moves: Default::default(),
+            job_feed: Default::default(),
             update_parked: Default::default(),
             watchers: observed.watchers,
             frame: Default::default(),

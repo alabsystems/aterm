@@ -332,7 +332,7 @@ fn walled(shell: bool) -> Vec<String> {
 
 /// THE WALL'S NOTICE LEFT AN IDLE SCREEN: the measured wall on a tab with no
 /// shell, a person's `/model` said under it (its `❯` row and its `⎿` result):
-/// the notice is no longer the last thing said, and nothing runs.
+/// the notice is not the last thing said, and nothing runs.
 fn left() -> Vec<String> {
     with_rows_before_the_done_row(
         walled(false),

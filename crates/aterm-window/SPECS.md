@@ -21,8 +21,8 @@
 
 The package and lib were named `winit` when this was written; since winit-core step 7
 (2026-10-19) they are `aterm-window` and `aterm_window`. The inventory below is historical: the original 36
-entries plus 3 audit regressions. Of those 39, the 9 auto-trait checks in `tests/send_objects.rs`
-and `tests/sync_object.rs` and 3 of the 4 non-spec tests in §4 are since deleted, which leaves 27
+entries plus 3 audit regressions. Of those 39, the 9 compile-only auto-trait (`Send`/`Sync`) checks
+and 3 of the 4 non-spec tests in §4 are since deleted, which leaves 27
 (src/event.rs 2, src/keyboard/smol_str.rs 1,
 src/platform_impl/linux/common/percent.rs 1, src/platform_impl/linux/headless.rs 5,
 src/platform_impl/linux/wayland/clipboard.rs 10, src/platform_impl/linux/wayland/seat/data_device.rs 3,
@@ -223,8 +223,7 @@ Status: the compositor negative control remains a migration candidate for foldin
 ## 6. Proof order (easiest high-value first)
 
 1. **`public-handles-send-sync`**. No Trust gap at all: add the `const _` auto-trait assertion item to
-   the library. The 9 tests in `tests/send_objects.rs` and `tests/sync_object.rs` it was to retire are
-   already deleted.
+   the library. The 9 compile-only `Send`/`Sync` tests it was to retire are already deleted.
 2. **`copy-outcome-placed`**. Blocked only by gap 0 plus enum carriers (gaps 1, 3); decidable by
    evaluation over 5 values. It is the lemma `copy-verdict` and `selection-port-copy` cite.
 3. **`headless-wait-deadline`** (pure factor). Linear `Duration`/`Option` arithmetic plus a

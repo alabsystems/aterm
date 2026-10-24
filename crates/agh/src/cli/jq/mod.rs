@@ -276,6 +276,7 @@ impl Program {
     /// Evaluates the filter against `input` and returns the results in order.
     /// # Errors
     /// Returns a usage error on any runtime error (a bad type or index, an undefined `$name`, …).
+    /// A `?`, or the left side of `//`, suppresses one.
     pub fn run(&self, input: &aterm_json::Value) -> Result<Vec<aterm_json::Value>> {
         let mut out = Vec::new();
         eval::run(&self.ast, input, &mut out)?;

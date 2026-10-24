@@ -1011,11 +1011,15 @@ pub(crate) const fn path_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)
     }
 }
 
-fn closest_eye_path(eyes: &Layer, pcx: f32, pcy: f32) -> Option<(usize, (f32, f32, f32, f32))> {
-    eyes.paths
+fn closest_eye_bounds(
+    eye_bounds: &[Option<(f32, f32, f32, f32)>],
+    pcx: f32,
+    pcy: f32,
+) -> Option<(usize, (f32, f32, f32, f32))> {
+    eye_bounds
         .iter()
         .enumerate()
-        .filter_map(|(index, eye)| path_bounds(eye).map(|bounds| (index, bounds)))
+        .filter_map(|(index, &bounds)| bounds.map(|b| (index, b)))
         .min_by(|(_, a), (_, b)| {
             let distance = |bounds: &(f32, f32, f32, f32)| {
                 let (x0, y0, x1, y1) = *bounds;
@@ -1024,6 +1028,28 @@ fn closest_eye_path(eyes: &Layer, pcx: f32, pcy: f32) -> Option<(usize, (f32, f3
             };
             distance(a).total_cmp(&distance(b))
         })
+}
+
+#[cfg(test)]
+fn closest_eye_path(eyes: &Layer, pcx: f32, pcy: f32) -> Option<(usize, (f32, f32, f32, f32))> {
+    let mut inline_bounds = [None; 8];
+    let heap_bounds = (eyes.paths.len() > inline_bounds.len()).then(|| {
+        eyes.paths
+            .iter()
+            .map(|eye| path_bounds(eye))
+            .collect::<Vec<_>>()
+    });
+    let bounds = match heap_bounds.as_deref() {
+        Some(bounds) => bounds,
+        None => {
+            let bounds = &mut inline_bounds[..eyes.paths.len()];
+            for (slot, eye) in bounds.iter_mut().zip(eyes.paths.iter()) {
+                *slot = path_bounds(eye);
+            }
+            &*bounds
+        }
+    };
+    closest_eye_bounds(bounds, pcx, pcy)
 }
 
 fn open_eye_reflection_eligible(bounds: (f32, f32, f32, f32), xform: PathTransform) -> bool {
@@ -1073,6 +1099,23 @@ fn paint_open_eye_reflections(
     else {
         return;
     };
+    let mut inline_eye_bounds = [None; 8];
+    let heap_eye_bounds = (eyes.paths.len() > inline_eye_bounds.len()).then(|| {
+        eyes.paths
+            .iter()
+            .map(|eye| path_bounds(eye))
+            .collect::<Vec<_>>()
+    });
+    let all_eye_bounds = match heap_eye_bounds.as_deref() {
+        Some(bounds) => bounds,
+        None => {
+            let bounds = &mut inline_eye_bounds[..eyes.paths.len()];
+            for (slot, eye) in bounds.iter_mut().zip(eyes.paths.iter()) {
+                *slot = path_bounds(eye);
+            }
+            &*bounds
+        }
+    };
     let mut painted_mask = false;
 
     for catch_light in catch_lights.paths {
@@ -1080,7 +1123,7 @@ fn paint_open_eye_reflections(
             continue;
         };
         let (pcx, pcy) = ((cx0 + cx1) * 0.5, (cy0 + cy1) * 0.5);
-        let Some((_, eye_bounds)) = closest_eye_path(eyes, pcx, pcy) else {
+        let Some((_, eye_bounds)) = closest_eye_bounds(all_eye_bounds, pcx, pcy) else {
             continue;
         };
         if !open_eye_reflection_eligible(eye_bounds, xform) {

@@ -326,6 +326,9 @@ pub struct Block {
     pub command: String,
     /// The exit status `D` carried, once closed.
     pub status: Option<i32>,
+    /// `status` says job control stopped the command (Ctrl-Z): it lives on, parked. The host
+    /// decodes it, the signal's number being the host's.
+    pub stopped: bool,
 }
 
 /// The session's terminal mode word (§6.6), as last stamped.
@@ -453,6 +456,12 @@ pub struct JobTab {
     pub shell_pid: u32,
     /// The latest OSC 133 block; `None` without shell integration.
     pub block: Option<Block>,
+    /// The block the latest one replaced, closed: a command that ended and was followed by
+    /// another between two ticks keeps its status.
+    pub ended: Option<Block>,
+    /// When the shell last wrote one of its own OSC 133 marks (a prompt, a command taken, its
+    /// end), host ms: lines read since may be its prompt's, or a command's that ran between ticks.
+    pub shell_ms: Option<u64>,
     /// The terminal mode word; `None` where unread.
     pub tty: Option<TtyMode>,
     /// The unread-input gate.

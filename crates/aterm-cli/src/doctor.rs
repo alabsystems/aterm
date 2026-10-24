@@ -35,7 +35,7 @@ pub fn names(token: &str) -> bool {
 
 /// `aterm doctor`'s grammar after its name.
 pub const GRAMMAR: &str =
-    "[--read-only | --check | --apply | --restore] [--json] [--only <id,...>]";
+    "[--read-only] [--json] [--only <id,...>] | (--check | --apply | --restore) [--json]";
 
 const ROWS: [(&str, &str, &str, &str); 12] = [
     ("shell:", SHELL, "shell", "the shell aterm starts"),
@@ -62,7 +62,7 @@ const ROWS: [(&str, &str, &str, &str); 12] = [
         "spotlight:",
         "base.machine.spotlight",
         "machine",
-        "what Spotlight indexes of build output",
+        "what Spotlight indexes of Rust build output and rustup's docs",
     ),
     (
         "syspolicyd:",
@@ -151,7 +151,14 @@ pub fn args(rest: &[String]) -> Result<Args, String> {
         };
         if let Some(settings) = action {
             if parsed.read_only || parsed.settings.is_some() {
-                return Err(refuse("choose one action".to_owned()));
+                let repeated =
+                    parsed.settings == settings && parsed.read_only == settings.is_none();
+                let problem = if repeated {
+                    format!("unknown or repeated argument {arg:?}")
+                } else {
+                    "choose one action".to_owned()
+                };
+                return Err(refuse(problem));
             }
             parsed.read_only = settings.is_none();
             parsed.settings = settings;
@@ -350,13 +357,16 @@ pub fn gather(fix: bool) -> Gathered {
     }
 }
 
-/// The diagnostic facts' legacy shell-health assessment, used by isolated fact tests.
+/// The rows and the `health:` line, with its exit code; only tests call it, and
+/// `aterm doctor` prints [`render_readiness`].
 #[must_use]
 pub fn render(gathered: &Gathered, rows: &[ItemReport], sections: &[Section]) -> (String, i32) {
     super::render_doctor_lines(&report_lines(gathered, rows, sections))
 }
 
-/// Composed doctor readiness assessment distinguishing selected checks from full OS setup.
+/// The rows (a failing shell row with its fix), then the `readiness:` and `scope:` lines (all
+/// doctor checks, or the `--only` words plus shell usability) and any pending-activation and
+/// unresolved ids.
 #[must_use]
 pub fn render_readiness(
     gathered: &Gathered,
@@ -364,7 +374,15 @@ pub fn render_readiness(
     sections: &[Section],
     readiness: &Readiness,
 ) -> String {
-    let mut text = super::render_doctor_rows(&report_lines(gathered, rows, sections));
+    let mut lines = report_lines(gathered, rows, sections);
+    if let Some(shell) = lines
+        .iter_mut()
+        .find(|line| line.label == "shell:" && line.mark == Mark::Fail)
+    {
+        shell.fact.push_str("; ");
+        shell.fact.push_str(super::SHELL_REMEDY);
+    }
+    let mut text = super::render_doctor_rows(&lines);
     let scope = if readiness.scope.is_empty() {
         "all doctor checks".to_owned()
     } else {

@@ -8,7 +8,7 @@ use std::time::Duration;
 use aterm_aos::contract::{Contract, Verdict};
 use aterm_aos::effects::NoEffects;
 use aterm_aos::replay::{Run, replay};
-use aterm_aos::task::state_digest;
+use aterm_aos::task::{Code, state_digest};
 use aterm_render::GlowQuad;
 use aterm_time::Instant;
 
@@ -30,6 +30,15 @@ pub(super) const LANE: Duration = Duration::from_nanos(16_666_667);
 
 /// The build id the tests attach under.
 pub(super) const BUILD: &str = "aos-momentum-test-build";
+
+/// A 60 Hz panel's effect lane (two panel periods), as the windows of design §10.9 ran it.
+pub(super) const WINDOW_LANE: Duration = Duration::from_nanos(33_333_332);
+
+/// A window's timer lateness after a deadline, design §10.9's median.
+pub(super) const LATE: Duration = Duration::from_micros(1_160);
+
+/// A window's query lag after its tick, design §10.9's median.
+pub(super) const LAG: Duration = Duration::from_micros(1_500);
 
 pub(super) fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
@@ -438,6 +447,41 @@ pub(super) fn run_lane(
     }
 }
 
+/// Runs a window's turn order from the frame drawn at `last` until the lane parks: each deadline fires, the glow ticks `late` after it and the scheduler asks `lag` after the tick; an active glow arms one `f` after the deadline that fired (the brisk branch's phase lock), a settling one its answer; returns how many turns it planned.
+pub(super) fn run_lagged(
+    host: &mut MomentumHost,
+    last: Instant,
+    f: Duration,
+    late: Duration,
+    lag: Duration,
+    cell: (u16, u16),
+    cfg: &MomentumGlowConfig,
+) -> usize {
+    let (mut fired, mut now) = (last, last + lag);
+    let mut turns = 0;
+    loop {
+        turns += 1;
+        let armed = if host.is_active() {
+            Some(Some(fired + f).filter(|&d| d > now).unwrap_or(now + f))
+        } else if host.settling() {
+            host.next_change_deadline(now, f)
+        } else {
+            None
+        };
+        let Some(next) = armed else {
+            return turns;
+        };
+        assert!(next > now, "a wake at or before now is a busy re-arm");
+        assert!(
+            next.saturating_duration_since(last) < Duration::from_secs(60),
+            "the lane never parked"
+        );
+        fired = next;
+        let _ = draw(host, Some(cell), next + late, geom(), cfg, 1);
+        now = next + late + lag;
+    }
+}
+
 /// Types into `host` (attached at `t0` under a code that forgets the settle forecast) until its lane strands a lit glow; returns the host, park instant and caret.
 pub(super) fn strand(
     mut host: MomentumHost,
@@ -488,6 +532,11 @@ pub(super) fn hosted_mut(h: &mut MomentumHost) -> &mut Hosted {
 
 /// `code` replayed from the host's ancestor checkpoint over its log.
 pub(super) fn replay_log(h: &MomentumHost, code: MomentumCode) -> Run<MomentumSchema> {
+    replay_by(h, &PrebuiltMomentum::new(code, BUILD))
+}
+
+/// Any `code` replayed from the host's ancestor checkpoint over its log.
+pub(super) fn replay_by(h: &MomentumHost, code: &impl Code<MomentumSchema>) -> Run<MomentumSchema> {
     let b = &hosted(h).boundary;
     let checkpoint = b.checkpoint().expect("fixture: attached");
     let log = b.log().expect("fixture: attached");
@@ -496,7 +545,7 @@ pub(super) fn replay_log(h: &MomentumHost, code: MomentumCode) -> Run<MomentumSc
         .expect("the ancestor restores");
     replay(
         b.schema(),
-        &PrebuiltMomentum::new(code, BUILD),
+        code,
         start,
         log.inputs(),
         log.header().first_cursor,

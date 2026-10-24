@@ -37,7 +37,8 @@ fn parse(argv: Vec<std::ffi::OsString>) -> Result<Opts, String> {
             }
             "--dial" | "--remote" => {
                 return Err(format!(
-                    "unknown option '{a}': use `aterm ctl survey --host <h>` for remote sessions"
+                    "unknown option '{a}': read another Mac's sessions with `aterm ctl survey \
+                     --host <h>`, drive them with `aterm ctl --host <h> …`"
                 ));
             }
             other if other.starts_with("--") => {

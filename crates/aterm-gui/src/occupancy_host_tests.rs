@@ -1180,6 +1180,7 @@ fn said(
         ],
         at_ms: NOW,
         reading: OccupancyReading::default(),
+        ready_idle: None,
     }
 }
 

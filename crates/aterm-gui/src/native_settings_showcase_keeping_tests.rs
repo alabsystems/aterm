@@ -2144,34 +2144,34 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Warning,
             ],
         ),
-        // Round 6's review: a status over a pinned control (the filter, and
+        // A status over a pinned control (the filter, and
         // the strip's Done beside the sheet), which the sweep counted whole
         // by its clipped rect.
         (filter, at(w444x420, 2), vec![Focus, Status]),
         (filter, at(w444x420, 2), vec![Wheel(8), Status]),
         (first, at((640, 480), 2), vec![Status]),
-        // Round 6's review: a status that took the keyboard's control out of
+        // A status that took the keyboard's control out of
         // view, the list sent back to a place no wheel had put it.
         (closed, at(w444x292, 2), vec![Window((600, 200)), Status]),
         (row, at((600, 200), 1), vec![Window((380, 300)), Status]),
-        // Round 6's review: the keyboard on the row next to the theme in
+        // The keyboard on the row next to the theme in
         // use's before the first frame, which a screen shows with it (R3),
         // under the bar at its least too.
         (row, at(w1284x714, 2), vec![Again]),
         (row, at(w178x348, 1), vec![Status, Text]),
-        // Round 6's review: reaches in windows no rule was tuned on.
+        // Reaches in windows no rule was tuned on.
         (
             drawn,
             at((380, 300), 1),
             vec![Wheel(4), Status, Again, Status, Wheel(-4), Status],
         ),
-        // Round 6's review: the person's own keys, the keyboard left on its
+        // The person's own keys, the keyboard left on its
         // control (R5).
         (filter, at((230, 420), 2), vec![Up]),
         (closed, at(w300x160, 1), vec![Up]),
         (side, at(w444x180, 1), vec![Up, Up]),
         (filter, at(w178x348, 1), vec![Down, Type]),
-        // Round 7's review: the keyboard on a row by the theme in use's
+        // The keyboard on a row by the theme in use's
         // before the first frame, a landing the keyboard's row held off the
         // screen on a frame measured again (R3).
         (
@@ -2183,13 +2183,13 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
         (row_after, at(w178x348, 2), vec![Text]),
         (row_default, at(w444x292, 2), vec![Window((980, 420))]),
         (pack, at((1_440, 900), 2), vec![Text]),
-        // Round 7's review: a status over a row taller than the room, which
+        // A status over a row taller than the room, which
         // the bar at its least shows 64pt of, its words whole (R2).
         (row_after, at(w178x348, 2), vec![Focus, Warning, Status]),
         (row_after, at(w178x348, 2), vec![Warning, Status, Focus]),
         (closed, at(w178x348, 2), vec![Focus, Warning, Status]),
         (closed, at(w178x348, 2), vec![Status, Status]),
-        // Round 8's review: a filter change that held the chrome the short
+        // A filter change that held the chrome the short
         // list of results had chosen, the long list back with less room (R5).
         (
             filter,
@@ -2226,7 +2226,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at(w584x348, 1),
             vec![Down, Type, Window((380, 300)), Erase, Again, Warning],
         ),
-        // Round 8's review: a long name wrapped at 2× text, its row in the
+        // A long name wrapped at 2× text, its row in the
         // list's faded foot, which the code counted shown and the paint did
         // not (R3, R4).
         (latte, at((330, 260), 1), vec![Text, Status]),
@@ -2264,7 +2264,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window(w178x348),
             ],
         ),
-        // Round 8's review: Up on Customize, which the last screen showed
+        // Up on Customize, which the last screen showed
         // cut, scrolled it out of view (R5).
         (closed, at((600, 200), 2), vec![Status, Focus, Up]),
         (
@@ -2272,7 +2272,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at(w444x292, 2),
             vec![Window((600, 200)), Status, Focus, Up],
         ),
-        // Round 8's review: the wheel's place over a re-layout, the filter
+        // The wheel's place over a re-layout, the filter
         // its screen listed (R4).
         (
             filter_tokyo,
@@ -2294,7 +2294,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Warning,
             ],
         ),
-        // Round 8's review: what a view holds past the scenario's opening
+        // What a view holds past the scenario's opening
         // that lays the page out — the Community disclosure Left shuts and
         // Right opens, a draft typed in the sheet's foreground field — which
         // a reach must hold too ([`Held`]).
@@ -2355,7 +2355,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window(w178x348),
             ],
         ),
-        // Round 8's review: a control the room holds, whole on no screen of
+        // A control the room holds, whole on no screen of
         // a list that scrolls by stops — foreground under the caption COLORS
         // repeats over every screen of its rows (R2, R5), and under a status
         // the built-in section's caption over its first theme, a stop grouped

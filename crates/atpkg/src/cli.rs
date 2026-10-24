@@ -64,8 +64,8 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "update",
         tier: Tier::Daily,
-        usage: "aterm pkg update [program] [--retry]  (--retry: try a held-back download again \
-                now)\n\
+        usage: "aterm pkg update [program] [--retry]  (a program not installed is installed; \
+                --retry: try a held-back download again now)\n\
                 aterm pkg update codex --vendor | --alab  — OpenAI's codex here, or back to \
                 ALab's",
         arity: Arity::One {
@@ -115,7 +115,7 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "run",
         tier: Tier::Daily,
-        usage: "aterm pkg run <tool> [args…]",
+        usage: "aterm pkg run <tool> [--] [args…]  — one leading `--` is dropped",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
@@ -175,7 +175,9 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "gc",
         tier: Tier::Occasional,
-        usage: "aterm pkg gc                — reclaim superseded builds",
+        usage: "aterm pkg gc                — reclaim superseded builds (the live build, one \
+                rollback and any build a run holds stay) and what interrupted installs left: \
+                unfinished builds, leftover downloads, unused exec-root copies",
         arity: Arity::None,
         program_flags: None,
         mutates_store: true,
@@ -198,15 +200,15 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "machine",
         tier: Tier::Occasional,
-        usage: "aterm pkg machine                 — the [machine] settings, as the doctor reads \
-                them\n\
-                aterm pkg machine apply           — apply them now: Universal Control off for \
-                this host, Rosetta 2 on Apple silicon, and removes Rust build-cache folders \
-                nothing builds into any more and pinned tools nothing has run for a month\n\
+        usage: "aterm pkg machine                 — (macOS) the [machine] settings, as the \
+                doctor reads them\n\
+                aterm pkg machine apply           — apply them now (by default Universal \
+                Control off for this host, Rosetta 2 on Apple silicon), then reclaim what \
+                `machine cache` lists\n\
                 aterm pkg machine cache           — what the apply would take from the Rust \
                 build cache and the tooling cache, and why; removes nothing\n\
-                aterm pkg machine cache clean     — reclaim unused Rust build cache entries \
-                without applying host settings",
+                aterm pkg machine cache clean     — reclaim only that, without applying host \
+                settings",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
@@ -219,7 +221,8 @@ const TABLE: &[Verb] = &[
         usage: "aterm pkg self-uninstall [--dry-run] [--install-dir <dir>] [--bin-dir <dir>] \
                 [--store-dir <dir>] [--man-root <dir>] [--man <dir>]  — remove what install.sh \
                 placed (the toolchain store, the app, the command links, man pages, \
-                completions, the PATH block), each only when it is aterm's",
+                completions, the PATH block, the Linux desktop entry and its icons), each only \
+                when it is aterm's",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
@@ -304,7 +307,7 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "verify-pkg",
         tier: Tier::Plumbing,
-        usage: "aterm pkg verify-pkg <master-pubkey-b64> <pkg-*.toml> <pkg.sig> \
+        usage: "aterm pkg verify-pkg <master-pubkey-b64> <pkg-*.toml> <pkg-*.toml.sig> \
                 <aterm-machines.toml> <aterm-machines.toml.sig>",
         arity: Arity::Own,
         program_flags: None,
@@ -327,7 +330,7 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "abrew",
         tier: Tier::Daily,
-        usage: "aterm pkg abrew <brew-command> [args…]  — aterm's Homebrew (docs/DESIGN-abrew-2026-10-19.md): \
+        usage: "aterm pkg abrew <brew-command> [args…]  — aterm's Homebrew (`aterm help abrew`): \
                 relocation-free bottles and simple casks natively over abrew's own prefix, the rest delegated to real brew before effects; \
                 abrew bundle lays the bundled Homebrew; abrew on|off toggles the `brew` reroute; \
                 brew --real … runs real Homebrew unchanged",
@@ -341,8 +344,10 @@ const TABLE: &[Verb] = &[
         name: "lane",
         tier: Tier::Plumbing,
         usage: "aterm pkg lane [--cwd <dir>] (-- <command…> | - | --json <field.path>)  — \
-                check one command line for stock Rust: exit 2 with the Trust spelling, 0 when \
-                clean or ATERM_STOCK_REASON='<why>' leads, 1 on unreadable or over-8 MiB input",
+                check one command line for stock Rust: exit 2 with the Trust spelling; 0 when \
+                clean, when ATERM_STOCK_REASON='<why>' leads, or when the --json field is absent \
+                or not a string; 1 on a bad argument, or on stdin that is unreadable, not UTF-8 \
+                (not JSON for --json) or over 8 MiB",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
@@ -830,7 +835,9 @@ fn exit_code_u8(code: ExitCode) -> u8 {
 }
 
 fn cmd_help() -> ExitCode {
-    println!("aterm pkg \u{2014} installs and updates the ALab toolchain");
+    println!(
+        "aterm pkg \u{2014} installs and updates the ALab toolchain and the managed agent CLIs"
+    );
     println!("{}", aterm_types::identity::ORIGIN_LINE);
     println!("usage: aterm pkg <command> [args\u{2026}]");
     print_verb_tiers(&mut std::io::stdout());
@@ -1851,7 +1858,7 @@ fn detach_rustup_seams(layout: &crate::store::Layout) {
 }
 
 fn lay_reroute_stubs(layout: &crate::store::Layout) {
-    // abrew's `brew` stub rides the same seams (docs/DESIGN-abrew-2026-10-19.md §6);
+    // abrew's `brew` stub rides the same seams (docs/DESIGN-abrew-2026-10-19.md §1);
     // `reroute::lay` lays it too, so every spawn seam is covered by this one call.
     if let Err(err) = crate::reroute::lay(layout) {
         eprintln!(
@@ -5700,7 +5707,7 @@ pub const LOCK_WAITING_MARKER: &str = "lock-waiting: ";
 pub const LOCK_ACQUIRED_MARKER: &str = "lock-acquired: ";
 /// The shadow reconcile's answer ([`reconcile_shadowed`]).
 pub const SHADOWED_MARKER: &str = "shadowed: ";
-/// The managed-current answer, printed at the end of every successful update/seed pass.
+/// The managed-current answer, printed late in a whole `update` pass (one an error stopped too), `update <agent>` and `install --default-set` when a managed agent is current; never by `seed`.
 pub const MANAGED_CURRENT_MARKER: &str = "managed-current: ";
 
 /// `machine-settings: universal-control disabled; rosetta installed`.
@@ -10193,8 +10200,8 @@ fn install_toolset(
     let report = crate::gc::run_keeping_pinned_partials(layout, channel.as_ref(), &|p| {
         failures_outcome.resolved_assets.get(p).cloned()
     });
-    print_gc_sweeps("install-default-set", &report);
-    print_gc_abstentions("install-default-set", &report);
+    print_gc_sweeps("install --default-set", &report);
+    print_gc_abstentions("install --default-set", &report);
     (seams.rustup_seam)(layout);
     (seams.shell_hooks)(layout);
     let now = (seams.now)();

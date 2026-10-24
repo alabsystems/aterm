@@ -3122,7 +3122,7 @@ tests/zsh_isearch_band.rs	whole_reads_lay_no_band_on_the_match_row_or_under_zle_
 
 ## 4. Tests that are not spec samples
 
-Status 2026-10-15: the 30 rows marked **deleted** below were removed from the crate (spec recovery plus a skeptic confirmed they sample no property of shipped code). The `web_binding_parity.rs` rows went with the file: the six web binding modules and the shared facade are one source each in `crates/aterm-wasm/src`, which aterm-gpu-web mounts, so the two surfaces cannot drift. On 2026-10-17 the twinkle's photosensitivity bound, constant arithmetic, became two const assertions beside its constants, and its row went.
+Status 2026-10-15: the 30 rows marked **deleted** below were removed from the crate (spec recovery plus a skeptic confirmed they sample no property of shipped code). The `web_binding_parity` rows went with their test file: the six web binding modules and the shared facade are one source each in `crates/aterm-wasm/src`, which aterm-gpu-web mounts, so the two surfaces cannot drift. On 2026-10-17 the twinkle's photosensitivity bound, constant arithmetic, became two const assertions beside its constants, and its row went.
 
 | test | action | why |
 |---|---|---|
@@ -3171,14 +3171,14 @@ Status 2026-10-15: the 30 rows marked **deleted** below were removed from the cr
 | `tests/nova_channel_budget.rs::the_resident_scratch_grows_once_not_every_frame` | **deleted** (was delete) | Exercises a test-local replica of the host scratch. |
 | `tests/ribbon_arrival_conformance.rs::the_2026_09_23_writer_is_caught_on_the_copies_that_stood` | **delete** | Becomes the mutation control of witness-arrival-evidence-refines-model. |
 | `tests/torn_repaint_hidden_caret.rs::a_raw_echo_anchor_spends_a_torn_space_at_the_line_end` | **delete** | Becomes the mutation control of motion-caret-contract (the echo anchor handed over raw). |
-| `tests/web_binding_parity.rs::effects_api_requires_matrix_rain_surface` | **deleted** (was becomes-spec-after-fix) | A symbol floor on another crate's text; single-sourcing makes it a compile error. |
-| `tests/web_binding_parity.rs::effects_api_requires_output_streak_surface` | **deleted** (was becomes-spec-after-fix) | Same as effects_api_requires_matrix_rain_surface. |
-| `tests/web_binding_parity.rs::every_cpu_only_web_binding_module_is_declared` | **deleted** (was delete) | Meta-test of a registry policed by a test. |
-| `tests/web_binding_parity.rs::every_duplicated_web_binding_module_is_covered` | **deleted** (was delete) | Meta-test of the guard's own coverage set. |
-| `tests/web_binding_parity.rs::messages_api_requires_band_surface` | **deleted** (was becomes-spec-after-fix) | Same as effects_api_requires_matrix_rain_surface. |
-| `tests/web_binding_parity.rs::normalizer_does_not_mask_code_drift` | **deleted** (was delete) | Self-tests the test-local normalizer. |
-| `tests/web_binding_parity.rs::production_binding_surface_is_identical` | **deleted** (was becomes-spec-after-fix) | Single-source the shared wasm-bindgen modules so parity holds by construction; until then an aterm-census guard. |
-| `tests/web_binding_parity.rs::wasm_lib_facade_surface_is_mirrored_by_gpu_web` | **deleted** (was becomes-spec-after-fix) | A shared trait both facades implement makes the mirror type-checked. |
+| `web_binding_parity::effects_api_requires_matrix_rain_surface` | **deleted** (was becomes-spec-after-fix) | A symbol floor on another crate's text; single-sourcing makes it a compile error. |
+| `web_binding_parity::effects_api_requires_output_streak_surface` | **deleted** (was becomes-spec-after-fix) | Same as effects_api_requires_matrix_rain_surface. |
+| `web_binding_parity::every_cpu_only_web_binding_module_is_declared` | **deleted** (was delete) | Meta-test of a registry policed by a test. |
+| `web_binding_parity::every_duplicated_web_binding_module_is_covered` | **deleted** (was delete) | Meta-test of the guard's own coverage set. |
+| `web_binding_parity::messages_api_requires_band_surface` | **deleted** (was becomes-spec-after-fix) | Same as effects_api_requires_matrix_rain_surface. |
+| `web_binding_parity::normalizer_does_not_mask_code_drift` | **deleted** (was delete) | Self-tests the test-local normalizer. |
+| `web_binding_parity::production_binding_surface_is_identical` | **deleted** (was becomes-spec-after-fix) | Single-source the shared wasm-bindgen modules so parity holds by construction; until then an aterm-census guard. |
+| `web_binding_parity::wasm_lib_facade_surface_is_mirrored_by_gpu_web` | **deleted** (was becomes-spec-after-fix) | A shared trait both facades implement makes the mirror type-checked. |
 | `tests/wrap_code_reflow.rs::diagnostic_sweep` | **deleted** (was delete) | An #[ignore]d census that prints. |
 
 ## 5. Implied specs that look wrong, or disagree with the code

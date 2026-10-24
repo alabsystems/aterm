@@ -2642,10 +2642,9 @@ mod tests {
         );
     }
 
-    /// THE BAND (R17-HANDOFF-1's review, ruled 2026-10-11). Where the whole
-    /// carry does not fit the old form but would without the directory and
-    /// colours (then the title and mark state), a window before round
-    /// seventeen sent it so shed, and every reader lost the directory.
+    /// THE BAND. Where the whole carry does not fit the old form but would without the
+    /// directory and colours (then the title and mark state), the meta goes packed, not
+    /// shed: every reader keeps the directory, and a newer one the program's region too.
     #[cfg(unix)]
     #[test]
     fn where_only_a_shed_old_form_fit_the_meta_goes_packed_and_whole() {
@@ -2816,9 +2815,10 @@ mod tests {
 
     /// A FULL QUEUE NEVER DROPS A REPLACED REGION'S CUSTODY (R6). The memory shed hands the
     /// keeper a fresh region's only read-only descriptor; a link whose keeper is slow to
-    /// read (paged out under the very pressure being shed) has a full queue, and the
-    /// COMPANION it could not take used to be dropped there (`let _ = link.enqueue(op)`),
-    /// leaving the keeper on the superseded region for good.
+    /// read (paged out under the very pressure being shed) has a full queue, so
+    /// `replace_companion` hands the region back (`CompanionOffer::Busy`) for another
+    /// offer: a COMPANION dropped there would leave the keeper on the superseded region
+    /// for good.
     #[cfg(unix)]
     #[test]
     fn a_full_queue_hands_a_replaced_regions_custody_back_for_another_offer() {

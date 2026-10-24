@@ -4,7 +4,7 @@
 //! Initial configuration ([`SessionSetup`]) passed to a [`Session`] before its loop runs.
 
 use super::*;
-use crate::supervise::occupancy::rules;
+use crate::supervise::occupancy::{due, rules};
 use crate::supervise::tape::header::{Reader, Roots, VERBATIM, Writer};
 
 /// The hosted loop's hand-over flag ([`Session::set_handover`]), as a setup holds it.
@@ -110,6 +110,8 @@ pub struct SessionSetup {
     pub(super) beside_idle_min: Duration,
     /// How old a hold the occupancy door's `wait-nudge` holds from ([`rules::wait_nudge_after_ms`]: the shipped 30 min, or the lab's seam's seconds in a build that reads seams): read once, here, so a tape replays under the wait it was recorded under.
     pub(super) occupancy_nudge_after: Duration,
+    /// How many looks a due line of the door's stands untold before the loop says it ready-idle ([`crate::supervise::occupancy::due::K_LOOKS`]; a test shortens it): read once, here, so a tape replays under the K it was recorded under, and one recorded before the K clock under [`crate::supervise::occupancy::due::K_NEVER`].
+    pub(super) occupancy_k_looks: i64,
 }
 
 impl SessionSetup {
@@ -148,6 +150,7 @@ impl SessionSetup {
             occupancy_nudge_after: Duration::from_millis(
                 rules::wait_nudge_after_ms().unsigned_abs(),
             ),
+            occupancy_k_looks: due::K_LOOKS,
         }
     }
 
@@ -217,6 +220,7 @@ impl SessionSetup {
             person_hold_wait,
             beside_idle_min,
             occupancy_nudge_after,
+            occupancy_k_looks,
         } = self;
         w.section("setup");
         w.opt_text("sid", sid.as_deref());
@@ -310,6 +314,7 @@ impl SessionSetup {
         w.opt_duration("person_hold_wait", *person_hold_wait);
         w.duration("beside_idle_min", *beside_idle_min);
         w.duration("occupancy.nudge_after", *occupancy_nudge_after);
+        w.shown("occupancy.k_looks", occupancy_k_looks);
         let ApprovalEnv {
             home,
             uid,
@@ -431,6 +436,10 @@ impl SessionSetup {
             Duration::from_millis(rules::WAIT_NUDGE_AFTER_MS.unsigned_abs()),
             Reader::duration,
         )?;
+        // A tape without the row was recorded before the loop had a K clock: none of its lines
+        // was ever said ready-idle, so it replays under a K no line reaches.
+        let occupancy_k_looks =
+            r.or_shipped("occupancy.k_looks", due::K_NEVER, Reader::parsed::<i64>)?;
         r.section("env");
         let approval_env = ApprovalEnv {
             home: r.opt_path("home", &VERBATIM)?,
@@ -468,6 +477,7 @@ impl SessionSetup {
             person_hold_wait,
             beside_idle_min,
             occupancy_nudge_after,
+            occupancy_k_looks,
         })
     }
 }

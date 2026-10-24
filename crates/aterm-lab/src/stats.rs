@@ -423,8 +423,8 @@ mod tests {
         assert_eq!(at_path(&j, "rate_limits.five_hour"), "-");
     }
 
-    /// Lines of 2.1.301's debug log (labs `uc0` to `uc3`, 2026-10-16; the
-    /// juniper one as fact (4) quotes it).
+    /// Lines of 2.1.301's debug log (labs `uc0` to `uc3`, and the juniper line a
+    /// five-hour wall's grant read logs).
     #[test]
     fn the_default_debug_lines_are_those_that_name_a_request() {
         let re = aterm_regex::Regex::new(DEBUG_DEFAULT).unwrap();

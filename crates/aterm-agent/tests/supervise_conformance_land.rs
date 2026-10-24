@@ -124,7 +124,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
         worked_doubt: Duration::ZERO,
         record_turn: None,
         credits: None,
-        repo: at.dirty.then(finding),
+        repo: aterm_agent::harness::repo_work::RepoRead::of_found(at.dirty.then(finding)),
         fact: None,
     }
 }

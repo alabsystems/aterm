@@ -32,7 +32,8 @@ USAGE
       aterm while the long steps run, and waited on at the publish. Ends in one
       line: RELEASED …, or REFUSED at <step>: <why> — <what is public>. <remedy>.
       Exit 0 released, prepared, or a dry run with nothing refused · 1 refused ·
-      2 usage · 3 a resumable stop (run it again) · 130 interrupted.
+      2 usage, or no checkout, HOME or log directory to run in · 3 a resumable
+      stop (run it again) · 130 interrupted.
         --bump             commit the next MINOR on origin/main's tip, push it,
                            release it
         --commit REV       release this commit of origin/main; replaces, out
@@ -65,10 +66,12 @@ USAGE
   targo --unverified ship build
       The one build of a release bundle: both slices at once from a snapshot of
       the commit's git objects (the x86_64 slice run under Rosetta), laid out
-      unsigned in the release cache — or found there, its bytes re-proved. `ship
-      release` runs it for the build its journal reserved. With no release in
-      progress it builds HEAD under a provisional number (max(HEAD's ledger tail
-      + 1, now), claimed nowhere) and prints the .app for `verify measure --app`.
+      unsigned in the release cache — or found there, its bytes re-proved. The
+      slices build one after the other when their last recorded memory peaks
+      would not fit in three quarters of this Mac's memory. `ship release` runs
+      it for the build its journal reserved. With no release in progress it
+      builds HEAD under a provisional number (max(HEAD's ledger tail + 1, now),
+      claimed nowhere) and prints the .app for `verify measure --app`.
 
   targo --unverified ship linux-build --version X.Y.Z --build-number N
                  --commit FULL-CLAIM-SHA --out EXISTING-PRIVATE-DIRECTORY
@@ -142,7 +145,8 @@ USAGE
                            phrase, typed once, is the only input, and a roster id
                            is never spent on a machine that cannot release. A
                            provisioned machine is audited, never re-minted. Ends
-                           READY TO CUT
+                           READY TO CUT (ROSTERED on a host that cannot cut,
+                           such as a non-Mac)
         --cert-dir <folder>
                            the one visible folder the Apple certificate errand
                            may use: the request is copied there and the issued
@@ -152,8 +156,9 @@ USAGE
         --check            audit only: nothing provisioned, minted or written;
                            exits non-zero while anything is open
 
-  targo --unverified ship status        version · next cut · ledger tail · journaled
-                           cut · newest published build · dangling claims
+  targo --unverified ship status        what a cut signs with · version · next cut ·
+                           ledger tail · journaled cut · newest published build ·
+                           dangling claims
   targo --unverified ship check [--commit REV] [--engine DIRECTORY]
                  [--cut] [--export] [--wasm32]
                            would a release of REV (default HEAD) pass? Read-only;
@@ -173,20 +178,22 @@ USAGE
                            $PUBLICATION_ENGINE, else ~/publication), gitleaks,
                            and rustup's `trust` toolchain
         --wasm32           publish/config.sh's wasm32 clause, on its stock pin,
-                           over the export
-      Exits 0 READY, 1 a gate would refuse, 2 REV names no release, 3 a gate
-      could not run (each line names its fix), 130 interrupted
+                           over the export when --export judged one, else over
+                           REV's own tree
+      Exits 0 READY, 1 a gate would refuse, 2 no checkout or REV names no
+      release, 3 a gate could not run (each line names its fix), 130 interrupted
   targo --unverified ship trust run (-p <crate>... | --whole-tree | --remeasure)
         [--jobs N|auto] [--target-root DIR] [--crate-budget SECONDS] [--prover BIN-DIR]
         [--update-ratchet] [--try-refused] [--obligations] [--stop-if-narrowed]
                            the Trust lane: `targo trust check -p <lib> --lib
                            --allow-l0-gaps` over the named libraries (-p <lib>
-                           also selects its feature rows, such as
-                           aterm-link+sealed), every workspace library and
-                           vendored fork (--whole-tree), or what this tree's
-                           stored facts left undecided (--remeasure). Each check
-                           runs in its own slot (--jobs; default sized from cores
-                           and memory) under --target-root (default
+                           also selects its <lib>+<feature> rows, one for each
+                           non-default feature that turns on a vendored fork),
+                           every workspace library and vendored fork
+                           (--whole-tree), or what this tree's stored facts
+                           left undecided (--remeasure). Each check runs in its
+                           own slot (--jobs; default sized from cores and
+                           memory) under --target-root (default
                            <repo>/target-trust.noindex, else a per-user cache
                            directory), is ended OVER-BUDGET at --crate-budget
                            (default 21600 s), and is held to

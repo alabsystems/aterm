@@ -81,7 +81,8 @@ fn sources<'a>(nsswitch: &'a str, database: &str) -> Option<Vec<&'a str>> {
 }
 
 impl Accounts {
-    /// Whether `nsswitch` leaves `passwd` and `group` to files and lists `systemd` beside them.
+    /// Whether `nsswitch` leaves `passwd` and `group` to files, and whether it lists `systemd`
+    /// beside them.
     #[must_use]
     pub fn files_answer(nsswitch: Option<&str>) -> Option<bool> {
         let mut systemd = false;

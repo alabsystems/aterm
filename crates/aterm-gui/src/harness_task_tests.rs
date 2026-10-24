@@ -677,7 +677,7 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         worked_doubt: Duration::ZERO,
         record_turn: None,
         credits: None,
-        repo: None,
+        repo: aterm_agent::harness::repo_work::RepoRead::Clean,
         login_screen: None,
         login_interrupted: false,
         login_at_wall: None,

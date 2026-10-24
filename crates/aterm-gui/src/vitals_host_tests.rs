@@ -1592,11 +1592,14 @@ fn feed(app: &crate::App, bytes: &[u8]) {
     feed_tab(app, 0, bytes);
 }
 
+/// Feeds `bytes` to tab `tab`'s engine as its PTY reader does, counting the move and feeding the jobs feed.
 fn feed_tab(app: &crate::App, tab: u64, bytes: &[u8]) {
     let s = app.pool.get(tab).expect("the tab");
+    s.ctx.job_feed.read(bytes);
     let mut t = s.term.lock().unwrap_or_else(PoisonError::into_inner);
     t.process(bytes);
-    s.ctx.screen_moves.fed(crate::control::screen_gen(&t));
+    let moved = s.ctx.screen_moves.fed(crate::control::screen_gen(&t));
+    s.ctx.job_feed.fed(&t, bytes, moved, Instant::now);
 }
 
 const MUSE_RESET: &[u8] = b"\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[5;3H";
@@ -2133,7 +2136,13 @@ fn engine_reads(
     seq: u64,
 ) {
     let sweep = aterm_sysprobe::processes().expect("this machine's process table");
-    let jobs = jobs_step(pass, at_ms, Some(&sweep.procs), req, false);
+    let jobs = jobs_step(
+        pass,
+        &req.tab_reads(epoch_of(at_ms), Instant::now),
+        Some(&sweep.procs),
+        req,
+        false,
+    );
     let snap = Arc::new(Snapshot {
         seq,
         jobs,
@@ -2145,6 +2154,13 @@ fn engine_reads(
         req.ttys.iter().map(TtyWord::seen).collect(),
         Instant::now(),
     );
+}
+
+/// The probe thread's zero that puts now at `at_ms` on its clock, which the request's feeds are read against.
+#[cfg(target_os = "macos")]
+fn epoch_of(at_ms: u64) -> Instant {
+    let now = Instant::now();
+    now.checked_sub(Duration::from_millis(at_ms)).unwrap_or(now)
 }
 
 /// The wait the held view names for tab 0's job, and its demand.
@@ -2387,7 +2403,13 @@ fn the_thread_hands_back_the_words_it_read_with_and_the_loop_parks_from_them() {
             let at_ms = 1_000 + u64::try_from(self.t0.elapsed().as_millis()).unwrap_or(0);
             Snapshot {
                 seq: self.seq,
-                jobs: jobs_step(&mut self.pass, at_ms, Some(&sweep.procs), req, false),
+                jobs: jobs_step(
+                    &mut self.pass,
+                    &req.tab_reads(epoch_of(at_ms), Instant::now),
+                    Some(&sweep.procs),
+                    req,
+                    false,
+                ),
                 ..Snapshot::default()
             }
         }
@@ -2553,9 +2575,10 @@ fn a_canonical_job_at_rest_is_still_read_at_the_engines_cadence() {
     );
 }
 
-/// THE WORD'S FRESHNESS (§6.6): read through the sink, it holds for the
-/// engine until the session's next output, and is stamped at the tick that
-/// uses it.
+/// THE WORD'S FRESHNESS (§6.6): read through the sink, it is stamped newer
+/// than every output until the session's next output, then stamped 0 (its
+/// mode still holds, but it names no wait), and a key unread yields no
+/// word.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_terminal_word_holds_until_output_and_never_over_an_unread_key() {
@@ -2594,12 +2617,17 @@ fn a_terminal_word_holds_until_output_and_never_over_an_unread_key() {
     let word = TtyWord::read(3, &sink, &output).expect("a terminal's word");
     assert_eq!((word.key, word.canonical, word.echo), (3, false, false));
     assert_eq!(
-        word.current(40)
+        word.current()
             .map(|(key, m)| (key, m.canonical, m.echo, m.stamped_ms)),
-        Some((3, false, false, 40))
+        Some((3, false, false, u64::MAX))
     );
     output.fed(drawn(6));
-    assert_eq!(word.current(41), None, "output since the read: no word");
+    assert_eq!(
+        word.current()
+            .map(|(key, m)| (key, m.canonical, m.echo, m.stamped_ms)),
+        Some((3, false, false, 0)),
+        "output since the read: the mode holds, stamped too old to name a wait"
+    );
 
     // SAFETY: Writes one byte of a local buffer to this test's master.
     let n = unsafe { libc::write(job.master(), b"x".as_ptr().cast(), 1) };
@@ -2662,11 +2690,123 @@ fn the_readers_whole_reading_names_a_raw_program_from_the_loops_word() {
     assert_eq!(read_wait(&req), (Some(WaitName::Unnamed), Demand::Fast));
 }
 
+/// A line `ping` prints, fed on a terminal holding no block.
+#[cfg(target_os = "macos")]
+const PING_LINE: &[u8] = b"64 bytes from 127.0.0.1: icmp_seq=1\r\n";
+
+/// THE PASS READS EACH TAB'S FEED ON THE PROBE THREAD'S CLOCK (system-awareness §6.6, P2a): a
+/// line the tab printed between two passes is its foreground job's progress: the job runs for 5 s
+/// after it, then is quiet only since it. Before the feed reached the engine a `ping` printing
+/// every 5 s read quiet from the pass that found it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_line_the_tab_printed_between_passes_is_its_jobs_progress() {
+    use aterm_vitals::jobs::Verdict;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let job = JobAtRest::new(false);
+    let (app, _rx) = job.app(&BOARD);
+    let mut req = app.vitals_request(Duration::ZERO, false);
+    req.jobs_now = true;
+    let epoch = Instant::now();
+    let ms = |ms| epoch + Duration::from_millis(ms);
+    let sweep = aterm_sysprobe::processes().expect("this machine's process table");
+    let mut pass = crate::vitals_jobs::JobsPass::new();
+    let mut quiet = |at_ms| {
+        let view = jobs_step(
+            &mut pass,
+            &req.tab_reads(epoch, || ms(at_ms)),
+            Some(&sweep.procs),
+            &req,
+            false,
+        )
+        .expect("a jobs view");
+        view.rows
+            .iter()
+            .find(|r| r.tab == 0 && r.verdict != Verdict::Exited)
+            .and_then(|r| r.quiet_ms)
+    };
+    let line = |at_ms| {
+        app.pool.get(0).expect("tab 0").ctx.job_feed.fed(
+            &aterm_core::terminal::Terminal::new(24, 80),
+            PING_LINE,
+            true,
+            || ms(at_ms),
+        );
+    };
+    assert_eq!(quiet(1_000), Some(0), "found at rest");
+    line(5_000);
+    assert_eq!(quiet(8_000), None, "running: the line is 3 s old");
+    assert_eq!(quiet(12_000), Some(7_000), "quiet since the line");
+}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// What [`MID_SWEEP`]'s sweep does before it sweeps, once.
+    static AT_SWEEP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The kernel's probe, with a sweep that first runs [`AT_SWEEP`]'s hook.
+#[cfg(target_os = "macos")]
+const MID_SWEEP: CoalProbe = CoalProbe {
+    sweep: |opts, ids| {
+        if let Some(hook) = AT_SWEEP.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+        aterm_sysprobe::processes_keeping(opts, ids)
+    },
+    ..CoalProbe::KERNEL
+};
+
+/// A READING TAKES ITS TABS BEFORE ITS SWEEP (system-awareness §6.6): what a tab's reader reads
+/// while the sweep runs is the next reading's. So a `D` and the exit of the command it closes,
+/// read during a sweep that still saw the command, never meet in one pass as a closed block over
+/// a live member (a false orphan), and a line printed then counts at the next reading, never at
+/// none.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_reading_takes_its_tabs_before_its_sweep() {
+    use aterm_vitals::jobs::Verdict;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let job = JobAtRest::new(false);
+    let (app, _rx) = job.app(&BOARD);
+    let mut req = app.vitals_request(Duration::ZERO, false);
+    req.jobs_now = true;
+    let mut reader = Reader::new(Arc::default());
+    reader.split = SplitReader::new(MID_SWEEP, Box::leak(Box::new(Arming::new())));
+    let mut quiet = || {
+        let view = reader.read(&req).jobs.expect("a jobs view");
+        view.rows
+            .iter()
+            .find(|r| r.tab == 0 && r.verdict != Verdict::Exited)
+            .map(|r| r.quiet_ms.is_some())
+    };
+    assert_eq!(quiet(), Some(true), "found at rest");
+    let feed = Arc::clone(&app.pool.get(0).expect("tab 0").ctx.job_feed);
+    AT_SWEEP.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move || {
+            feed.fed(
+                &aterm_core::terminal::Terminal::new(24, 80),
+                PING_LINE,
+                true,
+                Instant::now,
+            );
+        }));
+    });
+    assert_eq!(
+        quiet(),
+        Some(true),
+        "the line came after the tabs were read"
+    );
+    assert_eq!(quiet(), Some(false), "the next reading's progress");
+}
+
 /// A WRITE THAT MOVES NO CELL LEAVES THE WORD STANDING (`docs/measured/vitals-3-2026-10-22.md`,
 /// V1): Muse Code at rest writes a colour reset every ~9 s a tab, and the output stamp moves with
 /// it. A word voided by it would name the raw program's wait `unnamed` and ask the next reading in
 /// 2 s (`Demand::Fast`), keeping `system_vitals` armed at rest; the word follows the reader's
-/// moving feeds instead, so three resets leave it standing and a write that draws voids it.
+/// moving feeds instead, so three resets leave it standing and a write that draws leaves it no
+/// wait to name.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_write_that_moves_no_cell_leaves_the_word_standing() {
@@ -2694,7 +2834,7 @@ fn a_write_that_moves_no_cell_leaves_the_word_standing() {
     assert_eq!(
         read_wait(&req),
         (Some(WaitName::Unnamed), Demand::Fast),
-        "a write that drew: the word is void"
+        "a write that drew: the word names no wait"
     );
 }
 
@@ -2711,7 +2851,7 @@ fn a_key_driven_after_the_word_was_read_voids_it_for_a_pull() {
     let job = JobAtRest::new(true);
     let (app, _rx) = job.app(&BOARD);
     let held = app.vitals_request(Duration::ZERO, false);
-    assert!(held.ttys[0].current(1).is_some(), "the word holds");
+    assert!(held.ttys[0].current().is_some(), "the word holds");
     assert_eq!(read_wait(&held), (Some(WaitName::TtyRaw), Demand::Idle));
     let sink = Arc::clone(&app.pool.get(0).expect("tab 0").ctx.sink);
     assert_eq!(sink.write_frame(b"k").expect("typed"), 1);
@@ -2721,12 +2861,13 @@ fn a_key_driven_after_the_word_was_read_voids_it_for_a_pull() {
         || aterm_pty::input_queue_len(job.master()).filter(|n| *n > 0),
     )
     .expect("the key waits unread");
-    assert_eq!(held.ttys[0].current(2), None, "a key since: no word");
+    assert_eq!(held.ttys[0].current(), None, "a key since: no word");
     assert_eq!(read_wait(&held), (Some(WaitName::Unnamed), Demand::Fast));
 }
 
 /// THE WORD TAKES ITS STAMPS BEFORE IT READS THE TERMINAL (§6.6): output
-/// that lands between them and the `tcgetattr` leaves the word unused.
+/// that lands between them and the `tcgetattr` leaves the word its mode but
+/// stamps it before all output, so it names no wait.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_word_takes_its_stamps_before_it_reads_the_terminal() {
@@ -2738,10 +2879,15 @@ fn the_word_takes_its_stamps_before_it_reads_the_terminal() {
         output.fed(drawn(6));
     })
     .expect("a terminal's word");
-    assert_eq!(word.current(9), None, "output mid-read: unused");
+    let stamp = |w: &TtyWord| w.current().map(|(_, m)| m.stamped_ms);
+    assert_eq!(stamp(&word), Some(0), "output mid-read: no wait from it");
     output.fed(drawn(7));
     let word = TtyWord::read_seamed(3, &sink, &output, || {}).expect("a terminal's word");
-    assert!(word.current(9).is_some(), "output before the read: its own");
+    assert_eq!(
+        stamp(&word),
+        Some(u64::MAX),
+        "output before the read: newer than all of it"
+    );
 }
 
 #[test]

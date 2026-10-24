@@ -791,8 +791,9 @@ pub(crate) fn pm_settled(runtime_status: &str, control: &str, boot_vga: &str) ->
     runtime_status == "unsupported" || control == "on" || boot_vga == "1"
 }
 
-/// The owner of a `/proc/<pid>` entry: the process's user (its effective
-/// uid while it is dumpable).
+/// The owner of a `/proc/<pid>` directory: the process's user (its effective
+/// uid, dumpable or not: the kernel gives root a non-dumpable process's files
+/// inside the directory, never the directory itself).
 fn owner(entry: &std::fs::DirEntry) -> Option<u32> {
     #[cfg(unix)]
     {

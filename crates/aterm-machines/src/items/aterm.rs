@@ -467,7 +467,6 @@ impl Item for Cli {
     }
 
     fn after(&self) -> Vec<String> {
-        // Distinct branch.
         if self.toolset {
             vec!["aterm.app".into(), "developer.command-line-tools".into()]
         } else {

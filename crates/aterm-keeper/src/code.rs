@@ -62,7 +62,7 @@ pub fn origin_exe(from_copy: bool) -> Option<PathBuf> {
     }
 }
 
-/// Copy `exe`'s code into `dir` ([`ORIGIN_ENV`]).
+/// Copy `exe`'s code into `dir` and re-execute from it with [`ORIGIN_ENV`] naming `exe`.
 #[must_use]
 pub fn run_from_own_copy(exe: &Path, dir: &Path, identity: &Identity) -> String {
     let copy = match copy_own_code(exe, dir, identity) {
@@ -164,7 +164,7 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     }
 }
 
-/// Become `copy` ([`ORIGIN_ENV`]).
+/// Become `copy`, with [`ORIGIN_ENV`] naming `origin`.
 fn reexec(copy: &Path, origin: &Path) -> io::Error {
     let mut args = std::env::args_os();
     let mut cmd = aterm_uds::spawnfd::command(copy);

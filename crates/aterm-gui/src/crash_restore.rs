@@ -94,9 +94,9 @@ fn scratch_engine(
 pub(crate) enum Rung {
     /// The screen, modes and parser carry exactly as the dead window had them, every byte it read replayed (no size pulse for a main-screen session).
     Exact,
-    /// A screen from the region with a loss counted (a keyframe alone, an overflowed tail, a byte read and never processed, a resize or a mark the tail missed, a kitty image command in the tail, a tail recorded under another config, a region the memory shed had superseded when the window died): the program is pulsed to redraw over it.
+    /// A screen from the region with a loss counted (a keyframe alone, an overflowed tail, a byte read and never processed, a resize or a mark the tail missed, a kitty image command in the tail, a tail recorded under another config, a region the memory shed had superseded when the window died, or any other loss `first_loss` names): the program is pulsed to redraw over it.
     Screen,
-    /// No screen: a blank one carrying the keeper's META scalars, as before the journal (no region, a refused one, a second failed restore, a panic).
+    /// No screen: a blank one carrying the keeper's META scalars (no region, a refused one or one without a keyframe, a second failed restore, a panic, a screen past the cell budget).
     Meta,
 }
 
@@ -641,7 +641,7 @@ fn writer_identity(id: u64, sid: &str, birth_us: u64) -> WriterIdentity<'_> {
     }
 }
 
-/// One session's journal (module doc).
+/// One session's crash-restore journal: its shared region (keyframes, tail, control slot, history ring), its writer, and the custody the keeper is handed.
 #[cfg(unix)]
 pub(crate) struct SessionJournal {
     store: Store,
@@ -843,7 +843,7 @@ impl SessionJournal {
         }
     }
 
-    /// The custody descriptor and the region's length, for the session's registration (once).
+    /// The session's custody was registered with the keeper link.
     pub(crate) fn note_custody_registered(&self) {
         self.turn_ids
             .lock()
@@ -872,6 +872,7 @@ impl SessionJournal {
         })
     }
 
+    /// The custody descriptor and the region's length, for the session's registration (once).
     pub(crate) fn take_custody_with_receipt(&self) -> Option<JournalCustody> {
         if self.broken.get().is_some() {
             return None;
@@ -2555,7 +2556,7 @@ impl HistoryWorker {
                     Err(e) => {
                         aterm_log::warn!(
                             "crash restore: the journal worker could not start ({e}); a crash \
-                             restores screens without their scrollback"
+                             restores screens without their scrollback or a current turn ledger"
                         );
                         None
                     }

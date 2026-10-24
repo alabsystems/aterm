@@ -467,7 +467,7 @@ mod tests {
                 Some(home.path()),
                 Some(state.path())
             ),
-            None
+            aterm_agent::harness::repo_work::RepoRead::Clean
         );
         let elsewhere = aterm_tempfile::tempdir().expect("tmp");
         dirty(elsewhere.path());
@@ -477,7 +477,7 @@ mod tests {
             Some(home.path()),
             Some(state.path()),
         );
-        assert!(found.is_some_and(|w| w.untracked == 1));
+        assert!(found.found().is_some_and(|w| w.untracked == 1));
     }
 
     #[test]

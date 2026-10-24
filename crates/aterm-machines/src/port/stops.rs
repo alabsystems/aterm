@@ -10,6 +10,7 @@ const STOPS: [c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
 static CAUGHT: AtomicI32 = AtomicI32::new(0);
 
+/// The handler: keep the first signal, nothing else (async-signal-safe).
 extern "C" fn note(sig: c_int) {
     let _ = CAUGHT.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
 }

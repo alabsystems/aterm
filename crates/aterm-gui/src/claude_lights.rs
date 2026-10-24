@@ -6407,9 +6407,8 @@ mod gesture_tests {
         feed(app, session, screen.as_bytes());
     }
 
-    /// NO SELECTION NOBODY CAN SEE (the review of 2026-09-27): the keyboard
-    /// selects only a chip the pane has ROOM for, the reveal giving way
-    /// first.
+    /// NO SELECTION NOBODY CAN SEE: the keyboard selects only a chip the pane
+    /// has ROOM for, the reveal giving way first.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_keyboard_never_selects_a_chip_the_pane_has_no_room_for() {

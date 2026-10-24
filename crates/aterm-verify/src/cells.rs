@@ -196,7 +196,7 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
         ctx.env.cargo_home.as_deref().map(Path::as_os_str),
         Some(ctx.env.home.as_os_str()),
     );
-    let mut members: Option<Result<BTreeSet<String>, String>> = None;
+    let mut members: Option<Result<Members, String>> = None;
     for cell in &cells {
         let label = format!("cell {} ({})", cell.name, cell.triple);
         let started = Instant::now();
@@ -353,7 +353,7 @@ fn win32_oracles(ctx: &Ctx, r: &mut Report, have_rustup: bool) {
 fn audit_policy(ctx: &Ctx, r: &mut Report, policy: &[Shim], ran: &[Cell]) {
     let all = aterm_forge::resolve::default_cells();
     let mut graphs: BTreeMap<String, Result<(Graph, BTreeSet<PkgId>), String>> = BTreeMap::new();
-    let mut members: Option<Result<BTreeSet<String>, String>> = None;
+    let mut members: Option<Result<Members, String>> = None;
     let mut unread = false;
     for shim in policy
         .iter()
@@ -371,7 +371,11 @@ fn audit_policy(ctx: &Ctx, r: &mut Report, policy: &[Shim], ran: &[Cell]) {
             continue;
         }
         let graph = graphs.entry(cell.name.clone()).or_insert_with(|| {
-            graph_of(ctx, cell).map(|(g, paths)| {
+            let extra = members
+                .get_or_insert_with(|| member_names(ctx))
+                .clone()?
+                .roots_of(cell);
+            graph_of(ctx, cell, &extra).map(|(g, paths)| {
                 let library = library_nodes(ctx, &g, &paths);
                 (g, library)
             })
@@ -385,7 +389,7 @@ fn audit_policy(ctx: &Ctx, r: &mut Report, policy: &[Shim], ran: &[Cell]) {
                 let tests = members
                     .get_or_insert_with(|| member_names(ctx))
                     .clone()
-                    .and_then(|m| test_graph(ctx, cell, &m, &names));
+                    .and_then(|m| test_graph(ctx, cell, &m.names, &names));
                 match tests {
                     Ok(t) => {
                         if let Some(why) = dead_shim(shim, library, &t.nodes) {
@@ -654,14 +658,59 @@ fn library_nodes(ctx: &Ctx, graph: &Graph, paths: &BTreeMap<PkgId, PathBuf>) -> 
 }
 
 /// One cell's graph from forge's own resolver, asking this run's targo, under
-/// the run's ceiling.
-fn graph_of(ctx: &Ctx, cell: &Cell) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), String> {
-    let (cargo, root, owned) = (ctx.forge_cargo(), ctx.root.clone(), cell.clone());
+/// the run's ceiling: its root package's, with each of `extra`'s joined on
+/// ([`resolve_roots`]).
+fn graph_of(
+    ctx: &Ctx,
+    cell: &Cell,
+    extra: &[String],
+) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), String> {
+    let (cargo, root, owned, extra) = (
+        ctx.forge_cargo(),
+        ctx.root.clone(),
+        cell.clone(),
+        extra.to_vec(),
+    );
     crate::exec::bounded(ctx.child_ceiling, move || {
         let mut log = String::new();
-        aterm_forge::resolve::graph_and_paths(&cargo, &root, &owned, &mut log)
+        resolve_roots(&cargo, &root, &owned, &extra, &mut log)
     })
     .unwrap_or_else(|why| Err(format!("`targo tree` {}", why.sentence())))
+}
+
+/// `cell`'s graph with every `extra` root's joined on: forge resolves each
+/// root's normal-edge graph for the cell's triple, and each extra root hangs
+/// off the cell's root as though the root depended on it, so the host side
+/// ([`host_side`]) and the lint's library are judged from the one root.
+///
+/// # Errors
+/// A root forge could not resolve.
+pub fn resolve_roots(
+    cargo: &aterm_forge::resolve::Cargo,
+    root: &Path,
+    cell: &Cell,
+    extra: &[String],
+    log: &mut String,
+) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), String> {
+    let (mut graph, mut paths) = aterm_forge::resolve::graph_and_paths(cargo, root, cell, log)?;
+    for package in extra {
+        let one = Cell {
+            package: package.clone(),
+            ..cell.clone()
+        };
+        let (more, more_paths) = aterm_forge::resolve::graph_and_paths(cargo, root, &one, log)?;
+        graph
+            .edges
+            .entry(graph.root.clone())
+            .or_default()
+            .insert(more.root.clone());
+        graph.nodes.extend(more.nodes);
+        for (from, to) in more.edges {
+            graph.edges.entry(from).or_default().extend(to);
+        }
+        paths.extend(more_paths);
+    }
+    Ok((graph, paths))
 }
 
 /// One cell, end to end: its graph, its shims, its toolchain, the lint of
@@ -671,7 +720,7 @@ fn check_cell(
     rustup: &Path,
     cell: &Cell,
     policy: &[Shim],
-    members: &mut Option<Result<BTreeSet<String>, String>>,
+    members: &mut Option<Result<Members, String>>,
 ) -> CellOutcome {
     let failed = |status: &str, detail: Vec<String>| CellOutcome::Failed {
         status: status.to_string(),
@@ -681,7 +730,12 @@ fn check_cell(
         status: status.to_string(),
         detail,
     };
-    let (graph, paths) = match graph_of(ctx, cell) {
+    let members = match members.get_or_insert_with(|| member_names(ctx)) {
+        Ok(m) => &*m,
+        Err(e) => return could_not("NO-MEMBERS", vec![e.clone()]),
+    };
+    let extra = members.roots_of(cell);
+    let (graph, paths) = match graph_of(ctx, cell, &extra) {
         Ok(g) => g,
         Err(e) => return could_not("UNRESOLVED", vec![e]),
     };
@@ -715,12 +769,7 @@ fn check_cell(
     let tests = if cell.triple.starts_with("wasm32") {
         None
     } else {
-        let members = members.get_or_insert_with(|| member_names(ctx));
-        let members = match members {
-            Ok(m) => m,
-            Err(e) => return could_not("NO-MEMBERS", vec![e.clone()]),
-        };
-        match test_graph(ctx, cell, members, &graph_names) {
+        match test_graph(ctx, cell, &members.names, &graph_names) {
             Ok(t) => Some(t),
             Err(e) => return could_not("NO-TEST-GRAPH", vec![e]),
         }
@@ -778,7 +827,7 @@ fn check_cell(
         shim_args: &shim_args,
     };
 
-    let lint = exec::run(&cargo.lint(cell), ctx.exec_env());
+    let lint = exec::run(&cargo.lint(cell, &extra), ctx.exec_env());
     let mut red = Red::default();
     let read = match read_cargo_run(&lint, &cell.triple, &graph_names, false, &mut red) {
         Ok(read) => read,
@@ -819,6 +868,13 @@ fn check_cell(
         toolchain.name,
         not_owed_note(&proc_macros, &host_deps)
     );
+    if !extra.is_empty() {
+        summary.push_str(&format!(
+            ", roots {} and {} ({CELLS_KEY})",
+            cell.package,
+            extra.join(", ")
+        ));
+    }
     if !shimmed.is_empty() {
         summary.push_str(&format!(", shimmed (not linked): {}", shimmed.join(", ")));
     }
@@ -1030,15 +1086,13 @@ impl CellCargo<'_> {
         cmd
     }
 
-    /// The lint of the cell's root package: of clippy, only the `clippy.toml`
-    /// bans (every other clippy lint is the host's), the browser cells with
-    /// their own clock-only config; rustc's own warnings are read from the
-    /// stream ([`is_cell_warning`]).
-    fn lint(&self, cell: &Cell) -> Cmd {
-        let mut cmd = self
-            .base("clippy")
-            .args(["-p", cell.package.as_str(), "--"])
-            .args(lint_flags(self.triple));
+    /// The lint of the cell's root package and its `extra` roots: of clippy,
+    /// only the `clippy.toml` bans (every other clippy lint is the host's), the
+    /// browser cells with their own clock-only config; rustc's own warnings are
+    /// read from the stream ([`is_cell_warning`]).
+    fn lint(&self, cell: &Cell, extra: &[String]) -> Cmd {
+        let mut cmd = self.base("clippy").args(lint_packages(cell, extra));
+        cmd = cmd.arg("--").args(lint_flags(self.triple));
         if self.triple.starts_with("wasm32") {
             cmd = cmd.env("CLIPPY_CONF_DIR", self.ctx.root.join(WASM_CLIPPY_CONF));
         }
@@ -1081,9 +1135,48 @@ pub fn lint_flags(triple: &str) -> &'static [&'static str] {
     }
 }
 
-/// The workspace member names, from `targo metadata --no-deps` (the NAME,
-/// which `--exclude` takes, is not always the directory).
-fn member_names(ctx: &Ctx) -> Result<BTreeSet<String>, String> {
+/// The `-p` arguments of a cell's lint: its root package, then each extra root.
+#[must_use]
+pub fn lint_packages(cell: &Cell, extra: &[String]) -> Vec<String> {
+    std::iter::once(&cell.package)
+        .chain(extra)
+        .flat_map(|p| ["-p".to_string(), p.clone()])
+        .collect()
+}
+
+/// Where a member names the cells it ships for outside their root packages'
+/// graphs (the Linux lane's guest agent, which nothing in `aterm` depends on):
+/// `[package.metadata.aterm] cells = ["linux-arm"]`. Each cell it names lints
+/// it and type-checks its targets beside the cell's root.
+pub const CELLS_KEY: &str = "[package.metadata.aterm] cells";
+
+/// The workspace's members, from `targo metadata --no-deps`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Members {
+    /// Every member's name (the NAME, which `--exclude` takes, is not always
+    /// the directory).
+    pub names: BTreeSet<String>,
+    /// Each cell's extra roots: the members whose manifests name it under
+    /// [`CELLS_KEY`].
+    pub roots: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Members {
+    /// The members `cell` checks beside its root package, in name order.
+    #[must_use]
+    pub fn roots_of(&self, cell: &Cell) -> Vec<String> {
+        self.roots
+            .get(&cell.name)
+            .into_iter()
+            .flatten()
+            .filter(|name| **name != cell.package)
+            .cloned()
+            .collect()
+    }
+}
+
+/// The workspace's members, from `targo metadata --no-deps`.
+fn member_names(ctx: &Ctx) -> Result<Members, String> {
     let out = aterm_uds::spawnfd::command(&ctx.tools.targo)
         .args([
             "metadata",
@@ -1103,28 +1196,69 @@ fn member_names(ctx: &Ctx) -> Result<BTreeSet<String>, String> {
             String::from_utf8_lossy(&out.stderr).trim_end()
         ));
     }
-    parse_member_names(&String::from_utf8_lossy(&out.stdout))
+    parse_members(
+        &String::from_utf8_lossy(&out.stdout),
+        &aterm_forge::resolve::default_cells(),
+    )
 }
 
-/// The package names in `cargo metadata --no-deps` JSON.
+/// The members in `cargo metadata --no-deps` JSON: their names, and the cells
+/// each names under [`CELLS_KEY`], every one of which must be one of `cells`.
 ///
 /// # Errors
-/// Not JSON, or no `packages`.
-pub fn parse_member_names(json: &str) -> Result<BTreeSet<String>, String> {
+/// Not JSON, no `packages`, or a member's [`CELLS_KEY`] that is not a list of
+/// `cells`' names.
+pub fn parse_members(json: &str, cells: &[Cell]) -> Result<Members, String> {
     let value = aterm_json::from_str::<aterm_json::Value>(json)
         .map_err(|e| format!("`targo metadata --no-deps` did not print JSON: {e}"))?;
-    let names: BTreeSet<String> = value
+    let mut members = Members::default();
+    let packages = value
         .get("packages")
         .and_then(aterm_json::Value::as_array)
         .into_iter()
-        .flatten()
-        .filter_map(|p| p.get("name").and_then(aterm_json::Value::as_str))
-        .map(str::to_string)
-        .collect();
-    if names.is_empty() {
+        .flatten();
+    for package in packages {
+        let Some(name) = package.get("name").and_then(aterm_json::Value::as_str) else {
+            continue;
+        };
+        members.names.insert(name.to_string());
+        let Some(named) = package.pointer("/metadata/aterm/cells") else {
+            continue;
+        };
+        let known = || {
+            cells
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let list = named.as_array().ok_or_else(|| {
+            format!(
+                "`{name}`'s {CELLS_KEY} is not a list of cell names ({})",
+                known()
+            )
+        })?;
+        for cell in list {
+            let cell = cell
+                .as_str()
+                .filter(|c| cells.iter().any(|known| known.name == *c))
+                .ok_or_else(|| {
+                    format!(
+                        "`{name}`'s {CELLS_KEY} names {cell:?}, which is no cell ({})",
+                        known()
+                    )
+                })?;
+            members
+                .roots
+                .entry(cell.to_string())
+                .or_default()
+                .insert(name.to_string());
+        }
+    }
+    if members.names.is_empty() {
         return Err("`targo metadata --no-deps` listed no workspace members".to_string());
     }
-    Ok(names)
+    Ok(members)
 }
 
 /// The members this cell's graph carries, and the ones `--exclude` drops.
@@ -1902,13 +2036,144 @@ mod tests {
 
     #[test]
     fn member_names_come_out_of_cargo_metadata() {
-        let json = r#"{"packages":[{"name":"aterm"},{"name":"arrayvec"}],"version":1}"#;
+        let cells = aterm_forge::resolve::default_cells();
+        let json =
+            r#"{"packages":[{"name":"aterm","metadata":null},{"name":"arrayvec"}],"version":1}"#;
+        let members = parse_members(json, &cells).expect("names");
+        assert_eq!(members.names, names(&["aterm", "arrayvec"]));
+        assert!(members.roots.is_empty());
+        assert!(parse_members("not json", &cells).is_err());
+        assert!(parse_members(r#"{"packages":[]}"#, &cells).is_err());
+    }
+
+    /// A member names the cells that check it beside their root; a name that
+    /// is no cell, or a key that is no list, is refused rather than dropped.
+    #[test]
+    fn a_member_names_the_cells_that_check_it_beside_their_root() {
+        let cells = aterm_forge::resolve::default_cells();
+        let cell = |name: &str| cells.iter().find(|c| c.name == name).unwrap().clone();
+        let json = r#"{"packages":[
+            {"name":"aterm","metadata":null},
+            {"name":"guest","metadata":{"aterm":{"cells":["linux-arm"]}}},
+            {"name":"both","metadata":{"aterm":{"cells":["linux-arm","win"]}}},
+            {"name":"docs-only","metadata":{"docs":{"rs":{}}}}
+        ]}"#;
+        let members = parse_members(json, &cells).expect("members");
+        assert_eq!(members.roots_of(&cell("linux-arm")), ["both", "guest"]);
+        assert_eq!(members.roots_of(&cell("win")), ["both"]);
         assert_eq!(
-            parse_member_names(json).expect("names"),
-            names(&["aterm", "arrayvec"])
+            members.roots_of(&cell("win-arm")),
+            Vec::<String>::new(),
+            "a cell no member names checks its root alone"
         );
-        assert!(parse_member_names("not json").is_err());
-        assert!(parse_member_names(r#"{"packages":[]}"#).is_err());
+        assert_eq!(
+            lint_packages(&cell("linux-arm"), &members.roots_of(&cell("linux-arm"))),
+            ["-p", "aterm", "-p", "both", "-p", "guest"]
+        );
+        assert_eq!(lint_packages(&cell("win-arm"), &[]), ["-p", "aterm"]);
+        let unknown =
+            r#"{"packages":[{"name":"g","metadata":{"aterm":{"cells":["linux-musl"]}}}]}"#;
+        let why = parse_members(unknown, &cells).unwrap_err();
+        assert!(why.contains("`g`") && why.contains("linux-musl"), "{why}");
+        let not_a_list =
+            r#"{"packages":[{"name":"g","metadata":{"aterm":{"cells":"linux-arm"}}}]}"#;
+        assert!(parse_members(not_a_list, &cells).is_err());
+    }
+
+    /// An extra root's graph is joined onto the cell's: the test pass selects
+    /// it and its own members, the host side stays empty, and a cell no member
+    /// names (the negative control) still excludes it.
+    #[test]
+    fn an_extra_root_joins_the_cells_graph_and_its_test_pass() {
+        let dir = aterm_tempfile::tempdir().expect("private resolver fixture");
+        let root = dir.path();
+        let packages = [
+            ("app", "[dependencies]\nshared={path='../shared'}\n"),
+            (
+                "guest",
+                "[dependencies]\nshared={path='../shared'}\nguest-only={path='../guest-only'}\n\
+                 [package.metadata.aterm]\ncells=['linux-arm']\n",
+            ),
+            ("shared", ""),
+            ("guest-only", ""),
+            ("mac-only", ""),
+        ];
+        let listed: Vec<&str> = packages.iter().map(|(n, _)| *n).collect();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            format!("[workspace]\nresolver='2'\nmembers={listed:?}\n"),
+        )
+        .expect("workspace manifest");
+        for (name, deps) in packages {
+            let package = root.join(name);
+            std::fs::create_dir_all(package.join("src")).expect("fixture source dir");
+            std::fs::write(package.join("src/lib.rs"), "").expect("empty library");
+            std::fs::write(
+                package.join("Cargo.toml"),
+                format!("[package]\nname='{name}'\nversion='1.0.0'\nedition='2021'\n{deps}"),
+            )
+            .expect("package manifest");
+        }
+        std::fs::write(
+            root.join("Cargo.lock"),
+            "version=4\n\
+             [[package]]\nname='app'\nversion='1.0.0'\ndependencies=['shared']\n\
+             [[package]]\nname='guest'\nversion='1.0.0'\ndependencies=['guest-only','shared']\n\
+             [[package]]\nname='guest-only'\nversion='1.0.0'\n\
+             [[package]]\nname='mac-only'\nversion='1.0.0'\n\
+             [[package]]\nname='shared'\nversion='1.0.0'\n",
+        )
+        .expect("locked local dependency graph");
+        let targo = PathBuf::from(env!("CARGO"));
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let metadata = aterm_uds::spawnfd::command(&targo)
+            .args([
+                "metadata",
+                "--no-deps",
+                "--locked",
+                "--offline",
+                "--format-version",
+                "1",
+            ])
+            .arg("--manifest-path")
+            .arg(root.join("Cargo.toml"))
+            .current_dir(root)
+            .env("PATH", &path)
+            .output_owned()
+            .expect("targo metadata");
+        assert!(metadata.status.success(), "{metadata:?}");
+        let cells = aterm_forge::resolve::default_cells();
+        let members = parse_members(&String::from_utf8_lossy(&metadata.stdout), &cells)
+            .expect("the fixture's members");
+        let cargo = aterm_forge::resolve::Cargo::pinned(&targo, &path);
+        let resolve = |name: &str, package: &str| {
+            let cell = Cell {
+                package: package.to_string(),
+                ..cells.iter().find(|c| c.name == name).unwrap().clone()
+            };
+            let extra = members.roots_of(&cell);
+            let mut log = String::new();
+            let (graph, _) = resolve_roots(&cargo, root, &cell, &extra, &mut log)
+                .expect("resolve the fixture without compiling");
+            (extra, graph)
+        };
+
+        let (extra, graph) = resolve("linux-arm", "app");
+        assert_eq!(extra, ["guest"]);
+        let normal: BTreeSet<String> = graph.nodes.iter().map(|id| id.name.clone()).collect();
+        assert_eq!(normal, names(&["app", "guest", "guest-only", "shared"]));
+        assert_eq!(host_side(&graph, |_| false), BTreeSet::new());
+        let (selected, excluded) = test_selection(&members.names, &normal, &BTreeSet::new());
+        assert_eq!(selected, ["app", "guest", "guest-only", "shared"]);
+        assert_eq!(excluded, ["mac-only"]);
+
+        // The negative control: a cell the guest does not name leaves it out.
+        let (extra, graph) = resolve("win-arm", "app");
+        assert!(extra.is_empty());
+        let normal: BTreeSet<String> = graph.nodes.iter().map(|id| id.name.clone()).collect();
+        assert_eq!(normal, names(&["app", "shared"]));
+        let (_, excluded) = test_selection(&members.names, &normal, &BTreeSet::new());
+        assert_eq!(excluded, ["guest", "guest-only", "mac-only"]);
     }
 
     /// The members the graph carries are selected; the rest are excluded,

@@ -2836,12 +2836,11 @@ impl App {
         // picked by `WindowLayout::bootstrap_local_id`, i.e. by this leaf); on a
         // cold restore, the shell those same two spawned for the window. Either
         // way it started with a fresh ctx, so whatever the operator stamped with
-        // `meta set` in the previous process exists only in this leaf. Returning
-        // the view without it is how the 0.82.0 -> 0.83.0 handoff (measured
-        // 2026-09-12) came back with `user_title=- description=- icon=- role=-
-        // attention=-` on BOTH of its sessions: two windows, one terminal each,
-        // so every session was a graft, and only a leaf that spawned or
-        // re-adopted a session below was ever re-seeded. Which shell the leaf's
+        // `meta set` in the previous process exists only in this leaf. With the
+        // view returned without it, a handoff of two windows, one terminal each,
+        // comes back with `user_title=- description=- icon=- role=- attention=-` on
+        // BOTH of its sessions: every session there is a graft, and only a leaf that
+        // spawns or re-adopts a session below is re-seeded. Which shell the leaf's
         // identity lands on is `carry_restored_identity`'s business, and what it
         // may overwrite there is `graft_restored_user_meta`'s.
         if let Some((view, session)) = reusable_terminal.take() {

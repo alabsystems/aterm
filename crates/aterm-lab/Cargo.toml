@@ -78,6 +78,10 @@ aterm-durable = { workspace = true }
 # here.
 aterm-link = { path = "../aterm-link" }
 
+# `linux vz-agent` finds rustup as `verify cells` does (`rustup::find_rustup`).
+# Not a new edge in the build graph: aterm-agent above already depends on it.
+aterm-toolchain = { workspace = true }
+
 # `aos-search` runs Aos M4's evaluator in process: schedule plans, the grid and file
 # proposers, the evaluator and the provenance bundle exist in a release build only
 # under `aos-candidates`. aterm-lab is the one crate that enables it (design §10.8):

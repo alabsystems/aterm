@@ -9,7 +9,9 @@ use super::*;
 use crate::supervise::config::Autopilot;
 use crate::supervise::occupancy::fault::{self, Fault};
 use crate::supervise::occupancy::templates;
-use crate::supervise::occupancy::{OccupancyReading, PaceGrant, PaceRefusal, RuleId, SlotsSeen};
+use crate::supervise::occupancy::{
+    OccupancyReading, OccupancySaid, PaceGrant, PaceRefusal, RuleId, SaidReadyIdle, SlotsSeen,
+};
 use crate::supervise::policy::turn_end::{HostTurn, RULE_LAND};
 
 const NUDGE: &str = "wait-nudge@v1";
@@ -35,6 +37,8 @@ struct DoorHost {
     /// The wall (unix ms) of the read the run is at, when the facts reading is taken.
     facts_at: Mutex<i64>,
     calls: Mutex<Vec<String>>,
+    /// What the door told the host ([`IdleHost::occupancy_said`]), in order.
+    said: Mutex<Vec<OccupancySaid>>,
 }
 
 impl DoorHost {
@@ -101,6 +105,9 @@ impl IdleHost for DoorHost {
             as_of_ms: *self.facts_at.lock().expect("facts_at"),
             no_progress: calls,
         })
+    }
+    fn occupancy_said(&self, said: &OccupancySaid) {
+        self.said.lock().expect("said").push(said.clone());
     }
 }
 
@@ -239,6 +246,8 @@ struct Ran {
     /// Whether the land act a loop before this one typed is still owed its answer
     /// (`land_act_seeded`), as the run left it.
     land: bool,
+    /// What the door told the host, in order.
+    said: Vec<OccupancySaid>,
 }
 
 impl Ran {
@@ -358,6 +367,7 @@ impl<'a> Script<'a> {
             calls: self.host.calls(),
             ledger,
             land,
+            said: self.host.said.lock().expect("said").clone(),
         }
     }
 }
@@ -1788,6 +1798,402 @@ fn a_fact_row_closes_no_remembered_wall() {
     };
     assert_eq!(rebooked(crate::supervise::facts::FactKind::Hold.rule()), 0);
     assert_eq!(rebooked(RULE_CONTINUE), 1, "a policy's act closes it");
+}
+
+/// The reads of a held session: its first, and one a minute from `from_min` to `to_min`.
+fn minutely(from_min: i64, to_min: i64) -> Vec<i64> {
+    std::iter::once(0)
+        .chain((from_min..=to_min).map(|m| m * 60))
+        .collect()
+}
+
+/// The told words' `ready_idle` lines, each with the wall it was told at.
+fn ready_idles(ran: &Ran) -> Vec<(i64, Option<SaidReadyIdle>)> {
+    ran.said.iter().map(|s| (s.at_ms, s.ready_idle)).collect()
+}
+
+/// The first told word that names a line ready-idle.
+fn first_ready_idle(ran: &Ran) -> Option<&OccupancySaid> {
+    ran.said.iter().find(|s| s.ready_idle.is_some())
+}
+
+#[test]
+fn a_due_line_held_k_looks_is_said_ready_idle_under_prompt_alone() {
+    let run = |occupancy| {
+        let mut script = Script::new("write-k-land", occupancy, &minutely(31, 42));
+        script.policy.autopilot = Autopilot::Land;
+        script.run(&mut nothing)
+    };
+    let ran = run(Occupancy::Prompt);
+    assert_eq!(wrote(&ran.noted), [said(NUDGE, "held:autopilot")]);
+    let first = T0 + 31 * MIN;
+    let raised = SaidReadyIdle {
+        rule: RuleId::WaitNudge,
+        guard: Some(Guard::Autopilot),
+        since_ms: first,
+    };
+    let word = first_ready_idle(&ran).expect("raised");
+    assert_eq!(
+        word.at_ms,
+        first + crate::supervise::occupancy::due::K_LOOKS * MIN,
+        "at its K-th look: {:#?}",
+        ready_idles(&ran)
+    );
+    assert_eq!(word.ready_idle, Some(raised));
+    assert_eq!(word.ready_idle_under_prompt(), Some(raised));
+    assert_eq!(
+        ran.said.last().and_then(|s| s.ready_idle),
+        Some(raised),
+        "it stands while the line does"
+    );
+    assert!(ran.writes().is_empty(), "{:?}", ran.writes());
+    // The clock runs in every mode; only `prompt`'s word names the line for the tab's Entry.
+    let observe = run(Occupancy::Observe);
+    assert_eq!(
+        first_ready_idle(&observe).and_then(|s| s.ready_idle),
+        Some(raised)
+    );
+    assert!(
+        observe
+            .said
+            .iter()
+            .all(|s| s.ready_idle_under_prompt().is_none()),
+        "{:#?}",
+        observe.said
+    );
+    assert!(run(Occupancy::Off).said.is_empty(), "off tells nothing");
+    observe_types_nothing(&run);
+}
+
+#[test]
+fn a_persons_hand_holds_the_ready_idle_line_and_a_handover_raises_it_at_once() {
+    let run = |handover: Option<usize>| {
+        Script {
+            set: &|m| m.human_ms = Some(1_000),
+            ..Script::new("write-k-person", Occupancy::Prompt, &minutely(31, 40))
+        }
+        .run(&mut |s, i| {
+            if i == 0 {
+                s.set_occupancy_k_looks(3);
+            }
+            if Some(i) == handover {
+                s.ctl.m.human_ms = Some(60 * MIN.unsigned_abs());
+                s.ctl.m.hold = "1";
+            }
+        })
+    };
+    let held = run(None);
+    assert_eq!(wrote(&held.noted), [said(NUDGE, "held:person")]);
+    assert!(
+        first_ready_idle(&held).is_none(),
+        "nine looks under a person's hand: {:#?}",
+        ready_idles(&held)
+    );
+    let handed = run(Some(7));
+    assert_eq!(
+        wrote(&handed.noted),
+        [said(NUDGE, "held:person"), said(NUDGE, "held:halted")]
+    );
+    let word = first_ready_idle(&handed).expect("raised at the handover");
+    assert_eq!(word.at_ms, T0 + 37 * MIN, "{:#?}", ready_idles(&handed));
+    assert_eq!(
+        word.ready_idle,
+        Some(SaidReadyIdle {
+            rule: RuleId::WaitNudge,
+            guard: Some(Guard::Halted),
+            since_ms: T0 + 31 * MIN,
+        }),
+        "its clock from its first look, not from the halt"
+    );
+    assert!(handed.writes().is_empty(), "{:?}", handed.writes());
+}
+
+#[test]
+fn a_line_the_write_holds_k_looks_is_ready_idle_until_it_is_typed() {
+    let run = |typed: bool| {
+        let host = Arc::new(DoorHost::default());
+        host.taskless.store(true, Ordering::SeqCst);
+        let free = Arc::clone(&host);
+        Script {
+            host,
+            ..Script::new("write-k-taskless", Occupancy::Prompt, &minutely(31, 35))
+        }
+        .run(&mut |s, i| {
+            if i == 0 {
+                s.set_occupancy_k_looks(3);
+            }
+            if typed && i == 5 {
+                free.taskless.store(false, Ordering::SeqCst);
+            }
+        })
+    };
+    let ran = run(true);
+    assert_eq!(
+        wrote(&ran.noted),
+        [said(NUDGE, "held:taskless"), said(NUDGE, "typed")]
+    );
+    let raised = Some(SaidReadyIdle {
+        rule: RuleId::WaitNudge,
+        guard: Some(Guard::Taskless),
+        since_ms: T0 + 31 * MIN,
+    });
+    let word = first_ready_idle(&ran).expect("raised");
+    assert_eq!(
+        (word.at_ms, word.ready_idle),
+        (T0 + 34 * MIN, raised),
+        "{:#?}",
+        ready_idles(&ran)
+    );
+    let last = ran.said.last().expect("told");
+    assert_eq!(
+        (last.at_ms, last.ready_idle),
+        (T0 + 35 * MIN, None),
+        "typed: no longer due"
+    );
+    assert_eq!(ran.writes().len(), 2, "{:?}", ran.writes());
+    let held = run(false);
+    assert_eq!(held.said.last().and_then(|s| s.ready_idle), raised);
+}
+
+#[test]
+fn a_successor_says_the_carried_line_ready_idle_when_its_predecessor_would_have() {
+    let land = |tag: &'static str, at_s: &[i64], seed: Option<(String, i64)>| {
+        let mut script = Script {
+            seed,
+            ..Script::new(tag, Occupancy::Prompt, at_s)
+        };
+        script.policy.autopilot = Autopilot::Land;
+        script.run(&mut nothing)
+    };
+    let first = land("write-k-first", &minutely(31, 36), None);
+    assert_eq!(wrote(&first.noted), [said(NUDGE, "held:autopilot")]);
+    assert!(first_ready_idle(&first).is_none(), "five looks");
+    assert_eq!(held_rows_of(&first.ledger), [held_by(NUDGE, "autopilot")]);
+    // Each row at the wall of the read that wrote it: the hold's since plus its `held_ms`.
+    let body: String = first
+        .ledger
+        .lines()
+        .map(|line| {
+            let held_ms = line
+                .split(['"', ' '])
+                .find_map(|w| w.strip_prefix("held_ms=")?.parse::<i64>().ok())
+                .expect("each row's held_ms");
+            stamped(line, T0 + held_ms)
+        })
+        .collect();
+    let successor = || {
+        let at_s: Vec<i64> = (0..=5).map(|m| m * 60).collect();
+        land(
+            "write-k-successor",
+            &at_s,
+            Some((body.clone(), T0 + 37 * MIN)),
+        )
+    };
+    let carried = successor();
+    let word = first_ready_idle(&carried).expect("raised");
+    assert_eq!(
+        word.at_ms,
+        T0 + 41 * MIN,
+        "ten looks from the predecessor's first: {:#?}",
+        ready_idles(&carried)
+    );
+    assert_eq!(
+        word.ready_idle,
+        Some(SaidReadyIdle {
+            rule: RuleId::WaitNudge,
+            guard: Some(Guard::Autopilot),
+            since_ms: T0 + 31 * MIN,
+        })
+    );
+    let unseeded = fault::with(Fault::KUnseeded, successor);
+    assert!(
+        first_ready_idle(&unseeded).is_none(),
+        "a clock from the successor's first look raises at 47 min: {:#?}",
+        ready_idles(&unseeded)
+    );
+}
+
+/// A PERSON AT THE K-TH LOOK HOLDS THE RAISE (the slice-2 plan's D2, S15): a line the write holds
+/// taskless for K looks, whose K-th look's write finds a person's keys, is said ready-idle at no
+/// look: the break leaves its look to the write, whose `status` read the person shows in, and no
+/// word names the line while the person holds it. NEGATIVE CONTROL: the person arriving a look
+/// past the K-th finds the line raised there, taskless, standing on, held now by the person.
+#[test]
+fn a_person_at_the_kth_look_holds_the_raise() {
+    let run = |arrives: usize| {
+        let host = Arc::new(DoorHost::default());
+        host.taskless.store(true, Ordering::SeqCst);
+        Script {
+            host,
+            ..Script::new("write-k-person-at-k", Occupancy::Prompt, &minutely(31, 36))
+        }
+        .run(&mut |s, i| {
+            if i == 0 {
+                s.set_occupancy_k_looks(3);
+            }
+            if i == arrives {
+                s.ctl.m.human_ms = Some(1_000);
+            }
+        })
+    };
+    let at_k = run(4);
+    assert_eq!(
+        wrote(&at_k.noted),
+        [said(NUDGE, "held:taskless"), said(NUDGE, "held:person")]
+    );
+    assert!(
+        first_ready_idle(&at_k).is_none(),
+        "a person at its K-th look: {:#?}",
+        ready_idles(&at_k)
+    );
+    let raised = SaidReadyIdle {
+        rule: RuleId::WaitNudge,
+        guard: Some(Guard::Taskless),
+        since_ms: T0 + 31 * MIN,
+    };
+    let after = run(5);
+    let word = first_ready_idle(&after).expect("raised at its K-th look");
+    assert_eq!(
+        (word.at_ms, word.ready_idle),
+        (T0 + 34 * MIN, Some(raised)),
+        "{:#?}",
+        ready_idles(&after)
+    );
+    assert_eq!(
+        after.said.last().and_then(|s| s.ready_idle),
+        Some(SaidReadyIdle {
+            guard: Some(Guard::Person),
+            ..raised
+        })
+    );
+    assert!(at_k.writes().is_empty(), "{:?}", at_k.writes());
+    assert!(after.writes().is_empty(), "{:?}", after.writes());
+}
+
+/// A SUCCESSOR COUNTS A CRASHED LINE FROM ITS INTENT, AND A TYPED ONE NOT AT ALL: a nudge whose
+/// write crashed after its intent row (its typed row lost), carried by a successor whose
+/// autopilot holds it, is said ready-idle K looks from that row; the same nudge typed, its typed
+/// row kept beside the same intent row, is the hold's nudge spent, and no word names a line.
+/// NEGATIVE CONTROL: `KUnseeded` counts the crashed line from the successor's first look, ten
+/// looks on.
+#[test]
+fn a_successor_counts_a_crashed_line_from_its_intent_and_a_typed_one_not_at_all() {
+    let first = Script::new("write-k-intent-1", Occupancy::Prompt, &[0, 31 * 60]).run(&mut nothing);
+    assert_eq!(wrote(&first.noted), [said(NUDGE, "typed")]);
+    let typed_row = |l: &&str| {
+        l.contains("\"rule_id\":\"fact-hold@v1\"") && l.contains("\"decision\":\"typed\"")
+    };
+    assert!(first.ledger.lines().any(|l| typed_row(&l)));
+    let crashed: String = first
+        .ledger
+        .lines()
+        .filter(|l| !typed_row(l))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(crashed.contains(INTENT));
+    let successor = |tag: &'static str, body: &str| {
+        let at_s: Vec<i64> = (0..=12).map(|m| m * 60).collect();
+        let mut script = Script {
+            seed: Some((stamped(body, T0 + 31 * MIN), T0 + 35 * MIN)),
+            ..Script::new(tag, Occupancy::Prompt, &at_s)
+        };
+        script.policy.autopilot = Autopilot::Land;
+        script.run(&mut nothing)
+    };
+    let carried = successor("write-k-intent-crashed", &crashed);
+    assert_eq!(wrote(&carried.noted), [said(NUDGE, "held:autopilot")]);
+    let raised = SaidReadyIdle {
+        rule: RuleId::WaitNudge,
+        guard: Some(Guard::Autopilot),
+        since_ms: T0 + 31 * MIN,
+    };
+    let word = first_ready_idle(&carried).expect("raised");
+    assert_eq!(
+        (word.at_ms, word.ready_idle),
+        (T0 + 41 * MIN, Some(raised)),
+        "ten looks from its intent: {:#?}",
+        ready_idles(&carried)
+    );
+    let typed = successor("write-k-intent-typed", &first.ledger);
+    assert!(wrote(&typed.noted).is_empty(), "{:#?}", typed.noted);
+    assert!(
+        first_ready_idle(&typed).is_none(),
+        "a typed line stands typed: {:#?}",
+        ready_idles(&typed)
+    );
+    assert!(carried.writes().is_empty() && typed.writes().is_empty());
+    let unseeded = fault::with(Fault::KUnseeded, || {
+        successor("write-k-intent-unseeded", &crashed)
+    });
+    assert_eq!(
+        first_ready_idle(&unseeded).map(|s| (s.at_ms, s.ready_idle)),
+        Some((
+            T0 + 45 * MIN,
+            Some(SaidReadyIdle {
+                since_ms: T0 + 35 * MIN,
+                ..raised
+            })
+        )),
+        "{:#?}",
+        ready_idles(&unseeded)
+    );
+}
+
+/// OF TWO LINES STANDING RAISED, THE WORD NAMES THE ONE DUE LONGEST: a person's exchange holds the
+/// nudge from 30 minutes and the room line from two hours, each past K looks by the last read (at
+/// three hours), and every word from the nudge's raise on names the nudge, from its first look:
+/// none moves to the room line at its own raise.
+#[test]
+fn of_two_lines_raised_the_word_names_the_one_due_longest() {
+    let at_s: Vec<i64> = (0..=18).map(|i| i * 10 * 60).collect();
+    let host = Arc::new(DoorHost::default());
+    *host.board.lock().expect("board") = room_at(T0);
+    let ran = Script {
+        host,
+        ..Script::new("write-k-longest", Occupancy::Prompt, &at_s)
+    }
+    .run(&mut |s, i| {
+        if i == 0 {
+            s.set_occupancy_k_looks(3);
+        }
+        if !s.turn_end.left_to_person() {
+            let mut reading = s.turn_end_reading(&screen_at(90, ended(SAID)), None, &hosted(30));
+            reading.left_record = true;
+            s.turn_end.observe(&reading, s.fx.mono());
+        }
+    });
+    assert_eq!(
+        wrote(&ran.noted),
+        [said(NUDGE, "held:exchange"), said(ROOM, "held:exchange")]
+    );
+    let nudge = SaidReadyIdle {
+        rule: RuleId::WaitNudge,
+        guard: Some(Guard::Exchange),
+        since_ms: T0 + 30 * MIN,
+    };
+    let raised: Vec<(i64, Option<SaidReadyIdle>)> = ready_idles(&ran)
+        .into_iter()
+        .filter(|(_, idle)| idle.is_some())
+        .collect();
+    assert_eq!(raised.first(), Some(&(T0 + 40 * MIN, Some(nudge))));
+    assert!(
+        raised.iter().all(|(_, idle)| *idle == Some(nudge)),
+        "{raised:#?}"
+    );
+    let both = ran
+        .said
+        .iter()
+        .find(|s| {
+            s.rules.iter().all(|r| {
+                r.verdict == crate::supervise::occupancy::SaidVerdict::Held(Guard::Exchange)
+            })
+        })
+        .expect("both lines held");
+    assert_eq!(
+        both.at_ms,
+        T0 + 120 * MIN,
+        "the room line due from two hours"
+    );
 }
 
 #[path = "facts_loop_tests.rs"]

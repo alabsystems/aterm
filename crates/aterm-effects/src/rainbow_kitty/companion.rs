@@ -520,11 +520,11 @@ const SHADE_BORDER_CELLS: f32 = 0.30;
 
 /// The pet's body as the sky draws around it: a star whose centre lies on the
 /// body is not drawn, so the cat flies in front of the sky and no star sits
-/// on its fur. The pet ticks after the sky emits, so the shade is the body's
-/// last box joined with that box carried on by its last frame's move (the
-/// box it is about to be drawn at), each shaved of the tile's transparent
-/// border at the sides. Round 2's judge, 2026-10-23: purple sky stars on a
-/// flying companion's face and back on paper (`burst` t0).
+/// on its fur (on paper, purple sky stars would stand on a flying
+/// companion's face and back, `burst` t0). The pet ticks after the sky emits,
+/// so the shade is the body's last box joined with that box carried on by
+/// its last frame's move (the box it is about to be drawn at), each shaved
+/// of the tile's transparent border at the sides.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PetShade {
     /// The last two drawn boxes, `(x0, x1, y0, y1)` in window pixels, newest first.
@@ -551,14 +551,19 @@ impl PetShade {
         let Some(last) = self.boxes[0] else {
             return false;
         };
-        let ahead = self.boxes[1].map_or(last, |prev| {
-            let (dx, dy) = (last.0 - prev.0, last.2 - prev.2);
-            (last.0 + dx, last.1 + dx, last.2 + dy, last.3 + dy)
-        });
         let border = (SHADE_BORDER_CELLS * cell_w as f32).round() as i32;
-        [last, ahead]
-            .iter()
-            .any(|&(x0, x1, y0, y1)| x >= x0 + border && x < x1 - border && y >= y0 && y < y1)
+        if x >= last.0 + border && x < last.1 - border && y >= last.2 && y < last.3 {
+            return true;
+        }
+        let Some(prev) = self.boxes[1] else {
+            return false;
+        };
+        let (dx, dy) = (last.0 - prev.0, last.2 - prev.2);
+        if dx == 0 && dy == 0 {
+            return false;
+        }
+        let (x0, x1, y0, y1) = (last.0 + dx, last.1 + dx, last.2 + dy, last.3 + dy);
+        x >= x0 + border && x < x1 - border && y >= y0 && y < y1
     }
 }
 
@@ -601,12 +606,12 @@ impl PetOffer {
 /// (`row`, `col`) holds a letter. A row the frame carries holds only its
 /// written columns; the columns past them, inside the grid's `cols`, are the
 /// frame's implicit blank (unwritten glass), not unknown. Read as unknown,
-/// they made every probe of a head that sat past a line's last letter blind,
-/// and the blind seat put it behind the caret, on the letters: a kitten-size
-/// nyan head at the end of `... the kitty flies` typed to two cells short of
-/// the margin sat on `flies` from the last key through its landing
-/// (2026-10-22, the trail gallery's `burst` on GitHub Light, 1.1 to 2.6:1
-/// under the head) where a larger head, reaching back over a letter, rose
+/// they would make every probe of a head that sits past a line's last letter
+/// blind, and the blind seat would put it behind the caret, on the letters: a
+/// kitten-size nyan head at the end of `... the kitty flies` typed to two
+/// cells short of the margin would sit on `flies` from the last key through
+/// its landing (the trail gallery's `burst` on GitHub Light, 1.1 to 2.6:1
+/// under the head) where a larger head, reaching back over a letter, rises
 /// into the row above. A row the frame does not carry, or a column past the
 /// grid, is unknown.
 #[inline]
@@ -765,8 +770,8 @@ mod tests {
     /// rises into the row above when the line is written up to the caret:
     /// the frame's trimmed row reads blank past its written cells
     /// ([`cell_ink`]), so the probe is not blind. Negative control: read as
-    /// unknown (the probe before 2026-10-22), the columns blind the probe and
-    /// the head sits behind the caret on the letters.
+    /// unknown, the columns blind the probe and the head sits behind the
+    /// caret on the letters.
     #[test]
     fn a_head_past_the_last_letter_reads_the_unwritten_columns_blank() {
         use aterm_core::terminal::RenderCell;

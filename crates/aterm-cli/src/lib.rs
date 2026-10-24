@@ -76,12 +76,14 @@ const HELP_SESSION_LINE: &str = concat!(
     session_shell!(),
     " and passes its bytes through unchanged.\n"
 );
-/// See the Unix twin above; only the wrap differs.
+/// See the Unix twin above; the wrap differs, and it adds the in-tab rule (`nests_inside_aterm`).
 #[cfg(windows)]
 const HELP_SESSION_LINE: &str = concat!(
     "Runs ",
     session_shell!(),
-    " and passes its\nbytes through unchanged.\n"
+    " and passes its\nbytes through unchanged. ",
+    "A bare `aterm` typed in an aterm tab opens a new tab\n",
+    "there; `aterm --session` nests a session instead.\n"
 );
 const HELP_HEAD: &str = concat!(
     "\n",
@@ -98,7 +100,8 @@ const HELP_HEAD: &str = concat!(
     "                              every tool. Inside an aterm tab it prints the\n",
     "                              agent operating brief. Start here.\n",
     "    aterm <verb> [args]       A verb (see VERBS) or a tool (see TOOLCHAIN).\n",
-    "    aterm <SUBCOMMAND>        Print diagnostics and exit (see SUBCOMMANDS).\n",
+    "    aterm <SUBCOMMAND>        Print diagnostics and exit; `doctor` also\n",
+    "                              repairs (see SUBCOMMANDS).\n",
     "\n",
     "OPTIONS:\n",
     "        --containment <MODE>  user (the default: no sandbox, no extra limits),\n",
@@ -116,6 +119,8 @@ const HELP_HEAD: &str = concat!(
     "    -q, --quiet               Hide the session's startup line.\n",
     "        --verbose             On exit, print to stderr how many bytes of output\n",
     "                              passed through.\n",
+    "        --completions <SHELL> Print the bash, zsh or fish completion script\n",
+    "                              and exit.\n",
     "    -h, --help                Print this help and exit.\n",
     "    -V, --version             Print the version and exit.\n",
     "\n",
@@ -169,7 +174,7 @@ pub enum Verb {
     Fabric,
     /// `aterm ship` — the release tool (publishing; source checkouts only).
     Ship,
-    /// `aterm update` — the headless update lane (`status`, `check`, `identity`).
+    /// `aterm update` — the headless update lane (`status`, `check`, `identity`; on Linux also `enable`, `apply`, `rollback`).
     Update,
     /// `aterm agents` — the coding-agent primer installer.
     Agents,
@@ -343,7 +348,7 @@ impl Verb {
             Verb::Keeper => "aterm keeper <cmd>",
             Verb::Caffeine => "aterm caffeine [<cmd>]",
             Verb::Theme => "aterm theme <cmd>",
-            Verb::Edit => "aterm edit [+L[:C]] <file>",
+            Verb::Edit => "aterm edit [+L[:C]] <file>...",
             Verb::NewTab => "aterm new-tab [-d dir]",
             Verb::NewWindow => "aterm new-window [-d dir]",
             Verb::SplitPane => "aterm split-pane [-d dir]",
@@ -377,16 +382,17 @@ impl Verb {
                 "peers | allow | leave); `allow drive --from",
                 "<host|node>` lets that node drive this machine",
                 "(`aterm ctl --host <h> …`, `aterm help workers`).",
+                "Unix only.",
             ],
             Verb::Link => &[
-                "The fabric bridge: carries inbox and post",
-                "traffic between this instance and the bus.",
+                "The fabric bridge: carries inbox and post traffic",
+                "between this instance and the bus. Unix only.",
             ],
             Verb::Fabric => &[
                 "The fabric: mail between sessions and people",
                 "(status | tail | brief | on | off | doctor |",
                 "mint-for | halt | inbox | post); `status` is the",
-                "default.",
+                "default. Unix only.",
             ],
             Verb::Drive => &[
                 "The window harness's readers, run by hand",
@@ -399,7 +405,8 @@ impl Verb {
             ],
             Verb::Update => &[
                 "Report or check for an update, or print this",
-                "build's identity (status | check | identity).",
+                "build's identity (status | check | identity;",
+                "on Linux also enable | apply | rollback).",
             ],
             Verb::Agents => &[
                 "Keep the aterm primer in coding agents' context",
@@ -429,7 +436,7 @@ impl Verb {
                 "One credentials file for every machine: the",
                 "vault, its server and ~/.secrets (status | join |",
                 "sync | edit | approve | serve …); `status` is the",
-                "default.",
+                "default. Unix only.",
             ],
             Verb::Harness => &[
                 "Claude Code's spend, limits and accounts, the",
@@ -527,11 +534,11 @@ const HELP_TAIL: &str = concat!(
     "    aterm doctor --read-only           Check this machine; change nothing.\n",
 );
 
-/// The diagnostic subcommands and their `--help` lines: `aterm <name>` reports and exits without starting a shell.
+/// The diagnostic subcommands and their `--help` lines (`aterm list-themes --help` prints `aterm theme list`'s help instead): `aterm <name>` reports and exits without starting a shell.
 pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     (
         "show-config",
-        "Print the version, shell, TERM, size and default containment mode as key=value lines.",
+        "Print the version, $SHELL as set (on Windows, this tab's shell or a new window's, and shell_origin=), TERM, the size (24x80 when stdout is not a terminal) and the default containment mode as key=value lines.",
     ),
     (
         "explain-config",
@@ -539,7 +546,15 @@ pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "doctor",
-        "Check the shell, macOS access (Full Disk Access, debugger access, Developer Tools, macOS's check of each new program), running instances, the fabric's broker, past crashes, open exceptions, the packages (`aterm pkg doctor`'s rows) and, on a develop machine, what `aterm init --develop` converges (each recorded checkout against origin as last fetched, its submodule and its tools; read-only and offline). Repair what aterm lays: the shell integration, the installed commands and their ~/.local/bin links, the reroute stubs, the rustup link and exec roots; it moves stale copies of aterm to the Trash and, when aterm is off in Developer Tools, opens that pane for you. --read-only changes nothing; --json prints every row in the JSON schema `aterm init --json` shares; --only <id,...> narrows to those items, families or layers (the shell is always checked). Exits 0 when every selected check is satisfied or not applicable, 2 on a usage error, else 1. On macOS, --check, --apply and --restore act on the fleet settings profile alone: --check checks it, --apply backs it up and applies it, --restore restores the backup (--json: its fleet report; drift exits 1). See `aterm help doctor`.",
+        concat!(
+            "Check this machine (the shell, macOS access, running instances, the\n",
+            "fabric's broker, past crashes, open exceptions, the packages) and repair what\n",
+            "aterm lays. --read-only changes nothing; --json prints the report as JSON;\n",
+            "--only <id,...> narrows to those items, families or layers. On macOS,\n",
+            "--check, --apply and --restore act on the fleet settings profile alone.\n",
+            "Exits 0 when every selected check is satisfied or not applicable, 2 on a\n",
+            "usage error, else 1. `aterm help doctor` has the rest.",
+        ),
     ),
     ("list-fonts", "List available font families, one per line."),
     (
@@ -754,8 +769,8 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20 warmup_hold_ms          how long a pending update waits for a running warm-up\n\
      \x20                         (default 120000, at most 600000).\n\
      \x20 probe_interval_ms       the shortest gap between access re-checks (default 5000);\n\
-     \x20                         `aterm ctl @<sid> await consent` waits for the next completed\n\
-     \x20                         check.\n\
+     \x20                         `aterm ctl @<sid> await consent` answers when a check's result\n\
+     \x20                         differs from the first one it read.\n\
      \x20 protected_roots         the sensitive set; empty = the containment tier's own list, so\n\
      \x20                         the two tiers cannot disagree about which paths are sensitive.\n\
      \x20 auto_accept             reserved, not implemented: aterm never answers a macOS consent\n\
@@ -2587,7 +2602,7 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
                 std::process::exit(code);
             }
             None => {
-                eprintln!("aterm: unknown subcommand {cmd} (try --help)");
+                eprintln!("aterm: `{cmd}` must be the first argument (`aterm {cmd} …`)");
                 std::process::exit(2);
             }
         },
@@ -3169,7 +3184,7 @@ mod tests {
 
     #[test]
     fn doctor_operand_grammar_is_enforced_at_the_edge() {
-        const USAGE: &str = "usage: aterm doctor [--read-only | --check | --apply | --restore] [--json] [--only <id,...>]";
+        const USAGE: &str = "usage: aterm doctor [--read-only] [--json] [--only <id,...>] | (--check | --apply | --restore) [--json]";
         assert_eq!(decide(&["doctor"]), diag("doctor", None));
         assert_eq!(
             decide(&["doctor", "--read-only"]),

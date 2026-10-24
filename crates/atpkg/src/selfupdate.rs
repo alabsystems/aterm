@@ -387,7 +387,7 @@ pub fn prefix_mismatch_line(row: &VendorSpec, operand: &Path, resolved: &Path) -
     let p = row.program;
     format!(
         "atpkg: this {p} lives under {} but atpkg here resolves {} — run `aterm pkg update \
-         {p}` from a shell whose HOME (or aterm.toml) names that store",
+         {p}` from a shell whose HOME names that store",
         operand.display(),
         resolved.display()
     )

@@ -21,7 +21,7 @@ pub struct SlotsSeen {
     pub n: u16,
 }
 
-/// The board as one session's host reads it ([module docs](self)).
+/// The board as one session's host reads it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OccupancyReading {
     /// When the board was taken.

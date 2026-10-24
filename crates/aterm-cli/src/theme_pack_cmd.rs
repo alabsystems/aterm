@@ -21,22 +21,24 @@ aterm theme pack [<id>] [--appearance dark|light] [--format text|tsv] [--licence
 
   The community theme pack: themes from permissively licensed projects,
   built into aterm and copied into the themes folder only when asked
-  (`install`, or Keep in Settings \u{25b8} Themes). With no id, list them with
-  each one's status in the themes folder: available, installed, modified,
-  or blocked (by a file whose name differs only in case). With an id or
-  display name, in any case, print that theme's file.
+  (`install`, Keep in Settings \u{25b8} Themes, or `aterm ctl theme commit`
+  of a pack theme's preview). With no id, list them with each one's status
+  in the themes folder: available, installed, modified, or blocked (by a
+  file whose name differs only in case). With an id or display name, in
+  any case, print that theme's file.
 
   --appearance dark|light   Only the pack themes drawn for that appearance.
   --format tsv              Tab-separated rows for scripts: a header row, one
                             row per theme, then a `#collection` line naming
                             the upstream repo and commit.
   --licences                Print the attribution and licence notices of
-                            every palette aterm bundles.
+                            every third-party palette aterm bundles.
 
 aterm theme install <id>... | --all [--replace]
 
-  Copy pack themes into the themes folder as <id>.conf, where Settings and
-  `theme = \"<id>\"` find them, and for one with a pair print the
+  Copy pack themes, each named by id or display name in any case, into the
+  themes folder as <id>.conf, where Settings and `theme = \"<id>\"` find
+  them, and for each one written that has a pair print the
   `theme = \"dark:<dark>,light:<light>\"` value. A copy that differs from the
   pack's is kept unless --replace; a file whose name differs only in case
   blocks the install. An unknown id is a usage error before anything is
@@ -116,6 +118,7 @@ fn parse_pack_args(args: &[OsString]) -> Result<Option<PackArgs>, String> {
             "--appearance" => parsed.appearance = Some(appearance_value(&value(flag)?)?),
             "--format" => parsed.format = format_value(&value(flag)?)?,
             "--licences" | "--licenses" if inline.is_none() => parsed.licences = true,
+            "--licences" | "--licenses" => return Err(format!("pack: {flag} takes no value")),
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(format!("pack: unknown option {other:?}"));
             }
@@ -402,8 +405,9 @@ pub(crate) fn install(args: &[OsString], theme_dir: Option<&Path>) -> Outcome {
         if count > MAX_USER_THEME_FILES {
             let _ = writeln!(
                 out.stderr,
-                "aterm theme install: warning: the themes folder holds {count} theme files; \
-                 aterm reads the first {MAX_USER_THEME_FILES} by name (aterm theme list shows them)"
+                "aterm theme install: warning: the themes folder holds {count} .conf entries; \
+                 aterm reads at most {MAX_USER_THEME_FILES} theme files, lowest names first \
+                 (aterm theme list says if any were left out)"
             );
         }
     }

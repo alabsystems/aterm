@@ -18,9 +18,10 @@ use aterm_time::Instant;
 
 use super::plan::{
     DEMO_PLAN, MAX_GAP_US, MAX_PERIOD_US, MIN_PERIOD_US, PLAN_ARTIFACT_NAME, PLAN_DOMAIN,
-    PLAN_FORMAT, PLAN_INTERPRETER, PLAN_LEN, PLAN_NAME, PlanField, PlanRefusal, SHIPPED_PLAN,
-    SchedulePlan, Split, Wake,
+    PLAN_FORMAT, PLAN_INTERPRETER, PLAN_LEN, PLAN_NAME, PlanField, PlanRefusal, PlanView,
+    SHIPPED_PLAN, SchedulePlan, Split, Wake,
 };
+use super::policy::GRID_V1;
 use super::test_fixtures::{
     BUILD, Call, LANE, Seen, attached, burst, cfg, draw, geom, hosted, hosted_mut, ms, play,
     random_stream, run_lane, strand,
@@ -28,7 +29,7 @@ use super::test_fixtures::{
 use super::{
     HOT_HAS_WAKE, MOMENTUM_HOST_MAX_EVENTS, MomentumCode, MomentumHost, MomentumSchema,
     MomentumTrace, NoStrandedLight, PrebuiltMomentum, Sched, TraceFault, momentum_identity,
-    target_name,
+    offset_of, target_name,
 };
 use crate::cursor_glow::Geom;
 use crate::cursor_momentum::MomentumGlowConfig;
@@ -939,4 +940,97 @@ fn no_name_reaches_a_plan() {
     assert_eq!(host.aos_sched(), Sched::Plan(DEMO_PLAN));
     host.aos_attach(t0, MomentumCode::Shipped, BUILD, 4);
     assert_eq!(host.aos_code(), Some(MomentumCode::Shipped));
+}
+
+/// The digest of every grid plan's answers over [`conformance_digest`]'s fixed vectors under `plan interpreter v1`; a test pin, not a policy term.
+const INTERPRETER_V1_CONFORMANCE: &str =
+    "33ce1a94719990f75e1969e8d990e73c6b30d34f572009a60629f73cd90a86de";
+
+/// Every grid plan's `is_active`, `settling` and deadline over fixed views, query times and frame intervals (ns from an origin that is the stamp, `now` before it included), digested.
+fn conformance_digest() -> Digest {
+    let o = Instant::now() + Duration::from_secs(10);
+    let at = |ns: i64| {
+        let d = Duration::from_nanos(ns.unsigned_abs());
+        if ns < 0 { o - d } else { o + d }
+    };
+    let forecasts = [
+        None,
+        Some(0),
+        Some(1_000),
+        Some(1_000_000),
+        Some(16_000_000),
+        Some(40_000_000),
+        Some(195_000_000),
+    ];
+    let colds = [None, Some(5_000_000), Some(34_000_000), Some(4_700_000_000)];
+    let nows = [
+        -33_333_332,
+        -1_500_000,
+        -1,
+        0,
+        1_160_000,
+        2_660_000,
+        17_000_000,
+        1_000_000_000,
+    ];
+    let frames = [8_333_333, 16_666_667, 33_333_332];
+    let mut plans = Enc::new();
+    for &(split, wake) in &GRID_V1 {
+        let p = plan(split, wake);
+        let mut e = Enc::new();
+        e.bytes(&p.encode());
+        for (hot, changed) in [(false, false), (false, true), (true, false), (true, true)] {
+            for stamp in [None, Some(o)] {
+                for forecast in forecasts {
+                    for cold in colds {
+                        let v = PlanView::new(hot, changed, forecast.map(at), stamp, cold.map(at));
+                        e.bool(p.is_active(&v));
+                        e.bool(p.settling(&v));
+                        for now in nows {
+                            for f in frames {
+                                let d =
+                                    p.next_change_deadline(&v, at(now), Duration::from_nanos(f));
+                                e.opt(d, |e, d| e.offset(offset_of(o, d)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        plans.digest(&Digest::of(PLAN_DOMAIN, &[e.as_bytes()]));
+    }
+    Digest::of(
+        b"aterm-aos-m4-interpreter-conformance-v1\0",
+        &[plans.as_bytes()],
+    )
+}
+
+/// The interpreter is bound by its answers as well as its name: every grid plan's answers over fixed vectors, the query before the stamp included (the floor lock's case), digest to the pinned value, and the winner's answer there is its floor from that query.
+#[test]
+fn the_interpreter_answers_its_conformance_vectors() {
+    assert_eq!(PLAN_INTERPRETER, "plan interpreter v1");
+    assert_eq!(GRID_V1.len(), 54);
+    assert_eq!(conformance_digest().hex(), INTERPRETER_V1_CONFORMANCE);
+    let o = Instant::now() + Duration::from_secs(10);
+    let winner = plan(Split::SettleAtStep { gap_us: 0 }, Wake::NextStep);
+    let f = Duration::from_nanos(33_333_332);
+    let v = PlanView::new(
+        true,
+        true,
+        Some(o + ms(1)),
+        Some(o),
+        Some(o + Duration::from_millis(4_700)),
+    );
+    assert!(!winner.is_active(&v) && winner.settling(&v));
+    let before = o - Duration::from_micros(1_500);
+    assert_eq!(winner.next_change_deadline(&v, before, f), Some(before + f));
+    assert_eq!(
+        winner.next_change_deadline(&v, o + Duration::from_millis(40), f),
+        Some(o + Duration::from_millis(40) + f)
+    );
+    let far = PlanView::new(true, false, Some(o + ms(40)), Some(o), None);
+    assert_eq!(
+        winner.next_change_deadline(&far, before, f),
+        Some(o + ms(41))
+    );
 }

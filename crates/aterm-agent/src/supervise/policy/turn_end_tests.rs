@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 use super::*;
+use crate::harness::repo_work::RepoRead;
 use aterm_phase::prompt::fixtures::{
     COMPACT_FAILED_1_MEASURED, COMPACT_FAILED_2_MEASURED, COMPACT_FAILED_3_MEASURED,
     COMPACT_FAILED_FIRST_MEASURED, COMPACT_NOT_ENOUGH_MEASURED, COMPACT_SUCCEEDED_MEASURED,
@@ -130,7 +131,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         worked_doubt: Duration::ZERO,
         record_turn: None,
         credits: None,
-        repo: None,
+        repo: crate::harness::repo_work::RepoRead::Clean,
     }
 }
 
@@ -13540,7 +13541,7 @@ fn uncommitted_repo() -> crate::harness::repo_work::RepoWork {
 
 fn over_repo(r: TurnEndReading, repo: crate::harness::repo_work::RepoWork) -> TurnEndReading {
     TurnEndReading {
-        repo: Some(repo),
+        repo: crate::harness::repo_work::RepoRead::Found(repo),
         ..r
     }
 }
@@ -13674,6 +13675,77 @@ fn land_lands_nothing_over_repo_work() {
     assert!(st.landed() && st.task_done());
     let (st, _) = landed_at(t0());
     assert!(st.landed());
+}
+
+/// A STARVED REPOSITORY PROBE NEVER ENDS LAND ([`RepoRead::Unread`]): over a
+/// repository holding one unpushed commit, a probe whose first read is
+/// starved past [`crate::harness::repo_work::PROBE_LIMIT`] (on the probe's
+/// clock, no sleep) reads as unread, and Land's clean defense over it gets the
+/// land nudge saying the repository could not be read ([`REPO_UNREAD`]), round
+/// after round, its hold naming the unread leg, never the landing.
+/// NEGATIVE CONTROL: the commit pushed and the probe finished clean, the same
+/// defense lands.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_starved_repository_probe_never_ends_land() {
+    use crate::harness::repo_work::{self, PROBE_LIMIT, tests::scratch_git};
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo_work::tests::repo(tmp.path(), true);
+    std::fs::write(work.join("b.txt"), "two\n").expect("b.txt");
+    scratch_git(&work, &["add", "b.txt"]);
+    scratch_git(&work, &["commit", "-q", "-m", "two"]);
+    let starved = u64::try_from(PROBE_LIMIT.as_millis()).unwrap_or(u64::MAX) + 1_000;
+    let probe = |stall: u64| {
+        repo_work::read_stall::set(stall);
+        let read = repo_work::probe(&work, Some(&work), PROBE_LIMIT);
+        repo_work::read_stall::set(0);
+        read
+    };
+    assert!(
+        probe(0).found().is_some_and(|w| w.unpushed == 1),
+        "the unpushed commit, read whole"
+    );
+    let nudge = TurnEndAction::Type {
+        text: act_words(LAND_NUDGE, &[REPO_UNREAD], None),
+        rule_id: RULE_LAND_NUDGE,
+    };
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    assert_eq!(
+        act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now),
+        land_instruction()
+    );
+    for round in 0..3 {
+        now += 3 * MIN;
+        let r = land(TurnEndReading {
+            repo: probe(starved),
+            ..idle(DEFENSE, Some(3 * MIN))
+        });
+        assert_eq!(r.repo, RepoRead::Unread, "round {round}: the starved probe");
+        let (a, then) = past_backoff(&mut st, &r, now);
+        assert_eq!(a, nudge, "round {round}");
+        assert!(!st.landed() && !st.task_done(), "round {round}");
+        assert!(
+            st.repo_unread() && st.repo_owed().is_none(),
+            "round {round}"
+        );
+        let held = st.land_held().expect("Land holds");
+        assert!(
+            held.read && held.holds(HoldLeg::Unread) && !held.holds(HoldLeg::Repo),
+            "round {round}: {held:?}"
+        );
+        st.acted(&a, &r, then);
+        now = then;
+    }
+    scratch_git(&work, &["push", "-q", "origin", "HEAD:main"]);
+    now += 3 * MIN;
+    let r = land(TurnEndReading {
+        repo: probe(0),
+        ..idle(DEFENSE, Some(3 * MIN))
+    });
+    assert_eq!(r.repo, RepoRead::Clean, "pushed, the probe finished");
+    assert_eq!(at(&mut st, &r, now), TurnEndAction::Nothing);
+    assert!(st.landed() && st.task_done());
 }
 
 #[test]
@@ -17272,16 +17344,26 @@ fn the_record_keeps_a_landing_only_over_a_clean_repository() {
         text: act_words(LAND_NUDGE, &[&repo_work_suffix(&dirty)], None),
         rule_id: RULE_LAND_NUDGE,
     };
+    let unread = TurnEndAction::Type {
+        text: act_words(LAND_NUDGE, &[REPO_UNREAD], None),
+        rule_id: RULE_LAND_NUDGE,
+    };
     for (case, repo) in [
-        ("a wake", None),
-        ("a wake", Some(dirty.clone())),
-        ("Off and back", None),
-        ("Off and back", Some(dirty.clone())),
+        ("a wake", RepoRead::Clean),
+        ("a wake", RepoRead::Found(dirty.clone())),
+        ("a wake", RepoRead::Unread),
+        ("Off and back", RepoRead::Clean),
+        ("Off and back", RepoRead::Found(dirty.clone())),
+        ("Off and back", RepoRead::Unread),
     ] {
         let (mut st, now) = landed_at(t0());
         let r = if case == "a wake" {
             idle(
-                if repo.is_none() { QUIET_WAKE } else { wake },
+                if repo.found().is_none() {
+                    QUIET_WAKE
+                } else {
+                    wake
+                },
                 Some(4 * MIN),
             )
         } else {
@@ -17294,17 +17376,17 @@ fn the_record_keeps_a_landing_only_over_a_clean_repository() {
             ..r
         });
         let (a, _) = past_backoff(&mut st, &r, now + 6 * MIN);
-        if repo.is_none() {
+        if repo.is_clean() {
             assert_eq!(a, TurnEndAction::Nothing, "{case}, a clean repository");
             assert!(st.landed(), "{case}, a clean repository");
             assert_eq!(st.face(), TaskFace::Landed, "{case}");
         } else {
-            let owed = if case == "a wake" {
-                nudged.clone()
-            } else {
-                land_instruction()
+            let owed = match (case, &repo) {
+                ("a wake", RepoRead::Unread) => unread.clone(),
+                ("a wake", _) => nudged.clone(),
+                _ => land_instruction(),
             };
-            assert_eq!(a, owed, "{case}, work in the repository");
+            assert_eq!(a, owed, "{case}, work in the repository: {repo:?}");
             assert!(!st.landed() && !st.task_done(), "{case}");
             assert_eq!(st.face(), TaskFace::Open, "{case}");
         }
@@ -17484,7 +17566,12 @@ fn a_landing_stands_through_a_wall_whether_restored_or_live() {
             let (st, now) = landed_at(t0());
             (st, now, Some(MIN))
         };
-        let limit = limit_at(now, worked, record, repo);
+        let limit = limit_at(
+            now,
+            worked,
+            record,
+            crate::harness::repo_work::RepoRead::of_found(repo),
+        );
         let first = at(&mut st, &limit, now);
         let later = now + 40 * MIN;
         let a = act(&mut st, &limit, later);

@@ -47,8 +47,9 @@
 Source: `crates/aterm-http` (read only). I read every `#[test]` (src/client.rs 28, src/pem.rs 11,
 src/proxy.rs 16, src/stream.rs 4, src/tls.rs 2, src/uri.rs 10, src/verifier/tests.rs 10,
 src/verifier/unix.rs 7, tests/loopback.rs 11, tests/signature_methods.rs 3, tests/tls_stream.rs 2,
-tests/trust_config.rs 2 = 106) and the code each one reaches. `tests/http_suite.rs` has no `#[test]`
-fn: it only declares modules, and a grep counts 107 because of the `#[test]` in its doc comment.
+and 2 in a trust-config test file deleted 2026-10-16 = 106) and the code each one reaches.
+`tests/http_suite.rs` has no `#[test]` fn: it only declares modules, and a grep counts 107 because
+of the `#[test]` in its doc comment.
 Nothing was compiled or run. The claims below come from reading the code.
 
 Result: **42 specs** cover **142 tests**. 36 specs are the primary spec of at least one test. Four
@@ -148,7 +149,7 @@ secret-header-scrub	invariant	client::RequestBuilder::{secret_header, exchange_w
 
 Unqualified test names in `subsumes` are in the file that holds the spec's functions (`src/uri.rs`,
 `src/pem.rs`, `src/proxy.rs`, `src/client.rs`, `src/stream.rs`, `src/tls.rs`). A `loopback::`,
-`trust_config::`, `tls_stream::`, `signature_methods::`, `golden_post::`, `methods::` or
+`tls_stream::`, `signature_methods::`, `golden_post::`, `methods::` or
 `streaming::` prefix is the file under `tests/`; `connect::` is `src/connect.rs`, and
 `verifier::tests::` and `verifier::unix::` are `src/verifier/tests.rs` and `src/verifier/unix.rs`.
 

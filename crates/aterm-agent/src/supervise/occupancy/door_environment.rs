@@ -5,12 +5,13 @@
 //! here performs. The loop's own bind where the real code runs: `Intend` and `Lapse` on
 //! [`super::decide`], `IdleRead` and `HoldCloses` on [`super::HoldClock::step`], `Crash` on
 //! [`crate::supervise::facts::FactsState::seed`], `Type` on the loop's fenced write
-//! (`Session::type_fact`) and `Skip` on its skipped outcome (`Session::door_skipped`), each
-//! projected by the Tier-1 bind (`tests/conformance_occupancy.rs`). Proof and test builds only.
+//! (`Session::type_fact`), `Skip` on its skipped outcome (`Session::door_skipped`), and `Sample`
+//! and `SampleLast` on the K clock's look ([`super::due::DueClock::sample`]), each projected by
+//! the Tier-1 bind (`tests/conformance_occupancy.rs`). Proof and test builds only.
 
 /// The world, the loop's steps not built yet and the mutants of `OccupancyDoor`: the agent's, the
-/// person's, the machine's, the host's and the clock's steps the Tier-1 bind mirrors, the K Entry
-/// that nothing implements yet, and each `Buggy` member.
+/// person's, the machine's, the host's and the clock's steps the Tier-1 bind mirrors, and each
+/// `Buggy` member.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
@@ -169,22 +170,6 @@
         machine = "OccupancyDoor",
         action = "UpgradeTypes",
         reason = "The upgrade's notice typed at the break: the host's own step (IdleHost::at_background), which the break's step takes before the door's write and which holds the door's line there (Guard::HostLine). The Tier-1 bind sets the host's line and the clock's answer owed exactly there."
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::spec_unmodeled(
-        machine = "OccupancyDoor",
-        action = "Sample",
-        reason = "One look toward the K Entry, not implemented yet."
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::spec_unmodeled(
-        machine = "OccupancyDoor",
-        action = "SampleLast",
-        reason = "The K-th look, raising the Entry, not implemented yet."
     )
 )]
 #[cfg_attr(

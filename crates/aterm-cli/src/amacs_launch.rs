@@ -11,8 +11,9 @@ use std::process::ExitCode;
 /// Run amacs with `args` (argv past `amacs`, or past `aterm edit`).
 #[must_use]
 pub fn run(args: Vec<OsString>) -> ExitCode {
-    // SAFETY: the trusted entry of the amacs process, reached exactly once, before any input (an
-    // argument, a key, a file) is read.
+    // SAFETY: the trusted entry of the amacs process, reached exactly once, before amacs processes
+    // any of its input (an argument, a key, a file): the front door has only matched argv0 and the
+    // verb to route here.
     let authority = unsafe { aterm_cap::Authority::root_authority() };
     amacs_term::run_client(args, authority.grant(aterm_cap::Tier::Trusted))
 }

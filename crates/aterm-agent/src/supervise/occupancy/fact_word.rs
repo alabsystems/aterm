@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Closed fact word (`<rule>@v<n>#<ordinal>`) on a managed worker's task record ([`NoteOutcome`]).
+//! Closed fact word (`<rule>@v<n>#<ordinal>`) on a managed worker's task record, and the host's
+//! answer to the loop's write of it ([`NoteOutcome`]).
 
 use std::num::NonZeroU16;
 
 use super::rules::RuleId;
 
-/// THE FACT WORD (`<rule>@v<n>#<ordinal>`) ([`RuleId::name`]).
+/// THE FACT WORD (`<rule>@v<n>#<ordinal>`): a built-in rule ([`RuleId::name`]) and an ordinal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FactWord {
     /// The rule whose line would have gone.

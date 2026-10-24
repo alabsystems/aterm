@@ -265,7 +265,7 @@ impl Entry {
         self
     }
 
-    /// Its words move only when its fact does.
+    /// Its words move only when its fact does, so each restatement is shown at once.
     #[must_use]
     pub const fn restated_at_once(mut self) -> Self {
         self.at_once = true;

@@ -54,8 +54,9 @@ pub struct Table {
 /// The items `table` asks for: `homebrew.pkg`, `homebrew.ruby` after it, then
 /// `homebrew.formula.<name>` and `homebrew.cask.<name>`, each waiting for both.
 /// # Errors
-/// One line naming what cannot be expanded: no owner, an owner this Mac does not have, a malformed
-/// pkg pin, a name `brew` would read as an option.
+/// One line naming what cannot be expanded: no owner, an owner this Mac does not have or
+/// root, a malformed pkg pin, a formula or cask name `brew` could read as an option or a
+/// path.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let owner_name = table
         .owner

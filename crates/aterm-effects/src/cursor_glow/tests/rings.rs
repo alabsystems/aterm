@@ -400,9 +400,8 @@ fn a_landing_at_the_grids_edge_fades_before_the_edge() {
 /// its bloom lights over a dark page, through its life, is lit an
 /// orange-red (the light it adds at most 30 degrees of hue, saturated),
 /// never the khaki a thin amber lays over the dark where a bloom thins out
-/// (a dim `#352b1c` disc stood around a jump's landing, 2026-10-22).
-/// Negative control: the same blooms in the white-hot flash cooling to
-/// amber that it was light khaki pixels.
+/// (a dim `#352b1c` disc around a jump's landing). Negative control: laid in
+/// the white-hot flash cooling to amber, the same blooms light khaki pixels.
 #[test]
 fn a_dark_fire_landing_flash_burns_as_an_ember_to_its_rim() {
     let g = tall_geom();
@@ -764,22 +763,24 @@ fn a_paper_landing_veil_keeps_the_caret_row_through_a_hidden_caret() {
 }
 
 /// THE DARK LANDING VEIL STAYS IN THE CARET'S CELL AND ROW, IN ITS STYLE'S
-/// HUE (2026-10-22, the trail gallery's `enter-bottom` at 120 ms: after an
+/// HUE (the trail gallery's `enter-bottom` at 120 ms: unbound, after an
 /// Enter at the bottom row the bloom, carried up with the scrolled text,
-/// stood as a round grey haze two rows over the caret on `$ echo` and `the
+/// stands as a round grey haze two rows over the caret on `$ echo` and `the
 /// qu`: sparkle `#303236`, comet `#2d3237`, phaser and lumen `#1f322f`,
 /// laser `#272437`). The dark twin of the paper tests above, on two dark
 /// themes, each veiled style with its own colour and the accent a window
 /// derives from it (brightened 1.5x, near white). Through the whole frame
 /// step (a jump lays the landing on the bottom row, the Enter's two scrolls
 /// carry it two rows up with the text, and one frame the host withholds the
-/// caret) the landing's light lies over none of the rows above the caret's. And the ring
-/// itself, landed two rows up where the scroll left it: every pixel it lays
-/// lies in the caret's row within [`CursorGlow::LIGHT_VEIL_REACH_CELLS`] of
-/// its centre (graded by the landing's impact, [`classic_ring_radius_factor`]), the theme's text over it keeps 4.5:1, and its light is its
-/// style's hue (its lift over the page saturated 0.6 or more). NEGATIVE
-/// CONTROL: the veil as it was ([`CursorGlow::veil_unbound`]) lies over the
-/// rows above, leaves the caret's row, and its light is grey.
+/// caret) the landing's light lies over none of the rows above the caret's.
+/// And the ring itself, landed two rows up where the scroll left it: every
+/// pixel it lays lies in the caret's row within
+/// [`CursorGlow::LIGHT_VEIL_REACH_CELLS`] of its centre (graded by the
+/// landing's impact, [`classic_ring_radius_factor`]), the theme's text over
+/// it keeps 4.5:1, and its light is its style's hue (its lift over the page
+/// saturated 0.6 or more). NEGATIVE CONTROL: the veil unbound
+/// ([`CursorGlow::veil_unbound`]) lies over the rows above, leaves the
+/// caret's row, and its light is grey.
 #[test]
 fn a_dark_landing_veil_stays_in_the_caret_row_in_its_hue() {
     let g = tall_geom();
@@ -1038,13 +1039,13 @@ fn a_ring_on_the_last_row_melts_into_the_box_edge() {
     );
 }
 
-/// A COLOUR THE USER CHOSE LANDS AS ITSELF (2026-10-23, review): the dark
-/// landing veil re-hued a near-grey ring colour to the trail's and pushed
-/// every colour to full value and a clean chroma, so a pinned white accent
-/// landed green and a pinned `#8040c0` Laser `#9f40ff`. With the colour chosen ([`ColourPins`]),
-/// the veil's light keeps the chosen colour's hue and saturation (a grey
-/// stays grey), held legible by its coverage alone. Negative control: the
-/// same colours unchosen are re-hued or saturated.
+/// A COLOUR THE USER CHOSE LANDS AS ITSELF: unchosen, the dark landing veil
+/// re-hues a near-grey ring colour to the trail's and pushes every colour to
+/// full value and a clean chroma, which would land a pinned white accent
+/// green and a pinned `#8040c0` Laser `#9f40ff`. With the colour chosen
+/// ([`ColourPins`]), the veil's light keeps the chosen colour's hue and
+/// saturation (a grey stays grey), held legible by its coverage alone.
+/// Negative control: the same colours unchosen are re-hued or saturated.
 #[test]
 fn a_chosen_colour_lands_as_itself_on_dark() {
     let g = geom();

@@ -3973,9 +3973,12 @@ fn a_spent_cap_under_prompt_is_the_tabs_hold_entry() {
         ],
         at_ms: 1_792_600_000_000,
         reading: OccupancyReading::default(),
+        ready_idle: None,
     };
-    let sid = "s-occupancy-hold";
     let mut app = App::headless_for_test();
+    let stable = occupancy_sid(&app);
+    let sid = stable.as_str();
+    crate::occupancy_host::set_mode(Occupancy::Prompt);
     let spent = [SaidVerdict::Quiet, SaidVerdict::Spent];
     for _ in 0..2 {
         app.note_harness_host(HostNote::OccupancySaid {
@@ -3998,10 +4001,252 @@ fn a_spent_cap_under_prompt_is_the_tabs_hold_entry() {
     assert!(app.messages.digest().is_empty(), "nothing spent ends it");
 
     let mut observe = App::headless_for_test();
-    observe.note_occupancy_said(sid, word(Occupancy::Observe, [SaidVerdict::Spent; 2]));
+    let observe_sid = occupancy_sid(&observe);
+    crate::occupancy_host::set_mode(Occupancy::Prompt);
+    observe.note_occupancy_said(
+        &observe_sid,
+        word(Occupancy::Observe, [SaidVerdict::Spent; 2]),
+    );
     assert!(
         observe.messages.digest().is_empty(),
         "observe raises nothing"
     );
     crate::occupancy_host::told(sid, None);
+    crate::occupancy_host::told(&observe_sid, None);
+    crate::occupancy_host::set_mode(Occupancy::Observe);
+}
+
+/// The existing headless fixture's registered tab, rather than an invented host-note SID.
+fn occupancy_sid(app: &App) -> String {
+    app.pool
+        .get(0)
+        .expect("session 0")
+        .ctx
+        .self_id
+        .as_str()
+        .to_string()
+}
+
+/// A told word of an open hold under `mode`: each rule's verdict, and the K clock's line.
+fn occupancy_word(
+    mode: aterm_agent::supervise::Occupancy,
+    verdicts: [aterm_agent::supervise::occupancy::SaidVerdict; 2],
+    ready_idle: Option<aterm_agent::supervise::occupancy::SaidReadyIdle>,
+) -> aterm_agent::supervise::occupancy::OccupancySaid {
+    use aterm_agent::supervise::occupancy::{
+        OccupancyReading, OccupancySaid, RuleId, SaidHold, SaidRule,
+    };
+    OccupancySaid {
+        mode,
+        hold: Some(SaidHold {
+            since_ms: 1_792_600_000_000,
+            declared: false,
+        }),
+        ready: false,
+        guards: None,
+        rules: RuleId::ALL
+            .into_iter()
+            .zip(verdicts)
+            .map(|(rule, verdict)| SaidRule {
+                rule,
+                verdict,
+                at_ms: 1_792_600_000_000,
+            })
+            .collect(),
+        at_ms: 1_792_601_800_000,
+        reading: OccupancyReading::default(),
+        ready_idle,
+    }
+}
+
+/// The K clock's line of a nudge the autopilot held from the hold's first minute.
+fn held_nudge() -> aterm_agent::supervise::occupancy::SaidReadyIdle {
+    aterm_agent::supervise::occupancy::SaidReadyIdle {
+        rule: aterm_agent::supervise::occupancy::RuleId::WaitNudge,
+        guard: Some(aterm_agent::supervise::Guard::Autopilot),
+        since_ms: 1_792_600_000_000,
+    }
+}
+
+/// THE K ENTRY (the slice-2 plan's D2, `occupancy.ready-idle`): told through the host's note, a
+/// word under `prompt` that names a due line held K looks raises the tab's entry, once while it
+/// stands, where the owner's mode in force here is `prompt` too; the next word, the line told
+/// (typed, or no longer due), clears it. NEGATIVE CONTROLS: the same word under `observe` raises
+/// nothing, and a word that says `prompt` while the owner's mode here does not raises nothing.
+#[test]
+fn a_due_line_held_k_looks_under_prompt_is_the_tabs_ready_idle_entry() {
+    use aterm_agent::supervise::Occupancy;
+    use aterm_agent::supervise::occupancy::SaidVerdict::Quiet;
+    let idle = held_nudge();
+    let mut app = App::headless_for_test();
+    let stable = occupancy_sid(&app);
+    let sid = stable.as_str();
+    crate::occupancy_host::set_mode(Occupancy::Prompt);
+    for _ in 0..2 {
+        app.note_harness_host(HostNote::OccupancySaid {
+            sid: sid.to_string(),
+            said: occupancy_word(Occupancy::Prompt, [Quiet; 2], Some(idle)),
+        });
+    }
+    let digest = app.messages.digest();
+    assert_eq!(digest.len(), 1, "{digest:?}");
+    assert_eq!(digest.entries[0].key, mr::occupancy_ready_idle_key(sid));
+    for guard in [idle.guard, None] {
+        mr::occupancy_ready_idle_entry(
+            sid,
+            &aterm_agent::supervise::occupancy::SaidReadyIdle { guard, ..idle },
+            1_792_601_800_000,
+        )
+        .message()
+        .expect("the words pass the rule");
+    }
+    app.note_occupancy_said(sid, occupancy_word(Occupancy::Prompt, [Quiet; 2], None));
+    assert!(app.messages.digest().is_empty(), "told: it ends");
+
+    let mut observe = App::headless_for_test();
+    let observe_sid = occupancy_sid(&observe);
+    crate::occupancy_host::set_mode(Occupancy::Prompt);
+    observe.note_occupancy_said(
+        &observe_sid,
+        occupancy_word(Occupancy::Observe, [Quiet; 2], Some(idle)),
+    );
+    assert!(
+        observe.messages.digest().is_empty(),
+        "observe raises nothing"
+    );
+
+    let mut forged = App::headless_for_test();
+    let forged_sid = occupancy_sid(&forged);
+    crate::occupancy_host::set_mode(Occupancy::Observe);
+    assert!(!crate::occupancy_host::prompt_now());
+    forged.note_occupancy_said(
+        &forged_sid,
+        occupancy_word(Occupancy::Prompt, [Quiet; 2], Some(idle)),
+    );
+    assert!(
+        forged.messages.digest().is_empty(),
+        "a word that says prompt raises nothing the owner's mode here does not grant"
+    );
+    crate::occupancy_host::told(sid, None);
+    crate::occupancy_host::told(&observe_sid, None);
+    crate::occupancy_host::told(&forged_sid, None);
+}
+
+/// A tab's close ends its occupancy entries even when a queued word arrives afterward. The
+/// registered peer's same word still stands as the negative control.
+#[test]
+fn a_closed_tabs_occupancy_entries_end_with_it() {
+    use aterm_agent::supervise::Occupancy;
+    use aterm_agent::supervise::occupancy::SaidVerdict::{Quiet, Spent};
+    let mut app = App::headless_for_test();
+    crate::occupancy_host::set_mode(Occupancy::Prompt);
+    let sid = app
+        .pool
+        .get(0)
+        .expect("session 0")
+        .ctx
+        .self_id
+        .as_str()
+        .to_string();
+    let peer = crate::stub_session(1);
+    let open = peer.ctx.self_id.as_str().to_string();
+    App::register_session(&app.store, &peer, None);
+    let queued = occupancy_word(Occupancy::Prompt, [Quiet, Spent], Some(held_nudge()));
+    for tab in [sid.as_str(), open.as_str()] {
+        app.note_occupancy_said(tab, queued.clone());
+    }
+    let keys = |app: &App| -> std::collections::BTreeSet<String> {
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .map(|e| e.key.clone())
+            .collect()
+    };
+    let of = |tab: &str| {
+        [
+            mr::occupancy_hold_key(tab),
+            mr::occupancy_ready_idle_key(tab),
+        ]
+    };
+    let all: std::collections::BTreeSet<String> = of(&sid).into_iter().chain(of(&open)).collect();
+    assert_eq!(keys(&app), all);
+    app.retire_session_registration(0);
+    assert_eq!(keys(&app), of(&open).into_iter().collect());
+    for tab in [sid.as_str(), open.as_str()] {
+        app.note_harness_host(HostNote::OccupancySaid {
+            sid: tab.to_string(),
+            said: queued.clone(),
+        });
+    }
+    assert_eq!(
+        keys(&app),
+        of(&open).into_iter().collect(),
+        "the queued closed-tab word stays retired; the registered peer still stands"
+    );
+    crate::occupancy_host::set_mode(Occupancy::Observe);
+    for tab in [sid.as_str(), open.as_str()] {
+        crate::occupancy_host::told(tab, None);
+    }
+}
+
+/// THE OWNER'S MODE LEAVING `prompt` ENDS EVERY TAB'S OCCUPANCY ENTRIES, the `hold` and the
+/// `ready-idle` one that `prompt` alone raises, for `off` and `observe` alike. Delivering queued
+/// prompt words afterward restores neither; a registered tab under prompt can still raise both.
+#[test]
+fn the_owners_mode_leaving_prompt_ends_every_tabs_occupancy_entries() {
+    use aterm_agent::supervise::Occupancy;
+    use aterm_agent::supervise::occupancy::SaidVerdict::{Quiet, Spent};
+    let keys = |app: &App| -> std::collections::BTreeSet<String> {
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .map(|e| e.key.clone())
+            .collect()
+    };
+    for left in [Occupancy::Off, Occupancy::Observe] {
+        let mut app = App::headless_for_test();
+        let peer = crate::stub_session(1);
+        let tabs = [occupancy_sid(&app), peer.ctx.self_id.as_str().to_string()];
+        App::register_session(&app.store, &peer, None);
+        let queued = occupancy_word(Occupancy::Prompt, [Quiet, Spent], Some(held_nudge()));
+        app.note_occupancy_mode(Occupancy::Prompt);
+        for tab in &tabs {
+            app.note_occupancy_said(tab, queued.clone());
+        }
+        let raised: std::collections::BTreeSet<String> = tabs
+            .iter()
+            .flat_map(|tab| {
+                [
+                    mr::occupancy_hold_key(tab),
+                    mr::occupancy_ready_idle_key(tab),
+                ]
+            })
+            .chain([mr::occupancy_prompt_key()])
+            .collect();
+        assert_eq!(keys(&app), raised);
+        app.note_occupancy_mode(Occupancy::Prompt);
+        assert_eq!(keys(&app), raised, "prompt again: they stand");
+        app.note_occupancy_mode(left);
+        assert!(keys(&app).is_empty(), "{left:?}: {:?}", keys(&app));
+        for tab in &tabs {
+            app.note_harness_host(HostNote::OccupancySaid {
+                sid: tab.clone(),
+                said: queued.clone(),
+            });
+        }
+        assert!(
+            keys(&app).is_empty(),
+            "{left:?}: queued prompt words cannot restore either entry"
+        );
+        app.note_occupancy_mode(Occupancy::Prompt);
+        app.note_occupancy_said(&tabs[0], queued);
+        assert!(keys(&app).contains(&mr::occupancy_hold_key(&tabs[0])));
+        assert!(keys(&app).contains(&mr::occupancy_ready_idle_key(&tabs[0])));
+        for tab in &tabs {
+            crate::occupancy_host::told(tab, None);
+        }
+    }
+    crate::occupancy_host::set_mode(Occupancy::Observe);
 }

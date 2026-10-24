@@ -145,6 +145,8 @@ struct Mug {
     awake: Option<Awake>,
     /// The one activity-acquisition door.
     awake_begin: fn(&str) -> Option<Awake>,
+    /// Restore saved state, including any corrective save-back.
+    take_saved: fn(&Path, Clocks) -> std::io::Result<Mode>,
     /// Whether a replaced origin still has the `caffeine` verb ([`crate::code::serves_caffeine`]).
     origin_serves: fn(&Path) -> Option<bool>,
     /// Start a bridge that holds the Mac awake while the mug restarts ([`bridge::start`]).
@@ -269,15 +271,16 @@ impl Mug {
         Next::Tick(next_tick_secs(self.mode, now))
     }
 
-    /// The tick, and a wake from sleep.
+    /// The tick, and a wake from sleep. A timed mode that has ended is taken from the file again
+    /// ([`Mug::reload`]): the mug's own restores off, and a writer's change saved before its
+    /// notification is taken is kept.
     fn tick(&mut self, now: Clocks, menu_open: bool) -> Next {
-        let settled = self.mode.settled(now);
-        if settled == self.mode {
+        if self.mode.settled(now) == self.mode {
             if !self.apply(now) {
                 return Next::Stop(Exit::Quit);
             }
             self.refresh(now);
-        } else if let stop @ Next::Stop(_) = self.set(settled, now) {
+        } else if let stop @ Next::Stop(_) = self.reload(now) {
             return stop;
         }
         if !menu_open && self.watch.as_mut().is_some_and(Watch::replaced) {
@@ -318,24 +321,32 @@ impl Mug {
     }
 
     /// Take the saved mode at `now`, saving it back when the file is one to ([`state::take`]):
-    /// one on the wall clock alone, or one whose deadline the restore changed. So no later read
-    /// of the file, by `status`, a bridge or the next mug, reads another time than the mug holds.
-    /// A writer's change that lands before that save is taken instead
-    /// ([`state::take_saving`]). Whether the save, if due, was made.
+    /// one on the wall clock alone, or one whose deadline the restore changed, but for one
+    /// brought in by no more than [`state::DRIFT_SECS`]. So no later read of the file, by
+    /// `status`, a bridge or the next mug, reads another time than the mug holds by more than
+    /// those seconds. A writer's change that lands before that save is taken instead
+    /// ([`state::take_saving`]). Whether the save, if due, was made; when it was not, the mug
+    /// keeps its own mode, settled at `now`, so one that has ended is off.
     fn take(&mut self, now: Clocks) -> bool {
         let file = self.paths.state_file();
-        match state::take_saving(&file, now) {
+        match (self.take_saved)(&file, now) {
             Ok(mode) => {
                 self.mode = mode;
                 true
             }
-            Err(err) => saved(&file, Err(err)),
+            Err(err) => {
+                self.mode = self.mode.settled(now);
+                saved(&file, Err(err))
+            }
         }
     }
 
-    /// Take the writer's mode.
+    /// Take the file's mode: a writer's, or the mug's own. The mode held is applied even when
+    /// the take's save fails and the mug stops, so a span that has ended lets go of the activity
+    /// at once, not only when the app stops, which waits for an open menu ([`schedule_stop`]).
     fn reload(&mut self, now: Clocks) -> Next {
-        if !self.take(now) || !self.apply(now) {
+        let took = self.take(now);
+        if !self.apply(now) || !took {
             return Next::Stop(Exit::Quit);
         }
         Next::Tick(next_tick_secs(self.mode, now))
@@ -850,6 +861,7 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
         version,
         awake: None,
         awake_begin: Awake::begin,
+        take_saved: state::take_saving,
         origin_serves: crate::code::serves_caffeine,
         bridge_start: bridge::start,
         doors: super::STARTUP_DOORS,
@@ -1075,6 +1087,7 @@ mod tests {
             mode: Mode::Off,
             awake: None,
             awake_begin: Awake::begin,
+            take_saved: state::take_saving,
             origin_serves: |_| Some(true),
             bridge_start: || panic!("only a restart that holds the activity starts a bridge"),
             doors: StartupDoors {
@@ -1428,6 +1441,111 @@ mod tests {
                 "{writers:?}"
             );
         }
+    }
+
+    /// Activate for 1 Hour, and a writer's save as the hour ends, its notification not yet
+    /// taken: on with no end, a new hour, or a new hour on clocks a second ahead of the tick's.
+    /// The tick that ends the hour takes the writer's mode and leaves its file as it is; with no
+    /// writer, it lets go and saves off.
+    #[test]
+    fn the_tick_that_ends_a_span_keeps_a_writers_mode() {
+        let end = NOW + HOUR;
+        let at = end + 1;
+        for writers in [
+            None,
+            Some((Mode::Forever, end)),
+            Some((Mode::chosen(Choice::Hours1, end), end)),
+            Some((Mode::chosen(Choice::Hours1, at + 1), at + 1)),
+        ] {
+            let dir = aterm_tempfile::tempdir().expect("tempdir");
+            let mut mug = scratch_mug(dir.path());
+            let file = mug.paths.state_file();
+            let _ = mug.choose(MenuAction::Activate(Choice::Hours1), NOW);
+            let text = writers.map(|(mode, saved_at)| {
+                state::save_at(&file, mode, saved_at).expect("the writer's save");
+                std::fs::read_to_string(&file).expect("the writer's file")
+            });
+            assert_eq!(mug.tick(at, false), Next::Tick(TICK_SECS), "{writers:?}");
+            let want = writers.map_or(Mode::Off, |(mode, _)| mode.settled(at));
+            assert_eq!(mug.mode, want, "{writers:?}");
+            assert_eq!(mug.awake.is_some(), writers.is_some(), "{writers:?}");
+            match text {
+                Some(text) => assert_eq!(
+                    std::fs::read_to_string(&file).expect("the state file"),
+                    text,
+                    "{writers:?}"
+                ),
+                None => assert_eq!(saved(&mug), Some(Mode::Off), "CONTROL"),
+            }
+        }
+    }
+
+    /// Activate for 1 Hour, and obstruct the save-back after its expired state is read, the menu
+    /// open: the tick stops on the real storage error and lets go of the activity itself, off,
+    /// rather than leaving it to the stop, which waits for the menu to close.
+    #[test]
+    fn a_span_that_ends_on_a_failed_save_lets_go_at_once() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let mut mug = scratch_mug(dir.path());
+        let _ = mug.choose(MenuAction::Activate(Choice::Hours1), NOW);
+        assert!(mug.awake.is_some());
+        let file = mug.paths.state_file();
+        let before = std::fs::read(&file).expect("the saved span");
+        mug.take_saved = |path, now| {
+            let (mode, was) = state::take(path, now);
+            assert_eq!(mode, Mode::Off, "the saved span has ended");
+            let was = was.expect("the expired span needs a corrective save");
+            struct RestoreParent {
+                path: PathBuf,
+                kept: PathBuf,
+                moved: bool,
+            }
+            impl RestoreParent {
+                fn restore(&mut self) -> std::io::Result<()> {
+                    if self.moved {
+                        match std::fs::remove_file(&self.path) {
+                            Ok(()) => {}
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(err) => return Err(err),
+                        }
+                        std::fs::rename(&self.kept, &self.path)?;
+                        self.moved = false;
+                    }
+                    Ok(())
+                }
+            }
+            impl Drop for RestoreParent {
+                fn drop(&mut self) {
+                    let _ = self.restore();
+                }
+            }
+            let parent = path.parent().expect("private state directory");
+            let mut restore = RestoreParent {
+                path: parent.to_path_buf(),
+                kept: parent.with_extension("preserved"),
+                moved: false,
+            };
+            assert!(!restore.kept.exists(), "the preservation path is new");
+            std::fs::rename(&restore.path, &restore.kept).expect("preserve the state directory");
+            restore.moved = true;
+            std::fs::write(&restore.path, b"not a directory").expect("obstruct the save parent");
+            let failed = state::save_over(path, mode, &was, now);
+            assert!(
+                failed.is_err(),
+                "the real save must fail even with elevated privileges"
+            );
+            restore.restore().expect("restore the state directory");
+            failed.map(|_| mode)
+        };
+        let next = mug.tick(NOW + HOUR + 1, true);
+        assert_eq!(next, Next::Stop(Exit::Quit));
+        assert_eq!(mug.mode, Mode::Off);
+        assert!(mug.awake.is_none());
+        assert_eq!(
+            std::fs::read(&file).expect("the original state file"),
+            before
+        );
+        assert!(!mug.paths.state_dir.with_extension("preserved").exists());
     }
 
     #[test]

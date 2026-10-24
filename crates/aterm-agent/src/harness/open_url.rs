@@ -1170,45 +1170,100 @@ fn resolve_relative_url(base_url: &str, target: &str) -> String {
     if target.starts_with("//") {
         return format!("{scheme}:{target}");
     }
-    let authority = rest.split('/').next().unwrap_or(rest);
+    let (authority, tail) = rest
+        .find(['/', '?', '#'])
+        .map_or((rest, ""), |idx| rest.split_at(idx));
+    let base_path = tail.find(['?', '#']).map_or(tail, |idx| &tail[..idx]);
+    let effective_path = if base_path.is_empty() { "/" } else { base_path };
+    if target.is_empty() {
+        return base_url.split('#').next().unwrap_or(base_url).to_owned();
+    }
+    if target.starts_with('?') {
+        return format!("{scheme}://{authority}{effective_path}{target}");
+    }
     if target.starts_with('/') {
         format!("{scheme}://{authority}{target}")
     } else {
-        format!("{scheme}://{authority}/{target}")
+        let rel = target.strip_prefix("./").unwrap_or(&target);
+        let dir = effective_path
+            .rfind('/')
+            .map_or("/", |idx| &effective_path[..=idx]);
+        format!("{scheme}://{authority}{dir}{rel}")
     }
 }
 
-fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let needle = format!("{attr_name}=");
-    let mut search_from = 0;
-    while let Some(rel) = lower[search_from..].find(&needle) {
-        let idx = search_from + rel;
-        let prev_ok = idx == 0
-            || tag.as_bytes()[idx - 1].is_ascii_whitespace()
-            || matches!(tag.as_bytes()[idx - 1], b'"' | b'\'');
-        let val_start = idx + needle.len();
-        search_from = val_start;
-        if !prev_ok || val_start >= tag.len() {
+/// Find a real attribute; `Some(None)` is a bare boolean attribute.
+fn html_attr<'a>(tag: &'a str, attr_name: &str) -> Option<Option<&'a str>> {
+    let bytes = tag.as_bytes();
+    // All callers supply an opening tag. Skip its name before reading attributes.
+    let mut pos = bytes
+        .iter()
+        .position(|&b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/'))?;
+    while pos < bytes.len() {
+        while pos < bytes.len() && (bytes[pos].is_ascii_whitespace() || bytes[pos] == b'/') {
+            pos += 1;
+        }
+        if pos == bytes.len() || bytes[pos] == b'>' {
+            break;
+        }
+        let start = pos;
+        while pos < bytes.len()
+            && !bytes[pos].is_ascii_whitespace()
+            && !matches!(bytes[pos], b'=' | b'>' | b'/')
+        {
+            pos += 1;
+        }
+        if start == pos {
+            pos += 1;
             continue;
         }
-        let rest = &tag[val_start..];
-        if let Some(stripped) = rest.strip_prefix('"') {
-            if let Some(end) = stripped.find('"') {
-                return Some(decode_html_amp(&stripped[..end]));
+        let name = &tag[start..pos];
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        let value = if bytes.get(pos) == Some(&b'=') {
+            pos += 1;
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
             }
-        } else if let Some(stripped) = rest.strip_prefix('\'') {
-            if let Some(end) = stripped.find('\'') {
-                return Some(decode_html_amp(&stripped[..end]));
+            let first = *bytes.get(pos)?;
+            let start = pos;
+            if matches!(first, b'"' | b'\'') {
+                pos += 1;
+                let end = pos + bytes[pos..].iter().position(|b| *b == first)?;
+                let value = &tag[pos..end];
+                pos = end + 1;
+                Some(value)
+            } else {
+                while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() && bytes[pos] != b'>' {
+                    pos += 1;
+                }
+                Some(&tag[start..pos])
             }
         } else {
-            let end = rest
-                .find(|c: char| c.is_ascii_whitespace() || c == '>')
-                .unwrap_or(rest.len());
-            return Some(decode_html_amp(&rest[..end]));
+            None
+        };
+        if name.eq_ignore_ascii_case(attr_name) {
+            return Some(value);
         }
     }
     None
+}
+
+fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
+    html_attr(tag, attr_name).flatten().map(decode_html_amp)
+}
+
+fn has_html_attr(tag: &str, attr_name: &str) -> bool {
+    html_attr(tag, attr_name).is_some()
+}
+
+fn is_negative_form_token(s: &str) -> bool {
+    let lower = s.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "deny" | "cancel" | "reject" | "decline" | "no" | "false" | "logout" | "signout"
+    )
 }
 
 /// Parses an OAuth consent page into `(HTTP method, resolved action URL, optional form body)`.
@@ -1227,55 +1282,158 @@ pub fn parse_html_approval_action(
         ));
     }
     let lower = html.to_ascii_lowercase();
-    if let Some(form_start) = lower.find("<form") {
+    let mut best_form: Option<(u8, String, String, Option<String>)> = None;
+    let mut search_pos = 0;
+    while let Some(rel_start) = lower[search_pos..].find("<form") {
+        let form_start = search_pos + rel_start;
+        let after_name = form_start + 5;
+        if after_name < lower.len()
+            && !lower.as_bytes()[after_name].is_ascii_whitespace()
+            && !matches!(lower.as_bytes()[after_name], b'>' | b'/')
+        {
+            search_pos = after_name;
+            continue;
+        }
         let form_slice = &html[form_start..];
-        let form_end = lower[form_start..]
+        let form_lower = &lower[form_start..];
+        let form_end = form_lower
             .find("</form>")
             .map_or(form_slice.len(), |e| e + 7);
+        search_pos = form_start + form_end;
         let form_html = &form_slice[..form_end];
-        let tag_end = form_html.find('>')?;
+        let Some(tag_end) = form_html.find('>') else {
+            continue;
+        };
         let open_tag = &form_html[..=tag_end];
         let action = extract_attr(open_tag, "action").map_or_else(
             || base_url.to_owned(),
             |a| resolve_relative_url(base_url, &a),
         );
+        let action_low = action.to_ascii_lowercase();
+        if [
+            "logout", "signout", "sign-out", "deny", "cancel", "reject", "decline", "/search",
+        ]
+        .iter()
+        .any(|bad| action_low.contains(bad))
+        {
+            continue;
+        }
         let method = extract_attr(open_tag, "method")
             .unwrap_or_else(|| "GET".to_owned())
             .to_ascii_uppercase();
         let mut fields = Vec::new();
-        let mut scan = form_html;
-        while let Some(in_pos) = scan.to_ascii_lowercase().find("<input") {
-            let after_in = &scan[in_pos..];
-            let Some(end_in) = after_in.find('>') else {
+        let mut submitted_button = false;
+        let mut scan = &form_html[tag_end + 1..];
+        while !scan.is_empty() {
+            let scan_low = scan.to_ascii_lowercase();
+            let next_in = scan_low.find("<input");
+            let next_btn = scan_low.find("<button");
+            let (ctrl_pos, is_button, tag_len) = match (next_in, next_btn) {
+                (Some(i), Some(b)) if i <= b => (i, false, 6),
+                (Some(_), Some(b)) => (b, true, 7),
+                (Some(i), None) => (i, false, 6),
+                (None, Some(b)) => (b, true, 7),
+                (None, None) => break,
+            };
+            let after_ctrl = &scan[ctrl_pos..];
+            if after_ctrl.len() > tag_len
+                && !after_ctrl.as_bytes()[tag_len].is_ascii_whitespace()
+                && !matches!(after_ctrl.as_bytes()[tag_len], b'>' | b'/')
+            {
+                scan = &after_ctrl[tag_len..];
+                continue;
+            }
+            let Some(end_ctrl) = after_ctrl.find('>') else {
                 break;
             };
-            let input_tag = &after_in[..=end_in];
-            if let Some(name) = extract_attr(input_tag, "name") {
-                let value = extract_attr(input_tag, "value").unwrap_or_default();
+            let ctrl_tag = &after_ctrl[..=end_ctrl];
+            scan = &after_ctrl[end_ctrl + 1..];
+            if has_html_attr(ctrl_tag, "disabled") {
+                continue;
+            }
+            let ctrl_type = extract_attr(ctrl_tag, "type")
+                .unwrap_or_else(|| {
+                    if is_button {
+                        "submit".to_owned()
+                    } else {
+                        "text".to_owned()
+                    }
+                })
+                .to_ascii_lowercase();
+            if matches!(ctrl_type.as_str(), "reset" | "button") {
+                continue;
+            }
+            if matches!(ctrl_type.as_str(), "checkbox" | "radio")
+                && !has_html_attr(ctrl_tag, "checked")
+            {
+                continue;
+            }
+            let is_submit = is_button || matches!(ctrl_type.as_str(), "submit" | "image");
+            if let Some(name) = extract_attr(ctrl_tag, "name") {
+                let value = extract_attr(ctrl_tag, "value").unwrap_or_default();
+                if is_submit {
+                    if is_negative_form_token(&name)
+                        || is_negative_form_token(&value)
+                        || submitted_button
+                    {
+                        continue;
+                    }
+                    submitted_button = true;
+                }
                 fields.push(format!(
                     "{}={}",
                     percent_encode(&name),
                     percent_encode(&value)
                 ));
             }
-            scan = &after_in[end_in + 1..];
         }
         let encoded = fields.join("&");
-        if method == "POST" {
-            return Some(("POST".to_owned(), action, Some(encoded)));
-        }
-        let full_url = if encoded.is_empty() {
-            action
-        } else if action.contains('?') {
-            format!("{action}&{encoded}")
+        let candidate = if method == "POST" {
+            ("POST".to_owned(), action.clone(), Some(encoded))
         } else {
-            format!("{action}?{encoded}")
+            let full_url = if encoded.is_empty() {
+                action.clone()
+            } else if action.contains('?') {
+                format!("{action}&{encoded}")
+            } else {
+                format!("{action}?{encoded}")
+            };
+            ("GET".to_owned(), full_url, None)
         };
-        return Some(("GET".to_owned(), full_url, None));
+        let f_low = form_html.to_ascii_lowercase();
+        let score = if [
+            "approve",
+            "authorize",
+            "consent",
+            "allow",
+            "accept",
+            "confirm",
+            "continue",
+        ]
+        .iter()
+        .any(|kw| action_low.contains(kw) || f_low.contains(kw))
+        {
+            2
+        } else {
+            1
+        };
+        if score == 2 {
+            return Some(candidate);
+        }
+        if best_form.is_none() {
+            best_form = Some((score, candidate.0, candidate.1, candidate.2));
+        }
+    }
+    if let Some((_, m, a, b)) = best_form {
+        return Some((m, a, b));
     }
     let mut scan = html;
-    while let Some(a_pos) = scan.to_ascii_lowercase().find("<a ") {
+    while let Some(a_pos) = scan.to_ascii_lowercase().find("<a") {
         let after_a = &scan[a_pos..];
+        if after_a.len() > 2 && !after_a.as_bytes()[2].is_ascii_whitespace() {
+            scan = &after_a[2..];
+            continue;
+        }
         let Some(end_a) = after_a.find('>') else {
             break;
         };
@@ -1360,9 +1518,14 @@ pub(super) fn loopback_http_exchange(
     let rest = url
         .strip_prefix("http://")
         .ok_or("loopback client takes http:// only")?;
-    let (authority, path_and_query) = match rest.find('/') {
+    let (authority, tail) = match rest.find(['/', '?']) {
         Some(idx) => (&rest[..idx], &rest[idx..]),
         None => (rest, "/"),
+    };
+    let path_and_query = if tail.starts_with('/') {
+        tail.to_owned()
+    } else {
+        format!("/{tail}")
     };
     let (_, port_str) = authority
         .rsplit_once(':')
@@ -1564,11 +1727,15 @@ fn loopback_parts(url: &str) -> Option<(u16, &str, Option<&str>)> {
     let rest = url
         .strip_prefix("http://127.0.0.1:")
         .or_else(|| url.strip_prefix("http://localhost:"))?;
-    let (port, path) = rest.split_once('/')?;
+    let (port, tail) = match rest.find(['/', '?']) {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
     let port = port.parse::<u16>().ok().filter(|port| *port > 0)?;
-    let (path, query) = path
+    let (raw_path, query) = tail
         .split_once('?')
-        .map_or((path, None), |(path, query)| (path, Some(query)));
+        .map_or((tail, None), |(path, query)| (path, Some(query)));
+    let path = raw_path.strip_prefix('/').unwrap_or(raw_path);
     Some((port, path, query))
 }
 

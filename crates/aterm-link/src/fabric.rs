@@ -50,8 +50,9 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
                      or `remote` (no instance here answers as that node)
                    - BRIDGES: each aterm instance on this machine and its bridge
                    - SESSIONS: each session's bus state (`live`, `away`, `gone`), hold,
-                     mail counts, topics, role, detail, phase, context and title
-                     (`rows=4096+ truncated` past 4096 rows)
+                     mail counts, topics, role, detail, phase and title (CTX stays `-`:
+                     no bridge of this build writes it; `rows=4096+ truncated` past 4096
+                     rows)
                    - TRAFFIC: the last 10 bus records, metadata only
                    - WARNINGS: each problem found (`doctor` prints its fix)
   --json           status: one JSON object of the same data; brief: one object whose
@@ -80,7 +81,8 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
                    on: what the broker's ack promises (default the installed job's, else
                    `ordered`):
                    - `ordered`: acks after a disk ordering barrier and flushes in full
-                     within 100 ms (served `strict` where the disk cannot keep the order)
+                     within 100 ms; served `strict` off macOS, for a log off the boot
+                     volume, or where the device refuses the barrier
                    - `strict`: acks after a full drive-cache flush; a power loss loses
                      nothing acked
                    - `relaxed`: acks after the page-cache write; survives a broker
@@ -112,8 +114,10 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
                    brief: read under it instead of the node's cap
 
 `status` and `tail` print no message text (`tail --bodies` does); `status`, `tail`,
-`brief` and a plain `doctor` write nothing. Exit status: 0 healthy, 1 a warning or a
-failed step or proof, 2 fabric off, unreadable config, a refusal, or a usage error.
+`brief` and a plain `doctor` write nothing. Exit status: 0 healthy (`on`: done, even
+when its status warns), 1 a warning, a failed step or proof, or a request the broker
+refused or failed, 2 fabric off, unreadable config, a refused precondition, or a usage
+error.
 ";
 
 const FABRIC_COMMAND_ENV: &str = "ATERM_FABRIC_COMMAND";
@@ -186,7 +190,13 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
             });
         }
         Some("help" | "-h" | "--help") => return Ok(Cmd::Help),
-        Some("brief") => return crate::fabric_brief::BriefOpts::parse(&args[1..]).map(Cmd::Brief),
+        Some("brief") => {
+            let rest = &args[1..];
+            if rest.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+                return Ok(Cmd::Help);
+            }
+            return crate::fabric_brief::BriefOpts::parse(rest).map(Cmd::Brief);
+        }
         Some(flag) if flag.starts_with('-') => ("status", args),
         Some(other) => {
             return Err(format!(
@@ -287,7 +297,11 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 );
             }
             ("tail", "--json") => {
-                return Err("--json is a `status` flag (`aterm fabric --json`)".to_string());
+                return Err(
+                    "--json is a `status` or `brief` flag (`aterm fabric --json`, \
+                     `aterm fabric brief --json`)"
+                        .to_string(),
+                );
             }
             (_, f @ ("--dry-run" | "--service")) => {
                 return Err(format!("{f} is an `on`/`off` flag (`aterm fabric on {f}`)"));
@@ -4436,6 +4450,9 @@ mod tests {
     fn the_grammar_is_status_by_default_and_refuses_what_it_does_not_know() {
         assert_eq!(parse_args(&[]), Ok(Cmd::Status { json: false }));
         assert_eq!(parse_args(&argv("--json")), Ok(Cmd::Status { json: true }));
+        for help in ["brief --help", "brief -h", "brief --json -h", "tail --help"] {
+            assert_eq!(parse_args(&argv(help)), Ok(Cmd::Help), "{help}");
+        }
         for bad in [
             "pub/>",
             "/f//pub/>",

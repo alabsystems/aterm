@@ -65,6 +65,7 @@ fn said(
         ],
         at_ms,
         reading: reading(at_ms),
+        ready_idle: None,
     }
 }
 
@@ -264,4 +265,91 @@ fn the_told_rules_print_as_slice_ones_array() {
     assert!(RuleId::ALL.into_iter().all(RuleId::slice1));
     let one = vec![s.rules[0]];
     assert_ne!(format!("{one:?}"), format!("{slice1:?}"));
+}
+
+/// A line of the hold due past K looks.
+fn raised() -> SaidReadyIdle {
+    SaidReadyIdle {
+        rule: RuleId::WaitNudge,
+        guard: Some(Guard::Draft),
+        since_ms: SINCE + 30 * MIN,
+    }
+}
+
+/// THE READY-IDLE LINE IS THE ENTRY'S UNDER `prompt` ALONE, with a hold open (the plan's W4, the
+/// loop's half): the word names it under every mode, and only `prompt` hands it on. NEGATIVE
+/// CONTROLS: `observe`, `off` and a closed hold hand on nothing; a word with none hands on none.
+#[test]
+fn the_ready_idle_line_is_named_under_prompt_alone() {
+    let word = |mode: Occupancy| {
+        let mut s = said(
+            mode,
+            [SaidVerdict::Held(Guard::Draft), SaidVerdict::Quiet],
+            None,
+        );
+        s.ready_idle = Some(raised());
+        s
+    };
+    assert_eq!(
+        word(Occupancy::Prompt).ready_idle_under_prompt(),
+        Some(raised())
+    );
+    for mode in [Occupancy::Observe, Occupancy::Off] {
+        assert_eq!(word(mode).ready_idle_under_prompt(), None, "{mode:?}");
+    }
+    let mut closed = word(Occupancy::Prompt);
+    closed.hold = None;
+    assert_eq!(closed.ready_idle_under_prompt(), None, "no hold");
+    let mut none = word(Occupancy::Prompt);
+    none.ready_idle = None;
+    assert_eq!(none.ready_idle_under_prompt(), None);
+    assert!(
+        !none.same_change(&word(Occupancy::Prompt)),
+        "its raise is a change"
+    );
+}
+
+/// The told word as slice 1 derived its `Debug`, field for field.
+#[derive(Debug)]
+#[expect(dead_code, reason = "read through its Debug alone")]
+struct SliceOneSaid {
+    mode: Occupancy,
+    hold: Option<SaidHold>,
+    ready: bool,
+    guards: Option<Guards>,
+    rules: [SaidRule; 2],
+    at_ms: i64,
+    reading: OccupancyReading,
+}
+
+/// A WORD WITH NO READY-IDLE LINE PRINTS AS SLICE 1'S DID (the plan's D7): a tape compares the told
+/// word's `Debug`, so a word that raises nothing is slice 1's bytes in both forms, and only a raise
+/// prints the field. NEGATIVE CONTROL: a raised word prints otherwise.
+#[test]
+fn a_word_with_no_ready_idle_line_prints_as_slice_ones() {
+    let s = said(
+        Occupancy::Prompt,
+        [SaidVerdict::Held(Guard::Draft), SaidVerdict::Spent],
+        Some(holding(&[Guard::Draft])),
+    );
+    let slice1 = SliceOneSaid {
+        mode: s.mode,
+        hold: s.hold,
+        ready: s.ready,
+        guards: s.guards,
+        rules: [s.rules[0], s.rules[1]],
+        at_ms: s.at_ms,
+        reading: s.reading,
+    };
+    let renamed = |text: String| text.replacen("SliceOneSaid", "OccupancySaid", 1);
+    assert_eq!(format!("{s:?}"), renamed(format!("{slice1:?}")));
+    assert_eq!(format!("{s:#?}"), renamed(format!("{slice1:#?}")));
+    let mut up = s.clone();
+    up.ready_idle = Some(raised());
+    let text = format!("{up:?}");
+    assert_ne!(text, format!("{s:?}"));
+    assert!(
+        text.ends_with(&format!(", ready_idle: {:?} }}", raised())),
+        "{text}"
+    );
 }

@@ -7,28 +7,28 @@
 //! Each style keeps its own lights off the letters as it emits them (the ink
 //! ledger's tiers, the bed, the fire's cap, the ribbon's hold), each against
 //! its own account and floor, so the frame's sum can still wash a letter out:
-//! on 2026-10-22 the gallery read the newest letters beside a dark caret at
-//! 2.65 to 4.17:1 (Beam, Comet, Laser, Lumen, Phaser, Sparkle), Water's wave
-//! through its letters at 2.3, a ribbon's Enter flare on the echo at 2.84 and
-//! a fire spark on `好` at 1.79. The guard is the one law over all of them,
-//! run once on the frame's finished streams before they are published: for
-//! each lettered cell of the frame's own text (the caret's own cell is the
-//! caret's law), it composites every light that reaches the cell exactly as
-//! the renderer will (the under-text quads on the ground, then the over-text
-//! quads and the halos on ground and ink alike), reads each pixel of the cell
-//! as solid ink ([`SOLID_SHARE`] of the clean ratio, as `aterm-lab
+//! unguarded, the trail gallery measured the newest letters beside a dark
+//! caret at 2.65 to 4.17:1 (Beam, Comet, Laser, Lumen, Phaser, Sparkle),
+//! Water's wave through its letters at 2.3, a ribbon's Enter flare on the echo
+//! at 2.84 and a fire spark on `好` at 1.79. The guard is the one law over all
+//! of them, run once on the frame's finished streams before they are
+//! published: for each lettered cell of the frame's own text (the caret's own
+//! cell is the caret's law), it composites every light that reaches the cell
+//! exactly as the renderer will (the under-text quads on the ground, then the
+//! over-text quads and the halos on ground and ink alike), reads each pixel of
+//! the cell as solid ink ([`SOLID_SHARE`] of the clean ratio, as `aterm-lab
 //! trail-contrast` counts ink) against the worst ground within [`RING`] px of
 //! it, and where the cell would fall under [`LETTER_FLOOR`] it finds the
 //! largest share of those lights that keeps the floor. A letter whose solid
 //! ink reads under the floor on the bare page (a clean ratio under about
 //! 5.4:1: Solarized Dark's text, a 5:1 grey, many a coloured output) keeps
 //! [`OWN_SHARE`] of its own bare reading instead: the floor it cannot reach
-//! never leaves it to the whole light. Every light is then
-//! cut to that share over the cell (and its ring), easing back to its whole
-//! strength over the ledger's feather off the cell, so a bloom hugs its caret
-//! and a flare dims behind the word it crosses with no hard edge. A cell the
-//! lights leave at the floor is untouched, and a frame with no such cell is
-//! byte-identical to the one it would have drawn.
+//! never leaves it to the whole light. Every light is then cut to that share
+//! over the cell (and its ring), easing back to its whole strength over the
+//! ledger's feather off the cell, so a bloom hugs its caret and a flare dims
+//! behind the word it crosses with no hard edge. A cell the lights leave at
+//! the floor is untouched, and a frame with no such cell is byte-identical to
+//! the one it would have drawn.
 
 use super::*;
 
@@ -41,9 +41,9 @@ pub(crate) const LETTER_FLOOR: f32 = 4.6;
 const SOLID_SHARE: f32 = 0.85;
 /// The share of its own bare reading a letter whose solid ink reads under
 /// [`LETTER_FLOOR`] on the bare page keeps under the lights ([`letter_bar`]).
-/// Given up on, such letters lay unguarded: a 5.0:1 grey under Sparkle's
-/// caret bloom read 1.01:1 and Solarized Dark's text under Laser's Enter bolt
-/// 1.34:1, the guard on or off (2026-10-23, review).
+/// Given up on, such letters would lie unguarded: a 5.0:1 grey under
+/// Sparkle's caret bloom measured 1.01:1 and Solarized Dark's text under
+/// Laser's Enter bolt 1.34:1, the guard on or off.
 const OWN_SHARE: f32 = 0.97;
 /// How far from an ink pixel its ground is read, px (the judge's ring).
 const RING: i32 = 2;

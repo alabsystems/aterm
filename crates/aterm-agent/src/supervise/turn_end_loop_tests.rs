@@ -3,11 +3,11 @@
 
 use super::*;
 use crate::harness::login_latch::LoginLatches;
-use crate::harness::repo_work::RepoWork;
+use crate::harness::repo_work::{RepoRead, RepoWork};
 use crate::supervise::policy::login::LoginShared;
 use crate::supervise::policy::turn_end::{
-    DONE_CHECK, FINISHED, LAND, LAND_NUDGE, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LEFT,
-    RULE_LOGIN, RULE_LOGIN_BACK, RULE_SUGGESTION, repo_work_suffix,
+    DONE_CHECK, FINISHED, LAND, LAND_NUDGE, REPO_UNREAD, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND,
+    RULE_LEFT, RULE_LOGIN, RULE_LOGIN_BACK, RULE_SUGGESTION, repo_work_suffix,
 };
 use std::sync::PoisonError;
 
@@ -1913,7 +1913,7 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
     };
     let undrawn = format!(
         "rule={RULE_CONTINUE} the worker has not drawn the input it read (the screen has not \
-         moved since it was unread); nothing written"
+         moved since it was seen undrawn); nothing written"
     );
     let skipped = |r: &Ran, tail: &str| {
         r.notes
@@ -11266,12 +11266,12 @@ fn a_dialog_no_reader_names_climbs_to_a_record_and_a_line_and_its_end_withdraws_
 /// standing; how often it was asked is counted.
 #[derive(Debug)]
 struct RepoHost {
-    found: std::sync::Mutex<VecDeque<Option<RepoWork>>>,
+    found: std::sync::Mutex<VecDeque<RepoRead>>,
     asked: std::sync::atomic::AtomicUsize,
 }
 
 impl RepoHost {
-    fn new(found: Vec<Option<RepoWork>>) -> Self {
+    fn reads(found: Vec<RepoRead>) -> Self {
         Self {
             found: std::sync::Mutex::new(found.into()),
             asked: std::sync::atomic::AtomicUsize::new(0),
@@ -11289,17 +11289,19 @@ impl IdleHost for RepoHost {
     fn owns_turn_end(&self) -> bool {
         false
     }
-    fn repo_work(&self) -> Option<RepoWork> {
+    fn repo_work(&self) -> RepoRead {
         self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut found = self.found.lock().unwrap_or_else(PoisonError::into_inner);
         if found.len() > 1 {
-            found.pop_front().flatten()
+            found.pop_front().unwrap_or_default()
         } else {
-            found.front().cloned().flatten()
+            found.front().cloned().unwrap_or_default()
         }
     }
 }
 
+/// Dirty and unfinished probes both keep a done claim open through the loop;
+/// only the unfinished probe journals `REPO UNREAD`.
 #[test]
 fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
     let report = |lines: &[&str]| {
@@ -11316,9 +11318,9 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
         paths: vec!["src/lexer.rs".to_string()],
         ..RepoWork::default()
     };
-    let run = |tag: &str, screens: Vec<Vec<String>>, found: Vec<Option<RepoWork>>| {
+    let run = |tag: &str, screens: Vec<Vec<String>>, found: Vec<RepoRead>| {
         let (dir, journal) = journal_file(tag);
-        let host = Arc::new(RepoHost::new(found));
+        let host = Arc::new(RepoHost::reads(found));
         let mut m = Mock::new(screens);
         m.turn_releases = Some(1);
         m.vanish_after = Some(2);
@@ -11329,11 +11331,10 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
             ..auto(30)
         };
         let (lines, _) = watch_lines(&mut m, &opts);
-        let done: Vec<String> = journal_records(&journal)
+        let journaled: Vec<String> = journal_records(&journal)
             .0
             .into_iter()
             .map(|r| r.line)
-            .filter(|l| l.starts_with("DONE "))
             .collect();
         let _ = std::fs::remove_dir_all(&dir);
         let asked = host.asked.load(std::sync::atomic::Ordering::SeqCst);
@@ -11343,17 +11344,30 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
             .filter(|r| r.starts_with("turn "))
             .cloned()
             .collect();
-        (turns, lines, done, asked)
+        (turns, lines, journaled, asked)
+    };
+    let done = |journaled: &[String]| -> Vec<String> {
+        journaled
+            .iter()
+            .filter(|l| l.starts_with("DONE "))
+            .cloned()
+            .collect()
+    };
+    let unread_said = |journaled: &[String]| {
+        journaled
+            .iter()
+            .filter(|l| l.starts_with("REPO UNREAD seq="))
+            .count()
     };
     let suffix = repo_work_suffix(&dirty);
     assert!(
         suffix.contains("/Users//a/Developer/parser: 1 changed (src/lexer.rs)"),
         "{suffix}"
     );
-    let (turns, lines, done, asked) = run(
+    let (turns, lines, journaled, asked) = run(
         "claim-dirty",
         vec![busy_screen(), claim.clone()],
-        vec![Some(dirty.clone())],
+        vec![RepoRead::Found(dirty.clone())],
     );
     assert_eq!(
         turns.first(),
@@ -11361,23 +11375,50 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
         "the check with the repository's suffix: {lines:#?}"
     );
     assert!(asked >= 1, "the probe was asked at the claim");
-    assert!(done.is_empty(), "{done:#?}");
-    let (turns, lines, done, asked) = run("claim-clean", vec![busy_screen(), claim], vec![None]);
+    assert!(done(&journaled).is_empty(), "{journaled:#?}");
+    assert_eq!(
+        unread_said(&journaled),
+        0,
+        "a probe that finished: {journaled:#?}"
+    );
+    let (turns, lines, journaled, asked) = run(
+        "claim-unread",
+        vec![busy_screen(), claim.clone()],
+        vec![RepoRead::Unread],
+    );
+    assert_eq!(
+        turns.first(),
+        Some(&continue_request(&format!("{DONE_CHECK} {REPO_UNREAD}"))),
+        "the check saying the repository could not be read: {lines:#?}"
+    );
+    assert!(asked >= 1, "the probe was asked at the claim");
+    assert!(done(&journaled).is_empty(), "{journaled:#?}");
+    assert_eq!(
+        unread_said(&journaled),
+        1,
+        "the journal names the probe that did not finish, once: {journaled:#?}"
+    );
+    let (turns, lines, journaled, asked) = run(
+        "claim-clean",
+        vec![busy_screen(), claim],
+        vec![RepoRead::Clean],
+    );
     assert_eq!(
         turns.first(),
         Some(&continue_request(DONE_CHECK)),
         "the plain check: {lines:#?}"
     );
     assert!(asked >= 1, "the probe was asked at the claim");
-    assert!(done.is_empty(), "{done:#?}");
+    assert!(done(&journaled).is_empty(), "{journaled:#?}");
+    assert_eq!(unread_said(&journaled), 0, "a clean probe: {journaled:#?}");
     let progress = report(&["Stage 2 landed; the parser is next."]);
-    let (turns, lines, done, asked) = run(
+    let (turns, lines, journaled, asked) = run(
         "claim-progress",
         vec![busy_screen(), progress],
-        vec![Some(dirty)],
+        vec![RepoRead::Found(dirty)],
     );
     assert_eq!(asked, 0, "no done said, no probe: {lines:#?}");
-    assert!(done.is_empty(), "{done:#?}");
+    assert!(done(&journaled).is_empty(), "{journaled:#?}");
     assert!(
         !turns.is_empty() && turns.iter().all(|t| !t.contains(&suffix)),
         "continued, no suffix: {turns:#?}"

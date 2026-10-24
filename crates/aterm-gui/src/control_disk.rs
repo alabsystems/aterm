@@ -26,7 +26,7 @@ pub(crate) const FRESH: Duration = Duration::from_secs(10);
 /// At arm time a reading at most this old is used.
 pub(crate) const ARM_FRESH: Duration = Duration::from_secs(1);
 
-/// Window in which a spent pass answers a new wait at arm time (`why=spent`).
+/// Window in which a spent pass answers a new wait at arm time (`why=spent`, or `why=held-back` while idle build directories are off).
 pub(crate) const SPENT_RECENT: Duration = Duration::from_secs(60);
 
 /// Max demand percent of the volume beyond current free space (`why=too-large`).
@@ -119,7 +119,7 @@ pub(crate) enum Decision {
     Met,
     /// What is left is not aterm's to free: `ERR unmet`.
     Unmet,
-    /// The watch made no progress for [`STALL`]: `ERR unavailable why=watch-stalled`.
+    /// The wait holds a demand and the running watch made no progress for [`STALL`]: `ERR unavailable free why=watch-stalled`.
     Stalled,
     /// Park on.
     Park,
@@ -138,7 +138,7 @@ pub(crate) const fn decide(f: &Facts) -> Decision {
     }
 }
 
-/// Whether every term of `wait` holds on `row` for resolved `needs`.
+/// Whether every term of `wait` holds on `row` (a `room` need read from `row.room`, never met while it is unknown).
 fn holds(wait: &SysWait, row: &VolumeRow) -> bool {
     wait.terms.iter().all(|t| match t {
         Term::Free { strict, need } => {
@@ -197,7 +197,7 @@ fn largest_need(wait: &SysWait, row: &VolumeRow) -> Option<u64> {
 
 /// External readers injected into the wait ([`cmd_await_sys`] injects the production ones).
 pub(crate) struct Env<'a> {
-    /// A fresh reading of the volume holding a path (one `statfs`).
+    /// A fresh reading of the volume holding a path (a fresh mount table, then that volume's `statfs`).
     pub(crate) read: &'a dyn Fn(&Path) -> Result<Reading, Unread>,
     /// Ask the watch to look now for a demand of so many bytes.
     pub(crate) poke: &'a dyn Fn(u64),

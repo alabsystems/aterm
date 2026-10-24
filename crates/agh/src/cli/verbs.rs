@@ -16,7 +16,7 @@ pub enum Class {
     Read,
     /// A listing.
     List,
-    /// This machine only.
+    /// This machine only (`whoami --verify` also asks GitHub as each profile).
     Local,
     /// A person provisions an identity.
     Provision,
@@ -677,7 +677,8 @@ pub static GLOBAL_FLAGS: &[FlagSpec] = &[
     short(
         value(
             "--repo",
-            "the repository, OWNER/NAME or @TARGET, in place of the first argument's REPO",
+            "the repository, OWNER/NAME or @TARGET, in place of the first argument's REPO \
+             (api: routes a /repositories/ID path)",
         ),
         'R',
     ),
@@ -686,7 +687,8 @@ pub static GLOBAL_FLAGS: &[FlagSpec] = &[
     on("--anonymous", "send no credential"),
     value(
         "--timeout",
-        "the longest the command may take: 30s, 2m, 1h or seconds, at most 24h",
+        "each request's time limit (release wait: the whole wait): 30s, 2m, 1h or seconds, \
+         at most 24h",
     ),
     on("--meta", "always print the receipt line on stderr"),
     value("--format", "json (the default), ndjson, tsv or text"),
@@ -703,7 +705,7 @@ pub static GLOBAL_FLAGS: &[FlagSpec] = &[
     value("--limit", "at most N items"),
     on(
         "--partial",
-        "accept an incomplete answer instead of exit 14",
+        "accept a capped or truncated answer instead of exit 14",
     ),
     on(
         "--as-read",

@@ -30,8 +30,8 @@ Source: `crates/aterm-spec` (read only). Three recovery passes read every `#[tes
 (the chunk manifests said 726; counting `#[test]` attributes that are followed by a fn gives
 **723**: `tests/spec_suite.rs` has none, its only `#[test]` is in a doc comment) and the
 code each one reaches. Nothing was compiled or run; the claims come from reading the code.
-`tests/derived_ring_ty.rs` (237) and `tests/derived_supervise.rs` (55) were the two big files;
-`src/verify_tests.rs` (51) is the `#[cfg(test)]` module of `src/verify.rs`.
+`tests/derived_ring_ty.rs` (237) and the supervisor models' test file (55, deleted 2026-10-16)
+were the two big files; `src/verify_tests.rs` (51) is the `#[cfg(test)]` module of `src/verify.rs`.
 
 Result: **56 specs**, covering **596 tests**. **127 tests are not spec samples** (§4). 48 of the
 specs are left (§1.1).

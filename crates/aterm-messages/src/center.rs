@@ -2526,7 +2526,7 @@ impl MessageCenter {
             posted_at: now,
             anchor_wall: stamp.unix_ms,
             repeats: 1,
-            confirmation: 1,
+            confirmation: DigestItem::first_confirmation(stamp.unix_ms),
             missed_at: None,
             restated_at: now,
         });
@@ -2951,7 +2951,7 @@ impl MessageCenter {
                 posted_at: now,
                 anchor_wall: wall.unix_ms,
                 repeats: r.repeats,
-                confirmation: 1,
+                confirmation: DigestItem::first_confirmation(wall.unix_ms),
                 missed_at: None,
                 restated_at: now,
             });

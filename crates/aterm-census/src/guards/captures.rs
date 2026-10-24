@@ -215,7 +215,7 @@ impl View {
         }
     }
 
-    /// What the stream prints ([`Read::Spaced`], [`Read::Edited`]).
+    /// What the stream prints, its controls read as `read` says.
     fn printable(stream: &[u8], read: Read) -> Self {
         const ESC: u8 = 0x1b;
         let mut v = Self {

@@ -1354,7 +1354,7 @@ impl CursorGlow {
             };
             // A row whose letters nobody named (no probe of it, no frame
             // cells) has no gap to stand a tongue in: it burns as one crest
-            // held to its letters, as round 3 did.
+            // held to its letters.
             #[cfg(test)]
             let crest = self.fire_kept_crest || !self.flame_row_named(&text, row_i);
             #[cfg(not(test))]
@@ -1364,10 +1364,10 @@ impl CursorGlow {
             // burning run (a word's gap, the caret's cell and the one ahead
             // of it), rooted under the baseline, with its gold core, and none
             // on a letter, whose cell keeps only a tongue's held flank.
-            // Round 3 stood the row's field as one crest along the whole
-            // line under its letters, held to their bar: a muddy brown haze
-            // in three bands with a hot bead line under it (2026-10-22,
-            // `context`, all three judges).
+            // Laid as one crest along the whole line under its letters, held
+            // to their bar, the row's field reads as a muddy brown haze in
+            // three bands with a hot bead line under it (the trail gallery's
+            // `context`).
             if air && !crest {
                 let (head_col, head_strength) = (i32::from(burning[0].1), burning[0].2);
                 let back = if burning.len() > 1 && i32::from(burning[1].1) > head_col {
@@ -1432,9 +1432,9 @@ impl CursorGlow {
                 }
                 tongues = kept;
             }
-            // Round 3's kept flame (a test's control): a blank cell between
-            // the burning letters (a word's gap) carries a tongue of its own
-            // on its axis, so its core burns there.
+            // The crest (a row nobody named, or a test's control): a blank
+            // cell between the burning letters (a word's gap) carries a
+            // tongue of its own on its axis, so its core burns there.
             if air && crest {
                 for col in cmin..=cmax {
                     let u = col as f32 + 0.5;
@@ -2047,8 +2047,8 @@ impl CursorGlow {
             let mut n = 0usize;
             let base = if kept { kept_base } else { air_base } as f32;
             // A core in the air feathers in over its tongue's own foot: over
-            // five pixels its gold heart stood on the floor the tongue's
-            // feathered root no longer draws.
+            // a fixed five pixels its gold heart would stand on a floor the
+            // tongue's feathered root does not draw.
             let root_px = if kept {
                 Self::FIRE_DARK_KEPT_CORE_ROOT_PX
             } else if columns {
@@ -2084,9 +2084,9 @@ impl CursorGlow {
                     continue;
                 }
                 // A core in the air stands in its tongue's body, which the
-                // wind's lean set over by `shift` from root to tip: on the
-                // tongue's own axis its gold stood beside the flame, a bare
-                // needle at full heat (2026-10-23, `burst`).
+                // wind's lean sets over by `shift` from root to tip: on the
+                // tongue's own axis its gold would stand beside the flame, a
+                // bare needle at full heat (the trail gallery's `burst`).
                 let over = if kept || columns { 0.0 } else { shift as f32 };
                 cores[n] = (
                     oxf + tg.u * cwf + over,
@@ -3245,9 +3245,9 @@ impl CursorGlow {
             if peak >= 1.0 {
                 // THE CARET'S BLOOM BURNS EMBER: a deep orange-red over the
                 // dark, its heart an orange. Lit from the ramp's gold and
-                // cream, a bloom this dim added a tan to the page's blue-grey
-                // and read khaki round the caret (#5f4b2b to #2e271d,
-                // 2026-10-23, `burst`), no fire's colour.
+                // cream, a bloom this dim adds a tan to the page's blue-grey
+                // and reads khaki round the caret (#5f4b2b to #2e271d in the
+                // trail gallery's `burst`), no fire's colour.
                 #[cfg(test)]
                 let unwarmed = self.fire_bloom_unwarmed;
                 #[cfg(not(test))]
@@ -3515,10 +3515,10 @@ impl CursorGlow {
         let peak = (f32::from(cov) * Self::DARK_RING_SHARE) as u8;
         // THE DARK VEIL STAYS IN THE CARET'S CELL AND ROW, in the style's
         // clean hue, as the paper veil does ([`Self::emit_ring_light`]):
-        // after an Enter at the bottom row the bloom, carried up with the
-        // scrolled text, stood as a round grey haze two rows over the
-        // caret on the lines just printed (2026-10-22, sparkle `#303236`,
-        // comet `#2d3237`, phaser and lumen `#1f322f`, laser `#272437`: a
+        // unbound, after an Enter at the bottom row the bloom, carried up
+        // with the scrolled text, would stand as a round grey haze two rows
+        // over the caret on the lines just printed (sparkle `#303236`, comet
+        // `#2d3237`, phaser and lumen `#1f322f`, laser `#272437`: a
         // near-white accent added thin over the dark). It sits on the
         // caret's cell (the last one the ring saw while the host withholds
         // the caret; with none known, on the landing's own cell), reaches
@@ -3558,8 +3558,8 @@ impl CursorGlow {
     /// colour, never the grey a near-white accent adds to (a grey trail
     /// colour stays grey). A colour the user chose ([`ColourPins`]) is the
     /// veil's as it is, held legible by [`Self::dark_veil_cap`]'s coverage
-    /// alone: re-hued and brightened, a pinned white accent landed green and
-    /// a pinned violet Laser `#9f40ff` (2026-10-23, review).
+    /// alone: re-hued and brightened, a pinned white accent would land green
+    /// and a pinned `#8040c0` Laser `#9f40ff`.
     pub(super) fn dark_veil_ink(cfg: &GlowConfig, rgb: u32, pins: ColourPins) -> u32 {
         let chosen = match cfg.style {
             GlowStyle::Laser => pins.trail,
@@ -3619,21 +3619,21 @@ impl CursorGlow {
 
     /// A dark fire's landing flash at `t` of its life: an ember's
     /// orange-red cooling to red. A bloom thins to nothing at its rim, and
-    /// a thin yellow over the dark is no colour of fire: the white-hot
-    /// flash (cooled to amber) stood around a jump's landing as a dim
-    /// khaki disc (`#352b1c` on the gallery's dark, 2026-10-22). Orange-red
-    /// stays warm however thin it lies.
+    /// a thin yellow over the dark is no colour of fire: a white-hot flash
+    /// cooled to amber stands around a jump's landing as a dim khaki disc
+    /// (`#352b1c` on the gallery's dark). Orange-red stays warm however thin
+    /// it lies.
     pub(super) fn fire_dark_flash(t: f32) -> u32 {
         fire_ramp(0.55 - 0.25 * t.clamp(0.0, 1.0))
     }
 
     /// The dark ring's bloom peak as a share of the ring's coverage: a
-    /// filled bloom carries far more light than the 2 px outline it replaced
-    /// at the same coverage. Held to the caret's cell and row, the veil's
-    /// cap ([`Self::dark_veil_cap`]) bounds most hues' centre below this; a
-    /// dim hue carries its light up to that cap, where at 0.45 Laser's
-    /// violet veil barely showed past the caret block in the settings
-    /// preview's card (7 px more than 32 levels from no ring, 2026-10-22).
+    /// filled bloom carries far more light than a 2 px outline at the same
+    /// coverage. Held to the caret's cell and row, the veil's cap
+    /// ([`Self::dark_veil_cap`]) bounds most hues' centre below this; a dim
+    /// hue carries its light up to that cap, where at 0.45 Laser's violet
+    /// veil barely shows past the caret block in the settings preview's card
+    /// (7 px more than 32 levels from no ring).
     const DARK_RING_SHARE: f32 = 0.8;
 
     #[allow(
@@ -4603,9 +4603,9 @@ const fn flame_level_light(level: usize) -> u32 {
 /// The dark flame field's ceiling as a share of its whole, at `rise` (0 at
 /// the root, 1 at the tallest tongue's tip): whole over the lower third,
 /// thinning to nothing at the tip, so the light dies upward into a point.
-/// Thinned only to a quarter there, every slice of a tongue ended cut flat
-/// a quarter lit, the tongues straight-sided and blunt as an equaliser's
-/// bars (2026-10-22, `typing`, dark).
+/// Thinned only to a quarter there, every slice of a tongue would end cut
+/// flat a quarter lit, the tongues straight-sided and blunt as an
+/// equaliser's bars (the trail gallery's `typing` on dark).
 #[inline]
 fn flame_tip_fade(rise: f32) -> f32 {
     const HOLD: f32 = 0.33;

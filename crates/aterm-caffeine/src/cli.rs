@@ -50,9 +50,12 @@ USAGE:
                caffeine=stopped when none ran). `own`: only this build's mug and
                job; another build's is left as it is, on or off.
     serve      Run the mug in this process (what its launchd job runs). It
-               exits 0 even when it refuses, so launchd does not restart it.
+               exits 0 even when it refuses, so launchd does not restart it,
+               and, as that job, 75 when an update replaces its aterm, so
+               launchd starts the new one.
     bridge     Keep the Mac awake while the mug restarts onto an aterm update,
-               until the new mug takes over (what a restarting mug runs).
+               until the new mug takes over or keep-awake ends, at most 21 min
+               (what a restarting mug runs).
 
 A restart of the Mac turns it off. Exit status: 1 when a command fails, 2 for a
 refused command line. macOS only.

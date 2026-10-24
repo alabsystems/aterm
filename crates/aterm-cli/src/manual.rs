@@ -158,7 +158,7 @@ KEY USAGE
                              (--read-only fixes nothing; `aterm help doctor`)"#,
             aterm_page_shell!(doctor),
             r#"
-  aterm show-config | explain-config | list-fonts | show-face | list-themes
+  aterm show-config | explain-config | list-fonts | show-face <family> | list-themes
                              print a diagnostic and exit; no shell is spawned
   aterm list-kitty-commands  the words the cursor cat obeys (`aterm help kitty`)
   aterm exceptions [--all]   what needs a look later, and what you filed
@@ -216,18 +216,19 @@ WHAT IT IS
   operations abrew hands off.
 
 KEY USAGE (`abrew help <command>` has each one's flags)
-  abrew install [--formula|--cask] <name>      relocation-free bottles and zip/tar casks
+  abrew install [--formula|--cask] <name>…     bottles and tar/zip/DMG/single-file casks
   abrew uninstall [--formula|--cask] <name>…   remove installed packages
   abrew update / upgrade / outdated / list / info / search / doctor
   abrew deps [--tree] / uses / leaves / missing / autoremove / cleanup
   abrew tap <user/repo>                        managed tap clones
   abrew bundle [status|remove|dump|check|install]
-  abrew shellenv                               PATH edits for the prefix's bin
+  abrew shellenv [<shell>]                     ABREW_PREFIX, PATH, MANPATH, INFOPATH
   abrew on | off | status                      the brew reroute switch
 
-  Source builds (`-s`/`--HEAD`), services, `--zap`, custom `def install` Ruby,
-  DMG/pkg casks and bottles that need relocation run real Homebrew, before any
-  change is made.
+  Source builds (`-s`/`--HEAD`), `user/repo/name` tap formulae, post-install
+  recipes, services, `--zap`, pkg casks and bottles abrew cannot relocate (`:any`
+  needs macOS and the developer tools) run real Homebrew, before any change is
+  made; a need found only after abrew has changed the prefix fails instead.
 
 ESCAPES — real Homebrew, unchanged
   brew --real <cmd>…     one command, real brew (bundled first, then system)
@@ -236,8 +237,9 @@ ESCAPES — real Homebrew, unchanged
   [abrew] enabled=false  in aterm.toml: no stub is laid
 
 GOTCHAS
-  * `abrew linkage <formula>` checks for build-prefix references; `abrew doctor`
-    reports stub and prefix state under the writer lock.
+  * `abrew linkage <formula>…` (macOS) reports build-prefix references and missing
+    libraries in a keg's Mach-O files; `abrew doctor` reports prefix problems. Both
+    exit 1 on any; `aterm pkg doctor` checks the `brew` stub.
   * `abrew config` prints `ABREW_*` variables (`brew --real config` prints `HOMEBREW_*`)."#,
         ),
     },
@@ -346,10 +348,11 @@ STATUS & RESTORE
   one with `aterm keeper start` (a window never does). The keeper holds each
   terminal's screen, scrollback and turn-ledger journal in memory beside its master
   (never on disk; gone at logout or reboot). When aterm reopens after an unclean
-  exit it reattaches the orphaned shells: `restore=exact`, `restore=screen` if
-  output arrived mid-crash, or `restore=meta` if unjournaled (`history_lost=` counts
-  shed scrollback). A clean quit closes its terminals as usual; `stop` hangs up the
-  shells only the keeper holds.
+  exit it reattaches the orphaned shells: `restore=exact`, `restore=screen` when
+  the replay since the last keyframe was not exact (`restore_why=` names why), or
+  `restore=meta`, a blank screen, when no region was usable or the restore failed
+  (`history_lost=` counts shed scrollback). A clean quit closes its terminals as
+  usual; `stop` hangs up the shells only the keeper holds.
   `serve` from an app bundle reopens the app after a crash, up to 3 times in a row
   (after 0 s, 10 s, 60 s). A peer must be the same user and, by default, satisfy
   this build's designated requirement; each dev tree has its own socket and label."#,
@@ -482,9 +485,11 @@ Optional GitHub bootstrap (`~/.config/aterm/init.toml`):
   token_file = "~/.secrets/github-token" # 0600 file; optional token_key = "GH_TOKEN"
 
 It verifies the token and stores it in the login keychain with CLT git's `osxkeychain`
-helper, unless git's own lookups already hand that token back for every repository (the
-secrets vault's helper does when `token_file` is its `~/.secrets/gh_access_token`): git's
-credential settings and the keychain are then left as they are. It clones `owner`'s repositories the token can reach into `~/<repo>`. A clean
+helper (a keychain token GitHub already signs in as `account` is kept instead). When
+git's own lookups already hand that token back for every repository (the secrets
+vault's helper does when `token_file` is its `~/.secrets/gh_access_token`) and GitHub
+signs it in as `account`, git's credential settings and the keychain are left as they
+are. It clones `owner`'s repositories the token can reach into `~/<repo>`. A clean
 checkout behind GitHub's default branch is fast-forwarded from origin, running no
 hook; any other is left as it is, saying why. With no secrets vault configured,
 `init` first offers to join the ALab vault (`http://alab-secrets.local:7484/v1/alab`)
@@ -547,7 +552,8 @@ HOW IT WORKS
 SETUP AT EACH MAC (`aterm machines help enroll` is the checklist)
   In System Settings ▸ General ▸ Sharing, turn on Remote Login (with Full Disk Access
   for remote users) and Screen Sharing. Then from the controller:
-    aterm machines enroll <address>… | --found [--user <admin>] [--fingerprint SHA256:…]
+    aterm machines enroll <address>… | --found [--user <admin>] [--parallel N]
+    aterm machines enroll <address> [--user <admin>] [--name <n>] [--fingerprint SHA256:…]
     aterm machines apply <host>… | --all [--only <table>,…]
     aterm machines person <host> --here    # or `aterm machines screen <host>`
 
@@ -876,7 +882,9 @@ ESCAPES
   aterm --no-reroute           start a session with no reroute directory on PATH
   cargo +<channel> …           a named non-Trust channel runs upstream after the signpost
   [reroute] announce = false   silence every row's stderr notice (never a refusal)
-  [reroute] strict = true      refuse (exit 2) when a DIRECT target is missing
+  [reroute] strict = true      never fall back to upstream: a missing DIRECT tool does not
+                               run (exit 127); `z3`, and every row when no store
+                               resolves, is refused (exit 2)
 
   `aterm pkg doctor` checks every stub and the PATH order; `aterm pkg repair` lays them
   again. Windows lays no stubs: a session runs whatever PATH resolves."#,
@@ -1449,7 +1457,7 @@ fn overview_page() -> String {
                 "the fabric bridge: carry this instance's inbox/post traffic to the bus"
             }
             crate::Verb::Fabric => {
-                "mail between sessions and people (status | tail | on | off | doctor | \
+                "mail between sessions and people (status | tail | brief | on | off | doctor | \
                  mint-for | halt | inbox | post)"
             }
             crate::Verb::Ship => {
@@ -2277,8 +2285,8 @@ WHAT TO DO, IN ORDER
      status`).
   3. Tell your operator. If `full_disk_access=denied`, only a person can grant Full Disk
      Access to the app `running=` names, in System Settings ▸ Privacy & Security ▸ Full
-     Disk Access. Once granted, `app-data=covered-by-fda`; App Management, media
-     libraries, Photos and Contacts stay separate (`uncovered=`).
+     Disk Access. Once granted, `app-data=covered-by-fda`; App Management, cloud-synced
+     folders, media libraries, Photos and Contacts stay separate (`uncovered=`).
   4. `aterm ctl @<sid> await consent timeout=<ms>` waits until the posture changes.
 
 WHAT DOES NOT HELP
@@ -2368,15 +2376,16 @@ MEMBERSHIP
   join code to a 0600 file and prints that file's path (never the code), and sets
   `[fleet]` (port 7100). `aterm fleet join` on each other machine reads the code from
   stdin, `--code-file F` or a hidden prompt, never an argument. `init --rotate` mints
-  a new secret; `peers` checks every known peer (3 s); `leave` removes the keys, the
-  books and `[fleet]`.
+  a new secret; `peers` checks every known peer (3 s) and `peers add|rm` edits the
+  book of peers; `leave` removes the fleet secret, the join code, both books and
+  `[fleet]`'s listen, allow and drive_from (the node id and node key stay).
 
 READING & DRIVING ACROSS THE FLEET
   aterm ctl survey --fleet
                        every session on every reachable fleet machine
   aterm ctl survey --host <host|node|address> [--sid <s>]
                        one peer machine (or one session's excerpts)
-  Levels (`--allow`, `[fleet] allow`):
+  Levels (`[fleet] allow`; `--allow` on init and join sets `facts` or `content`):
   * `facts` (default) — programs, agent states, redacted roles, task records, models.
   * `content` — `facts` plus titles, cwds, prompts, recent agent words and shell lines.
   * `drive` — `content`, and the nodes `aterm fleet allow drive --from` names (bound by
@@ -2967,8 +2976,8 @@ fn rust_page() -> String {
          \x20 * Never rebuild a toolchain from source to answer a rustup error: `aterm pkg doctor`,\n\
          \x20   then `aterm pkg repair`.\n\
          \n\
-         FLAGS   `aterm --no-reroute` restores every upstream name for a session · `[reroute]\n\
-         \x20       announce = false` in aterm.toml silences the signpost (no environment variable).\n\
+         FLAGS   `aterm --no-reroute` restores the upstream Rust and verifier names for a session ·\n\
+         \x20       `[reroute] announce = false` in aterm.toml silences the signpost (no environment variable).\n\
          SEE     `aterm help trust` (the lanes and the report gates) · `aterm help reroute` (the table) ·\n\
          \x20       `aterm help atpkg` (the store)."
     );

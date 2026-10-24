@@ -5640,7 +5640,11 @@ fn escalated_op_fences_argument_dependent_seams() {
         assert!(refusal.starts_with("ERR denied"), "{name}: {refusal}");
     }
     let lens = super::control_media::invoke_refusal("ToggleStatsLens").expect("refused");
-    assert!(lens.contains("\u{2318}I"), "{lens}");
+    assert_eq!(
+        lens.contains("\u{2318}I"),
+        cfg!(target_os = "macos"),
+        "{lens}"
+    );
     assert_eq!(super::control_media::invoke_refusal("OpenPalette"), None);
     assert_eq!(
         super::control_media::invoke_refusal("TotallyBogusAction"),
@@ -6531,6 +6535,7 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
         typed: Default::default(),
         bells: Default::default(),
         screen_moves: Default::default(),
+        job_feed: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),
@@ -13486,7 +13491,7 @@ fn a_bridges_hello_and_its_unparsed_lines_body() {
     ] {
         assert_eq!(
             run(bad),
-            "ERR usage: hello lane=<n> [build=<token>]\n",
+            "ERR usage: hello lane=<n> [build=<token>] [refill=<lane,...>] [log=auto|turns]\n",
             "{bad}"
         );
     }

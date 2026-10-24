@@ -24,16 +24,18 @@ pub(crate) const USAGE: &str = "usage: aterm theme list [--appearance dark|light
                                 aterm theme pack [<id>] [--appearance dark|light] [--format text|tsv] [--licences]\n       \
                                 aterm theme install <id>... | --all [--replace]";
 
-/// `aterm theme help`, and `--help` on any subcommand.
+/// `aterm theme help`, and `--help` on every subcommand but `pack` and `install` (those print
+/// [`theme_pack_cmd::PACK_HELP`]).
 pub(crate) const HELP: &str = "\
 aterm theme list [--appearance dark|light] [--format text|tsv]
 
   List every theme: the built-ins (Default first), then each <id>.conf in
   the themes folder, loaded or not, with its id (what `theme = \"<id>\"`
-  takes), label, appearance, pair, source, status and description, and any
-  warnings or the reason it did not load. The themes folder's path closes
-  the listing, with a truncation line when the folder holds more than aterm
-  reads. `aterm list-themes` is the same command.
+  takes), label, appearance, pair, source, status, type (the typography it
+  sets) and description, and any warnings or the reason it did not load.
+  The themes folder's path closes the listing, with a truncation line when
+  the folder holds more than aterm reads. `aterm list-themes` is the same
+  command.
 
   --appearance dark|light   Only the themes drawn for that appearance.
   --format tsv              Tab-separated rows for scripts: a header row, one
@@ -44,13 +46,14 @@ aterm theme check <file> [--strict] [--signature] [--format text|json]
 
   Read a theme file as the themes folder will: parse it, run the checks it
   loads under, and measure each contrast it rests on (text, each ANSI
-  colour, the selection band and the text on it, the cursor). Each
-  diagnostic names its line and key where it has them.
+  colour, the selection band and the text on it, the cursor, and each of
+  accent_color, border_color and search_match_color it sets). Each
+  diagnostic names its line where it has one (and, in JSON, its key).
 
   Exit status: 0 the theme loads, 1 it loads with warnings and --strict was
   given, 2 it does not load (or a usage error).
 
-  --strict         Warnings fail the check (exit 1).
+  --strict         Warnings fail the check (exit 1); notes never do.
   --signature      Also measure the stricter bar aterm's signature themes
                    (Aterm Night and Day, Hearth, Linen) clear: text 7:1; each
                    accent (ANSI 1-6, brights 9-14) 4.5:1; a tier's accents 25
@@ -58,32 +61,39 @@ aterm theme check <file> [--strict] [--signature] [--format text|json]
                    normal; color8 in [3, 4.5); color0 1.15:1; color7 and
                    color15 4.5:1; the selection band 1.5:1 with text 4.5:1 on
                    it; a cursor at 3:1, OkLCh chroma 0.08 or more, within 15
-                   deg of an accent's hue; accent chroma 0.07-0.17, max/min
-                   at most 1.75. A missed bar is listed, and fails --strict.
-  --format json    One JSON object: {document: \"aterm-theme-check\", version: 1,
+                   deg of a normal accent's (ANSI 1-6) hue; accent chroma
+                   0.07-0.17, max/min at most 1.75. A missed bar is listed,
+                   and fails --strict.
+  --format json    One JSON object: {document: \"aterm-theme-check\", version: 2,
                    file, id, status: ok|warnings|invalid, strict, exit_code,
                    theme: null | {display_name, description, author,
                    appearance, appearance_source: declared|measured,
-                   foreground, background, selection, selection_derived},
-                   diagnostics: [{severity: error|warning, code, line, key,
-                   message, foreign_format}],
+                   foreground, background, selection, selection_derived,
+                   bold_is_bright, palette_generate, typography,
+                   skipped_keys},
+                   diagnostics: [{severity: error|warning|note, code, line,
+                   key, message, foreign_format}],
                    contrast: [{drawn, on, ratio, minimum, below_minimum}],
                    signature: null | [{code, message}]}. A missing value is
                    null; a version only ever gains fields.
 
   Diagnostic codes: errors parse, unreadable, not_utf8; warnings
   low_text_contrast, faint_selection, ansi_matches_background,
-  low_cursor_contrast, appearance_mismatch (load checks), and not_conf,
-  invalid_id, shadowed_by_builtin, symlink_not_followed (the file name).
+  low_cursor_contrast, chrome_below_floor, search_match_like_selection,
+  appearance_mismatch, skipped_keys (load checks), palette_anchors_close
+  (palette_generate's derived palette), and not_conf, invalid_id,
+  shadowed_by_builtin, symlink_not_followed (the file name); notes
+  palette_generate, font_not_installed.
 
 aterm theme new <name> [--from <theme>] [--appearance dark|light] [--force]
 
   Write <name>.conf into the themes folder, each key under a comment saying
-  what it does, and print its path. Its colours come from --from (a built-in
-  or a themes-folder theme that loads; with --appearance, its pair when it
-  is drawn for the other appearance), else Default, or Default Light with
-  --appearance light. A built-in's name is refused; an existing theme is
-  kept unless --force.
+  what it does, and print its path. Its colours, typography and
+  bold_is_bright come from --from (a built-in or a themes-folder theme that
+  loads), else Default, or Default Light with --appearance light. When that
+  theme is drawn for the appearance --appearance does not name, its pair is
+  used instead; one with no pair (every themes-folder theme) is refused. A
+  built-in's name is refused; an existing theme is kept unless --force.
 
 aterm theme export <name> [--out <file>] [--force]
 
@@ -94,19 +104,20 @@ aterm theme export <name> [--out <file>] [--force]
 aterm theme schema [--format json|text]
 
   Describe every key a theme file can hold, from the parser's own key
-  table. JSON (the default) is {document: \"aterm-theme-schema\", version: 1,
+  table. JSON (the default) is {document: \"aterm-theme-schema\", version: 2,
   syntax, keys: [{name, aliases, type, required, index, constraints,
-  when_omitted, default, description, example}]}; --format text is the
-  same table for a person.
+  when_omitted, default, description, example, group, config_key}]};
+  --format text is the same table for a person.
 
 aterm theme import <file> [--name <id>] [--replace]
 
-  Convert another terminal's theme into a theme in the themes folder, where
-  Settings and `theme = \"<id>\"` find it: kitty, Ghostty, Alacritty (TOML),
-  iTerm2 (.itermcolors), Windows Terminal (JSON) or base16/base24 (YAML),
-  told apart by the file's extension, else its contents. Only a local file
-  up to 256 KiB is read; no URL, include or import line is followed. Keys
-  aterm has no place for are listed, not fatal.
+  Convert another terminal's theme (or an aterm theme file's colours) into a
+  theme in the themes folder, where Settings and `theme = \"<id>\"` find it:
+  kitty, Ghostty, Alacritty (TOML), iTerm2 (.itermcolors), Windows Terminal
+  (JSON) or base16/base24 (YAML), told apart by the file's extension, else
+  its contents. Only a local file up to 256 KiB is read; no URL, include or
+  import line is followed. Keys aterm has no place for are listed, not
+  fatal.
 
   --name <id>   The theme's id (its file name) and display name; default the
                 file's name without its extension, keeping the theme's own
@@ -115,8 +126,15 @@ aterm theme import <file> [--name <id>] [--replace]
                 (else the first).
   --replace     Overwrite an existing theme with this id.
 
-Every command but check exits 0 when done, 1 when it fails (a file that
-exists or cannot be read, an unknown theme), 2 on a usage error.
+aterm theme pack [<id>] [--appearance dark|light] [--format text|tsv] [--licences]
+aterm theme install <id>... | --all [--replace]
+
+  The community theme pack built into aterm, and copying its themes into
+  the themes folder: `aterm theme pack --help` describes both.
+
+list, new, export, schema and import exit 0 when done, 1 when they fail (a
+file that exists or cannot be read, an unknown theme), 2 on a usage error;
+pack and install exit as `aterm theme pack --help` says.
 ";
 
 /// What a run printed and its exit code.
@@ -261,7 +279,7 @@ fn parse_list_args(args: &[OsString]) -> Result<Option<ThemeListRequest>, String
     Ok(Some(request))
 }
 
-/// `--appearance`'s value, as `list` and `pack` read it.
+/// `--appearance`'s value, as `list`, `new` and `pack` read it.
 pub(crate) fn appearance_value(value: &str) -> Result<Appearance, String> {
     match value {
         "dark" => Ok(Appearance::Dark),

@@ -81,30 +81,38 @@ fn every_host_answer_reads_back_as_written() {
         opened_ms: Some(1_789_660_500_000),
         asked: vec!["prompt:c-1".to_string(), "prompt:c-2".to_string()],
     }));
-    same(None::<crate::harness::repo_work::RepoWork>);
-    same(Some(crate::harness::repo_work::RepoWork {
-        repo: "/Users//a/Developer/r".to_string(),
-        changed: 2,
-        untracked: 1,
-        stashes: 1,
-        unpushed: 3,
-        unlanded: 4,
-        main_ref: "origin/main".to_string(),
-        paths: vec!["src/a.rs".to_string(), "notes/".to_string()],
-        state: Some(u64::MAX),
-    }));
+    same(crate::harness::repo_work::RepoRead::Clean);
+    same(crate::harness::repo_work::RepoRead::Unread);
+    same(crate::harness::repo_work::RepoRead::Found(
+        crate::harness::repo_work::RepoWork {
+            repo: "/Users//a/Developer/r".to_string(),
+            changed: 2,
+            untracked: 1,
+            stashes: 1,
+            unpushed: 3,
+            unlanded: 4,
+            main_ref: "origin/main".to_string(),
+            paths: vec!["src/a.rs".to_string(), "notes/".to_string()],
+            state: Some(u64::MAX),
+        },
+    ));
     let old =
         br#"{"repo":"/r","changed":1,"untracked":0,"stashes":0,"unpushed":2,"paths":["a.rs"]}"#;
     assert_eq!(
-        <Option<crate::harness::repo_work::RepoWork> as TapeValue>::from_tape(old)
+        <crate::harness::repo_work::RepoRead as TapeValue>::from_tape(old)
             .expect("an older tape's finding"),
-        Some(crate::harness::repo_work::RepoWork {
+        crate::harness::repo_work::RepoRead::Found(crate::harness::repo_work::RepoWork {
             repo: "/r".to_string(),
             changed: 1,
             unpushed: 2,
             paths: vec!["a.rs".to_string()],
             ..Default::default()
         })
+    );
+    assert_eq!(
+        <crate::harness::repo_work::RepoRead as TapeValue>::from_tape(b"null")
+            .expect("an older tape's clean probe"),
+        crate::harness::repo_work::RepoRead::Clean
     );
     same(None::<StandingLimit>);
     same(Some(StandingLimit {
@@ -1242,6 +1250,7 @@ fn the_doors_tell_is_taped() {
         ],
         at_ms: since + 1_800_000,
         reading: OccupancyReading::default(),
+        ready_idle: None,
     };
     let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
     let host = TapedHost::new(

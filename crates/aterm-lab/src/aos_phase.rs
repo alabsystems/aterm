@@ -263,19 +263,20 @@ pub fn ms(ns: i128) -> String {
     format!("{sign}{}.{:03}", us / 1_000, us % 1_000)
 }
 
-/// The ticks drawn before the earliest settle deadline pending at them, by cause: a key since the tick before, else a moved caret, else neither.
+/// The ticks drawn before the earliest settle deadline pending at them, by cause: a key since the tick before, else a moved caret, else a floor answer as that deadline (design §10.10's class for a plan floor lock's tick), else none of these.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EarlyTicks {
     pub after_key: u64,
     pub moved: u64,
     pub other: u64,
+    pub locked: u64,
 }
 
 impl EarlyTicks {
     /// Every early tick.
     #[must_use]
     pub const fn total(&self) -> u64 {
-        self.after_key + self.moved + self.other
+        self.after_key + self.moved + self.other + self.locked
     }
 }
 
@@ -321,12 +322,16 @@ pub struct Phase {
     pub rounding: Vec<i128>,
     /// `t − d` (ns) for the earliest settle answer pending at each tick, early ticks included.
     pub earliest: Vec<i128>,
-    /// `t − d` (ns) for the tick right after each early tick, `d` the earliest deadline the early tick took.
+    /// `t − d` (ns) for the tick right after each early tick but a locked one, `d` the earliest deadline the early tick took.
     pub after_early: Vec<i128>,
     /// For each settle wake whose earliest answer was the floor (`d = q + frame_interval`), its period `t − t'` (ns) since the tick before, which `t − d` cannot show since the floor is re-anchored at every query.
     pub floor_period: Vec<i128>,
     /// For the same wakes, in order: `q − t'` (ns), the query's lag behind the tick before.
     pub query_lag: Vec<i128>,
+    /// For each locked early tick, its period `t − t'` (ns) since the tick before.
+    pub period_locked: Vec<i128>,
+    /// For each locked early tick, `d − t` (ns): how far before its floor answer it came.
+    pub ahead_locked: Vec<i128>,
     /// The stretch after the last key over which the glow changed at every tick.
     pub run: Run,
     /// Every frame interval a query of the phase carried (ns), with how many carried it, ascending.
@@ -547,15 +552,21 @@ pub fn phase(steps: &[Step], prior: usize) -> Option<Phase> {
                             p.floor_period.push(at - prev);
                             p.query_lag.push(a.q - prev);
                         }
+                    } else if keyed {
+                        took = Some(a.d);
+                        p.early.after_key += 1;
+                    } else if before.is_some_and(|(_, c)| c != cur) {
+                        took = Some(a.d);
+                        p.early.moved += 1;
+                    } else if a.floor {
+                        p.early.locked += 1;
+                        p.ahead_locked.push(a.d - at);
+                        if let Some((prev, _)) = before {
+                            p.period_locked.push(at - prev);
+                        }
                     } else {
                         took = Some(a.d);
-                        if keyed {
-                            p.early.after_key += 1;
-                        } else if before.is_some_and(|(_, c)| c != cur) {
-                            p.early.moved += 1;
-                        } else {
-                            p.early.other += 1;
-                        }
+                        p.early.other += 1;
                     }
                 }
                 p.rounding.extend(pending.drain(..).map(|a| at - a.d));
@@ -635,6 +646,11 @@ pub fn measured_lines(p: &Phase, presents: Option<u64>) -> Vec<String> {
         values_words(&p.floor_period)
     ));
     lines.push(format!("query_lag floor {}", values_words(&p.query_lag)));
+    lines.push(format!(
+        "period locked {} frame_ms={frame}",
+        values_words(&p.period_locked)
+    ));
+    lines.push(format!("ahead locked {}", values_words(&p.ahead_locked)));
     lines.push(format!(
         "run ticks={} span_ms={} mean_period_ms={} frame_ms={frame}",
         p.run.ticks,
@@ -958,7 +974,8 @@ mod tests {
             EarlyTicks {
                 after_key: 0,
                 moved: 0,
-                other: 1
+                other: 1,
+                locked: 0
             }
         );
         assert_eq!(ms(&p.after_early), [21]);
@@ -1041,6 +1058,98 @@ mod tests {
         assert!(measured_lines(&p, Some(12))[0].ends_with(" presents=12"));
     }
 
+    /// A locked floor wake, an early tick one frame after the tick before with its floor answer pending, keeps the frame period and comes the query's lag before that answer, counted early but not `other` and measured by no `after_early`; a key or a caret move since the tick before takes precedence over it; a trace of floor wakes armed at the query's floor reads none.
+    #[test]
+    fn a_locked_floor_wake_keeps_the_frame_period() {
+        const F: u64 = 33_333_332;
+        let f = i128::from(F);
+        let (lag, late) = (1_500_000, 1_160_000);
+        let trace = |locked: bool, moved_at: Option<u64>, key_at: Option<u64>| {
+            let mut steps = vec![key(0, 0)];
+            let mut t = 100_000;
+            steps.push(tick_ns(1, t, 1, (1, 1)));
+            for k in 0..10u64 {
+                let q = t + lag;
+                steps.push(query_ns(2 + 3 * k, q, F, Some(q + f)));
+                if key_at == Some(k) {
+                    steps.push(key(3 + 3 * k, q / 1_000_000));
+                }
+                t = if locked { t + f } else { q + f + late };
+                let cur = if moved_at.is_some_and(|m| k >= m) {
+                    (1, 2)
+                } else {
+                    (1, 1)
+                };
+                steps.push(tick_ns(4 + 3 * k, t, 2 + k, cur));
+            }
+            let q = t + lag;
+            steps.push(query_ns(32, q, F, Some(q + 100_000_000)));
+            steps.push(tick_ns(33, q + 100_000_000 + late, 0, (1, 1)));
+            phase(&steps, 0).expect("a phase")
+        };
+        let p = trace(true, None, None);
+        assert!(p.cleared);
+        assert_eq!((p.counts.ticks, p.counts.presented), (12, 12));
+        assert_eq!(
+            p.early,
+            EarlyTicks {
+                after_key: 0,
+                moved: 0,
+                other: 0,
+                locked: 10
+            }
+        );
+        assert_eq!(p.early.total(), 10);
+        assert_eq!(p.period_locked, vec![f; 10]);
+        assert_eq!(p.ahead_locked, vec![lag; 10]);
+        assert!(p.after_early.is_empty(), "a locked tick takes no deadline");
+        assert!(p.floor_period.is_empty() && p.query_lag.is_empty());
+        assert_eq!(p.settle_wakes, 1);
+        assert_eq!(p.run.ticks, 11);
+        assert_eq!(p.run.mean_period(), Some(f));
+        let lines = measured_lines(&p, None);
+        for want in [
+            "early_ticks after_key=0 moved=0 other=0",
+            "period floor n=0 frame_ms=33.333",
+            "period locked n=10 min_ms=33.333 p50_ms=33.333 p90_ms=33.333 max_ms=33.333 \
+             frame_ms=33.333",
+            "ahead locked n=10 min_ms=1.500 p50_ms=1.500 p90_ms=1.500 max_ms=1.500",
+            "run ticks=11 span_ms=333.333 mean_period_ms=33.333 frame_ms=33.333",
+        ] {
+            assert!(lines.iter().any(|l| l == want), "{want}\n{lines:#?}");
+        }
+        assert!(
+            lines[0].contains(" settle_wakes=1 early_ticks=10 cleared=true "),
+            "{}",
+            lines[0]
+        );
+
+        let moved = trace(true, Some(4), None);
+        assert_eq!((moved.early.moved, moved.early.locked), (1, 9));
+        assert_eq!(
+            moved.after_early.len(),
+            1,
+            "a moved tick takes its deadline"
+        );
+
+        let keyed = trace(true, None, Some(4));
+        assert_eq!((keyed.early.after_key, keyed.early.locked), (1, 9));
+        assert_eq!(
+            keyed.after_early.len(),
+            1,
+            "a keyed tick takes its deadline"
+        );
+        assert_eq!(keyed.period_locked.len(), 9);
+
+        let unlocked = trace(false, None, None);
+        assert_eq!(unlocked.early.total(), 0);
+        assert_eq!(unlocked.floor_period, vec![lag + f + late; 10]);
+        let lines = measured_lines(&unlocked, None);
+        for want in ["period locked n=0 frame_ms=33.333", "ahead locked n=0"] {
+            assert!(lines.iter().any(|l| l == want), "{want}\n{lines:#?}");
+        }
+    }
+
     /// A redraw within half a frame of the tick before neither counts in the run nor ends it, unless the phase carried no frame interval.
     #[test]
     fn a_redraw_within_half_a_frame_neither_counts_in_the_run_nor_ends_it() {
@@ -1109,7 +1218,8 @@ mod tests {
             EarlyTicks {
                 after_key: 1,
                 moved: 1,
-                other: 1
+                other: 1,
+                locked: 0
             }
         );
         assert_eq!(p.early.total(), 3);
@@ -1257,6 +1367,11 @@ mod tests {
         assert!(
             p.rounding.iter().all(|&r| r <= 0),
             "{why}: a lane wakes at d, or an input beats it"
+        );
+        assert_eq!(p.early.locked, 0, "{why}: the lane cannot lock");
+        assert!(
+            p.period_locked.is_empty() && p.ahead_locked.is_empty(),
+            "{why}: no locked tick is measured"
         );
     }
 

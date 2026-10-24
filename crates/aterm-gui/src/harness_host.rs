@@ -1772,8 +1772,7 @@ type LimitResetFn = dyn Fn(&Snapshot) -> Option<u64> + Send + Sync;
 /// The tail of the transcript the Claude Code a snapshot names writes now ([`upgrade_drive::snapshot_transcript_tail`]; [`Acts::transcript_tail`]).
 type TranscriptTailFn = dyn Fn(&Snapshot) -> Option<String> + Send + Sync;
 /// What the repository the session a snapshot names works in holds that no remote has ([`Acts::repo_work`]).
-type RepoWorkFn =
-    dyn Fn(&Snapshot) -> Option<aterm_agent::harness::repo_work::RepoWork> + Send + Sync;
+type RepoWorkFn = dyn Fn(&Snapshot) -> aterm_agent::harness::repo_work::RepoRead + Send + Sync;
 /// That transcript and the file it is ([`upgrade_drive::snapshot_transcript`]; [`Acts::transcript`]).
 type TranscriptFn = dyn Fn(&Snapshot) -> Option<(PathBuf, String)> + Send + Sync;
 /// A tasked session's record told its agent is gone for good ([`Acts::task_exited`]): its sid.
@@ -3752,9 +3751,9 @@ impl IdleHost for WorkerIdle {
     }
 
     /// What the session's repository holds that no remote has ([`IdleHost::repo_work`]).
-    fn repo_work(&self) -> Option<aterm_agent::harness::repo_work::RepoWork> {
-        let snap = self.followed_kept()?;
-        (self.hooks.acts.repo_work)(&snap)
+    fn repo_work(&self) -> aterm_agent::harness::repo_work::RepoRead {
+        self.followed_kept()
+            .map_or_else(Default::default, |snap| (self.hooks.acts.repo_work)(&snap))
     }
 
     /// The turn the conversation ends on, by every key that names it.
@@ -13319,8 +13318,10 @@ fn live_acts(store: Store, sock: String) -> Acts {
         transcript_tail: Arc::new(upgrade_drive::snapshot_transcript_tail),
         repo_work: Arc::new(move |snap| {
             let tail = upgrade_drive::snapshot_transcript_tail(snap);
-            let dir = aterm_agent::harness::repo_work::session_dir(&snap.cwd, tail.as_deref())?;
-            session_repo_work(&dir, repo_home.as_deref())
+            aterm_agent::harness::repo_work::session_dir(&snap.cwd, tail.as_deref())
+                .map_or_else(Default::default, |dir| {
+                    session_repo_work(&dir, repo_home.as_deref())
+                })
         }),
         transcript: Arc::new(upgrade_drive::snapshot_transcript),
         task_exited: Arc::new(move |sid| task_exited_live(&task_sock, sid)),
@@ -13496,7 +13497,7 @@ fn account_wall_of(
 pub(crate) fn session_repo_work(
     dir: &std::path::Path,
     home: Option<&std::path::Path>,
-) -> Option<aterm_agent::harness::repo_work::RepoWork> {
+) -> aterm_agent::harness::repo_work::RepoRead {
     session_repo_work_under(dir, home, aterm_types::dirs::state_dir().as_deref())
 }
 
@@ -13505,10 +13506,10 @@ pub(crate) fn session_repo_work_under(
     dir: &std::path::Path,
     home: Option<&std::path::Path>,
     state: Option<&std::path::Path>,
-) -> Option<aterm_agent::harness::repo_work::RepoWork> {
+) -> aterm_agent::harness::repo_work::RepoRead {
     use aterm_agent::harness::repo_work;
     if state.is_some_and(|state| crate::summarize::in_summary_folder_under(dir, state)) {
-        return None;
+        return repo_work::RepoRead::Clean;
     }
     repo_work::probe(dir, home, repo_work::PROBE_LIMIT)
 }
@@ -17387,7 +17388,7 @@ impl Acts {
             finished: Arc::new(|_, _, _| None),
             limit_reset: Arc::new(|_| None),
             transcript_tail: Arc::new(|_| None),
-            repo_work: Arc::new(|_| None),
+            repo_work: Arc::new(|_| Default::default()),
             transcript: Arc::new(|_| None),
             task_exited: Arc::new(|_| {}),
             startups: Arc::new(|_| Vec::new()),

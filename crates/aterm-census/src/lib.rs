@@ -164,11 +164,12 @@ pub struct Census {
     pub run: fn(&Path) -> CensusOutcome,
 }
 
-/// All censuses in `--all` execution order.
+/// Every census, in the order a run prints them (they run in parallel).
 pub const CENSUSES: &[Census] = &[
     Census {
         name: "mainloop",
-        about: "main-thread reach to unbounded work or a frame wait (OB-1..OB-6, OB-22, OB-23)",
+        about: "main-thread reach to unbounded work or a frame wait; unbounded work under a held \
+                `term` guard (OB-1..OB-6, OB-22, OB-23)",
         run: run_mainloop_census,
     },
     Census {
@@ -233,7 +234,8 @@ pub fn run_censuses(root: &Path, selected: &[&Census]) -> Vec<CensusOutcome> {
     })
 }
 
-/// Runs every census in [`CENSUSES`] order over `root`.
+/// Runs every census over `root` in parallel and returns each outcome under its
+/// name, in [`CENSUSES`] order.
 #[must_use]
 pub fn run_all(root: &Path) -> Vec<(&'static str, CensusOutcome)> {
     let every: Vec<&Census> = CENSUSES.iter().collect();
@@ -245,7 +247,7 @@ pub fn run_all(root: &Path) -> Vec<(&'static str, CensusOutcome)> {
 }
 
 /// The walker's limits, printed after a red verdict that found an
-/// unbounded-work site.
+/// unbounded-work site or a frame wait.
 pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (this census's limits):
       - LEXICAL, name-based: fns are segmented by rustfmt's
         closing-brace-at-fn-indent layout and calls matched as `<ident>(`,
@@ -254,9 +256,10 @@ pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (this census's limits):
         Macro-generated calls, fn pointers and aliasing can evade it; a
         synchronous `term_lock(..).resize(..)` on a main-thread path is
         caught, with its path printed.
-      - SCOPE: the call graph covers non-test `crates/aterm-gui/src` only
-        (OB-22 adds `crates/aterm-control/src`), plus one modeled `term_lock`
-        hop into Terminal methods. Test, bench and proof files are dropped by
+      - SCOPE: the call graph covers non-test `crates/aterm-gui/src` and
+        `crates/aterm-gui-*/src` (OB-22's held-guard scan also reads
+        `crates/aterm-control/src`), plus one modeled `term_lock` hop into
+        Terminal methods. Test, bench and proof files are dropped by
         path; an in-file item is blanked only when its `cfg` entails `test`
         (`all(test, ..)` yes; `any(test, unix)` and `not(test)` no). The walk
         does not enter aterm-core or aterm-grid: the unbounded sinks are
@@ -339,7 +342,8 @@ const OFFLOAD_ALLOWLIST: &[OffloadBoundary] = &[
         def_file: "crates/aterm-core/src/terminal/callback_setters.rs",
         justification: "The re-attach half: O(1) store re-attach plus a bounded \
             lazy-buffer drain (O(window output), not O(history)) under a brief lock, \
-            after the worker did the unbounded rewrap off-thread. Guarded against \
+            after the worker did the unbounded rewrap off-thread; when the width changed \
+            meanwhile it re-detaches and returns a new job for the worker. Guarded against \
             clobbering (reset raced) and against resurrecting erased history \
             (clear_gen check).",
     },
@@ -353,8 +357,9 @@ const OFFLOAD_ALLOWLIST: &[OffloadBoundary] = &[
     OffloadBoundary {
         symbol: "reattach_reflowed_scrollback",
         def_file: "crates/aterm-grid/src/grid/scrollback_offload.rs",
-        justification: "The Grid-level primitive `finish_resize_offload` forwards \
-            to: O(1) attach of the already-rewrapped store + bounded lazy drain. \
+        justification: "The Grid-level re-attach that `finish_resize_offload` reaches \
+            through `reattach_reflowed_scrollback_or_redetach`: O(1) attach of the \
+            already-rewrapped store + bounded lazy drain. \
             Registered so GUI code driving a Grid directly (no Terminal wrapper) \
             still has a sanctioned re-attach shape; it IS the underlying boundary, \
             not a suppression.",
@@ -920,17 +925,19 @@ fn fn_defined_in(root: &Path, rel_file: &str, symbol: &str) -> bool {
 fn append_why_and_repair(log: &mut String) {
     let _ = writeln!(
         log,
-        "    WHY THIS IS L0: the winit event-loop thread does O(session-history)\n\
-         \x20        work (decompressing and rewrapping every scrollback line) while\n\
-         \x20        holding the per-session `term` mutex; input, redraw and every\n\
-         \x20        window this loop serves stall until it finishes.\n\
+        "    WHY THIS IS L0: work that grows with session history (or, for a\n\
+         \x20        diskwalk sink, with the entries walked) runs on the winit\n\
+         \x20        event-loop thread or under the per-session `term` mutex the\n\
+         \x20        event loop takes to draw; input, redraw and every window this\n\
+         \x20        loop serves stall until it finishes.\n\
          \x20   HOW TO REPAIR (pick one):\n\
          \x20     1. OFFLOAD (the canonical fix): replace `.resize(rows, cols)` with\n\
          \x20        `.resize_offloading_scrollback(rows, cols)` inside the lock; hand\n\
          \x20        the returned `PendingScrollbackReflow` to a worker (its `reflow()`\n\
-         \x20        runs off the lock), re-attach with `.finish_resize_offload(..)`,\n\
-         \x20        and call `.abort_resize_offload()` if the worker dies. Canonical\n\
-         \x20        shape: `resize_panes_scoped_with_active_plan` in\n\
+         \x20        runs off the lock), re-attach with `.finish_resize_offload(..)`\n\
+         \x20        and drive any job it returns the same way, and call\n\
+         \x20        `.abort_resize_offload()` if the worker dies. Canonical shape:\n\
+         \x20        `resize_panes_scoped_with_active_plan` in\n\
          \x20        crates/aterm-gui/src/app_render.rs.\n\
          \x20     2. BOUND the work: if this site provably never reflows unbounded\n\
          \x20        history (alt-screen grid, fixed-size scratch terminal), use a path\n\
@@ -945,7 +952,7 @@ fn append_why_and_repair(log: &mut String) {
 
 const MAINLOOP: &str = "main-loop census";
 
-/// Runs the main-loop census (`OB-1`..`OB-6`, `OB-22`) over `root`.
+/// Runs the main-loop census (`OB-1`..`OB-6`, `OB-22`, `OB-23`) over `root`.
 pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
     let mut log = String::new();
     let mut failures = 0usize;
@@ -1074,8 +1081,8 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             let _ = writeln!(
                 log,
                 "  ✗ FAIL [OB-2] declared main-thread root `{r}` not found in \
-                 crates/aterm-gui/src; if the handler was renamed, rename it in \
-                 MAIN_THREAD_ROOTS (crates/aterm-census/src/lib.rs)."
+                 crates/aterm-gui/src or crates/aterm-gui-*/src; if the handler was renamed, \
+                 rename it in MAIN_THREAD_ROOTS (crates/aterm-census/src/lib.rs)."
             );
             failures += 1;
         }
@@ -1314,9 +1321,9 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         let _ = writeln!(
             log,
             "  ✗ FAIL [OB-4] ZERO calls to any allowlisted offload boundary ({}) found in \
-             crates/aterm-gui/src — either the offload was removed (the freeze class is \
-             unguarded) or the boundary was renamed (update OFFLOAD_ALLOWLIST with a fresh \
-             justification).",
+             crates/aterm-gui/src or crates/aterm-gui-*/src — either the offload was removed \
+             (the freeze class is unguarded) or the boundary was renamed (update \
+             OFFLOAD_ALLOWLIST with a fresh justification).",
             allowlist_symbols().join("/")
         );
         failures += 1;

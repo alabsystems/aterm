@@ -178,7 +178,8 @@ impl std::error::Error for ImportError {}
 
 /// Detect the format of `bytes` and convert it into an [`ImportReport`].
 /// # Errors
-/// Returns [`ImportError`] if `bytes` is too large, not UTF-8, or fails conversion.
+/// Returns [`ImportError`] if `bytes` is too large, not UTF-8, in no format an import reads, or
+/// fails conversion.
 pub fn import_theme(
     file_name: Option<&str>,
     bytes: &[u8],
@@ -267,13 +268,13 @@ pub fn to_native_conf_package(theme: &ParsedTheme, header: &[&str]) -> String {
     write_native_conf(theme, header, false)
 }
 
-/// Serialize a whole [`ParsedTheme`] with descriptive comments and commented-out defaults.
+/// Serialize a whole [`ParsedTheme`] with descriptive comments and commented-out examples.
 #[must_use]
 pub fn to_native_conf_package_commented(theme: &ParsedTheme, header: &[&str]) -> String {
     write_native_conf(theme, header, true)
 }
 
-/// Serialize a [`ColorScheme`] with descriptive comments and commented-out defaults.
+/// Serialize a [`ColorScheme`] with descriptive comments and commented-out examples.
 #[must_use]
 pub fn to_native_conf_commented(
     scheme: &ColorScheme,

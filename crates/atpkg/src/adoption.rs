@@ -48,7 +48,8 @@ pub fn holds_no_alab_program(layout: &Layout) -> bool {
         .any(|program| !crate::vendor_direct::is_vendor(program))
 }
 
-/// Returns the managed `bin/` directory for a session's PATH when consented or hooked.
+/// Returns the managed `bin/` directory for a session's PATH when `home` holds the shell hook or
+/// the automatic lanes are enabled on a consenting machine.
 #[must_use]
 pub fn session_bin_dir(
     layout: &Layout,

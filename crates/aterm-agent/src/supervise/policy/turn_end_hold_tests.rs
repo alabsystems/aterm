@@ -69,7 +69,7 @@ fn instructed() -> (TurnEndState, Instant) {
 fn yield_of(said: &str, cut: bool, repo: Option<RepoWork>) -> TurnEndReading {
     land(TurnEndReading {
         said_cut: cut,
-        repo,
+        repo: crate::harness::repo_work::RepoRead::of_found(repo),
         ..idle(said, Some(2 * MIN))
     })
 }
@@ -116,7 +116,7 @@ fn first_leg_only(r: &TurnEndReading) -> u8 {
         .is_some_and(|t| !needs::needs_you(t).is_empty())
     {
         Some(HoldLeg::Needs)
-    } else if r.repo.is_some() {
+    } else if r.repo.found().is_some() {
         Some(HoldLeg::Repo)
     } else {
         None
@@ -662,7 +662,7 @@ fn a_land_acts_yield_names_legs_only_where_the_act_was_taken() {
     let a = owed(&mut st, &y, now + 2 * MIN);
     assert_eq!(a.rule_id(), Some(RULE_LAND_NUDGE), "{a:?}");
     let untaken = land(TurnEndReading {
-        repo: Some(found(0, 1, 0, 0, 0)),
+        repo: crate::harness::repo_work::RepoRead::Found(found(0, 1, 0, 0, 0)),
         ..idle(&open_defense(), None)
     });
     at(&mut st, &untaken, now + 6 * MIN);

@@ -72,7 +72,8 @@ impl Usage {
 ///
 /// # Errors
 /// An unknown word or flag, a flag without its value, a value that is not one,
-/// or options that contradict each other.
+/// options that contradict each other or the checks named, or `release` without
+/// `--app`.
 pub fn parse<I, S>(args: I) -> Result<Args, Usage>
 where
     I: IntoIterator<Item = S>,
@@ -242,7 +243,7 @@ Run aterm's checks in place, alone or in any combination.
 
   verify                          the dev set on what changed since origin/main
   verify lint test -p aterm-grid  two checks on one crate
-  verify test --all               every crate's tests
+  verify test --all               every crate's tests (+ gpu-oracle, wasm-smoke)
   verify fmt --fix                rewrite what fmt finds unformatted
   verify release --app <APP>      everything publication requires
   verify list                     every check: sets, needs, what it runs
@@ -282,7 +283,8 @@ Options:
       --test-threads <n>  RUST_TEST_THREADS for every test binary
       --test-jobs <n>     test binaries at once (default 8)
       --timeout <s|off>   hang ceiling for each child (default 3h)
-      --log <path>        where the full log goes (default <target>/verify/logs.noindex)
+      --log <path>        where the full log goes (default: a new file in
+                          <target>/verify/logs.noindex, the newest 20 kept)
   -h, --help
 
 Exit: 0 every check that ran passed, 1 a check failed, 2 usage, 3 could not run.

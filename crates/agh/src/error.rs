@@ -14,15 +14,15 @@ use crate::wire::WireKind;
 /// What went wrong: sixteen kinds, one exit code each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
-    /// agh's own gate refused; nothing was sent (exit 1).
+    /// agh's own gate refused (exit 1): nothing was sent; for `auth add`, nothing was written.
     Refused,
     /// Bad flags or arguments (exit 2).
     Usage,
-    /// The request could not run: network, trust store, proxy, deadline or local I/O (exit 3).
+    /// Could not run: network, trust store, proxy, deadline, I/O, protocol or tape (exit 3).
     CouldNotRun,
     /// No routed credential, an unusable token file, or a 401 (exit 4).
     Unauthenticated,
-    /// GitHub refused the permission: a 403 or 451 (exit 5).
+    /// A 403 or 451 from GitHub, or agh's own permission check (exit 5).
     Forbidden,
     /// Confirmed absent: the parent is visible to this identity (exit 6).
     NotFound,
@@ -122,10 +122,10 @@ impl Kind {
     #[must_use]
     pub const fn meaning(self) -> &'static str {
         match self {
-            Kind::Refused => "agh's own gate; nothing was sent",
+            Kind::Refused => "agh's own gate; nothing was sent (auth add: nothing was written)",
             Kind::Usage => "bad flags or arguments",
             Kind::CouldNotRun => {
-                "the request could not run: network, trust store, proxy, deadline or local I/O"
+                "could not run: network, trust store, proxy, deadline, I/O, protocol or tape"
             }
             Kind::Unauthenticated => "no routed credential, an unusable token file, or a 401",
             Kind::Forbidden => "a 403 or 451 from GitHub, or agh's own permission check",
@@ -264,7 +264,7 @@ impl SideEffect {
     }
 }
 
-/// Permission refusal sub-kind (403/451 or untrusted draft writer).
+/// Permission refusal sub-kind: GitHub's 403 or 451, or agh's own check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Forbid {
@@ -328,7 +328,7 @@ pub enum Replay {
     Unconsumed,
     /// The run reached a reply the tape holds only by digest.
     BodyNotTaped,
-    /// A streaming door or a request with a body under a tape.
+    /// A streaming door, a request with a body, or a credentialed request, under a tape.
     StreamNotTaped,
     /// Invalid tape format or unsupported header.
     Format,

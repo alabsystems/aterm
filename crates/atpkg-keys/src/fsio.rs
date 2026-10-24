@@ -83,8 +83,35 @@ pub fn write_bytes(path: &str, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Replace `path` atomically via a synced sibling temporary ([`stage_sibling_temp_with_mode`]).
 pub fn write_bytes_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = stage_sibling_temp(path, bytes)?;
-    promote_staged(&tmp, path)
+    write_bytes_atomic_with_sync(path, bytes, sync_parent).map_err(|e| e.error)
+}
+
+/// An atomic replacement's error and whether its rename already succeeded.
+#[derive(Debug)]
+pub(crate) struct AtomicWriteError {
+    pub error: std::io::Error,
+    pub renamed: bool,
+}
+
+/// The shared replacement with its parent-directory sync operation supplied by the caller.
+pub(crate) fn write_bytes_atomic_with_sync(
+    path: &str,
+    bytes: &[u8],
+    sync: impl FnOnce(&str) -> std::io::Result<()>,
+) -> Result<(), AtomicWriteError> {
+    let before_rename = |error| AtomicWriteError {
+        error,
+        renamed: false,
+    };
+    let tmp = stage_sibling_temp(path, bytes).map_err(before_rename)?;
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(before_rename(error));
+    }
+    sync(path).map_err(|error| AtomicWriteError {
+        error,
+        renamed: true,
+    })
 }
 
 /// The staging half of [`write_bytes_atomic`].
@@ -125,15 +152,6 @@ fn stage_sibling_temp_with_mode(path: &str, bytes: &[u8], mode: u32) -> std::io:
         return Err(e);
     }
     Ok(tmp)
-}
-
-/// Promote `tmp` over `path` and sync the parent directory ([`write_bytes_atomic`], [`sync_parent`]).
-fn promote_staged(tmp: &str, path: &str) -> std::io::Result<()> {
-    if let Err(e) = std::fs::rename(tmp, path) {
-        let _ = std::fs::remove_file(tmp);
-        return Err(e);
-    }
-    sync_parent(path)
 }
 
 /// Install a new owner-only (`0600`) file atomically, never replacing an existing path.
@@ -290,17 +308,27 @@ mod tests {
         assert_eq!(std::fs::read(&fresh).unwrap(), b"hello");
     }
 
-    /// Revoking the directory's write permission stands in for ENOSPC or a crash.
+    /// A parent obstructed before staging fails without changing the original, even as root.
     #[test]
     fn a_failed_atomic_write_leaves_the_original_intact() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = scratch("failed");
+        let root = scratch("failed");
+        let dir = root.join("anchor");
+        std::fs::create_dir(&dir).unwrap();
         let path = dir.join("pins.rs").to_str().unwrap().to_string();
         std::fs::write(&path, b"the trust anchor").unwrap();
 
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let result = write_bytes_atomic(&path, b"a replacement that cannot land");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let saved = root.join("anchor-before-staging");
+        let (move_from, move_to) = (dir.clone(), saved.clone());
+        let result = window::with(
+            "temp name drawn",
+            move |_| {
+                std::fs::rename(&move_from, &move_to).unwrap();
+                std::fs::write(&move_from, b"a parent must be a directory").unwrap();
+            },
+            || write_bytes_atomic(&path, b"a replacement that cannot land"),
+        );
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::rename(&saved, &dir).unwrap();
 
         assert!(result.is_err(), "the write must fail");
         assert_eq!(

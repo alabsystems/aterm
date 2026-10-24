@@ -1398,7 +1398,7 @@ pub struct ModelReadStep {
     pub settled: Settled,
     /// The record changed (the settle step, or the clock): the caller saves it.
     pub changed: bool,
-    /// The [`ride_bar`] word why the carried model ([`ModelView::carried`]) no longer rides its round's restart.
+    /// The [`ride_bar`] word why the carried model ([`ModelView::carried`]) does not ride its round's restart.
     pub ride_barred: Option<&'static str>,
 }
 

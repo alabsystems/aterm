@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Read-only upgrade watch ([`super::watch_at`], [`super::Opts::dry_run`], [`look_word`]).
+//! Applies hands-free [`St::for_target`], [`St::hold_clock`], and [`super::rearm`] updates.
 
 use std::path::PathBuf;
 

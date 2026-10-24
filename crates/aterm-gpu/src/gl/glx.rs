@@ -1607,8 +1607,8 @@ mod tests {
     /// nothing, fails as an unavailable surface a retry may recover, and
     /// latches nothing. Binding it would have Mesa's software GLX (drisw)
     /// ask the same question after the swap, unchecked, and draw into a
-    /// buffer of the uninitialized size it read: the Linux lane's display
-    /// gone mid-resize, x86_64, 2026-10-22, all eight llvmpipe threads dead
+    /// buffer of the uninitialized size it read: with the display gone
+    /// mid-resize on the Linux lane (x86_64), all eight llvmpipe threads die
     /// of SIGSEGV with the server killed under that ask. The control: the
     /// first present posts. It runs in a child ([`in_child`]).
     #[test]
@@ -1678,9 +1678,9 @@ mod tests {
     /// posts. The negative control: with `hung_up` answering `false`, the
     /// first present after the hang-up reports a post (its swap is queued
     /// on the dead socket and nothing latches), and the GLX calls go on
-    /// into a connection Xlib has given up on (the Linux lane's
-    /// display-gone rows died of that on 2026-10-22, by SIGSEGV after Xlib's
-    /// `request … would exceed buffer size` and by an abort in
+    /// into a connection Xlib has given up on (which, on the Linux lane's
+    /// display-gone rows, ends in a SIGSEGV after Xlib's
+    /// `request … would exceed buffer size` and in an abort in
     /// `glXQueryDrawable`'s unchecked reply). It runs in a child
     /// ([`in_child`]).
     #[test]

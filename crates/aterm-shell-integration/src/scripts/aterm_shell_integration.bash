@@ -434,7 +434,7 @@ __aterm_in_prompt_cmd="${__aterm_in_prompt_cmd:-0}"
 # For compound commands with redirections (`{ ...; } > f`, `for ...; done > f`),
 # bash applies the redirection before firing the DEBUG trap for the first simple
 # command inside, so stdout points at `f`. Route marks to stdout when it is a
-# tty (or when the shell started on pipes in tests/embedders), otherwise to
+# tty (or when the shell started on pipes in tests or embedders), otherwise to
 # stderr if it is a tty, or `/dev/tty`.
 if [[ -z ${__aterm_osc_tty+x} ]]; then
     if [[ -t 1 ]]; then __aterm_osc_tty=1; else __aterm_osc_tty=0; fi

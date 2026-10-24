@@ -64,7 +64,7 @@ pub enum Lit {
 }
 
 impl Lit {
-    /// As a property-list value ([`Lit::NoWidgets`]).
+    /// As a property-list value: for [`Lit::NoWidgets`], the list written where there was none.
     #[must_use]
     pub fn value(self) -> PValue {
         match self {

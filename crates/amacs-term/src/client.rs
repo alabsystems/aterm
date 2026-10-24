@@ -33,9 +33,10 @@ FILE that does not exist yet is created by its first save.
 
 OPTIONS:
     +LINE[:COL]   put the caret on LINE (and column COL) of the next FILE
-    --wait        use the Editor tab and wait even when stdin or stdout is not
-                  a terminal
-    --no-wait     hand each FILE to an Editor tab and return at once
+    --wait        in an aterm tab, use the Editor tab and wait even when stdin
+                  or stdout is not a terminal
+    --no-wait     in an aterm tab, hand each FILE to an Editor tab and return
+                  at once (in the terminal neither flag changes anything)
     -nw, --tty    edit in this terminal instead of an Editor tab
     -h, --help    print this help
     --            every later argument is a FILE
@@ -46,14 +47,17 @@ terminal with Emacs keys: C-x C-s saves, C-x C-c closes the file (asking first
 when it has unsaved changes), C-c C-c saves and closes, C-c C-k closes without
 saving, C-g cancels, C-z suspends. A save refuses when the file changed on disk
 since it was read: C-x C-s again overwrites it, M-x revert-buffer reloads it.
+On Windows there is no terminal editor yet: in these cases amacs says so and
+exits 1.
 
 EXIT STATUS:
     0    every FILE was closed (with --no-wait: handed to the window)
     1    a FILE could not be opened, the window did not answer or failed the
-         wait, the edit was abandoned (C-c C-k), or the terminal hung up
-    2    a usage error; in an aterm tab without -nw, stdin or stdout is not a
-         terminal and neither --wait nor --no-wait was given; or no terminal
-         to edit in
+         wait, the edit was abandoned (C-c C-k), the terminal hung up or
+         failed, or (on Windows) the edit needed the terminal
+    2    a usage error; in an aterm tab (not in tmux or screen) without -nw,
+         stdin or stdout is not a terminal and neither --wait nor --no-wait
+         was given; or no terminal to edit in
     75   the aterm serving the edit went away and no successor took the wait
     130  interrupted (C-c) while waiting; the Editor tab stays open
 ";

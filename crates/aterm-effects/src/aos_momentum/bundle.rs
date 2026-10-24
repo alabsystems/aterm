@@ -93,7 +93,8 @@ pub struct Row {
     pub split: CorpusSplit,
     /// Its kind.
     pub kind: ItemKind,
-    /// Whether the run was made: the golden trace read and the plan entered on its checkpoint.
+    /// Whether the run was made: the golden trace read and the plan entered on its checkpoint, or
+    /// the host logged every call and its replayed log reproduced the live head.
     pub run: RowVerdict,
     /// `NoStrandedLight` on the replay.
     pub stranded_light: RowVerdict,
@@ -179,7 +180,7 @@ pub struct Publication {
     pub live_verdict: RowVerdict,
     /// The digest of the replayed inputs.
     pub trace: Digest,
-    /// The replayed cursor range `(from, to)`.
+    /// The replayed cursor range `[from, to)`.
     pub from: u64,
     /// See `from`.
     pub to: u64,
@@ -685,7 +686,7 @@ fn decode_strs(d: &mut Dec<'_>, field: &'static str) -> Result<Vec<String>, Wire
 }
 
 impl UncheckedBundle {
-    /// The bundle's bytes (the module docs), sealed.
+    /// The bundle's bytes, sealed.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::with_capacity(8 * 1024);

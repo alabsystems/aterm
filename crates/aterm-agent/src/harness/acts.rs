@@ -323,6 +323,8 @@ pub enum HoldLeg {
     Needs,
     /// The session's repository holds work no remote main has.
     Repo,
+    /// The repository probe did not finish: what the repository holds is unknown.
+    Unread,
     /// Land's strict reading found open work in the reply.
     Open,
     /// No `Nothing left:` defense in the reply.
@@ -333,9 +335,10 @@ pub enum HoldLeg {
 
 impl HoldLeg {
     /// Every leg, in the order the owner can act on them.
-    pub const ALL: [HoldLeg; 5] = [
+    pub const ALL: [HoldLeg; 6] = [
         HoldLeg::Needs,
         HoldLeg::Repo,
+        HoldLeg::Unread,
         HoldLeg::Open,
         HoldLeg::Defense,
         HoldLeg::Cut,
@@ -350,6 +353,7 @@ impl HoldLeg {
             HoldLeg::Open => 4,
             HoldLeg::Defense => 8,
             HoldLeg::Cut => 16,
+            HoldLeg::Unread => 32,
         }
     }
 
@@ -362,6 +366,7 @@ impl HoldLeg {
             HoldLeg::Open => "open",
             HoldLeg::Defense => "defense",
             HoldLeg::Cut => "cut",
+            HoldLeg::Unread => "repo-unread",
         }
     }
 }

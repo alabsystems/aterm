@@ -6,7 +6,7 @@
 /// Where a windowing request should be served; the result of [`route_launch`].
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum WindowRoute {
-    /// Start a new aterm window in this process.
+    /// Open a new aterm window from this invocation (on Windows, through the windowed image).
     Spawn,
     /// Hand the request to the running instance over the control socket and exit.
     Forward,
@@ -98,7 +98,7 @@ pub struct WindowRequest {
     pub intent: LaunchIntent,
     /// The `-d <dir>` starting directory.
     pub dir: Option<String>,
-    /// `split-pane`'s orientation; ignored (not rejected) for other verbs.
+    /// `split-pane`'s orientation; other verbs keep the default and never send it.
     pub split: SplitOrientation,
 }
 

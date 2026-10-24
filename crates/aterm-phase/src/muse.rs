@@ -10,7 +10,7 @@ use crate::text::blank;
 use crate::turn::{CardPlace, LaunchCard};
 use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
-/// Version of the Muse Code.
+/// Version of the Muse Code (`muse`) harness.
 pub const HARNESS_VERSION: &str = "0.1";
 
 #[derive(Debug, Clone, Copy)]
@@ -494,7 +494,7 @@ fn footer_says(rows: &[String], f: Frame, said: &str) -> bool {
     })
 }
 
-/// The window title says a run is active: a frame of the spinner.
+/// The window title says a run is active: a frame of the spinner, a blank, then the title.
 #[must_use]
 pub fn title_runs(title: &str) -> bool {
     let mut chars = title.chars();
@@ -717,7 +717,8 @@ fn is_url(token: &str) -> bool {
     })
 }
 
-/// A block whose first line `lines[0]` is a tool row of Muse Code's ([`bare_tool_row`]).
+/// A block whose first line `lines[0]` is a tool row of Muse Code's. A row of
+/// [`bare_tool_row`]'s stands alone: with lines under it, the block is a reply.
 fn tool_block(lines: &[&str]) -> bool {
     lines
         .first()
@@ -731,7 +732,9 @@ fn names_a_path(rest: &str) -> bool {
     !token.is_empty() && own_tail(&rest[token.len()..], false)
 }
 
-/// A tool row's own tail after its name, each part optional and in order ([`TOOL_OUTCOMES`]).
+/// A tool row's own tail after its name, each part optional and in order: the diff's count
+/// (` (+1 −1)`), an outcome after ` — ` ([`TOOL_OUTCOMES`]; with `status`, also a three-digit
+/// HTTP status), the expander (` · ctrl+o`); nothing else.
 fn own_tail(tail: &str, status: bool) -> bool {
     let mut tail = tail;
     if let Some(r) = tail.strip_prefix(" (") {
@@ -801,7 +804,8 @@ pub fn turn_said_before(rows: &[String]) -> Option<String> {
     (!said.is_empty()).then(|| said.join("\n\n"))
 }
 
-/// Returns whether the entire last turn ([`said_tail`]).
+/// Returns whether the entire last turn (from the user's `❯` message through [`said_tail`])
+/// fits on `rows`.
 #[must_use]
 pub fn turn_whole(rows: &[String]) -> bool {
     turn_before(rows).is_some_and(|(opened, _)| opened)

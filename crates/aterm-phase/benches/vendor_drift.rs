@@ -274,22 +274,29 @@ fn every_reset_template_is_whole_in_the_store_claude() -> Outcome {
         version.as_deref().unwrap_or("?"),
         missing.len()
     );
-    let planted = [(
-        "planted",
-        vec![format!(
-            "{} planted-by-no-build reset?",
-            anchor("reset.row")
-        )],
-    )];
-    assert_eq!(
-        missing_templates(&bytes, &planted),
-        ["planted"],
-        "{path}: the planted template"
+    let changed: Vec<(&str, Vec<String>)> = templates
+        .iter()
+        .map(|(name, spellings)| (*name, spellings.iter().flat_map(|t| reworded(t)).collect()))
+        .collect();
+    let refused = missing_templates(&bytes, &changed);
+    let held: Vec<&str> = changed
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !refused.contains(name))
+        .collect();
+    assert!(
+        held.is_empty(),
+        "{path}: {} reset templates are held with a word changed: {held:?}",
+        held.len()
     );
     eprintln!(
-        "{path} ({}): every reset template is whole ({})",
+        "{path} ({}): every reset template is whole ({}), and none with a word changed ({})",
         version.as_deref().unwrap_or("?"),
-        templates.len()
+        templates.len(),
+        changed
+            .iter()
+            .map(|(_, spellings)| spellings.len())
+            .sum::<usize>()
     );
     Outcome::Pass(format!(
         "{path} ({}): reset templates checked",

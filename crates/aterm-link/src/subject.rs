@@ -16,7 +16,8 @@ pub fn is_fleet(f: &str) -> bool {
 /// Why a record on an `in` lane was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
-    /// Not seven segments, not under this fleet.
+    /// Not seven segments, not under this fleet, or a segment that is not the shape its position
+    /// demands.
     Malformed,
     /// A `<sid>` this node does not host.
     NotHosted,
@@ -49,7 +50,8 @@ pub struct InAddr {
     pub kind: String,
 }
 
-/// Parse an `in` subject by position from the left, against the fleet and node this bridge serves.
+/// Parse an `in` subject by position from the left, against the fleet and node this bridge serves:
+/// exactly `f`, `<F>`, `in`, `<node>`, `<sid>`, `<src>`, `<kind>`.
 /// # Errors
 /// [`Reject::Malformed`] for anything that is not that shape.
 pub fn parse_in(fleet: &str, node: &str, subject: &str) -> Result<InAddr, Reject> {

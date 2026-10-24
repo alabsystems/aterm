@@ -149,23 +149,29 @@ fn hue_gap(a: f32, b: f32) -> f32 {
 #[must_use]
 #[inline]
 pub fn status_gap(ink: u32, dark: bool) -> Option<f32> {
+    static STATUS_HUES: std::sync::OnceLock<[[f32; 2]; 2]> = std::sync::OnceLock::new();
     let (c, h) = chroma_hue(ink);
     if c < HUE_CHROMA_GATE {
         return None;
     }
-    let i = usize::from(!dark);
-    Some(
-        [CLAUDE_SUCCESS[i], CLAUDE_ERROR[i]]
-            .into_iter()
-            .map(|s| hue_gap(h, chroma_hue(s).1))
-            .fold(f32::MAX, f32::min),
-    )
+    let [hs, he] = STATUS_HUES.get_or_init(|| {
+        [
+            [
+                chroma_hue(CLAUDE_SUCCESS[0]).1,
+                chroma_hue(CLAUDE_ERROR[0]).1,
+            ],
+            [
+                chroma_hue(CLAUDE_SUCCESS[1]).1,
+                chroma_hue(CLAUDE_ERROR[1]).1,
+            ],
+        ]
+    })[usize::from(!dark)];
+    Some(hue_gap(h, hs).min(hue_gap(h, he)))
 }
 
-/// Palette stripe indices safe for dots on a dark or light ground.
-#[must_use]
-#[inline]
-pub fn dot_stripes(palette: CardPalette, dark: bool) -> ([usize; STRIPES], usize) {
+type DotStripes = ([usize; STRIPES], usize);
+
+fn compute_dot_stripes(palette: CardPalette, dark: bool) -> DotStripes {
     let mut out = [0; STRIPES];
     let mut n = 0;
     for k in 0..STRIPES {
@@ -179,6 +185,23 @@ pub fn dot_stripes(palette: CardPalette, dark: bool) -> ([usize; STRIPES], usize
         return ([0, 1, 2, 3, 4, 5], STRIPES);
     }
     (out, n)
+}
+
+/// Palette stripe indices safe for dots on a dark or light ground.
+#[must_use]
+#[inline]
+pub fn dot_stripes(palette: CardPalette, dark: bool) -> DotStripes {
+    static DOT_STRIPES: std::sync::OnceLock<[[DotStripes; 2]; 3]> = std::sync::OnceLock::new();
+    let table = DOT_STRIPES.get_or_init(|| {
+        [CardPalette::Cruise, CardPalette::Land, CardPalette::Off]
+            .map(|p| [true, false].map(|d| compute_dot_stripes(p, d)))
+    });
+    let p_idx = match palette {
+        CardPalette::Cruise => 0,
+        CardPalette::Land => 1,
+        CardPalette::Off => 2,
+    };
+    table[p_idx][usize::from(!dark)]
 }
 
 /// Palette position for panel row `k` on a dark or light ground.
@@ -222,18 +245,6 @@ pub fn crest(d_cells: f32, ms: u64) -> f32 {
     glint(d_cells, ms)
 }
 
-/// `0x00RRGGBB` channel `sh` in linear light (the WCAG transfer the crate's
-/// [`relative_luminance`] uses).
-#[inline]
-fn lin(rgb: u32, sh: u32) -> f32 {
-    let n = ((rgb >> sh) & 0xff) as f32 / 255.0;
-    if n <= 0.039_28 {
-        n / 12.92
-    } else {
-        ((n + 0.055) / 1.055).powf(2.4)
-    }
-}
-
 /// A linear-light channel back to a byte.
 #[inline]
 fn srgb(l: f32) -> u32 {
@@ -250,30 +261,39 @@ fn srgb(l: f32) -> u32 {
 #[must_use]
 #[inline]
 pub fn match_luminance(ink: u32, target: u32) -> u32 {
-    if relative_luminance(ink) <= 1e-6 {
+    let table = crate::color_math::relative_luminance_table();
+    if crate::color_math::relative_luminance_with(table, ink) <= 1e-6 {
         return target & 0x00FF_FFFF;
     }
-    at_luminance(ink, relative_luminance(target))
+    at_luminance(
+        ink,
+        crate::color_math::relative_luminance_with(table, target),
+    )
 }
 
 /// Returns `ink`'s hue scaled or lifted to WCAG luminance `lt` in linear light.
 #[must_use]
 #[inline]
 pub fn at_luminance(ink: u32, lt: f32) -> u32 {
-    let (lc, lt) = (relative_luminance(ink), lt.clamp(0.0, 1.0));
+    let table = crate::color_math::relative_luminance_table();
+    let (lc, lt) = (
+        crate::color_math::relative_luminance_with(table, ink),
+        lt.clamp(0.0, 1.0),
+    );
     if lc <= 1e-6 {
         let g = srgb(lt);
         return (g << 16) | (g << 8) | g;
     }
-    let map = |f: &dyn Fn(f32) -> f32| {
-        (srgb(f(lin(ink, 16))) << 16) | (srgb(f(lin(ink, 8))) << 8) | srgb(f(lin(ink, 0)))
-    };
+    let r = table.linear[((ink >> 16) & 0xff) as usize];
+    let g = table.linear[((ink >> 8) & 0xff) as usize];
+    let b = table.linear[(ink & 0xff) as usize];
     if lt <= lc {
         let s = lt / lc;
-        map(&|c| c * s)
+        (srgb(r * s) << 16) | (srgb(g * s) << 8) | srgb(b * s)
     } else {
         let k = (lt - lc) / (1.0 - lc).max(1e-6);
-        map(&|c| c + (1.0 - c) * k)
+        let lift = |c: f32| srgb(c + (1.0 - c) * k);
+        (lift(r) << 16) | (lift(g) << 8) | lift(b)
     }
 }
 
@@ -298,7 +318,8 @@ pub fn fade_chroma(ink: u32, keep: f32) -> u32 {
 #[inline]
 pub fn at_luminance_hue(ink: u32, lt: f32) -> u32 {
     let lt = lt.clamp(0.0, 1.0);
-    let lc = relative_luminance(ink);
+    let table = crate::color_math::relative_luminance_table();
+    let lc = crate::color_math::relative_luminance_with(table, ink);
     if lt <= lc || lc <= 1e-6 {
         return at_luminance(ink, lt);
     }
@@ -307,20 +328,13 @@ pub fn at_luminance_hue(ink: u32, lt: f32) -> u32 {
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     for _ in 0..12 {
         let mid = (lo + hi) / 2.0;
-        if relative_luminance(at(mid)) < lt {
+        if crate::color_math::relative_luminance_with(table, at(mid)) < lt {
             lo = mid;
         } else {
             hi = mid;
         }
     }
     at(hi)
-}
-
-/// WCAG contrast ratio of two colours.
-#[inline]
-fn contrast(a: u32, b: u32) -> f32 {
-    let (la, lb) = (relative_luminance(a), relative_luminance(b));
-    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
 /// A light-ground dot's ring: `fresh` (the dot's hue, darkened by
@@ -331,13 +345,18 @@ fn contrast(a: u32, b: u32) -> f32 {
 /// it).
 #[inline]
 fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
+    let table = crate::color_math::relative_luminance_table();
+    let g = over_rgb(ground, fresh, veil) & 0x00FF_FFFF;
+    let lg = crate::color_math::relative_luminance_with(table, g);
     let ring = |l: f32| at_luminance(fresh, l);
     let holds = |l: f32| {
         let r = over_rgb(ring(l), fresh, veil) & 0x00FF_FFFF;
-        let g = over_rgb(ground, fresh, veil) & 0x00FF_FFFF;
-        contrast(r, g) >= PRINT_RING_CONTRAST
+        let lr = crate::color_math::relative_luminance_with(table, r);
+        (lr.max(lg) + 0.05) / (lr.min(lg) + 0.05) >= PRINT_RING_CONTRAST
     };
-    let top = top.min(relative_luminance(fresh)).max(0.0);
+    let top = top
+        .min(crate::color_math::relative_luminance_with(table, fresh))
+        .max(0.0);
     if holds(top) {
         return ring(top);
     }

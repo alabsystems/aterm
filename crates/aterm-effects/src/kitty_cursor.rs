@@ -251,8 +251,7 @@ impl CatFrame {
     pub const fn render_look(&self) -> KittyLook {
         // The goodbye keeps the cat's markings: the flourish faces carry no
         // pattern layers, so a marked cat (a calico patch, an eye patch)
-        // waves goodbye in its own head and the flourish rides beside it
-        // (round 2's judge, 2026-10-23: nyan's l4200 lost its coat).
+        // waves goodbye in its own head and the flourish rides beside it.
         let flourish_face_earned = self.fade_out >= EXIT_FACE_FADE && !marked(self.look.variant);
         let variant = match (self.exit, self.reaction) {
             (_, CatReaction::Startled) => CatGlyphId::S121,
@@ -2421,10 +2420,10 @@ mod tests {
         assert!(still_held.discovery, "only drawable time consumes the hold");
     }
 
-    /// Round 2's judge (2026-10-23, nyan's `burst` l4200): the goodbye face
-    /// dropped a marked cat's coat. Every head whose art carries markings
-    /// keeps its own head, coat and iris through both flourishes; the
-    /// control: an unmarked head still swaps to the flourish face, so the
+    /// The goodbye face carries no pattern layers, so it would drop a marked
+    /// cat's coat (nyan's `burst` at l4200). Every head whose art carries
+    /// markings keeps its own head, coat and iris through both flourishes;
+    /// the control: an unmarked head still swaps to the flourish face, so the
     /// frames below are the goodbye's.
     #[test]
     fn a_marked_cat_s_goodbye_keeps_its_markings() {

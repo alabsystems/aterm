@@ -115,7 +115,7 @@ impl World {
     #[must_use]
     pub fn env(&self) -> Vec<(String, String)> {
         let s = |p: &Path| p.to_string_lossy().into_owned();
-        vec![
+        let mut env = vec![
             ("HOME".into(), s(&self.home)),
             ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
             ("SHELL".into(), "/bin/sh".into()),
@@ -131,9 +131,24 @@ impl World {
             ("TEMP".into(), s(&self.home.join("tmp"))),
             ("HISTFILE".into(), "/dev/null".into()),
             ("xcrun_nocache".into(), "1".into()),
-            crate::tape::seam(),
-        ]
+        ];
+        env.extend(seams());
+        env
     }
+}
+
+/// The development seams every lab world sets ([`World::env`], the lab runs' `lab_vars`, the
+/// fleet's `world_env`): the hosted loop records its harness tape ([`crate::tape::seam`]), and
+/// the instance hears no system's memory pressure (`aterm-gui`'s `memory_pressure::SYSTEM_SEAM`
+/// set to `none`), so its level is the one a driver sets with the `pressure` verb, never the
+/// host's, and a loaded host sheds no scrollback or history ring mid-run. The lab sets them, so
+/// `--env` and `LAB_INSTANCE_ENV` refuse them (`lab_sets`).
+#[must_use]
+pub(crate) fn seams() -> [(String, String); 2] {
+    [
+        crate::tape::seam(),
+        ("ATERM_DEBUG_SYSTEM_PRESSURE".into(), "none".into()),
+    ]
 }
 
 /// Roots for a newly owned HOME, on its volume even when `rehome` moved it.

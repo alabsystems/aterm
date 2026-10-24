@@ -137,8 +137,9 @@ pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
 fn passthrough(prefix: &Prefix, args: &[String], notice: Option<&str>) -> ExitCode {
     let Some(brew) = stub::resolve_real_brew(prefix) else {
         eprintln!(
-            "abrew: no real Homebrew found{}\n  lay the bundled one with: abrew bundle",
-            notice.map_or(String::new(), |n| format!(" ({n})"))
+            "abrew: no real Homebrew found{}\n  {}lay the bundled one with: abrew bundle",
+            notice.map_or(String::new(), |n| format!(" ({n})")),
+            steps_before_bundle(prefix)
         );
         return ExitCode::from(127);
     };
@@ -167,8 +168,9 @@ fn run_real_brew(brew: &std::path::Path, args: &[&OsString]) -> ExitCode {
 fn passthrough_os(prefix: &Prefix, args: &[&OsString], notice: Option<&str>) -> ExitCode {
     let Some(brew) = stub::resolve_real_brew(prefix) else {
         eprintln!(
-            "abrew: no real Homebrew found{}\n  lay the bundled one with: abrew bundle",
-            notice.map_or(String::new(), |n| format!(" ({n})"))
+            "abrew: no real Homebrew found{}\n  {}lay the bundled one with: abrew bundle",
+            notice.map_or(String::new(), |n| format!(" ({n})")),
+            steps_before_bundle(prefix)
         );
         return ExitCode::from(127);
     };
@@ -1183,9 +1185,15 @@ Further help: abrew help <command>; abrew commands; aterm help abrew
 fn help_for(cmd: &str) -> &'static str {
     match cmd {
         "install" => {
-            "Usage: abrew install [--formula|--cask] [--ignore-dependencies] [--force|-f] [--dry-run|-n] [--quiet|-q] [--no-quarantine] <name>…\n  --ignore-dependencies and --quiet stay native only with --formula; -s, --HEAD\n  and flags abrew does not take run real Homebrew. Every name is planned first:\n  one that needs real Homebrew sends the whole command there.\n"
+            "Usage: abrew install [--formula|--cask] [--ignore-dependencies] [--force|-f] [--dry-run|-n] [--quiet|-q] <name>…\n  --ignore-dependencies and --quiet stay native only with --formula; -s, --HEAD\n  and flags abrew does not take run real Homebrew (--no-quarantine, --verbose and\n  --debug are accepted and change nothing). Every name is planned first; one the\n  plan shows needs real Homebrew sends the whole command there. A need found\n  later, once abrew has changed the prefix, fails that name instead (exit 1).\n"
         }
-        "uninstall" | "remove" => {
+        "reinstall" => {
+            "Usage: abrew reinstall [--formula|--cask] [--ignore-dependencies] [--dry-run|-n] [--quiet|-q] <name>…\n  --ignore-dependencies and --quiet stay native only with --formula.\n"
+        }
+        "upgrade" => {
+            "Usage: abrew upgrade [--formula|--cask] [--greedy] [--ignore-dependencies] [--force|-f] [--dry-run|-n] [--quiet|-q] [name…]\n  --ignore-dependencies and --quiet stay native only with --formula. No names:\n  every outdated formula not pinned; --cask: outdated casks (--greedy adds the\n  ones that update themselves).\n"
+        }
+        "uninstall" | "remove" | "rm" => {
             "Usage: abrew uninstall [--formula|--cask] [--ignore-dependencies] [--force|-f] [--dry-run|-n] <name>…\n  --force removes every installed version, pinned or not.\n"
         }
         "list" | "ls" => {
@@ -1198,12 +1206,34 @@ fn help_for(cmd: &str) -> &'static str {
             "Usage: abrew outdated [--formula|--cask] [--greedy] [--verbose|-v|--quiet|-q] [--json[=v2]] [name…]\n"
         }
         "options" => {
-            "Usage: abrew options [--compact] [--installed] [name…]\n  No names: every formula, as in brew. Tapped formulae run real Homebrew.\n"
+            "Usage: abrew options [--compact] [--installed] [name…]\n  No names: every formula, as in brew; with names, --installed lists the\n  installed ones in their place. Tapped formulae run real Homebrew, and so does\n  the no-name listing once a tap exists.\n"
         }
         "cleanup" => {
             "Usage: abrew cleanup [--dry-run|-n] [--prune=<days>|--prune=all|--scrub|-s] [name…]\n  Removes old versions (only the named packages', when names are given). With no\n  names, --prune=<days> also deletes cached downloads at least that old, and\n  --prune=all or --scrub every cached download.\n"
         }
         "missing" => "Usage: abrew missing [--hide=<name>,…] [name…]\n",
+        "uses" | "dependents" => {
+            "Usage: abrew uses [--installed] <formula>…\n  Installed formulae that depend directly on each name; abrew reads installed\n  formulae only, so --installed changes nothing.\n"
+        }
+        "leaves" => {
+            "Usage: abrew leaves [--installed-on-request|--installed-as-dependency]\n  Installed formulae no other installed formula depends on, optionally only\n  those installed on request, or only those installed as a dependency.\n"
+        }
+        "autoremove" => {
+            "Usage: abrew autoremove [--dry-run|-n]\n  Uninstalls formulae installed as dependencies that no requested or pinned\n  formula still needs.\n"
+        }
+        "fetch" => {
+            "Usage: abrew fetch [--formula|--cask] [--deps] <name>…\n  Downloads into the cache without installing; a cask needs --cask, and --deps\n  also fetches a formula's dependencies.\n"
+        }
+        "link" | "ln" | "unlink" => "Usage: abrew link|unlink [--dry-run|-n] <formula>\n",
+        "doctor" | "dr" => {
+            "Usage: abrew doctor [--quiet|-q]\n  Warns about the prefix (unwritable, broken links, missing receipts, extra\n  versions, unlinked kegs, bad pins, bin not on PATH, no real brew) and exits 1\n  on any; --quiet drops the all-clear line. `aterm pkg doctor` checks the `brew`\n  stub.\n"
+        }
+        "tap" => {
+            "Usage: abrew tap [--list-official] [<user/repo> [<URL>]]\n  No name: lists the taps abrew manages.\n"
+        }
+        "shellenv" => {
+            "Usage: abrew shellenv [<shell>]\n  Prints ABREW_PREFIX, PATH (bin and sbin), MANPATH and INFOPATH settings for\n  <shell> or the invoking shell: fish, csh, tcsh and pwsh get their own syntax,\n  any other shell POSIX sh.\n"
+        }
         "deps" => {
             "Usage: abrew deps [--tree] [--direct|--declared|-1|--1] [--installed] [--for-each] [--union] [--topological|-n] [name…]\n"
         }
@@ -1211,7 +1241,7 @@ fn help_for(cmd: &str) -> &'static str {
             "Usage: abrew desc [--formula|--cask] <name>…\n       abrew desc [--formula|--cask] (--search|-s|--name|-n|--description|-d) <text>|/<regex>/\n"
         }
         "search" => {
-            "Usage: abrew search [--formula|--cask] [--desc] <text>|/<regex>/\n  Text ignores case and punctuation; a /regex/ is case-sensitive, as in brew.\n  Shows at most 200 matches. Patterns the native engine refuses run real brew.\n"
+            "Usage: abrew search [--formula|--cask] [--desc] <text>|/<regex>/\n  Text ignores case and all but ASCII letters, digits, @ and +; a /regex/ is\n  case-sensitive, as in brew. Shows at most 200 matches. A pattern the native\n  engine cannot compile runs real brew; one that outruns its work budget fails\n  (exit 1) and names `brew --real search`.\n"
         }
         "bundle" => {
             "Usage: abrew bundle [--version V --sha256 H] [--force]\n       abrew bundle status | remove\n       abrew bundle dump [--file F] [--force]\n       abrew bundle install | check [--file F]\n  With no subcommand, lays the pinned real Homebrew under the abrew prefix;\n  delegated commands prefer it. Bare `brew bundle` is Homebrew's Brewfile\n  install and runs real Homebrew, as do other subcommands and Brewfiles with\n  rows abrew cannot read.\n"

@@ -216,8 +216,9 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn last_turn(&self) -> Option<crate::harness::upgrade::LastTurn> {
         None
     }
-    fn repo_work(&self) -> Option<crate::harness::repo_work::RepoWork> {
-        None
+    /// Repository work, or an unfinished deadline-limited probe.
+    fn repo_work(&self) -> crate::harness::repo_work::RepoRead {
+        crate::harness::repo_work::RepoRead::Clean
     }
     fn lifted_off(&self) -> bool {
         false

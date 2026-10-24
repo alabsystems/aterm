@@ -277,7 +277,7 @@ impl SchedulePlan {
         Self::decode(&raw(split, wake))
     }
 
-    /// The plan `bytes` encode, or the first field in the bytes table's order they break.
+    /// The plan `bytes` encode, or the first field they break, in byte order.
     /// # Errors
     /// [`PlanRefusal::Length`], then [`PlanRefusal::Format`], [`PlanRefusal::SplitTag`],
     /// [`PlanRefusal::WakeTag`], [`PlanRefusal::Reserved`], the gap ([`PlanRefusal::Gap`] or
@@ -487,6 +487,25 @@ impl PlanView {
             forecast: glow.settle_forecast(),
             stamp: glow.stamp(),
             cold_at: glow.cold_at(),
+        }
+    }
+
+    /// A view of these fields, as the interpreter's conformance vectors spell them.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn new(
+        hot: bool,
+        changed: bool,
+        forecast: Option<Instant>,
+        stamp: Option<Instant>,
+        cold_at: Option<Instant>,
+    ) -> PlanView {
+        PlanView {
+            hot,
+            changed,
+            forecast,
+            stamp,
+            cold_at,
         }
     }
 

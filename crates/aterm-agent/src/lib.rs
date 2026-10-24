@@ -471,15 +471,16 @@ COMMANDS
                        Flags come first; `--` ends them. Every segment's head, seen
                        through `env` and `xargs`, must be a known read-only program
                        (bare, or by path under /bin, /usr/bin, /sbin or /usr/sbin) or a
-                       `python3` script matching an `--allow-python GLOB` (none by
-                       default; no `..`). Refuses file redirects, forms that write or run
-                       (`git pull`, `git -c`, `sed -i`, `find -delete`, `python3 -c`,
-                       `sort -o`) and assignments that change what runs (`PATH`, `HOME`,
-                       `GIT_*`, `LD_*`/`DYLD_*`, pager, editor). `aterm ctl` and
-                       `aterm drive` are judged by verb: ctl's reads (`status`, `text`,
-                       `await`, `result`, `survey`, …), bare `meta` and `task`, and
-                       drive's `phase`, `classify` and `ledger` without `--out` read;
-                       `meta set`, `task mark`, `spawn` and `answer` write.
+                       script run by `python`, `python2` or `python3` whose path, free of
+                       `..` and `$`, matches an `--allow-python GLOB` (none by default).
+                       Refuses file redirects, forms that write or run (`git pull`,
+                       `git -c`, `sed -i`, `find -delete`, `python3 -c`, `sort -o`) and
+                       assignments that change what runs (`PATH`, `HOME`, `GIT_*`,
+                       `LD_*`/`DYLD_*`, pager, editor). `aterm ctl` and `aterm drive` are
+                       judged by verb: ctl's reads (`status`, `text`, `await`, `result`,
+                       `survey`, …), bare `meta` and `task`, and drive's `phase`,
+                       `classify` and `ledger` without `--out` read; `meta set`,
+                       `task mark`, `spawn` and `answer` write.
     phase [@sid] [--allow-python GLOB]...
                        Read @sid (default: the active tab) once with its program's reader
                        (`status program=`, else the screen) and print its phase,
@@ -489,7 +490,8 @@ COMMANDS
                                    `classify` (a Bash box), `option N <label>`,
                                    `cancel esc` | `exit esc` | `interrupt esc`, and
                                    `box <token>` on a question dialog (for `answer --box`)
-                         busy:     `reason <where>: <rule>`
+                         busy:     `reason <where>: <rule>` (`its reader reads it busy`
+                                   when agy, Muse Code or Gemini CLI name none)
                          limited:  `message <text>` and `reset <text|->`
                        `question` means the last thing said ends in `?`. Then come
                        `survey 0` when a rating survey that `0` dismisses is open (`survey
@@ -498,22 +500,25 @@ COMMANDS
                        tab always reads `idle`.
     answer @sid [--box TOKEN] <answer...>
                        Choose in @sid's open question dialog by its program's grammar:
-                         Claude Code: an option number or exact label; comma-separated
+                         Claude Code: an option number or label; comma-separated
                            options on a multi-select; `submit` on the review tab. Moves
                            the focus to each and presses Enter, fenced on that row (never
                            a digit, Esc, typed text or the chat row).
-                         agy, Gemini CLI: an option number or exact label; types the
+                         agy, Gemini CLI: an option number or label; types the
                            option's digit, fenced on the title row.
-                         Muse Code: an option number or exact label; moves the focus and
+                         Muse Code: an option number or label; moves the focus and
                            presses Enter, fenced on the question row.
-                       Each also takes `recommended` (the window's own choice) and `human`
-                       (types nothing). Refused: a free-text row (Muse's `None of the
-                       above` too) and a policy word that names no option (`long-term`,
-                       `short-term`; `meta set questions <word>` sets one). `--box TOKEN`
-                       (`phase`'s `box`) refuses when the dialog on screen is another box.
-                       A person's input within `[harness] human_grace_s` leaves the dialog
+                       A label matches whole, in any case. Each also takes `recommended`
+                       (the window's own choice) and `human` (types nothing). Refused: a
+                       free-text row (Muse's `None of the above` too) and a policy word
+                       that names no option (`long-term`, `short-term`;
+                       `meta set questions <word>` sets one). `--box TOKEN` (`phase`'s
+                       `box`) refuses when the dialog on screen is another box. A
+                       person's input within `[harness] human_grace_s` leaves the dialog
                        to them. Prints one line:
-                         `ANSWERED @sid enters=<k> answer=<what> next=<question|review|none>` (exit 0)
+                         `ANSWERED @sid enters=<k> answer=<what> next=<next>` (exit 0;
+                           <next> is the next question's text, `question` when that is
+                           unread, `review` on the review tab, or `none`)
                          `LEFT @sid <why>` (a person's input, or `human`; exit 0)
                          `NO-BOX @sid <why>` (exit 1)
                          `REFUSED @sid <why>` (exit 2, nothing typed)
@@ -526,9 +531,9 @@ COMMANDS
                        `inbox --peek --meta`). Prints SOURCES, SUMMARY and
                        a TIMELINE in `manager`, `worker`, `watcher` and `fabric` lanes as
                        text columns (default), Markdown tables (`md`) or one swimlane
-                       HTML page (`html`). `--out PATH` writes it there (mode 0600) and
-                       prints `wrote PATH`; `open_ledger` (⇧⌘L, Ctrl+Shift+L) opens the
-                       focused tab's HTML page.
+                       HTML page (`html`). `--out PATH` writes it there (a new file 0600;
+                       an existing one keeps its mode) and prints `wrote PATH`;
+                       `open_ledger` (⇧⌘L, Ctrl+Shift+L) opens the focused tab's HTML page.
                        `--since TIME` keeps what happened from TIME on: Unix ms or
                        `YYYY-MM-DD[THH:MM[:SS]][Z|±HH:MM]`.
                        `--source log` (default) places turns and mail by the session
@@ -544,19 +549,22 @@ COMMANDS
     tape cat FILE [--text] [--salvage] | tape show FILE --decisions [--salvage]
     tape stats FILE [--salvage]
                        Read a recorded `.atape` (binary, or `atape-text 1`) offline.
-                       `cat` lists its numbered items (`--text`: the round-trippable text
-                       form); `show --decisions` prints each decision's screen, rule,
-                       outcome, act, reply and journal line; `stats` prints its bytes,
-                       span, kB/h, item, effect and decision counts. A damaged tape exits
-                       2 unless `--salvage` keeps the whole frames before the damage; a
-                       torn tail is read up to the tear and noted on stderr.
+                       `cat` lists its items, each effect as `#N` (`door=N`'s N), or with
+                       `--text` the round-trippable text form; `show --decisions` prints
+                       each decision's screen, rule, outcome, act, reply and journal line;
+                       `stats` prints its bytes, span, kB/h, item, effect and decision
+                       counts. A damaged tape exits 2 unless `--salvage` keeps the whole
+                       frames before the damage; a torn tail is read up to the tear and
+                       noted on stderr.
     tape ls [@sid] | tape forget FILE|@sid...
-                       The hosted tapes in `<state>/drive/tapes/<sid>/`, recorded when a
-                       dev build runs with `ATERM_HARNESS_TAPE` set and swept past
-                       256 MiB or 72 h (`tapes/kept/` and tapes being written stay).
-                       `ls` lists them newest first (with @sid: its tapes and `kept/`);
-                       `forget` deletes the FILEs named, or every unkept tape of an @sid,
-                       refusing before deleting anything when an @sid has none.
+                       The hosted tapes (macOS and Linux) in `<state>/drive/tapes/<sid>/`,
+                       recorded when a dev build runs with `ATERM_HARNESS_TAPE` set and
+                       swept past 256 MiB or 72 h (`tapes/kept/` and tapes being written
+                       stay). `ls` lists them newest first (with @sid: its tapes and
+                       `kept/`). `forget` deletes each FILE given as `ls` prints its path
+                       (the one way to delete a kept tape) or every unkept tape of an
+                       @sid, refusing before deleting anything when a FILE is no tape
+                       there or an @sid has none.
     replay FILE [--until door=N]
                        Replay FILE's loop offline against its recorded observations,
                        comparing every request and output. Prints `REPRODUCED`, `ENDED`,
@@ -594,6 +602,12 @@ COMMANDS
 OPTIONS
     --socket PATH   Target aterm control socket (default: the instance hosting this
                     shell, else the newest local instance).
+
+ERRORS
+    Bad usage, an unknown command, or (for `phase` and `answer`) no reachable aterm
+    prints `aterm drive: <why>` on stderr and exits 1, like `not-read-only` and
+    `NO-BOX` (under `tape` and `replay`, 2). `phase` and `ledger` otherwise exit 0;
+    `ledger` names a source it could not read under SOURCES.
 
 EXAMPLES
     aterm drive classify 'git status --short && git pull | tail'

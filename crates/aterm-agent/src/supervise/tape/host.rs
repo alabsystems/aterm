@@ -16,7 +16,7 @@ use super::frame::Hint;
 use crate::harness::accounts::Sample;
 use crate::harness::acts::{Act, LandHeld, TaskFace};
 use crate::harness::disk::Level;
-use crate::harness::repo_work::RepoWork;
+use crate::harness::repo_work::{RepoRead, RepoWork};
 use crate::harness::upgrade::{LastTurn, StandingLimit};
 use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
 use crate::supervise::facts::FactsReading;
@@ -1211,9 +1211,19 @@ struct RepoWorkWire {
     state: Option<u64>,
 }
 
-impl TapeValue for Option<RepoWork> {
+/// The word a tape holds for [`RepoRead::Unread`]; [`RepoRead::Clean`] is
+/// `null` and [`RepoRead::Found`] its [`RepoWorkWire`], as a tape recorded
+/// before the probe could read as unread holds them.
+const REPO_UNREAD: &str = "unread";
+
+impl TapeValue for RepoRead {
     fn to_tape(&self) -> Vec<u8> {
-        json(&self.as_ref().map(|w| {
+        let found = match self {
+            RepoRead::Unread => return json(&REPO_UNREAD),
+            RepoRead::Clean => None,
+            RepoRead::Found(w) => Some(w),
+        };
+        json(&found.map(|w| {
             let RepoWork {
                 repo,
                 changed,
@@ -1240,17 +1250,22 @@ impl TapeValue for Option<RepoWork> {
     }
 
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
-        Ok(of_json::<Option<RepoWorkWire>>(bytes)?.map(|w| RepoWork {
-            repo: w.repo,
-            changed: w.changed,
-            untracked: w.untracked,
-            stashes: w.stashes,
-            unpushed: w.unpushed,
-            unlanded: w.unlanded,
-            main_ref: w.main_ref,
-            paths: w.paths,
-            state: w.state,
-        }))
+        if of_json::<String>(bytes).is_ok_and(|w| w == REPO_UNREAD) {
+            return Ok(RepoRead::Unread);
+        }
+        Ok(RepoRead::of_found(
+            of_json::<Option<RepoWorkWire>>(bytes)?.map(|w| RepoWork {
+                repo: w.repo,
+                changed: w.changed,
+                untracked: w.untracked,
+                stashes: w.stashes,
+                unpushed: w.unpushed,
+                unlanded: w.unlanded,
+                main_ref: w.main_ref,
+                paths: w.paths,
+                state: w.state,
+            }),
+        ))
     }
 }
 

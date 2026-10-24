@@ -315,7 +315,8 @@ fn attribute_spans(tag: &str, attr: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-/// Rewrite the anchor's opening `tag` with each platform attribute written once.
+/// Rewrite the anchor's opening `tag` with every platform attribute removed and those with a
+/// value written once, at the end.
 fn with_platform_attributes(
     page: &str,
     tag: &str,

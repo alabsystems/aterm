@@ -212,7 +212,7 @@ fn a_landed_tasks_own_wake_over_someone_elses_edits_keeps_the_landing() {
     let theirs = uncommitted_repo();
     let (mut st, _) = landed_at(t0());
     st.took_quiet();
-    st.wake_began_over(Some(theirs.clone()));
+    st.wake_began_over(crate::harness::repo_work::RepoRead::Found(theirs.clone()));
     let (a, _) = until_acted(&mut st, &ended_over(theirs.clone()), wake_at);
     assert_eq!(a, TurnEndAction::Nothing);
     assert!(st.landed() && st.task_done());
@@ -230,7 +230,7 @@ fn a_landed_tasks_own_wake_over_someone_elses_edits_keeps_the_landing() {
         let (mut st, _) = landed_at(t0());
         st.took_quiet();
         if let Some(began) = began {
-            st.wake_began_over(began);
+            st.wake_began_over(crate::harness::repo_work::RepoRead::of_found(began));
         }
         let ended = if why == "changed by the wake" {
             more.clone()
@@ -243,7 +243,7 @@ fn a_landed_tasks_own_wake_over_someone_elses_edits_keeps_the_landing() {
     }
     let (mut st, _) = landed_at(t0());
     st.took();
-    st.wake_began_over(Some(theirs.clone()));
+    st.wake_began_over(crate::harness::repo_work::RepoRead::Found(theirs.clone()));
     let r = TurnEndReading {
         finished_record: Some(false),
         ..ended_over(theirs)
@@ -263,7 +263,7 @@ fn a_wake_that_reopens_a_landing_over_someone_elses_edit_names_none_of_it() {
     ] {
         let (mut st, _) = landed_at(t0());
         st.took_quiet();
-        st.wake_began_over(began);
+        st.wake_began_over(crate::harness::repo_work::RepoRead::of_found(began));
         let r = over_repo(
             recorded(Some(true), land(idle(open, Some(Duration::from_secs(20))))),
             theirs.clone(),
@@ -896,20 +896,20 @@ fn an_off_and_back_then_the_tasks_own_wake_keeps_no_landing_over_the_persons_edi
     ] {
         let mut st = make();
         st.took_quiet();
-        st.wake_began_over(Some(theirs.clone()));
+        st.wake_began_over(crate::harness::repo_work::RepoRead::Found(theirs.clone()));
         let (a, _) = until_acted(&mut st, &over, wake_at);
         assert!(!st.landed() && !st.task_done(), "{why}: {a:?}");
         assert!(matches!(a, TurnEndAction::Type { .. }), "{why}: {a:?}");
         let mut st = make();
         st.took_quiet();
-        st.wake_began_over(None);
+        st.wake_began_over(crate::harness::repo_work::RepoRead::Clean);
         let (a, _) = until_acted(&mut st, &wake, wake_at);
         assert!(st.landed(), "{why}, clean: {a:?}");
         assert_eq!(a, TurnEndAction::Nothing, "{why}, clean");
     }
     let (mut st, _) = landed_at(t0());
     st.took_quiet();
-    st.wake_began_over(Some(theirs.clone()));
+    st.wake_began_over(crate::harness::repo_work::RepoRead::Found(theirs.clone()));
     let (a, _) = until_acted(&mut st, &over, wake_at);
     assert!(st.landed(), "no Off: {a:?}");
     assert_eq!(a, TurnEndAction::Nothing, "no Off");
@@ -927,14 +927,14 @@ fn a_successor_attached_mid_wake_takes_no_probe_as_the_wakes_start() {
     st.seed_landed(said_mark(Some(DEFENSE)));
     st.took_quiet();
     assert!(!st.wake_start_owed());
-    st.wake_began_over(Some(found.clone()));
+    st.wake_began_over(crate::harness::repo_work::RepoRead::Found(found.clone()));
     let (a, _) = until_acted(&mut st, &over, t0());
     assert!(!st.landed(), "{a:?}");
     assert!(matches!(a, TurnEndAction::Type { .. }), "{a:?}");
     let (mut st, now) = landed_at(t0());
     st.took_quiet();
     assert!(st.wake_start_owed());
-    st.wake_began_over(Some(found.clone()));
+    st.wake_began_over(crate::harness::repo_work::RepoRead::Found(found.clone()));
     assert!(!st.wake_start_owed(), "taken once");
     let (a, _) = until_acted(&mut st, &over, now + 30 * MIN);
     assert!(st.landed(), "{a:?}");
@@ -949,7 +949,7 @@ fn a_wakes_edit_to_a_path_already_changed_reopens_the_landing() {
               at_end: crate::harness::repo_work::RepoWork| {
         let (mut st, _) = landed_at(t0());
         st.took_quiet();
-        st.wake_began_over(Some(at_start));
+        st.wake_began_over(crate::harness::repo_work::RepoRead::Found(at_start));
         let r = over_repo(
             recorded(Some(true), land(idle(quiet, Some(Duration::from_secs(20))))),
             at_end,
@@ -1052,7 +1052,7 @@ fn the_tasks_own_wake_read_under_off_keeps_the_landing_for_the_park() {
     let wake = |mode: Autopilot| {
         let (mut st, now) = landed_at(t0());
         st.took_quiet();
-        st.wake_began_over(None);
+        st.wake_began_over(crate::harness::repo_work::RepoRead::Clean);
         let r = under(
             mode,
             recorded(Some(true), idle(quiet, Some(Duration::from_secs(20)))),

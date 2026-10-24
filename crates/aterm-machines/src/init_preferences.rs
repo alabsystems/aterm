@@ -1788,8 +1788,8 @@ mod tests {
         /// How many `launchctl print` session checks fail before one answers.
         session_failures: u32,
         /// A domain macOS keeps from the reader, as it keeps another app's container from a
-        /// process without Full Disk Access: its export prints an empty dictionary (measured
-        /// 2026-10-22); a write is assumed to exit 0 and never be read back (not measured).
+        /// process without Full Disk Access: its export prints an empty dictionary
+        /// (measured); a write is assumed to exit 0 and never be read back (not measured).
         denied: Option<&'static str>,
         /// What happened, in order: `write <domain> <key>`, `kill <process>`, `<process>
         /// <pid> wrote back what it read at its start`, `Dock <pid> past its start`.

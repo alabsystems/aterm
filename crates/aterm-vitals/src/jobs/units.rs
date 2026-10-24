@@ -82,8 +82,20 @@ struct Job {
     /// `read`), and its reaped children's CPU is the job's.
     shell: Option<u32>,
     consumer_pid: Option<u32>,
-    /// The last name the row printed, kept for the exited row.
+    /// The first group other than the shell's in front of its block: its own command's.
+    own_pgid: Option<u32>,
+    /// It ran in the background or stopped (`cmd &`, Ctrl-Z): a block that resumes it is `fg`'s,
+    /// whose command is not its own, and whose `C` the shell's notice of `fg` follows.
+    backgrounded: bool,
+    /// The tick a block resumed it after it ran in the background or stopped (`fg`): the
+    /// shell's notice of `fg` follows `fg`'s `C` and may follow that tick's clock, so the tab's
+    /// output through the next tick is not its own.
+    fg_ms: Option<u64>,
+    /// The last name the row printed.
     last_name: String,
+    /// The last name a member other than the shell gave, the exited row's: the program exits
+    /// before the shell writes `D`, and a tick between the two sees the shell alone.
+    member_name: String,
     members: MemberMap,
     outputs: HashMap<(u64, u64), u64>,
     pty_bytes: Option<u64>,
@@ -302,6 +314,7 @@ impl Jobs {
         let mut matched: BTreeSet<usize> = BTreeSet::new();
         let mut tab_facts: HashMap<u64, TabFacts> = HashMap::new();
         let mut assigned: HashMap<usize, Vec<u32>> = HashMap::new();
+        let mut handed_to: HashMap<u32, usize> = HashMap::new();
         for tab in &tick.tabs {
             let (units, tf) = discover(tab, &sweep, &facts, &children);
             tab_facts.insert(tab.key, tf);
@@ -310,20 +323,57 @@ impl Jobs {
                     .jobs
                     .iter()
                     .position(|j| j.exited_ms.is_none() && j.key.same(&u.key));
+                // A job whose block a newer one replaced hands this block what it holds of it
+                // (the shell, and a group in front it took for its own while the reader had not
+                // fed `D` yet): its command is over.
+                let handed = |c: usize| {
+                    let j = &self.jobs[c];
+                    u.block.is_some() && j.block.is_some() && j.block != u.block
+                };
                 let free: Vec<u32> = u
                     .members
                     .iter()
                     .copied()
-                    .filter(|p| claimed.get(p).is_none_or(|c| Some(*c) == found))
+                    .filter(|p| {
+                        claimed
+                            .get(p)
+                            .is_none_or(|c| Some(*c) == found || handed(*c))
+                    })
                     .collect();
                 if found.is_none()
                     && u.block.is_some()
-                    && let Some(i) = resumed(&u, &claimed, &self.jobs)
+                    && let Some(i) = resumed(&u, tab, tf.shell_pgid, &claimed, &self.jobs)
                 {
                     let j = &mut self.jobs[i];
+                    // A job a tick saw in front before its block takes the block's command; one
+                    // that ran in the background (a stopped or `&` job `fg` resumed) keeps its
+                    // own (the new block's is `fg`).
+                    if j.block.is_none() && !j.backgrounded && !u.command.is_empty() {
+                        j.command.clone_from(&u.command);
+                    }
+                    // A job a newer block resumes stopped under its old one (`fg` resumes it), and
+                    // the group in front is its own (a `cmd &` job never had one in front).
+                    j.backgrounded |= j.block.is_some();
+                    if j.backgrounded {
+                        j.fg_ms = Some(at);
+                    }
+                    if u.pgid != tf.shell_pgid {
+                        j.own_pgid.get_or_insert(u.pgid);
+                    }
                     j.kind = JobKind::Shell;
                     j.consumer = Consumer::PersonFg;
                     j.block = u.block;
+                    // The block is its identity from now on, so the next tick finds it again
+                    // and opens no second job beside it, and the shell is its member then, as
+                    // it is any block's job's.
+                    j.key.block = u.block;
+                    j.shell = u.shell;
+                    for p in &free {
+                        if claimed.get(p).is_some_and(|c| *c != i) {
+                            handed_to.insert(*p, i);
+                        }
+                        claimed.insert(*p, i);
+                    }
                     matched.insert(i);
                     assigned
                         .entry(i)
@@ -348,7 +398,10 @@ impl Jobs {
                     }
                 };
                 for p in &free {
-                    claimed.entry(*p).or_insert(idx);
+                    if claimed.get(p).is_some_and(|c| *c != idx) {
+                        handed_to.insert(*p, idx);
+                    }
+                    claimed.insert(*p, idx);
                 }
                 let j = &mut self.jobs[idx];
                 if u.key.start.is_some() && j.key.start.is_none() {
@@ -357,11 +410,15 @@ impl Jobs {
                 if j.kind != JobKind::AgentCall || u.kind == JobKind::AgentCall {
                     j.kind = u.kind;
                     j.consumer = u.consumer;
+                    j.backgrounded |= u.kind == JobKind::ShellBg;
                 }
                 if j.kind != JobKind::AgentCall {
                     // The group in front of a block changes command by
                     // command.
                     j.pgid = u.pgid;
+                }
+                if j.own_pgid.is_none() && j.kind == JobKind::Shell && u.pgid != tf.shell_pgid {
+                    j.own_pgid = Some(u.pgid);
                 }
                 j.promoted_ms = u.promoted_ms.or(j.promoted_ms);
                 j.task = u.task.clone().or_else(|| j.task.clone());
@@ -436,6 +493,7 @@ impl Jobs {
             let candidates: BTreeSet<u32> = prev
                 .keys()
                 .copied()
+                .filter(|p| handed_to.get(p).is_none_or(|to| *to == i))
                 .chain(assigned.get(&i).into_iter().flatten().copied())
                 .collect();
             for pid in candidates {
@@ -472,16 +530,28 @@ impl Jobs {
                 (st == Some(ProcState::Stopped) && Some(*p) != shell)
                     .then(|| (*p, now.get(p).map(|m| m.name.clone()).unwrap_or_default()))
             });
+            // A stopped member parks the job in the background, as does a block that ended in a
+            // stop while its command runs on (`bg` before a tick saw the stop).
+            let shell_pid = tab.map_or(0, |t| t.shell_pid);
+            let parked_by = stopped_member.as_ref().map(|(p, _)| *p).or_else(|| {
+                job.block
+                    .filter(|b| block_closed && tab.is_some_and(|t| stopped_block(t, *b)))
+                    .and_then(|_| {
+                        now.keys()
+                            .copied()
+                            .find(|p| !zombie(p) && Some(*p) != shell && *p != shell_pid)
+                    })
+            });
             if block_closed
                 && job.block.is_some()
-                && let Some((sp, _)) = &stopped_member
+                && let Some(sp) = parked_by
             {
                 let g = facts
-                    .get(sp)
+                    .get(&sp)
                     .map(|f| f.pgid)
-                    .or_else(|| sweep.get(sp).map(|s| s.pgid))
+                    .or_else(|| sweep.get(&sp).map(|s| s.pgid))
                     .filter(|g| *g != 0)
-                    .unwrap_or(*sp);
+                    .unwrap_or(sp);
                 if let Some(sh) = job.shell.take() {
                     now.remove(&sh);
                 }
@@ -489,6 +559,8 @@ impl Jobs {
                 job.kind = JobKind::ShellBg;
                 job.consumer = Consumer::PersonBg;
                 job.pgid = g;
+                job.own_pgid = Some(g);
+                job.backgrounded = true;
                 job.key = Key {
                     tab: job.key.tab,
                     leader: g,
@@ -502,13 +574,13 @@ impl Jobs {
                 || (job.kind == JobKind::AgentCall && !alive(job.key.leader, job.key.start));
             if (ended || block_closed) && job.block.is_some() {
                 job.exit = tab
-                    .and_then(|t| t.block.as_ref())
-                    .filter(|b| Some(b.id) == job.block)
+                    .into_iter()
+                    .flat_map(|t| t.block.iter().chain(&t.ended))
+                    .find(|b| Some(b.id) == job.block)
                     .and_then(|b| b.status);
             }
             let exited = ended || live.is_empty();
             if exited {
-                let shell_pid = tab.map_or(0, |t| t.shell_pid);
                 let survivors: MemberMap = now
                     .iter()
                     .filter(|(p, _)| !zombie(p) && **p != shell_pid && Some(**p) != job.shell)
@@ -520,11 +592,17 @@ impl Jobs {
             }
 
             let dt = job.last_tick_ms.map_or(0, |l| at.saturating_sub(l));
-            let floor = job.last_tick_ms.unwrap_or_else(|| {
-                tab.and_then(|t| t.block.as_ref())
-                    .filter(|b| Some(b.id) == job.block)
-                    .map_or(at, |b| b.started_ms)
-            });
+            // A block's own `C` is its job's floor: what the tab printed up to it is the shell's,
+            // also when the reader fed `C` after a pass's clock and the job's next tick is its
+            // second. A job `fg` resumed is no block's own: the shell's notice follows `fg`'s `C`.
+            let own_start = tab
+                .and_then(|t| t.block.as_ref())
+                .filter(|b| Some(b.id) == job.block && !job.backgrounded)
+                .map(|b| b.started_ms);
+            let floor = job.last_tick_ms.map_or_else(
+                || own_start.unwrap_or(at),
+                |l| l.max(own_start.unwrap_or(0)),
+            );
             let mut refused = false;
             let mut rebased = false;
             let mut cpu: u64 = 0;
@@ -550,6 +628,10 @@ impl Jobs {
                         pageins += delta(c.pageins, p.pageins);
                     }
                     None if prev.contains_key(pid) => rebased = true,
+                    // The job's shell lived long before it joined (`fg`, a block learned late,
+                    // a block whose predecessor held it at its first tick): a baseline, never a
+                    // birth with its lifetime's CPU and writes.
+                    None if Some(*pid) == job.shell => {}
                     None if !first_tick => {
                         births += 1;
                         cpu += c.cpu_ns;
@@ -560,8 +642,14 @@ impl Jobs {
                     None => {}
                 }
             }
-            let reaps = u32::try_from(prev.keys().filter(|p| !now.contains_key(p)).count())
-                .unwrap_or(u32::MAX);
+            // A member that left the job alive (the shell at a stop, one a newer block took)
+            // is no reap: churn is processes exiting.
+            let reaps = u32::try_from(
+                prev.iter()
+                    .filter(|(p, m)| !now.contains_key(p) && !alive(**p, m.start))
+                    .count(),
+            )
+            .unwrap_or(u32::MAX);
             let churn = births + reaps > 0;
             let churn_work = child_work.saturating_mul(1000)
                 >= CHURN_WORK_NS_PER_S.saturating_mul(dt.max(1))
@@ -573,14 +661,20 @@ impl Jobs {
             let mut progress: Option<(Progress, u64)> = None;
             let mut out_growth: u64 = 0;
             let fresh = |stamp: Option<u64>| stamp.filter(|s| *s > floor && *s <= at);
+            // The tab's output is a job's only over a tick the shell wrote no mark in (a block's
+            // own `C` is its floor): else it may be the shell's prompt, its notice of a stop, the
+            // echo of `fg`, or a command's that ran between two ticks.
+            let shells = tab.is_some_and(|t| t.shell_ms.is_some_and(|s| s > floor))
+                || job.fg_ms.is_some_and(|f| f >= floor);
             if let Some(t) = tab.filter(|_| credited_pty) {
-                let canonical = t.tty.is_none_or(|m| m.canonical);
+                // The mode word is the foreground reader's (a background job's is the shell's
+                // line editor, raw at its prompt): a background writer is judged by its lines.
+                let canonical = job.kind == JobKind::ShellBg || t.tty.is_none_or(|m| m.canonical);
                 let raw_counts = fault == Some(Fault::RawBytesProgress);
-                if canonical && !raw_counts {
-                    if let Some(s) = fresh(t.line_output_ms) {
-                        progress = Some((Progress::Line, s));
-                    }
-                } else if let Some(s) = fresh(t.output_ms) {
+                let line = canonical && !raw_counts;
+                if let Some(s) = fresh(t.line_output_ms).filter(|_| line && !shells) {
+                    progress = Some((Progress::Line, s));
+                } else if let Some(s) = fresh(t.output_ms).filter(|_| !line && !shells) {
                     progress = Some((Progress::Raw, s));
                 }
                 if let Some(b) = job.pty_bytes {
@@ -722,8 +816,12 @@ impl Jobs {
             let out = step::classify_tick(&mut job.track, &ev, &cx);
             let leader_name = match now_name(job, &live, &sweep, &facts) {
                 Some(n) if !exited || job.last_name.is_empty() => n,
+                _ if !job.member_name.is_empty() => job.member_name.clone(),
                 _ => job.last_name.clone(),
             };
+            if live.iter().any(|p| Some(*p) != job.shell) {
+                job.member_name.clone_from(&leader_name);
+            }
             job.last_name.clone_from(&leader_name);
             job.members = now;
             job.last_tick_ms = Some(at);
@@ -1030,7 +1128,11 @@ impl Job {
             block: u.block,
             shell: u.shell,
             consumer_pid: u.consumer_pid,
+            own_pgid: None,
+            backgrounded: u.kind == JobKind::ShellBg,
+            fg_ms: None,
             last_name: String::new(),
+            member_name: String::new(),
             members: BTreeMap::new(),
             outputs: HashMap::new(),
             pty_bytes: None,
@@ -1069,7 +1171,11 @@ impl Job {
             block: None,
             shell: None,
             consumer_pid: None,
+            own_pgid: None,
+            backgrounded: false,
+            fg_ms: None,
             last_name: m.name.clone(),
+            member_name: m.name.clone(),
             members,
             outputs: HashMap::new(),
             pty_bytes: None,
@@ -1286,14 +1392,46 @@ fn discover(
     (units, tf)
 }
 
-/// The live job a block's group in front already belongs to, when that job
-/// is a background one (a parked job `fg` resumed): its index.
-fn resumed(u: &Unit, claimed: &HashMap<u32, usize>, jobs: &[Job]) -> Option<usize> {
+/// The live job a block's group in front already belongs to, when that block
+/// resumes it: a background job (a parked job `fg` resumed), the foreground
+/// group a tick saw before its block (an engine restored running, or a fork
+/// swept before the reader fed its `C`), or a block's job whose block ended in
+/// a stop and whose own group (its first in front) or last group in front (the
+/// stopped command of an `a && b`) is in front again under the newer block (a
+/// stop and `fg` no tick saw; a command typed ahead of a block that ended is no
+/// stop, and its own job): its index.
+fn resumed(
+    u: &Unit,
+    tab: &JobTab,
+    shell_pgid: u32,
+    claimed: &HashMap<u32, usize>,
+    jobs: &[Job],
+) -> Option<usize> {
     u.members
         .iter()
         .filter(|p| Some(**p) != u.shell)
         .find_map(|p| claimed.get(p).copied())
-        .filter(|i| jobs[*i].block.is_none() && jobs[*i].kind == JobKind::ShellBg)
+        .filter(|i| {
+            let j = &jobs[*i];
+            let front = j.kind == JobKind::Shell && u.pgid != shell_pgid;
+            match j.block {
+                None => j.kind == JobKind::ShellBg || (front && j.pgid == u.pgid),
+                Some(b) => {
+                    Some(b) != u.block
+                        && front
+                        && (j.own_pgid == Some(u.pgid) || j.pgid == u.pgid)
+                        && stopped_block(tab, b)
+                }
+            }
+        })
+}
+
+/// Block `id` of `tab` ended in a job-control stop: its command lives on, parked.
+fn stopped_block(tab: &JobTab, id: u64) -> bool {
+    tab.block
+        .iter()
+        .chain(&tab.ended)
+        .any(|b| b.id == id && !b.open && b.stopped)
 }
 
 /// The waiting leaves: live members with no live member below them, deepest

@@ -7023,7 +7023,7 @@ impl Acting {
                 }),
                 limit_reset: Arc::new(|_| None),
                 transcript_tail: Arc::new(|_| None),
-                repo_work: Arc::new(|_| None),
+                repo_work: Arc::new(|_| Default::default()),
                 transcript: Arc::new(|_| None),
                 task_exited: Arc::new(move |sid| {
                     a27.tasks_exited.lock().unwrap().push(sid.to_string());

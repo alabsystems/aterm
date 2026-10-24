@@ -82,7 +82,7 @@ fn profile(sys: &dyn System, user: &User) -> Result<Option<Config>, String> {
     decode(&bytes, user).map(Some)
 }
 
-/// Returns aterm workspace checkouts in the home directory owned by the configured account.
+/// Returns the home's checkouts of the configured owner's repositories that are aterm workspaces.
 ///
 /// # Errors
 /// The profile cannot be admitted, or the listing or a worktree cannot be read.

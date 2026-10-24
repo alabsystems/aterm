@@ -27,7 +27,7 @@ pub const USAGE: &str = "\
 aterm ai — this machine's AI CLIs (claude, codex, agy, muse): health, sign-in, cross-AI reviews.
 
   aterm ai [status] [--json]    one row per CLI and a health line, read-only (exit 0)
-  aterm ai doctor [--read-only] [--json] [--on <host>,\u{2026} | --fleet]
+  aterm ai doctor [--read-only] [--json] [--on <host>[:/abs/aterm],\u{2026} | --fleet]
                                 the same with fixes; for a person at a terminal (no
                                 --read-only or --json) it installs or signs in each CLI that
                                 needs it; exit 1 while one is signed out or not installed;
@@ -39,11 +39,15 @@ aterm ai — this machine's AI CLIs (claude, codex, agy, muse): health, sign-in,
                                 ask the other AI CLIs used here to review this repository's
                                 change (the branch's since its upstream, unless --base or
                                 --uncommitted), by default at the asking agent's permission level
+                                or, when a person asks, yolo ([ai] review_permissions pins one);
+                                --with asks those named and --all each of [ai] reviewers, the
+                                asker too
   aterm ai review --show <id> [--json]
                                 reprint a saved review (kept 24h)
   aterm ai fleet [status]       the fleet document's source, signer, state and fetched copy
   aterm ai fleet fetch          fetch and verify it from the https:// URL `[ai] fleet` names
-                                (`aterm ai doctor` also fetches, at most every 6h)
+                                (the window and `aterm ai doctor`, --read-only too, also
+                                fetch it, at most every 6h)
   aterm ai fleet keygen <secret-key-file>
                                 generate an Ed25519 signing keypair (0600, never overwritten)
   aterm ai fleet sign <doc> --key <secret-key-file>
@@ -51,8 +55,9 @@ aterm ai — this machine's AI CLIs (claude, codex, agy, muse): health, sign-in,
   aterm ai fleet verify <doc> [--key <public-key>]
                                 verify <doc> against <doc>.sig (--key, else [ai] fleet_key)
 
-Config: `[ai]` in `aterm.toml`; the fleet document is `[ai] fleet` (a path or https:// URL),
-else `ai-fleet.toml` beside `aterm.toml`. See `aterm help ai`.";
+Config: `[ai]` in `aterm.toml`; the fleet document is `[ai] fleet` (an absolute path or an
+https:// URL), else `ai-fleet.toml` beside `aterm.toml`. A repository refuses reviews with
+`git config aterm.aiReview false`. See `aterm help ai`.";
 
 /// Everything the verbs read of the process, once.
 #[derive(Debug, Clone)]
@@ -218,7 +223,19 @@ pub fn look(env: &Env) -> Look {
     let store = env.store();
     let (records, store_note) = match store.as_ref().map(Store::load) {
         Some(Ok(r)) => (r, None),
-        Some(Err(why)) => (Default::default(), Some(format!("{why:?}"))),
+        Some(Err(super::store::Unread::Torn(why))) => (
+            Default::default(),
+            Some(format!(
+                "the AI store's connections.json is not used ({why})"
+            )),
+        ),
+        Some(Err(super::store::Unread::NotOurs(n))) => (
+            Default::default(),
+            Some(format!(
+                "the AI store's connections.json has schema {n}, which this build does not read; \
+                 it is not used"
+            )),
+        ),
         None => (
             Default::default(),
             Some("aterm's state directory is unknown".to_string()),
@@ -347,7 +364,8 @@ fn default_reviewers<'s>(s: &'s Settings, asker: &str) -> Vec<&'s str> {
         .collect()
 }
 
-/// The asking CLI (`--from`, ancestor agent, environment, or preferred CLI).
+/// The asking CLI when `--from` names none: the ancestor agent, else `CLAUDECODE` /
+/// `CODEX_THREAD_ID`, else the preferred CLI.
 fn asker_id(env: &Env, s: &Settings) -> &'static str {
     if let Some((id, _)) = env.asker.agent() {
         return id;
@@ -1325,7 +1343,7 @@ fn secret_of(path: &Path) -> Result<Vec<u8>, String> {
     {
         use std::os::unix::fs::PermissionsExt as _;
         if meta.permissions().mode() & 0o077 != 0 {
-            return Err("others may read it: `chmod 600` it first".to_string());
+            return Err("its group or others have access to it: `chmod 600` it first".to_string());
         }
     }
     let mut raw = Vec::new();
@@ -1343,7 +1361,7 @@ fn secret_of(path: &Path) -> Result<Vec<u8>, String> {
 
 fn doc_of(path: &Path) -> Result<Vec<u8>, String> {
     crate::harness::accounts::read_bounded(path, config::FLEET_MAX_BYTES)
-        .map_err(|e| crate::harness::one_line(&format!("{e:?}"), 120))?
+        .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?
         .map(String::into_bytes)
         .ok_or_else(|| "no such file".to_string())
 }
@@ -1499,6 +1517,7 @@ fn fleet_verify(
     key: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<(), String> {
+    let from_flag = key.is_some();
     let key = match key {
         Some(k) => k.to_string(),
         None => look(env)
@@ -1514,7 +1533,13 @@ fn fleet_verify(
             crate::harness::one_line(&e.to_string(), 120)
         )
     })?;
-    fleet::verify(&bytes, &sig, &key)?;
+    fleet::verify(&bytes, &sig, &key).map_err(|why| {
+        if from_flag {
+            why.replace("[ai] fleet_key", "--key")
+        } else {
+            why
+        }
+    })?;
     let text = std::str::from_utf8(&bytes).map_err(|_| "the document is not UTF-8")?;
     config::read_fleet(text).map_err(|why| format!("verified, but refused: {why}"))?;
     let (seq, until) = fleet::meta(text)?;

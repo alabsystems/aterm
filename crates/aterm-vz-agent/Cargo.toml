@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-vz-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "The Linux lane's guest agent: a static, std-only binary that runs the host's commands in the VM over vsock and reports the guest's boot on its watch connection (docs/DESIGN-vz-guest-2026-10-23.md §6)"
+
+# Dev-only, never packed or shipped (the workspace's atpkg lists name `aterm`
+# alone). The lab cross-builds it for aarch64-unknown-linux-musl on rustup's
+# stable (STOCK EXCEPTION: Trust has no Linux std) and the guest runs it from
+# its read-only boot share. On macOS the bin serves on a unix socket: the test
+# seam, never a shipped mode.
+[[bin]]
+name = "aterm-vz-agent"
+path = "src/main.rs"
+
+# Nothing in `aterm` depends on the agent, so `verify cells` reaches its Linux
+# code only through this key: the linux-arm cell lints it with the clippy.toml
+# bans and type-checks its targets (the Linux-only tests among them) on
+# aarch64-unknown-linux-gnu, beside `aterm` (STOCK EXCEPTION, as every cell).
+# Its musl std builds only the release bin, not the tests' dev-dependencies.
+[package.metadata.aterm]
+cells = ["linux-arm"]
+
+[dependencies]
+# The SHA-256 of the agent's own executable, which its Hello reports. Its one
+# dependency (astream-digest) has none, so it builds for musl, where aterm-libc
+# has no cell and so nothing that reaches aterm-uds does (the design's fact 50).
+aterm-digest = { workspace = true }
+
+[dev-dependencies]
+# Scratch directories for the tests' sockets and fixtures (zero dependencies).
+aterm-tempfile = { workspace = true }
+# The tests' one child constructor (`spawnfd::command`, the seam bin) and their
+# pid probe (`process::pid_alive`). The host's tests only: a dev-dependency is
+# never built for the guest.
+aterm-uds = { workspace = true }
+
+[lints]
+workspace = true

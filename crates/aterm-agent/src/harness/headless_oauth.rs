@@ -424,7 +424,11 @@ impl MailboxConfig {
             if u.starts_with("imap://") || u.starts_with("imaps://") {
                 cfg.imap_url.get_or_insert(u);
             } else if u.starts_with("http://") || u.starts_with("https://") {
-                cfg.http_url.get_or_insert(u);
+                if is_webmail_ui_url(&u) {
+                    cfg.webmail_url.get_or_insert(u);
+                } else {
+                    cfg.http_url.get_or_insert(u);
+                }
             } else {
                 cfg.dir.get_or_insert_with(|| expand_path(&u));
             }
@@ -921,6 +925,13 @@ fn candidate_lookup_keys(target_email: Option<&str>) -> Vec<String> {
     keys
 }
 
+fn is_webmail_ui_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("mail.proton.me")
+        || lower.contains("app.fastmail.com")
+        || lower.contains("mail.zoho.com")
+}
+
 fn parse_single_line_mailbox_secret(text: &str) -> Option<MailboxConfig> {
     let mut cfg = MailboxConfig::default();
     for raw_line in text.lines() {
@@ -944,11 +955,7 @@ fn parse_single_line_mailbox_secret(text: &str) -> Option<MailboxConfig> {
             continue;
         }
         if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            let lower_url = trimmed.to_ascii_lowercase();
-            if lower_url.contains("mail.proton.me")
-                || lower_url.contains("app.fastmail.com")
-                || lower_url.contains("mail.zoho.com")
-            {
+            if is_webmail_ui_url(trimmed) {
                 cfg.webmail_url.get_or_insert_with(|| trimmed.to_owned());
             } else {
                 cfg.http_url.get_or_insert_with(|| trimmed.to_owned());
@@ -1355,7 +1362,11 @@ pub(super) fn mailbox_config_from_override(value: &OsStr, home: Option<&Path>) -
             return cfg;
         }
         if url.starts_with("http://") || url.starts_with("https://") {
-            cfg.http_url = Some(url.to_owned());
+            if is_webmail_ui_url(url) {
+                cfg.webmail_url = Some(url.to_owned());
+            } else {
+                cfg.http_url = Some(url.to_owned());
+            }
             return cfg;
         }
     }
@@ -1397,7 +1408,11 @@ pub fn discover_mailbox_config(
         if url.starts_with("imap://") || url.starts_with("imaps://") {
             cfg.imap_url = Some(url);
         } else if url.starts_with("http://") || url.starts_with("https://") {
-            cfg.http_url = Some(url);
+            if is_webmail_ui_url(&url) {
+                cfg.webmail_url = Some(url);
+            } else {
+                cfg.http_url = Some(url);
+            }
         }
     }
     if let Some(imap) = non_empty_env(IMAP_URL_ENV) {
@@ -1416,6 +1431,14 @@ pub fn discover_mailbox_config(
         cfg.password = Some(p);
     }
     if let Some(totp) = non_empty_env(TOTP_SECRET_ENV) {
+        if let Some(params) = parse_otpauth_uri(&totp)
+            && let Some(email) = params.account_email
+        {
+            cfg.totp_secrets
+                .entry(email.clone())
+                .or_insert_with(|| totp.clone());
+            cfg.user.get_or_insert(email);
+        }
         cfg.totp_secret = Some(totp);
     }
     if let Some(tok) = non_empty_env(MAILBOX_TOKEN_ENV) {
@@ -1434,7 +1457,7 @@ pub fn discover_mailbox_config(
     if cfg.seen_file.is_none() {
         cfg.seen_file = store_dir
             .map(|s| s.join("mailbox.seen"))
-            .or_else(|| cfg.dir.as_ref().map(|d| d.join(".mailbox.seen")));
+            .or_else(|| cfg.dir.as_deref().map(default_seen_file_for_path));
     }
 
     cfg.is_configured().then_some(cfg)
@@ -2517,15 +2540,45 @@ fn fetch_imap_credential(
     }
 }
 
-fn is_loopback_http_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return false;
+fn authority_and_tail(rest: &str) -> (&str, &str) {
+    rest.find(['/', '?', '#'])
+        .map_or((rest, ""), |end| rest.split_at(end))
+}
+
+struct LoopbackHttpUrl<'a> {
+    authority: &'a str,
+    userinfo: Option<&'a str>,
+    port: u16,
+    target: String,
+}
+
+fn parse_loopback_http_url(url: &str) -> Option<LoopbackHttpUrl<'_>> {
+    let rest = url.strip_prefix("http://")?;
+    let (raw_authority, tail) = authority_and_tail(rest);
+    let (userinfo, authority) = match raw_authority.rsplit_once('@') {
+        Some((ui, host_port)) => (Some(ui), host_port),
+        None => (None, raw_authority),
     };
-    let raw_authority = rest.split('/').next().unwrap_or(rest);
-    let authority = raw_authority
-        .rsplit_once('@')
-        .map_or(raw_authority, |(_, hp)| hp);
-    authority.starts_with("127.0.0.1:") || authority.starts_with("localhost:")
+    let (host, port) = authority.rsplit_once(':')?;
+    if !matches!(host, "127.0.0.1" | "localhost") {
+        return None;
+    }
+    let target = tail.split('#').next().unwrap_or("");
+    let target = if target.is_empty() || target.starts_with('?') {
+        format!("/{target}")
+    } else {
+        target.to_owned()
+    };
+    Some(LoopbackHttpUrl {
+        authority,
+        userinfo,
+        port: port.parse().ok()?,
+        target,
+    })
+}
+
+fn is_loopback_http_url(url: &str) -> bool {
+    parse_loopback_http_url(url).is_some()
 }
 
 fn fetch_loopback_http_body(
@@ -2533,20 +2586,13 @@ fn fetch_loopback_http_body(
     bearer_token: Option<&str>,
     basic_auth: Option<(&str, &str)>,
 ) -> Option<String> {
-    let rest = url.strip_prefix("http://")?;
-    let (raw_authority, path_and_query) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
-    };
-    let (embedded_userinfo, authority) = match raw_authority.rsplit_once('@') {
-        Some((ui, host_port)) => (Some(ui), host_port),
-        None => (None, raw_authority),
-    };
-    let (host, port_str) = authority.rsplit_once(':')?;
-    if !matches!(host, "127.0.0.1" | "localhost") {
-        return None;
-    }
-    let port: u16 = port_str.parse().ok()?;
+    let parsed = parse_loopback_http_url(url)?;
+    let LoopbackHttpUrl {
+        authority,
+        userinfo: embedded_userinfo,
+        port,
+        target: path_and_query,
+    } = parsed;
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -2583,7 +2629,7 @@ fn url_has_embedded_userinfo(url: &str) -> bool {
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
         .unwrap_or("");
-    let raw_authority = rest.split('/').next().unwrap_or(rest);
+    let (raw_authority, _) = authority_and_tail(rest);
     raw_authority
         .rsplit_once('@')
         .is_some_and(|(ui, _)| !ui.is_empty())
@@ -2956,14 +3002,12 @@ fn scan_maildir_once(
             );
             if exhausted {
                 tried.insert((path.clone(), len, mtime));
-                if !mailbox_dir.is_file()
-                    && let Some(name) = path.file_name()
-                {
+                if let Some(name) = path.file_name() {
                     let name_str = name.to_string_lossy();
                     let parent = path.parent().unwrap_or(mailbox_dir);
                     let marker = parent.join(format!("{name_str}.clicked"));
                     let _ = std::fs::write(marker, b"1\n");
-                    if parent != mailbox_dir {
+                    if !mailbox_dir.is_file() && parent != mailbox_dir {
                         let base_name = name_str.split(":2,").next().unwrap_or(&name_str);
                         let root_marker = mailbox_dir.join(format!("{base_name}.clicked"));
                         let _ = std::fs::write(root_marker, b"1\n");
@@ -4481,4 +4525,67 @@ pub fn authorize_with_headless_browser(
         target_email,
         timeout,
     )
+}
+
+#[cfg(test)]
+mod uri_authority_tests {
+    #[test]
+    fn userinfo_ends_before_path_query_and_fragment() {
+        for (url, embedded) in [
+            ("https://user:password@mail.example", true),
+            ("http://user@mail.example?to=a@b", true),
+            ("https://user:password@mail.example#fragment@tail", true),
+            ("https://mail.example?to=a@b", false),
+            ("https://mail.example#fragment@tail", false),
+            ("https://mail.example/path@tail", false),
+            ("https://mail.example/?to=a@b", false),
+            ("https://@mail.example", false),
+            ("https://mail.example", false),
+            ("https://?to=a@b", false),
+            ("ftp://user:password@mail.example", false),
+            ("HTTPS://user@mail.example", false),
+        ] {
+            assert_eq!(super::url_has_embedded_userinfo(url), embedded, "{url}");
+        }
+
+        for (url, selected) in [
+            ("http://localhost:1777", true),
+            ("http://user:password@127.0.0.1:1777?to=a@b", true),
+            ("http://remote.example?to=owner@127.0.0.1:1777", false),
+            ("http://remote.example#owner@localhost:1777", false),
+            ("http://remote.example/path@127.0.0.1:1777", false),
+            ("http://[::1]:1777?to=a@b", false),
+            ("https://localhost:1777", false),
+        ] {
+            assert_eq!(super::is_loopback_http_url(url), selected, "{url}");
+        }
+
+        for (url, authority, userinfo, target) in [
+            ("http://localhost:1777", "localhost:1777", None, "/"),
+            (
+                "http://user:password@127.0.0.1:1777?to=a@b#fragment@tail",
+                "127.0.0.1:1777",
+                Some("user:password"),
+                "/?to=a@b",
+            ),
+            (
+                "http://localhost:1777/mail?to=a@b#fragment@tail",
+                "localhost:1777",
+                None,
+                "/mail?to=a@b",
+            ),
+            (
+                "http://@localhost:1777#tail",
+                "localhost:1777",
+                Some(""),
+                "/",
+            ),
+        ] {
+            let parsed = super::parse_loopback_http_url(url).unwrap();
+            assert_eq!(parsed.authority, authority, "{url}");
+            assert_eq!(parsed.userinfo, userinfo, "{url}");
+            assert_eq!(parsed.port, 1777, "{url}");
+            assert_eq!(parsed.target, target, "{url}");
+        }
+    }
 }

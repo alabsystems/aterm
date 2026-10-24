@@ -45,6 +45,13 @@ pub fn sock_fits(sock: &Path) -> bool {
     dialled.as_os_str().len() < MAX_SOCK_PATH
 }
 
+/// The development seam naming the system an instance hears (`aterm-gui`'s
+/// `memory_pressure::SYSTEM_SEAM`): [`apply`] sets it to `none`, so the instance hears only
+/// what its test drives with the `pressure` verb and a loaded host never sheds the scrollback
+/// or history ring a test waits on; `normal`, `warn` or `critical` stands in for a system held
+/// at that level.
+pub const SYSTEM_PRESSURE: &str = "ATERM_DEBUG_SYSTEM_PRESSURE";
+
 /// Config disabling automatic update, package, and agent supervisor lanes ([`HARNESS_OFF`]).
 pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
                               [packages]\nenabled = false\n\
@@ -193,7 +200,8 @@ pub fn apply(cmd: &mut Command, root: &Path) {
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_STATE_HOME", root.join("state"))
         .env("TMPDIR", root.join("tmp"))
-        .env("ATERM_LOG", "off");
+        .env("ATERM_LOG", "off")
+        .env(SYSTEM_PRESSURE, "none");
     #[cfg(unix)]
     cmd.env("SHELL", "/bin/sh");
     #[cfg(windows)]

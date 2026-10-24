@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The quit the system asked for: a logout, a restart or a shutdown, after which the agents aterm
-//! hosted relaunch at the next start.
+//! The quit the system asked for (a logout, a restart or a shutdown) and the end of a failed
+//! event loop, after which the agents aterm hosted relaunch at the next start.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 

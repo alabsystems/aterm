@@ -2440,10 +2440,10 @@ impl Stardust {
         let ch = g.ch as f32;
         // The sky is never below the glyph row's top: under `underline` the
         // band's top lies among the letters, and a star born just above it
-        // sat on the ascenders or at x-height, reading as an apostrophe
-        // (round 2's judge, 2026-10-23, on paper). Above the row's top it is
-        // in the row above's foot (a pixel clear of the row's top at any cell
-        // height), which the probe certified blank above.
+        // would sit on the ascenders or at x-height, reading as an apostrophe
+        // on paper. Above the row's top it is in the row above's foot (a pixel
+        // clear of the row's top at any cell height), which the probe
+        // certified blank above.
         let cell_top = f32::from(g.origin_y) + f32::from(row) * ch;
         let top = ribbon
             .band(row, col)
@@ -4349,11 +4349,11 @@ mod tests {
         sc
     }
 
-    /// Round 2's judge (2026-10-23, the trail gallery's `burst` t0 on paper):
-    /// purple sky stars on a flying companion's face and back. A star whose
-    /// centre lies on the pet's body is not drawn, on dark and on paper, nor
-    /// one on the box the body's last move carries it to; one beside the body
-    /// is. The negative control: the same sky with no body noted draws it.
+    /// A star whose centre lies on the pet's body is not drawn, on dark and
+    /// on paper, nor one on the box the body's last move carries it to; one
+    /// beside the body is (the trail gallery's `burst` t0 on paper, where
+    /// purple sky stars would stand on a flying companion's face and back).
+    /// The negative control: the same sky with no body noted draws it.
     #[test]
     fn no_star_is_drawn_on_the_pet_s_body() {
         let t0 = Instant::now();

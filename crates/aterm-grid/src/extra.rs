@@ -148,7 +148,7 @@ impl CellExtra {
         }
     }
 
-    /// Attach an already-built.
+    /// Attach an already-built, possibly shared, hyperlink payload.
     #[inline]
     pub(crate) fn set_hyperlink_data(&mut self, data: Option<Arc<HyperlinkData>>) {
         self.hyperlink = data;

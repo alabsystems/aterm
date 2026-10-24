@@ -560,6 +560,7 @@ pub fn all() -> Vec<Scenario> {
                     open: true,
                     command: "read -r x".to_owned(),
                     status: None,
+                    stopped: false,
                 });
             },
             each: nothing,
@@ -831,7 +832,7 @@ pub fn all() -> Vec<Scenario> {
                 }
                 if rel == 10_000 {
                     w.p(FG).state = ProcState::Stopped;
-                    w.close_block(1, 148);
+                    w.stop_block(1);
                 }
             },
             id: "b51",
@@ -1367,6 +1368,7 @@ pub fn all() -> Vec<Scenario> {
                     open: true,
                     command: "while :; do sleep 0.5; done".to_owned(),
                     status: None,
+                    stopped: false,
                 });
             },
             each: typed_sleep_loop,

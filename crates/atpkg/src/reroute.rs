@@ -30,7 +30,7 @@ pub const ANNOUNCED_ENV: &str = "__ATERM_REROUTE_ANNOUNCED";
 pub const STUB_MARKER: &str = "# atpkg reroute stub v1";
 /// The hidden verb a stub execs: `atpkg __reroute <upstream> [args…]`.
 pub const HIDDEN_VERB: &str = "__reroute";
-/// The exit of a refusal: strict's, a non-Trust `cargo`/`rustc` inside a Trust source checkout, a `__reroute` call naming no rerouted tool, and `atpkg lane`'s.
+/// The exit of a refusal: strict's (`z3`, a store-less call, a stub whose atpkg is unreachable; a strict DIRECT row whose Trust tool is missing exits 127), a non-Trust `cargo`/`rustc` inside a Trust source checkout, a `__reroute` call naming no rerouted tool, and `atpkg lane`'s.
 pub const REFUSAL_EXIT: u8 = 2;
 /// The directory under the manager prefix (`<prefix>/reroute`).
 pub const DIR_NAME: &str = "reroute";
@@ -274,24 +274,28 @@ pub const ANNOUNCE_SETTING: &str = "[reroute] announce = false";
 
 const MEASURING_LINE: &str = "       `aterm help rust` shows which toolchain this directory gets; the default here is Trust.";
 
-fn signpost_closing() -> String {
-    format!(
-        "{MEASURING_LINE}\n       ({ANNOUNCE_SETTING} in aterm.toml silences this — Settings ▸ Packages.)"
-    )
+fn signpost_closing(rust: bool) -> String {
+    let silence =
+        format!("       ({ANNOUNCE_SETTING} in aterm.toml silences this — Settings ▸ Packages.)");
+    if rust {
+        format!("{MEASURING_LINE}\n{silence}")
+    } else {
+        silence
+    }
 }
 
-fn pin_lines(pin: &Pin) -> String {
+fn pin_lines(pin: &Pin, tool: &str) -> String {
     if rust_lane::is_trust_channel(&pin.channel) {
         return String::new();
     }
     let channel = &pin.channel;
     match &pin.source {
         rust_lane::PinSource::File(file) => format!(
-            "       This directory pins stock \"{channel}\", which moves only rustup's proxies, never targo:\n       the Trust spellings above run the Trust toolchain here too. ({})\n",
+            "       This directory pins stock \"{channel}\", which moves only rustup's proxies, never {tool}:\n       the Trust spellings above run the Trust toolchain here too. ({})\n",
             file.display()
         ),
         rust_lane::PinSource::Env => format!(
-            "       $RUSTUP_TOOLCHAIN names stock \"{channel}\", which moves only rustup's proxies, never targo:\n       the Trust spellings above run the Trust toolchain here too.\n"
+            "       $RUSTUP_TOOLCHAIN names stock \"{channel}\", which moves only rustup's proxies, never {tool}:\n       the Trust spellings above run the Trust toolchain here too.\n"
         ),
     }
 }
@@ -446,7 +450,7 @@ fn signpost_block(
             [_] if rust_lane::is_unknown_verb(&spellings) => {
                 out.push_str(&head_line(verb, " (no proof claim)"));
                 out.push_str(&format!(
-                    "; targo is not known to have `{verb}`\n       (a cargo extension targo lacks has no Trust spelling). If it has, it is:\n"
+                    "; targo is not known to have `{verb}`\n       (a cargo extension targo lacks has no Trust spelling; a cargo alias takes its expansion's lane). If it has, it is:\n"
                 ));
             }
             [one] if one.label.is_empty() => {
@@ -503,14 +507,14 @@ fn signpost_block(
             None => out.push_str(&format!("       ('{upstream}' here is {real}.)\n")),
         }
     }
+    let tool = trust_tool.split(' ').next().unwrap_or(branded);
     if let Head::Stock(_) = head {
-        let tool = trust_tool.split(' ').next().unwrap_or(branded);
         out.push_str(&format!(
             "       A stock channel, named here or pinned, moves only rustup's proxies, never {tool}.\n"
         ));
     }
-    if let Some(pin) = pin {
-        out.push_str(&pin_lines(pin));
+    if let Some(pin) = pin.filter(|_| is_rust_row(row)) {
+        out.push_str(&pin_lines(pin, tool));
     }
     if head == Head::NotOnPath {
         out.pop();
@@ -518,7 +522,7 @@ fn signpost_block(
         // A refusal is never silenced, so the setting that silences a signpost is not named.
         out.push_str(MEASURING_LINE);
     } else {
-        out.push_str(&signpost_closing());
+        out.push_str(&signpost_closing(is_rust_row(row)));
     }
     out
 }
@@ -768,12 +772,13 @@ pub fn policy_summary(row: &Row, upstream_found: bool, strict: bool) -> String {
                 .collect();
             let mut s = format!("announced, naming {}", named.join(" / "));
             if upstream == "cargo" {
-                s.push_str(" for build/check/test, 'targo --unverified <args>' for a verb with no verified lane (run, doc, install, …), 'targo <args>' for one that takes no lane (metadata, tree, …); ");
+                s.push_str(" for build/check/test, 'targo --unverified <args>' for a verb with no verified lane (run, doc, install, …), 'targo <args>' for one that takes no lane (tree, clean, …); ");
                 let verbs: Vec<String> = CARGO_VERB_REROUTES
                     .iter()
                     .map(|(verb, reroute)| format!("'{upstream} {verb}' → '{reroute}'"))
                     .collect();
                 s.push_str(&verbs.join(", "));
+                s.push_str("; 'cargo trust <args>' / 'cargo --unverified <args>' run targo after one stderr line, and 'cargo metadata' / 'locate-project' / 'version' / '--version' run an installed targo with no line");
             }
             s.push_str(&stock_channel("names the same Trust spelling"));
             let resolves = names_what_runs(row) && upstream_found;

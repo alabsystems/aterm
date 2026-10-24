@@ -260,6 +260,7 @@ mod tests {
             typed: Default::default(),
             bells: Default::default(),
             screen_moves: Default::default(),
+            job_feed: Default::default(),
             update_parked: Default::default(),
             witness: Default::default(),
             fenced_writes: Default::default(),

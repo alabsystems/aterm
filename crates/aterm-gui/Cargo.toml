@@ -319,9 +319,7 @@ aterm-toml = { workspace = true }
 # The first-party TLS layer. Its user here is the supervisor's network probe
 # (`harness_netprobe.rs`): a TLS handshake to the API host that the OPERATING
 # SYSTEM's trust store verifies (`aterm_http::tls` over `aterm_http::verifier`),
-# under one deadline. (It was written for the Smart Titles LLM worker, retired
-# 2026-10-15, when it replaced `ureq` — 12 packages / 89,080 lines — and its
-# bundled `webpki-roots`.)
+# under one deadline.
 aterm-http = { workspace = true }
 # PNG codec: the `window` verb's full-window capture and wallpaper decoding.
 aterm-png = { workspace = true }
@@ -336,10 +334,9 @@ aterm-secrets = { workspace = true }
 # The development Security-posture catalog owns its scratch bundle through the
 # existing exclusive directory guard; the shipped catalog is compiled out.
 aterm-tempfile = { workspace = true }
-# NOTE: the tray's glyph rasterization no longer takes a font dependency of its
-# own — `aterm_render::font::Font` (first-party: the aterm-font reader + this
-# workspace's own coverage fill) retired `fontdue` here and in aterm-render
-# together.
+# The tray's glyph rasterization takes no font dependency of its own: it draws
+# with `aterm_render::font::Font` (first-party: the aterm-font reader + this
+# workspace's own coverage fill).
 
 [build-dependencies]
 # The build script derives the exact 64-byte lowercase updater-key fingerprint

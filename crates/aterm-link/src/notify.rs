@@ -1307,16 +1307,15 @@ thread_local! {
 const USAGE: &str = "\
 aterm link notify — run a command when the fabric needs a human
 
-  aterm link notify --fleet <F> --broker <socket> --cap-file <path>...
+  aterm link notify --fleet <F> --broker <socket> [--cap-file <path>...]
                     --on <attention|ask:<person>|halt>,... --exec <cmd> [options]
 
   --on <sel>,...         what to watch (repeatable):
-                         - `attention`: a presence row raising `attention=` (node.cap)
+                         - `attention`: a presence row raising `attention=` (node.cap,
+                           or a person's cap)
                          - `ask:<person>`: an ask addressed to <person> (that person's own
                            cap, from `aterm fabric mint-for <person>`)
                          - `halt`: a fleet halt coming on (node.cap)
-                         Exits 2 when the broker refuses a selector's read: no --cap-file
-                         grants it.
   --exec <cmd>           run `/bin/sh -c <cmd>` per record, its facts in `$ATERM_NOTIFY_*`
                          (FLEET ON OFFSET SUBJECT NODE WHO SID TEXT DUP SUPPRESSED)
   --rate <n>/<window>    at most <n> runs per window, e.g. `10/1m`, `1/30s`, `40/1h`
@@ -1331,16 +1330,21 @@ Dedups across restarts by offset, and `attention` by each subject's standing val
 (clearing it and raising it again pages again); a crash mid-`--exec` runs it again with
 `ATERM_NOTIFY_DUP=1`. On an `ordered` broker a record waits until it is durable; `--once`
 leaves one not yet durable for the next run. Prints `notify: fired= dup= skipped=
-dropped= suppressed= standing=` on exit.
+dropped= suppressed= standing=` on exit. Exits 2 on a usage error, an unreadable
+--cap-file, or a broker that refuses the cap files or a selector's read (no --cap-file
+grants it); 1 when the state dir cannot open or the run fails.
 ";
 
 /// `aterm-link notify`.
 #[must_use]
 pub fn main(args: &[String]) -> ExitCode {
+    if crate::cli::asks_help(args) {
+        return aterm_uds::stdout::answer_exit("aterm link notify", USAGE, 0);
+    }
     let cfg = match parse(args) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("aterm-link notify: {e}");
+            eprintln!("aterm link notify: {e}");
             eprint!("{USAGE}");
             return ExitCode::from(2);
         }

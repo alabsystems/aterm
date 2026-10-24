@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Per-session fabric endpoint: bounded [`Inbox`] ring, outbound post queue, [`Holds`] gate, [`SessionFabric`] verb handlers (`inbox`, `post`, `deliver`, `hold`, `topic`), and instance `LINK` state.
+//! Per-session fabric endpoint ([`SessionFabric`]): bounded [`Inbox`] ring, outbound post queue, [`Holds`] gate, the verb handlers (`inbox`, `post`, `topic`, `await inbox`, `hold`, and the bridge's `deliver`, `outbox`, `link`, `hello`), and instance `LINK` state.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -98,7 +98,7 @@ pub enum FabricFact<'a> {
         reason: Option<&'a str>,
         carried: bool,
     },
-    /// A broadcast opt-in moved (`topic add <t> since=<s>`, `topic drop <t>`; phase 6, 6F-5).
+    /// A broadcast opt-in moved (`topic add <t> since=<s>`, `topic drop <t>`).
     Topic {
         add: bool,
         name: &'a str,
@@ -169,7 +169,7 @@ const DEDUP_CAP: usize = 2 * RING_CAP;
 
 const REASON_MAX: usize = 128;
 
-/// The seven session-timeline record kinds the fabric writes, which are also their wire names on the `events` digest (`EVENT <local> inbox <id> …`).
+/// The seven session-timeline record kinds the fabric writes that the `events` digest carries, under these same wire names (`EVENT <local> inbox <id> …`); the fabric's `hold-advisory` row stays off the digest.
 pub const FABRIC_EVENT_KINDS: &[&str] = &[
     "inbox",
     "inbox-seen",
@@ -437,7 +437,7 @@ pub struct PostRow {
 pub struct Hold {
     /// Pct-encoded reason, or `-`.
     pub reason: String,
-    /// `person` (the person at the window took the tab over: Take Over, [`HoldIssuer::Person`]), `fleet` (a human's halt through the bridge, or a lost bridge) or `local` (the instance Owner's own halt, over the local control socket).
+    /// `person` (the person at the window took the tab over: Take Over, [`HoldIssuer::Person`]), `remote` (another Mac's hold over a drive connection, [`HoldIssuer::Remote`]), `fleet` (a human's halt through the bridge, or a lost bridge) or `local` (the instance Owner's own halt, over the local control socket).
     pub origin: String,
 }
 
@@ -595,7 +595,7 @@ impl Holds {
         }
     }
 
-    /// Every standing hold, the person's first, then a remote node's, then the fleet's.
+    /// Every standing hold, in this order: the person's, a remote node's, the fleet's, then the local one.
     pub fn standing(&self) -> impl Iterator<Item = Hold> + '_ {
         [
             (PERSON_ORIGIN, self.person.as_ref()),
@@ -939,7 +939,7 @@ impl FabricCarry {
     }
 }
 
-/// The fabric a PTY keeper recovery carries (the fabric audit's fourth round).
+/// The fabric a PTY keeper recovery carries.
 #[cfg(unix)]
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct KeeperCarry {
@@ -1324,7 +1324,7 @@ impl SessionFabric {
         self.lock().closed
     }
 
-    /// The delivered rows newer than `after` that `want` asks for, with the cursor to resume from and the oldest id still in the ring.
+    /// The delivered rows newer than `after` that `want` asks for, with the highest id ever delivered here ([`MailSince::high`]) and how many rows above `after` the ring still holds ([`MailSince::present`]).
     pub fn mail_since(&self, after: u64, want: &MailFilter) -> MailSince {
         let inbox = self.lock();
         if after >= inbox.last_msg_id {
@@ -1968,7 +1968,7 @@ impl SessionFabric {
         }
     }
 
-    /// **the room's read** (the resident pet, `kitty_pet` panel #9(e)).
+    /// What the resident pet's room reads: the newest row id when it is unseen (else 0), whether an unseen row is past its `dl=`, and whether a hold stands.
     pub fn room_facts(&self, now_ms: u64) -> (u64, bool, bool) {
         let inbox = self.lock();
         let seen = inbox.seen;
@@ -2043,7 +2043,7 @@ struct BridgeHello {
 enum HelloLog {
     /// No `log=`, or a word this endpoint does not read.
     Off,
-    /// `log=auto` (`[fabric] log = "auto"`, the default).
+    /// `log=auto`: a `[fabric] log = "auto"` bridge (the default) whose last attach did not find the broker retaining; over a retaining broker that bridge says `log=turns`.
     Auto,
     /// `log=turns`: it asks this endpoint to serve `log-take`/`log-landed`.
     Turns,
@@ -2338,7 +2338,7 @@ pub fn fabric_state_seen() -> &'static str {
     fabric_state()
 }
 
-/// The link's three reported facts, as `status` and `fabric status` print them.
+/// The link's three reported facts (reason, rtt, ack age), as `fabric status` prints them; `status` prints the last two ([`fabric_status_tail`]).
 pub fn fabric_link_facts() -> (String, Option<u64>, Option<u64>) {
     let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
     let reason = if link.up || link.reason.is_empty() {
@@ -2500,11 +2500,12 @@ pub fn bridge_refills_broadcasts() -> bool {
         .is_some_and(|h| h.refills_broadcasts)
 }
 
-const HELLO_USAGE: &str = "ERR usage: hello lane=<n> [build=<token>]\n";
+const HELLO_USAGE: &str =
+    "ERR usage: hello lane=<n> [build=<token>] [refill=<lane,...>] [log=auto|turns]\n";
 
 const BUILD_TOKEN_MAX: usize = 64;
 
-/// `hello lane=<n> [build=<token>] [refill=<lanes>]`.
+/// `hello lane=<n> [build=<token>] [refill=<lane,...>] [log=auto|turns]`: answers `OK lane=<n> build=<b>` (` log=turns` when asked), or `OK stale=1 …` to a superseded incarnation.
 pub fn cmd_hello(rest: &str, generation: Option<BridgeGeneration>) -> String {
     let mut lane: Option<u32> = None;
     let mut build: Option<String> = None;
@@ -3129,7 +3130,7 @@ pub fn set_hold_on_bridge_lost(on: bool) {
     LINK.hold_on_loss.store(on, Ordering::Relaxed);
 }
 
-/// Whether a lost bridge halts the sessions it governed ([`set_hold_on_bridge_lost`]; `false` by default since 2026-09-29).
+/// Whether a lost bridge halts the sessions it governed ([`set_hold_on_bridge_lost`]; `false` by default).
 #[cfg(any(unix, test, debug_assertions))]
 pub fn holds_on_bridge_lost() -> bool {
     LINK.hold_on_loss.load(Ordering::Relaxed)
@@ -3154,7 +3155,7 @@ fn advise(ctx: &dyn FabricSession, lost: Hold, generation: BridgeGeneration) -> 
     true
 }
 
-/// Whether a fleet halt refuses `verb` (§5.3).
+/// Whether a standing hold, of any origin, refuses `verb`: whether its input reaches the PTY ([`aterm_types::control_verbs::Input::PTY`]).
 #[must_use]
 pub fn is_pty_reaching(verb: &str) -> bool {
     aterm_types::control_verbs::input_of(verb).contains(aterm_types::control_verbs::Input::PTY)
@@ -3282,6 +3283,10 @@ fn reason_token(raw: &str) -> String {
 }
 
 const HOLD_USAGE: &str = "ERR usage: hold <sid> on|off [reason=<pct>] [origin=fleet|local]\n";
+
+/// The usage a drive connection gets: it holds as its own node and names no `origin=`.
+const HOLD_REMOTE_USAGE: &str = "ERR usage: hold <sid> on|off [reason=<pct>] (a drive connection \
+                                 holds as its own node, so it takes no origin=)\n";
 
 /// The answer to a `hold` that names the person's slot from the wire (`origin=person`).
 pub const HOLD_PERSON_USAGE: &str = "ERR usage: origin=person is the window's own hold \
@@ -3692,14 +3697,19 @@ pub fn cmd_hold_within_waking(
     wake: &dyn Fn(&SessionId),
 ) -> String {
     let store = &store.as_store();
+    let usage = if issuer == HoldIssuer::Remote {
+        HOLD_REMOTE_USAGE
+    } else {
+        HOLD_USAGE
+    };
     let mut toks = rest.split_whitespace();
     let (Some(sid), Some(state)) = (toks.next(), toks.next()) else {
-        return HOLD_USAGE.to_string();
+        return usage.to_string();
     };
     let on = match state {
         "on" => true,
         "off" => false,
-        _ => return HOLD_USAGE.to_string(),
+        _ => return usage.to_string(),
     };
     let mut reason = String::new();
     let mut origin = match issuer {
@@ -3717,14 +3727,14 @@ pub fn cmd_hold_within_waking(
                 return HOLD_PERSON_USAGE.to_string();
             }
             if issuer == HoldIssuer::Remote {
-                return HOLD_USAGE.to_string();
+                return usage.to_string();
             }
             if !matches!(v, "fleet" | "local") {
-                return HOLD_USAGE.to_string();
+                return usage.to_string();
             }
             origin = v.to_string();
         } else {
-            return HOLD_USAGE.to_string();
+            return usage.to_string();
         }
     }
     if issuer == HoldIssuer::Owner && origin != "local" {
@@ -3815,17 +3825,18 @@ pub fn person_hold(ctx: &dyn FabricSession, on: bool, wake: &dyn Fn()) -> Person
     }
 }
 
-const DELIVER_USAGE: &str = "ERR usage: deliver <sid> off=<n> from=<p> kind=<k> trust=<t> \
-                             [re=<n>] [dl=<ms>] [late=1] [demoted=<k>] [via=<p,...>] \
-                             [verdict=<handled|refused|deferred>] [len=<n>] [text=<pct>] \
+const DELIVER_USAGE: &str = "ERR usage: deliver <sid> off=<n> from=<p> kind=<k> [trust=<t>] \
+                             [topic=<t>] [re=<n>] [dl=<ms>] [late=1] [demoted=<k>] \
+                             [via=<p,...>] [verdict=<handled|refused|deferred>] [len=<n>] \
+                             [text=<pct>] \
                              | deliver <sid> landed=<post-id> off=<n> \
                              | deliver <sid> fetched=<off> (err=<token> [floor=<n>] \
-                             | from=<p> kind=<k> trust=<t> [re=<n>] [dl=<ms>] \
+                             | from=<p> kind=<k> [trust=<t>] [re=<n>] [dl=<ms>] \
                              [demoted=<k>] [via=<p,...>] [verdict=<v>] [len=<n>] [at=<n>] \
                              [more=1] [text=<pct>]) \
                              | deliver <sid> receipt=<rid> off=<n|->\n";
 
-/// `deliver` — put one bus record in a session's inbox, or close an outbound post.
+/// `deliver` — put one bus record in a session's inbox, close an outbound post (`landed=`), answer a parked `inbox get @<off>` (`fetched=`), or retire an owed receipt (`receipt=`).
 pub fn cmd_deliver(store: &impl AsStore, rest: &str) -> String {
     cmd_deliver_waking(store, rest, &|_| {})
 }
@@ -4388,7 +4399,7 @@ pub fn cmd_outbox(store: &impl AsStore, rest: &str) -> String {
     format!("OK {}\n{payload}", payload.len())
 }
 
-/// `outbox sent <sid> <post-id> off=<n|->`.
+/// `outbox sent <sid> <post-id> off=<n|-> [dup=1] [reason=<word>]`.
 pub fn cmd_outbox_sent(store: &impl AsStore, rest: &str) -> String {
     cmd_outbox_sent_waking(store, rest, &|_| {})
 }
@@ -4729,7 +4740,7 @@ pub const CARRIED_UNREADABLE: &str = "carried-unreadable";
 #[cfg(unix)]
 pub const REASON_NOT_CARRIED: &str = "not-carried";
 
-/// Every standing hold as the carries write them ([`render_hold`] rows), in [`Holds::standing`]'s order.
+/// Every standing hold except a remote node's (a drive hold is not carried), as the carries write them ([`render_hold`] rows), in [`Holds::standing`]'s order.
 pub fn render_holds(holds: &Holds) -> Vec<String> {
     holds
         .standing()
@@ -5488,11 +5499,11 @@ fn wait_is_futile() -> bool {
     }
 }
 
-/// `await inbox since=<id> [kinds=<k,...>] [topic=<t>] | await inbox re=<off> [since=<id>] [kinds=<k,...>]`.
+/// `await inbox since=<id> [kinds=<k|hold,...>] [topic=<t>] | await inbox re=<off> [since=<id>] [kinds=<k|hold,...>] [topic=<t>]` (the caller strips `timeout=<ms>`).
 pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) -> String {
     const USAGE: &str = "ERR usage: await inbox since=<id> [kinds=<k|hold,...>] [topic=<t>] \
                          [timeout=<ms>] | await inbox re=<off> [since=<id>] [kinds=<k|hold,...>] \
-                         [timeout=<ms>]\n";
+                         [topic=<t>] [timeout=<ms>]\n";
     let mut since: Option<u64> = None;
     let mut re: Option<u64> = None;
     let mut kinds: Option<Vec<String>> = None;

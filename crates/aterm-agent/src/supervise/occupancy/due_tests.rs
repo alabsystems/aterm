@@ -163,3 +163,54 @@ fn each_key_keeps_its_own_clock() {
         "raised stays raised"
     );
 }
+
+/// A READ OF WHAT STANDS TAKES NO LOOK: `standing` names the keys a sample raised, with the guard
+/// holding each now, and raises none itself, so a line past K looks unsampled stays unraised
+/// until a look samples it. CONTROL: the sample at the same instant raises it.
+#[test]
+fn what_stands_is_read_without_a_look() {
+    let mut clock: DueClock<u8> = DueClock::default();
+    clock.observe(&[(1, Some(Guard::Draft))], 0);
+    clock.observe(
+        &[(1, Some(Guard::Draft)), (2, Some(Guard::Memory))],
+        5 * LOOK,
+    );
+    assert_eq!(
+        clock.sample(K_LOOKS, 10 * LOOK).len(),
+        1,
+        "key 1 at look 10"
+    );
+    clock.observe(
+        &[(1, Some(Guard::Person)), (2, Some(Guard::Memory))],
+        15 * LOOK,
+    );
+    let standing = [ReadyIdle {
+        key: 1,
+        guard: Some(Guard::Person),
+        since_ms: 0,
+    }];
+    assert_eq!(clock.standing(), standing, "key 2, past K, unsampled");
+    assert_eq!(clock.standing(), standing, "and a read again moves nothing");
+    assert_eq!(
+        clock
+            .sample(K_LOOKS, 15 * LOOK)
+            .iter()
+            .map(|r| r.key)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+}
+
+/// A CLOCK WITH NO K NEVER RAISES: [`K_NEVER`], what a tape recorded before the loop had a K
+/// clock replays under, raises nothing however long a line stands due, a look late or not.
+#[test]
+fn a_clock_with_no_k_never_raises() {
+    let never = || {
+        let mut clock: DueClock<u8> = DueClock::default();
+        clock.observe(&[(1, Some(Guard::Draft))], 0);
+        clock.observe(&[(1, Some(Guard::Draft))], i64::MAX);
+        clock.sample(K_NEVER, i64::MAX)
+    };
+    assert!(never().is_empty());
+    assert!(fault::with(Fault::LateRaise, never).is_empty());
+}

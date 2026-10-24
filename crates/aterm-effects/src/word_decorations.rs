@@ -3994,10 +3994,6 @@ impl WordDecorations {
         let mut unseen = [(FormId::UNKNOWN, 0u64); PERSIST_CAP];
         let mut winner: [Option<usize>; MAX_OCCURRENCES] = [None; MAX_OCCURRENCES];
         let mut matched = [false; PERSIST_CAP];
-        let mut decisions = std::mem::take(&mut self.align_decisions);
-        if decisions.len() < ALIGN_DECISION_CELLS {
-            decisions.resize(ALIGN_DECISION_CELLS, 0);
-        }
         let mut prev_scores = [AlignScore::default(); MAX_OCCURRENCES + 1];
         let mut curr_scores = [AlignScore::default(); MAX_OCCURRENCES + 1];
         let mut unseen_len = 0usize;
@@ -4009,6 +4005,10 @@ impl WordDecorations {
             }
         }
         unseen[..unseen_len].sort_unstable_by_key(|&(f, _)| f);
+        let mut decisions = std::mem::take(&mut self.align_decisions);
+        if unseen_len > 0 && decisions.len() < ALIGN_DECISION_CELLS {
+            decisions.resize(ALIGN_DECISION_CELLS, 0);
+        }
         for i in 0..pending.len() {
             if done[i] {
                 continue;
@@ -4024,72 +4024,77 @@ impl WordDecorations {
             }
             let group = &group[..group_len];
             self.align_old.clear();
-            let lo = unseen[..unseen_len].partition_point(|&(f, _)| f < form_id);
-            let hi = unseen[lo..unseen_len].partition_point(|&(f, _)| f == form_id) + lo;
-            for &(_, k) in &unseen[lo..hi] {
-                // Order does not matter; `align_old` is sorted below by
-                // `(last_row, last_col, key)`.
-                if let std::collections::hash_map::Entry::Occupied(entry) = self.persist.entry(k)
-                    && entry.get().form_id == form_id
-                    && entry.get().seen_seq != seq
-                {
-                    self.align_old.push((k, entry.remove()));
+            if unseen_len > 0 {
+                let lo = unseen[..unseen_len].partition_point(|&(f, _)| f < form_id);
+                let hi = unseen[lo..unseen_len].partition_point(|&(f, _)| f == form_id) + lo;
+                for &(_, k) in &unseen[lo..hi] {
+                    // Order does not matter; `align_old` is sorted below by
+                    // `(last_row, last_col, key)`.
+                    if let std::collections::hash_map::Entry::Occupied(entry) =
+                        self.persist.entry(k)
+                        && entry.get().form_id == form_id
+                        && entry.get().seen_seq != seq
+                    {
+                        self.align_old.push((k, entry.remove()));
+                    }
                 }
+                self.align_old
+                    .sort_unstable_by_key(|(k, ep)| (ep.last_row, ep.last_col, *k));
             }
-            self.align_old
-                .sort_unstable_by_key(|(k, ep)| (ep.last_row, ep.last_col, *k));
 
             winner[..group_len].fill(None);
-            prev_scores[..=group_len].fill(AlignScore::default());
-            decisions[1..=group_len].fill(2);
-            let same_width = self.have_scanned && self.cols == cols;
-            for oi in 1..=self.align_old.len() {
-                let row_base = oi * (MAX_OCCURRENCES + 1);
-                curr_scores[0] = prev_scores[0];
-                decisions[row_base] = 1;
-                let ep = &self.align_old[oi - 1].1;
-                for gj in 1..=group_len {
-                    let mut best = prev_scores[gj];
-                    let mut decision = 1u8;
-                    if curr_scores[gj - 1].better_than(best) {
-                        best = curr_scores[gj - 1];
-                        decision = 2;
-                    }
-                    let k = group[gj - 1];
-                    let candidate = pending[k];
-                    let occ = &out[usize::from(candidate.occ_idx)];
-                    if let Some((tier, distance)) =
-                        alignment_edge(ep, candidate, occ, same_width, seq, cols)
-                    {
-                        let stationary = ep.last_row == occ.row && ep.last_col == occ.start_col;
-                        let score = prev_scores[gj - 1].with_edge(stationary, tier, distance);
-                        if score.better_than(best) || score == best {
-                            best = score;
-                            decision = 3;
+            if !self.align_old.is_empty() {
+                prev_scores[..=group_len].fill(AlignScore::default());
+                decisions[1..=group_len].fill(2);
+                let same_width = self.have_scanned && self.cols == cols;
+                for oi in 1..=self.align_old.len() {
+                    let row_base = oi * (MAX_OCCURRENCES + 1);
+                    curr_scores[0] = prev_scores[0];
+                    decisions[row_base] = 1;
+                    let ep = &self.align_old[oi - 1].1;
+                    for gj in 1..=group_len {
+                        let mut best = prev_scores[gj];
+                        let mut decision = 1u8;
+                        if curr_scores[gj - 1].better_than(best) {
+                            best = curr_scores[gj - 1];
+                            decision = 2;
                         }
+                        let k = group[gj - 1];
+                        let candidate = pending[k];
+                        let occ = &out[usize::from(candidate.occ_idx)];
+                        if let Some((tier, distance)) =
+                            alignment_edge(ep, candidate, occ, same_width, seq, cols)
+                        {
+                            let stationary = ep.last_row == occ.row && ep.last_col == occ.start_col;
+                            let score = prev_scores[gj - 1].with_edge(stationary, tier, distance);
+                            if score.better_than(best) || score == best {
+                                best = score;
+                                decision = 3;
+                            }
+                        }
+                        curr_scores[gj] = best;
+                        decisions[row_base + gj] = decision;
                     }
-                    curr_scores[gj] = best;
-                    decisions[row_base + gj] = decision;
+                    std::mem::swap(&mut prev_scores, &mut curr_scores);
                 }
-                std::mem::swap(&mut prev_scores, &mut curr_scores);
-            }
-            let mut oi = self.align_old.len();
-            let mut gj = group_len;
-            while oi > 0 || gj > 0 {
-                match decisions[oi * (MAX_OCCURRENCES + 1) + gj] {
-                    1 => oi -= 1,
-                    2 => gj -= 1,
-                    3 => {
-                        winner[gj - 1] = Some(oi - 1);
-                        oi -= 1;
-                        gj -= 1;
+                let mut oi = self.align_old.len();
+                let mut gj = group_len;
+                while oi > 0 || gj > 0 {
+                    match decisions[oi * (MAX_OCCURRENCES + 1) + gj] {
+                        1 => oi -= 1,
+                        2 => gj -= 1,
+                        3 => {
+                            winner[gj - 1] = Some(oi - 1);
+                            oi -= 1;
+                            gj -= 1;
+                        }
+                        _ => break,
                     }
-                    _ => break,
                 }
-            }
-            matched[..self.align_old.len()].fill(false);
-            for &oi in winner[..group_len].iter().flatten() {
-                matched[oi] = true;
+                matched[..self.align_old.len()].fill(false);
+                for &oi in winner[..group_len].iter().flatten() {
+                    matched[oi] = true;
+                }
             }
             let group_class = out[usize::from(pending[group[0]].occ_idx)].class;
             let has_tainted_old = self.align_old.iter().any(|(_, ep)| ep.continuity_tainted);
@@ -6361,12 +6366,15 @@ fn feline_glow_env(t_ms: u64, window_ms: u64, amp: f32) -> f32 {
 
 const PAPER_GLOW_KEEP: f32 = 0.9;
 
-fn paper_glow_scale(fg: u32, lit: u32, bg: u32, amp: f32) -> f32 {
-    let table = crate::color_math::relative_luminance_table();
-    let (lum_fg, lum_bg) = (
-        crate::color_math::relative_luminance_with(table, fg),
-        crate::color_math::relative_luminance_with(table, bg),
-    );
+#[inline]
+fn paper_glow_scale_with(
+    table: &crate::color_math::RelativeLuminanceTable,
+    fg: u32,
+    lit: u32,
+    lum_bg: f32,
+    amp: f32,
+) -> f32 {
+    let lum_fg = crate::color_math::relative_luminance_with(table, fg);
     if lum_bg <= lum_fg || amp <= 0.0 {
         return 1.0;
     }
@@ -6389,6 +6397,13 @@ fn paper_glow_scale(fg: u32, lit: u32, bg: u32, amp: f32) -> f32 {
         }
     }
     lo / amp
+}
+
+#[cfg(test)]
+fn paper_glow_scale(fg: u32, lit: u32, bg: u32, amp: f32) -> f32 {
+    let table = crate::color_math::relative_luminance_table();
+    let lum_bg = crate::color_math::relative_luminance_with(table, bg);
+    paper_glow_scale_with(table, fg, lit, lum_bg, amp)
 }
 
 /// §4.2 specular lobe at gradient position `u` for sweep center `center`:
@@ -6448,7 +6463,8 @@ fn emit_ink(
             let frame_term = frame.wrapping_mul(0x9E37_79B1);
             let cols = &base_cols[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
             let fgs = &base_fg[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
-            let bg = rgb3_to_u32(occ.ink_bg);
+            let table = crate::color_math::relative_luminance_table();
+            let lum_bg = crate::color_math::relative_luminance_with(table, rgb3_to_u32(occ.ink_bg));
             let mut memo: Option<([u8; 3], [u8; 3])> = None;
             for (&col, &fg_rgb) in cols.iter().zip(fgs) {
                 let color = match memo {
@@ -6459,7 +6475,7 @@ fn emit_ink(
                         let v = u32_to_rgb3(mix_rgb(
                             fg,
                             lit,
-                            glow * paper_glow_scale(fg, lit, bg, amp),
+                            glow * paper_glow_scale_with(table, fg, lit, lum_bg, amp),
                         ));
                         memo = Some((fg_rgb, v));
                         v
@@ -6524,11 +6540,12 @@ fn emit_ink(
     } else {
         (0.0, 0.0)
     };
-    let mid_raw = mix_rgb(
-        mix_rgb(c0, c1, 0.5),
-        0x00FF_FFFF,
-        glare * spec_lobe(0.5, center),
-    );
+    let mid_base = mix_rgb(c0, c1, 0.5);
+    let mid_raw = if glare > 0.0 {
+        mix_rgb(mid_base, 0x00FF_FFFF, glare * spec_lobe(0.5, center))
+    } else {
+        mid_base
+    };
     let strength = legible_strength(
         cfg.ink_strength,
         rgb3_to_u32(base_fg[occ.ink_base]),
@@ -6543,9 +6560,13 @@ fn emit_ink(
     for (&col, &fg_rgb) in cols.iter().zip(fgs) {
         let u = f32::from(col.saturating_sub(occ.start_col)) / span;
         let base = mix_rgb(c0, c1, u);
-        let lobe = glare * spec_lobe(u, center);
-        let raw = if lobe > 0.0 {
-            mix_rgb(base, 0x00FF_FFFF, lobe)
+        let raw = if glare > 0.0 {
+            let lobe = glare * spec_lobe(u, center);
+            if lobe > 0.0 {
+                mix_rgb(base, 0x00FF_FFFF, lobe)
+            } else {
+                base
+            }
         } else {
             base
         };
@@ -6609,8 +6630,7 @@ fn emit_rainbow_ink(
     fp: &mut u64,
     active_until: &mut Option<Instant>,
 ) {
-    let bg = rgb3_to_u32(occ.ink_bg);
-    let lum_bg = relative_luminance(bg);
+    let lum_bg = relative_luminance(rgb3_to_u32(occ.ink_bg));
     let (sat, val) = if lum_bg > 0.5 {
         (1.0, 0.62)
     } else {
@@ -6857,11 +6877,17 @@ fn cat_color_context_footprint(
     let mut max_background_band = 0u8;
     let fallback_bg = u32_to_rgb3(default_bg);
     let fallback_band = CatColorKey::background_band(default_bg);
+    let mut last_bg = (fallback_bg, fallback_band);
     'rows: for line in (r0..=r1).map(|row| cells.get(row)) {
         for col in c0..=c1 {
             let cell = line.and_then(|line| line.get(col));
             let (background, band) = match cell {
-                Some(cell) => (cell.bg, CatColorKey::background_band(rgb3_to_u32(cell.bg))),
+                Some(cell) if cell.bg == last_bg.0 => (cell.bg, last_bg.1),
+                Some(cell) => {
+                    let b = CatColorKey::background_band(rgb3_to_u32(cell.bg));
+                    last_bg = (cell.bg, b);
+                    (cell.bg, b)
+                }
                 None => (fallback_bg, fallback_band),
             };
             min_background_band = min_background_band.min(band);

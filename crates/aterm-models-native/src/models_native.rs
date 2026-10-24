@@ -1721,7 +1721,8 @@ pub fn native_settings_singleton_model() -> Model {
     }
 }
 
-/// Native Settings keeps text drafts across navigation, blocks closes, and shows recovery.
+/// Native Settings keeps text drafts across navigation, blocks closes while a draft exists, and
+/// shows recovery.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_settings_draft_close_model() -> Model {
@@ -2967,7 +2968,8 @@ pub fn restore_manifest_single_use_model() -> Model {
     }
 }
 
-/// Atomic close planning model freezing final document sequence until durable acknowledgment.
+/// Atomic close planning freezes the final document sequence and detaches the tree only after a
+/// durable acknowledgement and every leaf's readiness.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_close_plan_model() -> Model {

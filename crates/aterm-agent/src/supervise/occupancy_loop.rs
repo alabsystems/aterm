@@ -7,15 +7,16 @@
 use std::time::{Duration, Instant};
 
 use super::super::config::{Occupancy, SupervisorConfig};
-use super::super::facts::{EpisodeKey, FactKind};
+use super::super::facts::{EpisodeKey, FactKind, SeedOutcome};
 use super::super::memory;
 use super::super::occupancy::door::{self, AtWrite, PaceGrant, StatusSeen, Told};
+use super::super::occupancy::due::DueClock;
 use super::super::occupancy::fault::{Fault, armed};
 use super::super::occupancy::hold::{self, Close, HoldChange, HoldClock, HoldEvent, RowSaid};
 use super::super::occupancy::rules::{self, Books, Guards, HoldSeen, RuleId, Verdict};
 use super::super::occupancy::said;
 use super::super::occupancy::{
-    FactLine, OccupancyReading, OccupancySaid, SaidHold, SaidRule, SaidVerdict,
+    FactLine, OccupancyReading, OccupancySaid, SaidHold, SaidReadyIdle, SaidRule, SaidVerdict,
 };
 use super::super::policy::turn_end::{HostTurn, Reach};
 use super::approvals::Outcome;
@@ -77,11 +78,30 @@ struct DoorWatch {
     /// The open hold's held verdicts booked as `fact-held@v1` rows ([`Session::held_row`]):
     /// each episode by its rule and its ordinal in the hold, with the guard that held it.
     held: Vec<HeldKey>,
+    /// THE K CLOCK (the slice-2 plan's D2): how many looks each due episode of the hold has
+    /// stood untold, on the clock's milliseconds; fed after the decider at each break
+    /// ([`Session::door_k`]) and by the write's outcome ([`Session::door_k_wrote`]), which takes
+    /// the look where a write follows the break, and seeded on a carry from the episode's earliest
+    /// row ([`Session::door_seed`]).
+    k_clock: DueClock<EpisodeKey>,
+    /// The episodes the last break fed the K clock: each with its rule and the guard holding it
+    /// (`None`: its pace, or a write that wrote nothing).
+    k_due: Vec<(RuleId, EpisodeKey, Option<Guard>)>,
+    /// What the K clock last raised: the told word's `ready_idle` while the hold stands.
+    ready_idle: Option<SaidReadyIdle>,
 }
 
 /// A held verdict of the open hold, as [`DoorWatch::held`] keeps it: the rule, the episode's
 /// ordinal in the hold ([`rules::Books::this_hold`]), and the guard that held it.
 type HeldKey = (RuleId, usize, Guard);
+
+/// What a loop before this one booked, as the seed reads it from the ledger, oldest first: its
+/// would-be lines, its held verdicts and its fact rows ([`Session::door_seed`]).
+type Booked<'a> = (
+    &'a [rules::WouldRow],
+    &'a [rules::HeldRow],
+    &'a [(EpisodeKey, i64, SeedOutcome)],
+);
 
 /// A due line under `prompt`, between the decider and the write at the same break.
 #[derive(Debug, Clone)]
@@ -212,7 +232,7 @@ impl<C: Ctl> Session<'_, C> {
         self.hold.door.wall = Some((start_ms, now_ms));
         let would = rules::would_rows_in(body, self.setup.sid.as_deref());
         let held = rules::held_rows_in(body, self.setup.sid.as_deref());
-        let booked = (&would[..], &held[..]);
+        let booked = (&would[..], &held[..], &facts[..]);
         let Some(row) = hold::seed_row_in(body, self.setup.sid.as_deref()) else {
             self.door_seed(booked, start_ms, now_ms, None);
             return;
@@ -247,10 +267,13 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Seed the door's books from the would-be lines and the held verdicts a loop before this one
-    /// booked (`would` and `held`, oldest first), placed on the clock by the loop's start.
+    /// booked (`would` and `held`, oldest first), placed on the clock by the loop's start; and,
+    /// for a carried hold, the K clock from each episode's earliest held verdict or intent row
+    /// (`facts`), so a successor says a line ready-idle when its predecessor would have. A
+    /// would-be line's row seeds nothing: its episode was booked as told.
     fn door_seed(
         &mut self,
-        (would, held): (&[rules::WouldRow], &[rules::HeldRow]),
+        (would, held, facts): Booked<'_>,
         start_ms: i64,
         now_ms: i64,
         carried: Option<(i64, i64)>,
@@ -272,6 +295,23 @@ impl<C: Ctl> Session<'_, C> {
                 continue;
             }
             books.fired(row.rule, start_ms.saturating_sub(ago), this_hold);
+        }
+        let Some((_, since_wall)) = carried else {
+            return;
+        };
+        let on_clock = |row_ms: i64| start_ms.saturating_sub(now_ms.saturating_sub(row_ms));
+        let k = &mut self.hold.door.k_clock;
+        for row in held.iter().filter(|row| this_hold(row.row_ms)) {
+            let key = EpisodeKey {
+                kind: FactKind::Hold,
+                id: rules::episode(row.rule, since_wall, row.ordinal),
+            };
+            k.seed(key, on_clock(row.row_ms));
+        }
+        for &(key, row_ms, outcome) in facts {
+            if key.kind == FactKind::Hold && outcome == SeedOutcome::Intent && this_hold(row_ms) {
+                k.seed(key, on_clock(row_ms));
+            }
         }
     }
 
@@ -409,6 +449,7 @@ impl<C: Ctl> Session<'_, C> {
         let prompt = cfg.occupancy.grant().is_some()
             && !self.fx.replay_lacks_host_door("host.occupancy_pace");
         let ready = rules::ready(&reading, Some(hold), now_ms);
+        self.hold.door.k_due = self.k_due_of(&verdicts, hold);
         for (rule, verdict) in verdicts {
             if prompt && let Verdict::Due(line) = &verdict {
                 self.occupancy_due(screen.seq, rule, line, hold, (now_ms, now));
@@ -416,6 +457,10 @@ impl<C: Ctl> Session<'_, C> {
             }
             self.occupancy_said(screen.seq, rule, verdict, hold, now_ms, review);
         }
+        // A line the write takes at this break is looked at by the write, past its `status`
+        // read (`door_k_wrote`): a person it finds there holds the raise (S15).
+        let look = self.hold.door.due.is_none();
+        self.door_k(now_ms, look);
         self.hold.door.seen = Some((ready, guards, reading));
         let mode = if cfg.occupancy == Occupancy::Prompt && !prompt {
             Occupancy::Observe
@@ -457,6 +502,9 @@ impl<C: Ctl> Session<'_, C> {
             (false, None, OccupancyReading::default()),
             |(ready, guards, reading)| (ready, Some(guards), reading),
         );
+        let ready_idle = door
+            .ready_idle
+            .filter(|_| hold.is_some() && self.fx.slice2_recorded());
         let said = OccupancySaid {
             mode,
             hold,
@@ -465,6 +513,7 @@ impl<C: Ctl> Session<'_, C> {
             rules,
             at_ms,
             reading,
+            ready_idle,
         };
         if door
             .told
@@ -520,15 +569,20 @@ impl<C: Ctl> Session<'_, C> {
         let Some(mut due) = self.hold.door.due.take() else {
             return Ok(false);
         };
-        let (Some(cfg), Some(host)) = (cfg, self.stall_host.clone()) else {
+        let ready = match (cfg, self.stall_host.clone()) {
+            (Some(cfg), Some(host)) if due.seq == screen.seq => {
+                cfg.occupancy.grant().map(|grant| (cfg, host, grant))
+            }
+            _ => None,
+        };
+        let Some((cfg, host, grant)) = ready else {
+            // Nothing written, and the look the break left the write is still the K clock's.
+            self.door_k(due.now_ms, true);
+            if let Some(cfg) = cfg {
+                self.occupancy_tell(cfg.occupancy, self.hold_wall_ms(due.now_ms));
+            }
             return Ok(false);
         };
-        let Some(grant) = cfg.occupancy.grant() else {
-            return Ok(false);
-        };
-        if due.seq != screen.seq {
-            return Ok(false);
-        }
         let key = EpisodeKey {
             kind: FactKind::Hold,
             id: due.episode,
@@ -564,6 +618,7 @@ impl<C: Ctl> Session<'_, C> {
             }
             wrote
         };
+        self.door_k_wrote(&due, wrote);
         self.door_said(&due, wrote, review);
         self.occupancy_tell(cfg.occupancy, self.hold_wall_ms(due.now_ms));
         Ok(wrote == Wrote::Typed)
@@ -748,6 +803,93 @@ impl<C: Ctl> Session<'_, C> {
             due.now_ms.saturating_add(rules::SESSION_PACE_MS),
         ));
         row(self, Told::Skipped(why));
+    }
+
+    /// What the K clock is fed at a break, from the decider's `verdicts` on `hold`: each episode
+    /// a guard holds, its pace holds or that is due, with the guard. A due line keeps the guard the
+    /// door's last write found ([`Self::door_k_wrote`]) until this break's write finds its own: the
+    /// decider does not read what the write's `status` read does (a person's keys). Quiet and spent
+    /// lines are not due.
+    fn k_due_of(
+        &self,
+        verdicts: &[(RuleId, Verdict)],
+        hold: HoldSeen,
+    ) -> Vec<(RuleId, EpisodeKey, Option<Guard>)> {
+        let door = &self.hold.door;
+        let hold_key = self.hold_wall_ms(hold.since_ms);
+        verdicts
+            .iter()
+            .filter_map(|(rule, verdict)| {
+                let key = EpisodeKey {
+                    kind: FactKind::Hold,
+                    id: rules::episode(*rule, hold_key, door.books.this_hold(*rule)),
+                };
+                let guard = match verdict {
+                    Verdict::Held(guard) => Some(*guard),
+                    Verdict::Due(_) => door.k_clock.get(&key).and_then(|due| due.last),
+                    Verdict::Paced { .. } => None,
+                    Verdict::Quiet | Verdict::Spent => return None,
+                };
+                Some((*rule, key, guard))
+            })
+            .collect()
+    }
+
+    /// THE K CLOCK'S LOOK at `now_ms` (the clock's): the episodes [`DoorWatch::k_due`] names fed
+    /// to it, and of those standing the setup's K looks untold (`occupancy_k_looks`), the one due
+    /// longest kept for the told word ([`DoorWatch::ready_idle`]). Where `look` is false (a break
+    /// whose write takes the look) the clock is fed and what stands already read, none raised.
+    fn door_k(&mut self, now_ms: i64, look: bool) {
+        let k = self.setup.occupancy_k_looks;
+        let door = &mut self.hold.door;
+        let due: Vec<(EpisodeKey, Option<Guard>)> = door
+            .k_due
+            .iter()
+            .map(|&(_, key, guard)| (key, guard))
+            .collect();
+        door.k_clock.observe(&due, now_ms);
+        let raised = if look {
+            door.k_clock.sample(k, now_ms)
+        } else {
+            door.k_clock.standing()
+        };
+        let raised = raised
+            .into_iter()
+            .filter_map(|r| {
+                let (rule, _, _) = door.k_due.iter().find(|(_, key, _)| *key == r.key)?;
+                Some((*rule, r))
+            })
+            .min_by_key(|(_, r)| r.since_ms);
+        self.hold.door.ready_idle = raised.map(|(rule, r)| SaidReadyIdle {
+            rule,
+            guard: r.guard,
+            since_ms: self.hold_wall_ms(r.since_ms),
+        });
+    }
+
+    /// The write's outcome on the K clock: a line a guard held at the write is held by that
+    /// guard, one the host's pace held or whose write wrote nothing by none, and a line typed, or
+    /// told by a loop before this one, is no longer due.
+    fn door_k_wrote(&mut self, due: &DueLine, wrote: Wrote) {
+        let key = EpisodeKey {
+            kind: FactKind::Hold,
+            id: due.episode,
+        };
+        let k_due = &mut self.hold.door.k_due;
+        let held = match wrote {
+            Wrote::Held(guard) => Some(guard),
+            Wrote::Paced(_) | Wrote::Skipped(_) => None,
+            Wrote::Typed | Wrote::Told => {
+                k_due.retain(|(_, named, _)| *named != key);
+                return self.door_k(due.now_ms, true);
+            }
+        };
+        for (_, named, guard) in k_due.iter_mut() {
+            if *named == key {
+                *guard = held;
+            }
+        }
+        self.door_k(due.now_ms, true);
     }
 
     /// The write's `OCCUPANCY` line, once a change: `typed`, `skipped why=<word>`,
@@ -1045,6 +1187,7 @@ impl<C: Ctl> Session<'_, C> {
                     at_ms: 0,
                 })
                 .collect(),
+            ready_idle: None,
             ..told.clone()
         })
     }
@@ -1075,6 +1218,7 @@ impl<C: Ctl> Session<'_, C> {
         };
         if let HoldChange::Closed { .. } = change {
             self.facts.state.observe_closed(FactKind::Hold, &[]);
+            self.hold.door.ready_idle = None;
         }
         review.note(&format!("OCCUPANCY seq={seq} {words}"));
         let row = match change {

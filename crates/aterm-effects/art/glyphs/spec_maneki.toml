@@ -1,28 +1,23 @@
 id = "spec_maneki"
 kind = "special"
-# Owner, 2026-08-09: "make it bigger with 50% bigger wings so I can see it more
-# clearly". The "wings" are this cat's ONE distinguishing feature — the raised
-# pink-bean paw — so the paw group (outline path 2, coat path 2, all three pink
-# beans) took a uniform 1.5x about the shoulder at (102, 148), the point where
-# the arm meets the body, so the limb grows outward while staying attached.
+# The raised pink-bean paw is this cat's one distinguishing feature, so it is
+# drawn large: the paw group (outline path 2, coat path 2, all three pink
+# beans) is scaled 1.5x about the shoulder at (102, 148), the point where the
+# arm meets the body, so the limb grows outward while staying attached.
 #
-# THE VIEWBOX GREW WITH IT. Coordinates normalize as `v / extent` and the
-# codegen CLAMPS to the box, so a 1.5x paw reaching x = 160.5 inside the old
-# [150, 170] frame would have been squashed flat against the right edge instead
-# of drawn. 166 clears the paw's true extent with a small margin; the cat's
-# other geometry is untouched, so only the authored ASPECT changes (0.882 ->
-# 0.976 — a wider sprite for a wider cat, which is exactly what a bigger paw
-# is).
+# THE VIEWBOX IS SIZED FOR THE PAW. Coordinates normalize as `v / extent` and
+# the codegen CLAMPS to the box, so a paw reaching past the right edge would be
+# squashed flat against it instead of drawn. 166 clears the paw's extent
+# (x = 160.5) with a small margin, for an authored aspect of 0.976.
 viewbox = [166, 170]
 anchor = { eye_y = 0.36, center_x = 0.5, word_top = 1.0 }
 
 # Lucky Bean: a smiling beckoning cat with one raised pink-bean paw.
 #
-# LAYER ORDER IS PAINT ORDER. `whisker` used to be last, which put the right-
-# hand whisker tips ON TOP of the pink beans; at the enlarged paw size those
-# hairlines bisect the pad instead of grazing it. Whiskers now paint after the
-# face (`mouth`) and BEFORE the paw group, so the pad reads as a solid shape in
-# front of the face — which is what a raised paw physically is.
+# LAYER ORDER IS PAINT ORDER. Whiskers paint after the face (`mouth`) and
+# before the pink beans, so the right-hand whisker tips run under the pad
+# instead of bisecting it, and the pad reads as a solid shape in front of the
+# face, as a raised paw is.
 [[layer]]
 role = "outline"
 ref_fill = "#342B35"

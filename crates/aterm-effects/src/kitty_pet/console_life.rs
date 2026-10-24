@@ -976,7 +976,7 @@ impl PetBrain {
         world.seen_under_text_clearance_past_caret(rect)
     }
 
-    /// WHERE A SLEEPER MAY STRETCH (2026-10-20): the body where the cat lies covers no ink and nothing protected the map sees ([`PetWorld::ink_clearance`], which counts as ink every cell anything protects: the host's chrome, an image, a selection, an overlay, a row it cannot see), so the stretch is drawn in front of blank ground and never under a word.
+    /// WHERE A SLEEPER MAY STRETCH: the body where the cat lies covers no ink and nothing protected the map sees ([`PetWorld::ink_clearance`], which counts as ink every cell anything protects: the host's chrome, an image, a selection, an overlay, a row it cannot see), so the stretch is drawn in front of blank ground and never under a word.
     #[inline]
     pub(super) fn console_stretch_on_blank(&self) -> bool {
         self.console_stretch_on_blank_at((self.col, self.row))

@@ -2966,8 +2966,8 @@ mod tests {
         assert_eq!(fold(&app, now).0, None, "ended: nothing left to arm");
     }
 
-    /// THE DEVELOPER TOOLS HAND-OVER at the park (owner ask 2026-10-15), the
-    /// debugger change's sibling: the window's own hand-over waits for a quiet
+    /// THE DEVELOPER TOOLS HAND-OVER at the park, the debugger change's
+    /// sibling: the window's own hand-over waits for a quiet
     /// moment and arms nothing while no aterm window is focused; the owner's
     /// press opens the page and shows the helper panel through the one lane;
     /// while the panel is up the App folds its turn into the park as
@@ -3067,8 +3067,8 @@ mod tests {
         );
     }
 
-    /// THE DEVELOPER TOOLS CARD'S BUTTON (owner ask 2026-10-15) is the one
-    /// hand-over: its press is recorded on the view, the park performs it
+    /// THE DEVELOPER TOOLS CARD'S BUTTON is the one hand-over: its press is
+    /// recorded on the view, the park performs it
     /// through `App::hand_devtools_to_owner(Origin::Settings)` — the page, and
     /// the helper panel beside it — and what it did lands on the view's bar
     /// with the route in words.
@@ -3445,8 +3445,8 @@ mod tests {
         );
     }
 
-    /// `aterm ctl devtools hand-over [now]` (owner ask 2026-10-15) is the one
-    /// hand-over with `Origin::Ctl`, held to the window's own rules because
+    /// `aterm ctl devtools hand-over [now]` is the one hand-over with
+    /// `Origin::Ctl`, held to the window's own rules because
     /// every in-session client may send it: the bare form never opens the page
     /// as it asks but waits for a quiet moment; `now` (a person at `aterm
     /// doctor`'s terminal) shows only the panel — the asker opens the page —

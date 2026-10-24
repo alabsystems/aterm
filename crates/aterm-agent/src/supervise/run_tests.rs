@@ -209,6 +209,7 @@ struct Mock {
     human_on_top: bool,
     needs_attention: Option<String>,
     needs_calls: Vec<String>,
+    needs_times: Vec<Instant>,
     needs_replies: VecDeque<CtlReply>,
     card_ignores_within: Option<Duration>,
     card_first_served: Option<Instant>,
@@ -775,6 +776,7 @@ impl Mock {
             human_on_top: false,
             needs_attention: None,
             needs_calls: Vec::new(),
+            needs_times: Vec::new(),
             needs_replies: VecDeque::new(),
             card_ignores_within: None,
             card_first_served: None,
@@ -2661,6 +2663,7 @@ impl Mock {
             }
             "meta" if tail.get(2) == Some(&"owner=needs") => {
                 self.needs_calls.push(tail.join(" "));
+                self.needs_times.push(run_now(self.waits.as_deref()));
                 let r = self.needs_replies.pop_front().unwrap_or_else(|| ok("OK\n"));
                 if r.ok() {
                     match tail.first() {

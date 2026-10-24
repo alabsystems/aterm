@@ -1614,7 +1614,7 @@ mod tests {
         assert!(!tiny.field_cols.is_empty());
     }
 
-    /// A SPLIT PANE KEEPS THE TOGGLES on Windows ([`FIND_TOOLBAR`]): at the 55 columns half of a 111-column window gives a pane, the bracketed toggles were dropped for the count (the 2026-10-18 judge).
+    /// A SPLIT PANE KEEPS THE TOGGLES on Windows ([`FIND_TOOLBAR`]): at the 55 columns half of a 111-column window gives a pane, and wider, the toolbar paints the bracketed toggles beside the count and the buttons. The control: the right-edge layout drops them at 55 columns.
     #[test]
     fn the_toolbar_keeps_its_toggles_in_a_split_pane() {
         let v = FindBarView {

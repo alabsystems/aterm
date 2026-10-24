@@ -305,7 +305,7 @@ impl App {
         }
     }
 
-    /// Update the active occupancy mode ([`crate::occupancy_host::set_mode`]) and raise or clear the `prompt` digest entry.
+    /// Update the active occupancy mode ([`crate::occupancy_host::set_mode`]) and raise or clear the `prompt` digest entry; a mode other than `prompt` also ends every tab's `hold` and `ready-idle` entries, which `prompt` alone raises, since a loop under `off` tells no word that would end them.
     pub(crate) fn note_occupancy_mode(&mut self, mode: aterm_agent::supervise::Occupancy) {
         use crate::message_reporters::{occupancy_prompt_entry, occupancy_prompt_key};
         crate::occupancy_host::set_mode(mode);
@@ -313,23 +313,59 @@ impl App {
             self.except(&occupancy_prompt_entry());
         } else {
             self.except_clear(&occupancy_prompt_key());
+            for sid in crate::occupancy_host::told_sids() {
+                self.end_occupancy_lines_of(&sid);
+            }
         }
     }
 
-    /// Record tab `sid`'s occupancy state ([`HostNote::OccupancySaid`]) and raise or clear its `occupancy.hold` entry.
+    /// Record registered tab `sid`'s occupancy state ([`HostNote::OccupancySaid`]) and raise or clear its `occupancy.hold` and `ready-idle` entries: both require the word and the owner's current mode to say `prompt`. Queued words from a retired tab end its entries instead.
     pub(crate) fn note_occupancy_said(
         &mut self,
         sid: &str,
         said: aterm_agent::supervise::occupancy::OccupancySaid,
     ) {
-        use crate::message_reporters::{occupancy_hold_entry, occupancy_hold_key};
-        let spent = said.spent_under_prompt();
+        use crate::message_reporters::{
+            occupancy_hold_entry, occupancy_hold_key, occupancy_ready_idle_entry,
+            occupancy_ready_idle_key,
+        };
+        let registered = self
+            .store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_sid(&aterm_session::SessionId::new(sid))
+            .is_some();
+        if !registered {
+            // The host's note can already be queued when its tab is retired.
+            crate::occupancy_host::told(sid, None);
+            self.end_occupancy_lines_of(sid);
+            return;
+        }
+        let prompt = crate::occupancy_host::prompt_now();
+        let spent = if prompt {
+            said.spent_under_prompt()
+        } else {
+            Vec::new()
+        };
+        let ready_idle = said.ready_idle_under_prompt().filter(|_| prompt);
+        let at_ms = said.at_ms;
         crate::occupancy_host::told(sid, Some(said));
         if spent.is_empty() {
             self.except_clear(&occupancy_hold_key(sid));
         } else {
             self.except(&occupancy_hold_entry(sid, &spent));
         }
+        match ready_idle {
+            Some(idle) => self.except(&occupancy_ready_idle_entry(sid, &idle, at_ms)),
+            None => self.except_clear(&occupancy_ready_idle_key(sid)),
+        }
+    }
+
+    /// Tab `sid` closed, or the owner's mode left `prompt`: its occupancy entries (`hold`, `ready-idle`) end.
+    pub(crate) fn end_occupancy_lines_of(&mut self, sid: &str) {
+        use crate::message_reporters::{occupancy_hold_key, occupancy_ready_idle_key};
+        self.except_clear(&occupancy_hold_key(sid));
+        self.except_clear(&occupancy_ready_idle_key(sid));
     }
 
     /// Replaces the open set for a level-mode `family` with `entries`.

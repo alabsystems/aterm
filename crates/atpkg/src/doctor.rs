@@ -435,7 +435,7 @@ fn trust_chain_finding(build: u64, refusal: &ChainRefusal) -> Finding {
     let quoted = crate::platform::sh_quote_str(&refusal.dir.to_string_lossy());
     let lead = format!("trust build {build}: `targo trust` refuses this toolchain");
     let person = |how: &str| Remedy::Person {
-        pane: String::from("[packages].prefix"),
+        pane: String::from("HOME"),
         how: how.to_owned(),
     };
     let (text, remedy) = match refusal.why {
@@ -451,19 +451,26 @@ fn trust_chain_finding(build: u64, refusal: &ChainRefusal) -> Finding {
             format!(
                 "{lead} — {dir} is group- or world-writable (mode {mode:o}) and root's, not \
                  yours to change, and targo runs no verified check whose compiler or runtime \
-                 libraries sit below a directory another user could change; fix: set \
-                 [packages].prefix, or HOME, under directories only you can write"
+                 libraries sit below a directory another user could change; fix: set HOME \
+                 (or, in a development build, [packages].prefix) under directories only you can \
+                 write"
             ),
-            person("set [packages].prefix, or HOME, under directories only you can write"),
+            person(
+                "set HOME (or, in a development build, [packages].prefix) under directories only \
+                 you can write",
+            ),
         ),
         ChainWhy::Foreign { owner, ours } => (
             format!(
                 "{lead} — {dir} is owned by uid {owner}, neither root nor you (uid {ours}), and \
                  targo runs no verified check whose compiler or runtime libraries sit below a \
-                 directory another user owns; fix: set [packages].prefix under directories \
-                 root or you own"
+                 directory another user owns; fix: keep HOME (or, in a development build, \
+                 [packages].prefix) under directories root or you own"
             ),
-            person("set [packages].prefix under directories root or you own"),
+            person(
+                "keep HOME (or, in a development build, [packages].prefix) under directories \
+                 root or you own",
+            ),
         ),
         ChainWhy::Redirected => (
             format!(
@@ -741,7 +748,7 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
     ("ATERM_NO_HARNESS", "[harness] enabled = false"),
     (
         "ATERM_CPU",
-        "gpu = false (Settings ▸ Performance), or aterm --window --cpu",
+        "gpu = false (Settings ▸ Terminal), or aterm --window --cpu",
     ),
     (
         "ATERM_GPU",
@@ -2106,7 +2113,7 @@ pub(crate) fn read(
         let id = c::of(c::LIVE, &d.program);
         let title = format!("{}'s live build", d.program);
         let want = "one build, recorded current and run";
-        let update = Remedy::Command(String::from("aterm pkg update"));
+        let update = Remedy::Command(format!("aterm pkg update {}", d.program));
         f.push(match &d.reason {
             crate::gc::Diverged::LinkShimMismatch {
                 link_says,
@@ -2139,7 +2146,10 @@ pub(crate) fn read(
                     d.program
                 ),
                 want,
-                update,
+                Remedy::Command(format!(
+                    "aterm pkg repair && aterm pkg update {}",
+                    d.program
+                )),
             )
             .essential(),
             crate::gc::Diverged::NoLiveWitness { shims_say } => Finding::change(
@@ -2154,7 +2164,7 @@ pub(crate) fn read(
                     d.program
                 ),
                 want,
-                Remedy::Command(format!("aterm pkg update {}", d.program)),
+                update,
             ),
         });
     }
@@ -2397,7 +2407,8 @@ pub(crate) fn read(
             Class::Person,
             title,
             format!(
-                "only {} free (a toolchain update needs ~2.5x its artifact size)",
+                "only {} free (an update needs room for its download and unpacked tree, plus \
+                 1 GiB)",
                 crate::cost::human_bytes(free)
             ),
             "5 GiB free",
@@ -2653,8 +2664,8 @@ pub(crate) fn read(
             Class::Person,
             "rustup",
             format!(
-                "rustup at {} did not answer `--version` within {} s (a wedged shim, or a \
-                 toolchain fetch in flight); rustup `trust` is checked below without it",
+                "rustup at {} did not answer `--version` (it failed, or ran past {} s: a wedged \
+                 shim, or a toolchain fetch in flight); rustup `trust` is checked below without it",
                 rustup
                     .as_deref()
                     .map_or_else(String::new, |r| r.display().to_string()),

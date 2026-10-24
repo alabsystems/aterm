@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Read-only `aterm ctl` query handlers (`status`, `survey`, `search`, `metrics`, and screen reads).
+//! `aterm ctl` handlers: the screen reads (`text`, `screen`, `cursor`, `cell`, `line`, `lines`, `offscreen`, `search`), `dims`, `metrics`, `modes`, `custody`, `title`, `cwd`, `colors`, `appstatus` and `messages`, and the writes `mainscreen`, `appnotice`, `notice`, `story`, `devtools` and `metrics reset`.
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -272,7 +272,7 @@ pub(crate) fn screen_text(t: &Terminal) -> String {
     screen
 }
 
-/// `text [trim] [tail=<n>|rows=<a>-<b>]` -> `OK <n>[ trimmed=<k>][ first=<row>]\n` then `<n>` visible rows.
+/// `text [trim] [tail=<n>|rows=<a>-<b>] [order=<logical|display>]` -> `OK <n>[ frame=open][ trimmed=<k>][ first=<row>]\n` then `<n>` visible rows.
 /// Read in a whole frame ([`term_lock_whole`]); one still unfinished at the read's bound is read as it stands, `frame=open` after the count.
 pub(crate) fn cmd_text_opt(
     term: &Arc<Mutex<Terminal>>,
@@ -335,11 +335,15 @@ pub(crate) fn cmd_cell(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     let live = |t: &Terminal| abs.is_none_or(|n| n >= screen_first_abs(t));
     let t = term_lock_whole_when(term, Lane::SERVED, live);
     let out_of_range = || {
-        format!(
-            "ERR out of range: rows 0-{}, cols 0-{}\n",
-            t.rows().saturating_sub(1),
-            t.cols().saturating_sub(1)
-        )
+        let cols = t.cols().saturating_sub(1);
+        if abs.is_some() {
+            format!("ERR out of range: cols 0-{cols}\n")
+        } else {
+            format!(
+                "ERR out of range: rows 0-{}, cols 0-{cols}\n",
+                t.rows().saturating_sub(1)
+            )
+        }
     };
     let at = match abs {
         Some(n) => match t.abs_row_at(n) {
@@ -620,7 +624,7 @@ fn metrics_reply(term: Option<&Arc<Mutex<Terminal>>>, rest: &str, syntax: Syntax
     }
 }
 
-/// `lines` -> `OK <n>\n`.
+/// `lines` -> `OK <n>[ truncated=<k>]\n` (`<k>`: lines the scrollback limit dropped).
 pub(crate) fn cmd_lines(term: &Arc<Mutex<Terminal>>) -> String {
     let t = term_lock(term);
     lines_reply(t.grid().scrollback_lines(), t.scrollback_truncated_lines())
@@ -1375,7 +1379,7 @@ pub(crate) fn cmd_appnotice(proxy: &EventLoopProxy<Wake>, rest: &str) -> String 
     }
 }
 
-/// `messages [<n>] [since=<id>] [tag=<tag>] [sev=<sev>] [live]` -> `OK <count>` and one `message <id> …` row per record.
+/// `messages [<n>] [since=<id>] [tag=<tag>] [sev=<sev>] [need=later] [live]` -> `OK <count>` and one `message <id> …` row per record.
 pub(crate) fn cmd_messages(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let query = match aterm_messages::wire::parse_read_args(rest) {
         Ok(query) => query,
@@ -1388,7 +1392,7 @@ pub(crate) fn cmd_messages(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// `notice <post|progress|done|ask|later|dismiss|act> …` -> one status line.
+/// `notice <post|progress|done|settle|ask|later|dismiss|act> …` -> one status line.
 pub(crate) fn cmd_notice(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let request = match aterm_messages::wire::NoticeRequest::parse(rest) {
         Ok(request) => request,
@@ -1476,7 +1480,7 @@ pub(crate) fn parse_story(rest: &str) -> Result<(crate::presence::StoryVerb, Str
     Ok((verb, text.to_string()))
 }
 
-/// `story chose [<text>]` -> `OK story=<n>`.
+/// `story chose [<text>]` -> `OK story=<n>`; `<text>` is checked ([`parse_story`]), not kept.
 pub(crate) fn cmd_story(
     proxy: &EventLoopProxy<Wake>,
     session: u64,
@@ -1499,7 +1503,7 @@ pub(crate) fn cmd_story(
     }
 }
 
-/// `cwd` -> `OK <working directory>\n`.
+/// `cwd` -> `OK <pct-encoded shell-reported cwd>\n` (empty until the shell reports one).
 pub(crate) fn cmd_cwd(term: &Arc<Mutex<Terminal>>) -> String {
     use crate::cwd_native::ReportedCwd as _;
     let t = term_lock(term);
@@ -1507,7 +1511,7 @@ pub(crate) fn cmd_cwd(term: &Arc<Mutex<Terminal>>) -> String {
     format!("OK {}\n", pct_encode(cwd.as_deref().unwrap_or("")))
 }
 
-/// `text --json` -> `{"rows":["<row0>",...],"cursor":{...},"dims":{...},"seq":N,"gen":"E.S", "human_ms":N|null}`.
+/// `text --json` with no person, launch or input stamps -> `OK 1\n{"rows":[...],"cursor":{...},"dims":{...},"seq":N,"gen":"E.S","human_ms":null,"human_seq":0,"launch":null[,...]}`.
 #[cfg(test)]
 pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> String {
     cmd_text_json_read(
@@ -2217,7 +2221,7 @@ fn write_styled_frame(out: &mut String, snap: &StyledFrameSnapshot, payloads: &[
     out.push_str("]}");
 }
 
-/// The styled frame (`{"seq":N,"dims":{...},"cursor":{...},"rows":[[StyledCell,...],...]}`) gathered and serialized in one call, for the tests.
+/// The styled frame (`{"seq":N,"dims":{...},"cursor":{...},"rows":[[StyledCell,...],...],"line_sizes":[...],"selection":...,"selection_bg":...,"selection_fg":...,"images":[...]}`) gathered and serialized in one call, for the tests.
 #[cfg(test)]
 pub(crate) fn styled_frame_payload(t: &Terminal) -> String {
     serialize_styled_frame(&gather_styled_frame(t))
@@ -2463,7 +2467,7 @@ fn screen_etag(t: &Terminal) -> u64 {
 #[path = "control_screen_etag_tests.rs"]
 mod screen_etag_tests;
 
-/// Serialize the JSON twin of [`serialize_dims`].
+/// Serialize `dims --json`: every field of [`serialize_dims`] but `layer_gravity`, `layer_scale` and `layer_flipped`.
 pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
     let window = snapshot
         .window
@@ -3049,7 +3053,7 @@ mod tests {
         assert_ne!(live[3][0], live[0][0], "the control: the plain row");
         assert_eq!(cmd_cell(&term, "abs=100000 0"), "ERR out of range\n");
         assert_eq!(cmd_cell(&term, "abs=x 0"), "ERR bad args\n");
-        assert!(cmd_cell(&term, "abs=0 12").starts_with("ERR out of range: rows"));
+        assert_eq!(cmd_cell(&term, "abs=0 12"), "ERR out of range: cols 0-11\n");
     }
 
     #[test]

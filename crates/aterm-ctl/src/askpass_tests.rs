@@ -39,6 +39,23 @@ fn an_unknown_reply_never_reaches_the_refusal_diagnostic() {
 }
 
 #[test]
+fn the_server_fixed_refusal_reasons_reach_the_diagnostic() {
+    for reason in [
+        "off",
+        "owner-only",
+        "debugger-as-root",
+        "command-unreadable",
+    ] {
+        let line = format!("ERR askpass refused {reason}");
+        assert_eq!(refusal_reply(line.as_bytes()), line);
+    }
+    assert_eq!(
+        refusal_reply(b"ERR askpass refused the peer is not aterm"),
+        "ERR askpass refused"
+    );
+}
+
+#[test]
 fn sudo_output_is_exactly_one_plain_line_and_empty_writes_nothing() {
     let mut out = Vec::new();
     write_password(&mut out, &Secret::from_bytes(b"public-synthetic")).unwrap();

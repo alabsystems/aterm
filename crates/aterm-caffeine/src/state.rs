@@ -152,8 +152,9 @@ fn parse(text: &str, now: Clocks) -> Option<(Saved, bool)> {
 }
 
 /// How far, in seconds, a file's wall-clock `deadline` may sit from where the wall clock now puts
-/// its end before [`refresh`] saves it again: more than the whole-second readings of the two
-/// clocks wander apart.
+/// its end before [`refresh`] saves it again, and a deadline past its span from where the span
+/// puts it before [`take`] answers its file as one to save back: more than the whole-second
+/// readings of the two clocks wander apart, or of one clock in two processes a moment apart.
 pub const DRIFT_SECS: u64 = 5;
 
 /// Whether `text` holds `mode`, a timed mode of this boot (`boot`), saved before a change of the
@@ -389,9 +390,13 @@ pub fn load(path: &Path, now: Clocks) -> Mode {
 /// every read of it restores it anew: a timed mode on the wall clock alone (a build before `ends`
 /// wrote it), which a read after a change of the date reads as a span longer or shorter than the
 /// mode restored now; or a mode of this boot the restore changed, a deadline more than its span
-/// away (a hand-edited or damaged file), which every read brings in to a full span, or one gone,
-/// which a build before `ends` reads as on again once the date is set back. Saved, either reads
-/// as the mode restored now.
+/// and [`DRIFT_SECS`] away (a hand-edited or damaged file), which every read brings in to a full
+/// span, or one gone, which a build before `ends` reads as on again once the date is set back.
+/// Saved, either reads as the mode restored now. A deadline past its span by no more than
+/// [`DRIFT_SECS`] (a writer's fresh span, read at clocks a moment behind the writer's) is brought
+/// in only in the mode answered, and the file is left as it is: that writer read its clocks
+/// after `now` and posts its notification after its save, so the take that notification brings
+/// reads the span as written.
 #[must_use]
 pub fn take(path: &Path, now: Clocks) -> (Mode, Option<String>) {
     let Some(text) = read_text(path) else {
@@ -401,9 +406,23 @@ pub fn take(path: &Path, now: Clocks) -> (Mode, Option<String>) {
     let boot = crate::instance::boot_id();
     let mode = restore(parsed.map(|(saved, _)| saved), boot, now);
     let resave = parsed.is_some_and(|(saved, wall_only)| {
-        wall_only || (boot.is_some() && saved.boot == boot && saved.mode != mode)
+        wall_only
+            || (boot.is_some()
+                && saved.boot == boot
+                && saved.mode != mode
+                && !brought_in_by_drift(saved.mode, mode))
     });
     (mode, resave.then_some(text))
+}
+
+/// Whether `restored` is the timed mode `saved` brought in to its span by no more than
+/// [`DRIFT_SECS`].
+fn brought_in_by_drift(saved: Mode, restored: Mode) -> bool {
+    matches!(
+        (saved, restored),
+        (Mode::Until { deadline: was, .. }, Mode::Until { deadline, .. })
+            if was.abs_diff(deadline) <= DRIFT_SECS
+    )
 }
 
 /// How many times [`take_saving`] reads the file: each read after the first is of a writer's
@@ -725,7 +744,8 @@ mod tests {
 
     /// A file of this boot whose restore changes its mode is one to save back: a deadline a day
     /// away on a span of an hour comes in to the hour, and one gone is off. Saved, it reads the
-    /// time it had half an hour on, not the full hour each read would restore anew.
+    /// time it had half an hour on, not the full hour each read would restore anew. One past the
+    /// hour by no more than [`DRIFT_SECS`] comes in to it too, and is left as it is.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_restore_that_changes_this_boots_mode_is_saved_back() {
@@ -744,6 +764,8 @@ mod tests {
             (NOW.since_boot + DAY, this, hour, true),
             (NOW.since_boot - 1, this, Mode::Off, true),
             (NOW.since_boot + HOUR, this, hour, false),
+            (NOW.since_boot + HOUR + DRIFT_SECS, this, hour, false),
+            (NOW.since_boot + HOUR + DRIFT_SECS + 1, this, hour, true),
             (NOW.since_boot + DAY, this ^ 1, Mode::Off, false),
         ] {
             let text = file(ends, boot);
@@ -802,6 +824,47 @@ mod tests {
             std::fs::read_to_string(&path).expect("state"),
             earlier(NOW.wall + HOUR - landed)
         );
+    }
+
+    /// A writer's `on 1h` landing before the save-back of an earlier build's 8 hours, on clocks
+    /// up to a few seconds past the take's: the read after it brings the writer's hour in by
+    /// that much in the mode taken, and leaves the writer's file as it is, which a take at the
+    /// writer's clocks reads as its hour. A deadline past the hour by more than [`DRIFT_SECS`]
+    /// is saved in.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_writers_span_taken_at_clocks_behind_its_own_is_left_as_written() {
+        let this = boot_text(crate::instance::boot_id().expect("this boot"));
+        let earlier = format!(
+            "mode=until\ndeadline={}\nspan={}\nboot={this}\n",
+            NOW.wall + HOUR,
+            8 * HOUR
+        );
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("caffeine.state");
+        let hour = Mode::chosen(crate::model::Choice::Hours1, NOW);
+        for lead in [0, 1, 2, DRIFT_SECS, DRIFT_SECS + 1] {
+            std::fs::write(&path, &earlier).expect("an earlier build's file");
+            let writers = NOW + lead;
+            let on = Mode::chosen(crate::model::Choice::Hours1, writers);
+            let (mut landed, mut text) = (0, String::new());
+            let taken = take_saving_with(&path, NOW, |path| {
+                landed += 1;
+                if landed == 1 {
+                    save_at(path, on, writers).expect("the writer's on 1h");
+                    text = std::fs::read_to_string(path).expect("the writer's file");
+                }
+            })
+            .expect("taken");
+            assert_eq!(taken, hour, "{lead}");
+            let after = std::fs::read_to_string(&path).expect("state");
+            if lead <= DRIFT_SECS {
+                assert_eq!(after, text, "{lead}");
+                assert_eq!(load(&path, writers), on, "{lead}");
+            } else {
+                assert_eq!(after, encode(&this_boots(hour), NOW), "{lead}");
+            }
+        }
     }
 
     /// A save takes its directory's hold once its text is flushed and keeps it over its last read

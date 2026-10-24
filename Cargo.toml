@@ -45,7 +45,8 @@ default-members = [
     "crates/aterm-spec-models", "crates/aterm-sysprobe", "crates/aterm-tempfile",
     "crates/aterm-theme-pack", "crates/aterm-time", "crates/aterm-toml", "crates/aterm-toolchain",
     "crates/aterm-tracing", "crates/aterm-tty", "crates/aterm-types", "crates/aterm-uds",
-    "crates/aterm-unicode-width", "crates/aterm-update", "crates/aterm-update-core", "crates/aterm-vitals", "crates/aterm-vz",
+    "crates/aterm-unicode-width", "crates/aterm-update", "crates/aterm-update-core", "crates/aterm-vitals",
+    "crates/aterm-vz", "crates/aterm-vz-agent",
     "crates/aterm-wasm", "crates/aterm-wasm-abi", "crates/aterm-wasm-abi-macros", "crates/aterm-wayland",
     "crates/aterm-win32", "crates/aterm-window",
     "crates/aterm-x11", "crates/aterm-xkb",
@@ -79,7 +80,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.127.0"
+version = "0.128.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -368,7 +369,7 @@ opt-level = 2
 [profile.dev.package.aterm-grid]
 opt-level = 2
 
-# THE SCROLLBACK TIERS AT OPT-LEVEL 2 IN DEV (2026-10-20, gate speed). Cold
+# THE SCROLLBACK TIERS AT OPT-LEVEL 2 IN DEV, for test speed. Cold
 # lines live in LZ4 pages decoded and deserialized on read, and aterm-gui's
 # crash-restore ring test reads a million-line export back through them: 68%
 # of its CPU sat in `Scrollback::get_line` and the cold tier at opt-level 0.

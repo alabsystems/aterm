@@ -28,19 +28,19 @@ aterm init [--plan | --check] [--json] [--develop | --no-develop]
     (when there is a fleet accounts source), and Apple's Command Line Tools
     when missing (base.clt: one sudo password prompt in this terminal).
 
-    Then, at this Mac's console only, this login's settings: Caps Lock as
-    Control; natural scrolling off, trackpad scrolling on; desktop icons shown;
-    widgets hidden (Notification Center's only with Full Disk Access); a Dock of
-    only aterm, System Settings and Safari; Messages and FaceTime signed out
-    (which may need Accessibility and Automation permission for aterm); Rust
-    kept out of Spotlight (rustup's minimal profile, no rust-docs, build caches
-    in .noindex folders). It joins the secrets vault (aterm help secrets): the
-    ALab vault when it answers on this network (asking only its join password),
-    else the one you name. A [github] table in ~/.config/aterm/init.toml keeps
-    its token in the login keychain (unless git's own helpers, such as the
-    secrets vault's, already hand it back), clones the owner's repositories
-    into ~ and fast-forwards each clean checkout that is behind (aterm help
-    init).
+    Then, only when this account is the one logged in at this Mac's console
+    (over SSH too), this login's settings: Caps Lock as Control; natural
+    scrolling off, trackpad scrolling on; desktop icons shown; widgets hidden
+    (Notification Center's only with Full Disk Access); a Dock of only aterm,
+    System Settings and Safari; Messages and FaceTime signed out (which may need
+    Accessibility and Automation permission for aterm); Rust kept out of
+    Spotlight (rustup's minimal profile, no rust-docs, build caches in .noindex
+    folders). It joins the secrets vault (aterm help secrets): the ALab vault
+    when it answers on this network (asking only its join password), else the
+    one you name. A [github] table in ~/.config/aterm/init.toml keeps its token
+    in the login keychain (unless git's own helpers, such as the secrets
+    vault's, already hand it back), clones the owner's repositories into ~ and
+    fast-forwards each clean checkout that is behind (aterm help init).
 
     Last, on a develop machine (one `aterm init --develop` recorded), the
     develop items.
@@ -53,11 +53,11 @@ aterm init [--plan | --check] [--json] [--develop | --no-develop]
               fetched and fast-forwarded when it is clean, on its default
               branch and has no commit of its own (else left as it is, saying
               why; never a reset, stash, push or hook), with its vendor/astream
-              submodule where that loses nothing. In each checkout not left as
-              it is, init then runs the checkout's own `targo --unverified
-              --locked verify provision`. Run inside a checkout to record it (a
-              linked worktree is refused); elsewhere it records the [github]
-              owner's aterm checkouts in ~.
+              submodule where that loses nothing; its submodule.recurse is set
+              true. In each checkout not left as it is, init then runs the
+              checkout's own `targo --unverified --locked verify provision`. Run
+              inside a checkout to record it (a linked worktree is refused);
+              elsewhere it records the [github] owner's aterm checkouts in ~.
     --no-develop  Remove the [develop] table and run base only; the tools stay
               as cache.
     --only    Run only the items named: a base id such as base.clt or

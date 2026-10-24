@@ -25,7 +25,8 @@ pub fn token_preflight(ctx: &Ctx) -> Result<()> {
 
 /// Replace or add release assets on `<staging|public> <repo> <tag>`.
 /// # Errors
-/// Returns a usage, refusal, or unreachable-host error.
+/// A usage error for a missing operand or an unknown owner; a refusal for a file over the
+/// per-asset ceiling or the host's refusal; a could-not-run when the owner cannot be reached.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let [owner, repo, tag, files @ ..] = args else {
         return Err(Error::usage(
@@ -114,7 +115,8 @@ pub enum Uploaded {
 
 /// Upload `files` to the staging release of `repo`'s `tag` after checking public immutability.
 /// # Errors
-/// Returns a refusal if the public release differs or upload fails, or cannot-run if unreachable.
+/// Returns a refusal if the public release differs (or its manifest cannot be fetched) or upload
+/// fails, or cannot-run if unreachable.
 pub fn publish(
     ctx: &Ctx,
     repo: &str,

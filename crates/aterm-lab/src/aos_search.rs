@@ -454,7 +454,8 @@ pub enum Check {
     Build,
     /// `Evaluator::v1` of that build: the pinned policy, its corpus and its baseline.
     Evaluator,
-    /// The policy.
+    /// The policy, build, base, contracts, interpreter, lane model, oracle, corpus, schema,
+    /// profile, grade and assumption lists.
     Identities,
     /// The plan decodes, and the candidate is that plan's code in the bundle's build.
     Plan,

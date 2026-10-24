@@ -46,12 +46,12 @@ pub const USAGE: &str = "
         --no-install        assemble only
         --install-dir DIRECTORY
                             install there instead of /Applications (or
-                            ~/Applications when /Applications is not writable);
-                            only an install in those is told to LaunchServices
+                            ~/Applications when /Applications is not writable),
+                            and tell LaunchServices nothing
         --no-link           leave ~/.local/bin/aterm and amacs as they are; by
-                            default each link there is pointed at this build,
-                            which never updates, and what it displaced is named
-                            (a file that is not a link is left alone)
+                            default each becomes a link to this build (made if
+                            absent), which never updates, and what it displaced
+                            is named (a file that is not a link is left alone)
         --no-pin            omit the ATermDevBuild mark: the updater then tries
                             this install and every update fails
 
@@ -63,7 +63,8 @@ pub const USAGE: &str = "
         --remove            delete that keychain (only one that opens with the
                             empty password); privacy grants made under it are lost
         --keychain FILE     act on FILE instead; it is not put on the search list,
-                            so the signing self-check is skipped
+                            so the signing self-check is skipped unless FILE is
+                            on it already
 ";
 
 /// A parsed `ship dev-app …`.

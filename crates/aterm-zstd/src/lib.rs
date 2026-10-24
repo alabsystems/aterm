@@ -4,7 +4,8 @@
 // `src/decode/` is a modified, decode-only subset of upstream `ruzstd` 0.8.3
 // (https://github.com/KillingSpark/zstd-rs), MIT-licensed; see LICENSE-MIT.
 
-//! First-party Zstandard (RFC 8878) decoder, raw frame writer, and XXH64 checksum.
+//! First-party Zstandard (RFC 8878): a streaming decoder, a streaming encoder, a raw
+//! frame writer, and the XXH64 checksum.
 //!
 //! # Example
 //!
@@ -25,7 +26,9 @@
 #![forbid(unsafe_code)]
 
 mod decode;
+pub mod encode;
 pub mod frame;
 pub mod xxh64;
 
 pub use decode::{DecodeError, Decoder};
+pub use encode::{Encoder, compress};

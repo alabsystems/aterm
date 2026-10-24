@@ -977,7 +977,8 @@ pub fn line_exit_kind(status: i64) -> ExitKind {
     }
 }
 
-/// Return `--session-id <uuid>` from `argv` when `status` is [`FATAL_INPUT_ERROR`] (`42`).
+/// Return `--session-id <uuid>` from `argv` when `status` is [`FATAL_INPUT_ERROR`] (`42`) and
+/// no resume or session-file flag is present.
 #[must_use]
 pub fn restart_id(status: i64, argv: &[String]) -> Option<&str> {
     let names_another = argv

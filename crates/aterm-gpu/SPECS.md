@@ -582,8 +582,8 @@ tests/tray_present_scissor.rs	tray_present_scissors_and_stays_byte_identical_to_
 | test | why | action |
 |---|---|---|
 | src/metal/warm.rs::first_frame_compile_timing | An #[ignore] manual timing harness that prints compile times (its own ignore reason: 'not a correctness test'). It samples no property. | **moved to bench** (`first_frame_compile`) |
-| tests/pipeline_table_guard.rs::the_renderer_spells_no_pipeline_state_of_its_own | A source-text scan of renderer.rs (forbidden substrings, one create_render_pipeline( site). It pins spelling, not behaviour. | **deleted**: `pipeline_table::build_wgpu` builds every wgpu pipeline from its row, and `clippy.toml` refuses any other `create_render_pipeline` |
-| tests/pipeline_table_guard.rs::the_metal_blit_spells_no_pipeline_state_of_its_own | A source-text scan of metal/blit.rs for set_color_attachment, ColorWriteMask:: and BlendFactor::. Same as its sibling. | **deleted**, as its sibling |
+| the_renderer_spells_no_pipeline_state_of_its_own | A source-text scan of renderer.rs (forbidden substrings, one create_render_pipeline( site). It pins spelling, not behaviour. | **deleted** with its file (dc43b674da): `pipeline_table::build_wgpu` builds every wgpu pipeline from its row, and `clippy.toml` refuses any other `create_render_pipeline` |
+| the_metal_blit_spells_no_pipeline_state_of_its_own | A source-text scan of metal/blit.rs for set_color_attachment, ColorWriteMask:: and BlendFactor::. Same as its sibling. | **deleted**, as its sibling |
 
 Counts by action, of the rows left: moved to bench 1, deleted 2.
 

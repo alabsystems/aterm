@@ -3,14 +3,14 @@
 
 //! The decoder: a [`Read`] adapter over a stream of Zstandard frames.
 
-mod bits;
+pub(crate) mod bits;
 mod block;
 mod error;
-mod fse;
-mod header;
-mod huffman;
-mod literals;
-mod sequences;
+pub(crate) mod fse;
+pub(crate) mod header;
+pub(crate) mod huffman;
+pub(crate) mod literals;
+pub(crate) mod sequences;
 mod window;
 
 use std::io::{self, BufRead, BufReader, Read};

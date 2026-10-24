@@ -139,6 +139,10 @@ targo --unverified lab linux <verb> — the Linux runtime lane: a lima VM (vz, U
                            frames and the wgpu-WebGL recording within the CPU tolerance: x86_64 (Rosetta)
                            chrome-headless-shell linux64 on SwiftShader, aarch64 Firefox under Xvfb.
                            Exit 0 pass, 1 a row failed, 3 NOT RUN. Report and frames: $LAB_STATE/linux/
+  vz-agent                 cross-build the vz guest agent (crates/aterm-vz-agent; STOCK EXCEPTION: rustup stable,
+                           static aarch64-unknown-linux-musl, linked by its rust-lld) and place it at
+                           ~/Library/Caches/aterm/vz.noindex/agent/<sha256>/; prints the sha256. NOT RUN without
+                           the musl std (targo --unverified verify provision --linux)
   clean                    remove the guest's build output and trim the VM disk (its blocks go back to this Mac)
   destroy                  delete the VM and its disk (`limactl delete`); the next `up` makes it again
 ";
@@ -162,6 +166,7 @@ pub fn cmd_linux(args: &[String]) -> Res {
         "edges" => crate::linux_proof::cmd_edges(rest),
         "deck" => crate::linux_proof::cmd_deck(rest),
         "browser" => crate::linux_browser::cmd_browser(rest),
+        "vz-agent" => crate::linux_vz::cmd_vz_agent(rest),
         "clean" => cmd_clean(),
         "destroy" => cmd_destroy(),
         "help" | "-h" | "--help" => {

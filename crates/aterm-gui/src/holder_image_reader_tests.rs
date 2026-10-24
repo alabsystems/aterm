@@ -935,3 +935,46 @@ fn the_reader_counts_only_the_feeds_that_move_the_screen() {
     assert_eq!(fed(MUSE_AT_REST), drawn, "nor again");
     assert_eq!(fed(b"x"), drawn + 1, "a byte drawn moved it");
 }
+
+/// THE READER FEEDS THE STUCK ENGINE (system-awareness §19 P2a): every byte it read, a line stamp
+/// only from a read that held a line feed, and the shell's newest block, open from OSC 133 C with
+/// the command typed and closed by D with its status.
+#[test]
+fn the_reader_feeds_the_jobs_engine_its_bytes_lines_and_block() {
+    let shell = 8200;
+    set_image(shell, zsh(shell));
+    let rig = Rig::attach(9330, shell, SHIPPING);
+    let epoch = Instant::now();
+    let feed = || rig.session.ctx.job_feed.at(epoch);
+    let sent = |bytes: &[u8], marker: &str| {
+        u64::try_from(bytes.len() + 1 + marker.len()).expect("a short write")
+    };
+    let typed = [&prompt()[..], b"make\r\n", &signed("133;C")].concat();
+    rig.write(shell, &typed, "<typed>");
+    let running = feed();
+    let block = running.block.clone().expect("the running block");
+    assert_eq!((block.open, block.command.as_str()), (true, "make"));
+    assert!(
+        running.line_output_ms.is_some() && running.output_ms.is_some(),
+        "{running:?}"
+    );
+    assert_eq!(running.output_bytes, sent(&typed, "<typed>"));
+    rig.write(shell, b"\r 50%", "<bar>");
+    let bar = feed();
+    assert_eq!(
+        bar.line_output_ms, running.line_output_ms,
+        "a redraw is no line"
+    );
+    assert!(bar.output_ms >= running.output_ms, "{bar:?}");
+    assert_eq!(
+        bar.output_bytes - running.output_bytes,
+        sent(b"\r 50%", "<bar>")
+    );
+    assert_eq!(bar.block, running.block, "output keeps the block");
+    rig.write(shell, &signed("133;D;2"), "<done>");
+    let ended = feed().block.expect("the ended block");
+    assert_eq!(
+        (ended.id, ended.open, ended.status, ended.started_ms),
+        (block.id, false, Some(2), block.started_ms)
+    );
+}

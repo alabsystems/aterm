@@ -251,13 +251,12 @@ fn flying_kitty(keys: &[u64], at: &[u64]) -> Vec<(u8, bool)> {
     out
 }
 
-/// THE BURST EARNS THE FLYING KITTY (2026-10-22: `flying kitty` and the
-/// owner's `nyan rainbow` showed no kitty in any gallery frame; its head is
-/// earned by the typing momentum held in the cat's band for its dwell, and
-/// every burst the gallery typed ended at 0.19-0.54). `burst`'s own keys at
-/// its pace, and at a slow frame's (each key 80 ms), fed to the cat the
-/// window runs (`CursorCat`, presented every 16 ms): at its `fly` frame (30
-/// ms after key [`BURST_FLY_KEY`]), at `t0` and through `t470` the kitty
+/// THE BURST EARNS THE FLYING KITTY, whose head the typing momentum held in
+/// the cat's band for its dwell earns (a burst that falls short leaves
+/// `flying kitty` and `nyan rainbow` with no kitty in any gallery frame).
+/// `burst`'s own keys at its pace, and at a slow frame's (each key 80 ms), fed
+/// to the cat the window runs (`CursorCat`, presented every 16 ms): at its `fly`
+/// frame (30 ms after key [`BURST_FLY_KEY`]), at `t0` and through `t470` the kitty
 /// flies whole; and of its landing frames (`l…`) at least two catch it
 /// landing (fading out on its exit), none before it has flown. NEGATIVE
 /// CONTROL: the `typing` scenario's line at its 60 ms never earns it: no

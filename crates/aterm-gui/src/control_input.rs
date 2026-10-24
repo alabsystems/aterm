@@ -975,7 +975,7 @@ pub(crate) fn feed_bytes(rest: &str) -> Result<Vec<u8>, &'static str> {
     aterm_codec::hex::decode_vec(hex.as_bytes()).ok_or("ERR bad hex\n")
 }
 
-/// `signal <name> [pid=<n>] [quiet=<s>]` -> deliver a job-control signal to the PTY's foreground process group (`tcgetpgrp` on the master, then `killpg`), whatever the line discipline would generate.
+/// `signal <name> [pid=<n>] [quiet=<s>]` -> deliver a job-control signal to the PTY's foreground process group (`tcgetpgrp` on the master, then `killpg`), or with `pid=` (which must be that group's id) to its leader alone (`kill`), whatever the line discipline would generate.
 #[cfg(unix)]
 pub(crate) fn cmd_signal(
     master: i32,
@@ -1082,7 +1082,7 @@ pub(crate) fn cmd_signal(
     "ERR signal unsupported on this platform\n".to_string()
 }
 
-pub(crate) const MOUSE_USAGE: &str = "ERR usage: mouse <press|release|move|wheelup|wheeldown|wheelleft|wheelright> <left|middle|right|back|forward> <row> <col> [mods=..] [count=N] [side=left|right] [block=0|1] [lines=N]\n";
+pub(crate) const MOUSE_USAGE: &str = "ERR usage: mouse <press|release|move|wheelup|wheeldown|wheelleft|wheelright> <left|middle|right|back|forward> <row> <col> [mods=..] [count=N] [side=left|right] [block=0|1] [lines=N] (move may omit the button)\n";
 
 const MAX_WHEEL_LINES: i32 = crate::input::MAX_WHEEL_BURST;
 
@@ -1583,8 +1583,7 @@ pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerActio
     }
 }
 
-const POINTER_WHEEL_USAGE: &str =
-    "ERR usage: pointer wheel dy=<n> [dx=<n>] [unit=lines|pt] [key=<ui-key>|xy=<x>,<y>]\n";
+const POINTER_WHEEL_USAGE: &str = "ERR usage: pointer wheel [dy=<n>] [dx=<n>] (at least one nonzero) [unit=lines|pt] [key=<ui-key>|xy=<x>,<y>]\n";
 
 const MAX_POINTER_WHEEL: f64 = 10_000.0;
 

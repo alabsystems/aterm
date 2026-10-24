@@ -38,8 +38,9 @@ mod mwm {
     // Motif WM hints are obsolete, but still widely supported.
     // https://stackoverflow.com/a/1909708
     //
-    // LOCAL PATCH (aterm), 2026-10-21 (WC.8): only the decorations hint is written; the
-    // function hints left with `set_enabled_buttons` and `set_resizable` on Linux.
+    // LOCAL PATCH (aterm; docs/AUDIT-third-party-2026-10-15.md, WC.8): only the decorations
+    // hint is set. `set_enabled_buttons` and `set_resizable` are Windows-only, so the function
+    // hints read from a window go back to it unchanged.
     pub const MWM_HINTS_DECORATIONS: u32 = 1 << 1;
 }
 

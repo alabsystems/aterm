@@ -331,14 +331,14 @@ pub struct CursorGlow {
     fire_core_uncooled: bool,
     #[cfg(test)]
     fire_kept_core_from_base: bool,
-    /// Test-only: lay the dark flame kept in its row as round 3 did, one
-    /// crest of the row's field along the whole line with a tongue over
-    /// every letter, the negative control of its tongues in the gaps.
+    /// Test-only: lay the dark flame kept in its row as one crest of the
+    /// row's field along the whole line with a tongue over every letter, the
+    /// negative control of its tongues in the gaps.
     #[cfg(test)]
     fire_kept_crest: bool,
-    /// Test-only: cap the kept flame under a letter's baseline as round 3
-    /// did, its core whole a pixel under the band's top and its field eased
-    /// in over half the band, the negative control of the cap's ease.
+    /// Test-only: cap the kept flame under a letter's baseline hard, its core
+    /// whole a pixel under the band's top and its field eased in over half
+    /// the band, the negative control of the cap's ease.
     #[cfg(test)]
     fire_kept_cap_hard: bool,
     #[cfg(test)]
@@ -756,8 +756,9 @@ impl CursorGlow {
     const FIRE_DARK_AIR_TONGUE_CAP: f32 = 208.0;
     const FIRE_DARK_ROOT: f32 = 0.20;
     /// A tongue in the air feathers in over this share of a cell from its
-    /// root: over a fifth, every tongue's hottest light stood on one hard
-    /// edge, a ruler-straight floor along the run (2026-10-23, `burst`).
+    /// root: over a fifth, every tongue's hottest light would stand on one
+    /// hard edge, a ruler-straight floor along the run (the trail gallery's
+    /// `burst`).
     const FIRE_DARK_AIR_FOOT: f32 = 0.45;
     const FIRE_DARK_SPACING: f32 = 0.85;
     const FIRE_DARK_HALF_W: f32 = 0.70;
@@ -779,35 +780,37 @@ impl CursorGlow {
     const FIRE_DARK_GAP_RISE: f32 = 1.6;
     /// The least a tongue in a gap inside the burning run stands, as a share
     /// of the square root of the head's strength: held to the run's smoothed
-    /// heat alone, a gap three letters back in a cool run stood a candle
-    /// flame a third of the row tall (2026-10-22, the first capture).
+    /// heat alone, a gap three letters back in a cool run would stand a
+    /// candle flame a third of the row tall.
     const FIRE_DARK_GAP_FLOOR: f32 = 0.8;
     const FIRE_DARK_CORE_ROOT_PX: f32 = 5.0;
     const FIRE_DARK_KEPT_CORE_COV: f32 = 255.0;
     const FIRE_DARK_KEPT_CORE_ROOT_PX: f32 = 4.0;
     const FIRE_DARK_CORE_CLEAR_PX: f32 = 1.0;
     /// Under a kept letter's baseline, the pixels over which the flame's
-    /// light eases in from the letter's hold to the air's: over half the
-    /// band (some two pixels) and a core whole a pixel under it, the light
-    /// stepped there in a hot bead line along the line (2026-10-22).
+    /// light eases in from the letter's hold to the air's: eased over half
+    /// the band (some two pixels) with a core whole a pixel under it, the
+    /// light would step there in a hot bead line along the line.
     const FIRE_DARK_CAP_EASE_PX: f32 = 4.0;
     /// How far a tongue's foot curls up at its side, a share of a cell: its
     /// root rounds, so the run stands on its tongues' own feet.
     const FIRE_DARK_FOOT_CURL: f32 = 0.40;
-    /// A core in the air burns in its tongue's lower body, as tall as this
-    /// share of the tongue, a teardrop as wide as this share of its
-    /// tongue's half-width that narrows to a point by this power of its
-    /// rise: at seven tenths and a power of 0.7 every core stood a thin
-    /// olive needle past its flame, the run a row of straight-sided
-    /// columns (2026-10-23, `burst`).
     /// Where the dark caret bloom's rim and heart sit on [`fire_ramp`]:
     /// an ember's orange-red, an orange.
     const FIRE_BLOOM_EMBER: f32 = 0.46;
     const FIRE_BLOOM_HEART: f32 = 0.52;
+    /// A core in the air burns in its tongue's lower body, as tall as this
+    /// share of the tongue, a teardrop as wide as [`Self::FIRE_DARK_AIR_CORE_W`]
+    /// of its tongue's half-width that narrows to a point by the power
+    /// [`Self::FIRE_DARK_AIR_CORE_TAPER`] of its rise: at seven tenths and a
+    /// power of 0.7, as a kept core burns, every core in the air would stand
+    /// a thin olive needle past its flame, the run a row of straight-sided
+    /// columns (the trail gallery's `burst`).
     const FIRE_DARK_AIR_CORE_REACH: f32 = 0.45;
     const FIRE_DARK_AIR_CORE_W: f32 = 0.80;
-    /// Its heart's light: inside its flame, a core at the round-2 190 added
-    /// to the flame's orange burned no yellow.
+    /// Its heart's light: inside its flame, a core at the column control's
+    /// 190 ([`Self::FIRE_DARK_CORE_COV`]) added to the flame's orange burns
+    /// no yellow.
     const FIRE_DARK_AIR_CORE_COV: f32 = 255.0;
     const FIRE_DARK_AIR_CORE_TAPER: f32 = 1.1;
     const FIRE_DARK_AIR_LEAD: f32 = 0.45;

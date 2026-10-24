@@ -64,7 +64,7 @@ pub(crate) struct SessionRow {
 pub(crate) struct AccessCardReport {
     /// `quiet`, `asked`, `opened`, `granted` or `declined`.
     pub(crate) state: &'static str,
-    /// The four unix-second facts the record holds.
+    /// The record: three unix-second stamps and the build that last verified the grant.
     pub(crate) record: crate::consent_card::AccessRecord,
     /// Need events counted in this process.
     pub(crate) needs: u32,
@@ -157,21 +157,23 @@ pub(crate) struct PrivacySnapshot {
     /// §4.1): an Authorization Services right, not a TCC grant, so it joins no
     /// coverage bucket and never feeds `prompt_possible`.
     debugger: DebuggerRow,
-    /// The Developer Tools list (debugger design §9.1): tccd's newest answer
-    /// for this bundle id, read from tccd's own log.
+    /// The Developer Tools row (debugger design §9.1): tccd's newest answer
+    /// for this bundle id from tccd's log, the switch's row in the system
+    /// TCC.db, and the two joined (`grant=`).
     devtools: DevToolsRow,
     /// Per-service folder state, in `folder_names` order, and its source.
     folders: Vec<(&'static str, &'static str)>,
     folder_source: String,
     observer_fda: &'static str,
     observer_responsible: &'static str,
-    /// The `observer log=` token: `off` unless `[privacy] observer` asked.
+    /// The `observer log=` token: `ok` while a log stream runs (the default
+    /// sentinel or `observer = true`), `unavailable` when one was wanted and
+    /// cannot run, `off` otherwise.
     observer_log: &'static str,
     /// Where the Full Disk Access question stands (`access_card` row).
     access_card: AccessCardReport,
-    /// Every bundle on disk claiming this process's `CFBundleIdentifier`
-    /// (`aterm_containment::consent`, "The claimant census") and the answer's
-    /// age.
+    /// Every bundle on disk claiming this process's `CFBundleIdentifier`, and
+    /// the answer's age.
     claimants: Option<(Claimants, Duration)>,
     /// No census answer exists yet — `census=pending`, as opposed to `off`.
     census_pending: bool,
@@ -885,8 +887,9 @@ pub(crate) struct PrivacyAppFacts {
     /// The warm-up's rows, read without draining: a pass the Security panel
     /// has not folded yet must not be consumed.
     warmup_rows: Vec<(Folder, crate::consent_warmup::WarmupRow)>,
-    /// The warm-up's completion stamp (design §3.5), read without draining:
-    /// an unfolded pass is reported on the next read.
+    /// The warm-up's completion stamp
+    /// (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §3.5), read without
+    /// draining: an unfolded pass is reported on the next read.
     warmup_last_ms: Option<u128>,
     /// The `observer log=` token.
     observer_log: &'static str,

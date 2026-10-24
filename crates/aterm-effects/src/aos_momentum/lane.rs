@@ -135,11 +135,11 @@ pub enum Exo {
     Key { tau_bits: u32 },
     /// The glow back to rest.
     Reset,
-    /// From here on.
+    /// From here on, ticks present this.
     Present(Presentation),
 }
 
-/// An absolute.
+/// An absolute, exogenous timeline that nothing in the code under test can move.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Scenario {
     frame_interval_ns: u64,
@@ -153,7 +153,8 @@ pub struct Scenario {
 pub enum ScenarioFault {
     /// A frame interval of zero or past the profile's limit.
     FrameInterval(Duration),
-    /// Admission refuses an input (`index` into the inputs) or, with `None`.
+    /// Admission refuses an input (`index` into the inputs) or, with `None`, the start
+    /// presentation or the end time.
     Refused {
         index: Option<usize>,
         refusal: AdmitRefusal,

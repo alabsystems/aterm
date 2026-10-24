@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `await sys` (§13.8).
+//! `await sys`: the one grammar of the machine and volume waits, the machine wait's evaluation
+//! and its `OK sys` reply.
 
 use crate::jobs::{Class, JobRow, Verdict};
 use crate::model::{SlotsUnread, SlotsView, Snapshot, Throttle};
@@ -9,7 +10,7 @@ use crate::model::{SlotsUnread, SlotsView, Snapshot, Throttle};
 /// The usage line a refused `await sys` answers.
 pub const USAGE: &str = "ERR usage: await sys <predicate> [for=<n>(ms|s|m|h)] [scope=tab|aterm] \
                          [timeout=<ms>]; \
-                         <predicate> := quiet [<term> …] | <term> [and <term> …] \
+                         <predicate> := quiet [[and] <term> …] | <term> [and <term> …] \
                          | <volume> [and <volume>] [vol=<absolute path, percent-encoded>]; \
                          <term> := <metric><op><value> | (job|task)=<id> <verdict>[,…] \
                          | (job|task)=<id> class=<class>[,…] (done is exited), \
@@ -46,12 +47,12 @@ pub enum Metric {
     CpuLevel {
         /// `l<n>`'s index.
         index: Option<usize>,
-        /// The word typed (`l0`, `super`).
+        /// The word typed, lowercased (`l0`, `super`).
         label: String,
     },
     /// aterm's cores-worth.
     Aterm,
-    /// The target tab's cores-worth.
+    /// The target tab's cores-worth (every tab's under `scope=aterm`).
     Tab,
     /// Cores-worth of threads waiting for a core (own processes).
     Wait,
@@ -65,13 +66,14 @@ pub enum Metric {
     Decompress,
     /// Thrashing, `yes`/`no`.
     Thrash,
-    /// The target tab's footprint, bytes.
+    /// The target tab's footprint, bytes (every tab's under `scope=aterm`).
     TabMem,
     /// aterm's footprint, bytes.
     AtermMem,
     /// The thermal level.
     Throttle,
-    /// A count of the target tab's jobs (`jobs.stuck`, `jobs.quiet`, `jobs.running`).
+    /// A count of the target tab's jobs, every tab's under `scope=aterm` (`jobs.stuck`,
+    /// `jobs.quiet`, `jobs.running`).
     Jobs(JobCount),
     /// One job, by its id or its agent task id.
     Job(JobRef),
@@ -1100,7 +1102,7 @@ fn job_read<'a>(
         .map_or(JobRead::Absent, JobRead::Ended)
 }
 
-/// `job=<id> verdict=<v> class=<c> [quiet_ms=] [phi=] [exit=]`, or
+/// `job=<id> verdict=<v> class=<c> [wait=] [quiet_ms=] [phi=] [exit=]`, or
 /// `job=<ref> verdict=warming` before the engine has seen it.
 fn job_words(job: &JobRef, r: Option<&JobRow>) -> String {
     let Some(r) = r else {
@@ -1707,11 +1709,11 @@ mod tests {
         assert!(o.refused.is_none() && !o.holds, "{o:?}");
     }
 
-    /// THE VOLUME WAIT IN THE ONE GRAMMAR (design §3.1; `aterm-gui`'s
-    /// `control_disk` runs it): a size needs its unit, spelled exactly, and
-    /// is whole; `room` and the level words read; one or two terms joined by
-    /// `and`; `vol=` and `timeout=` and none of the machine wait's words
-    /// (`for=`, `scope=`); never mixed with machine terms.
+    /// THE VOLUME WAIT IN THE ONE GRAMMAR (`docs/DESIGN-harness-occupancy-2026-10-20.md`
+    /// §3.1; `aterm-gui`'s `control_disk` runs it): a size needs its unit, spelled exactly,
+    /// and is whole; `room` and the level words read; one or two terms joined by `and`;
+    /// `vol=` and `timeout=` and none of the machine wait's words (`for=`, `scope=`); never
+    /// mixed with machine terms.
     #[test]
     fn the_volume_wait_is_parsed_by_the_one_grammar() {
         let volume = |s: &str| match AwaitSys::parse(s) {

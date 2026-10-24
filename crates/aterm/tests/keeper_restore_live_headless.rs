@@ -142,9 +142,9 @@ fn keeper(root: &Path) -> Proc {
     keeper
 }
 
-/// One headless instance on its own socket in the world, with each debug seam in
-/// `seams` set.
-fn boot(root: &Path, tag: &str, seams: &[&str]) -> (Proc, String) {
+/// One headless instance on its own socket in the world, hearing no system's memory pressure
+/// ([`launch_isolation::SYSTEM_PRESSURE`]), with each debug seam in `seams` set to its value.
+fn boot(root: &Path, tag: &str, seams: &[(&str, &str)]) -> (Proc, String) {
     let sock = root.join(format!("run/aterm/{tag}.sock"));
     let log_path = root.join(format!("{tag}.log"));
     let (out, err) = match std::fs::File::create(&log_path).and_then(|f| Ok((f.try_clone()?, f))) {
@@ -159,8 +159,8 @@ fn boot(root: &Path, tag: &str, seams: &[&str]) -> (Proc, String) {
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
-    for seam in seams {
-        cmd.env(seam, "1");
+    for (seam, value) in seams {
+        cmd.env(seam, value);
     }
     let ledger = ledger_dir(root);
     if let Err(e) = std::fs::create_dir_all(&ledger) {
@@ -333,7 +333,7 @@ fn run_a(root: &Path, ctl: &mut Ctl, seam: bool) -> (Vec<String>, BTreeMap<Strin
 /// A SIGKILLed by its own pid (never `pkill`), then the keeper's word that the session is
 /// an orphan, then B booted in the same world with `seams`: B's recovered session, on a
 /// connection made once B's recovery-count fence has lifted ([`admitted`]).
-fn crash_and_recover(root: &Path, a: Proc, seams: &[&str]) -> (Proc, Ctl) {
+fn crash_and_recover(root: &Path, a: Proc, seams: &[(&str, &str)]) -> (Proc, Ctl) {
     let mut a = a;
     let pid = a.child.id();
     a.child.kill().expect("SIGKILL A");
@@ -416,7 +416,7 @@ fn a_crashed_window_s_session_comes_back_with_its_exact_screen() {
         (Some(KeeperAtLaunch::On), None)
     );
 
-    let (b, mut ctl) = crash_and_recover(&root, a, &[HOLD_KEYFRAMES_SEAM]);
+    let (b, mut ctl) = crash_and_recover(&root, a, &[(HOLD_KEYFRAMES_SEAM, "1")]);
     let b_row = census_row(&root, b.child.id());
     assert_eq!(b_row.keeper, Some(KeeperAtLaunch::On));
     assert_eq!(b_row.prev.pid, Some(a_pid), "B's row follows A's");
@@ -587,7 +587,7 @@ fn a_crashed_window_s_turns_are_still_in_history() {
 fn without_a_journal_the_recovery_comes_back_blank() {
     let world = world("n");
     let root = world.0.clone();
-    let (a, sock) = boot(&root, "a", &[NO_JOURNAL_SEAM]);
+    let (a, sock) = boot(&root, "a", &[(NO_JOURNAL_SEAM, "1")]);
     let a_row = census_row(&root, a.child.id());
     assert_eq!(
         (a_row.keeper, a_row.restores),
@@ -719,4 +719,33 @@ fn a_session_shed_under_memory_pressure_comes_back_with_its_exact_screen() {
         "{rows:?}"
     );
     assert_eq!(fields(&rows[0]).get("carried"), Some(&"1"), "{rows:?}");
+}
+
+/// CONTROL for every test here: an instance on a stand-in system held at critical, the level
+/// an overloaded host reaches ([`launch_isolation::SYSTEM_PRESSURE`] set to `critical` in place
+/// of `none`), is at critical with no test driving it, and its session's history ring is shed
+/// from the start, so a wait for `journal_ring_lag=0` would hang, as the exact-screen and shed
+/// tests do when their instances hear such a system.
+#[test]
+fn an_instance_hearing_a_system_at_critical_sheds_its_ring() {
+    let world = world("h");
+    let root = world.0.clone();
+    let _keeper = keeper(&root);
+    let (_a, sock) = boot(
+        &root,
+        "a",
+        &[(launch_isolation::SYSTEM_PRESSURE, "critical")],
+    );
+    let mut ctl = Ctl::connect(&sock);
+    await_status(&mut ctl, "journal", "live");
+    let mut last = String::new();
+    let heard = aterm_spec::wait::within(HANG, GAP, || {
+        last = ctl.ok("pressure");
+        (fields(&last).get("level") == Some(&"critical")).then_some(())
+    });
+    assert!(
+        heard.is_some(),
+        "the stand-in system never reached the instance: {last}"
+    );
+    await_status(&mut ctl, "journal_ring", "shed");
 }

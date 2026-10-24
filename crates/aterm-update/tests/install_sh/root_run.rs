@@ -784,8 +784,9 @@ fn a_source_build_names_what_it_cannot_change_before_it_starts() {
         format!("( {not_me}; source_build_preflight; echo \"$CARGO_RESOLVE_REASON\" )"),
         &[],
     );
-    // What the walk reads: each folder the build writes in, never the rest; git/
-    // only when Cargo.lock names a git source, or there is no Cargo.lock.
+    // What the walk reads: each folder the build writes in, never the rest (the
+    // folders in cargo's home one level deep); git/ only when Cargo.lock names a
+    // git source, or there is no Cargo.lock.
     let locks = [
         ("no Cargo.lock", "rm -f \"$ROOT/Cargo.lock\"", true),
         (
@@ -806,7 +807,7 @@ fn a_source_build_names_what_it_cannot_change_before_it_starts() {
             lib.call(
                 format!(
                     "( {not_me}; {lock}; rm -f \"$TMPDIR/walked\"; find() {{ if [ \"$2\" = -maxdepth ]; then \
-                     echo \"top $1\"; else echo \"tree $1\"; fi >>\"$TMPDIR/walked\"; command find \"$@\"; }}; \
+                     echo \"depth$3 $1\"; else echo \"tree $1\"; fi >>\"$TMPDIR/walked\"; command find \"$@\"; }}; \
                      source_build_preflight; LC_ALL=C sort \"$TMPDIR/walked\" )"
                 ),
                 &[],
@@ -824,12 +825,8 @@ fn a_source_build_names_what_it_cannot_change_before_it_starts() {
         ),
         &[],
     );
-    let as_root = lib.call(
-        "( id() { if [ \"$1\" = -u ]; then echo 0; else command id \"$@\"; fi; }; source_build_preflight )",
-        &[],
-    );
     let recs = lib.run(&scratch);
-    for i in [clean, elsewhere, linked_elsewhere, as_root] {
+    for i in [clean, elsewhere, linked_elsewhere] {
         assert_eq!(recs[i].rc, 0, "call {i}: {}", recs[i].err);
     }
     assert_eq!(recs[clean].var("CARGO_RESOLVE_REASON"), "");
@@ -857,15 +854,13 @@ fn a_source_build_names_what_it_cannot_change_before_it_starts() {
         "never the link: {reason}"
     );
     for ((label, _, git), i) in locks.iter().zip(walked) {
-        let mut want = vec![
-            format!("top {cargo}"),
-            format!("top {target}"),
-            format!("tree {cargo}/.package-cache"),
-        ];
+        let mut want = vec![format!("depth0 {cargo}"), format!("depth0 {target}")];
         if *git {
-            want.push(format!("tree {cargo}/git"));
+            want.push(format!("depth1 {cargo}/git"));
+            want.push(format!("depth1 {cargo}/git/db"));
         }
-        want.push(format!("tree {cargo}/registry"));
+        want.push(format!("depth1 {cargo}/registry"));
+        want.push(format!("depth1 {cargo}/registry/index"));
         want.push(format!("tree {target}/release"));
         assert_eq!(recs[i].out.lines().collect::<Vec<_>>(), want, "{label}");
     }
@@ -1003,4 +998,684 @@ fn a_root_runs_bundle_gives_its_folders_group_write_alone() {
         "group write is admitted for root's group alone"
     );
     assert_eq!(recs[entries].rc, 0, "{}", recs[entries].err);
+}
+
+/// `theirs <path>...` marks paths as another uid's, everything below them
+/// included (a test cannot give a file away), in `$FOREIGN_LIST`; `find`'s
+/// `! -user <uid>` asks for those alone, and the rest of each walk is find's.
+/// Under `FAKE_ROOT`, a walk of folders all outside its `$SCRATCH` finds
+/// nothing, as its `ls` shows them root's: a walk from the scratch up to `/`
+/// (each `.cargo/` above a checkout) would otherwise judge the host's own
+/// folders, such as a `~/.cargo` a umask of 002 left group-writable.
+const FOREIGN_FIND: &str = r#"theirs() { for p; do printf '%s\n' "$p" >>"$FOREIGN_LIST"; done; }
+theirs_at() {
+	local f
+	while IFS= read -r f; do
+		[ -n "$f" ] || continue
+		case "$1" in "$f" | "$f"/*) return 0 ;; esac
+	done <"$FOREIGN_LIST"
+	return 1
+}
+find() {
+	local -a a=()
+	local f inside=0
+	if [ -n "${SCRATCH:-}" ]; then
+		for f; do
+			case "$f" in -H | -L | -P) continue ;; -* | '(' | '!') break ;; esac
+			case "$f" in "$SCRATCH" | "$SCRATCH"/*) inside=1 ;; esac
+		done
+		[ "$inside" -eq 1 ] || return 0
+	fi
+	while [ $# -gt 0 ]; do
+		if [ "$1" = '!' ] && [ "${2:-}" = -user ]; then
+			a+=('(' -false)
+			while IFS= read -r f; do
+				[ -n "$f" ] && a+=(-o -path "$f" -o -path "$f/*")
+			done <"$FOREIGN_LIST"
+			a+=(')')
+			shift 3
+			continue
+		fi
+		a+=("$1")
+		shift
+	done
+	command find "${a[@]}"
+}"#;
+
+/// Root, over a scratch whose every entry `ls` shows as root's but those
+/// `theirs` marks, uid 424242's, below folders that are plain root ones.
+const FAKE_ROOT: &str = r#"id() { if [ "$1" = -u ]; then echo 0; else command id "$@"; fi; }
+SCRATCH="${TMPDIR%/tmp}"
+chmod 755 "$SCRATCH" "$TMPDIR"
+ls_entry() {
+	local p="${!#}" t=- u=0
+	case "$p" in
+	"$SCRATCH" | "$SCRATCH"/*)
+		theirs_at "$p" && u=424242
+		command ls "$@" | awk -v u="$u" 'NR == 1 { $3 = u } { print }'
+		;;
+	*)
+		if [ -L "$p" ]; then t=l; elif [ -d "$p" ]; then t=d; fi
+		echo "${t}rwxr-xr-x 2 0 0 64 Apr 22 2024 $p"
+		;;
+	esac
+}"#;
+
+/// What a root source build reads, all root's: a checkout with a build in
+/// target/, a `.cargo/config.toml` above it, cargo's home, and a store whose
+/// targo writes the PATH it ran on to `$TMPDIR/build-path` and the git config
+/// variables it was given to `$TMPDIR/build-git`.
+const ROOT_LAYOUT: &str = r#"umask 022
+mk() {
+	W="$TMPDIR/$1"
+	FOREIGN_LIST="$TMPDIR/$1.foreign"
+	: >"$FOREIGN_LIST"
+	mkdir -p "$W/co/src" "$W/co/target/release/deps" "$W/home/.cargo/registry/src/idx" \
+		"$W/home/.cargo/bin" "$W/store/trust/1/bin" "$W/.cargo" "$W/their-bin"
+	printf 'fn main() {}\n' >"$W/co/src/main.rs"
+	: >"$W/co/target/release/deps/libx.rlib"
+	printf '[build]\n' >"$W/.cargo/config.toml"
+	printf '#!/bin/sh\necho "$PATH" >"$TMPDIR/build-path"\necho "${GIT_CONFIG_GLOBAL-unset} ${GIT_CONFIG_NOSYSTEM-unset}" >"$TMPDIR/build-git"\n' \
+		>"$W/store/trust/1/bin/targo"
+	printf '#!/bin/sh\n' >"$W/their-bin/sccache"
+	cp "$W/their-bin/sccache" "$W/their-bin/rustc"
+	chmod -R u=rwX,go=rX "$W" && chmod 755 "$W/store/trust/1/bin/targo" "$W/their-bin/"*
+	theirs "$W/their-bin"
+	ROOT="$W/co" HOME="$W/home" CARGO_LANE=store CARGO_BIN="$W/store/trust/1/bin/targo"
+	unset CARGO_HOME RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
+}"#;
+
+/// What a root build refuses: the path it names, relative to the row's folder
+/// ("" for the folder itself, "/x" for a bare `x`), and whose it says that is.
+type Refusal = Option<(&'static str, &'static str)>;
+
+#[test]
+fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change() {
+    let scratch = Scratch::new();
+    let tmp = scratch.join("tmp");
+    let mut lib = Lib::new();
+    lib.step(format!("{FOREIGN_FIND}\n{FAKE_ROOT}\n{ROOT_LAYOUT}"));
+    // (label, setup, None for a build)
+    let rows: [(&str, &str, Refusal); 21] = [
+        ("root's alone", "", None),
+        (
+            "a file of theirs in the checkout",
+            ": >\"$W/co/src/lib.rs\"; theirs \"$W/co/src/lib.rs\"",
+            Some(("co/src/lib.rs", "checkout")),
+        ),
+        (
+            "what target/ already holds",
+            "theirs \"$W/co/target/release/deps/libx.rlib\"",
+            Some(("co/target/release/deps/libx.rlib", "checkout")),
+        ),
+        (
+            "an ancestor's .cargo/config.toml",
+            "theirs \"$W/.cargo/config.toml\"",
+            Some((".cargo/config.toml", "checkout")),
+        ),
+        (
+            "cargo home's config.toml",
+            "printf '[build]\\nrustc = \"x\"\\n' >\"$W/home/.cargo/config.toml\"; \
+             theirs \"$W/home/.cargo/config.toml\"",
+            Some(("home/.cargo/config.toml", "cargo home")),
+        ),
+        (
+            "a cc in cargo home's bin/",
+            ": >\"$W/home/.cargo/bin/cc\"; theirs \"$W/home/.cargo/bin/cc\"",
+            Some(("home/.cargo/bin/cc", "cargo home")),
+        ),
+        (
+            "a cargo home still to be made in their folder",
+            "HOME=\"$W/their-home\"; mkdir -p \"$HOME\"; theirs \"$HOME\"",
+            Some(("their-home", "cargo home")),
+        ),
+        (
+            "a folder above the checkout its group can write",
+            "chgrp \"$(command id -g)\" \"$W\" && chmod g+w \"$W\"",
+            Some(("", "checkout")),
+        ),
+        (
+            "a sticky folder above it every account can write",
+            "chmod 1777 \"$W\"",
+            Some(("", "checkout")),
+        ),
+        (
+            "a folder in it its group can write",
+            "chgrp \"$(command id -g)\" \"$W/co/src\" && chmod g+w \"$W/co/src\"",
+            Some(("co/src", "checkout")),
+        ),
+        (
+            "a link out of the checkout",
+            "mkdir -p \"$W/elsewhere\" && ln -s \"$W/elsewhere\" \"$W/co/vendor\"",
+            Some(("co/vendor", "checkout")),
+        ),
+        ("a link inside it", "ln -s src \"$W/co/alias\"", None),
+        (
+            "a worktree's common git dir of theirs",
+            "mkdir -p \"$W/repo/.git/worktrees/co\" \"$W/repo/.git/objects\" && \
+             printf 'gitdir: %s\\n' \"$W/repo/.git/worktrees/co\" >\"$W/co/.git\" && \
+             printf '../..\\n' >\"$W/repo/.git/worktrees/co/commondir\" && theirs \"$W/repo/.git/objects\"",
+            Some(("repo/.git/objects", "checkout")),
+        ),
+        (
+            "a rustc wrapper of theirs",
+            "export RUSTC_WRAPPER=\"$W/their-bin/sccache\"",
+            Some(("their-bin/sccache", "toolchain")),
+        ),
+        (
+            "a wrapper's bare name only their folder on PATH holds",
+            "export PATH=\"$W/their-bin:$PATH\" RUSTC_WRAPPER=sccache",
+            Some(("/sccache", "toolchain")),
+        ),
+        (
+            "a wrapper of root's",
+            "export RUSTC_WORKSPACE_WRAPPER=\"$W/store/trust/1/bin/targo\"",
+            None,
+        ),
+        (
+            "RUSTC of theirs on rustup's lane",
+            "CARGO_LANE=rustup; export RUSTC=\"$W/their-bin/rustc\"",
+            Some(("their-bin/rustc", "toolchain")),
+        ),
+        (
+            "RUSTC of theirs on the store lane, which scrubs it",
+            "export RUSTC=\"$W/their-bin/rustc\"",
+            None,
+        ),
+        (
+            "a program of theirs beside the lane's cargo",
+            "printf '#!/bin/sh\\n' >\"$W/store/trust/1/bin/cc\"; chmod 755 \"$W/store/trust/1/bin/cc\"; \
+             theirs \"$W/store/trust/1/bin/cc\"",
+            Some(("store/trust/1/bin", "toolchain")),
+        ),
+        (
+            "root's own wrapper by a bare name, in cargo home's bin/ on rustup's lane",
+            "CARGO_LANE=rustup; printf '#!/bin/sh\\n' >\"$W/home/.cargo/bin/sccache\"; \
+             chmod 755 \"$W/home/.cargo/bin/sccache\"; export RUSTC_WRAPPER=sccache",
+            None,
+        ),
+        (
+            "root's own wrapper by a bare name, beside the store's targo",
+            "printf '#!/bin/sh\\n' >\"$W/store/trust/1/bin/sccache\"; \
+             chmod 755 \"$W/store/trust/1/bin/sccache\"; export RUSTC_WRAPPER=sccache",
+            None,
+        ),
+    ];
+    let calls: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(n, (_, setup, _))| {
+            lib.call(
+                format!(
+                    "( mk row{n}; {setup}\n source_build_preflight; rc=$?; \
+                     echo \"${{CARGO_RESOLVE_REASON:-}}\"; exit $rc )"
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let built = lib.call(
+        format!(
+            "( mk build; PATH=\"$W/their-bin:{}\"; cargo_build_pinned \"$ROOT\" && cat \"$TMPDIR/build-path\" )",
+            system_path()
+        ),
+        &[],
+    );
+    let git = "cat \"$TMPDIR/build-git\"";
+    let built_git = lib.call(git, &[]);
+    let account_git = lib.call(
+        format!("( unset -f id; mk account; cargo_build_pinned \"$ROOT\" && {git} )"),
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    for (n, ((label, _, want), i)) in rows.iter().zip(calls).enumerate() {
+        let rec = &recs[i];
+        let reason = rec.out.trim_end();
+        let Some((rel, whose)) = want else {
+            assert_eq!(rec.rc, 0, "{label}: {reason}{}", rec.err);
+            continue;
+        };
+        assert_eq!(rec.rc, 1, "{label}: root builds it: {}", rec.err);
+        let row = tmp.join(format!("row{n}"));
+        let named = match *rel {
+            "" => s(&row).to_string(),
+            bare if bare.starts_with('/') => bare[1..].to_string(),
+            rel => s(&row.join(rel)).to_string(),
+        };
+        assert!(
+            reason.contains(&format!("and {named} ")) || reason.contains(&format!("and {named},")),
+            "{label}: names {named}: {reason}"
+        );
+        assert!(
+            reason.contains(&format!("whose {whose} it is")),
+            "{label}: {reason}"
+        );
+    }
+    assert_eq!(recs[built].rc, 0, "{}", recs[built].err);
+    assert_eq!(
+        recs[built].out.trim_end(),
+        format!(
+            "{}:{}",
+            s(&tmp.join("build/store/trust/1/bin")),
+            system_path()
+        ),
+        "root's build runs on PATH's root folders alone"
+    );
+    assert_eq!(
+        recs[built_git].out, "/dev/null 1",
+        "root's build reads no git config of HOME's or the system's"
+    );
+    assert_eq!(recs[account_git].rc, 0, "{}", recs[account_git].err);
+    assert_eq!(
+        recs[account_git].out, "unset unset",
+        "the account's build reads its own"
+    );
+}
+
+#[test]
+fn under_root_git_over_the_checkout_is_roots_and_reads_no_config_of_homes() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(format!(
+        "{FOREIGN_FIND}\n{FAKE_ROOT}\n{ROOT_LAYOUT}\n\
+         mk git; mkdir -p \"$W/root-bin\" && for b in their-bin root-bin; do \
+         printf '#!/bin/sh\\necho \"%s ${{GIT_CONFIG_GLOBAL-unset}} ${{GIT_CONFIG_NOSYSTEM-unset}} $*\"\\n' \"$b\" \
+         >\"$W/$b/git\" && chmod 755 \"$W/$b/git\"; done; export PATH=\"$W/their-bin:$W/root-bin:{}\"",
+        system_path()
+    ));
+    let as_root = lib.call("checkout_git -C \"$ROOT\" rev-parse HEAD", &["ROOT"]);
+    let as_account = lib.call(
+        "( unset -f id; checkout_git -C \"$ROOT\" rev-parse HEAD )",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    let root = recs[as_root].var("ROOT");
+    assert_eq!(recs[as_root].rc, 0, "{}", recs[as_root].err);
+    assert_eq!(
+        recs[as_root].out,
+        format!("root-bin /dev/null 1 -C {root} rev-parse HEAD"),
+        "root runs the git in its own folder, reading no git config of HOME's or the system's"
+    );
+    assert_eq!(recs[as_account].rc, 0, "{}", recs[as_account].err);
+    assert_eq!(
+        recs[as_account].out,
+        format!("their-bin unset unset -C {root} rev-parse HEAD"),
+        "the account runs PATH's"
+    );
+}
+
+#[test]
+fn a_source_build_asks_only_the_folders_new_downloads_land_in() {
+    let scratch = Scratch::new();
+    let tmp = scratch.join("tmp");
+    let mut lib = Lib::new();
+    lib.step(format!(
+        "{FOREIGN_FIND}\numask 022\n\
+         mk() {{ W=\"$TMPDIR/$1\"; FOREIGN_LIST=\"$TMPDIR/$1.foreign\"; : >\"$FOREIGN_LIST\"; \
+         ROOT=\"$W/co\" CARGO_HOME=\"$W/cargo\"; c=\"$W/cargo\"; \
+         mkdir -p \"$ROOT/target/release\" \"$c/registry/src/idx/cfg-if-1.0.0/src\" \"$c/registry/cache/idx\" \
+         \"$c/registry/index/idx/.cache/cf\" \"$c/git/checkouts/x-1/abc/src\" \"$c/git/db/x-1\" && \
+         : >\"$c/registry/src/idx/cfg-if-1.0.0/src/lib.rs\" && : >\"$c/registry/cache/idx/cfg-if-1.0.0.crate\" && \
+         : >\"$c/registry/index/idx/.cache/cf/cfg-if\" && : >\"$c/.package-cache\" && \
+         : >\"$c/.package-cache-mutate\" && : >\"$c/.global-cache\" && \
+         printf 'source = \"git+https://example.invalid/x#0\"\\n' >\"$ROOT/Cargo.lock\"; }}"
+    ));
+    let user = lib.call("id -un", &[]);
+    let rows: [(&str, &str, bool); 7] = [
+        (
+            "crate, index and lock files of root's",
+            "theirs \"$c/registry/src/idx/cfg-if-1.0.0/src/lib.rs\" \"$c/registry/cache/idx/cfg-if-1.0.0.crate\" \
+             \"$c/registry/index/idx/.cache\" \"$c/.package-cache\" \"$c/.package-cache-mutate\" \"$c/.global-cache\"",
+            true,
+        ),
+        (
+            "an extracted crate's folder",
+            "theirs \"$c/registry/src/idx/cfg-if-1.0.0\"",
+            true,
+        ),
+        (
+            "a per-index folder of root's",
+            "theirs \"$c/registry/src/idx\"",
+            false,
+        ),
+        ("registry/index", "theirs \"$c/registry/index\"", false),
+        (
+            "a git checkout's folder",
+            "theirs \"$c/git/checkouts/x-1\"",
+            false,
+        ),
+        (
+            "a folder deep in a git checkout",
+            "theirs \"$c/git/checkouts/x-1/abc/src\"",
+            true,
+        ),
+        (
+            "a git checkout's folder, with no git source in the lock",
+            "printf 'source = \"registry+https://example.invalid/index\"\\n' >\"$ROOT/Cargo.lock\"; \
+             theirs \"$c/git/checkouts/x-1\"",
+            true,
+        ),
+    ];
+    let calls: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(n, (_, setup, _))| {
+            lib.call(
+                format!(
+                    "( mk row{n}; {setup}; source_build_preflight; rc=$?; \
+                     echo \"${{CARGO_RESOLVE_REASON:-}}\"; exit $rc )"
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    let user = recs[user].out.trim();
+    for (n, ((label, _, builds), i)) in rows.iter().zip(calls).enumerate() {
+        let rec = &recs[i];
+        if *builds {
+            assert_eq!(rec.rc, 0, "{label}: {}", rec.out);
+            continue;
+        }
+        assert_eq!(rec.rc, 1, "{label}: {}", rec.err);
+        let cargo = tmp.join(format!("row{n}/cargo"));
+        assert!(
+            rec.out
+                .contains(&format!("sudo chown -R {user} {}", s(&cargo))),
+            "{label}: {}",
+            rec.out
+        );
+    }
+}
+
+#[test]
+fn under_root_an_aterm_root_does_not_ask_is_the_one_the_refusal_names() {
+    let scratch = Scratch::new();
+    let tmp = scratch.join("tmp");
+    let mut lib = Lib::new();
+    lib.step(format!(
+        "{FOREIGN_FIND}\numask 022; FOREIGN_LIST=\"$TMPDIR/foreign\"; : >\"$FOREIGN_LIST\"\n\
+         t=\"$TMPDIR/theirs\"; mkdir -p \"$TMPDIR/co\" \"$t/bin\" \"$t/pkg/store/trust/7/bin\" && \
+         printf '[toolchain]\\nchannel = \"trust\"\\n' >\"$TMPDIR/co/rust-toolchain.toml\" && \
+         printf '#!/bin/sh\\necho \"aterm $*\" >>\"$TMPDIR/ran\"\\necho \"targo → %s/targo — managed 7 — pinned by index 1\"\\n' \
+         \"$t/pkg/store/trust/7/bin\" >\"$t/bin/aterm\" && \
+         printf '#!/bin/sh\\necho \"targo $*\" >>\"$TMPDIR/ran\"\\n' >\"$t/pkg/store/trust/7/bin/targo\" && \
+         chmod 755 \"$t/bin/aterm\" \"$t/pkg/store/trust/7/bin/targo\" && theirs \"$t\"\n\
+         export PATH=\"$t/bin:{}\"; unset CARGO_HOME",
+        system_path()
+    ));
+    let vars = ["CARGO_LANE", "CARGO_RESOLVE_REASON"];
+    let as_account = lib.call("find_cargo_and_rustup \"$TMPDIR/co\"", &vars);
+    let ran = lib.call("cat \"$TMPDIR/ran\" && rm \"$TMPDIR/ran\"", &[]);
+    lib.step(FAKE_ROOT);
+    let as_root = lib.call("find_cargo_and_rustup \"$TMPDIR/co\"", &vars);
+    let remedy = lib.call("gate_trust_remedy", &[]);
+    let ran_as_root = lib.call("[ ! -e \"$TMPDIR/ran\" ]", &[]);
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[as_account].rc, 0, "{}", recs[as_account].var(vars[1]));
+    assert_eq!(recs[as_account].var(vars[0]), "store");
+    assert_eq!(recs[ran].out, "aterm pkg which targo");
+    let rec = &recs[as_root];
+    let reason = rec.var(vars[1]);
+    assert_eq!(rec.rc, 1, "{reason}");
+    let aterm = s(&tmp.join("theirs/bin/aterm")).to_string();
+    assert!(
+        reason.contains(&format!("and {aterm} is one")) && reason.contains("whose toolchain it is"),
+        "{reason}"
+    );
+    for said in [reason, recs[remedy].out.as_str()] {
+        assert!(!said.contains("aterm pkg install trust"), "{said}");
+    }
+    assert_eq!(
+        recs[ran_as_root].rc,
+        0,
+        "root ran {}",
+        read(&tmp.join("ran"))
+    );
+}
+
+/// Under root, the copy goes into a folder made inside the staging folder once
+/// that one is root's, 0700, empty and (on macOS) stripped of the ACL an
+/// inheritable entry on DEST gave it. A staging folder an account entered
+/// (an entry named with a newline), opened (mode 0777) or took (another
+/// uid's) fails the staging, and nothing is left in DEST.
+#[test]
+fn a_root_run_copies_the_app_where_only_root_can_reach_it() {
+    let scratch = Scratch::new();
+    let tmp = scratch.join("tmp");
+    let mut lib = Lib::new();
+    lib.step(
+        "id() { if [ \"$1\" = -u ]; then echo 0; else command id \"$@\"; fi; }\n\
+         log() { printf '%s\\n' \"$*\" >>\"$TMPDIR/log\"; }\n\
+         ls_entry() { command ls \"$@\" | awk -v u=\"${STAGE_UID:-0}\" 'NR == 1 && NF >= 9 { $3 = u } { print }'; }\n\
+         ditto() {\n\
+         \tlog \"ditto $2\"\n\
+         \tlog \"into: $(command ls -nd \"${2%/*}\" | awk '{print $1}')\"\n\
+         \tfor e in \"$DEST\"/* \"$DEST\"/.[!.]*; do\n\
+         \t\t[ -e \"$e\" ] && log \"in dest: $(command ls -nd \"$e\" | awk '{print $1}') ${e##*/}\"\n\
+         \tdone\n\
+         \tmkdir -p \"$2/Contents/MacOS\" && : >\"$2/Contents/MacOS/aterm\" && [ -z \"${DITTO_FAILS:-}\" ]\n\
+         }\n\
+         chown() { log \"chown $*\"; [ -z \"${CHOWN_FAILS:-}\" ]; }\n\
+         mv() { log \"mv $*\"; command mv \"$@\"; }\n\
+         mktemp() {\n\
+         \tlocal d\n\
+         \td=\"$(command mktemp \"$@\")\" || return\n\
+         \t[ -z \"${ENTERED:-}\" ] || mkdir \"$d\"/$'\\n'\n\
+         \t[ -z \"${OPENED:-}\" ] || command chmod 777 \"$d\"\n\
+         \tprintf '%s\\n' \"$d\"\n\
+         }\n\
+         mkdir -p \"$TMPDIR/ok\" \"$TMPDIR/copy-fails\" \"$TMPDIR/chown-fails\" \"$TMPDIR/entered\" \\\n\
+         \t\"$TMPDIR/opened\" \"$TMPDIR/taken\"\n\
+         [ \"$(uname -s)\" != Darwin ] || /bin/chmod +a \"user:nobody allow list,search,add_file,add_subdirectory,file_inherit,directory_inherit\" \"$TMPDIR/ok\"",
+    );
+    let staged = lib.call(
+        "DEST=\"$TMPDIR/ok\"; stage_bundle /nonexistent/aterm.app \"$DEST\" && swap_staged_bundle \"$DEST\" && \
+         ls -A \"$DEST\"",
+        &["STAGE", "STAGE_DIR"],
+    );
+    let log = lib.call("cat \"$TMPDIR/log\" && rm \"$TMPDIR/log\"", &[]);
+    let failed = |name: &str, set: &str| {
+        format!(
+            "DEST=\"$TMPDIR/{name}\"; {set} stage_bundle /nonexistent/aterm.app \"$DEST\"; rc=$?; drop_stage; \
+             ls -A \"$DEST\"; [ \"$rc\" -ne 0 ]"
+        )
+    };
+    let copy_fails = lib.call(failed("copy-fails", "DITTO_FAILS=1"), &[]);
+    let chown_fails = lib.call(failed("chown-fails", "CHOWN_FAILS=1"), &[]);
+    let entered = lib.call(failed("entered", "ENTERED=1"), &[]);
+    let opened = lib.call(failed("opened", "OPENED=1"), &[]);
+    let taken = lib.call(failed("taken", "STAGE_UID=424242"), &[]);
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[staged].rc, 0, "{}", recs[staged].err);
+    assert_eq!(
+        recs[staged].out, "aterm.app",
+        "the staging folder went with the swap"
+    );
+    assert_eq!(
+        [recs[staged].var("STAGE"), recs[staged].var("STAGE_DIR")],
+        ["", ""]
+    );
+    let log: Vec<&str> = recs[log].out.lines().collect();
+    let dest = s(&tmp.join("ok")).to_string();
+    let copied = log
+        .first()
+        .and_then(|l| l.strip_prefix("ditto "))
+        .unwrap_or_else(|| panic!("{log:?}"));
+    let (name, copy) = copied
+        .strip_suffix("/aterm.app")
+        .and_then(|folder| folder.strip_prefix(&format!("{dest}/")))
+        .and_then(|rel| rel.split_once('/'))
+        .unwrap_or_else(|| panic!("ditto copies into a folder of a folder in {dest}: {log:?}"));
+    assert!(name.starts_with("aterm.app.installing."), "{log:?}");
+    assert!(copy.starts_with("copy.") && !copy.contains('/'), "{log:?}");
+    assert_eq!(
+        log.get(1..),
+        Some(
+            &[
+                "into: drwx------",
+                format!("in dest: drwx------ {name}").as_str(),
+                format!("chown -R 0:{} {copied}", gid(&tmp.join("ok"))).as_str(),
+                format!("mv {copied} {dest}/aterm.app").as_str(),
+            ][..]
+        ),
+        "while ditto copies, {dest} holds the root-only folder alone, it and the folder the copy \
+         goes in with no ACL its inheritable entry would give them, and the copy is root's before \
+         it leaves it"
+    );
+    for i in [copy_fails, chown_fails, entered, opened, taken] {
+        assert_eq!(recs[i].rc, 0, "a failed staging says so: {}", recs[i].err);
+        assert_eq!(recs[i].out, "", "drop_stage leaves nothing behind");
+    }
+}
+
+#[test]
+fn an_interrupted_root_run_leaves_no_staging_folder_behind() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(
+        "umask 022; id() { if [ \"$1\" = -u ]; then echo 0; else command id \"$@\"; fi; }\n\
+         ls_entry() { command ls \"$@\" | awk 'NR == 1 && NF >= 9 { $3 = 0 } { print }'; }\n\
+         ditto() { mkdir -p \"$2/Contents/MacOS\" && : >\"$2/Contents/MacOS/aterm\"; }\n\
+         chown() { :; }\n\
+         CONTAINER_KIND=zip\n\
+         staged() { DEST=\"$TMPDIR/$1\"; TMP=\"$TMPDIR/$1.tmp\"; MNT=\"$TMP/mnt\"; OLD=\"\"; \
+         mkdir -p \"$DEST\" \"$MNT/aterm.app\" && stage_bundle \"$MNT/aterm.app\" \"$DEST\" && ls -A \"$DEST\"; }",
+    );
+    // Interrupted after the copy, before the swap; and after the swap set the
+    // installed bundle aside, before it renamed the copy in.
+    let before_swap = lib.call(
+        "staged before && echo -- && ( install_app_cleanup ); ls -A \"$DEST\"; [ ! -e \"$TMP\" ]",
+        &[],
+    );
+    let mid_swap = lib.call(
+        "mkdir -p \"$TMPDIR/mid/aterm.app\" && : >\"$TMPDIR/mid/aterm.app/installed\" && staged mid && \
+         OLD=\"$DEST/.aterm.app.old.x\" && mv \"$DEST/aterm.app\" \"$OLD\" && echo -- && \
+         ( install_app_cleanup ); ls -A \"$DEST\"; echo +; ls -A \"$DEST/aterm.app\"",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    for (label, i, kept) in [
+        ("before the swap", before_swap, &[][..]),
+        ("mid-swap", mid_swap, &["aterm.app", "+", "installed"][..]),
+    ] {
+        let rec = &recs[i];
+        assert_eq!(rec.rc, 0, "{label}: {}", rec.err);
+        let (staged, left) = rec
+            .out
+            .split_once("--")
+            .unwrap_or_else(|| panic!("{label}: {}", rec.out));
+        assert!(
+            staged
+                .lines()
+                .any(|e| e.starts_with("aterm.app.installing.")),
+            "{label}: the run staged in a folder of its own: {staged}"
+        );
+        let left: Vec<&str> = left.trim_start_matches('\n').lines().collect();
+        assert_eq!(
+            left, kept,
+            "{label}: the EXIT trap leaves no staging folder, and puts back what the swap set aside"
+        );
+    }
+}
+
+fn gid(path: &std::path::Path) -> u32 {
+    std::fs::metadata(path).expect("a folder").gid()
+}
+
+/// A bundle of this account's, in its own group (never gid 0, which
+/// bundle_is_only lets write), with plain modes whatever the umask.
+const BUNDLE: &str = "B=\"$TMPDIR/b/aterm.app\"; mkdir -p \"$B/Contents/MacOS\" && \
+                      printf '#!/bin/sh\\n' >\"$B/Contents/MacOS/aterm\" && : >\"$B/Contents/Info.plist\" && \
+                      chmod -R u=rwX,go=rX \"$TMPDIR/b\" && chmod 755 \"$B/Contents/MacOS/aterm\" && \
+                      chgrp -R \"$(id -g)\" \"$TMPDIR/b\"; ME=\"$(id -u)\"";
+
+#[test]
+fn a_bundle_every_account_can_write_in_is_reinstalled() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(BUNDLE);
+    let clean = lib.call("bundle_is_only \"$ME\" \"$B\"", &[]);
+    let file = lib.call(
+        "( chmod 646 \"$B/Contents/Info.plist\" && ! bundle_is_only \"$ME\" \"$B\"; rc=$?; \
+         chmod 644 \"$B/Contents/Info.plist\"; exit $rc )",
+        &[],
+    );
+    let folder = lib.call(
+        "( chmod 757 \"$B/Contents/MacOS\" && ! bundle_is_only \"$ME\" \"$B\"; rc=$?; \
+         chmod 755 \"$B/Contents/MacOS\"; exit $rc )",
+        &[],
+    );
+    let sticky = lib.call(
+        "( chmod 1777 \"$B/Contents\" && ! bundle_is_only \"$ME\" \"$B\"; rc=$?; \
+         chmod 755 \"$B/Contents\"; exit $rc )",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    assert_ne!(
+        gid(&scratch.join("tmp/b")),
+        0,
+        "the bundle's group is not root's"
+    );
+    for (label, i) in [
+        ("plain", clean),
+        ("a file every account can write", file),
+        ("a folder every account can write", folder),
+        ("a sticky one", sticky),
+    ] {
+        assert_eq!(recs[i].rc, 0, "{label}: {}", recs[i].err);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_root_runs_bundle_keeps_no_acl_and_one_with_an_acl_is_reinstalled() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(BUNDLE);
+    let aces = "/bin/ls -leRA \"$TMPDIR/dest/aterm.app\" | grep -c '^ [0-9]*: ' || true";
+    let clean = lib.call("bundle_is_only \"$ME\" \"$B\"", &[]);
+    let file = lib.call(
+        "( chmod +a 'group:everyone allow write,append' \"$B/Contents/MacOS/aterm\" && \
+         ! bundle_is_only \"$ME\" \"$B\"; rc=$?; chmod -N \"$B/Contents/MacOS/aterm\"; exit $rc )",
+        &[],
+    );
+    let folder = lib.call(
+        "( chmod +a 'group:everyone allow add_file' \"$B/Contents/MacOS\" && \
+         ! bundle_is_only \"$ME\" \"$B\"; rc=$?; chmod -N \"$B/Contents/MacOS\"; exit $rc )",
+        &[],
+    );
+    // What a destination's inheritable ACE gives every entry ditto makes in it.
+    let inherited = lib.call(
+        format!(
+            "mkdir -p \"$TMPDIR/dest\" && \
+             chmod +a 'group:everyone allow write,append,add_file,file_inherit,directory_inherit' \"$TMPDIR/dest\" && \
+             ditto \"$B\" \"$TMPDIR/dest/aterm.app\" && {aces}"
+        ),
+        &[],
+    );
+    let stripped = lib.call(
+        format!(
+            "chown() {{ :; }}; own_bundle_as_root \"$TMPDIR/dest/aterm.app\" \"$TMPDIR/dest\" && {aces}; \
+             bundle_is_only \"$ME\" \"$TMPDIR/dest/aterm.app\""
+        ),
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    for (label, i) in [
+        ("plain", clean),
+        ("a file with an ACL", file),
+        ("a folder with one", folder),
+    ] {
+        assert_eq!(recs[i].rc, 0, "{label}: {}", recs[i].err);
+    }
+    assert_eq!(recs[inherited].rc, 0, "{}", recs[inherited].err);
+    let before: u32 = recs[inherited].out.trim().parse().expect("a count");
+    assert!(before > 0, "the copy inherits the ACE");
+    assert_eq!(recs[stripped].rc, 0, "{}", recs[stripped].err);
+    assert_eq!(
+        recs[stripped].out.trim(),
+        "0",
+        "own_bundle_as_root strips every ACL"
+    );
 }

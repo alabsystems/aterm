@@ -18,12 +18,12 @@ use aterm_uds::host::When;
 
 pub use place::SCRATCH_PREFIX;
 pub use rows::{Anchor, Archive, Engine, Holds, Install, MICROSOFT_TEAM, ROWS, Row, row};
-pub use stable::{FOREIGN_CELL_TARGETS, WasmClause, wasm_clause};
+pub use stable::{FOREIGN_CELL_TARGETS, LINUX_LANE_TARGETS, WasmClause, wasm_clause};
 
 /// System `curl` binary path.
 pub(crate) const CURL: &str = "/usr/bin/curl";
 
-/// Stamp filename beside a pinned program ([`aterm_uds::host::PIN_STAMP`]).
+/// The stamp's file name in a placed row's directory ([`aterm_uds::host::PIN_STAMP`]).
 pub const STAMP: &str = aterm_uds::host::PIN_STAMP;
 
 /// What a placed row's `stamp.json` records.
@@ -39,7 +39,8 @@ pub struct Stamp {
     /// The archive's sha256 it was held to.
     #[serde(default)]
     pub sha256: Option<String>,
-    /// What the tree was held to besides: `sha256`, `developer-id <team>`, `crates.io`.
+    /// What the tree was held to: `sha256` (the archive's hash), `developer-id <team>` (that
+    /// and every Mach-O's signature) or `crates.io` (a `targo install --locked` build).
     pub anchor: String,
     /// A build's features (fish: none past `--no-default-features`).
     #[serde(default)]
@@ -52,7 +53,8 @@ pub struct Stamp {
     pub platform: Option<String>,
     /// When it was placed (Unix seconds).
     pub placed: u64,
-    /// Set by the retired adoption.
+    /// Set by the retired adoption: a stamp with it is never admitted, so a run replaces
+    /// that copy.
     #[serde(default)]
     pub adopted: bool,
 }
@@ -166,7 +168,8 @@ pub enum State {
     NotPinned(String),
     /// `--check`: not in place, and what a run would do.
     Missing(String),
-    /// Refused or failed, with nothing left behind.
+    /// Refused or failed, and why: the row is not placed, though a scratch a program ran from,
+    /// a copy moved aside and the rustup row's steps that succeeded stay.
     Failed(String),
     /// A pinned file upstream no longer serves to this fetch (Ubuntu archived its release):
     /// COULD NOT RUN, naming what changes that, with nothing left behind.
@@ -229,12 +232,13 @@ pub fn usage() -> String {
 Fetch or build the tools this checkout pins into this user's cache, each placed whole
 or not at all beside a stamp.json; each download is held to a pinned sha256 (pwsh's
 also to Microsoft's Developer ID), and wasm-bindgen builds from crates.io. The rustup
-row instead has rustup add stable, its cross targets and the wasm32 pin to rustup's
-homes, first installing rustup from a pinned rustup-init where there is none. It
-reads the network.
+row instead has rustup add stable with clippy, its cross targets and the wasm32 pin to
+rustup's homes, first installing rustup (auto-install off) from a pinned rustup-init
+where there is none. It reads the network.
 
   (no ROW)    the rows every checkout needs
-  --linux     and the Linux lane's VM: lima, and Ubuntu's pinned image for its own VM
+  --linux     and the Linux lane's VM: lima, Ubuntu's pinned image for its own VM, and
+              stable's aarch64-unknown-linux-musl std, which its guest agent is built against
   --record    and wasm-bindgen, to re-record the wasm-glue goldens
   --check     say what is missing; fetch and change nothing
   ROW...      just these: {}
@@ -441,14 +445,21 @@ fn not_pinned(row: &Row, machine: &Machine) -> String {
     format!("{}: nothing is pinned for {}", row.name, machine.platform)
 }
 
-/// Where `row` stands on `machine`, read only: in place, missing, or not pinned here.
+/// Where `row` stands on `machine`, read only, as a run with no flag sees it ([`check_for`]).
 pub fn check(row: &Row, machine: &Machine, host: &dyn Host) -> State {
+    check_for(row, &Options::default(), machine, host)
+}
+
+/// Where `row` stands on `machine` for a run asked for `opts`, read only: in place, missing,
+/// or not pinned here. `--linux` holds the rustup row to the Linux lane's stable targets
+/// ([`stable::LINUX_LANE_TARGETS`]) too.
+pub fn check_for(row: &Row, opts: &Options, machine: &Machine, host: &dyn Host) -> State {
     if matches!(row.install, Install::Rustup { .. }) {
         let pin = match stable::wasm_pin_wanted(&machine.repo) {
             Ok(pin) => pin,
             Err(why) => return State::Missing(format!("rustup: the wasm32 pin — {why}")),
         };
-        let lacks = stable::missing(&machine.homes, host.rustup(), pin.as_deref());
+        let lacks = stable::missing(&machine.homes, host.rustup(), pin.as_deref(), opts.linux);
         return if lacks.is_empty() {
             State::Present(machine.homes.rustup_home.clone())
         } else {
@@ -485,10 +496,22 @@ pub fn check(row: &Row, machine: &Machine, host: &dyn Host) -> State {
     }
 }
 
-/// Provide `row` on `machine`: leave it where it is complete, else fetch or build it.
+/// Provide `row` on `machine` as a run with no flag does ([`provide_for`]).
 pub fn provide(row: &Row, machine: &Machine, host: &dyn Host, say: &mut dyn FnMut(&str)) -> State {
+    provide_for(row, &Options::default(), machine, host, say)
+}
+
+/// Provide `row` on `machine` for a run asked for `opts`: leave it where it is complete,
+/// else fetch or build it. `--linux` adds the Linux lane's stable targets to the rustup row.
+pub fn provide_for(
+    row: &Row,
+    opts: &Options,
+    machine: &Machine,
+    host: &dyn Host,
+    say: &mut dyn FnMut(&str),
+) -> State {
     if let Install::Rustup { version, .. } = row.install {
-        return rustup_row(row, version, machine, host, say);
+        return rustup_row(row, version, opts.linux, machine, host, say);
     }
     let Some(t) = target(row, machine) else {
         return State::NotPinned(not_pinned(row, machine));
@@ -532,10 +555,12 @@ pub fn provide(row: &Row, machine: &Machine, host: &dyn Host, say: &mut dyn FnMu
     }
 }
 
-/// The rustup row: [`stable::run`], handed rustup-init at the pin where no rustup is installed.
+/// The rustup row: [`stable::run`], handed rustup-init at the pin where no rustup is installed;
+/// `linux` adds the Linux lane's stable targets.
 fn rustup_row(
     row: &Row,
     version: &str,
+    linux: bool,
     machine: &Machine,
     host: &dyn Host,
     say: &mut dyn FnMut(&str),
@@ -567,7 +592,14 @@ fn rustup_row(
         None
     };
     let init = fetched.as_ref().map(|(_, init)| init.as_path());
-    match stable::run(&machine.repo, &machine.homes, host.rustup(), init, say) {
+    match stable::run(
+        &machine.repo,
+        &machine.homes,
+        host.rustup(),
+        init,
+        linux,
+        say,
+    ) {
         Ok(acquired) if acquired.is_empty() => State::Present(machine.homes.rustup_home.clone()),
         Ok(_) => State::Placed(machine.homes.rustup_home.clone()),
         Err(why) => match fetched {
@@ -874,9 +906,9 @@ pub fn run(opts: &Options, machine: &Machine, host: &dyn Host, say: &mut dyn FnM
     let mut states = Vec::new();
     for row in &rows {
         let state = if opts.check {
-            check(row, machine, host)
+            check_for(row, opts, machine, host)
         } else {
-            provide(row, machine, host, &mut |l: &str| {
+            provide_for(row, opts, machine, host, &mut |l: &str| {
                 say(&format!("{}: {l}", row.name))
             })
         };

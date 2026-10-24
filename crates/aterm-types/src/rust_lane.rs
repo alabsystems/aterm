@@ -1211,12 +1211,12 @@ fn find_exec(rest: &[String], depth: usize, beside: Beside<'_>) -> Verdict {
     found
 }
 
-/// The longest a rendered command may be in a [`refusal`].
+/// The longest a rendered command may be in a [`refusal`], before the `…` that ends a cut one.
 pub const REFUSAL_COMMAND_CAP: usize = 240;
 
-/// `text` as one line of at most [`REFUSAL_COMMAND_CAP`] bytes: every control
-/// character (a newline inside a quoted argument, a tab) folded to a space, cut
-/// on a character boundary with `…` when it was longer.
+/// `text` as one line: every control character (a newline inside a quoted
+/// argument, a tab) folded to a space, cut on a character boundary at
+/// [`REFUSAL_COMMAND_CAP`] bytes and ended with `…` when it was longer.
 fn one_command_line(text: &str) -> String {
     let folded: String = text
         .chars()
@@ -1308,7 +1308,8 @@ pub fn refusal(hit: &Hit, pin: Option<(&PinSource, &str)>) -> String {
     if is_unknown_verb(&hit.instead) {
         out.push_str(
             "If it answers \"no such command\", the extension has no Trust spelling: use the \
-             escape below.\n",
+             escape below. A cargo alias takes the lane of the verb it expands to (`targo \
+             --unverified <alias>` for one that runs `run`).\n",
         );
     }
     if hit.compat {

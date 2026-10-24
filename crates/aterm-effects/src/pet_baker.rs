@@ -152,16 +152,21 @@ fn paint_eye_dots(
         }
     };
     let width = |b: &Option<(f32, f32, f32, f32)>| b.map_or(0.0, |(x0, _, x1, _)| x1 - x0);
-    let max_w = bounds.iter().map(width).fold(0.0, f32::max);
+    let mut max_w = 0.0_f32;
+    let mut near_cx = 0.5_f32;
+    let mut best_w: Option<f32> = None;
+    for &(x0, _, x1, _) in bounds.iter().flatten() {
+        let w = x1 - x0;
+        max_w = max_w.max(w);
+        if best_w.is_none_or(|bw| w.total_cmp(&bw).is_ge()) {
+            best_w = Some(w);
+            near_cx = (x0 + x1) * 0.5;
+        }
+    }
     let ratio = |b: &Option<(f32, f32, f32, f32)>| {
         if max_w > 0.0 { width(b) / max_w } else { 1.0 }
     };
     let occluded = |b: &Option<(f32, f32, f32, f32)>| ratio(b) < EYE_DOT_FAR_OCCLUDED_RATIO;
-    let near_cx = bounds
-        .iter()
-        .flatten()
-        .max_by(|a, b| (a.2 - a.0).total_cmp(&(b.2 - b.0)))
-        .map_or(0.5, |&(x0, _, x1, _)| (x0 + x1) * 0.5);
     let min_gap = EYE_DOT_GAP_PX / xform.scale_x.max(1.0);
     let core_min_w_px = EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y;
     let sx_eps = xform.scale_x.max(f32::EPSILON);

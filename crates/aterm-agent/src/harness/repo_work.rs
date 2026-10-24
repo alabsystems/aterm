@@ -3,10 +3,12 @@
 
 //! WHAT A SESSION'S REPOSITORY HOLDS THAT NO REMOTE MAIN HAS.
 
+use std::cell::Cell;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// How long the whole probe may take ([`probe`]).
+/// A probe cut by this deadline is [`RepoRead::Unread`].
 pub const PROBE_LIMIT: Duration = Duration::from_secs(60);
 
 /// The most paths a finding names ([`RepoWork::paths`]).
@@ -153,6 +155,70 @@ impl RepoWork {
             .chain(tail)
             .collect();
         format!("{}: {}", self.repo, all.join(", "))
+    }
+}
+
+/// WHAT ONE PROBE OF A SESSION'S REPOSITORY READ ([`probe`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RepoRead {
+    /// Nothing no remote main has: the probe finished and found nothing, or
+    /// it cannot run here (no `git`, no repository, a folder macOS guards).
+    #[default]
+    Clean,
+    /// What the repository holds that no remote main has.
+    Found(RepoWork),
+    /// The probe did not finish within its limit (a hung or starved `git`):
+    /// what the repository holds is not known.
+    Unread,
+}
+
+impl RepoRead {
+    /// `Some` finding as [`Self::Found`], `None` as [`Self::Clean`].
+    #[must_use]
+    pub fn of_found(found: Option<RepoWork>) -> Self {
+        found.map_or(Self::Clean, Self::Found)
+    }
+
+    /// The finding, where the probe found work.
+    #[must_use]
+    pub const fn found(&self) -> Option<&RepoWork> {
+        match self {
+            Self::Found(work) => Some(work),
+            Self::Clean | Self::Unread => None,
+        }
+    }
+
+    /// The finding, owned ([`Self::found`]).
+    #[must_use]
+    pub fn into_found(self) -> Option<RepoWork> {
+        match self {
+            Self::Found(work) => Some(work),
+            Self::Clean | Self::Unread => None,
+        }
+    }
+
+    /// Whether this reading permits the existing clean-repository policy.
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        matches!(self, Self::Clean)
+    }
+
+    /// Whether the probe did not finish ([`Self::Unread`]).
+    #[must_use]
+    pub const fn is_unread(&self) -> bool {
+        matches!(self, Self::Unread)
+    }
+
+    /// WHETHER TWO PROBES READ THE SAME WORK ([`RepoWork::same`]): both clean,
+    /// or both the same finding of a known state. An unfinished probe never
+    /// counts as the same state.
+    #[must_use]
+    pub fn same(a: &Self, b: &Self) -> bool {
+        match (a, b) {
+            (Self::Clean, Self::Clean) => true,
+            (Self::Found(a), Self::Found(b)) => RepoWork::same(Some(a), Some(b)),
+            _ => false,
+        }
     }
 }
 
@@ -416,8 +482,9 @@ pub fn printable(text: &str) -> String {
 }
 
 /// WHAT THE REPOSITORY `dir` IS IN HOLDS THAT NO REMOTE MAIN HAS.
+/// A deadline-cut read is [`RepoRead::Unread`], not a clean result.
 #[must_use]
-pub fn probe(dir: &Path, home: Option<&Path>, limit: Duration) -> Option<RepoWork> {
+pub fn probe(dir: &Path, home: Option<&Path>, limit: Duration) -> RepoRead {
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     probe_with(dir, home, xdg.as_deref(), limit)
 }
@@ -429,17 +496,33 @@ pub fn probe_with(
     home: Option<&Path>,
     xdg: Option<&Path>,
     limit: Duration,
-) -> Option<RepoWork> {
-    let home = home?;
+) -> RepoRead {
+    let Some(home) = home else {
+        return RepoRead::Clean;
+    };
     if atpkg::protected::under_protected_root(home, dir) {
-        return None;
+        return RepoRead::Clean;
     }
+    let Some(deadline) = Instant::now().checked_add(limit) else {
+        return RepoRead::Clean;
+    };
     let reads = Reads {
-        deadline: Instant::now().checked_add(limit)?,
+        deadline,
         home,
         xdg: xdg.filter(|x| x.is_absolute()),
+        cut: Cell::new(false),
     };
-    let reads = &reads;
+    match probe_reads(dir, &reads) {
+        Some(work) => RepoRead::Found(work),
+        None if reads.cut.get() => RepoRead::Unread,
+        None => RepoRead::Clean,
+    }
+}
+
+/// [`probe_with`]'s reads: the finding, `None` for none. A finding whose
+/// state read was cut keeps its counts, its state unknown ([`RepoWork::state`]).
+fn probe_reads(dir: &Path, reads: &Reads<'_>) -> Option<RepoWork> {
+    let home = reads.home;
     let table = aterm_sysprobe::volumes::table();
     let dir = unattended_dir(dir, Some(home), &table)?;
     let top = git(&dir, &["rev-parse", "--show-toplevel"], reads)?;
@@ -525,6 +608,7 @@ pub fn probe_hygiene(dir: &Path, home: Option<&Path>, limit: Duration) -> Option
         deadline: Instant::now().checked_add(limit)?,
         home,
         xdg: None,
+        cut: Cell::new(false),
     };
     let reads = &reads;
     let table = aterm_sysprobe::volumes::table();
@@ -918,6 +1002,8 @@ struct Reads<'a> {
     home: &'a Path,
     /// The person's `XDG_CONFIG_HOME` (absolute), for [`global_excludes`]'s read alone.
     xdg: Option<&'a Path>,
+    /// Whether a read did not start, or was cut off, at the deadline.
+    cut: Cell<bool>,
 }
 
 fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<String> {
@@ -927,6 +1013,7 @@ fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<
         .checked_sub(read_stall::spent())
         .unwrap_or_else(Instant::now);
     if Instant::now() >= deadline {
+        reads.cut.set(true);
         return None;
     }
     let path = std::env::var_os("PATH")?;
@@ -954,7 +1041,10 @@ fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<
         cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("XDG_CONFIG_HOME", "/dev/null");
     }
-    let output = aterm_uds::deadline::output_until_complete_stdout(&mut cmd, deadline).ok()?;
+    let Ok(output) = aterm_uds::deadline::output_until_complete_stdout(&mut cmd, deadline) else {
+        reads.cut.set(reads.cut.get() || Instant::now() >= deadline);
+        return None;
+    };
     if !output.status.success() {
         return None;
     }
@@ -963,25 +1053,42 @@ fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<
 
 /// A starved `git` for this thread's probes (tests).
 #[cfg(test)]
-mod read_stall {
+pub(crate) mod read_stall {
     use std::cell::Cell;
     use std::time::Duration;
 
     std::thread_local! {
+        static SKIP: Cell<u32> = const { Cell::new(0) };
         static NEXT: Cell<u64> = const { Cell::new(0) };
         static SPENT: Cell<u64> = const { Cell::new(0) };
     }
 
     /// The next read this thread starts is starved `ms` (0: none).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(super) fn set(ms: u64) {
+    pub(crate) fn set(ms: u64) {
+        set_after(0, ms);
+    }
+
+    /// Starve the read after `skip` reads, clearing the time already spent.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn set_after(skip: u32, ms: u64) {
+        SKIP.with(|k| k.set(skip));
         NEXT.with(|n| n.set(ms));
         SPENT.with(|s| s.set(0));
     }
 
     /// The time this thread's reads have lost so far, the read starting now included.
     pub(super) fn spent() -> Duration {
-        let next = NEXT.with(|n| n.replace(0));
+        let skipped = SKIP.with(|k| {
+            let left = k.get();
+            k.set(left.saturating_sub(1));
+            left > 0
+        });
+        let next = if skipped {
+            0
+        } else {
+            NEXT.with(|n| n.replace(0))
+        };
         SPENT.with(|s| {
             s.set(s.get().saturating_add(next));
             Duration::from_millis(s.get())
@@ -991,4 +1098,4 @@ mod read_stall {
 
 #[cfg(test)]
 #[path = "repo_work_tests.rs"]
-mod tests;
+pub(crate) mod tests;

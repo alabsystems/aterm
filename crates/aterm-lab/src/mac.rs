@@ -238,7 +238,7 @@ pub fn tcc_seen(log: &str) -> TccSeen {
     seen
 }
 
-/// Evaluates whether the `~/Desktop` control read confirms TCC enforcement.
+/// Whether the `~/Desktop` control read confirms TCC enforcement or, with `fda`, the grant.
 pub const fn control_verdict(
     fda: bool,
     desktop_read_passed: bool,

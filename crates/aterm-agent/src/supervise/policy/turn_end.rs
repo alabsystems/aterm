@@ -7951,10 +7951,11 @@ fn hold_at_yield(reading: &TurnEndReading) -> LandHeld {
     {
         *slot = Some(word);
     }
-    let repo = reading.repo.as_ref();
+    let repo = reading.repo.found();
     let legs = [
         (HoldLeg::Needs, said_need),
         (HoldLeg::Repo, repo.is_some()),
+        (HoldLeg::Unread, reading.repo.is_unread()),
         (HoldLeg::Open, !words.is_empty()),
         (
             HoldLeg::Defense,
@@ -9680,7 +9681,7 @@ pub struct TurnEndReading {
     pub answered: Option<ScreenAnswer>,
     pub record_turn: Option<RecordTurn>,
     pub credits: Option<CreditsCarry>,
-    pub repo: Option<crate::harness::repo_work::RepoWork>,
+    pub repo: crate::harness::repo_work::RepoRead,
 }
 
 /// THE TURN A SCREEN'S LAST WORDS CLOSE ([`TurnEndReading::answered`]).
@@ -9987,7 +9988,7 @@ impl TurnEndReading {
                 model: c.model.as_deref().and_then(credits_model),
                 ..CreditsCarry::default()
             }),
-            repo: None,
+            repo: crate::harness::repo_work::RepoRead::Clean,
         }
     }
 
@@ -10568,7 +10569,7 @@ pub struct TurnEndState {
     seeded_land: Option<&'static str>,
     land_point_seed: bool,
     open: Vec<&'static str>,
-    repo: Option<crate::harness::repo_work::RepoWork>,
+    repo: crate::harness::repo_work::RepoRead,
     needs: Needs,
     autopilot: Option<Autopilot>,
     land: LandEpisode,
@@ -10600,7 +10601,7 @@ pub struct TurnEndState {
     looked: Option<(Instant, Option<LeftKey>)>,
     other_turn: bool,
     quiet_wake: bool,
-    wake_repo: Option<Option<crate::harness::repo_work::RepoWork>>,
+    wake_repo: Option<crate::harness::repo_work::RepoRead>,
     landed_seed: Option<bool>,
     landed_words: Option<u64>,
     seed_by_wake: bool,
@@ -10705,7 +10706,7 @@ impl TurnEndState {
             seeded_land: None,
             land_point_seed: false,
             open: Vec::new(),
-            repo: None,
+            repo: crate::harness::repo_work::RepoRead::Clean,
             needs: Needs::default(),
             autopilot: None,
             land: LandEpisode::default(),
@@ -11713,10 +11714,16 @@ impl TurnEndState {
         &self.open
     }
 
-    /// What the session's repository held that no remote main has at the current point's done claim ([`Self::repo`]; `None`: nothing found).
+    /// What the session's repository held that no remote main has at the current point's done claim ([`Self::repo`]; `None`: nothing found, or the probe did not finish, [`Self::repo_unread`]).
     #[must_use]
     pub const fn repo_owed(&self) -> Option<&crate::harness::repo_work::RepoWork> {
-        self.repo.as_ref()
+        self.repo.found()
+    }
+
+    /// Whether the repository probe at the current point's done claim did not finish ([`crate::harness::repo_work::RepoRead::Unread`]).
+    #[must_use]
+    pub const fn repo_unread(&self) -> bool {
+        self.repo.is_unread()
     }
 
     /// THE NEEDS YOU STANDING ([`needs::needs_you`], [`Self::needs`]), as the worker's last report named them.
@@ -12001,7 +12008,7 @@ impl TurnEndState {
         self.carrying = false;
         self.checking = false;
         self.open.clear();
-        self.repo = None;
+        self.repo = crate::harness::repo_work::RepoRead::Clean;
         true
     }
 
@@ -12228,7 +12235,7 @@ impl TurnEndState {
     }
 
     /// WHAT THE SESSION'S REPOSITORY HELD AS A LANDED TASK'S OWN WAKE BEGAN ([`Self::took_quiet`]).
-    pub fn wake_began_over(&mut self, found: Option<crate::harness::repo_work::RepoWork>) {
+    pub fn wake_began_over(&mut self, found: crate::harness::repo_work::RepoRead) {
         if self.wake_start_owed() {
             self.wake_repo = Some(found);
         }
@@ -13205,19 +13212,19 @@ impl TurnEndState {
                 .turn_said
                 .as_deref()
                 .is_none_or(|t| needs::needs_you(t).is_empty());
-        let clean = clean_words && reading.repo.is_none();
+        let clean = clean_words && reading.repo.is_clean();
         let record_says = reading.finished_record == Some(true)
             && !reading.pending_input
             && reading.autopilot != Autopilot::Cruise;
-        let by_record = record_says && reading.repo.is_none();
+        let by_record = record_says && reading.repo.is_clean();
         let off_stood = self.off_landing.is_some() || seeded == Some(false);
         let began_over = !off_stood
             && wake_repo.as_ref().is_some_and(|began| {
-                crate::harness::repo_work::RepoWork::same(began.as_ref(), reading.repo.as_ref())
+                crate::harness::repo_work::RepoRead::same(began, &reading.repo)
             });
-        let wake_repo_kept = reading.repo.is_none() || began_over;
+        let wake_repo_kept = reading.repo.is_clean() || began_over;
         let wake_keeps = record_says && wake_repo_kept && !wake_left_open(reading);
-        let repo_theirs = reading.repo.is_some() && began_over;
+        let repo_theirs = reading.repo.found().is_some() && began_over;
         let landed_before = self.landed();
         let tail_mark = said_mark(reading.said_tail.as_deref());
         let words_hold = clean_defense(reading.said_tail.as_deref())
@@ -13226,14 +13233,14 @@ impl TurnEndState {
                 .as_deref()
                 .is_none_or(|t| needs::needs_you(t).is_empty())
             && landing_words.is_some_and(|w| tail_mark == Some(w))
-            && (seeded == Some(true) || reading.repo.is_none())
+            && (seeded == Some(true) || reading.repo.is_clean())
             && reading.worked.is_none()
             && awaited.is_none();
         let wake_hold = seeded_by_wake
             && record_says
             && landing_words.is_some_and(|w| tail_mark == Some(w))
             && !wake_words_open(reading)
-            && (seeded == Some(true) || reading.repo.is_none())
+            && (seeded == Some(true) || reading.repo.is_clean())
             && reading.worked.is_none()
             && awaited.is_none();
         let act_speaks = match reading.program {
@@ -13524,10 +13531,11 @@ impl TurnEndState {
                 Vec::new()
             };
             let unlanded_by_repo = record_says && landed_before && !self.landed;
-            self.repo = reading
-                .repo
-                .clone()
-                .filter(|_| (claim || unlanded_by_repo) && !repo_theirs);
+            self.repo = if (claim || unlanded_by_repo) && !repo_theirs {
+                reading.repo.clone()
+            } else {
+                crate::harness::repo_work::RepoRead::Clean
+            };
             if reading.wall.is_none() && !reading.pending_input {
                 // Someone else's turn on someone's prompt (`prompted`): the
                 // person answered what stood. A turn nobody asked — Claude
@@ -14205,7 +14213,7 @@ impl TurnEndState {
         };
         self.checking = typed_rule == Some(RULE_DONE_CHECK) || cut_check;
         self.open.clear();
-        self.repo = None;
+        self.repo = crate::harness::repo_work::RepoRead::Clean;
         if matches!(action, TurnEndAction::Type { text, .. } if text.contains(NEEDS_ACK)) {
             self.needs.acked = Some(self.needs.key);
         }
@@ -14384,7 +14392,7 @@ impl TurnEndState {
         self.seeded_check = None;
         self.seeded_land = None;
         self.open.clear();
-        self.repo = None;
+        self.repo = crate::harness::repo_work::RepoRead::Clean;
         self.landing = false;
         self.cut_check = false;
         self.cut_land = false;
@@ -14982,6 +14990,10 @@ fn repo_said(summary: &str) -> String {
 const REPO_BARE: &str = "Your repository still holds work no remote main has: commit, merge \
                          and push it to the remote main first.";
 
+/// THE REPOSITORY SUFFIX WHERE THE PROBE DID NOT FINISH ([`crate::harness::repo_work::RepoRead::Unread`]).
+pub const REPO_UNREAD: &str = "Your repository could not be read: show its git status yourself \
+                               and land what it holds first.";
+
 const REPO_SUMMARY_UNITS: usize = 160;
 
 /// RETIRED: the fixed words the last build before Autopilot Cruise opened its open-items challenge with ([`RULE_OPEN_ITEMS`]).
@@ -15033,7 +15045,7 @@ fn act_words(base: &str, after: &[&str], rules: Option<&str>) -> String {
 enum Suffix<'a> {
     Fixed(&'a str),
     Open(&'a [&'static str]),
-    Repo(Option<&'a crate::harness::repo_work::RepoWork>),
+    Repo(&'a crate::harness::repo_work::RepoRead),
 }
 
 fn units(s: &str) -> usize {
@@ -15057,11 +15069,16 @@ fn fitted_act(base: &str, parts: &[Suffix<'_>], rules: Option<&str>) -> String {
             _ => None,
         })
         .unwrap_or(&[]);
-    let repo = parts.iter().find_map(|p| match p {
-        Suffix::Repo(r) => *r,
+    let repo_read = parts.iter().find_map(|p| match p {
+        Suffix::Repo(r) => Some(*r),
         _ => None,
     });
+    let repo = repo_read.and_then(|r| r.found());
+    let unread = repo_read.is_some_and(|r| r.is_unread());
     let repo_in = |room: usize| -> Option<String> {
+        if unread {
+            return (units(REPO_UNREAD) < room).then(|| REPO_UNREAD.to_string());
+        }
         let repo = repo?;
         let whole = repo_work_suffix(repo);
         if units(&whole) < room {
@@ -15080,7 +15097,7 @@ fn fitted_act(base: &str, parts: &[Suffix<'_>], rules: Option<&str>) -> String {
             continue;
         }
         let repo_s = repo_in(left);
-        if repo_s.is_some() || repo.is_none() || most == 0 {
+        if repo_s.is_some() || (repo.is_none() && !unread) || most == 0 {
             chosen = (open, repo_s);
             break;
         }
@@ -16034,7 +16051,7 @@ fn words_act(
                 DONE_CHECK,
                 &[
                     Suffix::Open(&state.open),
-                    Suffix::Repo(state.repo.as_ref()),
+                    Suffix::Repo(&state.repo),
                     Suffix::Fixed(reversible_clause(irreversible || need_destroys)),
                     Suffix::Fixed(ack_s),
                 ],
@@ -16093,7 +16110,7 @@ fn land_words(state: &TurnEndState, reading: &TurnEndReading) -> (String, &'stat
                 LAND_NUDGE,
                 &[
                     Suffix::Open(&state.open),
-                    Suffix::Repo(state.repo.as_ref()),
+                    Suffix::Repo(&state.repo),
                     Suffix::Fixed(rev),
                     Suffix::Fixed(ack_s),
                 ],

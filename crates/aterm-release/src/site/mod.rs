@@ -31,8 +31,8 @@ pub const USAGE: &str = "usage: targo --unverified ship site [--latest] [--dry-r
   --no-deploy    commit and push, no deploy, no live check (SITE_NO_DEPLOY=1 too)
   --skip-site    do nothing, say so, exit 0
   --site-dir DIR the site checkout (else SITE_DIR, else publish/site.toml's dir)
-  --releases FILE plan offline from this release list instead of asking GitHub (needs
-                 --dry-run)
+  --releases FILE take the release list from FILE instead of GitHub's API (needs
+                 --dry-run); the clone, --latest and FILE's asset URLs are still fetched
 exit: 0 synced (said when not deployed or the live site is unreadable), planned, skipped
       or deferred · 1 failed · 2 usage or an unreadable publish/site.toml · 3 no usable
       site checkout · 4 the live site does not show the committed site";
@@ -166,7 +166,7 @@ pub fn parse_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Option<
         }
     }
     if o.releases.is_some() && !o.dry_run {
-        return Err("--releases plans offline from a local list: it needs --dry-run".into());
+        return Err("--releases plans from a local release list: it needs --dry-run".into());
     }
     Ok(Some(o))
 }

@@ -15,7 +15,9 @@ pub const HANG: Duration = Duration::from_secs(60);
 
 const TOOLCHAIN: [&str; 5] = ["cargo", "rustc", "rustup", "targo", "alab-targo"];
 
-/// The system dirs every run's PATH ends with: `/usr/bin:/bin`.
+/// The system dirs every run's PATH ends with: `/usr/bin:/bin`, unless one of them holds a
+/// [`TOOLCHAIN`] program, when it is one folder under [`scratch_root`] linking every other
+/// program of theirs.
 pub fn system_path() -> &'static str {
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {

@@ -86,6 +86,8 @@ mod linux_guest;
 #[cfg(target_os = "macos")]
 mod linux_proof;
 #[cfg(target_os = "macos")]
+mod linux_vz;
+#[cfg(target_os = "macos")]
 mod linux_xwire;
 #[cfg(target_os = "macos")]
 mod mac;
@@ -194,7 +196,7 @@ mod windows_window;
 #[cfg(target_os = "macos")]
 mod workers;
 
-/// How a person runs this program: every hint that tells them what to type next spells it so.
+/// How a person runs this program, for the hints that tell them what to type next.
 pub const LAB: &str = "targo --unverified lab";
 
 /// Poll `pred` every 100 ms until it holds (`true`) or `within` passes (`false`); a hang detector for something that must happen, interruptible.
@@ -217,31 +219,35 @@ pub fn wait_until(within: std::time::Duration, mut pred: impl FnMut() -> bool) -
 /// The verbs, as `help` prints them.
 pub const USAGE: &str = "\
 aterm-lab — the real Claude Code, Codex, Gemini CLI, agy or Muse Code TUI in a jailed private headless aterm
-against a local API stub (Anthropic, Responses, Gemini or Meta). Fully local: no real account, token or egress.
+against a local API stub (Anthropic, Responses, Gemini or Meta). A lab is fully local: no real account, token or egress.
 
 usage: targo --unverified lab <command> [tag] [args]
-       (tag defaults to $LAB_TAG or \"lab\"; a verb that brings up its own lab defaults to a tag of its own)
+       (tag: the first word when it names a lab that is up, else $LAB_TAG or \"lab\" and the word is an argument;
+       up, down, ps, crash and sleep take any first word as the tag; a verb that brings up its own lab defaults to a
+       tag of its own)
   up [tag]                       start the stub, a black-hole proxy, the egress witness and a jailed private headless aterm
                                  (env: LAB_SURVEY=1 LAB_TRUST=1 LAB_FIRST_RUN=1 LAB_RESTORE=1 LAB_CLOCK=1
                                  LAB_HARNESS_KEYS='continue = false' LAB_ATERM_TOML LAB_COLS LAB_LINES LAB_SCALE
-                                 LAB_PROXY=dead LAB_CLAUDE LAB_CODEX LAB_CODEX_MODEL LAB_GEMINI LAB_AGY LAB_MUSE
+                                 LAB_PROXY=dead LAB_CLAUDE LAB_CODEX LAB_GEMINI LAB_AGY LAB_MUSE
                                  LAB_ATERM=/physical/path LAB_STATE=/abs/outside/homes
-                                 LAB_INSTANCE_ENV='TMPDIR=/abs ATERM_DEBUG_<NAME>=V ATERM_DEV_<NAME>=V')
+                                 LAB_INSTANCE_ENV='TMPDIR=/abs ATERM_DEBUG_<NAME>=V ATERM_DEV_<NAME>=V ATERM_OCCUPANCY_NUDGE_S=N')
   claude [tag] [-e K=V]... [--no-wait] [--relay] [--subscriber] [--debug-log] [-- claude args]
                                  launch the managed Claude Code in tab 1 (--relay: behind the PTY relay; --subscriber: a
                                  fake claude.ai OAuth token, for `limit` headers; --debug-log: a scratch debug log)
   codex [tag] [--signed-out|--chatgpt[=PLAN]] [-e K=V]... [--no-wait] [-- codex args]
-                                 launch the managed Codex in tab 1 (CODEX_HOME=<scratch>/codex-home; --chatgpt: a fake
-                                 ChatGPT auth.json, plan plus by default, and stub refresh; --signed-out: the default
-                                 provider, no auth)
+                                 launch the managed Codex in tab 1 (CODEX_HOME=<scratch>/codex-home, model
+                                 $LAB_CODEX_MODEL when set; --chatgpt: a fake ChatGPT auth.json, plan plus by default,
+                                 and stub refresh; --signed-out: the default provider, no auth; either one also sets
+                                 [harness] enabled = false in the lab's aterm.toml)
   codex-run [tag] [--lab|--chatgpt|--signed-out] -- <args>
-                                 run non-interactive Codex in the jail (--help, exec, `login status`, `login --help`;
+                                 run non-interactive Codex in the jail (--help, exec, `login status`, `login --help|-h`;
                                  any other login, logout, app, app-server, remote-control, agents, exec-server, cloud
                                  and update are refused)
   codex-auth [tag] [LABEL [ACCOUNT [PLAN]]]
                                  write a fake auth.json (default B, acct-lab-1, plus) into the live CODEX_HOME
   ratelimits [tag] off | PRIMARY SECONDARY [credits=yes|no|unlimited] [balance=N] [reached=TYPE] [promo=TEXT] [active=ID]
-                                 set the x-codex-* rate-limit headers (5h and weekly used %) and the --chatgpt usage payload
+                                 set the x-codex-* rate-limit headers (5h and weekly used %, - leaves that window out) and
+                                 the --chatgpt usage payload
   rollout [tag] [all]            print token_count lines (all: every line) of the tab's newest scratch rollout
   codex-selftest [tag] [--keep]  end-to-end Codex isolation and stub proof (~20 s)
   gemini [tag] [-e K=V]... [--no-wait] [--untrusted] [-- gemini args]
@@ -257,11 +263,12 @@ usage: targo --unverified lab <command> [tag] [args]
                                  launch Muse Code in tab 1 against the stub's Meta routes with a scratch HOME
   muse-selftest [tag] [--keep]   end-to-end Muse Code isolation and stub proof (~30 s)
   muse-captures [--only <regex>] capture every Muse Code fixture screen (~10 min; --only narrows)
-  turn|send|enter|key [tag] ...  type prompt+Enter | text | Enter | named key (0, escape, ctrl-c, ...); turn exits 1
+  turn|send|enter|key [tag] ...  type prompt+Enter | text | Enter | named key (0, escape, ctrl+c, ...); turn exits 1
                                  unless the composer accepted the prompt
   mode [tag] [name ['<spec>']]   show or set the stub mode: ok long numbered overloaded too-long compact-fails slow
                                  rate-limit 401 500 bad-key bg[:SLEEP[:SLOW]] tool limit:CLAIM:RESET[:PLAN], or a
-                                 custom name whose '<spec>' JSON object is written to modes/<name>.json
+                                 custom name whose '<spec>' JSON object is written to modes/<name>.json (bg: a prompt
+                                 with `bgstart` runs `sleep SLEEP` in the background, any other streams SLOW s of ticks)
   limit [tag] CLAIM SECONDS [PLAN]
                                  answer with a 429 subscription usage limit (CLAIM: five_hour|seven_day|...|code_assist)
                                  that resets SECONDS from now
@@ -269,13 +276,14 @@ usage: targo --unverified lab <command> [tag] [args]
                                  trigger it with `turn TAG toolstart`
   headers [tag] ['<json>']       set extra /v1/messages headers {\"on200\":{...},\"on429\":{...}} (\"@SEQ:BASE:STEP@\"; '{}' clears)
   account [tag] composed|off|show|'<json>'
-                                 set the stub's claude.ai oauth/usage, profile and bootstrap route bodies (\"@ISO+N@\")
+                                 set the stub's claude.ai oauth/usage, profile and bootstrap route bodies (\"@ISO+N@\",
+                                 \"@NOW+N@\": now+N s as an ISO instant, as unix seconds)
   claude-json [tag] [KEY ...] | --set KEY '<json>'|composed
                                  read or set keys in the scratch .claude.json (never the owner's file)
   statusline [tag] on [SECS]|off|show
                                  record (every SECS, default 5) or show what Claude Code pipes to its statusLine command
   transcript [tag]               print the newest scratch transcript's rows (type/subtype and system/user text)
-  debuglog [tag] [egrep]         print lines from `claude TAG --debug-log` (default: request/account/telemetry lines)
+  debuglog [tag] [regex]         print lines from `claude TAG --debug-log` (default: request/account/telemetry lines)
   settings [tag] '<json>'        deep-merge JSON into the scratch settings.json (null removes a key; read live)
   survey [tag] on|off [--reread] toggle CLAUDE_FORCE_DISPLAY_SURVEY in the scratch settings env (--reread: rewrite every
                                  3 s until Claude Code reports a re-read)
@@ -285,9 +293,7 @@ usage: targo --unverified lab <command> [tag] [args]
   phase [tag]                    run `aterm drive phase` on the tab
   prices [<claude-bin>] [--codex <codex-bin>]
                                  check prices.toml against Claude Code's embedded price catalog and Codex's model ids
-  abrew-admission [--json] [--indexes DIR] [--this-machine | --arch A --macos V --xcode V|none --no-clt]
-                                 evaluate abrew admission across Homebrew's formula.json and cask.json
-  wait [tag] <egrep> [secs]      wait until a screen row matches <egrep> (default 60 s; `await match`); exit 1 if none did
+  wait [tag] <regex> [secs]      wait until a screen row matches <regex> (default 60 s; `await match`); exit 1 if none did
   ps [tag]                       list pids for [tag], or for every lab with a run directory under $LAB_STATE/runs
   journal [tag]                  print the harness journal and ledger
   watch [tag] [secs]             stream screen diffs and journal lines on one clock (default 30 s)
@@ -295,8 +301,8 @@ usage: targo --unverified lab <command> [tag] [args]
                                  the stub's log (last N lines, 40) | the keychain tripwire's log | egress witness, proxy
                                  refusals and sandbox denials (last MIN minutes, 30) | the lab's network sockets
   capture [tag] <name> \"<what>\"  write $LAB_STATE/captures/<agent>-<version>-<name>.txt (+png)
-  catch [tag] <egrep> <name> \"<what>\" [secs]
-                                 capture a fixture the instant <egrep> matches on screen (default 60 s)
+  catch [tag] <regex> <name> \"<what>\" [secs]
+                                 capture a fixture the instant <regex> matches on screen (default 60 s)
   header [tag] \"<what>\"          print the one-line `# ...` fixture header for [tag]
   footers [--out DIR] [--subscriber] [--settings '<json>'] [--no-turn] [--no-bypass] [--columns N] [--lines N]
                                  capture managed Claude Code footer screens across modes on a fresh lab
@@ -354,10 +360,6 @@ usage: targo --unverified lab <command> [tag] [args]
                                  manager Claude Code spawns 3 real Claude Code workers, awaits all, and verifies results (~20 s)
   twin [tag] <claude-bin>|--crashing [ver]
                                  stage <claude-bin> (or a crashing stand-in) as a newer managed store build to wake live upgrade
-  fleet-sim [--n N] [--runs R] [--keep] [--record]
-                                 run N (default 30, 4-64) private headless aterms on loopback fleet ports and verify
-                                 `aterm ctl survey --fleet` across R runs (default 3) under `ulimit -n 256` (--record:
-                                 a passing run's record goes to docs/measured/)
   scn list|run|show|agg ...      survey scenario runner (`scn run <scenario> [--n N] [--start K]`, `show <run>`, `agg [<scenario>]`)
   tape promote <results-run|dir|tape> [--as NAME] [--fewer] | tape lint [FILE|DIR...] | tape replay-jailed [FILE|DIR...] | tape rerecord NAME [--fewer]
                                  promote, scrub, lint, sandbox-replay, or rerecord harness tapes in crates/aterm-agent/tests/testdata/tapes/
@@ -375,6 +377,14 @@ Outside any lab (no jail, no stub):
                                  Ctrl-C (--window: a real window; --image PNG: capture one settled frame, run --post, and
                                  end; --pages cold: run a copy whose pages are evicted, to measure cold page-ins)
                                  --scene band-icons draws procedural chrome icons beside H (debug/dev-seams build)
+  abrew-admission [--json] [--indexes DIR] [--this-machine | --arch A --macos V --xcode V|none --no-clt]
+                                 evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from
+                                 formulae.brew.sh unless --indexes DIR holds them) on the newest Mac, that Mac with the
+                                 named facts replaced, or this one (--this-machine)
+  fleet-sim [--n N] [--runs R] [--keep] [--record]
+                                 run N (default 30, 4-64) private headless aterms on loopback fleet ports and verify
+                                 `aterm ctl survey --fleet` across R runs (default 3) under `ulimit -n 256` (--record:
+                                 a passing run's record goes to docs/measured/)
   disk-lane [--aterm PATH] [--keep]
                                  mount an 8 GiB sparse APFS image and verify disk-pressure tier eviction and reserve order (~1 min)
   slot-capture [--watch DUR [--dir DIR]]
@@ -382,7 +392,7 @@ Outside any lab (no jail, no stub):
   slot-lane [--aterm PATH] [--keep]
                                  verify `await sys slots>=1` wakes when a SIGKILLed stand-in releases slot-0
   trail-gallery [--aterm PATH] [--theme dark|light|both] [--scenario NAME[,NAME]]... [--extra 'key = value']...
-                [--columns N] [--lines N] [--font-px N] [--no-clean] <out_dir> [style ...]
+                [--columns N] [--lines N] [--font-px N] [--no-clean] [--keep] <out_dir> [style ...]
                                  render cursor trail styles across themes/scenarios into <out_dir> with sidecars (`--help` for details)
   trail-contrast <png> [--find TEXT]... [--cells ROW:COL[-COL]]... [--row N]... [--newest N] [--min X]
                  [--newest-min X] [--caret-min X] [--dims FILE|--origin X,Y --cell WxH] [--no-clean] ...
@@ -403,12 +413,13 @@ Outside any lab (no jail, no stub):
                [--rounds N] [--no-split] [--out DIR]
                                  OPENS A WINDOW (with --window): verify predictive editing over a simulated RTT `link` in
                                  single and split panes (defaults: both shells, 100 ms, both modes, 2 rounds)
-  codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep]
+  codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH]
                    [--policy-only|--upgrade-only|--raw-upgrade-only]
                                  end-to-end native harness proof on the real codex-alab package against a loopback fake
                                  model (~11 min; --policy-only: the cybersecurity-refusal leg alone; --upgrade-only: one
                                  live handoff; --raw-upgrade-only: started through the produced primary with its managed
-                                 entry absent, automatic crash repair, then a live handoff)
+                                 entry absent, automatic crash repair, then a live handoff); its scratch world is always
+                                 kept
   seamless --baseline PATH [--aterm PATH] [--runs N] [--keep]
                                  OPENS A WINDOW, one at a time: one instance of a debug or dev-seams aterm across a real
                                  seamless update (ATERM_DEBUG_SEAMLESS_REEXEC=1, `update apply`), legs gap, topics,
@@ -424,12 +435,13 @@ Outside any lab (no jail, no stub):
                                  run <cmd> behind a PTY delaying chunks by RTT/2 each way (default 100 ms)
   mac dmg [--image REF] [--fda] [--keep]
                                  run dmg_acceptance benches inside a fresh SIP-enabled macOS tart VM (`mac help`)
-  linux up|down|status|exec|proof|baseline|gone|cpu|a11y|edges|deck|browser|clean|destroy
+  linux up|down|status|exec|proof|baseline|gone|cpu|a11y|edges|deck|browser|vz-agent|clean|destroy
                                  manage and run the Ubuntu 24.04 Lima VM runtime lane on aarch64 and Rosetta x86_64 (`linux help`)
   windows up|down|status|exec|smoke|window|destroy
                                  manage and run the Windows 11 arm64 QEMU VM runtime lane on aarch64 and Prism x86_64 (`windows help`)
 
-Exit: 0 pass, 1 a finding or a refusal, 2 usage, 3 could not run, 128+N cut short by signal N (INT, TERM, HUP).
+Exit: 0 pass, 1 a finding or a refusal (also an unknown command and, on many verbs, a bad argument), 2 usage,
+3 could not run, 128+N cut short by signal N (INT, TERM, HUP).
 ";
 
 /// Why a verb ended: a message for stderr (when there is one), its exit status, and the interrupt that cut it short (when one did).

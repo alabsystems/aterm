@@ -86,7 +86,16 @@ pub const HIDDEN: usize = 64;
 pub const MIN_NGRAMS: usize = 6;
 
 /// Feed every hashed n-gram bucket of `text` to `f`; returns how many were emitted.
-pub fn for_each_ngram_bucket(text: &str, mut f: impl FnMut(usize)) -> usize {
+#[inline]
+pub fn for_each_ngram_bucket(text: &str, f: impl FnMut(usize)) -> usize {
+    for_each_ngram_bucket_chars(text.chars(), f)
+}
+
+/// Feed every hashed n-gram bucket of `chars` to `f`; returns how many were emitted.
+pub fn for_each_ngram_bucket_chars(
+    chars: impl IntoIterator<Item = char>,
+    mut f: impl FnMut(usize),
+) -> usize {
     use aterm_hash::{FNV64_OFFSET, fnv1a_64_extend};
     /// Per-order salt (odd constant × order) so n-gram orders occupy distinct hash streams.
     const ORDER_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -105,7 +114,7 @@ pub fn for_each_ngram_bucket(text: &str, mut f: impl FnMut(usize)) -> usize {
     let mut prev1_h3: Option<u64> = None;
     let mut prev2_h3: Option<u64> = None;
     let mut last_was_space = false;
-    for raw in text.chars() {
+    for raw in chars {
         let c = if matches!(raw, ' ' | '\t'..='\r') || (!raw.is_ascii() && raw.is_whitespace()) {
             if last_was_space {
                 continue; // collapse runs — indentation is not a mood
@@ -293,10 +302,20 @@ impl ToneModel {
     }
 
     /// Compute the raw output logits into `s.logits`, returning `false` when the text has fewer than [`MIN_NGRAMS`] character n-grams.
+    #[inline]
     fn compute_logits(&self, text: &str, s: &mut ToneScratch) -> bool {
+        self.compute_logits_chars(text.chars(), s)
+    }
+
+    /// Compute the raw output logits into `s.logits` directly from `chars`, returning `false` when fewer than [`MIN_NGRAMS`] character n-grams were emitted.
+    fn compute_logits_chars(
+        &self,
+        chars: impl IntoIterator<Item = char>,
+        s: &mut ToneScratch,
+    ) -> bool {
         s.sum = [0.0; EMBED];
         let emb_rows = self.emb.as_chunks::<EMBED>().0;
-        let n = for_each_ngram_bucket(text, |bucket| {
+        let n = for_each_ngram_bucket_chars(chars, |bucket| {
             // Masking keeps `bucket < BUCKETS`, so this never misses.
             if let Some(chunk) = emb_rows.get(bucket) {
                 for (acc, &w) in s.sum.iter_mut().zip(chunk) {
@@ -355,7 +374,17 @@ impl ToneModel {
     /// The verdict with abstention explicit: the argmax tone, or `None` when the evidence is too thin ([`MIN_NGRAMS`]).
     #[inline]
     pub fn classify_opt(&self, text: &str, s: &mut ToneScratch) -> Option<Tone> {
-        if !self.compute_logits(text, s) {
+        self.classify_chars_opt(text.chars(), s)
+    }
+
+    /// [`ToneModel::classify_opt`] over a character iterator without an intermediate `String`.
+    #[inline]
+    pub fn classify_chars_opt(
+        &self,
+        chars: impl IntoIterator<Item = char>,
+        s: &mut ToneScratch,
+    ) -> Option<Tone> {
+        if !self.compute_logits_chars(chars, s) {
             return None;
         }
         let mut best = 0usize;

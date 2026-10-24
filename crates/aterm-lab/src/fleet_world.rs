@@ -176,7 +176,7 @@ pub struct World {
 pub fn world_env(root: &Path, bin: &Path) -> Vec<(String, String)> {
     let p = crate::paths::paths();
     let r = |d: &str| root.join(d).to_string_lossy().into_owned();
-    vec![
+    let mut env = vec![
         ("HOME".into(), r("home")),
         ("XDG_CONFIG_HOME".into(), r("cfg")),
         ("XDG_RUNTIME_DIR".into(), r("run")),
@@ -194,7 +194,9 @@ pub fn world_env(root: &Path, bin: &Path) -> Vec<(String, String)> {
         ("LOGNAME".into(), p.user.clone()),
         ("LANG".into(), "en_US.UTF-8".into()),
         ("xcrun_nocache".into(), "1".into()),
-    ]
+    ];
+    env.extend(crate::instance::seams());
+    env
 }
 
 /// Creates the private directory layout and `aterm.toml` for a world at `root`.

@@ -72,7 +72,7 @@ impl Window {
         self.delegate.get_on_main(|delegate| f(delegate))
     }
 
-    /// LOCAL PATCH (aterm), 2026-10-15: the content view behind `aterm_objc::HasNsView` (`platform/macos.rs`); nil off the main thread, where the `rwh_06` handle below answers `Unavailable`.
+    /// LOCAL PATCH (aterm): the content view behind `aterm_objc::HasNsView` (`platform/macos.rs`); nil off the main thread, where the `rwh_06` handle below answers `Unavailable`.
     #[inline]
     pub(crate) fn ns_view(&self) -> Id {
         MainThread::new().map_or(Id::NIL, |mtm| self.delegate.get(mtm).ns_view())

@@ -767,6 +767,10 @@ fn write_cap(path: &Path, lines: &str, secret: &Path) -> Result<PathBuf, String>
     match std::fs::read(path) {
         Ok(old) if old == lines.as_bytes() => match private_mode(path) {
             Ok(None) => {}
+            Ok(Some(was)) if (was & 0o077) == 0 => eprintln!(
+                "aterm fabric mint-for: {} held this cap at mode {was:03o}; now 0600",
+                path.display()
+            ),
             Ok(Some(was)) => eprintln!(
                 "aterm fabric mint-for: {} held this cap at mode {was:03o}, readable by other \
                  users; now 0600. A copy of it works until its grants expire (a cap minted \

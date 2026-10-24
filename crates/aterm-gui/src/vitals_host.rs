@@ -221,6 +221,8 @@ pub(crate) struct Request {
     pub(crate) tabs: Vec<TabRoot>,
     /// Those roots' terminal mode words, where read ([`TtyWord`]).
     pub(crate) ttys: Vec<TtyWord>,
+    /// What those roots' PTY readers read, read again at each pass ([`crate::vitals_jobs::JobFeed`]).
+    pub(crate) feeds: Vec<(u64, Arc<crate::vitals_jobs::JobFeed>)>,
     /// Where each of those sessions sits (window, tab), for `sys`.
     pub(crate) layout: Vec<PaneFact>,
     /// Authenticated global session ids for those process-local tab keys.
@@ -315,18 +317,26 @@ impl TtyWord {
         }
     }
 
-    /// Returns the engine's word for the tick at `at_ms`, if output and input are unchanged.
-    pub(crate) fn current(&self, at_ms: u64) -> Option<(u64, aterm_vitals::jobs::TtyMode)> {
-        (self.output.count() == self.output_seen && self.input.get() == self.input_seen).then_some(
+    /// Returns the engine's word while no key was driven since the read. While no feed moved the
+    /// screen since, it was read after every output the jobs feed holds, so it is stamped
+    /// `u64::MAX`, newer than each of their stamps however the ms round
+    /// ([`crate::vitals_jobs::JobFeed::at`]). After one it keeps its mode, which judges the job's
+    /// output, but is stamped 0, before every output stamp, so the engine names no wait from it (a
+    /// word older than the job's last output names none). Dropping that word instead left a
+    /// program that redraws all the time with no mode, judged canonical, and its output never
+    /// counted.
+    pub(crate) fn current(&self) -> Option<(u64, aterm_vitals::jobs::TtyMode)> {
+        (self.input.get() == self.input_seen).then(|| {
+            let moved = self.output.count() != self.output_seen;
             (
                 self.key,
                 aterm_vitals::jobs::TtyMode {
                     canonical: self.canonical,
                     echo: self.echo,
-                    stamped_ms: at_ms,
+                    stamped_ms: if moved { 0 } else { u64::MAX },
                 },
-            ),
-        )
+            )
+        })
     }
 }
 
@@ -426,8 +436,8 @@ pub(crate) struct ScreenMoves {
 }
 
 impl ScreenMoves {
-    /// A feed left the screen at `now` (the reader, holding the term lock).
-    pub(crate) fn fed(&self, now: crate::control::ScreenGen) {
+    /// A feed left the screen at `now` (the reader, holding the term lock): whether it moved it.
+    pub(crate) fn fed(&self, now: crate::control::ScreenGen) -> bool {
         let moved = self
             .seen
             .lock()
@@ -445,6 +455,7 @@ impl ScreenMoves {
             // the count without the term lock, so only these fences order the two.
             fence(Ordering::SeqCst);
         }
+        moved
     }
 
     /// How many feeds moved the screen so far.
@@ -1561,20 +1572,51 @@ pub(crate) struct Reader {
     pub(crate) machine: Machine,
 }
 
-/// Steps the stuck engine over one whole reading at `at_ms`.
+/// What a reading takes of its tabs before its sweep ([`Request::tab_reads`]): the pass's clock,
+/// ms past the reader's zero, each feed, and each current mode word.
+#[derive(Debug)]
+pub(crate) struct TabReads {
+    at_ms: u64,
+    feeds: Vec<(u64, crate::vitals_jobs::TabFeed)>,
+    ttys: Vec<(u64, aterm_vitals::jobs::TtyMode)>,
+}
+
+impl Request {
+    /// Reads the pass's clock (`now`, ms past `epoch`, at 1 ms at the least), then each feed on
+    /// it, then each current mode word. A reading takes them before its sweep: a block's `D` and
+    /// the exit of the command it closes, read while the sweep runs, are the next pass's, never a
+    /// closed block over a member the sweep still saw (a false orphan). A feed rounds its stamps
+    /// up ([`crate::vitals_jobs::JobFeed::at`]), so whatever a reader reads after the clock is
+    /// stamped past it: no later than the next pass's, never at none.
+    pub(crate) fn tab_reads(&self, epoch: Instant, now: impl FnOnce() -> Instant) -> TabReads {
+        let at_ms = u64::try_from(now().saturating_duration_since(epoch).as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let feeds = self
+            .feeds
+            .iter()
+            .map(|(key, f)| (*key, f.at(epoch)))
+            .collect();
+        let ttys = self.ttys.iter().filter_map(TtyWord::current).collect();
+        TabReads { at_ms, feeds, ttys }
+    }
+}
+
+/// Steps the stuck engine over one whole reading, on the clock and with the tab reads taken
+/// before its sweep.
 pub(crate) fn jobs_step(
     pass: &mut crate::vitals_jobs::JobsPass,
-    at_ms: u64,
+    reads: &TabReads,
     sweep: Option<&[aterm_sysprobe::procs::ProcessReading]>,
     req: &Request,
     thrashing: bool,
 ) -> Option<Arc<aterm_vitals::jobs::JobsView>> {
-    let ttys: Vec<_> = req.ttys.iter().filter_map(|w| w.current(at_ms)).collect();
     pass.tick(
-        at_ms,
+        reads.at_ms,
         sweep,
         &req.tabs,
-        &ttys,
+        &reads.ttys,
+        &reads.feeds,
         req.self_pid,
         thrashing,
         req.jobs_now,
@@ -1689,6 +1731,7 @@ impl Reader {
 
     /// Takes one full reading (machine counters, process sweep, split set if due, and jobs pass).
     pub(crate) fn read(&mut self, req: &Request) -> Snapshot {
+        let reads = req.tab_reads(self.epoch, Instant::now);
         let now = Instant::now();
         let split = self.split.due(req, now);
         let live_split = split && self.fixture.is_none();
@@ -1750,7 +1793,7 @@ impl Reader {
         let thrashing = sample.mem.is_some_and(|m| m.pressure == Pressure::Critical);
         snap.jobs = jobs_step(
             &mut self.jobs,
-            sample.at_ns / 1_000_000,
+            &reads,
             sweep.as_ref().map(|s| s.procs.as_slice()),
             req,
             thrashing,
@@ -1773,6 +1816,7 @@ impl Reader {
             sample.at_ns / 1_000_000,
             None,
             &req.tabs,
+            &[],
             &[],
             req.self_pid,
             false,
@@ -2839,11 +2883,16 @@ impl crate::App {
                 TtyWord::read(t.key, &s.ctx.sink, &s.ctx.screen_moves)
             })
             .collect();
+        let feeds = tabs
+            .iter()
+            .filter_map(|t| Some((t.key, Arc::clone(&self.pool.get(t.key)?.ctx.job_feed))))
+            .collect();
         let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
         Request {
             self_pid: std::process::id(),
             tabs,
             ttys,
+            feeds,
             layout,
             session_ids,
             cadence_ms: duration_ms(period),

@@ -20,42 +20,49 @@ USAGE
         direct dependants, its dominator cost per cell, and whether a
         [patch.crates-io] fork reaches that version.
 
-  targo --unverified forge budget [--update] [--allow-regress \"<reason>\"]
-        Compare the live surface against tools/forge-budget.tsv. --update may
-        only LOWER a ceiling; raising one needs a one-line reason, which is
-        written into the file's 4th column.
+  targo --unverified forge budget [--update [--allow-regress \"<reason>\"]]
+        Compare the live surface (every cell, the lock, the patch table)
+        against tools/forge-budget.tsv. --update lowers each ceiling to its
+        live value, or seeds the file when it is absent; it never adds a row.
+        Raising a ceiling takes --allow-regress and a one-line reason, which
+        is written into the file's 4th column.
 
   targo --unverified forge attest
-        Provenance and license obligations over the [patch.crates-io] targets
-        (vendor/ forks, and upstream code absorbed under crates/): patch,
-        vendor/ and Cargo.lock agreement, [workspace] stubs,
-        .cargo_vcs_info.json and Cargo.toml.orig, retained licenses, NOTICE,
-        Apache-2.0 §4(b) notices, fork markers, deny.toml's license list and
-        .gitignore. vendor/astream must be a clean checkout of its gitlink,
-        not behind origin/main's pin.
+        Provenance and license obligations over the vendor/ forks and the
+        upstream code absorbed under crates/ (a [patch.crates-io] target, or
+        a member NOTICE lists): patch, vendor/ and Cargo.lock agreement,
+        [workspace] stubs, .cargo_vcs_info.json and Cargo.toml.orig, retained
+        licenses, NOTICE, Apache-2.0 §4(b) notices, fork markers, deny.toml's
+        license list and .gitignore. vendor/astream must be a clean checkout
+        of its gitlink, not behind the pin origin/main had at the merge-base
+        unless a commit on the branch says `astream-pin-rollback: <reason>`.
 
   targo --unverified forge check [--cell NAME]...
         The `forge` check of `targo --unverified verify`, without compiling:
         attest, plus a review row for every vendored fork, every fork live in
-        each cell, carved paths still gone, the budget ratchet, no patch
-        redirecting a dev-dependency oracle, vendor/forge.toml matching the
-        forks, and deny.toml's bans and sources.
+        some cell (or the first cell's build closure) with no unpatched copy
+        beside it, carved paths still gone, the budget ratchet (every cell,
+        whatever --cell says), no patch redirecting a dev-dependency oracle,
+        a wasm cell for every shipped browser root, vendor/forge.toml matching
+        the forks, and deny.toml's bans and sources.
 
   targo --unverified forge serde-attrs [PATH]...
-        Every #[serde(...)] key and form under crates/ (except
-        crates/aterm-serde), as TSV on stdout: the closed set the first-party
-        derive accepts. PATHs, relative to the workspace root, scan those
-        trees instead. Read-only.
+        Every #[serde(...)] key and form in use under crates/ (except
+        crates/aterm-serde), as TSV on stdout; the first-party derive accepts
+        only the set recorded in
+        docs/measured/third-party-2026-10-15/serde-attrs.tsv. PATHs, relative
+        to the workspace root, scan those trees instead. Read-only.
 
 OPTIONS
-  --root PATH      Workspace root (default: the nearest one above the CWD)
+  --root PATH      Workspace root (default: the nearest at or above the CWD)
   --cell NAME      One cell, a target triple and its root package (mac-arm,
                    linux, win, ...); repeatable. Default: every cell.
   --top N          Rows per ranked survey table; 0 = all (default 40)
   -h, --help       This text
 
 EXIT CODES
-  0 pass   1 fail   2 usage   3 could not run
+  0 pass   1 fail   2 usage (the command line did not parse)
+  3 could not run (also an unknown --cell name or a malformed blame spec)
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -99,7 +106,7 @@ pub enum ParseError {
 }
 
 impl ParseError {
-    /// One sentence, naming the fix.
+    /// One sentence; main prints USAGE after it.
     pub fn message(&self) -> String {
         match self {
             Self::NoVerb => "no verb given — try `targo --unverified forge survey`".into(),

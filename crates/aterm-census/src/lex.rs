@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The census lexer: code and text views of a Rust file with comments and literals blanked.
+//! The census lexer: a Rust file's code view (comments and literal contents blanked) and text
+//! view (comments blanked).
 
 /// What a non-code span is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

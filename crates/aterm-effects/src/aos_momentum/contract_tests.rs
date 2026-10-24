@@ -3,16 +3,24 @@
 
 //! Contract tests for `momentum-glow.no-stranded-light` and mutant negative controls.
 
+use aterm_aos::ArtifactId;
 use aterm_aos::contract::{Contract, Verdict};
+use aterm_aos::effects::EffectPort;
 use aterm_aos::replay::Run;
+use aterm_aos::task::{Code, EntryRefusal, StepRefusal};
 use aterm_time::Instant;
 
+use super::lane::{run, s0};
+use super::m4_tests::gap0;
+use super::plan::SchedulePlan;
 use super::test_fixtures::{
-    LANE, attached, burst, cfg, hosted, play, random_stream, replay_log, run_lane,
+    BUILD, LAG, LANE, LATE, WINDOW_LANE, attached, attached_for_lane, burst, cfg, hosted, play,
+    random_stream, replay_by, replay_log, run_lagged, run_lane,
 };
 use super::{
-    COLD_TICK_CLEARS, HOT_HAS_WAKE, MomentumCode, MomentumEvent, MomentumObservation,
-    MomentumSchema, NoStrandedLight, RUN_MATCHES_INPUTS, SETTLE_MARGIN, WAKE_NO_LATER_THAN_CLEAR,
+    Applied, COLD_TICK_CLEARS, HOT_HAS_WAKE, MomentumCode, MomentumEvent, MomentumObservation,
+    MomentumSchema, MomentumState, NoStrandedLight, PrebuiltMomentum, RUN_MATCHES_INPUTS,
+    SETTLE_MARGIN, Sched, WAKE_NO_LATER_THAN_CLEAR, observe,
 };
 use crate::cursor_momentum::AdmitRefusal;
 
@@ -261,4 +269,103 @@ fn refused_inputs_are_judged_by_no_law() {
         }
         Verdict::Pass => panic!("a refusal lifted ColdTickClears"),
     }
+}
+
+/// A test-only mutant of a plan whose floor is anchored on the stamp (the tick that latched the amplitude): every answer is the plan's asked at the stamp, not at its query's time.
+struct StampAnchored {
+    plan: SchedulePlan,
+    id: ArtifactId,
+}
+
+impl Code<MomentumSchema> for StampAnchored {
+    fn id(&self) -> &ArtifactId {
+        &self.id
+    }
+
+    fn entry(&self, schema: &MomentumSchema, state: &MomentumState) -> Result<(), EntryRefusal> {
+        PrebuiltMomentum::planned(self.plan, BUILD).entry(schema, state)
+    }
+
+    fn step(
+        &self,
+        schema: &MomentumSchema,
+        state: &mut MomentumState,
+        input: &MomentumEvent,
+        _port: &mut dyn EffectPort,
+    ) -> Result<MomentumObservation, StepRefusal> {
+        let sched = Sched::Plan(self.plan);
+        let (mut out, mut under) = (Vec::new(), Vec::new());
+        let mut applied = sched.apply(state, schema.epoch, input, &mut out, &mut under);
+        if let (MomentumEvent::Query { frame_interval, .. }, Applied::Schedule { deadline, .. }) =
+            (input, &mut applied)
+            && let Some(stamp) = state.glow.stamp()
+        {
+            *deadline = sched.next_change_deadline(state, stamp, *frame_interval);
+        }
+        Ok(observe(&applied, schema.epoch, &out, &under))
+    }
+}
+
+/// The settle deadlines a run answered, by cursor.
+fn deadlines(run: &Run<MomentumSchema>) -> Vec<(u64, Option<i128>)> {
+    run.observations
+        .iter()
+        .filter_map(|(c, o)| match o {
+            MomentumObservation::Schedule { deadline, .. } => Some((*c, *deadline)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The stamp remedy's negative control: a plan whose floor is anchored on the stamp breaks `WakeNoLaterThanClear` at the first floor answer of a log whose queries lag their ticks by 1.5 ms, which the plan itself passes, and in the lane, which queries at the tick, it answers as the plan and passes.
+#[test]
+fn a_stamp_anchored_floor_breaks_wake_no_later_than_clear_when_the_query_lags() {
+    let t0 = Instant::now();
+    let winner = gap0();
+    let planned = PrebuiltMomentum::planned(winner, BUILD);
+    let mutant = StampAnchored {
+        plan: winner,
+        id: winner.artifact(BUILD),
+    };
+    let (f, late, lag) = (WINDOW_LANE, LATE, LAG);
+    for dark in [true, false] {
+        let c = cfg(dark);
+        let mut host = attached_for_lane(t0, Sched::Plan(winner));
+        let mut seen = Vec::new();
+        let (last, cell) = burst(&mut host, t0, 24, &c, &mut seen);
+        let turns = run_lagged(&mut host, last, f, late, lag, cell, &c);
+        assert!(turns > 20, "fixture: a lagged lane");
+        let by_plan = replay_by(&host, &planned);
+        assert_eq!(
+            judge(&host, &by_plan),
+            Verdict::Pass,
+            "dark={dark}: the plan"
+        );
+        let by_mutant = replay_by(&host, &mutant);
+        let first_moved = deadlines(&by_plan)
+            .into_iter()
+            .zip(deadlines(&by_mutant))
+            .find(|((_, d), (_, m))| m < d)
+            .map(|((cursor, _), _)| cursor)
+            .expect("fixture: the stamp moves a floor answer earlier");
+        match judge(&host, &by_mutant) {
+            Verdict::Fail { cursor, law, .. } => assert_eq!(
+                (cursor, law),
+                (first_moved, WAKE_NO_LATER_THAN_CLEAR),
+                "dark={dark}"
+            ),
+            Verdict::Pass => panic!("dark={dark}: a stamp-anchored floor passed a lagged log"),
+        }
+    }
+    let mut host = attached_for_lane(t0, Sched::Plan(winner));
+    let lane = run(&mut host, &s0(), t0);
+    assert_eq!(lane.fault(), None);
+    let by_plan = replay_by(&host, &planned);
+    let by_mutant = replay_by(&host, &mutant);
+    assert!(deadlines(&by_plan).len() > 100, "fixture: the lane queried");
+    assert_eq!(
+        by_mutant.observations, by_plan.observations,
+        "in the lane the stamp is the query's time"
+    );
+    assert_eq!(judge(&host, &by_mutant), Verdict::Pass);
 }

@@ -57,7 +57,8 @@ pub(super) struct AppState {
     start_time: Cell<Option<Instant>>,
     wait_timeout: Cell<Option<Instant>>,
     pending_redraw: RefCell<Vec<WindowId>>,
-    /// LOCAL PATCH (aterm), 2026-10-17.
+    /// LOCAL PATCH (aterm): set when a user event's send armed the wake since the last take;
+    /// `cleared` then wakes the run loop before it sleeps, so the event is not left waiting.
     wake_armed: wake_queue::Armed,
 }
 
@@ -206,7 +207,7 @@ impl ApplicationDelegate {
         unsafe { aterm_objc::Retained::retain(delegate) }.expect("a non-null delegate retains")
     }
 
-    /// Main-thread witness derived from the receiver.
+    /// Main-thread witness for the receiver's methods, which AppKit calls on the main thread.
     #[track_caller]
     fn mtm(&self) -> MainThread {
         MainThread::new().expect(
@@ -370,7 +371,8 @@ impl ApplicationDelegate {
         self.handle_event(Event::Resumed);
     }
 
-    /// LOCAL PATCH (aterm).
+    /// LOCAL PATCH (aterm): a nested run loop inside the handler (an app-modal `NSAlert runModal`)
+    /// turns the observers with the handler borrowed, so nothing re-arms the waker: stop it.
     fn stop_waker_in_nested_loop(&self) {
         if self.ivars().event_handler.in_use() {
             self.ivars().waker.borrow_mut().stop();
@@ -487,6 +489,8 @@ fn min_timeout(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
 /// # Safety
 /// `app` must be the live shared `NSApplication`.
 unsafe fn window_activation_hack(app: Id) {
+    // LOCAL PATCH (aterm): the array is walked by index, in an explicit pool (`-windows` is +0
+    // autoreleased).
     autoreleasepool(|_| {
         // SAFETY: `-windows` is `@16@0:8` on `NSApplication`; `-count` is `Q16@0:8` and
         // `-objectAtIndex:` is `@24@0:8Q16` on `NSArray`, and no index below the count is out of

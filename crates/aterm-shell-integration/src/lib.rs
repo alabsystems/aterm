@@ -6,6 +6,18 @@
 #![cfg_attr(trust_verify, register_tool(trust))]
 
 //! Shell integration injection for aterm.
+//!
+//! # Usage
+//!
+//! ```rust,no_run
+//! use aterm_shell_integration::{ShellType, prepare};
+//!
+//! let shell = ShellType::detect("/bin/zsh");
+//! if let Ok(Some(injection)) = prepare(shell) {
+//!     // Add injection.env_add to the child's environment before fork
+//!     // Use injection.argv_override if Some (bash --rcfile)
+//! }
+//! ```
 #![cfg_attr(
     test,
     allow(

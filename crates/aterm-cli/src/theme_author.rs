@@ -943,7 +943,9 @@ fn schema_text() -> String {
     let mut out = String::from(
         "aterm theme file: one `key = value` per line. A line starting with `#` or `;`\n\
          is a comment, as is whitespace then `#` or `;` after a value.\n\
-         Keys are case-insensitive; an unknown or repeated key is an error.\n\n",
+         Keys are case-insensitive; an unknown or repeated key is an error, except that\n\
+         unknown keys in a file whose `schema` is newer than this aterm's are skipped\n\
+         and listed.\n\n",
     );
     let mut group = None;
     for spec in &THEME_KEYS {
@@ -984,9 +986,11 @@ fn schema_text() -> String {
             ThemeValueType::Appearance => {
                 out.push_str(&format!("    One of: {}.\n", APPEARANCE_VALUES.join(", ")));
             }
-            ThemeValueType::FontName => out.push_str(
-                "    A family name, never a file or a path (no / \\ ~ or font file extension).\n",
-            ),
+            ThemeValueType::FontName => out.push_str(&format!(
+                "    A family name of at most {} characters, never a file or a path (no / or \\, \
+                 no leading ~ or ., no drive letter, no font file extension).\n",
+                scheme::MAX_THEME_FONT_NAME_CHARS
+            )),
             ThemeValueType::FontNameList => out.push_str(&format!(
                 "    Family names separated by commas, 1 to {}.\n",
                 scheme::MAX_THEME_FONT_LIST

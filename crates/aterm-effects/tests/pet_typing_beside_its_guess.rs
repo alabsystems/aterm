@@ -65,7 +65,8 @@ const TAKES: [Take; 4] = [
 enum Reserve {
     /// As it ships: the person's ink.
     Ink,
-    /// As it did until 2026-10-20: a protected surface.
+    /// The negative control: a protected surface (an overlay), which steps the
+    /// pet aside and jumps it.
     Protected,
 }
 
@@ -90,10 +91,10 @@ struct Knobs {
     /// on ` at its right (`claude_footer::compose_top` repaints the rule's
     /// whole run).
     brand: bool,
-    /// The composer's upper rule reserved from end to end, as the host
-    /// reserved its tint until 2026-10-20 (`PetChrome::note_painted`): no
-    /// stand on the composer's first line, so the cat rests under the
-    /// composer while it is typed, beside the chips.
+    /// The composer's upper rule reserved from end to end, its strokes
+    /// included (`PetChrome::note_painted` reserves only the words and marks
+    /// on it): no stand on the composer's first line, so the cat rests under
+    /// the composer while it is typed, beside the chips.
     rule_walled: bool,
     /// The composer's first line itself reserved from end to end: no stand
     /// on it for the escort either, so the cat rests under the composer,

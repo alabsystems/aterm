@@ -87,7 +87,7 @@ impl PasswordInput {
     }
 }
 
-/// The sheet's wait for the owner, matched to `await consent`'s ceiling.
+/// The sheet's wait for the owner, matched to `await consent`'s default timeout.
 #[cfg(target_os = "macos")]
 pub(crate) const ASKPASS_DEADLINE: Duration = Duration::from_secs(300);
 /// One park between hang-up checks, so a killed `sudo`/helper frees the lane promptly.

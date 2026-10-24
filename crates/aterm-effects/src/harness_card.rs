@@ -877,24 +877,32 @@ impl CardPalette {
 
 #[inline]
 fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
-    let y_bg = relative_luminance(ground & 0x00FF_FFFF);
-    let holds = |k: f32| {
-        let y = relative_luminance(mix_rgb(rgb, 0, 1.0 - k));
+    let table = crate::color_math::relative_luminance_table();
+    let y_bg = crate::color_math::relative_luminance_with(table, ground & 0x00FF_FFFF);
+    let holds = |c: u32| {
+        let y = crate::color_math::relative_luminance_with(table, c);
         (y.max(y_bg) + 0.05) / (y.min(y_bg) + 0.05) >= PAPER_MARK_CONTRAST
     };
-    if holds(1.0) {
+    if holds(rgb) {
         return rgb;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
-    for _ in 0..24 {
+    let (mut lo_rgb, mut hi_rgb) = (0u32, rgb);
+    for i in 0..24 {
         let mid = 0.5 * (lo + hi);
-        if holds(mid) {
+        let mid_rgb = mix_rgb(rgb, 0, 1.0 - mid);
+        if holds(mid_rgb) {
             lo = mid;
+            lo_rgb = mid_rgb;
         } else {
             hi = mid;
+            hi_rgb = mid_rgb;
+        }
+        if i >= 1 && lo_rgb == hi_rgb {
+            break;
         }
     }
-    mix_rgb(rgb, 0, 1.0 - lo)
+    lo_rgb
 }
 
 #[inline]

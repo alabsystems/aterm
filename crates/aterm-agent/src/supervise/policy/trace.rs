@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Rule trace ([`super::approval::decide_traced`], [`super::turn_end::decide_turn_end_traced`]).
-//! Collectors: [`Trace`], [`TraceStep`], [`NoTrace`], [`Trace::on`], and [`note`].
-//! Selectors: [`TraceStep::rule`], [`TraceStep::check`], and [`deciding`].
+//! A decision's rule trace: the checks a policy consulted on its way to a decision, in the order
+//! it consulted them, each with what came of it ([`super::approval::decide_traced`],
+//! [`super::turn_end::decide_turn_end_traced`]).
 
 /// One step of a decision's trace ([module docs](self)).
 #[derive(Debug, Clone, PartialEq, Eq)]

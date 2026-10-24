@@ -11903,16 +11903,16 @@ impl Renderer {
     /// lays the page on the page. It holds while the body is there and
     /// never comes and goes: a flight keeps its whole silhouette from its
     /// gather to its landing, a resting cat keeps its full body, and no
-    /// letter under either reads against fur (2026-10-22, the trail
-    /// gallery's `burst`: 1.3 to 4.4:1 under a resting or flying body).
-    /// A cell the background pass left to a wallpaper has no page colour
-    /// here and keeps its body; the GPU builds the same stamps
+    /// letter under either reads against fur (unstamped, the trail
+    /// gallery's `burst` measured 1.3 to 4.4:1 under a resting or flying
+    /// body). A cell the background pass left to a wallpaper has no page
+    /// colour here and keeps its body; the GPU builds the same stamps
     /// (`aterm-gpu`'s glyph-knock stream). The stamp sets the page's colour
     /// only: each pixel keeps the transmittance it had ([`knock_blend`]), so
     /// on a translucent window the page round a glyph off the body stays
-    /// glass, where a stamp in the opaque page drew a solid glyph-shaped
+    /// glass; a stamp in the opaque page would draw a solid glyph-shaped
     /// outline round every letter the body's box touched, even under an
-    /// all-transparent body (2026-10-23, review).
+    /// all-transparent body.
     fn knock_out_under_text<I>(
         &mut self,
         pixels: &mut [u32],
@@ -18119,7 +18119,7 @@ pub struct BeamClip {
     pub origin_y: i32,
 }
 impl BeamClip {
-    /// Identity clip for a bare grid (tests/benches/demos).
+    /// Identity clip for a bare grid (tests, benches, demos).
     #[inline]
     #[must_use]
     pub const fn grid(w_px: usize, h_px: usize, cell_h: usize) -> Self {

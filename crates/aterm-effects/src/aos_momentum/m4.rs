@@ -2,6 +2,88 @@
 // Copyright 2026 Andrew Yates
 
 //! The Aos M4 evaluator.
+//!
+//! # The locks
+//!
+//! A result cannot be written by hand:
+//!
+//! ```compile_fail,E0451
+//! use aterm_effects::aos_momentum::m4::Admitted;
+//! let _ = Admitted {
+//!     policy: todo!(),
+//!     plan: todo!(),
+//!     bundle: todo!(),
+//!     useful: true,
+//!     gain: todo!(),
+//! };
+//! ```
+//!
+//! nor copied:
+//!
+//! ```compile_fail,E0277
+//! use aterm_effects::aos_momentum::m4::Admitted;
+//! fn copy(a: &Admitted) -> Admitted { Clone::clone(a) }
+//! ```
+//!
+//! nor a policy:
+//!
+//! ```compile_fail,E0451
+//! use aterm_effects::aos_momentum::policy::AcceptancePolicy;
+//! let _ = AcceptancePolicy { id: todo!(), terms: todo!() };
+//! ```
+//!
+//! nor the feedback a proposer is shown:
+//!
+//! ```compile_fail,E0451
+//! use aterm_effects::aos_momentum::search::TrainFeedback;
+//! let _ = TrainFeedback { plan: todo!(), admitted: true, law: None, ticks: Some(1) };
+//! ```
+//!
+//! ```compile_fail,E0624
+//! use aterm_aos::Digest;
+//! use aterm_effects::aos_momentum::search::TrainFeedback;
+//! let _ = TrainFeedback::admitted(Digest([0; 32]), 1);
+//! ```
+//!
+//! nor a planned code, which only the evaluator and publication build:
+//!
+//! ```compile_fail,E0624
+//! use aterm_effects::aos_momentum::PrebuiltMomentum;
+//! use aterm_effects::aos_momentum::plan::SHIPPED_PLAN;
+//! let _ = PrebuiltMomentum::planned(SHIPPED_PLAN, "build");
+//! ```
+//!
+//! nor a selection or a verified bundle:
+//!
+//! ```compile_fail,E0451
+//! use aterm_effects::aos_momentum::m4::Selection;
+//! let _ = Selection {
+//!     build: todo!(),
+//!     winner: todo!(),
+//!     proposer: todo!(),
+//!     round: 0,
+//!     index: 0,
+//!     stats: todo!(),
+//!     mode: todo!(),
+//! };
+//! ```
+//!
+//! ```compile_fail,E0423
+//! use aterm_effects::aos_momentum::bundle::CandidateBundle;
+//! let _ = CandidateBundle(todo!());
+//! ```
+//!
+//! and the held-out split cannot be looked at twice for one selection:
+//!
+//! ```compile_fail,E0382
+//! use aterm_effects::aos_momentum::m4::Evaluator;
+//! use aterm_effects::aos_momentum::search::GridProposer;
+//! fn twice(ev: &Evaluator) {
+//!     let Ok(s) = ev.select(&mut GridProposer::new()) else { return };
+//!     let _ = ev.held_out(s);
+//!     let _ = ev.held_out(s);
+//! }
+//! ```
 
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -71,7 +153,8 @@ pub enum CandidateRefusal {
     },
     /// The bytes are not a plan.
     Decode(PlanRefusal),
-    /// The planned code does not enter on the golden trace's checkpoint.
+    /// The planned code does not enter on the golden trace's checkpoint, or the trace does not read
+    /// in this build ([`GOLDEN_UNREADABLE`]).
     Entry {
         /// The item.
         item: String,
@@ -538,14 +621,15 @@ impl Admitted {
         line.clone_into(&mut self.bundle.parts_mut().toolchain);
     }
 
-    /// Re-evaluate the result under an alternate `policy` (never built by the pinned policy).
+    /// The result as if admitted under another `policy` (never built by the pinned policy).
     #[cfg(test)]
     pub(super) fn under_policy(mut self, policy: ArtifactId) -> Admitted {
         self.policy = policy;
         self
     }
 
-    /// Records the lab's `measured` timing under `label`, never scored.
+    /// Records the lab's `measured` timing under `label`, never scored, or returns `false` and
+    /// records nothing for an empty label or past [`MAX_TIMINGS`].
     #[must_use]
     pub fn record_timing(&mut self, label: &str, measured: Duration) -> bool {
         let timings = &mut self.bundle.parts_mut().timings;

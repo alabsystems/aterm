@@ -237,6 +237,7 @@ const fn noted_swatch(w: Noted) -> &'static str {
         | Noted::Memory
         | Noted::Abandoned
         | Noted::Claim
+        | Noted::RepoUnread
         | Noted::Watching => "warn",
         Noted::Done
         | Noted::Left
@@ -295,6 +296,7 @@ const fn noted_marks(w: Noted) -> &'static str {
         Noted::Note => "watcher: a NOTE line, a reading the loop notes",
         Noted::Sleep => "watcher: a SLEEP line, a sleep the loop could not count",
         Noted::Abandoned => "watcher: an ABANDONED line, a survey left under typed text",
+        Noted::RepoUnread => "watcher: a REPO UNREAD line, a repository probe did not finish",
     }
 }
 

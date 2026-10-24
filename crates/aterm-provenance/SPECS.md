@@ -12,7 +12,7 @@
 > Nothing has been proved or deleted yet.
 
 Source: `crates/aterm-provenance` (read only). I read every `#[test]`
-(`src/pty_wrap.rs` 3, `tests/unit.rs` 2 = 5) and the code each one reaches
+(`src/pty_wrap.rs` 3, plus 2 in an integration-test file since deleted = 5) and the code each one reaches
 (`src/pty_wrap.rs::pty_wrap_ref`, `src/provenance.rs::{Provenance, Provenance::from_pty, Provenance::as_ref}`).
 Nothing was compiled or run. The claims below come from reading the code.
 

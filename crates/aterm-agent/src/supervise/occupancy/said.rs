@@ -75,8 +75,21 @@ pub struct SaidRule {
     pub at_ms: i64,
 }
 
+/// A DUE LINE PAST K LOOKS UNTOLD, as the host is told it (the slice-2 plan's D2): what the tab's
+/// `ready-idle` Entry names, closed words and numbers only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaidReadyIdle {
+    /// The rule whose line stood due.
+    pub rule: RuleId,
+    /// The guard holding it at the last look; `None` where none did (its pace, or a write that
+    /// wrote nothing).
+    pub guard: Option<Guard>,
+    /// When it was first seen due, unix ms.
+    pub since_ms: i64,
+}
+
 /// THE DOOR'S STATE AS THE HOST IS TOLD IT, once a change ([module docs](self)).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OccupancySaid {
     /// The mode the break ran under (`[harness] occupancy`).
     pub mode: Occupancy,
@@ -92,6 +105,30 @@ pub struct OccupancySaid {
     pub at_ms: i64,
     /// The reading the break's decider judged (the empty reading where none was asked).
     pub reading: OccupancyReading,
+    /// A due line of the open hold past K looks untold ([`SaidReadyIdle`]); always `None` in a
+    /// replay of a recording without slice 2's doors (`Fx::slice2_recorded`), so its told words
+    /// compare as recorded.
+    pub ready_idle: Option<SaidReadyIdle>,
+}
+
+/// The derived form's bytes, with `ready_idle` printed only where it says something: a word with
+/// none prints as slice 1's did, so a tape that compares a told word's `Debug` replays unchanged
+/// (the slice-2 plan's D7).
+impl std::fmt::Debug for OccupancySaid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("OccupancySaid");
+        s.field("mode", &self.mode)
+            .field("hold", &self.hold)
+            .field("ready", &self.ready)
+            .field("guards", &self.guards)
+            .field("rules", &self.rules)
+            .field("at_ms", &self.at_ms)
+            .field("reading", &self.reading);
+        if let Some(ready_idle) = &self.ready_idle {
+            s.field("ready_idle", ready_idle);
+        }
+        s.finish()
+    }
 }
 
 impl OccupancySaid {
@@ -103,6 +140,18 @@ impl OccupancySaid {
             && self.ready == other.ready
             && self.guards == other.guards
             && self.rules == other.rules
+            && self.ready_idle == other.ready_idle
+    }
+
+    /// The due line past K looks the tab's `ready-idle` Entry names: under `prompt` alone, with
+    /// a hold open (the loop's half of the plan's W4; the GUI re-checks its own copy of the
+    /// owner's mode).
+    #[must_use]
+    pub fn ready_idle_under_prompt(&self) -> Option<SaidReadyIdle> {
+        if self.mode != Occupancy::Prompt || self.hold.is_none() {
+            return None;
+        }
+        self.ready_idle
     }
 
     /// The first guard the last break judged holding a line.

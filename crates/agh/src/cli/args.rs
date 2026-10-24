@@ -290,7 +290,7 @@ impl Invocation {
 /// What a command line asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Parsed {
-    /// `agh` alone, or global flags with no verb word and no `--replay`.
+    /// `agh` alone, or global flags with no verb word and neither `--replay` nor `--record`.
     Bare,
     /// `-h` or `--help`: the words of the verb path (or every word typed, when no verb matched).
     Help(Vec<String>),
@@ -322,9 +322,9 @@ pub fn verb_name(path: &[&str]) -> String {
 /// Rule 6 (what a tape cannot hold), for `verb` under `global`.
 /// # Errors
 /// Usage, next `agh help {verb}`: under `--record` or `--replay`, `M1's tapes are anonymous:
-/// drop --as` for `--as` or `--profile`; `{verb} cannot be taped: it answers from this
-/// machine, not from GitHub` for a `Local` or `Provision` verb; `release download cannot be
-/// taped in M1: it streams a body`.
+/// drop --as` for `--as` or `--profile`; `{verb} cannot be taped: a tape holds only anonymous
+/// GitHub reads` for a `Local` or `Provision` verb; `release download cannot be taped in M1: it
+/// streams a body`.
 pub(crate) fn tape_rule(verb: &Verb, global: &Global) -> Result<()> {
     if global.record.is_none() && global.replay.is_none() {
         return Ok(());
@@ -335,7 +335,7 @@ pub(crate) fn tape_rule(verb: &Verb, global: &Global) -> Result<()> {
     }
     if matches!(verb.class, Class::Local | Class::Provision) {
         return Err(usage(format!(
-            "{} cannot be taped: it answers from this machine, not from GitHub",
+            "{} cannot be taped: a tape holds only anonymous GitHub reads",
             verb.path.join(" ")
         )));
     }
@@ -762,7 +762,9 @@ fn parse_noting_tapes(
             return Ok(Parsed::Bare);
         }
         let words = p.words.join(" ");
-        let paths: Vec<String> = all_paths()
+        let paths: Vec<String> = VERBS
+            .iter()
+            .map(|verb| verb.path)
             .filter(|path| {
                 path.len() > p.words.len()
                     && path.iter().zip(&p.words).all(|(a, b)| *a == b.as_str())

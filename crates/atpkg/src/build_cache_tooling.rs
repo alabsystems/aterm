@@ -38,7 +38,7 @@ fn last_used(path: &Path, depth: usize) -> Option<SystemTime> {
 }
 
 // Scratch rows are reclaimed only when both EXEC_STAMP and RAN exist as regular files, since
-// elapsed time or a reboot cannot prove an image finished running.
+// elapsed time or a reboot cannot prove an image ran.
 fn why(entry: &Path, now: SystemTime) -> Option<Unused> {
     let name = entry.file_name()?.to_str()?;
     if !std::fs::symlink_metadata(entry).is_ok_and(|m| m.is_dir()) {

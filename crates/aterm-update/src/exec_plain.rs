@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A plain `exec` that leaves the process as it was when it fails.
+//! A plain `exec` that puts SIGPIPE's disposition back when it fails.
 
 use std::io;
 use std::os::unix::process::CommandExt as _;

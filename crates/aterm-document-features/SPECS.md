@@ -15,7 +15,8 @@
 Source: `crates/aterm-document-features` (read only). The directory is
 `aterm-document-features`, the package is `document-features` and the lib is
 `document_features`, with `proc-macro = true`. I read the one `#[test]`
-(`tests/consumer_forms.rs` 1) and the code it reaches: `src/lib.rs`, one `#[proc_macro]` fn.
+(in the `consumer_forms` test file, since deleted) and the code it reaches: `src/lib.rs`, one
+`#[proc_macro]` fn.
 Nothing was compiled or run. The claims below come from reading the code.
 
 Result: **1 spec**, covering **1 test**. **0 tests are not spec samples** (§4).
@@ -70,10 +71,11 @@ file	test	primary	also
 - 1 test: 1 is retired by the spec, and 0 are not spec samples.
 - The test samples the spec at 2 points of an unbounded input space: no arguments, and upstream's
   `feature_label = "**`{feature}`**"` form.
-- **Not a `#[test]`, and not covered by the spec.** `tests/consumer_forms.rs` also holds
-  `mod consumer { #![doc = document_features::document_features!()] }`. It is a compile-only
+- **Not a `#[test]`, and not covered by the spec.** The `consumer_forms` test file also held
+  `mod consumer { #![doc = document_features::document_features!()] }`, a compile-only
   witness that the shim builds as a proc macro and that rustc accepts the inner-attribute form
-  wgpu and wgpu-core use (§5.2).
+  wgpu and wgpu-core use (§5.2). The file is deleted, witness included; wgpu's and wgpu-core's
+  own `#![doc = document_features::document_features!()]` lines now exercise that form.
 
 ## 4. Tests that are not spec samples
 
@@ -87,14 +89,16 @@ None. Actions by kind: delete 0, keep 0, rewrite 0.
    never emits `compile_error!`. The test checks only 2 inputs, and no malformed-argument case is
    tested, so the "accepts any input" claim rests on reading the code. The spec states it for
    every `args`.
-2. **The compile witness must survive the test's deletion.** A Trust contract on
-   `document_features` cannot state that rustc accepts the `#![doc = ..]` form, because the macro
-   runs only inside rustc's expansion. When the `#[test]` is deleted, keep `mod consumer`, or move
-   the form into a doc comment in `src/lib.rs`. Do not delete the whole file.
+2. **Only wgpu now witnesses the compile form.** A Trust contract on `document_features` cannot
+   state that rustc accepts the `#![doc = ..]` form, because the macro runs only inside rustc's
+   expansion. 50785f757c deleted the whole test file, `mod consumer` included, so wgpu's and
+   wgpu-core's own `#![doc = document_features::document_features!()]` lines are the one check
+   left (§3).
 3. **A proof may cost more than it is worth.** The crate is a 40-line shim that retires with wgpu
    (the gpu-wgpu unit of `docs/AUDIT-third-party-2026-10-15.md`). Its one spec is blocked on the
-   proc-macro boundary and the bridge (gaps 1, 8 and 9). Keeping the test until wgpu leaves, and
-   deleting it together with the crate, is cheaper than widening Trust for this shim alone.
+   proc-macro boundary and the bridge (gaps 1, 8 and 9). Its test is deleted (50785f757c), so the
+   spec stays unproved until the crate retires with wgpu, which is cheaper than widening Trust for
+   this shim alone.
 
 ## 6. Proof order
 

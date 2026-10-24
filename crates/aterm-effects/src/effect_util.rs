@@ -199,7 +199,7 @@ pub(crate) fn push_fx_ramp(
     left: (u32, u8),
     right: (u32, u8),
 ) {
-    if w <= 0 || h <= 0 {
+    if w <= 0 || h <= 0 || (left == (0, 0) && right == (0, 0)) {
         return;
     }
     debug_assert_eq!(

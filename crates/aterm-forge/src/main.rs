@@ -13,42 +13,43 @@ fn main() -> ExitCode {
     let inv = match cli::parse(std::env::args().skip(1)) {
         Ok(inv) => inv,
         Err(e) => {
-            eprintln!("cargo forge: {}\n\n{}", e.message(), cli::USAGE);
+            eprintln!("forge: {}\n\n{}", e.message(), cli::USAGE);
             return ExitCode::from(exit::USAGE);
         }
     };
 
     // Absolute always: a relative root would be applied twice downstream (as
     // `current_dir` and inside `--manifest-path`).
-    let root = match inv.root.clone().map_or_else(discover_root, canonical_root) {
-        Ok(r) => r,
-        Err(msg) => {
-            eprintln!("cargo forge: {msg}");
-            return ExitCode::from(exit::COULD_NOT_RUN);
-        }
-    };
+    let root = inv.root.clone().map_or_else(discover_root, canonical_root);
 
-    let out = match inv.cmd {
-        cli::Cmd::Help => {
+    let out = match (inv.cmd, root) {
+        (cli::Cmd::Help, _) => {
             print!("{}", cli::USAGE);
             return ExitCode::from(exit::PASS);
         }
-        cli::Cmd::Survey { cells, top } => aterm_forge::survey::run(&root, &cells, top),
-        cli::Cmd::Blame { pkg, cells } => aterm_forge::blame::run(&root, &pkg, &cells),
-        cli::Cmd::Budget {
-            update,
-            allow_regress,
-        } => aterm_forge::budget::run(
+        (_, Err(msg)) => {
+            eprintln!("forge: {msg}");
+            return ExitCode::from(exit::COULD_NOT_RUN);
+        }
+        (cli::Cmd::Survey { cells, top }, Ok(root)) => aterm_forge::survey::run(&root, &cells, top),
+        (cli::Cmd::Blame { pkg, cells }, Ok(root)) => aterm_forge::blame::run(&root, &pkg, &cells),
+        (
+            cli::Cmd::Budget {
+                update,
+                allow_regress,
+            },
+            Ok(root),
+        ) => aterm_forge::budget::run(
             &aterm_forge::resolve::Cargo::from_env(),
             &root,
             update,
             allow_regress.as_deref(),
         ),
-        cli::Cmd::Attest => aterm_forge::attest::run(&root),
-        cli::Cmd::Check { cells } => {
+        (cli::Cmd::Attest, Ok(root)) => aterm_forge::attest::run(&root),
+        (cli::Cmd::Check { cells }, Ok(root)) => {
             aterm_forge::check::run(&aterm_forge::resolve::Cargo::from_env(), &root, &cells)
         }
-        cli::Cmd::SerdeAttrs { paths } => aterm_forge::serde_attrs::run(&root, &paths),
+        (cli::Cmd::SerdeAttrs { paths }, Ok(root)) => aterm_forge::serde_attrs::run(&root, &paths),
     };
 
     match out {
@@ -57,7 +58,7 @@ fn main() -> ExitCode {
             ExitCode::from(if ok { exit::PASS } else { exit::FAIL })
         }
         Err(msg) => {
-            eprintln!("cargo forge: could not run: {msg}");
+            eprintln!("forge: could not run: {msg}");
             ExitCode::from(exit::COULD_NOT_RUN)
         }
     }
@@ -76,9 +77,9 @@ fn canonical_root(given: PathBuf) -> Result<PathBuf, String> {
     Ok(aterm_forge::resolve::strip_verbatim_prefix(abs))
 }
 
-/// Walk up from CWD to the directory holding the workspace `Cargo.toml`,
-/// identified by `[workspace]` plus the members glob, since vendored crates
-/// carry an empty `[workspace]` stub below the root.
+/// Walk up from the CWD (itself first) to the first `Cargo.toml` whose text
+/// contains both `[workspace]` and `members`, since vendored crates carry an
+/// empty `[workspace]` stub below the root.
 fn discover_root() -> Result<PathBuf, String> {
     let mut dir: &Path =
         &std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;
@@ -91,7 +92,8 @@ fn discover_root() -> Result<PathBuf, String> {
             return Ok(dir.to_path_buf());
         }
         dir = dir.parent().ok_or_else(|| {
-            "no workspace Cargo.toml found above the current directory — pass --root".to_string()
+            "no workspace Cargo.toml found at or above the current directory — pass --root"
+                .to_string()
         })?;
     }
 }

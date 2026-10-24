@@ -19,6 +19,7 @@ use crate::window::WindowAttributes;
 
 const HANG: Duration = Duration::from_secs(60);
 
+/// `XkbBellNotifyMask` (`X11/extensions/XKB.h`).
 const XKB_BELL_NOTIFY_MASK: c_ulong = 1 << 8;
 
 unsafe extern "C" fn any_event(_: *mut Display, _: *mut XEvent, _: XPointer) -> xlib::Bool {

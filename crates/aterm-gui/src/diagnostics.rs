@@ -27,7 +27,6 @@ pub(crate) struct DiagInfo {
     pub privacy: String,
     /// macOS debugger rule (developer mode) via an injected probe.
     pub debugger: String,
-    pub features: Vec<(&'static str, bool)>,
     pub capabilities: Vec<(&'static str, bool)>,
     /// Claimed Objective-C protocols ([`CLAIMED_OBJC_PROTOCOLS`]) absent from this host's
     /// frameworks (e.g. `NSApplicationDelegate` on macOS 14.4.1).
@@ -149,11 +148,6 @@ impl DiagInfo {
             &self.config_path,
             &self.config_presence,
         ));
-        let _ = writeln!(s);
-        let _ = writeln!(s, "features:");
-        for (name, on) in &self.features {
-            let _ = writeln!(s, "  [{}] {name}", checkbox(*on));
-        }
         let _ = writeln!(s);
         let _ = writeln!(s, "terminal capabilities (advertised):");
         for (name, on) in &self.capabilities {
@@ -348,7 +342,6 @@ pub(crate) fn collect() -> DiagInfo {
         agent_primer: agent_primer_line(&config),
         privacy: privacy_line(&config, None),
         debugger: debugger_line(&config, None, aterm_containment::consent::self_hardening()),
-        features: Vec::new(),
         capabilities: capability_list(),
         objc_protocols_absent: objc_protocols_absent(),
         config_path,
@@ -1111,36 +1104,15 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
     warnings
 }
 
-/// Why the authored `shell` value cannot spawn, or `None` when it can.
+/// Why the authored `shell` value cannot start, or `None` when it can, judged as the spawn
+/// judges it (a bare name is looked up on PATH; a shell that cannot start is replaced).
 #[cfg(not(windows))]
 fn shell_config_warning(shell: &str) -> Option<String> {
-    if !shell.contains('/') {
-        return Some(format!(
-            "shell: {shell:?} is a bare name, and the spawn execs it verbatim \
-             (no PATH search) — new sessions will fail. Use an absolute path \
-             (e.g. /bin/zsh)"
-        ));
-    }
-    match std::fs::metadata(shell) {
-        Err(_) => Some(format!(
-            "shell: {shell:?} does not exist — new sessions will fail to spawn"
-        )),
-        Ok(md) => {
-            #[cfg(unix)]
-            let executable = {
-                use std::os::unix::fs::PermissionsExt as _;
-                md.is_file() && md.permissions().mode() & 0o111 != 0
-            };
-            #[cfg(not(unix))]
-            let executable = md.is_file();
-            (!executable).then(|| {
-                format!(
-                    "shell: {shell:?} is not an executable file — new sessions \
-                     will fail to spawn"
-                )
-            })
-        }
-    }
+    let (program, origin) = aterm_pty::select_shell_with_origin(Some(std::ffi::OsStr::new(shell)));
+    let why = aterm_pty::shell_cannot_start(&program, origin)?;
+    Some(format!(
+        "shell: {why}; new sessions start your login shell (or /bin/sh) instead"
+    ))
 }
 
 /// Why the authored `shell` value cannot spawn, or `None` when it can.
@@ -3343,14 +3315,18 @@ ink = "rainbow"
             .collect()
     }
 
-    /// Unix: `shell` names the execve target verbatim (no PATH search).
+    /// Unix: `shell` resolves as the spawn resolves it, a bare name on PATH.
     #[cfg(not(windows))]
     #[test]
     fn validate_flags_a_shell_the_spawn_cannot_exec() {
-        let bare = shell_warns("shell = \"zsh\"");
         assert!(
-            bare.iter().any(|w| w.contains("bare name")),
-            "a bare name must warn (execve does no PATH search): {bare:?}"
+            shell_warns("shell = \"sh\"").is_empty(),
+            "a bare name found on PATH is clean"
+        );
+        let bare = shell_warns("shell = \"aterm-no-such-shell-xyz\"");
+        assert!(
+            bare.iter().any(|w| w.contains("is not on PATH")),
+            "a bare name nothing on PATH answers must warn: {bare:?}"
         );
         let missing = shell_warns("shell = \"/nonexistent/definitely-not-a-shell\"");
         assert!(
@@ -3879,7 +3855,6 @@ ink = "rainbow"
             debugger: "mode=unknown member=unknown self_hardened=yes \
                        right=system.privilege.taskport.debug probe=none"
                 .into(),
-            features: vec![("a11y-appkit", true), ("a11y-accesskit", false)],
             capabilities: vec![("kitty_graphics", true), ("soft_fonts", false)],
             objc_protocols_absent: vec!["NSApplicationDelegate"],
             config_path: "/home/u/.config/aterm/aterm.toml".into(),

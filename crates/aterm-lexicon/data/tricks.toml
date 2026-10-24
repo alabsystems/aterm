@@ -92,9 +92,9 @@
 #     everyday-word name, list it in its row's `unglued` too.
 #
 # Seed authored with machine assistance; best-effort, extend via PR. New
-# languages are APPENDED as dated groups after English.
+# languages are APPENDED as groups after English.
 
-# ===================== group: en (2026-09-16) =====================
+# ===================== group: en =====================
 # The priority language. Cat-first (the pet is the cursor CAT), with the dog
 # school words a dog-skin owner reaches for (heel, beg, fetch, shake, walkies)
 # and the internet's cat-speak (pspsps, zoomies, loaf, sploot, boop, bap, mlem,
@@ -267,7 +267,7 @@ gated    = false
 cjk      = false
 notes    = "A filler fires NOTHING; it only keeps a pet-directed line pure, so the cost of a common word here is near zero (`go build` is impure at `build`, `for f in ...` at `f`). They exist for the phrases people actually type: `please sit`, `now jump`, `go to sleep kitty`, `whos a good boy`, `such a good girl`, `love you kitty`, `thank you kitty`, `nap time`, `big stretch`, `high five`, `gimme paw`, `wake up`, `good job kitty`. `the` is NOT here: it is how a command turns into a sentence (`stretch the image`) and must end the line's purity. Nor are the words that would hurt someone who presses Enter or that glue ordinary prose together: `yes` (`yes kitty` floods the terminal), `for` (`time for dinner` leaves zsh at a `for>` continuation and `wait for cat to finish` would sit the pet), `then`, `it`, `me`, `i`, `what` (`now play it` would confirm a play)."
 
-# ===================== group: romance (2026-09-17) =====================
+# ===================== group: romance =====================
 # Machine-assisted draft + skeptic pass; best-effort, native review welcome via PR.
 
 # ===== Spanish (es) =====
@@ -1470,7 +1470,7 @@ gated    = false
 cjk      = false
 notes    = "'si us plau' needs 'us' (an English word, but a filler never fires); sisplau is the common one-token spelling; bona carries 'bona nit / bona tarda'; 'jo' omitted (hu purr 'jó'); 'i' (and) relies on the English filler"
 
-# ===================== group: germanic + nordic (2026-09-17) =====================
+# ===================== group: germanic + nordic =====================
 # Machine-assisted draft + skeptic pass; best-effort, native review welcome via PR.
 
 # ===== German (de) =====
@@ -3045,7 +3045,7 @@ gated    = true
 cjk      = false
 notes    = "'hver er ...': 'er' is the English interjection; same role as no/da"
 
-# ===================== group: slavic + eastern europe (2026-09-17) =====================
+# ===================== group: slavic + eastern europe =====================
 # Machine-assisted draft + skeptic pass; best-effort, native review welcome via PR.
 
 # ===== Russian (ru) =====
@@ -5642,7 +5642,7 @@ gated    = true
 cjk      = false
 notes    = "mu (my), sa (you; also a shell command), anna (give: 'anna käpp') are English dictionary tokens; anna is a FILLER to agree with Finnish anna"
 
-# ===================== group: middle east + south asia (2026-09-17) =====================
+# ===================== group: middle east + south asia =====================
 # Machine-assisted draft + skeptic pass; best-effort, native review welcome via PR.
 
 # ===== Arabic (ar) =====
@@ -6844,7 +6844,7 @@ gated    = false
 cjk      = false
 notes    = "டா / டி / மா / பா = address particles after a command; light verbs குடு / கொடு / தா, பண்ணு / செய், போடு / அடி, எடு are fillers; யாரு for 'யாரு நல்ல பையன்?'. SKEPTIC: நேரம் dropped."
 
-# ===================== group: east + south-east asia, africa (2026-09-17) =====================
+# ===================== group: east + south-east asia, africa =====================
 # Machine-assisted draft + skeptic pass; best-effort, native review welcome via PR.
 
 # ===== Chinese (zh) =====

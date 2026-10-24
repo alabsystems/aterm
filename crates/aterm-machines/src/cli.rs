@@ -17,7 +17,8 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-/// `aterm machines` usage, printed by `--help` and after a refused command line.
+/// `aterm machines` usage, printed by `help`, `-h`/`--help`, a bare `aterm machines`, and
+/// after the reason line of a command line this module refuses.
 pub const USAGE: &str = "\
 aterm machines — configure and manage a lab of Macs from this Mac over SSH, with no MDM
 and no Apple account.
@@ -37,7 +38,7 @@ SET UP
                               Macs on the LAN: Bonjour's Remote Login, SFTP and Screen
                               Sharing advertisements, and port 22 across a subnet (a /22
                               at most)
-    enroll [<address>…] [--found] [--user <admin>] [--parallel N]
+    enroll <address>…|--found [--user <admin>] [--parallel N]
     enroll <address> [--user <admin>] [--name <n>] [--fingerprint <fp>]
                               install the agent on Macs, at a terminal: you type the
                               admin's password once for every Mac (held in memory and
@@ -52,9 +53,11 @@ SET UP
                               by the tag its Local hostname starts with (m10 of
                               m10-MacBook-Pro-M4-Max-36GB-1TB), or by --name
     unenroll <host> [--unreachable]
-                              remove the agent, the Mac's GitHub keys and its entry
-                              (--unreachable: without contacting a Mac that no longer
-                              answers, so its agent stays on it)
+                              at a terminal: remove the agent and the Mac's GitHub keys,
+                              unpin its host key and retire its entry (machines.toml
+                              keeps its [[host]] block as a comment); --unreachable:
+                              without contacting a Mac that no longer answers, so its
+                              agent stays on it
     rename <host> <new-name>  set or change a host's name in machines.toml, enrolled or
                               not (alias: name)
 
@@ -74,12 +77,12 @@ LOOK
                               (--by-item: each item's outcomes counted across hosts)
     outstanding               failures, refusals, person steps, deferred items, what an
                               apply left for a login or restart, hosts whose macOS
-                              changed, hosts only --only runs reached, and unreached
-                              hosts, as one to-do list
+                              changed, hosts only --only runs reached, hosts never
+                              planned or applied, and unreached hosts, as one to-do list
 
 CHANGE
     plan  [<host>…|--all] [--now] [--parallel N] [--only <table>,…] [--json]
-    apply [<host>…|--all] [--now] [--parallel N] [--only <table>,…] [--json]
+    apply <host>…|--all [--now] [--parallel N] [--only <table>,…] [--json]
                               bring hosts to their baseline (plan changes nothing, and
                               naming no host plans them all); apply first upgrades an
                               agent that is not this aterm's build, and the default
@@ -90,9 +93,11 @@ CHANGE
                               just those baseline tables (apply --all --only names
                               renames the fleet), and status keeps the other tables'
                               last results
-    attach <host> [<run>]     follow a run whose connection dropped
+    attach <host> [<run>] [--json]
+                              follow a run whose connection dropped
     run <host>…|--all [--user <u>] [--parallel N] -- <argv>
-                              run one program (no shell) as root, or as the account <u>
+                              run one program by its absolute path (no shell, no PATH
+                              lookup) as root, or as the account <u>
     github login              store the [github] machine user's token in the login
                               keychain (typed, not echoed) once GitHub signs it in as
                               that account with the admin:public_key scope
@@ -105,8 +110,9 @@ CHANGE
                               once a host takes it
 
 PEOPLE
-    person [<host>…|--all]    the switches only a person can flip (Full Disk Access,
-                              Developer Tools, Screen Sharing), by step
+    person [<host>…|--all]    the switches only a person can flip (Remote Login and its
+                              full disk access for remote users, Screen Sharing, Full
+                              Disk Access, Developer Tools), by step
     person <host> --here      at that Mac's keyboard: open each pane in turn and wait
                               for the switch
     screen <host> [<step>]    the same over Screen Sharing, carried by the fleet's SSH
@@ -123,8 +129,10 @@ that does not answer there is looked for at its Local hostname (lab-07.local), a
 there only when ssh answers under its pinned host key.
 
 Exit status: 0 nothing failed; 1 something failed (an unreadable inventory, a host that
-refused contact or a run); 2 nothing failed but some hosts could not be reached, or the
-command line was refused. `aterm machines help enroll` is the checklist for each Mac;
+refused contact or a run; for enroll and unenroll, also a Mac they could not reach); 2
+nothing failed but some hosts could not be reached, or the command line was refused.
+scan exits 0 even when it cannot read the inventory (each Mac then shows ?), and rename
+exits 2 on any error. `aterm machines help enroll` is the checklist for each Mac;
 `aterm help machines` has the manual.
 ";
 

@@ -43,7 +43,7 @@ pub struct Fork {
     pub name: String,
     /// The upstream version the fork keeps, so the existing `^` requirements still resolve.
     pub version: String,
-    /// Repo-relative directory (`vendor/indexmap`).
+    /// Repo-relative directory, under `vendor/` (`vendor/<name>`).
     pub path: String,
     /// The SPDX expression from the vendored manifest, verbatim.
     pub license: String,

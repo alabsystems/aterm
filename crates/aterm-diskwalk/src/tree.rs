@@ -90,7 +90,7 @@ pub struct DirRec {
     pub depth: u16,
     /// The files directly in it, and its own allocation.
     pub own: Sums,
-    /// It and everything under it ([`Self::complete`]).
+    /// It and everything under it; a lower bound while not [`Self::complete`].
     pub subtree: Sums,
     /// Entries directly in the directory.
     pub direct_entries: u32,

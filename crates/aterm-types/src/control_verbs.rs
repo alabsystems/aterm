@@ -582,7 +582,7 @@ const fn bytes_eq(a: &[u8], b: &[u8], len: usize) -> bool {
 }
 
 /// The budget for the short catalog's rows put together (every [`catalog_lines`] row, `\n`-terminated).
-pub const SHORT_CATALOG_MAX_BYTES: usize = 13874;
+pub const SHORT_CATALOG_MAX_BYTES: usize = 13927;
 
 /// The `subscribe` stream vocabulary: frame sources, then the two modifiers.
 pub const SUBSCRIBE_STREAMS: &[&str] = &[
@@ -895,15 +895,16 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         AnyScopeMeta,
         "privacy [--json]: the macOS consent posture behind EPERM",
-        "— instance-wide (no `@<sel>`; `--headless` answers it); reading raises no dialog. `OK \
-         <n>` then rows: `schema=1`; `platform= os=`; `bundle_id= display_name= signing= team= dr= \
-         grant_stable= dev_build=`; `install= running= anchor=`; `full_disk_access= probe= \
-         probe_age_ms= fda_scope=`; `covers=`, `uncovered=`, `unmeasured=`; `folder \
-         <name>=<state>… source=`; `claimants=<n|-> conflicting=<n|-> \
-         census=<complete|partial|unavailable|pending|off> [sole=<yes|no>] [age_ms=<n>]` and up to \
-         8 `claimant path= signing= dr= team= conflicts=yes \
-         trash=<offered|signature|requirement|linked|running-unstable|no-tool>` rows (then \
-         `claimant truncated=<m> of=<total>`); `prompt_possible=`; `attribution_root= \
+        "— instance-wide (a selector other than `@self` is refused; `--headless` answers it); \
+         reading raises no dialog. `OK <n>` then rows: `schema=1`; `platform= os=`; `bundle_id= \
+         display_name= signing= team= dr= grant_stable=<yes|no> dev_build=<true|false>`; \
+         `install= running= anchor=`; `full_disk_access= probe= probe_age_ms= fda_scope=`; \
+         `covers=`, `uncovered=`, `unmeasured=`; `folder <name>=<state>… source=`; \
+         `claimants=<n|-> conflicting=<n|-> census=<complete|partial|unavailable|pending|off> \
+         [sole=<yes|no>] [age_ms=<n>]` and up to 8 `claimant path= signing= dr= team= \
+         conflicts=yes trash=<offered|signature|requirement|linked|running-unstable|no-tool>` \
+         rows (then `claimant truncated=<m> of=<total>`, and a `note <pct>` when any copy \
+         conflicts); `prompt_possible=`; `attribution_root= \
          sessions_total= sessions_adopted=` and one `session sid= attribution= responsible_pid= \
          responsible= fs_consent= cwd=` row per readable session; `containment mode= seatbelt= \
          protected=`; `warmup= warmup_last_ms=`; `debugger \
@@ -914,18 +915,25 @@ pub const VERBS: &[VerbSpec] = &[
          grant=<granted|not_granted|unknown> list=<on|off|absent|unknown> list_probe=`; `observer \
          fda= responsible= log= taskport=`; `access_card \
          state=<quiet|asked|opened|granted|declined> asked_at= opened_at= verified_at= renew_at= \
-         needs=`; `remediate fda= files= debugger= devtools=`; then `note <pct>` rows. Free text \
-         is pct-encoded and `-` is unset; an in-flight probe reads `full_disk_access=unknown \
-         probe=pending`. A folder stays `unknown` until aterm sees an access (`allowed`, `denied`, \
-         `asking`, `error`) or a measured grant covers it (`covered-by-fda`; \
-         `source=none|warmup|fda|warmup,fda`); `fda_scope=this_process` covers `app-data` for this \
-         process. `anchor=` is `live`, `displaced`, `deleted`, `not-bundled` or `unknown` \
-         (`displaced` and `deleted` match no grant). Conflicting bundle copies reset TCC grants \
-         when they prompt; `trash=offered` marks a copy Settings ▸ Security can move to Trash. \
-         `devtools`: `state=` is tccd's newest answer within `window_s=`, `list=` the system \
-         `TCC.db` switch, and `grant=` the two joined (newer wins). Only a person changes these, \
-         in System Settings (`remediate` names each page); `devtools hand-over` opens one and \
-         `await consent [kind=debugger]` waits for a change.",
+         needs=`; `remediate fda= files= debugger= devtools=`; then a `note <pct>` when `anchor=` \
+         is `displaced` or `deleted`, and the closing `note <pct>`. `--json` is `OK 1` and one \
+         object of the same facts, nested (`identity`, `folders`, `census`, `sessions`, \
+         `containment`, `warmup`, `debugger`, `devtools`, `access_card`, `observers`, \
+         `remediate`), with `grant_unverifiable` for a `displaced` or `deleted` anchor and only \
+         the closing `note`. Free text is pct-encoded and `-` is unset; an in-flight probe reads \
+         `full_disk_access=unknown probe=pending`. A folder stays `unknown` until the warm-up \
+         asks macOS for it (`asking`, then `allowed`, `denied` or `error`) or a measured grant \
+         covers it (`covered-by-fda`; `source=none|warmup|fda|warmup,fda`); \
+         `fda_scope=this_process` covers `app-data` for this process. `anchor=` is `live`, \
+         `displaced`, `deleted`, `not-bundled` or `unknown` (`displaced` and `deleted` match no \
+         grant). Conflicting bundle copies reset TCC grants when they prompt; `trash=offered` \
+         marks a copy Settings ▸ Security can move to Trash. `devtools`: `state=` is tccd's \
+         newest answer within `window_s=`, `list=` the system `TCC.db` switch, and `grant=` the \
+         two joined (the newer wins, the switch when a time is missing; `list=absent` is \
+         `not_granted`). Only a person changes these, at the places `remediate` names: \
+         `settings:<pane>` is a System Settings pane, `aterm-settings:<page>` a page of aterm's \
+         Settings (the debugger's is Settings ▸ Security); `devtools hand-over` opens the \
+         Developer Tools pane and `await consent [kind=debugger]` waits for a change.",
     )
     .json(Json::Emits),
     v(
@@ -1230,8 +1238,11 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Lines,
         Session,
-        "shell-integration command blocks (exit codes, command text, state)",
-        "",
+        "blocks [<n>]: shell-integration command blocks (exit codes, command text, state)",
+        "— the newest `<n>` (default all), oldest first, one `block <id> \
+         <prompt|entering|executing|complete> exit=<n|-> prompt=<row> cmd=<row|-> out=<row|-> \
+         end=<row|-> cwd=<pct> cmdline=<pct>` row each; `--json` adds the command's column \
+         (`cmdcol`).",
     )
     .json(Json::Emits),
     v(
@@ -1382,10 +1393,10 @@ pub const VERBS: &[VerbSpec] = &[
          resolves that open digest entry only while its key and confirmation (`id` and `rev` from \
          its `messages need=later live` row) still match (`OK settled=<id|-> \
          how=<resolved-ok|gone>`); an entry repeated, changed, replaced or filed since that \
-         observation is left alone. \
-         The token is independent of UI revisions; an exhausted token refuses settlement. A \
-         dismissal is never forgotten. `notice dismiss <id|review>` dismisses a row or files the \
-         open exceptions; `notice act <id> <label|index|details>` presses a button (`OK \
+         observation is left alone, and a relaunch or update gives every open entry a new `rev`. \
+         `rev` is independent of UI revisions; an exhausted `rev` never settles (`how=gone`). \
+         Settling never forgets a dismissal. `notice dismiss <id|review>` dismisses a row or \
+         files the open exceptions; `notice act <id> <label|index|details>` presses a button (`OK \
          acted=<label> performed=<1|0>`). Titles <= 6 words / 48 chars; keys `1..=40` of \
          `[a-z0-9._-]` (stored as `wire.<key>`); built-in tags are reserved (use `script` or \
          your own). Limits: 3 live wire rows, 60 messages or 16 KiB a minute, 10 acts a minute \
@@ -1458,9 +1469,12 @@ pub const VERBS: &[VerbSpec] = &[
          journal_resident_bytes=<n> rings_back_in_ms=<-|n>`: the last OS memory-pressure level \
          (`-` before any), the sessions journaling a crash-restore region, the history rings \
          shed under `warn`/`critical` (the screen still restores; scrollback above the keyframe \
-         does not), their resident bytes, and the ms until the next shed ring returns (a \
-         session's `status` says `journal_ring=<live|shedding|shed> journal_bytes=`). `pressure \
-         normal|warn|critical` injects a level on macOS (`dev-seams` builds).",
+         does not), the resident bytes of every crash-restore region, and the ms until the next \
+         shed ring returns (a session's `status` says `journal_ring=<live|shedding|shed> \
+         journal_bytes=`). `pressure normal|warn|critical` injects that level on macOS (debug or \
+         `dev-seams` builds) as the OS's would: `warn`/`critical` also evict every session's \
+         in-memory scrollback down to a fraction of its budget, and `critical` retires the warm \
+         spare.",
     )
     .input(Input::NONE),
     v(
@@ -1487,9 +1501,10 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "card [seed=<u64>|seed=off]: pin the card's stars (debug builds)",
-        "— bare `card` answers `OK seed=<u64|off>`. `card seed=<u64>` pins every agent card's \
+        "— a release build answers every form `ERR card needs a debug build`. Bare `card` \
+         answers `OK seed=<u64|off> rearmed=0`. `card seed=<u64>` pins every agent card's \
          starfield to that seed and re-arms visible cards (`OK seed=<u64|off> rearmed=<cards>`); \
-         `card seed=off` restores per-session seeding. Pinning requires a debug build.",
+         `card seed=off` restores per-session seeding.",
     )
     .input(Input::NONE),
     v(
@@ -1502,17 +1517,19 @@ pub const VERBS: &[VerbSpec] = &[
         "— hosts the front window's typing-momentum glow as an Aos task. `aos [status]` answers \
          `OK window=<id> attached=<bool> code=<name> …` (revision, pause queue, trace cursor, \
          hot/active/settling flags, `cold_at=`, last wake and boundary counters). `aos attach \
-         [code=<shipped|demo-stranded-settle>]` checkpoints the glow and records keys, frames and \
-         scheduler queries; `aos pause` holds at the step boundary; `aos repair [code=<name>]` \
-         shadow-replays live and candidate code over the trace and swaps the candidate in only \
-         when live matches the paused head and the candidate keeps \
-         `momentum-glow.no-stranded-light` (else the old code resumes); `aos publish plan=<24 hex>` \
-         judges a 12-byte schedule plan under the pinned acceptance policy and publishes it at the \
-         step boundary (pausing first) only if it is admitted and, over the shipped code, useful \
-         (`useful=`, `gain_ppm=`, `bundle=`); `aos bundle` exports the live plan's candidate \
-         bundle (`bundle=<digest> rev= bytes= hex=`); `aos resume` drops a pending update; `aos \
-         detach` stops hosting; `aos trace` reports the log length, the trace and checkpoint \
-         digests and the broken flag, and `aos trace hex` adds the exported trace file's bytes.",
+         [code=<shipped|demo-stranded-settle>]` checkpoints the glow and records keys, resets, \
+         frame ticks and scheduler queries; `aos pause` holds at the step boundary; `aos repair \
+         [code=<name>]` shadow-replays live and candidate code over the trace and swaps the \
+         candidate in only when live matches the paused head and the candidate keeps \
+         `momentum-glow.no-stranded-light` (on a refusal a glow the repair paused resumes on the \
+         old code, and one `aos pause` held stays paused, as for `aos publish`); `aos publish \
+         plan=<24 hex>` judges a 12-byte schedule plan under the pinned acceptance policy and \
+         publishes it at the step boundary (pausing first) only if it is admitted and, over the \
+         shipped code, useful (`useful=`, `gain_ppm=`, `bundle=`); `aos bundle` exports the live \
+         plan's candidate bundle (`bundle=<digest> rev= bytes= hex=`); `aos resume` drops a \
+         pending update; `aos detach` stops hosting; `aos trace` reports the log length, the \
+         trace and checkpoint digests and the broken flag, and `aos trace hex` adds the exported \
+         trace file's bytes.",
     )
     .forms(&[form(AnyOf(&["status", "trace"])).op(Read)])
     .input(Input::NONE),
@@ -1523,14 +1540,16 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "login-notice [<code> [<label>]|disk [spent|inodes|off]|end|back]: harness login notices",
-        "— `dev-seams` builds. Bare, lists `OK notices=<code>:<id>,…`, the Claude Code login, \
-         renewal and account notices (`aterm help harness`). `login-notice <code> [<label>]` \
+        "— bare, lists `OK notices=<code>:<id>,…`, the Claude Code login, renewal, account and \
+         usage-limit notices (`aterm help harness`); the other forms need a debug or \
+         `dev-seams` build. `login-notice <code|id> [<label>]` \
          (label `main` by default) raises that notice on the first tab (`account-signed-out` and \
          `renewal-wrong-account` update the accounts line). `login-notice disk \
          [spent|inodes|off]` raises the disk-full alert (`spent`: after cache cleanup; \
          `inodes`: inodes exhausted; `off`: `[disk] auto_free_gib = 0`). `login-notice end` \
          withdraws the notices; `login-notice back` marks the login restored and closes its \
-         Settings ▸ Messages row. Replies `OK sid=<tab> notice=<id|disk-full|end|back>`.",
+         Settings ▸ Messages row. Replies `OK sid=<sid> notice=<id|disk-full|end|back>`, the \
+         first tab's session.",
     )
     .input(Input::NONE),
     v(
@@ -1668,7 +1687,8 @@ pub const VERBS: &[VerbSpec] = &[
         Bytes,
         Session,
         "temporal [status|<tick>] [trim]: the screen reconstructed at a past instant",
-        "— a replay needs `temporal_recording = true` (`ERR temporal: this session is not \
+        "— `<tick>` is µs since the session started (default: the latest recorded instant); a \
+         replay needs `temporal_recording = true` (`ERR temporal: this session is not \
          recording; …`). `temporal status` answers `enabled= latest_tick= \
          reachable_from=<tick|-> keyframes= live_events= dropped_events= lost_resizes= \
          dropped_input= dropped_replies= pending_resizes=` (`reachable_from=-`: nothing \
@@ -1751,7 +1771,8 @@ pub const VERBS: &[VerbSpec] = &[
         "resources", Read, Lines, Session,
         "resources [capabilities|register]: delegated job ownership and current usage",
         "— bare: `OK <n> resources version=1`, then this session's registered jobs (pid and start \
-         identity, AI and job labels, `cpu_cores`, physical bytes, `sample=complete`). \
+         identity, AI and job labels, `cpu_cores`, physical bytes, `procs=`, `age_ms=`, \
+         `sample=complete|unavailable`). \
          `resources capabilities` answers `OK resources version=1 available= self_register= \
          group_signals= runner= ai= session=`. `resources register start=<kernel-start> \
          [ai=<word>] job=<pct label>` (local, Owner-only) binds the caller's kernel peer pid for \
@@ -1790,7 +1811,7 @@ pub const VERBS: &[VerbSpec] = &[
          scheme_from=<theme|program> bg_dark= session_theme= theme_origin=` (`conpty=` on \
          Windows). Input and host: `integration=<on|off|degraded> \
          input=<clear|pending|typeahead|stalled|stopped|-> input_bytes= input_wait_ms= \
-         fg_rss_mb= disk=<ok|warn|critical|-> disk_free_mb= disk_room_mb= disk_age_ms= \
+         fg_rss_mb= disk=<ok|low|short|emergency|-> disk_free_mb= disk_room_mb= disk_age_ms= \
          job=<verdict|none> job_quiet_ms= syspolicyd=<-|ok|full|stuck> syspolicyd_workers= \
          syspolicyd_full_ms= occupancy=<off|observe|prompt> \
          occupancy_hold=<declared|undeclared|none> ready= slots= idle_ready_min=` (`occupancy \
@@ -1813,12 +1834,13 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "timeline [<n>] [since=<id>]: the session EVENT TIMELINE",
-        "— one `event <id> t=<ms> kind=<k> ...` line per event, a view of the session `log` (its \
-         newest rows, up to 512 or 64 KiB; ids carry across a seamless update, marked by a \
-         `handoff` row). Kinds: `spawned`, `state-change` (`state=`), `title-change`, \
-         `cwd-change`, `meta-change`, `agent-change`, `task-change` (`rev= state= \
-         attention=<0|1> [why=] [exit=]`), `status-change` (`phase= outcome= exit_code= signal= \
-         confidence=`), `human`, `harness-policy` (`gen=`), `job-change`, `modes-restored` \
+        "— one `event <id> t=<ms> kind=<k> ...` line per event, a view of the session `log` \
+         (every row it still holds, its newest 512 or 64 KiB evicted last; ids carry across a \
+         seamless update, marked by a `handoff` row). Kinds: `spawned`, `state-change` \
+         (`state=`), `title-change`, `cwd-change`, `meta-change`, `agent-change`, `task-change` \
+         (`rev= state= attention=<0|1> [why=] [exit=]`), `status-change` (`phase= outcome= \
+         exit_code= signal= confidence=`), `human`, `harness-policy` (`gen=`), `job-change`, \
+         `modes-restored` \
          (`from=<pgid> to=<pgid> program=<name|-> reverted=<csv> bytes=<n>` or `reason=manual \
          source=<ctl|menu> reverted=<csv|-> bytes=<n>`), the fabric's `hold`, `inbox`, \
          `inbox-seen`, `post`, `fetch`, `post-landed` and `topic`, `render` (`desync-risk \
@@ -2012,7 +2034,9 @@ pub const VERBS: &[VerbSpec] = &[
          [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] \
          [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] \
          [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] \
-         [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>]`. `presses=<n>` (default 3, max \
+         [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>]`; they end at `--` or the first \
+         word that is not one of them (text that starts `<option>=` needs the `--`). \
+         `presses=<n>` (default 3, max \
          10) retries the submit within `submit_window=<ms>` (default 2000). `settle=match:<re>` \
          settles when a visible row matches; `settle=gone:<re>` waits for `<re>` to appear \
          within `submit_window` and then leave (an idle settle when it never shows); \
@@ -2066,8 +2090,9 @@ pub const VERBS: &[VerbSpec] = &[
          `acquire` refuses a live `turn` or another holder's live lease (renews for the same \
          holder); `here` binds the lease to the requesting connection so it releases on \
          disconnect. Advisory by default (`turn` checks it); `hard` (`status` `hard=1`) refuses \
-         every other connection's `send`/`key`/`ctrl`/`feed`/`mouse`/`paste`/`turn`/`feed-bin` \
-         with `ERR busy lease=<holder>`. `status` also reports `pid=<n>` (peer PID of the \
+         every other connection's \
+         `send`/`key`/`ctrl`/`feed`/`mouse`/`paste`/`paste-bin`/`turn`/`feed-bin` with `ERR busy \
+         lease=<holder>`. `status` also reports `pid=<n>` (peer PID of the \
          acquiring local connection). Never blocks physical keyboard input and does not cross a \
          seamless update.",
     )
@@ -2078,7 +2103,8 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "write text to the PTY; reply `OK seq=<n>`",
-        "— `seq=<n>` is the content baseline (`await seq <n+1>` waits for resulting output). \
+        "— `seq=<n>` is the content baseline (`await seq <n+1>` waits for resulting output). A \
+         trailing `\\n` (backslash, n) is written as Enter (CR); no other escape is decoded. \
          Leading options (before `--`): `[id=<epoch>:<producer>:<seq>] [if=<re>] \
          [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] [if-supervisor=<holder>] \
          [unread=ok] [cause=@<off>|<seq>] [act=approve|deny|answer] [as=person]`. `id=` (shared \
@@ -2093,8 +2119,8 @@ pub const VERBS: &[VerbSpec] = &[
          `act=approve|deny|answer` tags the dismissed approval/question box in `log` \
          (`out=approved|declined|answered` for harness, `out=passed by=<actor>` otherwise, \
          `re=<box>`, rate-limited with `dropped=<n>` / `pool=shared` on `mark - input verb= \
-         by=`). `as=person` (debug / `dev-seams` only, with no other option) routes through the \
-         human input seam (`status human_ms=` / `human_seq=`).",
+         by=`). `as=person` (debug / `dev-seams` only; no fence, `id=`, `act=` or `cause=` beside \
+         it) routes through the human input seam (`status human_ms=` / `human_seq=`).",
     )
     .input(
         DRIVEN
@@ -2221,10 +2247,10 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         Session,
-        "mouse <action> <button> <row> <col> [mods=] [count=]: a mouse event",
+        "mouse <action> [<button>] <row> <col> [mods=] [count=]: a mouse event",
         "— `<action>` is `press|release|move|wheelup|wheeldown|wheelleft|wheelright`, `<button>` \
-         `left|middle|right|back|forward`; trailing `[mods=..] [count=N] [side=left|right] \
-         [block=0|1] [lines=N]`.",
+         `left|middle|right|back|forward` (only `move` may leave it out: no button held); \
+         trailing `[mods=..] [count=N] [side=left|right] [block=0|1] [lines=N]`.",
     )
     .input(DRIVEN.with(Input::STAMPS_SEQ)),
     v(
@@ -2279,7 +2305,8 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "select region / word <r> <c> / line <r> / block <r1> <c1> <r2> <c2> / extend / clear",
+        "select <r1> <c1> <r2> <c2>|word <r> <c>|line <r>|block <r1> <c1> <r2> <c2>|extend <r> \
+         <c>|clear",
         "— `extend <r> <c>` grows the selection (shift-click). `word` and `line` select across \
          soft wraps (not ragged double-width ones) up to hard newlines. Made on a whole frame as \
          `text` reads one; `OK frame=open` when one is still unfinished.",
@@ -2430,7 +2457,8 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "settings [open|close|toggle|section <name>]; `settings set|unset <key> [value...]`",
-        "— `set` and `unset` write `aterm.toml`, answering `OK saved: <key> = <value>`, `OK \
+        "— bare `settings` is `toggle`. `set` and `unset` write `aterm.toml`, answering `OK \
+         saved: <key> = <value>`, `OK \
          removed: <key>; now <effective>` (an unset, or a set to the key's default) or `OK <key>: \
          unchanged`.",
     )
@@ -2685,8 +2713,8 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "await <idle|seq|match|gone|block|frame|inbox|consent|momentum|agent|task|log|sys> …: \
-         wait",
+        "await <idle|seq|match|gone|block|frame|inbox|consent|momentum|agent|task|log|sys|edit> \
+         …: wait",
         "— blocks on a condition (`timeout=` default 30000 ms, 300000 for `await consent`, max \
          600000; `OK timeout` exits 124 in `aterm ctl`; `ERR exited` when the session ends; 64 \
          waits at once across tabs, then `ERR control server busy`). `await idle <ms>`: no \
@@ -2700,27 +2728,31 @@ pub const VERBS: &[VerbSpec] = &[
          gpu<10% throttle=none swap<1MB/s`, a term it cannot measure dropped as \
          `skipped=<metric>:<why>` (`OK sys <metric>=<value> … held_ms= as_of= next=`, a `job=` \
          term's reading `job=<id> verdict= class= [wait=] [quiet_ms=] [phi=] [exit=]`; `ERR \
-         unavailable <metric> why=<…>`, `ERR gone job=<id>`). On a volume, `free>=<size>`, \
-         `free>=room` (`status disk_room_mb=`) or `disk=<word>[,…]` `[vol=<path>]` first frees \
-         unused build caches (`OK sys free_bytes= disk= vol= freed_bytes= held_ms=0 as_of=`, \
-         `ERR unmet free_bytes= need_bytes= vol= freed_bytes= \
-         why=<spent|held-back|cleanup-off|settings|not-reclaimed> hogs= largest_bytes=`, or \
-         `ERR unavailable free why=<…>`). `await momentum <floor 0..=1>`: `trail status \
-         momentum=` falls to `<floor>` (`OK momentum <v>`). `await inbox [since=<id>] \
-         [re=<off>] [topic=<t>] [kinds=<k,...>]`: an inbox row past `since=` of those kinds, a \
-         reply to `re=<off>` (an `ack … verdict=` wakes it), a `post to=say:<t>` broadcast, or a \
-         `hold` change (`OK inbox <id>`, `OK inbox hold=0|1`; `ERR bad since high=<n>`). `await \
+         unavailable <metric> why=<…>`, `ERR gone job=<id>`). On a volume, one or two of \
+         `free>=<size|room>`, `free><size|room>` (`room` is `status disk_room_mb=`) or \
+         `disk=<word>[,…]` joined by `and`, `[vol=<absolute path>]`: for an owner-class caller \
+         an unmet `free` term first frees unused build caches (`disk=` alone only waits) (`OK \
+         sys free_bytes= disk= vol= freed_bytes= held_ms=0 as_of=`, `ERR unmet free_bytes= \
+         need_bytes= vol= freed_bytes= why=<spent|held-back|cleanup-off|settings|not-reclaimed> \
+         hogs= largest_bytes= [key=idle_build_dirs]`, or `ERR unavailable free why=<…>`). \
+         `await momentum <floor 0..=1>`: `trail status momentum=` falls to `<floor>` (`OK \
+         momentum <v>`). `await inbox since=<id>|re=<off> [topic=<t>] [kinds=<k|hold,...>]`: \
+         an inbox row past `since=` of those kinds, a reply to `re=<off>` (an `ack … verdict=` \
+         wakes it), a `post to=say:<t>` broadcast, or, with `hold` among `kinds=`, a `hold` \
+         change (`OK inbox <id>`, `OK inbox hold=0|1`; `ERR bad since high=<n>`). `await \
          agent <word>[,<word>…] [since=<rev>]`: `status agent=` is one of \
          `busy|prompt|question|idle|survey|unknown|-|wall|wall:<kind>` at a `rev` past \
          `since=`, such as a `settle=submitted` turn's `agent_rev=` (`OK agent <word> \
          rev=<n>`). `await task [@<sel>[:<rev>][,...]] [any|all] [since=<rev>]`: a `task` `rev` \
          past `since=` (`OK <n>`, or `OK <n> status=timeout`, then `@<sid> rev=<n> \
          state=<working|done|exited|stalled|-|closed> agent=<word> attention=<pct|-> \
-         result_bytes=<n>` rows). `await consent [kind=debugger] [timeout=<ms>]`: `privacy` \
-         `fs_consent= fda= attribution=` (or `debugger_mode=`) moves from where it stood (`OK \
-         consent … elapsed_ms=`). `await log need|open=<lvl>|close=<lvl>|kind=<k> [since=<seq> \
-         ep=<e>]` (`<lvl>` in `session|run|turn|step`, also `out=fail` and `conf=claim`; \
-         `status log_seq= log_ep=`): `OK seq=<n> ep=<e> [as_of=<head> latched=1] \
+         result_bytes=<n>` rows). `await consent [kind=debugger] [timeout=<ms>]`: this session's \
+         consent (`privacy`'s `full_disk_access=` and its `session` row's `fs_consent=` and \
+         `attribution=`; with `kind=debugger`, `debugger mode=`) differs from the first completed \
+         reading (`OK consent fs_consent= fda= attribution= elapsed_ms=`, or `OK consent \
+         debugger_mode= elapsed_ms=`). `await log need|open=<lvl>|close=<lvl>|kind=<k> \
+         [since=<seq> ep=<e>]` (`<lvl>` in `session|run|turn|step`, also `out=fail` and \
+         `conf=claim`; `status log_seq= log_ep=`): `OK seq=<n> ep=<e> [as_of=<head> latched=1] \
          [gap=<why>:<lost>] <record>` or `OK gap why=<w> lost=<k> resync_to=<seq> ep=<e>`. \
          `await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]` (Owner-only): `OK edit done \
          result=<finished|closed|aborted> saved=<0|1> seq=<n>`, `ERR unknown ticket` or `ERR \
@@ -2747,11 +2779,13 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Push,
         Session,
-        "subscribe @<sel>[,...]|@* <streams> [since=][every-frame]: push \
+        "subscribe [@<sel>[,...]|@*] <streams> [since=][every-frame]: push \
          DELTA/EVENT/GAP/BYTES/MAIL.",
         "`streams=screen,cursor,cells,bytes,events,mail,log,sessions` (plus inline modifiers \
-         `timestamps`/`ts` for `T <local|*> <t_us>` prefixes and `trim` for `screen,trim`; \
-         resumed via `since=` for content or `since-log=<seq> log-ep=<e>` for `log`; each target \
+         `timestamps`/`ts` for `T <local|*> <t_us>` prefixes and `trim` for `screen,trim`; no \
+         target means `@.`; resumed via `since=<seq>` for content, `since-turn=<id>` and \
+         `since-block=<id>` for `events`' turns and blocks, or `since-log=<seq> log-ep=<e>` for \
+         `log`, an anchor needing a single target; each target \
          acks `sub <local> <sid>[ log_seq=<seq> log_ep=<e>]`; `every-frame` re-reads `cells` on \
          every wake and sends a frame only when it changed). `log` pushes `LOG <local> \
          <record>` (`log:lvl=<session|run|turn|step>` and `log:class=turn` filter) and `GAP \
@@ -2818,12 +2852,12 @@ pub const VERBS: &[VerbSpec] = &[
         "inbox [<n>] [since=<id>] [--peek] [--meta]: this session's message rows",
         "— header: `OK <n> hold=<0|1> holder=<p|-> seen=<id> bus_head=<off> oldest_on_bus=<@off|-> \
          dropped=<n> pending=<n>`, then `msg <id> off=<n> t=<ms> from=<p> kind=<k> \
-         trust=<human|agent|relayed|screen> [re=<n> re-id=<id>] \
+         trust=<human|agent|relayed|screen> [re=<n> [re-id=<id>]] \
          [verdict=<handled|refused|deferred>] [dl=<ms>] [late=1] [demoted=<k>] [via=<p,...>] \
-         len=<n> [more=1] [truncated=1] text=<pct>` (text preview capped at 512 B; use `inbox get \
-         <id>` or `inbox get @<off>` for full bodies; lost bus records below retention return \
-         `ERR retained-from=<floor>` or `ERR no such record`) and queued outbound `post <id> \
-         to=<> kind=<> off=- len=<n> [key=<token>]` rows. `<n>` selects the newest `n` rows above \
+         [topic=<t>] len=<n> [more=1] [truncated=1] text=<pct>` (text preview capped at 512 B; \
+         use `inbox get <id>` or `inbox get @<off>` for full bodies; lost bus records below \
+         retention return `ERR retained-from=<floor>` or `ERR no such record`) and queued \
+         outbound `post <id> to=<> kind=<> off=- len=<n> [key=<token>]` rows. `<n>` selects the newest `n` rows above \
          `since=`; `--peek` leaves rows unlisted and `--meta` omits `text=`.",
     ),
     v(
@@ -2838,8 +2872,9 @@ pub const VERBS: &[VerbSpec] = &[
          through the bridge (`OK <nbytes> off=<n> from=<p> kind=<k> trust=<t> [re=<n>] [dl=<ms>] \
          [demoted=<k>] [via=<p,...>] [verdict=<v>] [truncated=1 len=<n>]` + body; errors: `ERR \
          retained-from=<floor> off=<n>` below `oldest_on_bus=`/`bus_head=` retention, `ERR no such \
-         record off=<n>`, `ERR timeout off=<n>` after 10 s, `ERR fabric <state> off=<n>`, or `ERR \
-         busy` past 8 parked reads).",
+         record off=<n>`, `ERR timeout off=<n>` after 10 s, `ERR fabric <state> off=<n>`, `ERR \
+         fetch failed reason=<why> off=<n>` (a malformed, refused or log-replaced answer), or \
+         `ERR busy` past 8 parked reads).",
     )
     .forms(&[form(AtWord).lane(Wait)]),
     v(
@@ -2867,9 +2902,9 @@ pub const VERBS: &[VerbSpec] = &[
          on `say/<topic>` (`<topic>` in `[a-z0-9][a-z0-9._-]{0,31}`, default `say`) to sessions \
          with `topic add <topic>` (`topic=<t>`). \
          `kind=<ask|answer|task|report|note|ack|control>`. Options before `--`: `[re=<n>] \
-         [dl=<ms>] [via=<p>] [key=<token>] [--wait[=<ms>]] [--wait-ack[=<ms>]] [len=<n>]` (inline \
-         text <= 4 KiB, or `len=<n>` + raw bytes <= 256 KiB; no `to=fleet`). `--wait` (default on \
-         for `ask`/`task`) waits for broker landing (`OK <id> off=<n>`, or `OK <id> off=<n> \
+         [dl=<ms>] [via=<p,...>] [key=<token>] [--wait[=<ms>]] [--wait-ack[=<ms>]] [len=<n>]` \
+         (inline text <= 4 KiB, or `len=<n>` + raw bytes <= 256 KiB; no `to=fleet`). `--wait` \
+         (default on for `ask`/`task`) waits for broker landing (`OK <id> off=<n>`, or `OK <id> off=<n> \
          dup=1` when deduped by idempotency `key=<token>`). `--wait-ack` (`ask`/`task` only) also \
          waits for the recipient's `inbox seen` receipt (`kind=ack re=<off> verdict=<v>` -> `OK \
          <id> off=<n> ack=<verdict> msg=<inbox id>`, `ERR expired id=<n> off=<n>` when `dl=` \
@@ -2923,7 +2958,10 @@ pub const VERBS: &[VerbSpec] = &[
         BridgeOnly,
         "hello lane=<n> [build=<token>]: bridge lane grammar and build handshake",
         "— Bridge-only: records `bridge_lane=` and `bridge_build=` for `fabric status` and \
-         replies `OK lane=<n> build=<b>` (`OK stale=1` to a superseded lane).",
+         replies `OK lane=<n> build=<b>` (`OK lane=<n> build=<b> log=turns` to a `log=turns` \
+         hello, `OK stale=1` to a superseded lane). `refill=<lane,...>` naming `say` says the \
+         bridge refills broadcasts; `log=auto|turns` is its bus mirror's mode (`fabric status \
+         bridge_log=`), and only `log=turns` opens `log-take`.",
     )
     .input(Input::NONE),
     va(
@@ -2964,10 +3002,13 @@ pub const VERBS: &[VerbSpec] = &[
         Bytes,
         Meta,
         BridgeOnly,
-        "outbox [<max>]: drain the queued outbound posts, bodies included",
+        "outbox [<max>] [earlier-receipts=1]: drain the queued outbound posts, bodies included",
         "— Bridge-only peek, up to `<max>` posts or 4 MiB, retiring nothing until `outbox \
          sent`: `OK <nbytes>`, then each `post sid= id= to= kind= … len=<n>` line and its body, \
-         then `receipt sid= rid= off= verdict= kind= from=` and `fetch sid= off=` lines.",
+         then `receipt sid= rid= off= verdict= kind= from=` and `fetch sid= off=` lines, and a \
+         final `more` line when `<max>` or the budget left posts queued. `earlier-receipts=1` \
+         adds the receipts owed for inbox rows from an earlier bus log, each \
+         ending ` log=earlier`.",
     ),
     va(
         "outbox sent",
@@ -3013,7 +3054,9 @@ pub const VERBS: &[VerbSpec] = &[
         "— Owner-only. `fabric status` replies `OK \
          state=<absent|connected|stale|stalled|disconnected> supervised=<0|1> command=<pct|-> \
          argv=<pct|-> reason=<token|-> rtt_ms=<n|-> link_age_ms=<n|-> build=<token> \
-         bridge_lane=<n|-> bridge_build=<token|-> lane_faults=<n>` (`state=` is each session's \
+         bridge_lane=<n|-> bridge_build=<token|-> lane_faults=<n>[ bridge_log=<auto|turns> \
+         mirror=<starting|on|stopped|capped|budget|unretained>[:<reason>]]` (`bridge_log=` and \
+         `mirror=` once the bridge's `hello` said `log=auto|turns`; `state=` is each session's \
          `status fabric=`). `fabric attach [<command...>]` arms the bridge supervisor \
          once per process using the `[fabric] command` in `aterm.toml` or launch argv (`OK \
          attached command=<pct>`, or `ERR fabric no command`, `ERR fabric not configured \
@@ -3065,7 +3108,8 @@ pub const VERBS: &[VerbSpec] = &[
         "survey [facts|content]: each session's program, state, task, prompt, last words and tool",
         "— Owner-only and fleet-readable (`[fleet] allow`). Replies `OK <n>`, an `instance pid= \
          host=<pct> version= sessions=<n> level=<facts|content> cut=<n> at_ms=<unix ms> node=<32 \
-         hex|-> instances=<n>` header, and one `session` row per session: `local= sid= state= \
+         hex|-> instances=<n>[ drive=1]` header (`drive=1`: a fleet reader this machine lets \
+         drive it), and one `session` row per session: `local= sid= state= \
          program=<pct|-> program_kind=<agent|shell|program|-> agent=<word|-> agent_detail=<pct|-> \
          agent_ms=<ms> human_ms=<ms|-> bg=<n|-> task=<state|-> task_rev=<n> task_from=<pct|-> \
          task_ms=<ms|-> model=<pct|-> effort=<pct|-> ctx_left_pct=<n|-> detail=<pct|-> \

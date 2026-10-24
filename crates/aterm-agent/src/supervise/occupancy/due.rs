@@ -11,6 +11,9 @@ use crate::supervise::Guard;
 /// Looks a due line stands untold before it is the tab's `ready-idle` Entry.
 pub const K_LOOKS: i64 = 10;
 
+/// The K of a loop with no K clock (a tape recorded before it had one): no line reaches it.
+pub const K_NEVER: i64 = i64::MAX;
+
 /// Per-key clock tracking how long a due line has stood untold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Due {
@@ -50,7 +53,7 @@ impl<K: Ord + Copy> Default for DueClock<K> {
 }
 
 impl<K: Ord + Copy> DueClock<K> {
-    /// Seeds `key`'s clock from predecessor ledger rows if not already tracked.
+    /// Seeds `key`'s clock from predecessor ledger rows; an earlier seed or clock stands.
     pub fn seed(&mut self, key: K, since_ms: i64) {
         use super::fault::{Fault, armed};
         if armed(Fault::KUnseeded) {
@@ -99,14 +102,33 @@ impl<K: Ord + Copy> DueClock<K> {
         self.keys.get(key)
     }
 
-    /// Returns keys due for at least `k` looks at `now_ms` that are not held by a person.
+    /// Raises each key due for at least `k` looks at `now_ms` unless a person holds it now,
+    /// and returns every raised key, lowest first; a key stays raised while it stays due. A look
+    /// is one step toward the K Entry (`OccupancyDoor`'s `Sample`); the K-th raises it
+    /// (`SampleLast`).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "OccupancyDoor",
+            action = "Sample",
+            project = "conformance_occupancy::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "OccupancyDoor",
+            action = "SampleLast",
+            project = "conformance_occupancy::project"
+        )
+    )]
     pub fn sample(&mut self, k: i64, now_ms: i64) -> Vec<ReadyIdle<K>> {
         use super::fault::{Fault, armed};
         let late = i64::from(armed(Fault::LateRaise));
         let mut raised = Vec::new();
         for (key, due) in &mut self.keys {
             let looks = now_ms.saturating_sub(due.since_ms).max(0) / LOOK_EVERY_MS;
-            if !due.raised && looks >= k + late && due.last != Some(Guard::Person) {
+            if !due.raised && looks >= k.saturating_add(late) && due.last != Some(Guard::Person) {
                 due.raised = true;
             }
             if due.raised {
@@ -118,6 +140,21 @@ impl<K: Ord + Copy> DueClock<K> {
             }
         }
         raised
+    }
+
+    /// The keys raised already, as the last [`Self::sample`] left them, each with the guard
+    /// holding it now: a read that takes no look, so it raises nothing.
+    #[must_use]
+    pub fn standing(&self) -> Vec<ReadyIdle<K>> {
+        self.keys
+            .iter()
+            .filter(|(_, due)| due.raised)
+            .map(|(key, due)| ReadyIdle {
+                key: *key,
+                guard: due.last,
+                since_ms: due.since_ms,
+            })
+            .collect()
     }
 }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 FOR `AutopilotTimer`.
+//! Conformance tests for `AutopilotTimer` against `aterm_models_gui::autopilot_timer_model`.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};

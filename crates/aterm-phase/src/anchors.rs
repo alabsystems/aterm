@@ -1949,6 +1949,26 @@ mod tests {
         assert_eq!(missing_templates(&bytes, &planted), ["planted"]);
     }
 
+    /// `template` with its slots filled by `names` in turn, and where each fill stands.
+    fn filled(template: &str, names: [&str; 4]) -> (String, Vec<std::ops::Range<usize>>) {
+        let mut names = names.into_iter();
+        let (mut out, mut slots) = (String::new(), Vec::new());
+        for (i, piece) in template.split(JS_NAME).enumerate() {
+            if i > 0 {
+                let name = names.next().expect("a name per slot");
+                slots.push(out.len()..out.len() + name.len());
+                out.push_str(name);
+            }
+            out.push_str(piece);
+        }
+        (out, slots)
+    }
+
+    /// A slot takes the minifier's renaming and no other change: in the limit
+    /// names' switch as 2.1.308 and 2.1.309 spell it, each word changed in
+    /// turn leaves the template whole only where that word is a slot's name,
+    /// and the switch holds no spelling of the template with one of its own
+    /// words changed.
     #[test]
     fn a_minifiers_name_fills_a_templates_slot() {
         let templates = reset_templates();
@@ -1958,16 +1978,12 @@ mod tests {
             .expect("the limit names' switch");
         let names = &spellings[0];
         assert_eq!(names.matches(JS_NAME).count(), 4, "{names:?}");
-        let built = |set: &str, reset: &str| {
-            let mut slots = [set, set, set, reset].into_iter();
-            let mut out = String::new();
-            for (i, piece) in names.split(JS_NAME).enumerate() {
-                if i > 0 {
-                    out.push_str(slots.next().expect("a name per slot"));
-                }
-                out.push_str(piece);
-            }
-            format!("function sr(x){{let s=new Set;for(let _ of x.clears)switch(_){{{out}}}}}")
+        let switch = |set, reset| filled(names, [set, set, set, reset]);
+        let built = |set, reset| {
+            format!(
+                "function sr(x){{let s=new Set;for(let _ of x.clears)switch(_){{{}}}}}",
+                switch(set, reset).0
+            )
         };
         let v308 = built("s", "a");
         let v309 = built("s", "i");
@@ -1990,15 +2006,20 @@ mod tests {
                 "{bad}"
             );
         }
-        let reworded = v309.replace(
-            "\"weekly\");break;case\"seven_day_overage",
-            "\"week\");break;case\"seven_day_overage",
-        );
-        assert_ne!(reworded, v309);
-        assert_eq!(
-            missing_templates(reworded.as_bytes(), &one),
-            ["limit names"]
-        );
+        for (switch, slots) in [switch("s", "a"), switch("s", "i")] {
+            let words = words(&switch);
+            assert!(slots.iter().all(|s| words.contains(s)), "{slots:?}");
+            for (word, changed) in words.iter().zip(reworded(&switch)) {
+                assert_eq!(
+                    missing_templates(changed.as_bytes(), &one).is_empty(),
+                    slots.contains(word),
+                    "{changed}"
+                );
+            }
+            for template in reworded(names) {
+                assert!(!holds(switch.as_bytes(), &template), "{template}");
+            }
+        }
         assert!(holds(b"a.b", "a"), "a template with no slot is a literal");
         assert!(!holds(b"a.b", "c"));
     }
@@ -2011,17 +2032,7 @@ mod tests {
             .find(|(name, _)| *name == "limit names")
             .expect("the limit names' switch");
         let names = &spellings[0];
-        let mut slots = ["s", "s", "s", "i"].into_iter();
-        let switch = names
-            .split(JS_NAME)
-            .enumerate()
-            .fold(String::new(), |mut out, (i, piece)| {
-                if i > 0 {
-                    out.push_str(slots.next().expect("a name per slot"));
-                }
-                out.push_str(piece);
-                out
-            });
+        let (switch, _) = filled(names, ["s", "s", "s", "i"]);
         let decoy = |k: usize| format!("switch(w{k}){{case\"five_hour\":return\"5h\";default:}}");
         let decoys = |range: std::ops::Range<usize>| range.map(decoy).collect::<String>();
         let one = [("limit names", vec![names.clone()])];

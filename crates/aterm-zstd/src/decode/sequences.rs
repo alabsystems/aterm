@@ -14,14 +14,14 @@ use super::error::DecodeError;
 use super::fse::FseTable;
 use super::window::{BlockBuf, Window};
 
-const MAX_LITERAL_LENGTH_CODE: u8 = 35;
-const MAX_MATCH_LENGTH_CODE: u8 = 52;
+pub(crate) const MAX_LITERAL_LENGTH_CODE: u8 = 35;
+pub(crate) const MAX_MATCH_LENGTH_CODE: u8 = 52;
 const MAX_OFFSET_CODE: u8 = 31;
 
-/// Accuracy limits of transmitted tables (RFC 8878 §3.1.1.3.2.2).
-const LL_MAX_LOG: u8 = 9;
-const ML_MAX_LOG: u8 = 9;
-const OF_MAX_LOG: u8 = 8;
+/// Accuracy limits of transmitted tables (RFC 8878 §3.1.1.3.2.1, `FSE_Compressed_Mode`).
+pub(crate) const LL_MAX_LOG: u8 = 9;
+pub(crate) const ML_MAX_LOG: u8 = 9;
+pub(crate) const OF_MAX_LOG: u8 = 8;
 
 /// The predefined distributions (RFC 8878 §3.1.1.3.2.2.1-3).
 pub(crate) const LL_DEFAULT_ACC_LOG: u8 = 6;
@@ -29,18 +29,18 @@ pub(crate) const LL_DEFAULT_DISTRIBUTION: [i32; 36] = [
     4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
     -1, -1, -1, -1,
 ];
-const ML_DEFAULT_ACC_LOG: u8 = 6;
-const ML_DEFAULT_DISTRIBUTION: [i32; 53] = [
+pub(crate) const ML_DEFAULT_ACC_LOG: u8 = 6;
+pub(crate) const ML_DEFAULT_DISTRIBUTION: [i32; 53] = [
     1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
 ];
-const OF_DEFAULT_ACC_LOG: u8 = 5;
-const OF_DEFAULT_DISTRIBUTION: [i32; 29] = [
+pub(crate) const OF_DEFAULT_ACC_LOG: u8 = 5;
+pub(crate) const OF_DEFAULT_DISTRIBUTION: [i32; 29] = [
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];
 
 /// Literal length codes: (base, extra bits) (RFC 8878 §3.1.1.3.2.1.1).
-const LL_CODES: [(u32, u8); 36] = [
+pub(crate) const LL_CODES: [(u32, u8); 36] = [
     (0, 0),
     (1, 0),
     (2, 0),
@@ -80,7 +80,7 @@ const LL_CODES: [(u32, u8); 36] = [
 ];
 
 /// Match length codes: (base, extra bits) (RFC 8878 §3.1.1.3.2.1.1).
-const ML_CODES: [(u32, u8); 53] = [
+pub(crate) const ML_CODES: [(u32, u8); 53] = [
     (3, 0),
     (4, 0),
     (5, 0),
@@ -509,7 +509,7 @@ pub(crate) fn execute(
 /// (RFC 8878 §3.1.2.5). Values 1 to 3 name a repeat offset (shifted by one
 /// when the literal length is zero); larger values are the offset plus 3. A
 /// result of 0 is corrupt input, which the caller refuses.
-const fn resolve_offset(offset_value: u32, lit_len: usize, hist: &mut [u32; 3]) -> u32 {
+pub(crate) const fn resolve_offset(offset_value: u32, lit_len: usize, hist: &mut [u32; 3]) -> u32 {
     let [r0, r1, r2] = *hist;
     if offset_value > 3 {
         let offset = offset_value - 3;

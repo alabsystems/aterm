@@ -1227,7 +1227,7 @@ impl Default for Train {
 pub(crate) enum Step {
     /// A frame presented.
     Frame,
-    /// A key stamped at its press ([`Live`]'s doc says which).
+    /// A key stamped at its press.
     Key,
     /// The program's bytes, processed.
     Out,

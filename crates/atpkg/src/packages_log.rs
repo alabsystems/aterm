@@ -701,7 +701,7 @@ fn is_secret_shaped(word: &str) -> bool {
 
 /// Append `line` to `<dir>/packages.log`, rotating first when `may_rotate` and due.
 /// # Errors
-/// Returns an error if directory creation, rotation, opening, or writing fails.
+/// Returns an error if ensuring the private directory, opening, or writing fails.
 pub fn append_line(dir: &Path, line: &str, may_rotate: bool) -> io::Result<()> {
     aterm_types::fs_restricted::ensure_private_dir(dir)?;
     let path = dir.join(LOG_NAME);

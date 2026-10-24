@@ -1954,11 +1954,9 @@ pub struct Session<'a, C: Ctl> {
     first_books: bool,
     books_last_ms: Option<i64>,
     pub(super) left_keys: Vec<String>,
-    pub(super) repo_seen: Option<(
-        Option<u64>,
-        Instant,
-        Option<crate::harness::repo_work::RepoWork>,
-    )>,
+    pub(super) repo_seen: Option<(Option<u64>, Instant, crate::harness::repo_work::RepoRead)>,
+    /// A fresh repository probe read [`crate::harness::repo_work::RepoRead::Unread`], not yet journaled.
+    pub(super) repo_unread_unsaid: bool,
     pub(super) left_at_wall_seq: Option<u64>,
     box_reason: Option<(String, String)>,
     changed_streak: u32,
@@ -2042,6 +2040,10 @@ pub struct Session<'a, C: Ctl> {
     task_seeded: bool,
     needs_told: Option<u64>,
     needs_told_text: String,
+    /// A needs write lacks acknowledgement; its entry may need restoring or clearing.
+    needs_pending: bool,
+    /// The next metadata-only attempt at an unacknowledged needs write.
+    needs_retry_at: Option<Instant>,
     needs_heard: Option<(u64, String)>,
     reach_seen: Option<Reach>,
     account_seen: Option<(u64, AccountPoint, Option<AccountAdvice>)>,
@@ -2140,7 +2142,7 @@ impl ApprovalEnv {
 }
 
 impl<'a, C: Ctl> Session<'a, C> {
-    /// Constructs a [`Session`] targeting `sid` (`None` for `@self`) with default [`SessionSetup`].
+    /// Constructs a [`Session`] targeting `sid` (`None`: no selector, so the instance's active tab) with default [`SessionSetup`].
     pub fn new(ctl: &'a mut C, sid: Option<String>) -> Self {
         Self::from_setup(ctl, SessionSetup::new(sid))
     }
@@ -2217,6 +2219,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             books_last_ms: None,
             left_keys: Vec::new(),
             repo_seen: None,
+            repo_unread_unsaid: false,
             left_at_wall_seq: None,
             box_reason: None,
             changed_streak: 0,
@@ -2286,6 +2289,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             task_seeded: false,
             needs_told: None,
             needs_told_text: String::new(),
+            needs_pending: false,
+            needs_retry_at: None,
             needs_heard: None,
             reach_seen: None,
             account_seen: None,
@@ -2495,6 +2500,13 @@ impl<'a, C: Ctl> Session<'a, C> {
     #[cfg(test)]
     pub(crate) fn set_person_hold_wait(&mut self, wait: Duration) {
         self.setup.person_hold_wait = Some(wait);
+    }
+
+    /// Overrides how many looks a due line of the occupancy door stands untold before it is said
+    /// ready-idle, in tests.
+    #[cfg(test)]
+    pub(crate) fn set_occupancy_k_looks(&mut self, k: i64) {
+        self.setup.occupancy_k_looks = k;
     }
 
     /// Lets a hold on a box outlast its countdown, the deny cap's negative control.
@@ -5308,7 +5320,12 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(None);
             }
             self.tell_wait(opts);
-            let due = self.due_at().into_iter().chain(self.look_at).min();
+            let due = self
+                .due_at()
+                .into_iter()
+                .chain(self.look_at)
+                .chain(self.needs_retry_at)
+                .min();
             let until = due.map_or(*deadline, |t| t.min(*deadline));
             let now = self.fx.mono();
             let step_cap = opts
@@ -5373,6 +5390,16 @@ impl<C: Ctl> Session<'_, C> {
             }
             if self.fx.mono() >= *deadline {
                 return Ok(Some(End::Timeout(seen)));
+            }
+            let now = self.fx.mono();
+            let policy_due = self.due_at().is_some_and(|at| now >= at)
+                || self.look_at.is_some_and(|at| now >= at);
+            if !policy_due && self.needs_retry_at.is_some_and(|at| now >= at) {
+                self.retry_needs(&seen.screen, opts, review)?;
+                if self.autopilot(opts) == Autopilot::Off {
+                    return Ok(None);
+                }
+                continue;
             }
             if self.look_at.is_some_and(|at| self.fx.mono() >= at) {
                 self.look_at = None;
@@ -5495,6 +5522,17 @@ impl<C: Ctl> Session<'_, C> {
             last,
         );
         self.sleep_unknown = since.unknown();
+    }
+
+    /// Journals a fresh repository probe that did not finish ([`Self::repo_unread_unsaid`]).
+    fn say_repo_unread(&mut self, seq: u64, review: &mut dyn Review) {
+        if std::mem::take(&mut self.repo_unread_unsaid) {
+            review.note(&format!(
+                "REPO UNREAD seq={seq} the repository probe did not finish within {}s: what the \
+                 repository holds is unknown, and no landing is judged clean on it",
+                crate::harness::repo_work::PROBE_LIMIT.as_secs()
+            ));
+        }
     }
 
     fn say_sleep_unknown(&mut self, seq: u64, review: &mut dyn Review) {

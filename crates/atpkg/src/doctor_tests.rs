@@ -2656,7 +2656,10 @@ fn a_refused_directory_on_the_trust_chain_names_its_next_step() {
             ),
             "/tmp",
             Some("1777"),
-            "fix: set [packages].prefix, or HOME, under directories only you can write".to_string(),
+            String::from(
+                "fix: set HOME (or, in a development build, [packages].prefix) under \
+                 directories only you can write",
+            ),
         ),
         (
             refusal("/s/trust/8589/lib", ChainWhy::Redirected),

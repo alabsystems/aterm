@@ -692,7 +692,7 @@ fn lab_vars(run: &Run, user: &str) -> Vec<(String, String)> {
     if run.seam == "1" {
         vars.push(("ATERM_DEBUG_HEADLESS_RESTORE".into(), "1".into()));
     }
-    vars.push(crate::tape::seam());
+    vars.extend(crate::instance::seams());
     vars.extend(crate::clock::vars(run));
     vars
 }
@@ -2289,13 +2289,22 @@ mod tests {
         assert_eq!(get("ATERM_STATE_HOME"), vec!["/s/runs/k1/scratch/state"]);
         assert!(get("ATERM_DEBUG_HEADLESS_RESTORE").is_empty());
         assert_eq!(
+            get("ATERM_DEBUG_SYSTEM_PRESSURE"),
+            vec!["none"],
+            "the host's memory pressure stays out of a lab run"
+        );
+        assert_eq!(
             vars.last(),
             Some(&("TMPDIR".to_string(), "/tmp".to_string()))
         );
         let seam = instance_vars(&recorded("", "1"), "owner").unwrap();
         assert!(seam.contains(&("ATERM_DEBUG_HEADLESS_RESTORE".to_string(), "1".to_string())));
         assert!(!seam.iter().any(|(k, _)| k == "TMPDIR"));
-        for edited in ["HOME=/elsewhere", "ATERM_DEBUG_HEADLESS_RESTORE=1"] {
+        for edited in [
+            "HOME=/elsewhere",
+            "ATERM_DEBUG_HEADLESS_RESTORE=1",
+            "ATERM_DEBUG_SYSTEM_PRESSURE=critical",
+        ] {
             assert!(
                 instance_vars(&recorded(edited, "1"), "owner").is_err(),
                 "{edited}"

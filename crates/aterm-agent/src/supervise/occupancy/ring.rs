@@ -36,7 +36,7 @@ pub struct RingSession {
     pub guard: Option<String>,
 }
 
-/// ONE BOARD LOOK ([module docs](self)).
+/// ONE BOARD LOOK: one row of the ring.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RingRow {
     /// When the board was taken, unix ms.

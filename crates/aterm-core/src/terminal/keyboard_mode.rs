@@ -595,9 +595,8 @@ mod console_host_modify_other_keys_tests {
     //! Behind a Windows console host a native console program's `CSI > 4 ; 2 m`
     //! reaches the terminal (OpenConsole and the inbox conhost both forward it),
     //! and conhost, which reads the key bytes, has no reader for the
-    //! `CSI 27 ; m ; c ~` chords it would ask for: PSReadLine got nothing for
-    //! Shift+A, Ctrl+A/E/K or Alt+B until the level was reset (measured
-    //! 2026-10-18).
+    //! `CSI 27 ; m ; c ~` chords it would ask for: PSReadLine gets nothing for
+    //! Shift+A, Ctrl+A/E/K or Alt+B until the level is reset.
     use crate::grid::ResizePolicy;
     use crate::terminal::Terminal;
     use crate::terminal::program_evidence;

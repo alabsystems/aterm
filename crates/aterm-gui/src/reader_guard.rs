@@ -80,7 +80,7 @@ pub(crate) fn guarded<T>(read: impl FnOnce() -> T) -> Result<T, ReaderPanic> {
 }
 
 /// [`guarded`] for a caller with no answer of its own to degrade to: the value, or — on a panic,
-/// warned once per `session` per location ([`warn_once`], `what` naming the caller).
+/// warned once per `session` per location ([`warn_once`], `what` naming the caller) — `None`.
 pub(crate) fn read_or_none<T>(
     session: impl std::fmt::Display,
     what: &str,

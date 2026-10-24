@@ -58,6 +58,11 @@ fn remapped_at(base: &Path, recorded: &Path) -> PathBuf {
 }
 
 fn watched() -> SessionSetup {
+    watched_with(|_| {})
+}
+
+/// [`watched`]'s setup with `set` applied to its session first.
+fn watched_with(set: impl FnOnce(&mut Session<'_, NoCtl>)) -> SessionSetup {
     let mut ctl = NoCtl;
     let mut s = Session::new(&mut ctl, Some("@s-1".to_string()));
     s.set_approval_env(ApprovalEnv {
@@ -67,6 +72,7 @@ fn watched() -> SessionSetup {
         worker: WorkerSource::Session,
     });
     s.set_approval_ledger(Some(abs("/st/drive/s-1.jsonl")));
+    set(&mut s);
     s.setup().clone()
 }
 
@@ -604,6 +610,7 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
                 "person_hold_wait",
                 "beside_idle_min=",
                 "occupancy.nudge_after=",
+                "occupancy.k_looks=",
                 "wait_step=",
                 "box_call_step=",
                 "turn_end.refused_backoff=",
@@ -627,13 +634,18 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
             "[setup] person_hold_wait",
             "[setup] beside_idle_min",
             "[setup] occupancy.nudge_after",
+            "[setup] occupancy.k_looks",
             "[opts] tasks",
             "[opts] host_doors",
             "[policy] land_at",
             "[policy] codex.enabled",
         ]
     );
-    assert_eq!(back.setup, watched(), "each knob at its shipped value");
+    assert_eq!(
+        back.setup,
+        watched_with(|s| s.set_occupancy_k_looks(crate::supervise::occupancy::due::K_NEVER)),
+        "each knob at its shipped value, and no K clock: the build that wrote it had none"
+    );
     assert_eq!(
         back.opts.policy,
         SupervisorConfig {

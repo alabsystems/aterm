@@ -25,7 +25,8 @@ pub(crate) struct TurnRecord {
     pub dur_ms: u64,
     /// Whether a submit keypress VERIFIABLY landed (content advanced).
     pub submitted: bool,
-    /// The settle verdict: `settled` ([`STATUS_PRESSED`]).
+    /// The settle verdict: `settled`, `timeout` or `hangup`; [`STATUS_PRESSED`] for `send` +
+    /// `key enter` and `turn settle=submitted`.
     pub status: &'static str,
     /// The submitted message, truncated to [`MAX_TEXT`] bytes on a char boundary.
     pub text: Arc<str>,
@@ -70,7 +71,8 @@ impl TurnBy {
         }
     }
 
-    /// A carried record's word as this build names it: one of its own words ([`TurnBy::Unknown`]).
+    /// A carried record's word as this build names it: one of its own words, a sid of the shape
+    /// this build mints, else [`TurnBy::Unknown`].
     #[must_use]
     pub(crate) fn from_wire(word: &str) -> Self {
         match word {
@@ -300,7 +302,8 @@ impl TurnLedger {
         self.unheld_below
     }
 
-    /// Eviction floor ([`TurnLedger::unheld_below`]).
+    /// The live [`TurnLedger::unheld_below`]: `None` when 0, or once the records it lost would
+    /// have aged out of a ledger carried whole.
     pub(crate) fn live_floor(&self) -> Option<u64> {
         let floor = self.unheld_below;
         let aged_out = self.records.len() >= LEDGER_CAP
@@ -354,7 +357,8 @@ impl TurnLedger {
     }
 }
 
-/// A carried record's `status` word as the one this build prints: `settled` ([`STATUS_PRESSED`]).
+/// A carried record's `status` word as the one this build prints: `settled`, `timeout`,
+/// `hangup` or [`STATUS_PRESSED`]; `None` for any other word.
 pub(crate) fn status_word(word: &str) -> Option<&'static str> {
     match word {
         "settled" => Some("settled"),

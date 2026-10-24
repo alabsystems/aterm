@@ -1351,24 +1351,33 @@ impl Witness {
                 self.seen[i].counted = true;
             }
         }
-        let recounted = self
-            .counted_names
-            .iter()
-            .filter(|id| retire.contains(id) || release.contains(id))
-            .count();
+        let recounted = if self.counted_names.is_empty() {
+            0
+        } else {
+            self.counted_names
+                .iter()
+                .filter(|id| retire.contains(id) || release.contains(id))
+                .count()
+        };
         self.find_standing_runs(cells, retire);
         self.released_runs.sort_unstable();
         if !self.retired_runs.is_empty() || !self.released_runs.is_empty() {
+            let mut sample_row: Option<(u16, Option<RowSample<'_>>)> = None;
             for cell in cells {
                 if cell.leaving() || self.find(cell.row, cell.col, cell.born).is_some() {
                     continue;
                 }
                 let run = (cell.row, cell.cohort);
                 if self.retired_runs.binary_search(&run).is_ok() {
-                    let still_blank = rows
-                        .iter()
-                        .find(|s| s.row == cell.row)
-                        .is_some_and(|s| unit_at(s.cols, cell.col).is_blank());
+                    let still_blank = match sample_row {
+                        Some((r, s)) if r == cell.row => s,
+                        _ => {
+                            let s = rows.iter().find(|s| s.row == cell.row).copied();
+                            sample_row = Some((cell.row, s));
+                            s
+                        }
+                    }
+                    .is_some_and(|s| unit_at(s.cols, cell.col).is_blank());
                     if !still_blank || self.standing_runs.binary_search(&run).is_err() {
                         retire.push((cell.row, cell.col, cell.born));
                     }
@@ -1424,14 +1433,16 @@ impl Witness {
                 }
             }
         }
-        for cell in cells {
-            if self
-                .released_runs
-                .binary_search(&(cell.row, cell.cohort))
-                .is_ok()
-                && let Some(i) = self.find(cell.row, cell.col, cell.born)
-            {
-                self.seen[i].restorable = true;
+        if !self.released_runs.is_empty() {
+            for cell in cells {
+                if self
+                    .released_runs
+                    .binary_search(&(cell.row, cell.cohort))
+                    .is_ok()
+                    && let Some(i) = self.find(cell.row, cell.col, cell.born)
+                {
+                    self.seen[i].restorable = true;
+                }
             }
         }
         self.seen.retain(|s| s.live);
@@ -1572,6 +1583,9 @@ impl Witness {
         release: &mut Vec<(u16, u16, Instant)>,
     ) {
         self.shape_runs.clear();
+        if self.retired_runs.is_empty() && self.released_runs.is_empty() {
+            return;
+        }
         self.shape_runs.extend_from_slice(&self.retired_runs);
         self.shape_runs.extend_from_slice(&self.released_runs);
         self.shape_runs.sort_unstable();
@@ -1765,6 +1779,7 @@ impl Witness {
         self.restore_runs
             .sort_unstable_by_key(|r| (r.cohort, r.stamp));
         self.restore_runs.dedup_by_key(|r| (r.cohort, r.stamp));
+        let mut sample_row: Option<(u16, Option<RowSample<'_>>)> = None;
         for cell in cells {
             let Ok(i) = self
                 .restore_runs
@@ -1775,12 +1790,23 @@ impl Witness {
             let seen = self
                 .find(cell.row, cell.col, cell.born)
                 .map(|j| self.seen[j]);
-            let sample = rows.iter().find(|r| r.row == cell.row);
-            let over_released = seen.is_some_and(|s| !s.restorable)
-                && self
+            let sample = match sample_row {
+                Some((r, s)) if r == cell.row => s,
+                _ => {
+                    let s = rows.iter().find(|r| r.row == cell.row).copied();
+                    sample_row = Some((cell.row, s));
+                    s
+                }
+            };
+            let over_released = seen.is_some_and(|s| !s.restorable) && {
+                let start = self
                     .seen
+                    .partition_point(|s| (s.row, s.col) < (cell.row, cell.col));
+                self.seen[start..]
                     .iter()
-                    .any(|s| s.row == cell.row && s.col == cell.col && s.released);
+                    .take_while(|s| (s.row, s.col) == (cell.row, cell.col))
+                    .any(|s| s.released)
+            };
             let run = &mut self.restore_runs[i];
             match (seen, sample) {
                 (Some(seen), Some(sample)) if run.stamp.is_some() => {

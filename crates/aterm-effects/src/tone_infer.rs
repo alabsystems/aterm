@@ -24,7 +24,6 @@ pub struct ToneTracker {
     last_infer: Option<Instant>,
     infer_pending: bool,
     scratch: ToneScratch,
-    text_buf_slot: String,
     /// Total inferences run.
     pub inferences: u64,
 }
@@ -40,7 +39,6 @@ impl Default for ToneTracker {
             last_infer: None,
             infer_pending: false,
             scratch: ToneScratch::default(),
-            text_buf_slot: String::new(),
             inferences: 0,
         }
     }
@@ -141,13 +139,12 @@ impl ToneTracker {
             self.tone = Tone::Technical;
             return;
         };
-        let mut text = std::mem::take(&mut self.text_buf_slot);
-        text.clear();
-        text.extend(self.buf.iter());
-        if let Some(tone) = model.classify_opt(&text, &mut self.scratch) {
+        if self.buf.len() < 3 {
+            return;
+        }
+        if let Some(tone) = model.classify_chars_opt(self.buf.iter().copied(), &mut self.scratch) {
             self.tone = tone;
         }
-        self.text_buf_slot = text;
     }
 }
 

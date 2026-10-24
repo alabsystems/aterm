@@ -1144,7 +1144,7 @@ impl CompanionOwner {
         cues: std::vec::Drain<'_, PeekCue>,
         cell: (u16, u16),
     ) {
-        if !self.last_visible {
+        if !self.last_visible || cues.len() == 0 {
             return;
         }
         let inv_2cw = 0.5 / f32::from(cell.0.max(1));

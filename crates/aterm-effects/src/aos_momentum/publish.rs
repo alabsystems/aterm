@@ -2,6 +2,17 @@
 // Copyright 2026 Andrew Yates
 
 //! Publication of an evaluator-admitted plan over a paused momentum glow (design §10.6, §10.7).
+//!
+//! A result cannot be published twice:
+//!
+//! ```compile_fail,E0382
+//! use aterm_effects::aos_momentum::MomentumHost;
+//! use aterm_effects::aos_momentum::m4::Admitted;
+//! fn twice(host: &mut MomentumHost, admitted: Admitted) {
+//!     let _ = host.aos_publish(admitted);
+//!     let _ = host.aos_publish(admitted);
+//! }
+//! ```
 
 use core::fmt;
 

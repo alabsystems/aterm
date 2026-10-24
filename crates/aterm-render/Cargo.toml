@@ -33,25 +33,23 @@ dev-seams = []
 #   the Nerd Font PUA icons (Devicons / Font Awesome / Material / Powerline-extra /
 #   …) render out of the box with NO installed Nerd Font. Tried last in the
 #   runtime fallback, so any installed/configured face still wins.
-# - The BUNDLED TERMINAL FONT STACK (owner decision, 2026-09-24: the fonts a stock
-#   Linux ships are poor and incomplete, so aterm ships its own). JetBrains Mono
-#   2.304 (Regular/Bold/Italic/BoldItalic, ~1.1MB, OFL-1.1) becomes the DEFAULT
-#   primary when no font is configured, and Noto Sans Symbols 2 + Noto Sans Math
-#   (~1.6MB, OFL-1.1) join the symbol tier ahead of the system faces; the embedded
-#   DejaVu Sans Mono leads the broad fallback tier. On WINDOWS the default primary
-#   is Iosevka Term Semibold instead (a ~2.3MB subset of Iosevka Term 34.9.0's
+# - The BUNDLED TERMINAL FONT STACK (the fonts a stock Linux ships are poor and
+#   incomplete, so aterm ships its own). JetBrains Mono 2.304
+#   (Regular/Bold/Italic/BoldItalic, ~1.1MB, OFL-1.1) is the DEFAULT primary when
+#   no font is configured, and Noto Sans Symbols 2 + Noto Sans Math (~1.6MB,
+#   OFL-1.1) join the symbol tier ahead of the system faces; the embedded DejaVu
+#   Sans Mono leads the broad fallback tier. On WINDOWS the default primary is
+#   Iosevka Term Semibold instead (a ~2.3MB subset of Iosevka Term 34.9.0's
 #   SemiBold/ExtraBold faces and their italics, without calt ligatures, OFL-1.1,
-#   compiled in on Windows only; owner request and two judged render farms,
-#   2026-10-16), with Cascadia Mono PL 2407.24 (the Windows default from
-#   2026-09-30, static Regular/Bold/Italic/BoldItalic, ~2.4MB, OFL-1.1, Windows
-#   only) and JetBrains Mono still compiled in there and selectable by name. See
-#   `src/bundled.rs` and assets/bundled/*.LICENSE.txt. Compiled in on NON-macOS
-#   targets only: the macOS default (SF Mono + CoreText system coverage) is
-#   unchanged by that decision, and a universal binary would carry the ~2.8MB
-#   twice for faces it never selects. The one exception is Iosevka Term 34.9.0's
-#   Regular set (a ~2.3MB subset of its four faces, OFL-1.1; owner request
-#   2026-10-14), compiled in on EVERY target, macOS included: no default
-#   anywhere, a family a user selects by name.
+#   compiled in on Windows only), with Cascadia Mono PL 2407.24 (static
+#   Regular/Bold/Italic/BoldItalic, ~2.4MB, OFL-1.1, Windows only) and JetBrains
+#   Mono still compiled in there and selectable by name. See `src/bundled.rs` and
+#   assets/bundled/*.LICENSE.txt. Compiled in on NON-macOS targets only: the macOS
+#   default stays SF Mono + CoreText system coverage, and a universal binary would
+#   carry the ~2.8MB twice for faces it never selects. The one exception is
+#   Iosevka Term 34.9.0's Regular set (a ~2.3MB subset of its four faces,
+#   OFL-1.1), compiled in on EVERY target, macOS included: no default anywhere, a
+#   family a user selects by name.
 embedded-font = []
 
 [dependencies]
@@ -100,7 +98,7 @@ libc = { workspace = true }
 # sizes (~12px, scale 1.0) stems and crossbars land at fractional pixel phases
 # and read fuzzy; aterm-font's `hint` feature, the automatic hinter carved
 # from skrifa 0.46.2 (TF.4 of docs/AUDIT-third-party-2026-10-15.md; never the
-# font's own bytecode since TF.2b), hands back a grid-fitted outline that the
+# font's own bytecode), hands back a grid-fitted outline that the
 # SAME coverage fill (as the FONT-2 variation path) turns into crisp masks.
 # Target-gated so the macOS (CoreText) release build and the wasm consumer —
 # which trims its closure deliberately — compile not one byte of it. A build

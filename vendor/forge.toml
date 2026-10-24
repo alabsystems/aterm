@@ -35,24 +35,20 @@ loc_method = "rs-physical-all-files-v1"
 graph_method = "cargo-tree-normal-no-dedupe-locked-offline-v1"
 # The measurement matrix is `aterm_forge::resolve::default_cells()`, declared there once.
 
-# --- winit 0.30.13: ABSORBED, no longer a fork ------------------------------
-# Re-homed 2026-10-15 as crates/aterm-window, a workspace member
-# (docs/AUDIT-third-party-2026-10-15.md, winit-core step 4). Its [[fork]] block
-# retired with the move. Its package kept the name `winit`, served by a root
-# [patch.crates-io] row, while accesskit_winit required a crate of that name; A11Y.4
-# retired accesskit_winit and winit-core step 7 (2026-10-19) renamed the package
-# `aterm-window` and deleted the row. It is an ABSORBED member: NOTICE lists it as
-# winit 0.30.13, and `targo --unverified forge attest` holds that line, its retained
-# LICENSE and its Apache-2.0 §4(b) notices ([OB-5]/[OB-6]/[OB-7]/[OB-9]);
-# aterm-census scans it from its ABSORBED_CRATES row. The carve ledger below stays:
-# those backends are still gone, now from crates/aterm-window.
+# --- winit 0.30.13: ABSORBED as crates/aterm-window, not a fork -------------------
+# winit 0.30.13 is the workspace member crates/aterm-window, package `aterm-window`
+# (docs/AUDIT-third-party-2026-10-15.md, winit-core steps 4 and 7), so it has no
+# [[fork]] block and no [patch.crates-io] row. It is an ABSORBED member: NOTICE lists
+# it as winit 0.30.13, and `targo --unverified forge attest` holds that line, its
+# retained LICENSE and its Apache-2.0 §4(b) notices ([OB-5]/[OB-6]/[OB-7]/[OB-9]);
+# aterm-census scans it from its ABSORBED_CRATES row. The carve ledger below holds the
+# backends removed from it.
 
-# The four backends no aterm cell compiles, DELETED from the fork 2026-10-15
-# (docs/AUDIT-third-party-2026-10-15.md, winit-core step 1; re-pointed with the
-# re-home, step 4): their target tables held 22 lock-only packages (android-activity,
-# jni, orbclient, pin-project, web-time, ...) and their sources were 16k of the fork's
-# lines in every native cell's count. aterm ships macOS, Windows and Linux GUIs; the
-# wasm cells do not compile winit at all.
+# The four backends no aterm cell compiles, carved out of crates/aterm-window
+# (docs/AUDIT-third-party-2026-10-15.md, winit-core step 1): their target tables held
+# 22 lock-only packages (android-activity, jni, orbclient, pin-project, web-time, ...)
+# and their sources were 16k lines in every native cell's count. aterm ships macOS,
+# Windows and Linux GUIs; the wasm cells do not compile aterm-window at all.
 [[carved]]
 path = "crates/aterm-window/src/platform_impl/android"
 reason = "aterm ships no Android GUI; the backend held android-activity, jni and ndk-context"
@@ -69,18 +65,16 @@ reason = "aterm ships no Redox GUI; the backend held orbclient and redox_syscall
 path = "crates/aterm-window/src/platform_impl/web"
 reason = "the wasm cells do not compile winit; the backend held pin-project and web-time"
 
-# --- indexmap 2.14.0: RETIRED to the registry's 2.13.0, no longer a fork -------
-# Retired 2026-10-16 (docs/AUDIT-third-party-2026-10-15.md, "The last fork"): the
-# [patch.crates-io] row and vendor/indexmap are gone. The fork carried two edits:
-# checked slice-range indexing (the `aterm-trust` index-panic fix, which the trust lane
-# never verified: QUEUED_FORKS held it) and a hashbrown 0.17 -> 0.16 requirement pin.
-# The lock now resolves the registry's indexmap 2.13.0 (`targo update -p indexmap
-# --precise 2.13.0`): the 2.13 releases ask for hashbrown ^0.16.1 and every parent
-# allows them (naga and wgpu-core ^2.11.4, toml_edit ^2.13.0), so the one hashbrown
-# 0.16.1 still serves the whole graph and no cell gains a package. A plain resolve picks
-# 2.14.x and brings hashbrown 0.17.1 back (+1 package / +25,236 lines and a duplicate
-# name in every cell that compiles indexmap); the forge-budget ratchet turns that RED.
-# indexmap leaves the graph with wgpu (win, win-arm, wasm-gpu: GW.5, WP.8) and with the
-# host-only proc-macro-crate -> toml_edit edge under zvariant_derive (linux: A11Y.5a;
-# zbus_macros's path to it left at A11Y.4). With this block gone the ledger holds no [[fork]]: vendor/ holds
-# only the first-party astream submodule.
+# --- indexmap: the registry's 2.13.0, not a fork ---------------------------------
+# aterm has no indexmap [patch.crates-io] row and no vendored copy
+# (docs/AUDIT-third-party-2026-10-15.md, "The last fork"). The fork it replaced
+# carried checked slice-range indexing (the `aterm-trust` index-panic fix, which the
+# trust lane never verified) and a hashbrown 0.17 -> 0.16 requirement pin. The lock
+# holds the registry's indexmap 2.13.0 (`targo update -p indexmap --precise 2.13.0`):
+# 2.13 asks for hashbrown ^0.16.1 and both its parents, naga and wgpu-core (^2.11.4),
+# allow it, so it shares the graph's hashbrown 0.16.1 and no cell gains a package. A
+# plain resolve picks 2.14.x and brings hashbrown 0.17.1 back (+1 package / +25,236
+# lines and a duplicate name in every cell that compiles indexmap); the forge-budget
+# ratchet turns that RED. indexmap leaves the graph with wgpu (win, win-arm, wasm-gpu:
+# GW.5, WP.8). The ledger holds no [[fork]]: vendor/ holds only the first-party
+# astream submodule.

@@ -141,6 +141,30 @@ pub(super) fn cmd_off(prefix: &Prefix) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// What to change before `abrew bundle` (which passes through while any of these holds) can lay
+/// the bundled Homebrew, as `"<step>, …, then "`; empty when nothing stands in its way.
+pub(super) fn steps_before_bundle(prefix: &Prefix) -> String {
+    let engaged = |name: &str| stub::engaged(std::env::var(name).ok().as_deref());
+    let mut steps = Vec::new();
+    if engaged(stub::REAL_ENV) {
+        steps.push("unset ABREW_REAL");
+    }
+    if engaged(super::reroute_passthrough_env()) {
+        steps.push("leave this --no-reroute session");
+    }
+    if !crate::config::cached_abrew().enabled() {
+        steps.push("set [abrew] enabled=true");
+    }
+    if prefix.is_disabled() {
+        steps.push("run `abrew on`");
+    }
+    if steps.is_empty() {
+        String::new()
+    } else {
+        format!("{}, then ", steps.join(", "))
+    }
+}
+
 pub(super) fn cmd_status(prefix: &Prefix) -> ExitCode {
     println!("prefix: {}", prefix.root.display());
     println!(
@@ -155,7 +179,10 @@ pub(super) fn cmd_status(prefix: &Prefix) -> ExitCode {
     );
     match stub::resolve_real_brew(prefix) {
         Some(p) => println!("real brew: {}", p.display()),
-        None => println!("real brew: none found (abrew bundle lays one)"),
+        None => println!(
+            "real brew: none found ({}abrew bundle lays one)",
+            steps_before_bundle(prefix)
+        ),
     }
     bundle::bundle_status(prefix);
     println!(
@@ -2742,9 +2769,14 @@ fn print_update_report(r: &UpdateReport) -> bool {
             msg += &format!("{oc} outdated cask{}", if oc == 1 { "" } else { "s" });
         }
         let pronoun = if of + oc == 1 { "it" } else { "them" };
+        let upgrade = match (of, oc) {
+            (_, 0) => "brew upgrade",
+            (0, _) => "brew upgrade --cask",
+            _ => "brew upgrade and brew upgrade --cask",
+        };
         println!();
         println!("You have {msg} installed.");
-        println!("You can upgrade {pronoun} with brew upgrade");
+        println!("You can upgrade {pronoun} with {upgrade}");
         println!("or list {pronoun} with brew outdated.");
     }
     printed

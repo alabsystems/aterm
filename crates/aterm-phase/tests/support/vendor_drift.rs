@@ -92,6 +92,34 @@ pub(crate) fn holds(bytes: &[u8], template: &str) -> bool {
     false
 }
 
+/// Where each word of `text` stands: a whole JavaScript name
+/// ([`js_name_len`]) that opens with an ASCII letter (a minifier's name, a
+/// key, a drawn word).
+pub(crate) fn words(text: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if !bytes[at].is_ascii_alphabetic() || (at > 0 && js_name_char(bytes[at - 1])) {
+            at += 1;
+            continue;
+        }
+        let end = at + js_name_len(&bytes[at..]);
+        out.push(at..end);
+        at = end;
+    }
+    out
+}
+
+/// `text` with one word changed, once for each of its [`words`]: the word
+/// gets a `Q` after it.
+pub(crate) fn reworded(text: &str) -> Vec<String> {
+    words(text)
+        .into_iter()
+        .map(|w| format!("{}Q{}", &text[..w.end], &text[w.end..]))
+        .collect()
+}
+
 /// The version a `--version` line names.
 pub(crate) fn version_in(text: &str) -> Option<String> {
     let dotted = |v: &str| {

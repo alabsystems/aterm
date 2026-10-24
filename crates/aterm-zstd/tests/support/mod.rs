@@ -195,6 +195,82 @@ pub fn far_repeat(seed: u64) -> Vec<u8> {
     out
 }
 
+/// Rounds of three 128 KiB blocks: noise; noise with two 4-byte copies from
+/// 125,000 and 130,000 bytes back near its start, which cost more to code
+/// than they save (an encoder codes them, then writes the block raw); then 16
+/// noise bytes, 32 bytes copied from 130,000 back, and text. A raw block
+/// moves no repeat offset and sets no table (RFC 8878 §3.1.1.2), so the third
+/// block's copy must be named by its distance: an encoder that kept the raw
+/// block's state would name it by a repeat offset the decoder does not hold,
+/// or repeat a table the decoder never read.
+pub fn raw_after_coding(rounds: usize, seed: u64) -> Vec<u8> {
+    const BLOCK: usize = 128 << 10;
+    let mut out = Vec::with_capacity(rounds * 3 * BLOCK);
+    for r in 0..rounds as u64 {
+        let at = out.len();
+        out.extend(noise(2 * BLOCK + 16, seed + 2 * r));
+        for (copy, dist) in [(at + BLOCK + 40, 125_000), (at + BLOCK + 150, 130_000)] {
+            out.copy_within(copy - dist..copy - dist + 4, copy);
+        }
+        let from = out.len() - 130_000;
+        out.extend_from_within(from..from + 32);
+        out.extend(words(BLOCK - 48, seed + 2 * r));
+    }
+    out
+}
+
+/// 32,768 distinct 4-byte words, each followed by a separator byte no word
+/// holds, zeros to the next 128 KiB, then a block of the same words in another
+/// order. Each word of that block matches its first copy and nothing longer,
+/// so with tables that reach that far back the block is 32,768 sequences of
+/// one 4-byte match and no literal: more than the 32,511 a two-byte
+/// `Number_of_Sequences` holds (RFC 8878 §3.1.1.3.2.1).
+pub fn many_sequences(seed: u64) -> Vec<u8> {
+    const N: usize = 32_768;
+    const SEPARATOR: u8 = 0xFF;
+    let mut x = XorShift::new(seed);
+    let mut seen = std::collections::HashSet::with_capacity(N);
+    let mut list = Vec::with_capacity(N);
+    while list.len() < N {
+        let word = (x.next() >> 16) as u32;
+        if !word.to_le_bytes().contains(&SEPARATOR) && seen.insert(word) {
+            list.push(word.to_le_bytes());
+        }
+    }
+    let mut out = Vec::with_capacity(3 * N * 4);
+    for word in &list {
+        out.extend_from_slice(word);
+        out.push(SEPARATOR);
+    }
+    out.resize(2 * N * 4, 0);
+    // Fisher-Yates.
+    for i in (1..N).rev() {
+        list.swap(i, x.below(i + 1));
+    }
+    for word in &list {
+        out.extend_from_slice(word);
+    }
+    out
+}
+
+/// A seeded 16 KiB of noise, then zeros, its four 4 KiB quarters copied
+/// 2^24 + 9, 2^25 + 5, 2^26 + 77 and 2^27 - 1 bytes on from where each sits:
+/// under a 2^27 window, matches of offset codes 24, 25, 26 and 27 (RFC 8878
+/// §3.1.1.3.2.1.1), which the predefined offset table holds as "less than 1"
+/// probabilities (§3.1.1.3.2.2.3); the last is as far as a frame of this
+/// encoder reaches.
+pub fn far_offsets(seed: u64) -> Vec<u8> {
+    const QUARTER: usize = 4096;
+    let dists = [(1 << 24) + 9, (1 << 25) + 5, (1 << 26) + 77, (1 << 27) - 1];
+    let mut out = noise(4 * QUARTER, seed);
+    out.resize(3 * QUARTER + (1 << 27) - 1 + QUARTER, 0);
+    for (q, d) in dists.into_iter().enumerate() {
+        let from = q * QUARTER;
+        out.copy_within(from..from + QUARTER, from + d);
+    }
+    out
+}
+
 /// A 64-byte pattern repeated, one `x` inserted at a seeded point in each
 /// copy: past the first copy, matches cover everything but the `x`s, so a
 /// block that starts past it has one-byte (RLE) literals.
@@ -350,6 +426,9 @@ pub struct Census {
     /// still read them (counted where no FSE description comes first, as
     /// this walker does not parse one).
     pub rle_extra_bits: [usize; 3],
+    /// Compressed blocks with sequences, by the width of their
+    /// `Number_of_Sequences` field (1, 2 or 3 bytes, RFC 8878 §3.1.1.3.2.1).
+    pub sequence_counts: [usize; 3],
 }
 
 impl Census {
@@ -436,6 +515,7 @@ impl Census {
             128..=254 => (2, s[2]),
             255 => (3, s[3]),
         };
+        self.sequence_counts[modes_at - 1] += 1;
         let table_modes = [6, 4, 2].map(|shift| usize::from((modes >> shift) & 3));
         for mode in table_modes {
             self.modes[mode] += 1;

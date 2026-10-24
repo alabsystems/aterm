@@ -123,7 +123,8 @@ fn walked_root(build_dir: &std::path::Path) -> std::io::Result<String> {
     crate::tree::tree_root_declared(build_dir, &modes)
 }
 
-/// The signed root a vendor program's stamp kept for its legacy index `build`.
+/// The signed root a vendor program's stamp kept for its legacy index `build`, when the recorded
+/// row does not attest that build itself.
 fn kept_legacy_root(
     layout: &Layout,
     program: &str,

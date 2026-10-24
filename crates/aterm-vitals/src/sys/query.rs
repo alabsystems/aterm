@@ -9,8 +9,9 @@ use crate::explain::WhySubject;
 pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|procs|why] \
                          [scope=pane|tab|window|aterm|global] [instances=all] [top=<1-64>] \
                          [depth=<1-8>] [fresh=<ms>] [since=<ep>.<seq>] [--json]; scope= on \
-                         jobs cores gpu mem disk procs, depth= on disk, instances=all on \
-                         overview aterm global cores gpu mem and procs scope=aterm\n";
+                         jobs disk procs (cores gpu mem take it, rows unchanged), depth= on \
+                         disk, instances=all on overview aterm global cores gpu mem and procs \
+                         scope=aterm\n";
 /// The usage line for a word after `why` that is not its one subject or an option.
 pub const WHY_USAGE: &str =
     "ERR usage: sys why [cpu|mem] [top=<1-64>] [fresh=<ms>] [since=<ep>.<seq>] [--json]\n";
@@ -333,7 +334,8 @@ impl SysQuery {
         self.scope.or(self.view.default_scope())
     }
 
-    /// Returns whether the request reads only aggregates or the target session's own rows.
+    /// Returns whether the request reads only aggregates or the target tab's own rows (`disk` up
+    /// to its window, other tabs' writers withheld and their folders unnamed).
     #[must_use]
     pub fn target_rows_only(&self) -> bool {
         if self.instances_all || self.name.is_some() {

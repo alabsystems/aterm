@@ -1603,6 +1603,181 @@ fn a_slice_one_tape_replays_unchanged() {
     assert_eq!(d.door.as_deref(), Some("host.occupancy_said"), "{d:?}");
 }
 
+/// A RAISED WORD REPLAYS UNDER THE K ITS TAPE NAMES: a watch whose nudge the autopilot holds,
+/// its K shortened by the setup, tells its host a ready-idle line, and its tape reproduces, every
+/// told word compared byte for byte at `host.occupancy_said`, under the `[setup]
+/// occupancy.k_looks` its header carries. NEGATIVE CONTROL: the same tape with that row taken
+/// out, as the header of a build before the K clock reads (no K: `due::K_NEVER`), diverges at
+/// `host.occupancy_said`: the replay tells no raise, and asks its next effect where the tape holds
+/// the raised word.
+#[test]
+fn a_ready_idle_word_replays_under_the_k_its_tape_names() {
+    use crate::supervise::tape::recover::recover;
+    use crate::supervise::tape::replay::{Options, replay};
+    use crate::supervise::tape::report::Verdict;
+    use crate::supervise::tape::testing::written;
+
+    let (dir, ledger) = ledger_at("door-k-tape");
+    let board = Board::reading(OccupancyReading::default());
+    let mut opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&board) as Arc<dyn IdleHost>),
+        ledger: Some(ledger.clone()),
+        journal: Some(dir.join("journal.jsonl")),
+        ..hosted(35 * 60)
+    };
+    opts.policy.autopilot = Autopilot::Land;
+    let mut m = Mock::new(vec![break_screen()]);
+    m.stall_sleep = Some(Duration::from_secs(60));
+    let run = record_watch(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_occupancy_k_looks(2);
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        board.said().iter().any(|s| s.ready_idle.is_some()),
+        "{:#?}",
+        board.said()
+    );
+    let header = run.header.encode();
+    assert!(
+        header.lines().any(|l| l == "occupancy.k_looks=2"),
+        "{header}"
+    );
+    let items = recover(&run.tape.reframed(&header)).items;
+    let report = replay(&written(&header, &items), &Options::default()).expect("replayed");
+    assert_eq!(report.verdict, Verdict::Reproduced, "{}", report.render());
+    let shipped: String = header
+        .lines()
+        .filter(|l| !l.starts_with("occupancy.k_looks="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let report = replay(&written(&shipped, &items), &Options::default()).expect("replayed");
+    assert_diverged_at_the_told_word(&report);
+}
+
+/// That `report` diverged at a told word (`host.occupancy_said`): there, or at the effect the
+/// replay asked next where the tape holds that word.
+fn assert_diverged_at_the_told_word(report: &crate::supervise::tape::report::Report) {
+    use crate::supervise::tape::report::{Cause, Verdict};
+    use astream_effects::{EffectRecord, ReplayDivergence};
+    let Verdict::Diverged(d) = &report.verdict else {
+        panic!("{}", report.render());
+    };
+    let at_the_word = d.door.as_deref() == Some("host.occupancy_said")
+        || matches!(
+            &d.cause,
+            Cause::Refused(ReplayDivergence::KindMismatch {
+                found: EffectRecord::Emit { door, .. },
+                ..
+            }) if door == "host.occupancy_said"
+        );
+    assert!(at_the_word, "{d:?}");
+}
+
+/// A watch whose nudge the autopilot holds past ten looks, recorded under a K none of its lines
+/// reaches (what a build with no K clock told): its header, as `header` rewrites it, and items.
+fn unraised_watch(tag: &str) -> (String, Vec<crate::supervise::tape::codec::Item>) {
+    use crate::supervise::tape::recover::recover;
+    let (dir, ledger) = ledger_at(tag);
+    let board = Board::reading(OccupancyReading::default());
+    let mut opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&board) as Arc<dyn IdleHost>),
+        ledger: Some(ledger.clone()),
+        journal: Some(dir.join("journal.jsonl")),
+        ..hosted(50 * 60)
+    };
+    opts.policy.autopilot = Autopilot::Land;
+    let mut m = Mock::new(vec![break_screen()]);
+    m.stall_sleep = Some(Duration::from_secs(60));
+    let run = record_watch(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_occupancy_k_looks(1_000_000);
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    let said = board.said();
+    assert!(said.iter().all(|s| s.ready_idle.is_none()), "{said:#?}");
+    assert!(
+        said.iter().any(|s| s
+            .rules
+            .iter()
+            .any(|r| r.verdict == SaidVerdict::Held(Guard::Autopilot))),
+        "the autopilot held its nudge: {said:#?}"
+    );
+    let header = run.header.encode();
+    let items = recover(&run.tape.reframed(&header)).items;
+    (header, items)
+}
+
+/// `header` with its `[setup] occupancy.k_looks` row `k` (`None`: taken out, as a build before
+/// the K clock wrote it) and, where `slice1`, slice 2's doors taken out of `host_doors`.
+fn as_recorded(header: &str, k: Option<i64>, slice1: bool) -> String {
+    header
+        .lines()
+        .filter_map(|line| {
+            if line.starts_with("occupancy.k_looks=") {
+                return k.map(|k| format!("occupancy.k_looks={k}\n"));
+            }
+            match line.strip_prefix("host_doors=") {
+                Some(doors) if slice1 => {
+                    let kept: Vec<&str> = doors
+                        .split(' ')
+                        .filter(|d| !SLICE2_DOORS.contains(d))
+                        .collect();
+                    Some(format!("host_doors={}\n", kept.join(" ")))
+                }
+                _ => Some(format!("{line}\n")),
+            }
+        })
+        .collect()
+}
+
+/// A TAPE A BUILD BEFORE THE K CLOCK WROTE REPLAYS UNCHANGED: slice 2's doors in its header and
+/// no `[setup] occupancy.k_looks` row (what the builds of sub-slices 2.0 to 2.2 wrote), of a nudge
+/// the autopilot held past ten looks, reproduces: the row's absence reads as no K
+/// (`due::K_NEVER`), so no told word names a line ready-idle; as does that tape with slice 2's
+/// doors out too (slice 1's). NEGATIVE CONTROL: the same tape under the shipped K, the row
+/// `occupancy.k_looks=10`, diverges at the told word that K raises.
+#[test]
+fn a_tape_from_before_the_k_clock_replays_unraised() {
+    use crate::supervise::tape::replay::{Options, replay};
+    use crate::supervise::tape::report::Verdict;
+    use crate::supervise::tape::testing::written;
+
+    let (header, items) = unraised_watch("door-k-before");
+    let replayed = |k: Option<i64>, slice1: bool| {
+        let header = as_recorded(&header, k, slice1);
+        replay(&written(&header, &items), &Options::default()).expect("replayed")
+    };
+    for slice1 in [false, true] {
+        let report = replayed(None, slice1);
+        assert_eq!(report.verdict, Verdict::Reproduced, "{}", report.render());
+    }
+    let k = crate::supervise::occupancy::due::K_LOOKS;
+    assert_diverged_at_the_told_word(&replayed(Some(k), false));
+}
+
+/// A SLICE-1 TAPE TELLS NO READY-IDLE LINE, WHATEVER K ITS HEADER NAMES (the slice-2 plan's D7):
+/// the tape above with slice 2's doors out of its header and the shipped K in, reproduces: the
+/// told word's `ready_idle` is held to slice 1's shape where the recording lacks slice 2's doors
+/// (`Fx::slice2_recorded`). NEGATIVE CONTROL: the same K with slice 2's doors in diverges at the
+/// told word it raises, so the doors alone kept the slice-1 tape's words.
+#[test]
+fn a_slice_one_tape_tells_no_ready_idle_line_whatever_its_k() {
+    use crate::supervise::tape::replay::{Options, replay};
+    use crate::supervise::tape::report::Verdict;
+    use crate::supervise::tape::testing::written;
+
+    let (header, items) = unraised_watch("door-k-slice-one");
+    let k = Some(crate::supervise::occupancy::due::K_LOOKS);
+    let replayed = |slice1: bool| {
+        let header = as_recorded(&header, k, slice1);
+        replay(&written(&header, &items), &Options::default()).expect("replayed")
+    };
+    let report = replayed(true);
+    assert_eq!(report.verdict, Verdict::Reproduced, "{}", report.render());
+    assert_diverged_at_the_told_word(&replayed(false));
+}
+
 #[test]
 fn a_closed_hold_is_told_to_the_host() {
     let (dir, path) = ledger_at("door-close-told");

@@ -20,6 +20,8 @@ struct CountingAllocator;
 pub const SIZE_SLOTS: usize = 16;
 
 thread_local! {
+    /// All three are const-initialised with no destructor, so reading them never allocates
+    /// and is safe inside `GlobalAlloc`.
     static COUNTING: Cell<bool> = const { Cell::new(false) };
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
     static ALLOCATION_SIZES: Cell<[usize; SIZE_SLOTS]> = const { Cell::new([0; SIZE_SLOTS]) };

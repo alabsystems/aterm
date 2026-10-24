@@ -14,9 +14,9 @@ use crate::transport;
 const USAGE: &str = "\
 aterm link — the fabric bridge (also runs as `aterm-link`)
 
-  aterm link serve  --fleet <F> --broker <socket> --cap-file <path>... [options]
+  aterm link serve  --fleet <F> --broker <socket> [--cap-file <path>...] [options]
   aterm link ls     [--fleet <F> --broker <socket> --cap-file <path>...] [--attention]
-  aterm link notify --fleet <F> --broker <socket> --cap-file <path>... --on <sel>,...
+  aterm link notify --fleet <F> --broker <socket> [--cap-file <path>...] --on <sel>,...
                     --exec <cmd> [options]        (alone, it lists its options)
   aterm link broker <socket> [log] [options]      (`aterm link broker --help`)
   aterm link broker --repair <log>
@@ -26,7 +26,8 @@ aterm link — the fabric bridge (also runs as `aterm-link`)
 `ls` takes --fleet and --broker from the rendezvous file `fabric.toml` that `aterm fabric
 on` writes, and --cap-file and --state too when --broker is not given; a flag given wins.
 `serve` reads `[fabric] presence`, `receipts` and `log` in aterm.toml for a flag not
-given.
+given. It is the bridge an aterm instance starts from `[fabric] command`, on the lanes it
+hands down; run by hand, it needs --sock and --token-file and serves as an observer.
 
   --fleet <F>            fleet name (the `/f/<F>/` subtree)
   --broker <socket>      the broker's Unix socket
@@ -46,12 +47,13 @@ given.
   --log <auto|off|turns> `serve` only, default `auto`: mirror session-log turns, runs,
                          needs and steps onto the session's `ev` face while the broker
                          retains them; `turns` mirrors over any broker, `off` not at all
-  --attention            `ls` only: keep only rows carrying `attention=`
+  --attention            `ls` only: keep only rows whose `attention=` is set (not `-`)
 
 `ls` prints each presence row's latest record, one pct-encoded token per column (<sid>
 is `node` on a node's own row):
   <node> <host> <sid> state= inc= role= detail= driving= holder= hold= fabric=
   attention= gen= observer= epoch= phase= context= title= proto= aterm=
+(`driving=`, `holder=` and `context=` stay `-`: no bridge of this build writes them)
 ";
 
 /// Library entry point for the `aterm-link` CLI.
@@ -80,7 +82,7 @@ pub fn dispatch_with_inherited_lanes(
                 && matches!(crate::enable::Rendezvous::read(), Ok(None))
             {
                 eprintln!(
-                    "aterm-link ls: no --fleet/--broker and no rendezvous file — \
+                    "aterm link ls: no --fleet/--broker and no rendezvous file — \
                      `aterm fabric on` writes one"
                 );
                 return ExitCode::from(2);
@@ -98,7 +100,7 @@ pub fn dispatch_with_inherited_lanes(
         Some("hook") => retired_hook(),
         Some("-h" | "--help" | "help") => aterm_uds::stdout::answer_exit("aterm link", USAGE, 0),
         Some(other) => {
-            eprintln!("aterm-link: unknown subcommand `{other}`");
+            eprintln!("aterm link: unknown subcommand `{other}`");
             eprint!("{USAGE}");
             ExitCode::from(2)
         }
@@ -108,6 +110,12 @@ pub fn dispatch_with_inherited_lanes(
         }
     }
 }
+
+/// Whether `args` holds `-h` or `--help`.
+pub(crate) fn asks_help(args: &[String]) -> bool {
+    args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+}
+
 /// The one line `aterm link hook …` prints, on stderr ([`retired_hook`]).
 pub const RETIRED_HOOK_LINE: &str =
     "aterm-link: `hook` is retired and does nothing — delete this entry from the settings file \
@@ -131,7 +139,7 @@ fn run(
     let parsed = match parse(args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("aterm-link: {e}");
+            eprintln!("aterm link: {e}");
             eprint!("{USAGE}");
             return ExitCode::from(2);
         }
@@ -140,7 +148,7 @@ fn run(
         // `--attention` is an `ls` filter; `serve` refuses it by name rather
         // than parsing it and doing nothing.
         if parsed.attention {
-            eprintln!("aterm-link: --attention is an `ls` filter; `serve` has no roster");
+            eprintln!("aterm link: --attention is an `ls` filter; `serve` has no roster");
             eprint!("{USAGE}");
             return ExitCode::from(2);
         }
@@ -170,7 +178,7 @@ fn run(
         match roster(&parsed.cfg, parsed.attention) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("aterm-link ls: {e}");
+                eprintln!("aterm link ls: {e}");
                 ExitCode::FAILURE
             }
         }
@@ -381,18 +389,20 @@ usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <ti
                          [--lifeline-fd <n>]
        aterm link broker --repair <log>
 
-  <socket>             the Unix socket the bridges' `--broker` names (in a 0700 dir)
+  <socket>             the Unix socket the bridges' `--broker` names (keep it in a 0700
+                       dir: nothing checks)
   [log]                the durable record log (default `<socket>.log`)
   --secret-file <path> the mint secret (32+ raw bytes, 0600, in a 0700 dir) that
                        `aterm link mint` and `aterm fabric mint-for` mint under. Without
                        the flag a `mint.secret` beside <socket> is used; with neither, the
                        broker is unguarded and checks no capability
   --durability <tier>  what an ack promises; default `ordered` with --secret-file, else
-                       `strict`:
-                       - `strict`: acks after a full drive-cache flush (`F_FULLFSYNC`).
-                       - `ordered`: acks after a disk barrier (`F_BARRIERFSYNC`) and
-                         flushes in full within 100 ms (served `strict` where the disk
-                         cannot keep the order).
+                       `strict` (a `mint.secret` found beside <socket> keeps `strict`):
+                       - `strict`: acks after a full flush (`F_FULLFSYNC` on macOS,
+                         `fdatasync` on Linux).
+                       - `ordered`: acks after an ordering barrier (`F_BARRIERFSYNC`) and
+                         flushes in full within 100 ms; served `strict` off macOS, for a
+                         log off the boot volume, or where the device refuses the barrier.
                        - `relaxed`: acks after the page-cache write; survives a broker
                          restart, not a power loss or panic.
                        Halts, a human's words, mail to a person and a person's read marks

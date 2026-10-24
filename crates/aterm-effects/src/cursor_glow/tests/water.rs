@@ -698,12 +698,11 @@ fn a_light_water_drop_is_clear_blue() {
     );
 }
 
-/// Round 2's judge (2026-10-23, the trail gallery's `enter-bottom`): water's
-/// Enter streak ran from the echo's end down across the line the command
-/// printed, and its drops sat in that line's word gaps, reading as
-/// punctuation. An Enter's leap keeps to the new prompt's row: no spark it
-/// lays stands on another. The control: a navigation jump of the same vector
-/// still spans the rows between.
+/// An Enter's leap keeps to the new prompt's row: no spark it lays stands on
+/// another (the trail gallery's `enter-bottom`, where a streak from the
+/// echo's end down across the line the command printed leaves drops in that
+/// line's word gaps that read as punctuation). The control: a navigation
+/// jump of the same vector still spans the rows between.
 #[test]
 fn water_s_enter_keeps_its_leap_to_the_prompt_row() {
     let g = geom();

@@ -288,7 +288,8 @@ fn an_armed_anchor_authorizes_a_listed_machine_and_names_it() {
     assert_eq!(who.roster_seq, 4);
 }
 
-/// Refuses unlisted, revoked, lapsed, wrong-master, torn-signature, and missing rosters.
+/// Refuses an unlisted key, a revoked machine, a lapsed roster, a roster under the wrong master,
+/// a torn signature and a missing roster.
 #[test]
 fn an_armed_anchor_refuses_every_machine_the_roster_does_not_authorize() {
     let master = pk(&MASTER);

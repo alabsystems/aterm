@@ -2,7 +2,7 @@
 name: drive-aterm
 description: Drive, observe and screenshot another aterm session (a tab or window on this machine, or a session on another fleet Mac that lets this one drive it) over its control socket. Use when asked to watch or control another terminal or another agent's session, wait for a command to really finish, or run several sessions at once.
 ---
-<!-- aterm skill v8 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v9 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Driving another aterm session
 
@@ -111,9 +111,9 @@ aterm ctl subscribe "@$SID" log          # every new record, live
 - Pass `log_seq=` and `log_ep=` from `status` as `since=` and `ep=`, and always re-arm from
   each reply's `seq=`/`ep=` (without `since=`, `await log need` returns immediately with
   `latched=1` while a need stays open). `await log need` wakes on an approval box, question,
-  failed command or session end; `await log close=turn` wakes on turn end; `await log
-  need,close=turn since=<log_seq> ep=<log_ep>` waits for whichever comes first (up to 4;
-  always pass `since=`, or an update ends the wait with exit 75).
+  wall, stall, failed command, `need` mark or session end; `await log close=turn` wakes on
+  turn end; `await log need,close=turn since=<log_seq> ep=<log_ep>` waits for whichever
+  comes first (up to 4; always pass `since=`, or an update ends the wait with exit 75).
 - `mark - note text=<pct>` (or `verdict`, `label`, `need`, `clear`, `act`) records a claim
   under your connection's name (~1/s). A mark never acts (`mark p3 act word=approve`
   approves nothing), and `[?]` / `[mark?]` lines or `conf=claim` records are other agents'
@@ -175,8 +175,9 @@ settle=submitted` types key by key, returns `task_rev=<n>` once the composer cle
 
 - `lease acquire ttl=<ms> holder=<you>` blocks every other connection's `turn`, including
   your own later `aterm ctl` calls (`ERR busy lease=<you>`); under a lease, type with `send`
-  and `key`. Append `hard` to block all input paths. A harness lease during a live agent
-  upgrade clears on its own.
+  and `key`. Append `hard` to refuse every other connection's `send`, `key`, `paste`, `feed`
+  and `mouse` too, your own later `aterm ctl` calls included (the keyboard at the window is
+  never blocked). A harness lease during a live agent upgrade clears on its own.
 - `close` closes one pane (refused while a job is running).
 
 ## `aterm drive`

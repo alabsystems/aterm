@@ -19,9 +19,9 @@
 Source: `crates/aterm-update-core` (read only). Every `#[test]` was read together with the code it
 reaches: src/{http 38, roster 21, handoff_policy 17, manifest 13, pkg_check 11, codesign 10, sys 6,
 sentinel 6, pointer 6, hash 5, settings 5, linux 4, source 4, pins 3, cdn 3, tag 2, privatedir 1} and
-tests/env_reads.rs 6, 161 in all. (The wave-2 chunk list says 159; a grep of `#[test]` finds 161, and that
-count includes the platform-gated codesign and sys tests.) Nothing was compiled or run. The claims below
-come from reading the code.
+6 in the crate's one integration test file, an env-read source lint since deleted (§4), 161 in all. (The
+wave-2 chunk list says 159; a grep of `#[test]` finds 161, and that count includes the platform-gated
+codesign and sys tests.) Nothing was compiled or run. The claims below come from reading the code.
 
 Result: **71 specs**, covering **148 tests**. **13 tests are not spec samples** (§4).
 
@@ -354,7 +354,7 @@ Status (2026-10-17): `rfc3339_parses_the_shapes_the_roster_uses` deleted; aterm-
 
 Status (2026-10-16): `release_asset_bound_is_githubs_ceiling_and_covers_batteries_included` deleted; its `const` assert now sits at module scope beside `RELEASE_ASSET_DOWNLOAD_BOUND` in src/http.rs.
 
-The audit also deleted all of `tests/env_reads.rs`, a source lint over the tree whose allow-list was a
+The audit also deleted the crate's one integration test file, a source lint over the tree whose allow-list was a
 registry the test policed (AGENTS.md); `dev_seam!` compiles the seams out of shipped builds and
 `env_sanitize` keeps them from child processes, so no env-knob guard replaces it. The rows of these deleted
 tests, here and in §2, are gone.

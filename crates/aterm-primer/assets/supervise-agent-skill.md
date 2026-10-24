@@ -2,7 +2,7 @@
 name: supervise-agent
 description: Run other Claude Code, Gemini CLI, agy or Muse Code sessions in aterm tabs as workers — start each on a task, wait for them in the background, read each one's result and check it against ground truth (tests, diff, exit codes) — or oversee another program (a codex-alab, a REPL, a long build) in an aterm session. Use when asked to hand work to other sessions or windows, run work in parallel in aterm, say what every aterm session or machine is doing, manage or babysit another agent, or act as a lead over workers.
 ---
-<!-- aterm skill v9 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v10 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Workers: other aterm sessions doing the work
 
@@ -23,7 +23,8 @@ EOF
 It prints `OK <sid>` (`@<sid>`), starts in this folder (`cwd=<path>` names another;
 `agent=claude|gemini|agy|muse`) and opens as a background tab of your window. The task is
 delivered as its first prompt (never typed or pasted) with one line of fact naming who
-started it and that its final report returns as its result.
+started it and how its work ends (under `land`, its final report returns as its result;
+under `cruise`, no report ends it).
 
 - Autopilot defaults to `land` unless `autopilot=cruise` is set: `land` carries the worker
   until its work is on the remote main branch and its reply defends that in a few lines
@@ -143,10 +144,10 @@ reads its output. For a hand-driven agent:
 
 - Wait for turn end with `aterm ctl @s-x await log close=turn since=<log_seq> ep=<log_ep>
   timeout=600000` (using `log_seq=` and `log_ep=` from `aterm ctl @s-x status`), for the
-  next approval box/question/failed command/session end with `aterm ctl @s-x await log need
-  since=<log_seq> ep=<log_ep> timeout=600000`, or for both with `await log need,close=turn
-  since=<log_seq> ep=<log_ep>`. Always pass `since=` and re-arm from the reply's `seq=`/`ep=`
-  (or `resync_to=` on `OK gap`).
+  next approval box, question, wall, stall, failed command, `need` mark or session end with
+  `aterm ctl @s-x await log need since=<log_seq> ep=<log_ep> timeout=600000`, or for both
+  with `await log need,close=turn since=<log_seq> ep=<log_ep>`. Always pass `since=` and
+  re-arm from the reply's `seq=`/`ep=` (or `resync_to=` on `OK gap`).
 - aterm does not parse Codex screens (`aterm drive phase` always reads `idle` there): judge
   `codex-alab` by `supervisor=`/`program_state=` and vendor `codex` by `program_state=` and
   ground truth; read `text` before typing and never `await agent` on `agent=unknown|-`.

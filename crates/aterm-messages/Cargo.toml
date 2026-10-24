@@ -28,8 +28,8 @@ aterm-types = { workspace = true }
 # Wasm-clean (aterm-core, which aterm-wasm ships, depends on it).
 aterm-grapheme = { workspace = true }
 
-# tests/conformance_*.rs drive `MessageCenter` in lock step with aterm-spec's
-# derived models.
+# tests/conformance_*.rs drive `MessageCenter` in lock step with aterm-models-session's
+# derived models on aterm-spec's interpreter.
 [dev-dependencies]
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).

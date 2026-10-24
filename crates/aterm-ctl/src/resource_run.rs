@@ -11,8 +11,8 @@ const USAGE: &str = "usage: aterm resource-run [--sock PATH] --session @self|@<s
 
 const ABOUT: &str = "Registers this process with the session's aterm as job LABEL, then execs PROGRAM in its\n\
                      place (same pid, descriptors and process group): its CPU and memory are charged to\n\
-                     that tab. --ai names the agent the job runs for (default: the tab's agent).\n\
-                     `aterm help resource-run` says more.";
+                     that tab. --ai names the agent the job runs for (default: the agent the tab\n\
+                     runs, else `unknown`). `aterm help resource-run` says more.";
 
 struct Args {
     sock: Option<String>,

@@ -37,8 +37,9 @@ gen writes crates/aterm-win32, crates/aterm-windows-sys's feature list and the w
 conformance and recorder crates from the pinned registry source and Cargo's consumer/feature
 graph; check regenerates into scratch and reports DRIFT, never writing; record rewrites
 win32-oracle/recorded.json from the host's answers, then runs gen; oracle compiles the
-conformance crate, compares the facade's import tables with upstream's and requires every
-planted fault to be caught, on both Windows triples; oracle-052 holds
+conformance crate (the closure against windows-sys 0.61.2, the hand-written COM and DXGI
+against windows 0.62.2), compares the facade's import tables with upstream's and requires
+every planted fault to be caught, on both Windows triples; oracle-052 holds
 crates/aterm-windows-sys-052 to registry windows-sys 0.52.0. The reference workspaces have no
 [patch] table. The driver, graph and host recorder use Trust; oracle and oracle-052 are a STOCK
 EXCEPTION: stock Cargo/RUSTC compile Windows std, and no Windows program runs.

@@ -197,8 +197,8 @@ mod tests {
 
     /// CLAUDE CODE'S LABELLED TOP RULE (`──── <the mode's name> ─`, drawn
     /// once the top-effort mode is on: a windowed aterm's harness writes it as
-    /// an unset default, measured on 2.1.306 in `forever --window`,
-    /// 2026-10-21) frames the composer as a bare rule does, from 40 columns.
+    /// an unset default, measured on 2.1.306 in `forever --window`) frames the
+    /// composer as a bare rule does, from 40 columns.
     #[test]
     fn claude_code_s_labelled_top_rule_frames_its_composer() {
         let mode = concat!("ultra", "code");
@@ -267,9 +267,9 @@ mod tests {
 
     /// Codex's question dialog is no composer: the user's message over it is
     /// the screen's last row in column 0 that opens `›` (the dialog's cursor
-    /// is at column 2), and read as a prompt still standing, `turn` pressed
-    /// Enter on the dialog and answered it (the rows measured on 0.163.0,
-    /// 2026-10-16).
+    /// is at column 2), and read as a prompt still standing it would make
+    /// `turn` press Enter on the dialog and answer it (the rows measured on
+    /// 0.163.0).
     #[test]
     fn codexs_question_dialog_is_no_composer() {
         let dialog = [
@@ -348,11 +348,10 @@ mod tests {
         assert_eq!(composer_row("agy", &survey), None);
     }
 
-    /// agy 1.4.0 with its background-work panel under the composer (the
-    /// lab's 2026-10-17 captures): the draft held over it is the composer's,
-    /// and the empty caret over it reads empty — where the first row between
-    /// the screen's last two rules, a panel row, was read before, and `turn`
-    /// refused a draft standing there.
+    /// agy 1.4.0 with its background-work panel under the composer (the lab's
+    /// captures): the draft held over it is the composer's, and the empty caret
+    /// over it reads empty; the first row between the screen's last two rules is
+    /// a panel row, not the composer.
     #[test]
     fn agy_s_composer_over_its_background_panel_is_its_caret_row() {
         use aterm_phase::agy::fixtures::lab as f;

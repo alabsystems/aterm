@@ -1577,9 +1577,12 @@ pub(crate) fn video_empty_ledger_note(
         if control_thread > 0 {
             causes.push_str(&format!(
                 " {control_thread} took the control-thread path, which bypasses the ledger: a \
-                 verb aimed at a session that is not the tab on screen (`@<sid>` naming a \
-                 background tab, or `@self` sent from one). Drive the on-screen tab instead: \
-                 flagless `key`/`ctrl`/`send`/`feed`/`paste`, or `@<sid>` naming it."
+                 verb aimed at any session but the front tab's focused pane (`@<sid>` naming a \
+                 background tab or an unfocused split pane, or `@self` sent from one), a fenced \
+                 `key`/`send` (`if=`, `if-gen=`, `if-fp=`, `if-human=`) wherever it is aimed, or \
+                 aterm's own guarded presses anywhere in this process (a `turn` submit guard, a \
+                 fact-menu slash command, a worker's launch line). Drive the front tab's focused \
+                 pane instead: flagless `key`/`ctrl`/`send`/`feed`/`paste`, or `@<sid>` naming it."
             ));
         }
         if unlogged_other_window > 0 {
@@ -1595,8 +1598,8 @@ pub(crate) fn video_empty_ledger_note(
         );
     }
     "measured zero: the ledger saw no input attempt during this take, and unlogged_inputs is \
-     0. Flagless `key`/`ctrl`/`send`/`feed`/`paste` aimed at the on-screen tab, and hardware \
-     keys on the recorded window, are all logged."
+     0. Flagless `key`/`ctrl`/`send`/`feed`/`paste` aimed at the front tab's focused pane, and \
+     hardware keys on the recorded window, are all logged."
         .to_string()
 }
 
@@ -2238,7 +2241,7 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                  \"input_semantics\": \"pre-routing attempts (`ch` = character, `key` = named key with no character); not PTY-delivery or visible-glyph receipts\",\n    \
                  \"keys_requested\": {keys_enabled}, \"inputs_logged\": {}, \"unlogged_inputs\": {unlogged_inputs},\n    \
                  \"unlogged_other_window\": {unlogged_other_window}, \"unlogged_over_cap\": {unlogged_over_cap}, \"inputs_cap\": {inputs_cap},\n    \
-                 \"unlogged_input_semantics\": \"input attempts during this take that are not in inputs[], from three causes. (1) The CONTROL-THREAD path: a verb aimed at a session that is NOT the tab on screen (`@<sid>` naming a background tab; `@self` when the driving session is not front). A background target has no active tab to touch, so it never enters the App input seam this ledger hooks. (2) `unlogged_other_window`: attempts that DID pass the seam but arrived on a window this take was not capturing — no frame here can answer them, so stamping them would fabricate a key->frame latency. (3) `unlogged_over_cap`: attempts on the recorded window after inputs[] reached inputs_cap rows — counted, not stamped. unlogged_inputs is the TOTAL and includes unlogged_other_window and unlogged_over_cap. Same unit as inputs_logged (one per would-be inputs[] row); cause (1) is process-wide, delta over this take. Non-zero means attempts happened that inputs[] does NOT contain.\",\n    \
+                 \"unlogged_input_semantics\": \"input attempts during this take that are not in inputs[], from three causes. (1) The CONTROL-THREAD path: input written to the PTY off the App input seam this ledger hooks: a verb aimed at any session but the front tab's focused pane (`@<sid>` naming a background tab or an unfocused split pane; `@self` when the driving session is not that pane), any fenced `key`/`send` (`if=`, `if-gen=`, `if-fp=`, `if-human=`) wherever it is aimed, and aterm's own guarded presses (a `turn` submit guard, a fact-menu slash command, a worker's launch line). (2) `unlogged_other_window`: attempts that DID pass the seam but arrived on a window this take was not capturing — no frame here can answer them, so stamping them would fabricate a key->frame latency. (3) `unlogged_over_cap`: attempts on the recorded window after inputs[] reached inputs_cap rows — counted, not stamped. unlogged_inputs is the TOTAL and includes unlogged_other_window and unlogged_over_cap. Same unit as inputs_logged (one per would-be inputs[] row); cause (1) is process-wide, delta over this take. Non-zero means attempts happened that inputs[] does NOT contain.\",\n    \
                  \"stamp_semantics\": \"{stamp_semantics}\",\n    \
                  \"wall_start_us\": {started_us}, \"wall_stop_us\": {stop_us},\n    \
                  \"requested_ms\": {requested_ms}, \"covered_us\": {covered_us},\n    \
@@ -5504,7 +5507,7 @@ impl App {
         }
     }
 
-    /// Render the CURRENT terminal for the control socket's `image` verb (the same renderer the window uses, GPU path if active).
+    /// Capture the client frame of the window showing `req.session` (else the front window) for the control socket's `image` verb: the presented destination when one is held, else a rerender through the window's renderer.
     pub(crate) fn render_image(&mut self, req: ImageReq) {
         self.run_capture(CaptureRequest::Image(req));
     }
@@ -6343,7 +6346,7 @@ impl App {
         })
     }
 
-    /// Off macOS/Windows there is no window server / `PrintWindow` to photograph, so the `window` verb says so.
+    /// Off macOS/Windows aterm has no window photograph (no CoreGraphics or `PrintWindow` path), so the `window` verb says so.
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     pub(crate) fn capture_window(
         &mut self,
@@ -6359,7 +6362,7 @@ impl App {
 }
 
 impl App {
-    /// Capture an auxiliary own-rendered GUI surface to the confined PNG, replying its `(width, height)`.
+    /// The `window [<target>]` verb: photograph the whole front window to the confined PNG once `target` is open in it (`front` always is), replying its `(width, height)`.
     #[cfg(any(target_os = "macos", windows))]
     pub(crate) fn capture_aux_window(
         &mut self,
@@ -6379,7 +6382,7 @@ impl App {
         }));
     }
 
-    /// Off macOS/Windows there is no window server / `PrintWindow` to photograph.
+    /// Off macOS/Windows aterm has no window photograph path.
     #[cfg(not(any(target_os = "macos", windows)))]
     pub(crate) fn capture_aux_window(
         &mut self,

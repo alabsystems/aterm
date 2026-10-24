@@ -1079,7 +1079,7 @@ pub fn with_rendezvous_defaults(args: &[String]) -> Vec<String> {
     fill_defaults(args, &r)
 }
 
-/// Prepend absent `--fleet` and `--broker` from `r`.
+/// Prepend absent `--fleet` and `--broker` from `r`, and absent `--cap-file` and `--state` too when `--broker` was not given.
 #[must_use]
 pub fn fill_defaults(args: &[String], r: &Rendezvous) -> Vec<String> {
     let has = |flag: &str| args.iter().any(|a| a == flag);

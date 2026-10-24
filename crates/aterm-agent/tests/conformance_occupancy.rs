@@ -4,13 +4,17 @@
 //! Tier-1 conformance tests binding `OccupancyDoor` to `occupancy::decide`, `write_held`,
 //! `HoldClock`, and `Books`, and, in its stuck runs (`Key = 1`), to the stuck fact's door:
 //! `FactsState::observe`/`pending` on a facts reading and `stuck_at_break` under the owner's
-//! `[harness] stuck_break_note` grant.
+//! `[harness] stuck_break_note` grant; and, in its hold-rule runs, `age` and `esc` to the K clock
+//! (`DueClock`) the loop feeds after the decider, whose `sample` its `Sample` and `SampleLast`
+//! drive in their own evidence windows.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use aterm_agent::harness::disk::Level;
 use aterm_agent::supervise::facts::{EpisodeKey, FactKind, FactsReading, FactsState, SeedOutcome};
+use aterm_agent::supervise::occupancy::due::DueClock;
 use aterm_agent::supervise::occupancy::fault::{self, Fault};
+use aterm_agent::supervise::occupancy::reading::LOOK_EVERY_MS;
 use aterm_agent::supervise::occupancy::rules::{
     HOLD_ROOM_AFTER_MS, HOLD_ROOM_APART_MS, SESSION_PACE_MS, WAIT_NUDGE_AFTER_MS, episode,
 };
@@ -21,6 +25,7 @@ use aterm_agent::supervise::occupancy::{
 use aterm_agent::supervise::{Autopilot, BackgroundCall, Guard, SupervisorConfig};
 use aterm_models_harness::occupancy_door_model;
 use aterm_spec::derive::Model;
+use aterm_spec::xref::StepEvidence;
 
 use crate::common::cnst;
 
@@ -55,6 +60,12 @@ struct Real {
     /// The hung call's leader's birth: an episode closed in an odd variant's run reopens on a
     /// call born later in the same group.
     birth: u64,
+    /// The K clock, fed as the loop's `door_k` feeds it, on its own clock: `look` moves one look
+    /// at each `Sample` and `SampleLast` alone, so the hold's and the pace's clocks never age it.
+    due: DueClock<EpisodeKey>,
+    look: i64,
+    /// The episode the K clock was last fed, if any.
+    k_key: Option<EpisodeKey>,
 }
 
 /// How a walk departs from the committed real code, for the negative controls.
@@ -111,11 +122,19 @@ fn grant(key: i64) -> Option<aterm_agent::supervise::config::StuckBreakGrant> {
         .stuck_break_grant()
 }
 
-fn project(r: &Real, rule: RuleId) -> State {
+fn project(m: &Model, r: &Real, rule: RuleId) -> State {
     let held = r.clock.held_ms(r.now).is_some_and(|ms| ms >= age_ms(rule));
+    let (age, esc) = r
+        .k_key
+        .and_then(|key| Some((r.due.looks(&key, r.look)?, r.due.get(&key)?.raised)))
+        .map_or((0, false), |(looks, raised)| {
+            (looks.min(cnst(m, "K")), raised)
+        });
     State::from([
         ("held", i64::from(held)),
         ("owed", i64::from(r.clock.wants_tail())),
+        ("age", age),
+        ("esc", i64::from(esc)),
     ])
 }
 
@@ -219,10 +238,8 @@ fn stuck_said(m: &Model, st: &State, r: &Real, run: Run) -> Said {
     }
 }
 
-fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
-    if run.stuck {
-        return stuck_said(m, st, r, run);
-    }
+/// The decider's verdicts at `st` on the real side.
+fn verdicts(m: &Model, st: &State, r: &Real, run: Run) -> [(RuleId, Verdict); 2] {
     let reading = match run.rule {
         RuleId::WaitNudge => OccupancyReading::default(),
         RuleId::HoldRoom => board(st["cond"] == 1),
@@ -232,9 +249,24 @@ fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
         declared: r.clock.declared(),
     });
     let g = guards(st, autopilot(m), run.variant);
-    let verdicts = decide(&reading, hold, &r.books, &g, WAIT_NUDGE_AFTER_MS, r.now);
+    decide(&reading, hold, &r.books, &g, WAIT_NUDGE_AFTER_MS, r.now)
+}
+
+/// What the door's write is told at the break: the host's line and the upgrade's notice.
+fn at_write(r: &Real) -> AtWrite {
+    AtWrite {
+        host_line: r.host_line,
+        withheld: false,
+        upgrade_due: r.upgrade_due,
+    }
+}
+
+fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
+    if run.stuck {
+        return stuck_said(m, st, r, run);
+    }
     let mut said = Said::Other(String::from("no verdict"));
-    for (rule, verdict) in verdicts {
+    for (rule, verdict) in verdicts(m, st, r, run) {
         if rule != run.rule {
             if verdict != Verdict::Quiet {
                 return Said::Other(format!("{rule:?} {verdict:?}"));
@@ -244,12 +276,7 @@ fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
         said = match verdict {
             Verdict::Quiet => Said::Quiet,
             Verdict::Due(_) => {
-                let at = AtWrite {
-                    host_line: r.host_line,
-                    withheld: false,
-                    upgrade_due: r.upgrade_due,
-                };
-                write_held(rule, at).map_or(Said::Due, |g| Said::Held(term(g)))
+                write_held(rule, at_write(r)).map_or(Said::Due, |g| Said::Held(term(g)))
             }
             Verdict::Held(g) => Said::Held(term(g)),
             Verdict::Paced { .. } => Said::Paced,
@@ -257,6 +284,53 @@ fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
         };
     }
     said
+}
+
+/// The K clock's feed at `st`, as the loop's `door_k` makes it after the decider: the run's
+/// episode with the guard holding it (for a due line, the one its write finds; for a paced one,
+/// none), or nothing for a quiet or spent line. The stuck fact's line is not the loop's K clock's.
+fn k_feed(m: &Model, st: &State, r: &mut Real, run: Run) {
+    if run.stuck {
+        return;
+    }
+    let held = verdicts(m, st, r, run)
+        .into_iter()
+        .find(|(rule, _)| *rule == run.rule)
+        .and_then(|(rule, verdict)| match verdict {
+            Verdict::Held(g) => Some(Some(g)),
+            Verdict::Due(_) => Some(write_held(rule, at_write(r))),
+            Verdict::Paced { .. } => Some(None),
+            Verdict::Quiet | Verdict::Spent => None,
+        });
+    let named: Vec<(EpisodeKey, Option<Guard>)> = held
+        .filter(|_| r.clock.since_ms().is_some())
+        .map(|guard| (episode_now(r, run.rule), guard))
+        .into_iter()
+        .collect();
+    r.k_key = named.first().map(|(key, _)| *key);
+    r.due.observe(&named, r.look);
+}
+
+/// The walk holds `age` and `esc` to the K clock: in a hold rule's run, committed or with a
+/// defect planted in the clock. A defect planted in the decider or the hold shows where the model
+/// says through `held` and the verdict; the clock downstream of it would show it again wherever
+/// the line it forgets stood due.
+fn k_projected(run: Run) -> bool {
+    !run.stuck
+        && run.fault.is_none_or(|f| {
+            matches!(
+                f,
+                Fault::LateRaise | Fault::KFromLastWord | Fault::KUnseeded
+            )
+        })
+}
+
+/// A person holds the line the K clock was last fed: the real clock never raises under them (the
+/// slice-2 plan's S15), which the model's `SampleLast` does not draw.
+fn person_holds(r: &Real) -> bool {
+    r.k_key
+        .and_then(|key| r.due.get(&key))
+        .is_some_and(|due| due.last == Some(Guard::Person))
 }
 
 fn agrees(m: &Model, st: &State, said: &Said, stuck: bool) -> bool {
@@ -307,6 +381,10 @@ fn realizable(st: &State, action: &str, r: &Real, run: Run) -> bool {
         return false;
     }
     match action {
+        "SampleLast" if !run.stuck => !person_holds(r),
+        // A successor raises a line again at its first look, which a person's hand holds: the
+        // Entry is down while they are at the tab.
+        "Crash" if !run.stuck && st["esc"] == 1 => !person_holds(r),
         "OpenWake" => false,
         "OpenNudge" => !run.stuck,
         "OpenStuck" => run.stuck,
@@ -378,7 +456,29 @@ fn point(closing: bool, variant: usize) -> HoldEvent {
     HoldEvent::DecidedPoint { acts, background }
 }
 
-fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> bool {
+/// The evidence windows of an audited walk, or none.
+struct Ev(Option<StepEvidence>);
+
+impl Ev {
+    fn step<T>(&mut self, action: &'static str, drive: impl FnOnce() -> T) -> T {
+        match &mut self.0 {
+            Some(ev) => ev.step(action, drive),
+            None => drive(),
+        }
+    }
+}
+
+/// The real step for `action` from `st` to `next`; false where the code answers otherwise than
+/// the step says. `Sample` and `SampleLast` run the K clock's `sample` in their own evidence
+/// window, and nothing else runs in one.
+fn mirror(
+    m: &Model,
+    action: &'static str,
+    (st, next): (&State, &State),
+    r: &mut Real,
+    run: Run,
+    ev: &mut Ev,
+) -> bool {
     let rule = run.rule;
     if matches!(action, "Break" | "IdleRead" | "Point" | "Turn") {
         r.host_line = false;
@@ -423,6 +523,7 @@ fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> boo
             r.clock.step(HoldEvent::AnswerTail { waiting_line: true });
         }
         "PaceLapses" => r.now += SESSION_PACE_MS,
+        "Sample" | "SampleLast" => r.look += LOOK_EVERY_MS,
         "Close" => {
             if rule == RuleId::HoldRoom && !run.stuck {
                 r.now += HOLD_ROOM_APART_MS;
@@ -467,6 +568,15 @@ fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> boo
             if run.stuck {
                 r.facts = seeded;
             }
+            // The successor's K clock, seeded from the episode's earliest row in the ledger: taken
+            // here as the predecessor's own `since` (the loop's tests bind the rows to it).
+            let mut successor = DueClock::default();
+            if let Some(key) = r.k_key
+                && let Some(due) = r.due.get(&key)
+            {
+                successor.seed(key, due.since_ms);
+            }
+            r.due = successor;
         }
         _ => {}
     }
@@ -487,6 +597,18 @@ fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> boo
             return false;
         }
     }
+    k_feed(m, next, r, run);
+    let k = cnst(m, "K");
+    match action {
+        "Sample" | "SampleLast" if !run.stuck => {
+            ev.step(action, || r.due.sample(k, r.look));
+        }
+        // The successor's first look, at the predecessor's last.
+        "Crash" if !run.stuck => {
+            r.due.sample(k, r.look);
+        }
+        _ => {}
+    }
     true
 }
 
@@ -499,8 +621,14 @@ struct Walked {
 
 impl Walked {
     fn check(&mut self, m: &Model, st: &State, r: &Real, stepped: bool, strict: bool, run: Run) {
-        let real = project(r, run.rule);
-        let mut ok = stepped && ["held", "owed"].iter().all(|v| real[v] == st[v]);
+        let real = project(m, r, run.rule);
+        let mut vars = vec!["held", "owed"];
+        // A line whose condition failed lapsed at that look on the real side: the model's `Lapse`
+        // takes one more step.
+        if k_projected(run) && !(st["due"] > 0 && st["cond"] == 0) {
+            vars.extend(["age", "esc"]);
+        }
+        let mut ok = stepped && vars.iter().all(|v| real[v] == st[v]);
         let said = (st["door"] == 1).then(|| decided(m, st, r, run));
         if let Some(said) = &said {
             ok &= agrees(m, st, said, run.stuck);
@@ -526,8 +654,8 @@ fn typed(r: &Real) -> usize {
         .min(2)
 }
 
-fn walk(m: &Model, strict: bool, run: Run) -> Walked {
-    let go = || {
+fn walk(m: &Model, strict: bool, run: Run, ev: &mut Ev) -> Walked {
+    let go = |ev: &mut Ev| {
         let init = Real {
             now: T0,
             clock: HoldClock::default(),
@@ -540,6 +668,9 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
             host_line: false,
             facts: FactsState::default(),
             birth: 11,
+            due: DueClock::default(),
+            look: T0,
+            k_key: None,
         };
         let mut w = Walked {
             states: HashSet::new(),
@@ -565,7 +696,7 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
                     continue;
                 }
                 let mut r = real.clone();
-                let stepped = mirror(action.name, &st, &next, &mut r, run);
+                let stepped = mirror(m, action.name, (&st, &next), &mut r, run, ev);
                 *w.fired.entry(action.name).or_default() += 1;
                 w.check(m, &next, &r, stepped, strict, run);
                 queue.push_back((next, r));
@@ -574,14 +705,14 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
         w
     };
     match run.fault {
-        Some(f) => fault::with(f, go),
-        None => go(),
+        Some(f) => fault::with(f, || go(ev)),
+        None => go(ev),
     }
 }
 
 fn walks(runs: &[(i64, Run)], strict: bool) -> Vec<Walked> {
     aterm_spec::check::each(runs, |&(mode, run)| {
-        walk(&under(mode, run.key), strict, run)
+        walk(&under(mode, run.key), strict, run, &mut Ev(None))
     })
 }
 
@@ -705,7 +836,7 @@ type Shows = fn(&State) -> bool;
 
 #[test]
 fn tier1_each_planted_defect_disagrees_where_the_model_says() {
-    let controls: [(Fault, Option<RuleId>, Shows, Option<Shows>); 9] = [
+    let controls: [(Fault, Option<RuleId>, Shows, Option<Shows>); 12] = [
         (
             Fault::DedupeByRule,
             Some(RuleId::WaitNudge),
@@ -754,6 +885,22 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
             None,
             |st| st["door"] == 1 && st["lines"] == 1,
             None,
+        ),
+        // The K clock's: the model's `LateRaise`, a raise a look past K; its `RestartClock`, a
+        // clock from the rule's last word; and its `LoseDeadline`, a successor's clock that starts
+        // at its first look.
+        (Fault::LateRaise, None, |st| st["esc"] == 1, None),
+        (
+            Fault::KFromLastWord,
+            None,
+            |st| st["due"] > 0 && st["age"] > 0,
+            None,
+        ),
+        (
+            Fault::KUnseeded,
+            None,
+            |st| st["due"] > 0 && st["age"] > 0,
+            Some(|st| st["intent"] == 0),
         ),
     ];
     let mut runs = Vec::new();
@@ -811,10 +958,10 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
             !w.off.is_empty(),
             "{fault:?} ({rule:?}, variant {variant}) agreed everywhere"
         );
+        let elsewhere: Vec<&State> = w.off.iter().filter(|st| !shows(st)).collect();
         assert!(
-            w.off.iter().all(shows),
-            "{fault:?} ({rule:?}, variant {variant}): {:?}",
-            w.off
+            elsewhere.is_empty(),
+            "{fault:?} ({rule:?}, variant {variant}) disagrees elsewhere: {elsewhere:?}"
         );
         if let Some(among) = among {
             assert!(
@@ -840,9 +987,40 @@ fn tier1_the_anchors_name_what_the_code_implements() {
             "IdleRead",
             "Intend",
             "Lapse",
+            "Sample",
+            "SampleLast",
             "Skip",
             "Type"
         ]),
         "{anchored:?}"
     );
+}
+
+#[test]
+fn tier1_sample_and_sample_last_enter_the_k_clock_in_their_own_windows() {
+    let mut ev = Ev(Some(StepEvidence::new("OccupancyDoor")));
+    for rule in RuleId::ALL {
+        let run = Run {
+            rule,
+            variant: 0,
+            fault: None,
+            key: 0,
+            stuck: false,
+        };
+        walk(&under(1, 0), true, run, &mut ev);
+    }
+    let audit = ev.0.expect("the audited walk's evidence").audit();
+    for action in ["Sample", "SampleLast"] {
+        assert!(
+            audit.actions.contains(action) && !audit.undriven.contains(&action),
+            "{audit:?}"
+        );
+        assert!(!audit.unwitnessed.contains(&action), "{audit:?}");
+        assert!(!audit.blind_steps.contains(&action), "{audit:?}");
+    }
+    assert!(audit.uninstrumented.is_empty(), "{audit:?}");
+    assert!(audit.ambiguous.is_empty(), "{audit:?}");
+    assert!(audit.unanchored_steps.is_empty(), "{audit:?}");
+    assert!(audit.stray.is_empty(), "{audit:?}");
+    assert!(audit.witnessed_steps > 0, "{audit:?}");
 }

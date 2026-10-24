@@ -61,14 +61,16 @@ impl IdleHost for Faces {
     fn finished(&self) -> Option<bool> {
         self.finished
     }
-    fn repo_work(&self) -> Option<crate::harness::repo_work::RepoWork> {
+    fn repo_work(&self) -> crate::harness::repo_work::RepoRead {
         self.probes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.repos
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front()
-            .unwrap_or_else(|| self.repo.clone())
+        crate::harness::repo_work::RepoRead::of_found(
+            self.repos
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+                .unwrap_or_else(|| self.repo.clone()),
+        )
     }
     fn task_face(&self, face: TaskFace) {
         self.told
@@ -1387,13 +1389,11 @@ fn after_off_on(
 const THEIR_LANDING_REPLY_REWRAPPED: &str =
     "Added the module docstring, ran the tests\nand committed it.\nATERM-TASK-DONE";
 
-/// SOMEONE ELSE'S DONE TURN AFTER A LANDING IS NEVER READ AS THE LANDING
-/// (Together D3, the real sequence of 2026-10-16 on Claude Code 2.1.302:
-/// `DONE seq=41432 rule=land@v1`; a person's turn typed into Claude ended on
-/// `ATERM-TASK-DONE`, `EVENT idle seq=46002`; Autopilot Off; then Cruise
-/// with a timer, whose new loop journaled `DONE seq=46004 rule=land@v1 the
-/// worker said it is done after the land instruction` and read
-/// `task=landed`; then the same again when Land was chosen).
+/// SOMEONE ELSE'S DONE TURN AFTER A LANDING IS NEVER READ AS THE LANDING (a
+/// sequence on Claude Code 2.1.302): the loop lands (`rule=land@v1`); a
+/// person's turn typed into Claude ends on `ATERM-TASK-DONE`; Autopilot goes
+/// Off, then Cruise with a timer, or Land, and the new loop reads that turn
+/// as no landing: no land note, never `task=landed`.
 #[test]
 fn someone_elses_done_turn_after_a_landing_is_never_read_as_the_landing() {
     for (tag, hand) in [
@@ -1459,10 +1459,9 @@ fn someone_elses_done_turn_after_a_landing_is_never_read_as_the_landing() {
     }
 }
 
-/// A DONE TURN NO LOOP WATCHED, AFTER A LANDING, IS NO LANDING (the review of
-/// Together D3, 2026-10-17): the first loop lands; then a turn is typed and
-/// ends on the worker's token while Off has stopped the loop, so the journal
-/// holds nothing of it.
+/// A DONE TURN NO LOOP WATCHED, AFTER A LANDING, IS NO LANDING: the first
+/// loop lands; then a turn is typed and ends on the worker's token while Off
+/// has stopped the loop, so the journal holds nothing of it.
 #[test]
 fn a_done_turn_no_loop_watched_after_a_landing_is_no_landing() {
     for word in ["cruise", "land"] {
@@ -1487,7 +1486,7 @@ fn a_done_turn_no_loop_watched_after_a_landing_is_no_landing() {
 }
 
 /// A LANDING RIDDEN THROUGH A SEAMLESS UPDATE'S CUT STILL READS LANDED AFTER
-/// ITS RESTART (the review of Together D3, 2026-10-17).
+/// ITS RESTART.
 #[test]
 fn a_landing_ridden_through_an_update_cut_reads_landed_after_its_restart() {
     const SHORT_DEFENSE: &str =
@@ -1824,9 +1823,8 @@ fn follow_landing(ledger: &Path, tag: &str, follower: &'static str, lifted: bool
 }
 
 /// A LANDING THE HOST'S STEP TOOK IS NOTED, AND A LOOP THAT FOLLOWS READS IT
-/// AS THE FIRST LOOP DID (the claim of 2026-10-20 against main's `look()`:
-/// the end's point journaled, its `DONE …` note owed to the point's act,
-/// which the host's step there skips).
+/// AS THE FIRST LOOP DID: the end's point is journaled, then its `DONE …`
+/// note, then the host's step (`step=done:resumed`).
 #[test]
 fn a_tasks_end_the_hosts_step_took_is_noted_and_its_follower_types_nothing() {
     for take in [true, false] {
@@ -1860,9 +1858,9 @@ fn a_tasks_end_the_hosts_step_took_is_noted_and_its_follower_types_nothing() {
     }
 }
 
-/// A LANDING IS NOTED HOWEVER ITS LOOP IS CUT AT ITS POINT, and a loop that
-/// follows reads it as the first loop did (the review of 2026-10-20 of
-/// `Session::say_point`).
+/// A LANDING IS NOTED HOWEVER ITS LOOP IS CUT AT ITS POINT
+/// (`Session::say_point`), and a loop that follows reads it as the first loop
+/// did.
 #[test]
 fn a_tasks_end_is_noted_when_its_point_line_or_its_publish_fails() {
     for cut in [Cut::ReaderGone, Cut::HungUp] {
@@ -2151,13 +2149,13 @@ impl IdleHost for Restarter {
     }
 }
 
-/// A LANDING THE MEMORY BANNER CUT IS CARRIED ON AFTER ITS RESTART (the
-/// review of 2026-10-16, §9.4.8): under Land a job's done report gets the
-/// land instruction, whose turn ends at Claude Code's memory banner; the
-/// host restarts the agent in place, and at the relaunched agent's first
-/// point, its resumed reply progress, the loop tells the host nothing of a
-/// task done (the done report before the banner stands, but the banner's
-/// reply said nothing), so the carry-on is typed (`continued`).
+/// A LANDING THE MEMORY BANNER CUT IS CARRIED ON AFTER ITS RESTART: under
+/// Land a job's done report gets the land instruction, whose turn ends at
+/// Claude Code's memory banner; the host restarts the agent in place, and at
+/// the relaunched agent's first point, its resumed reply progress, the loop
+/// tells the host nothing of a task done (the done report before the banner
+/// stands, but the banner's reply said nothing), so the carry-on is typed
+/// (`continued`).
 #[test]
 fn a_landing_the_memory_banner_cut_is_carried_on_after_its_restart() {
     use aterm_phase::prompt::fixtures::{MEMORY_BANNER_IDLE, screen};
@@ -2262,10 +2260,9 @@ fn a_landing_the_memory_banner_cut_is_carried_on_after_its_restart() {
     );
 }
 
-/// A LOOP STARTED UNDER CRUISE OVER A LANDING'S BOOKS TELLS NO LANDING (the
-/// merge review's P2): the journal holds a real landing (`DONE …
-/// rule=land@v1`), and the session is now under Cruise — started fresh, or
-/// as its Off lifts.
+/// A LOOP STARTED UNDER CRUISE OVER A LANDING'S BOOKS TELLS NO LANDING: the
+/// journal holds a real landing (`DONE … rule=land@v1`), and the session is
+/// now under Cruise — started fresh, or as its Off lifts.
 #[test]
 fn a_cruise_loop_over_a_landings_books_tells_no_landing() {
     let (dir, ledger) = files("cruise-over-landing", &[], &[]);
@@ -2566,9 +2563,9 @@ fn a_restart_after_a_kept_wake_keeps_the_landing() {
 
 /// A SWITCH FROM LAND TO CRUISE ON THE LANDED SCREEN IS READ AT THE WAKE'S
 /// END (`Session::turn_end_at_point`'s fresh word): the loop idles on the
-/// landed screen and reads no word there, so the owner's switch to Cruise
-/// was unread when the landed task's own wake ended, and the wake kept the
-/// landing under Cruise — nothing went on (the review of b8/residuals).
+/// landed screen and reads no word there, so a wake's end that read no fresh
+/// word would leave the owner's switch to Cruise unread and the landing kept
+/// under Cruise, with nothing going on.
 #[test]
 fn a_switch_to_cruise_on_the_landed_screen_is_read_at_the_wakes_end() {
     let wake = "The monitor fired: the deploy finished.";
@@ -2637,9 +2634,8 @@ fn bare_metas(m: &Mock) -> Vec<bool> {
 }
 
 /// A LANDING RESTARTED BY A LOOP WHOSE START-UP `meta` WAS NOT SERVED STILL
-/// READS LANDED under the session's own Land (the final check of
-/// 2026-10-20, W1: a seamless update's successor, its loops started before
-/// its control socket listened).
+/// READS LANDED under the session's own Land (a seamless update's successor,
+/// its loops started before its control socket listened).
 #[test]
 fn a_landing_whose_successors_first_meta_is_unserved_still_reads_landed() {
     for lose in [false, true] {
@@ -2677,7 +2673,7 @@ fn a_landing_whose_successors_first_meta_is_unserved_still_reads_landed() {
 /// UNSERVED, GETS LAND'S INSTRUCTION at its first point, never Cruise's
 /// continuation: the word never read is read where the decision would act
 /// (`Session::autopilot_read`), not left to the table's because no reply
-/// ever said the host keeps one (W1's second case).
+/// ever said the host keeps one.
 #[test]
 fn an_unread_word_is_read_at_the_first_decision_not_left_to_the_table() {
     for lose in [false, true] {
@@ -2768,8 +2764,7 @@ fn restart_over_landing(
 }
 
 /// AN OFF SESSION'S LANDING SURVIVES A LOST START-UP `meta`, and lands
-/// again when the owner turns it to Land (the second review of 2026-10-20,
-/// R1).
+/// again when the owner turns it to Land.
 #[test]
 fn an_off_landing_whose_first_meta_is_lost_reads_as_if_it_were_served() {
     for lose in [false, true] {
@@ -2802,8 +2797,7 @@ fn an_off_landing_whose_first_meta_is_lost_reads_as_if_it_were_served() {
 }
 
 /// A RESTART OVER A LANDING'S BOOKS WHOSE START-UP `meta` WAS LOST TELLS NO
-/// FACE BEFORE THE WORD IS READ (the merge review's P2, its lost-read case;
-/// the second review of 2026-10-20, R1).
+/// FACE BEFORE THE WORD IS READ.
 #[test]
 fn a_restart_whose_first_meta_is_lost_tells_the_face_its_served_start_tells() {
     for (word, table, want) in [

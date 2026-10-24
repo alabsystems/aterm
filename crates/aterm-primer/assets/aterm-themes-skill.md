@@ -2,7 +2,7 @@
 name: aterm-themes
 description: Design, write, check, preview, import or install an aterm colour theme (a .conf in the themes folder), or pick a light/dark pair. Use for "make a theme", "terminal colours", "colour scheme", "dark:…,light:…", "aterm theme", "install Catppuccin/Kanagawa/Tokyo Night", "import my kitty/Ghostty/iTerm2 theme", or a theme file that will not load.
 ---
-<!-- aterm skill v2 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v3 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # aterm themes: design, check, preview, commit
 
@@ -150,6 +150,8 @@ A theme file is untrusted text; the parser refuses to load:
   run `theme import`).
 - `aterm ctl theme` shows `miss="…"` when the configured theme cannot be drawn.
 - Top-level colour, chrome and font keys in `aterm.toml` override every theme.
-- Program-set colours (OSC 4/10/11, base16-shell, pywal) survive theme switches unless
-  `allow_palette_reconfigure = false`. Inspect them with `aterm ctl @<sid> colors`
-  (`program_palette=`, `program_slots=`, `palette_sets=`) and clear with `aterm ctl @<sid> reset`.
+- Program-set colours (OSC 4/10/11, base16-shell, pywal) survive theme switches.
+  `allow_palette_reconfigure = false` refuses and drops what programs set in the 256 indexed
+  colours (OSC 4/21); foreground, background and cursor (OSC 10/11/12) are not gated.
+  Inspect them with `aterm ctl @<sid> colors` (`program_palette=`, `program_slots=`,
+  `palette_sets=`) and clear with `aterm ctl @<sid> reset`.

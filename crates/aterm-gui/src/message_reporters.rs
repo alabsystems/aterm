@@ -3481,6 +3481,52 @@ pub(crate) fn occupancy_hold_entry(
         .fold(entry, |entry, cap| entry.more(format!("{cap} spent")))
 }
 
+/// Digest key for [`occupancy_ready_idle_entry`]: `harness.occupancy.<sid>.ready-idle`.
+pub(crate) fn occupancy_ready_idle_key(sid: &str) -> String {
+    digest_key(Family::Occupancy, sid, "ready-idle")
+}
+
+/// A TAB'S DUE LINE STOOD K LOOKS UNTYPED, under `prompt` (the slice-2 plan's D2, the K Entry):
+/// `idle` names its rule, the guard holding it at the last look and when it was first due; `at_ms`
+/// (unix) is the told word's. Every word it fills in is the tab's sid, the closed rule list's, the
+/// closed guard list's or a span the loop's clock measured.
+pub(crate) fn occupancy_ready_idle_entry(
+    sid: &str,
+    idle: &aterm_agent::supervise::occupancy::SaidReadyIdle,
+    at_ms: i64,
+) -> Entry {
+    use aterm_agent::supervise::occupancy::said::span_words;
+    let rule = idle.rule.name();
+    let span = span_words(at_ms.saturating_sub(idle.since_ms));
+    let held = idle.guard.map_or_else(
+        || String::from("no guard held it, and it went untyped"),
+        |guard| format!("{} held it at the last look", guard.word()),
+    );
+    Entry::new(
+        Family::Occupancy,
+        sid,
+        "ready-idle",
+        "A tab's occupancy line stands untyped",
+        Why::Spent {
+            tried: Reason::new(format!("kept {rule} due for {span}")),
+            reason: Reason::new(&held),
+        },
+        Then::step(format!(
+            "Look at the tab's wait with aterm ctl @{sid} occupancy why"
+        )),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .more(format!(
+        "The harness judged {rule} due on this tab for {span} and typed nothing: {held}."
+    ))
+    .log_line(format!(
+        "occupancy ready-idle sid={sid} rule={rule} guard={} due_ms={}",
+        idle.guard.map_or("none", |guard| guard.word()),
+        at_ms.saturating_sub(idle.since_ms).max(0)
+    ))
+}
+
 /// Retired `aterm.toml` feature table and its replacement guidance.
 pub(crate) struct RemovedFeature {
     pub(crate) table: &'static str,

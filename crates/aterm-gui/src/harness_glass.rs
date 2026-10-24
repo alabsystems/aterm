@@ -844,6 +844,7 @@ fn leg_words(
             (_, None) => "a need named earlier in its reply".to_owned(),
         },
         HoldLeg::Repo => repo_words(held),
+        HoldLeg::Unread => "a repository that could not be read".to_owned(),
         HoldLeg::Open => open_leg(held.open_words()),
         HoldLeg::Defense => "no \u{201c}Nothing left:\u{201d} defense yet".to_owned(),
         HoldLeg::Cut => "a reply too tall to read whole".to_owned(),
@@ -863,6 +864,7 @@ fn spoken_leg(held: LandHeld, leg: HoldLeg, need: Option<&crate::needs::HarnessA
             None => "A need named earlier in its reply.".to_owned(),
         },
         HoldLeg::Repo => format!("{}.", repo_words(held)),
+        HoldLeg::Unread => "A repository that could not be read.".to_owned(),
         HoldLeg::Open => {
             let words: Vec<String> = held
                 .open_words()

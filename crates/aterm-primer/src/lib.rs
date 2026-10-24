@@ -57,6 +57,7 @@ fn auto_prime_note(xdg: Option<&Path>) -> String {
 fn off_switch(xdg: Option<&Path>) -> String {
     let file = match xdg {
         Some(x) => x.join("aterm").join("aterm.toml").display().to_string(),
+        None if cfg!(windows) => r"%APPDATA%\aterm\aterm.toml".to_string(),
         None => "~/.config/aterm/aterm.toml".to_string(),
     };
     format!("set `agents_auto_prime = false` in {file} to stop")
@@ -118,14 +119,17 @@ const THEMES_SKILL_BODY: &str = include_str!("../assets/aterm-themes-skill.md");
 
 const SYSTEM_STATE_SKILL_BODY: &str = include_str!("../assets/system-state-skill.md");
 
-const FABRIC_BODY: &str = include_str!("../assets/aterm-fabric-body.md");
-
 const FABRIC_SKILL_BODY: &str = concat!(
     include_str!("../assets/aterm-fabric-frontmatter.md"),
     include_str!("../assets/aterm-fabric-body.md"),
 );
 
-const CODEX_FABRIC_BODY: &str = FABRIC_BODY;
+const CODEX_FABRIC_BODY: &str = concat!(
+    include_str!("../assets/aterm-fabric-body.md"),
+    "\nIn Codex's sandbox each `aterm ctl` command above answers `Operation not permitted \
+     (os error 1)`: the control socket is refused there. codex-alab's own TUI, outside the \
+     sandbox, reads this session's mail.\n",
+);
 
 const OPENCODE_FABRIC_BODY: &str = concat!(
     "---\ndescription: The aterm fabric — read this session's inbox, post to a peer or a human, and understand hold=/trust=/fabric=.\n---\n",
@@ -1083,7 +1087,8 @@ pub enum HookRemoval {
     Removed { removed: usize, backup: PathBuf },
 }
 
-/// Take every hook entry aterm wrote out of a Claude settings file, ONCE.
+/// Take every hook entry aterm wrote out of a Claude settings file, and put back the statusLine the
+/// harness replaced, ONCE.
 pub(crate) fn remove_aterm_hooks(path: &Path) -> Result<HookRemoval, String> {
     let edited = edit_settings(path, |text| {
         let Some(text) = text else {
@@ -1606,16 +1611,16 @@ fn auto_prime_in(home: &Path, xdg: Option<&Path>, switch: &str) -> AutoPrime {
                 Ok(PrimerWrite::Created | PrimerWrite::Appended | PrimerWrite::Replaced)
             )
         {
-            wrote.push(format!("~/{}", through.file));
+            wrote.push(display_path(home, xdg, through.file));
         }
         for (skill, write) in skills_for(a.name).iter().zip(&skills) {
             if matches!(write, Ok(SkillWrite::Installed | SkillWrite::Updated)) {
-                wrote.push(format!("~/{}", skill.path));
+                wrote.push(display_path(home, xdg, skill.path));
             }
         }
         if let Some(Ok(HookRemoval::Removed { removed, backup })) = &hooks {
             wrote.push(format!(
-                "~/{CLAUDE_SETTINGS_FILE} ({removed} aterm hook entr{} removed; backup {})",
+                "~/{CLAUDE_SETTINGS_FILE} ({removed} aterm hook or statusLine entr{} removed; backup {})",
                 if *removed == 1 { "y" } else { "ies" },
                 backup.display()
             ));
@@ -1711,6 +1716,7 @@ fn usage() -> String {
          \x20 install   install or update the primer and skills of every detected agent\n\
          \x20           (its config directory exists); name an agent to force it\n\
          \x20 remove    remove the primer block, bundled skills and aterm's Claude hooks\n\
+         \x20           and statusLine\n\
          \x20 primer    print the block (`primer codex` adds its sandbox note)\n\
          \n\
          agents:\n",
@@ -1718,6 +1724,7 @@ fn usage() -> String {
     for a in AGENT_FILES {
         let _ = writeln!(s, "  {:<9} {}  (~/{})", a.name, a.product, a.file);
     }
+    s.push_str("  ~/.config/ means $XDG_CONFIG_HOME/ when that is set\n");
     s
 }
 
@@ -1955,7 +1962,7 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                     let verdict = match remove_aterm_hooks(&settings) {
                         Ok(HookRemoval::Nothing) => None,
                         Ok(HookRemoval::Removed { removed, backup }) => Some(format!(
-                            "removed {removed} aterm hook entr{} (backup {})",
+                            "removed {removed} aterm hook or statusLine entr{} (backup {})",
                             if removed == 1 { "y" } else { "ies" },
                             backup.display()
                         )),
@@ -3011,8 +3018,9 @@ A worker's report ends with `ATERM-TASK-DONE` on a line by itself.
                 s.path
             );
         }
-        assert!(FABRIC_BODY.starts_with(SKILL_MARK_PREFIX));
-        assert!(!FABRIC_BODY.contains("'''") && !FABRIC_BODY.contains('\\'));
+        let body = include_str!("../assets/aterm-fabric-body.md");
+        assert!(body.starts_with(SKILL_MARK_PREFIX));
+        assert!(!body.contains("'''") && !body.contains('\\'));
     }
 
     #[test]

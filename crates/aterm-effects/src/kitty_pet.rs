@@ -2089,10 +2089,10 @@ impl PetBrain {
 
     /// THE HEAD LAW AT THE WRAP: the seat a cat leaps ahead to, on the row
     /// under a line typed to the margin, stands its 1.7-row body 0.7 of a row
-    /// into that line, so a typing that stops short of the wrap left it at
-    /// rest with its head behind the line's letters, cut away by them (the
-    /// trail gallery's `burst` on every theme, 2026-10-23: under `he` of the
-    /// echo from the burst's end on). Once the typing has stopped, the seat
+    /// into that line, so a typing that stops short of the wrap would leave
+    /// it at rest with its head behind the line's letters, cut away by them
+    /// (the trail gallery's `burst` on every theme: under `he` of the echo
+    /// from the burst's end on). Once the typing has stopped, the seat
     /// steps one row further down where the line's letters lie over the body
     /// and that row is clear: the whole body then stands on blank rows, its
     /// head in the row the wrap would fill. While the typing runs the wrap is
@@ -8237,10 +8237,10 @@ impl PetBrain {
         // once for that Enter, and holds while they come and go within
         // [`LETTER_VEIL_DWELL`] (output streaming in under the body). Any
         // other arrival, and letters back after the hold let the veil go,
-        // yield by the dwell and the ease, never a cut: an Enter's step
-        // left armed until the next key dropped the veil in one frame each
-        // time streamed lines brought letters back under a resting cat after
-        // it had eased up, 3.7 times a second (2026-10-23, review).
+        // yield by the dwell and the ease, never a cut: an Enter's step left
+        // armed until the next key would drop the veil in one frame each time
+        // streamed lines brought letters back under a resting cat after it
+        // had eased up, 3.7 times a second.
         #[cfg(any(test, debug_assertions))]
         let dwells = self.letter_arrival_dwells;
         #[cfg(not(any(test, debug_assertions)))]
@@ -8303,8 +8303,8 @@ impl PetBrain {
             // now: the veil steps on in the frame that shows them, as the
             // screen itself jumps, one fall that never comes back while they
             // stay. Dwelt on and eased in, the letters an Enter at the bottom
-            // row scrolled in under a resting cat read under 4.5:1 for 384 ms
-            // (352 on paper; 2026-10-22, `enter-bottom`).
+            // row scrolls in under a resting cat would read under 4.5:1 for
+            // 384 ms (352 on paper; the trail gallery's `enter-bottom`).
             target
         } else if target < level {
             let on = if resting {

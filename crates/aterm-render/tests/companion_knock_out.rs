@@ -8,7 +8,7 @@
 // around it whatever the coat. Judged per ink pixel against the ground next to it (the
 // nearest ring of pixels the glyph does not touch, as `aterm-lab trail-contrast` judges a
 // companion), on a dark and a light page, with coats near the ink's own lightness: the tan
-// and the cream of the 2026-10-22 burst landings (1.3 to 1.9:1 under the fur). Negative
+// and the cream of the trail gallery's `burst` landings (1.3 to 1.9:1 under the fur). Negative
 // control: the knock-out off (`Renderer::set_knock_out(false)`) leaves letters under 4.5:1.
 // Beside the body nothing changes: a frame with the body away from the letters is byte-equal
 // with and without the knock-out, and the body itself keeps every pixel no glyph touches.

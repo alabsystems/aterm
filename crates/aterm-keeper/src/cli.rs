@@ -20,15 +20,17 @@ terminal's master, so a window that crashes does not hang up its shells.
 
 USAGE:
     aterm keeper start  [--sock <path>] [--identity designated|uid] [--label <label>]
-    aterm keeper stop   [--label <label>]
+    aterm keeper stop   [--identity designated|uid] [--label <label>]
     aterm keeper status [--sock <path>] [--identity designated|uid]
     aterm keeper serve  [--sock <path>] [--identity designated|uid] [--no-relaunch]
 
-    start    Submit this build's keeper as a transient launchd job
-             (`launchctl submit`: no plist, gone at logout) unless a job is
-             loaded or a keeper answers. It runs `serve --no-relaunch`.
-    stop     Remove the job, wait for its keeper to end (shells only it held
-             hang up, as on a quit) and remove ended keepers' code copies.
+    start    Submit this build's keeper as a launchd job (`launchctl submit`:
+             no plist; launchd restarts it whenever it exits, until `stop` or
+             logout) unless a job is loaded or a keeper answers. It runs
+             `serve --no-relaunch` and waits up to 10 s for it to answer.
+    stop     Remove the job, wait up to 60 s for its keeper to end (shells
+             only it held hang up, as on a quit) and remove ended keepers'
+             code copies.
     status   What the keeper holds (masters by state, the relaunch brake, its
              identity), then this build's `label=` and `job=`. `keeper=absent`
              when none answers, `keeper=refused` when it is not this build's.
@@ -38,9 +40,9 @@ USAGE:
              ~/Library/Application Support/aterm/keeper-code, so windows can
              still check it after an update removes this build.
 
-OPTIONS:
+OPTIONS (a verb ignores those its USAGE line leaves out):
     --sock <path>        The socket (default: this build's own, as `status`
-                         prints it; each dev tree and the app have their own).
+                         prints it; each executable path has its own).
     --identity <which>   `designated` (the default): the peer must run code
                          that satisfies this build's designated requirement.
                          `uid`: the same user only, for tests and by-hand
@@ -82,7 +84,10 @@ fn parse(args: &[OsString]) -> Result<Args, String> {
                 identity = match it.next().as_deref() {
                     Some("designated") => IdentityPolicy::Designated,
                     Some("uid") => IdentityPolicy::SameUid,
-                    other => return Err(format!("--identity designated|uid, not {other:?}")),
+                    Some(other) => {
+                        return Err(format!("--identity takes designated or uid, not {other:?}"));
+                    }
+                    None => return Err("--identity needs designated or uid".to_string()),
                 };
             }
             "--label" => label = Some(it.next().ok_or("--label needs a label")?),
@@ -171,7 +176,7 @@ fn serve(args: &Args, version: &str) -> ExitCode {
         let why = match (exe.as_deref(), code.as_deref()) {
             (Some(exe), Some(dir)) => crate::code::run_from_own_copy(exe, dir, &identity),
             (None, _) => "this executable's path cannot be read".to_string(),
-            (_, None) => "no $HOME to keep a copy in".to_string(),
+            (_, None) => "no absolute $HOME to keep a copy in".to_string(),
         };
         eprintln!(
             "aterm keeper serve: running from this build, not a copy ({why}); no window can \

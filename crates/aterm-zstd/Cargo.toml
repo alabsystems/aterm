@@ -17,7 +17,7 @@ version.workspace = true
 edition.workspace = true
 license = "Apache-2.0 AND MIT"
 repository.workspace = true
-description = "First-party Zstandard for aterm: a safe streaming decoder (carved from ruzstd 0.8.3), XXH64 and a raw-block frame writer"
+description = "First-party Zstandard for aterm: a safe streaming decoder (carved from ruzstd 0.8.3), a streaming encoder, XXH64 and a raw-block frame writer"
 
 [lib]
 name = "aterm_zstd"
@@ -32,6 +32,12 @@ path = "src/lib.rs"
 # the recorded frames decode to (tests/cli_decode.rs, tests/sweep.rs). Those
 # recorded answers are the decoder's oracle.
 aterm-digest = { workspace = true }
+# The zstd CLI's TOOLS row (`aterm_uds::host::need_tool`), spawned through
+# `aterm_uds::spawnfd::command`, is the reference decoder the encoder's frames
+# are held to (tests/encode_cli.rs); without it that test ends COULD NOT RUN.
+aterm-uds = { workspace = true }
+# Scratch directories for the frames the CLI reads.
+aterm-tempfile = { workspace = true }
 
 [[test]]
 name = "zstd_suite"

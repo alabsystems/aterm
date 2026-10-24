@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm ctl privacy` and `await consent` (design §5.1, §5.3).
+//! `aterm ctl privacy` and `await consent`
+//! (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §5.1, §5.3).
 
 use std::time::{Duration, Instant};
 

@@ -473,7 +473,7 @@ mod tests {
         panic!("{why}")
     }
 
-    /// A REAL GIT.
+    /// A REAL GIT, ASKING A HELPER THAT NEVER ANSWERS.
     #[cfg(unix)]
     #[test]
     fn a_helper_waiting_for_a_person_is_ended_with_what_it_started() {

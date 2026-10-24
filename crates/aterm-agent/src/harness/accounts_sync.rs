@@ -323,28 +323,7 @@ fn parse_computer_cell(cell: &str) -> Option<(Vec<String>, Option<u32>)> {
 }
 
 fn machines_from_email_hint(email: &str) -> Vec<String> {
-    let Some((local, _)) = email.split_once('@') else {
-        return Vec::new();
-    };
-    let tokens: Vec<&str> = local.split(['.', '-', '_']).collect();
-    let mut out = Vec::new();
-    for (idx, tok) in tokens.iter().enumerate() {
-        if let Some(m) = normalize_machine_id(tok) {
-            if !out.contains(&m) {
-                out.push(m);
-            }
-            if let Some(next) = tokens.get(idx + 1)
-                && next.len() >= 2
-                && next.bytes().all(|b| b.is_ascii_digit())
-            {
-                let m2 = format!("m{next}");
-                if !out.contains(&m2) {
-                    out.push(m2);
-                }
-            }
-        }
-    }
-    out
+    email_machines_and_slot(email).0
 }
 
 fn csv_records(mut text: &str) -> impl Iterator<Item = Result<&str, &'static str>> {
@@ -540,10 +519,14 @@ pub fn parse_accounting_csv(csv_text: &str, source: &str) -> Result<FleetRoster,
         if disqualified_cell || machines.is_empty() {
             continue;
         }
-        for hint_m in machines_from_email_hint(email) {
+        let (email_machines, email_slot) = email_machines_and_slot(email);
+        for hint_m in email_machines {
             if !machines.contains(&hint_m) {
                 machines.push(hint_m);
             }
+        }
+        if slot.is_none() {
+            slot = email_slot;
         }
 
         let email_lower = email.to_ascii_lowercase();
@@ -920,7 +903,9 @@ fn email_machines_and_slot(email: &str) -> (Vec<String>, Option<u32>) {
                 let Ok(n) = next.parse::<u32>() else {
                     break;
                 };
-                let is_last = idx + 1 + rem_idx + 1 == tokens.len();
+                let is_last = tokens
+                    .get(idx + 1 + rem_idx + 1)
+                    .is_none_or(|t| t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()));
                 if is_last && n <= 9 {
                     slot = Some(n);
                 } else {

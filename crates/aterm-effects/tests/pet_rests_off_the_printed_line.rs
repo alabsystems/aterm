@@ -608,11 +608,11 @@ fn a_cat_waiting_on_a_wrap_that_never_comes_rests_off_the_line() {
     }
 }
 
-/// THE ENTER'S STEP FIRES ONCE (2026-10-23, review): output that keeps
-/// streaming in under a resting cat after the hand's last key, an Enter, is
-/// no Enter's letters. From two seconds after the Enter, lines that alternate
-/// between lettered to the margin and a lone `.` scroll up under the body
-/// eight a second. Judged from the stream's first line: the cat's presence
+/// THE ENTER'S STEP FIRES ONCE: output that keeps streaming in under a
+/// resting cat after the hand's last key, an Enter, is no Enter's letters.
+/// From two seconds after the Enter, lines that alternate between lettered
+/// to the margin and a lone `.` scroll up under the body eight a second.
+/// Judged from the stream's first line: the cat's presence
 /// never falls more than 60 levels in one frame and never comes back up
 /// once it fell (a body that dips and returns blinks), and no letter under
 /// it reads under the bar (the veil the Enter's letters stepped on holds

@@ -84,6 +84,7 @@ fn every_field_moved(dir: &Path) -> SessionSetup {
         person_hold_wait: Some(d(52)),
         beside_idle_min: d(53),
         occupancy_nudge_after: d(59),
+        occupancy_k_looks: 3,
     }
 }
 

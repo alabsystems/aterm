@@ -59,9 +59,9 @@ pub(crate) struct Args {
     pub(crate) brief: bool,
 }
 
-const USAGE: &str = "ERR usage: survey [--json] [--budget <chars>] [--sid <s-…>] \
-                     [--fleet | --host <h>] [--timeout <seconds, at most 10>] | survey --brief \
-                     [--budget <chars>]";
+const USAGE: &str = "ERR usage: survey [--fleet] [--budget <chars>] | survey [--json] \
+                     [--sid <s-…>] [--fleet | --host <h>] | survey --brief [--budget <chars>] \
+                     (--fleet and --host take --timeout <seconds, at most 10>)";
 
 /// Parameters for a fleet survey query ([`FleetSurveyFn`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -682,7 +682,8 @@ struct Excerpt {
     word: &'static str,
     /// The record's text, decoded.
     text: String,
-    /// A cut keeps the end ([the type](Excerpt)).
+    /// A cut keeps the end: a finished session's `said` (task `done`/`exited` or agent
+    /// `idle`) the server did not already cut.
     keeps_end: bool,
 }
 
@@ -942,7 +943,8 @@ fn closing_fitted(left_out: usize, budget: usize, fleet: bool, room: usize) -> S
     }
 }
 
-/// Render a budgeted survey read with leading [`DATA_LINE`] and trailing `notes`.
+/// Render a budgeted survey read with leading [`DATA_LINE`] and trailing `notes`; when no
+/// reply line fits, only the closing line and the notes that fit.
 pub(crate) fn render_read(
     replies: &[HostReply],
     budget: usize,
@@ -1112,7 +1114,7 @@ fn more_line(rest: &[Entry]) -> String {
         (Class::Stalled, "stalled"),
         (Class::Busy, "busy"),
         (Class::Done, "done"),
-        (Class::Agent, "idle agents"),
+        (Class::Agent, "other agents"),
         (Class::Running, "running shells"),
         (Class::Shell, "idle shells"),
     ] {
@@ -1169,8 +1171,8 @@ pub(crate) fn sid_not_found(replies: &[HostReply], sid: &str, fleet: bool) -> St
         .collect();
     if capped.is_empty() && !fleet {
         format!(
-            "ERR no such session @{sid} on this machine's instances (a fleet peer's: --fleet --sid \
-             <s>, or --host <h> --sid <s>)"
+            "ERR no such session @{sid} on any local instance that answered (a fleet peer's: \
+             --fleet --sid <s>, or --host <h> --sid <s>)"
         )
     } else if capped.is_empty() {
         format!("ERR no such session @{sid} on any instance that answered")

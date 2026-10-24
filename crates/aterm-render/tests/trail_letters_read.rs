@@ -660,7 +660,7 @@ fn every_letter_a_trail_lies_on_reads_at_the_bar() {
 }
 
 /// The negative control: the same replays with the letter guard off bury letters, each one a
-/// defect the trail gallery photographed (round 2's judge): the ribbon's Enter flare across the
+/// defect the trail gallery photographed: the ribbon's Enter flare across the
 /// printed line and the echo, Laser's Enter bolt across the printed line, the caret bloom of
 /// Beam, Phaser, Comet, Lumen and Sparkle on the newest letters, Water's wave through the letters
 /// on dark and in the burst on paper, the ribbon head's bloom in the burst, and Fire's spark on a
@@ -703,15 +703,15 @@ const RIBBONS: [&str; 5] = [
     "nyan rainbow",
 ];
 
-/// THE LAW ON DIM TEXT (2026-10-23, review): text that clears the bar with little room, a
-/// 5.0:1 grey on the dark page and Solarized Dark's 4.75:1, reads its solid ink under the
-/// guard's floor on the bare page, and the guard gave up on it and left every light whole: a
-/// 5.0:1 grey under Sparkle's caret bloom read 1.01:1 and Solarized under Laser's Enter bolt
-/// 1.34:1. Every style but classic, through every scene, keeps each letter it lies on at four
-/// fifths of the theme's own contrast ([`look_bar`]); the ribbons through the Enter (their
-/// flare, which the guard holds), their bodies under the typed line being the ribbon's own
-/// hold's (0.7 of the theme's contrast on these themes, not the guard's). Negative control:
-/// the guard off buries a letter under that bar in each replay the review measured.
+/// THE LAW ON DIM TEXT: text that clears the bar with little room, a 5.0:1 grey on the dark
+/// page and Solarized Dark's 4.75:1, reads its solid ink under the guard's floor on the bare
+/// page, so a guard that gives up on it leaves every light whole (a 5.0:1 grey under Sparkle's
+/// caret bloom read 1.01:1, Solarized under Laser's Enter bolt 1.34:1). Every style but
+/// classic, through every scene, keeps each letter it lies on at four fifths of the theme's
+/// own contrast ([`look_bar`]); the ribbons through the Enter (their flare, which the guard
+/// holds), their bodies under the typed line being the ribbon's own hold's (0.7 of the theme's
+/// contrast on these themes, not the guard's). Negative control: the guard off buries a letter
+/// under that bar in each of the four control replays.
 #[test]
 fn every_letter_on_a_dim_theme_keeps_its_own_reading() {
     let mut jobs = Vec::new();

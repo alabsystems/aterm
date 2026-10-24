@@ -1224,12 +1224,12 @@ Totals by action: delete 3, becomes-spec-after-fix 2.
      precondition should name that path.
    - `reflow.rs::last_resize_shape_in_the_trim_demote_and_bottom_push_regimes` samples three specs at once,
      and its retention-0 halves duplicate `resize_undo.rs`.
-   - `tests/deferred_line_equivalence.rs` (the `assert_lines_equivalent` helper used by 3 tests) passes a
+   - `src/grid/tests/deferred_line_equivalence.rs` (the `assert_lines_equivalent` helper used by 3 tests) passes a
      **byte** offset from `char_indices()` to `Line::get_attr`, which takes a **char** index. On non-ASCII
      rows it compares attrs at the wrong positions. `deferred-line-equals-eager` compares by char index.
-   - `tests/algorithm_boundary/resize_and_invariants.rs::reflow_grow_cursor_in_trailing_blank_of_continuation_row`
+   - `src/grid/tests/algorithm_boundary/resize_and_invariants.rs::reflow_grow_cursor_in_trailing_blank_of_continuation_row`
      asserts only what CursorInBounds already implies.
-   - `tests/extras_performance.rs` ratio tests check deterministic counters against loose windows
+   - `src/grid/tests/extras_performance.rs` ratio tests check deterministic counters against loose windows
      (0.5..2.0, 1.5..3.0, < 3.0). `extras-op-cost` and `reflow-cost` state the exact counts.
    - `scrollback_offload.rs::stepping_interleaved_with_window_output_keeps_history_and_order` checks
      conservation with slack (`+ 8`). `offload-refines-plain-resize` states equality.

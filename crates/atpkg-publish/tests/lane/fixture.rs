@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Test fixtures for publication lanes: scratch home, fake host, git repos, and fake packer.
+//! Test fixtures for publication lanes: scratch home, fake host, git repos, fake packer and fake
+//! indexer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -63,7 +64,7 @@ pub fn git_at(dir: &Path, args: &[&str], day: Option<&str>) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Creates or reuses a repository on `main` with `commits` empty commits, oldest first.
+/// Creates or reuses a repository on `main` with `commits` empty commits, returned oldest first.
 pub fn repo(dir: &Path, commits: u64) -> Vec<String> {
     static MADE: Made<u64, Vec<String>> = Mutex::new(BTreeMap::new());
     made_once(&MADE, &commits, dir, |dir| make_repo(dir, commits))

@@ -45,7 +45,7 @@ pub enum Source {
 /// A parsed `atpkg lane` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
-    /// The directory whose pin a refusal names (`--cwd`); the process's otherwise.
+    /// The directory the line runs in (`--cwd`; the process's otherwise): it resolves a relative command word's directory and names the stock pin in a refusal.
     pub cwd: Option<PathBuf>,
     /// Where the command line comes from.
     pub source: Source,

@@ -146,9 +146,9 @@ pub const RAIL_REACH_MAX_CH: f32 = DN_TOP_CH;
 
 /// The hairline of body the vivid rail leaves under the row, in cells
 /// ([`rail_gap_px`]): a descender's foot ends on the row's last pixel row,
-/// and a rail laid at the row's bottom met it, so the foot read against the
-/// rail's gold next to it (`g` of `dog` at 1.38:1, 2026-10-22, every rainbow
-/// kitty burst).
+/// and a rail laid at the row's bottom would meet it, so the foot would read
+/// against the rail's gold next to it (`g` of `dog` at 1.38:1 in every
+/// rainbow kitty burst).
 pub const RAIL_GAP_CH: f32 = 0.06;
 
 /// [`RAIL_GAP_CH`] in whole device pixels at cell height `ch`, at least one.
@@ -207,8 +207,8 @@ pub const PAPER_WEIGHT_LEADING: f32 = 0.30;
 /// The least contrast the caret block keeps against a light page
 /// ([`paper_caret_ink`]): the caret law's 4.5:1, as every effect-owned
 /// caret's ([`crate::cursor_fx::CARET_PAGE_MIN_CONTRAST`]). Held to a
-/// graphic's 3:1, a hot burst's green and orange stops printed their carets
-/// at 3.26:1 on white (`#6a9d01`, `#f35d01`; 2026-10-22, the trail gallery's
+/// graphic's 3:1, a hot burst's green and orange stops would print their
+/// carets at 3.26:1 on white (`#6a9d01`, `#f35d01`; the trail gallery's
 /// `burst`, every rainbow spelling on both light themes).
 pub const PAPER_CARET_CONTRAST: f32 = crate::cursor_fx::CARET_PAGE_MIN_CONTRAST;
 
@@ -984,7 +984,7 @@ pub fn bed_ink(rgb: u32, budget: f32) -> u32 {
     )
 }
 
-/// Round 2's bed ink, unbent (a test's control).
+/// [`bed_ink`] without the dark hue bend (a test's control).
 #[cfg(test)]
 pub(crate) fn bed_ink_unbent(rgb: u32, budget: f32) -> u32 {
     onto_luma(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR), budget)
@@ -993,8 +993,8 @@ pub(crate) fn bed_ink_unbent(rgb: u32, budget: f32) -> u32 {
 /// THE DARK BED KEEPS ITS STOPS' CHROMA: held to the letters' luminance
 /// budget (some 0.07 under `#d0d0d0` text), every hue from orange to
 /// yellow-green has no vivid colour left in sRGB (OKLab chroma 0.08 to 0.10:
-/// `#753a00` brown, `#4d4d00` olive, `#375200`), and a third of the walk drew
-/// the body in mud (`#524504`, `#374e03`, 2026-10-23, the round-2 judges).
+/// `#753a00` brown, `#4d4d00` olive, `#375200`), and unbent, a third of the
+/// walk draws the body in mud (`#524504`, `#374e03`).
 /// The bend draws orange as a red-orange and yellow as a deep orange, both
 /// as vivid as the budget allows (chroma 0.12 and more), and crosses the
 /// basin to green inside the yellow→green interval, as the light bed's
@@ -4197,7 +4197,7 @@ impl Ribbon {
     /// and its rail stays dark. Without it the body's lower reach
     /// ([`DN_FLOOR_CH`] to [`DN_TOP_CH`]), a wave crest's core and the rail lay
     /// up to a third of a cell of light on the next line's ascenders (the
-    /// 2026-10-22 context and enter-bottom frames: 1 to 5 px of the core
+    /// trail gallery's context and enter-bottom frames: 1 to 5 px of the core
     /// across the tops of the row below). The pane's last row is held (it has
     /// no row under it). A row first lit over ink is born held, one first lit
     /// over a blank row or a row the probe does not know is born free; one
@@ -6401,8 +6401,8 @@ mod tests {
         // luminance. Every named stop keeps a vivid colour there (OKLab
         // chroma), the walk's warm half (red to green) draws little of its
         // length in the olive and brown basin, and the letters' budget
-        // holds. (The green-to-blue crossing's teal is the same physics,
-        // and no judge's mud: it is left as main drew it.)
+        // holds. (The green-to-blue crossing's teal is the same physics but
+        // reads as no mud, so the bend leaves hues past 90° as they are.)
         let budget = bed_luma_budget(0x00D0_D0D0);
         let chroma = |rgb: u32| {
             let [_, a, b] = crate::color_math::oklab(rgb);
@@ -10046,8 +10046,8 @@ mod tests {
     /// meets the ground next to it, keep the text at the body's bar at every
     /// phase of the wave, and the rail is still lit below them. Negative
     /// control: the rail laid at the row's bottom (`rail_flush`) takes those
-    /// pixels to 1.35:1 (2026-10-22: `g` of `dog` at 1.38:1 by its foot in
-    /// every rainbow kitty burst).
+    /// pixels to 1.35:1 (in the trail gallery's rainbow kitty bursts, `g` of
+    /// `dog` by its foot at 1.38:1).
     #[test]
     fn the_rail_leaves_the_descenders_a_hairline_of_body() {
         let c = cfg(true, true);
@@ -10139,11 +10139,11 @@ mod tests {
 
     /// A row of light whose next line holds ink stays inside its own row: no
     /// body, core, wave crest or rail lies on the next line's ascenders, at any
-    /// phase of the wave, dark or light, tall, short or flat (the 2026-10-22
-    /// context and enter-bottom frames: the core 1 to 5 px into the row
-    /// below). The band is still drawn in its row. Negative controls: the same
-    /// typing over a row probed blank, and over no probe at all, reaches below
-    /// the row's bottom.
+    /// phase of the wave, dark or light, tall, short or flat (unheld, the trail
+    /// gallery's context and enter-bottom frames lay the core 1 to 5 px into
+    /// the row below). The band is still drawn in its row. Negative controls:
+    /// the same typing over a row probed blank, and over no probe at all,
+    /// reaches below the row's bottom.
     #[test]
     fn a_row_with_ink_below_keeps_its_light_inside_the_row() {
         let g = geom();
@@ -10338,16 +10338,16 @@ mod tests {
         }
     }
 
-    /// A LINE A SCROLL CARRIES UP KEEPS ITS ROW'S SHAPE (the 2026-10-23
-    /// `enter-bottom` frame: Enter on the bottom row scrolled the echo up over
-    /// the line it printed, and that frame laid the core across the printed
-    /// ascenders, 1.5:1 by the lab's local judge). Typed on the pane's last
-    /// row, the line is laid inside its row; carried up two rows, on the
-    /// scroll's frame (the probe cleared, knowing nothing below) and on every
-    /// frame after (the probe knowing the printed line), no light lies past
-    /// its row's bottom. Negative control: the hold left behind by the scroll
-    /// (`holds_left_behind`) lays the body's lower reach on the printed line
-    /// in the scroll's frame.
+    /// A LINE A SCROLL CARRIES UP KEEPS ITS ROW'S SHAPE (the trail gallery's
+    /// `enter-bottom` frame: Enter on the bottom row scrolls the echo up over
+    /// the line it prints, and a hold left behind lays the core across the
+    /// printed ascenders in that frame, 1.5:1 by the lab's local judge).
+    /// Typed on the pane's last row, the line is laid inside its row; carried
+    /// up two rows, on the scroll's frame (the probe cleared, knowing nothing
+    /// below) and on every frame after (the probe knowing the printed line),
+    /// no light lies past its row's bottom. Negative control: the hold left
+    /// behind by the scroll (`holds_left_behind`) lays the body's lower reach
+    /// on the printed line in the scroll's frame.
     #[test]
     fn a_line_a_scroll_carries_up_keeps_its_rows_shape() {
         let g = Geom {

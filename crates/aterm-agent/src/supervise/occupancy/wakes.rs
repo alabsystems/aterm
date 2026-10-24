@@ -933,7 +933,7 @@ pub fn reconcile_claim(episode: u64, rows: &[(u64, SeedOutcome)]) -> Reconciled 
     }
 }
 
-/// ONE SESSION'S BOOK ([module docs](self)).
+/// ONE SESSION'S BOOK.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WakeBook {
     /// Its wakes, lowest ordinal first.
@@ -1268,7 +1268,8 @@ impl WakeBook {
         }
     }
 
-    /// THE LOOP RELEASES its claim on `ord` of `episode`, its line not typed: ready again.
+    /// THE LOOP RELEASES its claim on `ord` of `episode`, its line not typed: ready again (or
+    /// answered again, for a retell's claim).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1527,7 +1528,8 @@ pub enum ParkAnswer {
 }
 
 impl ParkAnswer {
-    /// Format the reply (`OK wake #<n> ready since=<ms>` or `EXPIRED wake #<n> why=<word>`).
+    /// Format the reply (`OK wake #<n> ready since=<ms>[ slots=<u>/<n>]` or
+    /// `EXPIRED wake #<n> why=<word>`).
     #[must_use]
     pub fn reply(self) -> String {
         match self {

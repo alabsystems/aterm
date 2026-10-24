@@ -389,7 +389,7 @@ fn split_compose_recovery_bypasses_identical_key_at_shipping_callsite() {
 /// A split's first compose hands the cursor's step its focused pane's own
 /// text (the letter guard's letters, the dark streak's air): the window's
 /// cells are composed only after that step. Control: before the compose the
-/// window's own cells, which that step read until 2026-10-23, hold no letter.
+/// window's own cells hold no letter.
 #[test]
 fn a_split_s_first_compose_reads_its_focused_pane_s_text() {
     let mut app = App::headless_for_test();

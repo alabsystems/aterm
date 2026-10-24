@@ -682,6 +682,7 @@ impl PetWorld {
             }
             let typed_spans = &typed_spans[..n_typed];
             let mut scan = RowScan::new(input, frame_r);
+            let row_has_compounds = scan.has_compounds();
             let mut implicit_bg = None;
             let mut implicit = RenderCell::default();
             let cursor_row_near = input.cursor_visible
@@ -720,19 +721,23 @@ impl PetWorld {
                         Some(self.selection_rect.map_or(rect, |old| old.union(rect)));
                 }
                 let cursor = cursor_row_near && frame_c.abs_diff(input.cursor_col) <= 1;
-                let excluded = spans.iter().any(|&(lo, hi)| lo <= local_c && local_c < hi);
-                let overlaid = overlay_spans
-                    .iter()
-                    .any(|&(lo, hi)| lo <= local_c && local_c < hi);
-                let typed = typed_spans
-                    .iter()
-                    .any(|&(lo, hi)| lo <= local_c && local_c < hi);
+                let excluded = !spans.is_empty()
+                    && spans.iter().any(|&(lo, hi)| lo <= local_c && local_c < hi);
+                let overlaid = !overlay_spans.is_empty()
+                    && overlay_spans
+                        .iter()
+                        .any(|&(lo, hi)| lo <= local_c && local_c < hi);
+                let typed = !typed_spans.is_empty()
+                    && typed_spans
+                        .iter()
+                        .any(|&(lo, hi)| lo <= local_c && local_c < hi);
                 let bg = (u32::from(cell.bg[0]) << 16)
                     | (u32::from(cell.bg[1]) << 8)
                     | u32::from(cell.bg[2]);
                 let decorated =
                     cell.underline != UnderlineStyle::None || cell.strikethrough || cell.overline;
-                let compound = scan.cluster(frame_c).is_some() || scan.combining(frame_c).is_some();
+                let compound = row_has_compounds
+                    && (scan.cluster(frame_c).is_some() || scan.combining(frame_c).is_some());
                 let line = scan.line_size(frame_c);
                 let glyph = cell.ch != ' ' || cell.wide || decorated || compound;
                 let speck = glyph
@@ -752,8 +757,9 @@ impl PetWorld {
                             && !neighbour.strikethrough
                             && !neighbour.overline
                             && input.line_size_run_at(frame_r, column).0 == LineSize::SingleWidth
-                            && input.cluster_at(frame_r, column).is_none()
-                            && input.combining_at(frame_r, column).is_none()
+                            && (!row_has_compounds
+                                || (input.cluster_at(frame_r, column).is_none()
+                                    && input.combining_at(frame_r, column).is_none()))
                     };
                 self.letters[row_base + c] = line == LineSize::SingleWidth
                     && if cell.wide {
@@ -1847,10 +1853,18 @@ impl<'a, T> SparseRow<'a, T> {
         }
     }
 
+    #[inline]
+    const fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     /// The value at `col`.
     #[inline]
     fn get(&mut self, col: usize) -> Option<&'a T> {
         let items = self.items;
+        if items.is_empty() {
+            return None;
+        }
         if !self.ordered {
             return items
                 .binary_search_by_key(&col, |(c, _)| *c)
@@ -1868,6 +1882,10 @@ impl<'a, T> SparseRow<'a, T> {
 }
 
 impl<'a> RowScan<'a> {
+    #[inline]
+    const fn has_compounds(&self) -> bool {
+        !self.clusters.is_empty() || !self.combining.is_empty()
+    }
     #[inline]
     fn new(input: &'a RenderInput, row: usize) -> Self {
         let bg = match input.default_bg_spans.get(row).map(Vec::as_slice) {
@@ -1950,6 +1968,9 @@ impl<'a> RowScan<'a> {
 
     #[inline]
     fn image(&mut self, col: usize) -> Option<&'a ImageRef> {
+        if self.images.is_empty() {
+            return None;
+        }
         aterm_core::render::images_in_row_at(self.images, col)
             .last()
             .map(|(_, image)| image)

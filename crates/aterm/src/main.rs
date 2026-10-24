@@ -444,7 +444,7 @@ pub(crate) fn main() -> ExitCode {
         let dir = layout.reroute_dir();
         if let Err(error) = layout.ensure_dir(&dir) {
             aterm_log::warn!(
-                "aterm: reroute dir not created ({error}); this session does not reroute the upstream Rust names — `aterm pkg doctor` explains (aterm help reroute)"
+                "aterm: reroute dir not created ({error}); this session does not reroute the upstream toolchain names (cargo, rustc, z3, …) — `aterm pkg doctor` explains (aterm help reroute)"
             );
         }
         if dir.is_dir() {
@@ -455,7 +455,7 @@ pub(crate) fn main() -> ExitCode {
             .spawn(move || {
                 if let Err(error) = atpkg::reroute::lay(&layout) {
                     aterm_log::warn!(
-                        "aterm: reroute stubs not laid ({error}); this session does not reroute the upstream Rust names — `aterm pkg doctor` explains (aterm help reroute)"
+                        "aterm: reroute stubs not laid ({error}); this session does not reroute the upstream toolchain names (cargo, rustc, z3, …) — `aterm pkg doctor` explains (aterm help reroute)"
                     );
                 }
             });
@@ -642,7 +642,8 @@ fn agents_dir_handoff(layout: Option<&atpkg::store::Layout>) -> Option<String> {
     let layout = layout?;
     if !layout.prefix.is_absolute() {
         eprintln!(
-            "aterm: managed `claude`/`codex` not first on PATH: package prefix {} is not absolute",
+            "aterm: the managed agent CLIs (`claude`, `codex`, …) are not first on PATH: package \
+             prefix {} is not absolute",
             layout.prefix.display()
         );
         return None;
@@ -818,7 +819,7 @@ fn gui_alias_entry(rest: Vec<OsString>) -> ExitCode {
 }
 
 /// Which process serves a window the front door decided to open: off Windows always this one;
-/// on Windows it depends on the running image (see the file header) and on what was asked.
+/// on Windows it depends on the running image and on what was asked ([`window_host_for`]).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum WindowHost {
     /// Run the window here: in the windowed image (the `aterm-gui`/`aterm-windowed` aliases),
@@ -3445,9 +3446,11 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
             _ if sub.is_none() && !arg.starts_with('-') => sub = Some(arg),
             _ => {
                 // A word that is not ours (`claude --wait-lock 60`, `apply` on a Mac)
-                // says what it is, whatever flag follows it.
+                // says what it is, and one of ours out of place says so, whatever follows it.
                 if let Some(word) = sub.as_deref().filter(|w| !matches!(*w, "status" | "check")) {
-                    eprintln!("{}", update_unknown_line(word, store_resolves));
+                    let line = update_misplaced_line(word)
+                        .unwrap_or_else(|| update_unknown_line(word, store_resolves));
+                    eprintln!("{line}");
                     return ExitCode::from(2);
                 }
                 eprintln!("aterm update: unknown argument {arg:?} ({UPDATE_USAGE})");
@@ -3473,7 +3476,9 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
             Some(aterm_update::check_now_with_settings(build, &provider))
         }
         other => {
-            eprintln!("{}", update_unknown_line(other, store_resolves));
+            let line = update_misplaced_line(other)
+                .unwrap_or_else(|| update_unknown_line(other, store_resolves));
+            eprintln!("{line}");
             return ExitCode::from(2);
         }
     };
@@ -3522,7 +3527,11 @@ const fn no_ledger_fails(checking: bool) -> bool {
     checking || cfg!(target_os = "macos")
 }
 
-const UPDATE_USAGE: &str = "usage: aterm update [status|check] [-v] | identity";
+const UPDATE_USAGE: &str = if cfg!(target_os = "linux") {
+    "usage: aterm update [status|check] [-v] | identity | enable | apply | rollback"
+} else {
+    "usage: aterm update [status|check] [-v] | identity"
+};
 
 const UPDATE_HELP: &[&str] = &[
     "  status     this copy's version and where it stands, one line (the default)",
@@ -3541,11 +3550,23 @@ const UPDATE_HELP_LINUX: &[&str] = &[
     "An update replaces only the executable on disk; running sessions keep running.",
 ];
 
+/// A word of ours in the wrong place: `identity` with more after it, or on Linux a delivery
+/// word after a flag (that route takes the word only first).
+fn update_misplaced_line(word: &str) -> Option<String> {
+    if word == "identity" {
+        return Some(format!(
+            "aterm update: identity takes no arguments ({UPDATE_USAGE})"
+        ));
+    }
+    (cfg!(target_os = "linux") && matches!(word, "enable" | "apply" | "rollback"))
+        .then(|| format!("aterm update: {word} goes first, without -v ({UPDATE_USAGE})"))
+}
+
 fn update_unknown_line(word: &str, is_package: impl FnOnce(&str) -> bool) -> String {
     if !cfg!(target_os = "linux") && matches!(word, "enable" | "apply" | "rollback") {
         let mac = if cfg!(target_os = "macos") && word == "apply" {
-            " \u{2014} on a Mac a downloaded update installs from Settings \u{25b8} Software \
-             Update"
+            " \u{2014} on a Mac, `aterm ctl update apply` or Settings \u{25b8} Software Update \
+             installs a downloaded update"
         } else {
             ""
         };
@@ -3674,6 +3695,7 @@ fn update_summary(
     dev: &DevCopy,
     log_hint: &str,
 ) -> (String, Option<String>) {
+    const CHECKS_OFF: &str = " \u{b7} automatic checks are off (Settings \u{25b8} Software Update)";
     if !st.enabled {
         let remedy = st.outcome.trim();
         return (
@@ -3821,8 +3843,13 @@ fn update_summary(
                 None => "update checks keep failing".to_string(),
             }
         };
+        let next = if automatic_checks {
+            "; aterm keeps trying"
+        } else {
+            CHECKS_OFF
+        };
         return (
-            format!("aterm {version} \u{b7} {trouble}; aterm keeps trying"),
+            format!("aterm {version} \u{b7} {trouble}{next}"),
             Some(log_hint.to_string()),
         );
     }
@@ -3830,11 +3857,13 @@ fn update_summary(
         let why = check_trouble_words(class)
             .map(|words| format!(": {words}"))
             .unwrap_or_default();
+        let next = if automatic_checks {
+            "; aterm will try again"
+        } else {
+            CHECKS_OFF
+        };
         return (
-            format!(
-                "aterm {version} \u{b7} the last check didn\u{2019}t finish{why}; aterm will try \
-                 again"
-            ),
+            format!("aterm {version} \u{b7} the last check didn\u{2019}t finish{why}{next}"),
             Some(log_hint.to_string()),
         );
     }
@@ -3857,7 +3886,7 @@ fn update_summary(
         format!("aterm {version} hasn\u{2019}t checked for updates yet")
     };
     if !automatic_checks {
-        line.push_str(" \u{b7} automatic checks are off (Settings \u{25b8} Software Update)");
+        line.push_str(CHECKS_OFF);
     }
     (line, None)
 }
@@ -4037,6 +4066,10 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
     ("--session", "force the transparent shell session"),
     ("--headless", "engine + control socket, no window"),
     (
+        "--diagnose",
+        "print diagnostics (version, build, renderer, config) and exit",
+    ),
+    (
         "--containment",
         "containment mode (user|safety|containment)",
     ),
@@ -4044,7 +4077,7 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
     ("--no-sandbox", "shorthand for --containment user"),
     (
         "--no-reroute",
-        "restore the upstream Rust names in this session (see aterm help reroute)",
+        "restore the upstream names (cargo, rustc, z3, …) for this launch (aterm help reroute)",
     ),
     ("--quiet", "hide the session startup line"),
     (
@@ -4053,6 +4086,10 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
     ),
     ("--help", "print help and exit"),
     ("--version", "print the version and exit"),
+    (
+        "--completions",
+        "print the bash, zsh or fish completion script",
+    ),
 ];
 
 fn routes_to_doctor(first: &str, rest: &[OsString]) -> bool {

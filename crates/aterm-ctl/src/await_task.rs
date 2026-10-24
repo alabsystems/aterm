@@ -24,7 +24,8 @@ pub(crate) const LEG_MAX: Duration = Duration::from_secs(600);
 /// What a leg's socket may take beyond the wait it asked for: the reply's own write.
 pub(crate) const LEG_SLACK: Duration = Duration::from_secs(30);
 
-const USAGE: &str = "ERR usage: aterm ctl [@<sel>] await task [@<sel>[:<rev>][,...]] [any|all] \
+const USAGE: &str = "ERR usage: aterm ctl await task [@<sel>[:<rev>][,...]] [any|all] \
+                     [since=<rev>] [timeout=<ms>] | aterm ctl @<sel> await task [any|all] \
                      [since=<rev>] [timeout=<ms>]";
 
 /// Whether `parts` (the request, `@self` expanded) is `[@<sel>] await task …`.
@@ -217,7 +218,8 @@ enum Leg {
         server: Option<u32>,
         listener: Option<redial::ListenerId>,
     },
-    /// An `ERR` line, or a reply this client cannot read: the run's end.
+    /// An `ERR` line, or a reply this client cannot read: the run's end, except an
+    /// `ERR no such session @<sel>` after the baseline, which closes that target.
     Failed(io::Error),
     /// A leg over a drive the peer did not serve, which the same leg a
     /// moment later may be: its share for this machine's address full,
@@ -662,12 +664,16 @@ pub(crate) fn run_driven(
         .iter()
         .find(|t| global_sid(&t.selector).is_none())
     {
+        let named = if local.selector == "." {
+            "no target, or `@.`, names this Mac's active tab instead".to_owned()
+        } else {
+            format!("`@{}` is not one", local.selector)
+        };
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "await task over the fleet names each worker by its sid (@s-…, as `aterm ctl \
-                 survey --host <h>` shows it); `@{}` is not one",
-                local.selector
+                 survey --host <h>` shows it); {named}"
             ),
         ));
     }

@@ -52,7 +52,8 @@ impl Action {
 pub struct Row {
     /// Human-readable setting name.
     pub name: String,
-    /// `ok`, `drift`, `applied`, `restored`, `blocked`, `unverified`, or `error`.
+    /// `ok`, `drift`, `applied`, `restored`, `blocked`, `unverified` or `error`; a setup
+    /// snapshot's rows also `pending`, `running` or `stopped`.
     pub status: String,
     /// Action or failure detail, without account identifiers.
     pub detail: String,
@@ -65,14 +66,15 @@ pub struct Report {
     pub action: Action,
     /// Outcomes for settings this tool can configure.
     pub rows: Vec<Row>,
-    /// Supported UI steps that require the account owner.
+    /// Steps left to the account owner (the JSON's `manual_steps`); no pass records one, so
+    /// it is empty.
     pub manual_steps: Vec<String>,
     /// Original per-key values retained for `--restore`.
     pub backup: PathBuf,
 }
 
 impl Report {
-    /// Whether a setting or account remains out of policy, blocked, or unverified.
+    /// Whether a setting or account remains out of policy, blocked, unverified or failed.
     #[must_use]
     pub fn needs_attention(&self) -> bool {
         self.rows.iter().any(|r| {
@@ -339,7 +341,7 @@ fn apply_on_first_run_with(
     Ok(Some(report))
 }
 
-/// Permanently cancel automatic setup until the owner explicitly runs doctor with `--apply`.
+/// Cancel automatic setup until `aterm doctor --apply` or a System State rerun starts it again.
 pub fn cancel_automatic_setup() -> Result<(), String> {
     InitialSetupCancellation::default().persist().map(|_| ())
 }
@@ -1350,7 +1352,7 @@ impl Host for NativeHost {
                     .key
                     .starts_with("com.apple.keyboard.modifiermapping.")
         }) {
-            rows.push(Row { name: "Original active keyboard mapping".into(), status: "blocked".into(), detail: "saved mappings restored; the previous live HID service mappings were not recorded, so log out and back in to reload them".into() });
+            rows.push(Row { name: "Original active keyboard mapping".into(), status: "blocked".into(), detail: "the live HID service mappings from before this setup were not recorded, so log out and back in to load the saved mappings".into() });
         }
         rows
     }

@@ -3187,7 +3187,7 @@ fn mailpit_detail_loop_stops_after_200_and_secret_file_extensions_strip_cleanly(
     let cred = poll_mailbox_config_for_credential(
         &mpit_cfg,
         Some("sol-m27@proton.me"),
-        Duration::from_secs(5),
+        Duration::from_secs(60),
     )
     .expect("poll mailpit with non-auth message ahead of auth message");
     assert_eq!(
@@ -3197,4 +3197,223 @@ fn mailpit_detail_loop_stops_after_200_and_secret_file_extensions_strip_cleanly(
         )
     );
     server.join().unwrap();
+}
+
+#[test]
+fn approval_form_selection_root_loopback_callback_and_csv_slot_inference() {
+    use super::super::accounts_sync::parse_accounting_csv;
+    use super::super::headless_oauth::{
+        MailboxConfig, MailboxCredential, mailbox_config_from_override,
+        poll_mailbox_config_for_credential,
+    };
+
+    // CSV rows whose email encodes a slot (`.2.claude`) must retain their slot even when the
+    // `computer` column is `m27` and row 2 appears before row 1.
+    let csv = concat!(
+        "email,computer,claude\n",
+        "sun.m27.2.claude@example.test,m27,1\n",
+        "sol-m27@example.test,m27,1\n",
+    );
+    let fleet = parse_accounting_csv(csv, "slots.csv").expect("parse csv");
+    assert_eq!(fleet.accounts.len(), 2);
+    assert_eq!(fleet.accounts[0].label, "m27-2");
+    assert_eq!(fleet.accounts[0].machines, vec!["m27".to_owned()]);
+    assert_eq!(fleet.accounts[1].label, "m27");
+
+    // Webmail UI URLs in `url = ...` or `mailbox_config_from_override` populate `webmail_url`.
+    let toml_cfg = MailboxConfig::from_toml_str(
+        "url = \"https://mail.proton.me/u/0/inbox\"\npassword = \"pw\"\n",
+        None,
+    )
+    .expect("parse proton url");
+    assert_eq!(
+        toml_cfg.webmail_url.as_deref(),
+        Some("https://mail.proton.me/u/0/inbox")
+    );
+    assert!(toml_cfg.http_url.is_none());
+    let override_cfg =
+        mailbox_config_from_override(std::ffi::OsStr::new("https://app.fastmail.com"), None);
+    assert_eq!(
+        override_cfg.webmail_url.as_deref(),
+        Some("https://app.fastmail.com")
+    );
+    assert!(override_cfg.http_url.is_none());
+
+    // Single `.eml` file as `dir` must write `<file>.clicked` in its parent directory.
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-single-eml-")
+        .tempdir()
+        .expect("tempdir");
+    let eml_path = tmp.path().join("single.eml");
+    std::fs::write(
+        &eml_path,
+        concat!(
+            "To: <sol-m27@proton.me>\r\n",
+            "Subject: Sign in to Claude\r\n\r\n",
+            "https://claude.ai/magic?token=single_eml_tok\r\n",
+        ),
+    )
+    .unwrap();
+    let eml_cfg = MailboxConfig::from_dir(&eml_path);
+    let eml_cred = poll_mailbox_config_for_credential(
+        &eml_cfg,
+        Some("sol-m27@proton.me"),
+        Duration::from_secs(5),
+    )
+    .expect("poll single eml file");
+    assert_eq!(
+        eml_cred,
+        MailboxCredential::MagicLink("https://claude.ai/magic?token=single_eml_tok".to_owned())
+    );
+    assert!(
+        tmp.path().join("single.eml.clicked").is_file(),
+        "single .eml file must record .clicked marker in parent directory"
+    );
+
+    // Multi-form consent page with leading logout form, disabled/unchecked inputs, and
+    // deny/allow submit `<button>` elements.
+    let multi_form_html = r#"
+        <html><body>
+        <form method="POST" action="/logout">
+          <input type="hidden" name="logout" value="1">
+        </form>
+        <form method="POST" action="approve">
+          <input type="hidden" name="csrf" value="c_123">
+          <input type="hidden" name="ignored_disabled" value="bad" disabled>
+          <input type="checkbox" name="opt_in" value="yes" checked>
+          <input type="checkbox" name="unselected_box" value="no">
+          <button type="submit" name="decision" value="deny">Deny</button>
+          <button type="submit" name="decision" value="allow">Allow access</button>
+        </form>
+        </body></html>
+    "#;
+    let (method, action, body) = parse_html_approval_action(
+        multi_form_html,
+        "https://claude.ai/oauth/authorize?client_id=abc&state=st_root",
+    )
+    .expect("parse multi-form approval page");
+    assert_eq!(method, "POST");
+    assert_eq!(action, "https://claude.ai/oauth/approve");
+    assert_eq!(
+        body.as_deref(),
+        Some("csrf=c_123&opt_in=yes&decision=allow")
+    );
+
+    // Root loopback callback URL without trailing slash (`http://127.0.0.1:9123`).
+    let authorize_root = "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A9123&state=st_root";
+    let responses = [
+        "HTTP/1.1 200 OK\r\n\r\nCheck your email",
+        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9123?code=root_code&state=st_root\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n\r\nOK",
+    ];
+    let mut iter = responses.iter();
+    let mut seen = Vec::new();
+    authorize_using(
+        authorize_root,
+        Some("sol-m27@proton.me"),
+        |_| Ok("https://claude.ai/magic?token=root_magic".to_owned()),
+        &mut |_m, u, cookies, _b| {
+            seen.push(u.to_owned());
+            parse_raw_http_response(iter.next().expect("response"), cookies).ok_or("bad response")
+        },
+    )
+    .expect("root loopback callback without slash must succeed");
+    assert_eq!(
+        seen.last().map(String::as_str),
+        Some("http://127.0.0.1:9123?code=root_code&state=st_root")
+    );
+}
+
+#[test]
+fn approval_attributes_ignore_names_inside_quoted_values() {
+    let html = r#"
+      <form title='action=/logout method=GET' METHOD = 'POST' ACTION = 'approve'>
+        <input type=hidden title='name=forged value=bad' name = csrf value = 'c&amp;1'>
+        <input type=checkbox name=extra value=bad title="checked by administrator">
+        <input type=checkbox name=opt_in value=yes title="disabled until tomorrow" CHECKED = false>
+        <input type=radio name=extra_radio value=bad title='checked by administrator'>
+        <input type=radio name=chosen value=yes checked>
+        <input type=hidden name=enabled value=ok title='Préfixe disabled until tomorrow'>
+        <input type=hidden name=disabled_field value=bad DISABLED=false>
+        <input type=hidden data-name=wrong name=first value=one value=two>
+        <button name=decision value=allow title="disabled until tomorrow">Allow</button>
+      </form>
+    "#;
+    let base = "https://claude.ai/oauth/authorize";
+    let expected_body = "csrf=c%261&opt_in=yes&chosen=yes&enabled=ok&first=one&decision=allow";
+    assert_eq!(
+        parse_html_approval_action(html, base),
+        Some((
+            "POST".to_owned(),
+            "https://claude.ai/oauth/approve".to_owned(),
+            Some(expected_body.to_owned()),
+        ))
+    );
+    for misleading in [
+        r#"<input title="checked by administrator" type=checkbox name=extra value=bad>"#,
+        r#"<input title='checked by administrator' type=radio name=extra value=bad>"#,
+        r#"<input title="&quot; checked disabled name=forged" type=checkbox name=extra value=bad>"#,
+    ] {
+        let form = format!(
+            "<form method=POST action=/approve>{misleading}<input name=csrf value=kept></form>"
+        );
+        assert_eq!(
+            parse_html_approval_action(&form, base)
+                .unwrap()
+                .2
+                .as_deref(),
+            Some("csrf=kept")
+        );
+    }
+    assert!(
+        parse_html_approval_action(
+            r#"<a title="href=https://example.test/authorize">Allow</a>"#,
+            base
+        )
+        .is_none()
+    );
+    assert_eq!(
+        parse_html_approval_action(
+            r#"<a title='href=https://example.test/authorize' HREF = '/approve?ok=1'>Allow</a>"#,
+            base
+        ),
+        Some((
+            "GET".to_owned(),
+            "https://claude.ai/approve?ok=1".to_owned(),
+            None
+        ))
+    );
+
+    // The actual headless HTTP flow sends only the selected successful controls.
+    let authorize =
+        "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A9123&state=attr";
+    let replies = [
+        "HTTP/1.1 200 OK\r\n\r\nCheck your email".to_owned(),
+        format!("HTTP/1.1 200 OK\r\n\r\n{html}"),
+        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9123?code=ok&state=attr\r\n\r\n"
+            .to_owned(),
+        "HTTP/1.1 200 OK\r\n\r\nOK".to_owned(),
+    ];
+    let mut replies = replies.iter();
+    let mut posts = Vec::new();
+    authorize_using(
+        authorize,
+        Some("owner@example.test"),
+        |_| Ok("https://claude.ai/oauth/magic?token=attributes".to_owned()),
+        &mut |method, url, cookies, body| {
+            if method == "POST" {
+                posts.push((url.to_owned(), body.map(str::to_owned)));
+            }
+            parse_raw_http_response(replies.next().expect("response"), cookies).ok_or("response")
+        },
+    )
+    .expect("quoted attribute text cannot change the approval request");
+    assert_eq!(
+        posts,
+        vec![(
+            "https://claude.ai/oauth/approve".to_owned(),
+            Some(expected_body.to_owned())
+        )]
+    );
+    assert!(replies.next().is_none());
 }

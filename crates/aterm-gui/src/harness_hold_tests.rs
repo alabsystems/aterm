@@ -184,7 +184,7 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
 
     let every = glass(
         LandHeld {
-            legs: HoldLeg::ALL.iter().fold(0, |bits, leg| bits | leg.bit()),
+            legs: every_leg(),
             changed: 1,
             stashes: 2,
             unpushed: 0,
@@ -204,6 +204,35 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
              \u{b7} 1 nudge"
         )
     );
+    let unread = glass(
+        LandHeld {
+            legs: HoldLeg::Unread.bit() | HoldLeg::Defense.bit(),
+            nudges: 1,
+            ..held()
+        },
+        TODAY,
+    );
+    assert_eq!(
+        hold_words(&unread, None, HoldForm::Line, Some(TODAY)).as_deref(),
+        Some(
+            "not landed yet: a repository that could not be read; no \u{201c}Nothing \
+             left:\u{201d} defense yet \u{b7} landing since 14:02 \u{b7} 1 nudge"
+        )
+    );
+    let spoken = hold_words(&unread, None, HoldForm::Spoken, Some(TODAY)).expect("spoken");
+    assert!(
+        spoken.contains("A repository that could not be read."),
+        "{spoken}"
+    );
+}
+
+/// Every leg a yield can hold at once: the repository's work or its probe
+/// unread, never both ([`HoldLeg::Unread`] left out).
+fn every_leg() -> u8 {
+    HoldLeg::ALL
+        .iter()
+        .filter(|&&leg| leg != HoldLeg::Unread)
+        .fold(0, |bits, leg| bits | leg.bit())
 }
 
 #[test]
@@ -407,7 +436,7 @@ fn state_line_says_why_land_holds() {
 pub(crate) fn held_session(session: &mut crate::harness_screen::HarnessSession) {
     session.hold = Some(glass(
         LandHeld {
-            legs: HoldLeg::ALL.iter().fold(0, |bits, leg| bits | leg.bit()),
+            legs: every_leg(),
             changed: 3,
             untracked: 1,
             stashes: 1,

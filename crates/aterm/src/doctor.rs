@@ -20,8 +20,8 @@ use atpkg::converge::repair::{self, Ground, Pass};
 /// What bare doctor says when an install pass holds the store (design §3.2).
 pub(crate) const CONTENDED: &str = "an install pass holds the store; nothing was repaired";
 
-/// `aterm doctor [--read-only | --check | --apply | --restore] [--json] [--only <id,...>]`
-/// over this machine.
+/// `aterm doctor [--read-only] [--json] [--only <id,...>] | (--check | --apply | --restore)
+/// [--json]` over this machine.
 pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
     let rest: Vec<String> = rest
         .iter()
@@ -119,7 +119,8 @@ pub(crate) struct Ports<'a> {
     /// ([`cli::gather`]); called once, after every `--only` word is known to name
     /// something.
     pub(crate) gather: &'a dyn Fn(bool) -> Gathered,
-    /// The repair items' ground; `None` when no store can be found ($HOME unset).
+    /// The repair items' ground; `None` when no home folder, and so no store, can be found
+    /// ([`aterm_types::dirs::home_dir`]).
     pub(crate) ground: Option<&'a Arc<Ground>>,
     /// `aterm pkg doctor`'s rows, read after the repair.
     pub(crate) packages: &'a dyn Fn() -> Vec<ItemReport>,
@@ -355,7 +356,7 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
         "base.pkg.store",
         "pkg",
         Some(Layer::Base),
-        "$HOME is unset, so the package store cannot be found".to_owned(),
+        "the home folder cannot be found, so neither can the package store".to_owned(),
     );
     if ports.ground.is_none()
         && (tokens.is_empty() || tokens.iter().any(|token| named_by(token, &missing_store)))
@@ -413,10 +414,12 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     let mut sections: Vec<Section> = refused
         .into_iter()
         .map(|row| Section {
-            label: match row.family.as_str() {
-                "pkg" => "packages:",
-                "develop" => "develop:",
-                _ => "repair:",
+            label: match (row.family.as_str(), row.id.as_str()) {
+                ("pkg", _) => "packages:",
+                ("develop", _) => "develop:",
+                ("shell", _) => "shell:",
+                (_, "doctor.repairs") => "repair:",
+                _ => "doctor:",
             },
             mark: Mark::Warn,
             fact: row.why.unwrap_or_default(),
@@ -528,10 +531,9 @@ impl Item for AiAccountsItem {
             cli::Env,
         };
         use aterm_converge::Probe;
-        let Ok(env) = Env::from_process() else {
-            return Probe::NotApplicable {
-                why: "no user home directory is configured".to_owned(),
-            };
+        let env = match Env::from_process() {
+            Ok(env) => env,
+            Err(why) => return Probe::NotApplicable { why },
         };
         let Some(home) = env.home.as_deref() else {
             return Probe::NotApplicable {
@@ -578,7 +580,7 @@ impl Item for AiAccountsItem {
                 .unwrap_or_default();
             return Probe::Ok {
                 now: format!(
-                    "{} accounts synced ({ready} enrolled{next_hint})",
+                    "{} accounts synced ({ready} enrolled and not signed out{next_hint})",
                     bound.rows.len()
                 ),
             };

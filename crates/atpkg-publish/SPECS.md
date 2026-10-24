@@ -10,7 +10,7 @@
 > Status 2026-10-17: the candidate gate (D27) no longer gates `publish-group rustc` (Trust
 > DECISION_QUEUE D27, amended 2026-10-17: the proof comparison no longer gates publishing a seal).
 > `channel::candidate` is deleted, and with it the specs `candidate-command` and `candidate-refusals`,
-> their four tests in `tests/channel/candidate.rs`,
+> their four tests,
 > `group-preflight`'s gate clause and `tests/channel/group.rs::the_candidate_gate_decides_a_publish_and_informs_a_stage`.
 > `a_head_whose_own_roster_pair_lapsed_is_refused_under_a_newer_local_roster` moved to
 > `tests/channel/index_publish.rs`. The spec and gap counts below are recounted (140 specs on
@@ -23,8 +23,7 @@
 > (`artifact::lineage`), with their 13 tests, close §1 and §2.
 >
 > Status 2026-10-16: the vendor-floor rows are gone from `programs::PROGRAMS` (a vendor-direct program is
-> never pinned), and with them the spec `programs-vendor-floors-match-client` and its test
-> `tests/shared/programs.rs::the_vendor_floors_are_the_clients_index_pinned_agent_programs`;
+> never pinned), and with them the spec `programs-vendor-floors-match-client` and its test;
 > `tests/channel/index_publish.rs::a_vendor_yank_with_no_pin_behind_it_reaches_the_clients_policy` is new.
 >
 > Status 2026-10-16 (managed codex): `codex` is a `Shape::Package` row (repo `codex-alab`, aarch64); the
@@ -591,7 +590,7 @@ src/host/rest.rs	gits_token_is_in_its_environment_alone_never_its_argv_or_a_file
 
 ## 4. Tests that are not spec samples
 
-> Status 2026-10-16: deleted `tests/shared/cli.rs::a_created_release_is_a_prerelease_and_an_upload_never_replaces_by_default`.
+> Status 2026-10-16: deleted the FakeHost test that a created release is a prerelease and an upload never replaces by default.
 
 | test | why | action |
 |---|---|---|
@@ -610,7 +609,7 @@ By action: move-to-bench 4, delete 2 (both deleted; their rows are gone). A move
 4. `tests/lane/state.rs::attempts_count_up_clear_on_success_and_age_out`: Ages the counter with the real `SystemTime` while every other lane test uses `testkit::NOW`; the 30-day `PRUNE_AFTER_SECS` threshold is sampled only at 40 days, never at its boundary. `lane-state-counters` states the boundary.
 5. `tests/artifact/pack.rs::a_signed_pack_is_one_the_client_verifies_and_extracts_to_its_signed_root`: Also asserts a `strip ...bin/ay` line in the FakeTools log, an implementation detail no spec names (the plain pack's own strip pass is not otherwise tested). Decide whether that strip is a contract; if it is, add it to `pack-output`.
 6. `tests/channel/index_render.rs::the_rendered_index_reads_back_through_the_client_field_for_field`: `assert_eq!(text, render(&p))` checks that a pure function returns the same value twice, which a function with no interior state already guarantees.
-7. Retired with `tests/channel/gh.rs` (init-system design S15): `gh-classify` matched substrings of gh's stderr anywhere, so a text quoting "HTTP 404" read NotFound. `rest-error-map` reads the HTTP status curl reports, so that doubt is gone.
+7. Retired when `tests/channel/rest.rs` replaced the gh host's tests (init-system design S15): `gh-classify` matched substrings of gh's stderr anywhere, so a text quoting "HTTP 404" read NotFound. `rest-error-map` reads the HTTP status curl reports, so that doubt is gone.
 8. `tests/lane/alab.rs::a_horizon_inside_thirty_days_is_told`: Its horizon is a literal 2026-11-01, 17 days after `testkit::NOW` (2026-10-15), so the 30-day threshold is never sampled at its boundary; `horizon-warning` states it.
 
 One spec-level doubt for the owner's attention, from reading the code:

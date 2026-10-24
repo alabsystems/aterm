@@ -828,7 +828,7 @@ fn add_unix(
     }
 }
 
-/// Steps 5 and 6.
+/// Steps 5 and 6 of `add` (plan §11.2): the login bound, then the edit made and judged.
 #[cfg(unix)]
 fn bind_and_edit(
     gh: &Github,
@@ -886,7 +886,7 @@ fn bind_and_edit(
     Ok((added, new_text, meter))
 }
 
-/// Step 8.
+/// agh.toml written whole, 0600, in its private directory (`add`'s step 8, plan §11.2).
 #[cfg(unix)]
 fn write_config(dirs: &Dirs, text: &str, placed: Option<&Path>) -> Result<()> {
     let written = config_dir(dirs).and_then(|()| {

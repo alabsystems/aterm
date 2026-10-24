@@ -177,7 +177,7 @@ mod tests {
         assert_eq!(own_code_range(), Some(text));
     }
 
-    /// `read_ahead` faults an uncached file range into the page cache.
+    /// `read_ahead` brings an uncached file range into the page cache.
     #[test]
     fn read_ahead_brings_a_cold_range_into_the_page_cache() {
         use std::io::Write as _;

@@ -801,7 +801,7 @@ impl Keybindings {
         self.action_for(logical, NO_PHYSICAL_KEY, mods)
     }
 
-    /// The DISPLAY chord for `action` in this EFFECTIVE map, if any — the accelerator hint the palette's menu rows show off macOS (where the ⌘ key-equivalents are honestly blanked and the rows used to show nothing).
+    /// The DISPLAY chord for `action` in this EFFECTIVE map, if any — the accelerator hint the palette's menu rows show off macOS, where the ⌘ key-equivalents are blanked.
     #[must_use]
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn display_chord_for(&self, action: Action) -> Option<String> {
@@ -1263,8 +1263,8 @@ mod tests {
         }
     }
 
-    /// WINDOWS LEAVES PSREADLINE ITS KEYS (the 2026-10-17 audit's
-    /// `gui-chords-shadow-psreadline`).
+    /// WINDOWS LEAVES PSREADLINE ITS KEYS: the defaults bind no Shift selection key off
+    /// macOS, and on Windows no Ctrl+Shift+arrow or Enter.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn windows_defaults_leave_psreadline_its_selection_and_edit_chords() {

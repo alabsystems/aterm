@@ -244,11 +244,12 @@ pub enum Noted {
     Note,
     Sleep,
     Abandoned,
+    RepoUnread,
 }
 
 impl Noted {
     /// Every word, in declaration order.
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::Done,
         Self::Left,
         Self::Parked,
@@ -281,6 +282,7 @@ impl Noted {
         Self::Note,
         Self::Sleep,
         Self::Abandoned,
+        Self::RepoUnread,
     ];
 
     /// How a line of this word begins (`NOT ESCALATED` is two words).
@@ -319,6 +321,7 @@ impl Noted {
             Self::Note => "NOTE",
             Self::Sleep => "SLEEP",
             Self::Abandoned => "ABANDONED",
+            Self::RepoUnread => "REPO UNREAD",
         }
     }
 
@@ -358,6 +361,7 @@ impl Noted {
             Self::Note => "note",
             Self::Sleep => "sleep",
             Self::Abandoned => "abandoned",
+            Self::RepoUnread => "repo-unread",
         }
     }
 

@@ -298,7 +298,7 @@ fn sign(key: Option<&str>, msg: Option<&str>, sig_out: Option<&str>) -> Result<(
     };
     write_bytes(&path, &sig).map_err(|e| concat(&["write ", &path, ": ", &e.to_string()]))?;
     let shown = match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
+        Ok(home) if !home.is_empty() && path.starts_with(&concat(&[&home, "/"])) => {
             concat(&["~", &path[home.len()..]])
         }
         _ => path.clone(),
@@ -344,19 +344,25 @@ const PHRASE_RULE: &str = "-----------------------------------------------------
 fn show_phrase(
     tty: &mut atpkg_keys::master::Tty,
     phrase: &atpkg_keys::master::MasterPhrase,
-    seed: &atpkg_keys::master::MasterSeed,
 ) -> Result<(), String> {
     tty.write_line("")?;
     tty.write_line(PHRASE_HEADING)?;
     tty.write_line(PHRASE_RULE)?;
-    tty.write_phrase(phrase)?;
+    tty.write_phrase(phrase)
+}
+
+/// Close the phrase block with the fingerprint the paper carries beside the phrase.
+#[cfg(unix)]
+fn show_fingerprint(
+    tty: &mut atpkg_keys::master::Tty,
+    seed: &atpkg_keys::master::MasterSeed,
+) -> Result<(), String> {
     tty.write_line(&concat(&[
         "fingerprint: ",
         &seed.fingerprint()?,
         "  (write it beside the phrase)",
     ]))?;
-    tty.write_line(PHRASE_RULE)?;
-    Ok(())
+    tty.write_line(PHRASE_RULE)
 }
 
 /// The transcription gate: ask until the retyped paper derives the master just shown.
@@ -369,8 +375,8 @@ fn confirm_transcription(
     let want = seed.pubkey_b64()?;
     loop {
         let typed = match atpkg_keys::master::prompt_master_attempt(
-            "retype the phrase FROM YOUR PAPER (echo off; spaces ignored; Ctrl-C aborts, \
-             nothing is armed): ",
+            "retype the phrase FROM YOUR PAPER (echo off; spaces ignored; an empty line or \
+             Ctrl-C aborts, nothing is armed): ",
         )? {
             Ok(typed) => typed,
             Err(atpkg_keys::master::PhraseError::Length { got: 0 }) => {
@@ -420,11 +426,11 @@ const PROVISION_FLAGS: &[&str] = &["id", "pins", "roster", "key"];
 
 /// What `setup` says when it fails before showing a phrase: no master exists, so try again.
 #[cfg(unix)]
-const SETUP_ARMED_NOTHING: &str = "atpkg-keys: nothing was written and no phrase was \
+const SETUP_ARMED_NOTHING: &str = "atpkg-keys: no file was written and no phrase was \
      shown — no master exists as a result of this run. Fix the problem above and run \
      `atpkg-keys setup` again.";
 
-/// What `setup` says when the phrase was shown but the anchor not written.
+/// What `setup` says when the phrase was shown but this run did not write the anchor.
 #[cfg(unix)]
 const SETUP_PAPER_ARMS_NOTHING: &str = "atpkg-keys: THE PHRASE ABOVE ARMS NOTHING. The \
      anchor file was not written, so the master you just saw is not referenced by anything \
@@ -482,13 +488,25 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
             let planned = prov::plan(pre, &seed, now)
                 .map_err(|e| concat(&[&e, "\n", SETUP_ARMED_NOTHING]))?;
 
-            show_phrase(&mut tty, &phrase, &seed)
-                .map_err(|e| concat(&[&e, "\n", SETUP_ARMED_NOTHING]))?;
-            confirm_transcription(&mut tty, &phrase, &seed)
+            show_phrase(&mut tty, &phrase).map_err(|e| concat(&[&e, "\n", SETUP_ARMED_NOTHING]))?;
+            show_fingerprint(&mut tty, &seed)
+                .and_then(|()| confirm_transcription(&mut tty, &phrase, &seed))
                 .map_err(|e| concat(&[&e, "\n", SETUP_PAPER_ARMS_NOTHING]))?;
 
-            prov::write_pins(&planned)
-                .map_err(|e| concat(&[&e, "\n", SETUP_PAPER_ARMS_NOTHING]))?;
+            prov::write_pins(&planned).map_err(|e| {
+                if e.landed {
+                    concat(&[
+                        &e.message,
+                        "\natpkg-keys: the anchor file may now name the master above, but \
+                         nothing else was written. `git checkout -- ",
+                        &paths.pins,
+                        "`, DESTROY that paper, fix the problem above, and run `atpkg-keys \
+                         setup` again — it will generate a different master.",
+                    ])
+                } else {
+                    concat(&[&e.message, "\n", SETUP_PAPER_ARMS_NOTHING])
+                }
+            })?;
             announce_master(&seed)?;
             prov::write_rest(planned)?
         }

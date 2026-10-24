@@ -192,7 +192,7 @@ fn every_act_with(rules_text: &str) -> Vec<(String, String)> {
                 LAND_NUDGE,
                 &[
                     Suffix::Open(&open),
-                    Suffix::Repo(Some(&repo)),
+                    Suffix::Repo(&crate::harness::repo_work::RepoRead::Found(repo.clone())),
                     Suffix::Fixed(DONE_CHECK_REVERSIBLE),
                     Suffix::Fixed(NEEDS_ACK),
                 ],

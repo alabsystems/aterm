@@ -291,11 +291,10 @@ impl CursorDroplet {
         );
 
         // The ripples and drips stay in the caret's row: a ring rolled out
-        // under the bead, and a drop falling off it, reached into the row
-        // below (round 2's judge, 2026-10-23: the ripple on the selected
-        // line under the prompt), so both are cut at the row's foot, the
-        // water's surface: the near side of a ring is under it, and a drop
-        // falls through it.
+        // under the bead, and a drop falling off it, would reach into the row
+        // below (the ripple on the selected line under the prompt), so both
+        // are cut at the row's foot, the water's surface: the near side of a
+        // ring is under it, and a drop falls through it.
         let surface_from = out.len();
         if e > 0.0 {
             let ring_rgb = water_ramp(0.74 + 0.10 * e);
@@ -465,12 +464,12 @@ mod tests {
         );
     }
 
-    /// Round 2's judge (2026-10-23, the trail gallery's `context` on dark):
-    /// the ripple reached the selected line under the prompt. Through two whole
-    /// ripple and drip cycles at full surge, nothing the droplet draws lies
-    /// lower than its bead's own foot (the bead overhangs the cell, the rest
-    /// is cut at the row's foot). The negative control, uncut, runs rings and
-    /// drops into the row below, past the bead.
+    /// Through two whole ripple and drip cycles at full surge, nothing the
+    /// droplet draws lies lower than its bead's own foot (the bead overhangs
+    /// the cell, the rest is cut at the row's foot). The negative control,
+    /// uncut, runs rings and drops into the row below, past the bead: in the
+    /// trail gallery's `context` on dark, onto the selected line under the
+    /// prompt.
     #[test]
     fn ripples_and_drips_stay_in_the_caret_s_row() {
         let g = geom();

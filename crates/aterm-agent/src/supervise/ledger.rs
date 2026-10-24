@@ -678,8 +678,8 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         None => sources.push(Source {
             name: "journal",
             ok: false,
-            detail: "none given: `--journal FILE` (the file `watch --journal` wrote) adds the \
-                     watcher's lane"
+            detail: "none given: `--journal FILE` (the window's \
+                     `<state>/drive/<sid>.journal.jsonl`) adds the watcher's lane"
                 .to_string(),
         }),
         Some(path) => match read_journal(path) {

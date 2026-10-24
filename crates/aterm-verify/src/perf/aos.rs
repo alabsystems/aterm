@@ -283,7 +283,8 @@ fn agree(who: &str, what: &str, found: Option<&str>, want: &str) -> Result<(), S
     }
 }
 
-/// Checks that every process reached the same state digest and observation chain as the export run.
+/// Checks that every process reached the export run's state digest and observation chain (a cold
+/// `checkpoint` run, the state only).
 pub(crate) fn cross_process(
     export: &Value,
     import: &Value,

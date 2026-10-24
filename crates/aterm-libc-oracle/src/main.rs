@@ -39,13 +39,13 @@ const USAGE: &str = "\
 aterm-libc-oracle — check crates/aterm-libc against reference libc 0.2.186 on the native ABI cell
 (`targo --unverified verify libc` runs this gate)
 
-usage: aterm-libc-oracle [--root <checkout>] [--target-dir <dir>]
-       aterm-libc-oracle regen [--root <checkout>] [--out <dir>] [--work <dir>]
-                               [--docs <dir>] [--stock <toolchain>] [--no-format]
-       aterm-libc-oracle harvest --cell <key> [--root <checkout>] [--work <dir>]
-                                 [--docs <dir>] [--stock <toolchain>] [--write] <log>
+usage: targo --unverified run -q -p aterm-libc-oracle -- [--root <checkout>] [--target-dir <dir>]
+       targo --unverified run -q -p aterm-libc-oracle -- regen [--root <checkout>] [--out <dir>]
+           [--work <dir>] [--docs <dir>] [--stock <toolchain>] [--no-format]
+       targo --unverified run -q -p aterm-libc-oracle -- harvest --cell <key> [--root <checkout>]
+           [--work <dir>] [--docs <dir>] [--stock <toolchain>] [--write] <log>
 
-  --root <checkout>   aterm checkout (default: ancestor of cwd)
+  --root <checkout>   aterm checkout (default: the nearest one at or above cwd)
   --target-dir <dir>  gate build dir (default: <checkout>/libc-oracle/target.noindex)
   -h, --help          print this help
 
@@ -288,7 +288,7 @@ fn report_harvest(
         let added = union.widen(cell, new);
         union.store(&options.root)?;
         println!(
-            "added {} names to {}; now `aterm-libc-oracle regen`",
+            "added {} names to {}; now `targo --unverified run -q -p aterm-libc-oracle -- regen`",
             added.len(),
             union::PATH
         );

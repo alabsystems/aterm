@@ -14,8 +14,8 @@ use aterm_sysprobe::jobs::{self as probe, AtStart, JobsReader, ProcFacts, ReadRe
 use aterm_sysprobe::procs::ProcessReading;
 use aterm_sysprobe::volumes::Table;
 use aterm_vitals::jobs::{
-    Class, Consumer, Demand, Fd, FdKind, HeldProc, JobCounters, JobKind, JobProc, JobRow, JobTab,
-    JobTick, Jobs, JobsView, Knote, KnoteFilter, LanesSeen, Machine, ProcState, Standing,
+    Block, Class, Consumer, Demand, Fd, FdKind, HeldProc, JobCounters, JobKind, JobProc, JobRow,
+    JobTab, JobTick, Jobs, JobsView, Knote, KnoteFilter, LanesSeen, Machine, ProcState, Standing,
     SweepProc, TcpState, ThreadState, TtyMode,
 };
 use aterm_vitals::model::TabRoot;
@@ -110,6 +110,7 @@ impl JobsPass {
         sweep: Option<&[ProcessReading]>,
         tabs: &[TabRoot],
         ttys: &[(u64, TtyMode)],
+        feeds: &[(u64, TabFeed)],
         self_pid: u32,
         thrashing: bool,
         now: bool,
@@ -123,7 +124,7 @@ impl JobsPass {
         let self_uid = sweep.iter().find(|p| p.pid == self_pid).and_then(|p| p.uid);
         let readings = sweep;
         let sweep: Vec<SweepProc> = sweep.iter().map(sweep_proc).collect();
-        let tabs = job_tabs(tabs, ttys);
+        let tabs = job_tabs(tabs, ttys, feeds);
         let reqs: Vec<ReadReq> = self
             .jobs
             .plan(&sweep, &tabs)
@@ -421,23 +422,286 @@ pub(crate) fn told_after(view: &JobsView) -> Option<Duration> {
 }
 
 /// The engine's tabs from the host's request: its session key, the number
-/// the person sees (`Tab 2` is 2), its shell, and its terminal mode word
-/// where `ttys` holds a current one.
-fn job_tabs(tabs: &[TabRoot], ttys: &[(u64, TtyMode)]) -> Vec<JobTab> {
+/// the person sees (`Tab 2` is 2), its shell, its terminal mode word where
+/// `ttys` holds a current one, and what its PTY reader read where `feeds`
+/// holds it.
+fn job_tabs(tabs: &[TabRoot], ttys: &[(u64, TtyMode)], feeds: &[(u64, TabFeed)]) -> Vec<JobTab> {
     tabs.iter()
-        .map(|t| JobTab {
-            key: t.key,
-            number: t
-                .label
-                .rsplit(' ')
-                .next()
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(0),
-            shell_pid: t.shell_pid,
-            tty: ttys.iter().find(|(key, _)| *key == t.key).map(|(_, m)| *m),
-            ..JobTab::default()
+        .map(|t| {
+            let feed = feeds
+                .iter()
+                .find(|(key, _)| *key == t.key)
+                .map(|(_, f)| f.clone())
+                .unwrap_or_default();
+            JobTab {
+                key: t.key,
+                number: t
+                    .label
+                    .rsplit(' ')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0),
+                shell_pid: t.shell_pid,
+                block: feed.block,
+                ended: feed.ended,
+                shell_ms: feed.shell_ms,
+                tty: ttys.iter().find(|(key, _)| *key == t.key).map(|(_, m)| *m),
+                output_ms: feed.output_ms,
+                line_output_ms: feed.line_output_ms,
+                output_bytes: feed.output_bytes,
+                ..JobTab::default()
+            }
         })
         .collect()
+}
+
+/// WHAT A SESSION'S PTY READER READ, FOR THE ENGINE (system-awareness §6.6, P2a): its newest feed
+/// that moved the screen, its newest feed that held a line, the bytes it has read, and the
+/// newest OSC 133 block. The reader writes it as it reads and feeds ([`Self::read`],
+/// [`Self::fed`]); the probe thread reads it at each pass ([`Self::at`]). Without it a printing
+/// `ping` reads quiet, and each command of a typed `while` loop is a job of its own. A write that
+/// moves no cell (Muse Code's colour reset at rest) is no output here, as it is no edge for the
+/// output wake ([`crate::vitals_host::ScreenMoves`]): counted, it would keep a program at rest
+/// running and the engine reading every 2 s.
+#[derive(Debug, Default)]
+pub(crate) struct JobFeed(Mutex<Fed>);
+
+#[derive(Debug, Default)]
+struct Fed {
+    output: Option<Instant>,
+    line: Option<Instant>,
+    /// The read being fed holds text after its last line feed so far: a line feed in its next
+    /// chunk ends a line.
+    text: bool,
+    bytes: u64,
+    block: Option<FedBlock>,
+    /// The block `block` replaced, closed.
+    ended: Option<FedBlock>,
+    /// The terminal's current block as a feed last found one (id, state, status), and when a
+    /// feed found it changed: the shell wrote one of its own marks.
+    marks: Option<(u64, aterm_types::BlockState, Option<i32>)>,
+    shell: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct FedBlock {
+    id: u64,
+    open: bool,
+    command: String,
+    status: Option<i32>,
+    /// When the reader first saw it run (OSC 133 C).
+    started: Instant,
+}
+
+/// A [`JobFeed`] read at a pass, in host ms on the reader's clock.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TabFeed {
+    pub(crate) output_ms: Option<u64>,
+    pub(crate) line_output_ms: Option<u64>,
+    pub(crate) output_bytes: u64,
+    pub(crate) block: Option<Block>,
+    pub(crate) ended: Option<Block>,
+    pub(crate) shell_ms: Option<u64>,
+}
+
+impl JobFeed {
+    /// The reader read `bytes`, which it feeds next, chunk by chunk.
+    pub(crate) fn read(&self, bytes: &[u8]) {
+        let mut fed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        fed.text = false;
+        fed.bytes = fed
+            .bytes
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    }
+
+    /// A feed of `chunk` left `term` as it stands (the reader, holding the term lock), `moved` when
+    /// it moved the screen ([`crate::vitals_host::ScreenMoves::fed`]): a moving feed is output
+    /// `now`, and a chunk holding a line feed and text of its read (in the chunk, or in one the
+    /// parse cut before it) is a line `now` (line ends alone are what the line discipline echoes
+    /// of a typed Enter, and a person pressing Enter at a hung command would otherwise restart
+    /// its quiet clock; a writer that leads with its line feed, `\n<record>`, still prints
+    /// lines). Each stamp is read under the
+    /// feed's lock, so a pass that read the feed before it stamps past the pass's clock, and a
+    /// line and the shell's marks parsed with it share one stamp: no pass sees the shell's
+    /// prompt as a line without its marks. The
+    /// block held is the newest one that ran: open from OSC 133 C, started `now` when first seen
+    /// so, and closed by D with D's status, which it keeps until another block runs. The shell
+    /// writes D and the next prompt's A together, and A archives the closed block at once, so a
+    /// feed that finds a newer prompt's block closes the held one with the status its archive
+    /// keeps; a block never seen open is held only while nothing ran before it. A terminal that
+    /// holds no block (a reset, a clear) leaves an open one open: the command runs on, and its
+    /// block closes at the next prompt. The block a newer one replaces is kept as the ended one,
+    /// closed with the status it ended with, so a command followed by another before the next
+    /// pass keeps its status. A feed that finds the current block changed (a prompt, a command
+    /// taken, its end) stamps the shell's own marks `now`; a terminal left with no block (a
+    /// program's reset) is none of the shell's.
+    pub(crate) fn fed(
+        &self,
+        term: &aterm_core::terminal::Terminal,
+        chunk: &[u8],
+        moved: bool,
+        now: impl FnOnce() -> Instant,
+    ) {
+        enum Turn {
+            Keep,
+            Open(u64),
+            Close(Option<i32>),
+            Hold(u64, Option<i32>),
+        }
+        let current = term.current_block();
+        let marks = current.map(|c| (c.id, c.state, c.exit_code));
+        let lines = Lines::of(chunk);
+        let mut fed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let line = lines.ends && (lines.ended || lines.tail || fed.text);
+        fed.text = lines.tail || (fed.text && !lines.ends);
+        let marked = marks.is_some() && marks != fed.marks;
+        let runs = |c: &aterm_types::OutputBlock| c.state == aterm_types::BlockState::Executing;
+        let turn = match (current, fed.block.as_ref()) {
+            (Some(c), Some(w)) if c.id == w.id => match (runs(c), w.open) {
+                (true, true) => Turn::Keep,
+                (true, false) => Turn::Open(c.id),
+                (false, _) if (w.open, w.status) == (false, c.exit_code) => Turn::Keep,
+                (false, _) => Turn::Close(c.exit_code),
+            },
+            (Some(c), _) if runs(c) => Turn::Open(c.id),
+            (Some(_), Some(w)) if w.open => {
+                Turn::Close(term.block_by_id(w.id).and_then(|b| b.exit_code))
+            }
+            (Some(c), None) => Turn::Hold(c.id, c.exit_code),
+            _ => Turn::Keep,
+        };
+        if matches!(turn, Turn::Keep) && !moved && !marked && !line {
+            return;
+        }
+        let now = now();
+        if moved {
+            fed.output = Some(now);
+        }
+        if line {
+            fed.line = Some(now);
+        }
+        if marked {
+            fed.marks = marks;
+            fed.shell = Some(now);
+        }
+        match turn {
+            Turn::Keep => {}
+            Turn::Open(id) => {
+                if let Some(mut w) = fed.block.take().filter(|w| w.id != id) {
+                    if w.open {
+                        w.open = false;
+                        w.status = term.block_by_id(w.id).and_then(|b| b.exit_code);
+                    }
+                    fed.ended = Some(w);
+                }
+                fed.block = Some(FedBlock {
+                    id,
+                    open: true,
+                    command: crate::session_status::executing_command_line(term)
+                        .unwrap_or_default(),
+                    status: None,
+                    started: now,
+                });
+            }
+            Turn::Close(status) => {
+                if let Some(w) = fed.block.as_mut() {
+                    w.open = false;
+                    w.status = status;
+                }
+            }
+            Turn::Hold(id, status) => {
+                fed.block = Some(FedBlock {
+                    id,
+                    open: false,
+                    command: String::new(),
+                    status,
+                    started: now,
+                });
+            }
+        }
+    }
+
+    /// The feed now, on the clock whose zero is `epoch` (the probe thread's): each stamp in whole
+    /// ms rounded up, so a read after a pass's clock is stamped past it, and at least 1 ms, so a
+    /// mode word stamped 0 is older than all of them ([`crate::vitals_host::TtyWord::current`]).
+    pub(crate) fn at(&self, epoch: Instant) -> TabFeed {
+        let ms = |at: Instant| {
+            u64::try_from(
+                at.saturating_duration_since(epoch)
+                    .as_nanos()
+                    .div_ceil(1_000_000),
+            )
+            .unwrap_or(u64::MAX)
+            .max(1)
+        };
+        let block = |b: &FedBlock| Block {
+            id: b.id,
+            started_ms: ms(b.started),
+            open: b.open,
+            command: b.command.clone(),
+            status: b.status,
+            stopped: b.status.is_some_and(stopped),
+        };
+        let fed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        TabFeed {
+            output_ms: fed.output.map(ms),
+            line_output_ms: fed.line.map(ms),
+            output_bytes: fed.bytes,
+            block: fed.block.as_ref().map(block),
+            ended: fed.ended.as_ref().map(block),
+            shell_ms: fed.shell.map(ms),
+        }
+    }
+}
+
+/// What a fed chunk holds of lines.
+struct Lines {
+    /// A line feed.
+    ends: bool,
+    /// A line feed after text in the chunk itself.
+    ended: bool,
+    /// Text after its last line feed, or all of it when it holds none.
+    tail: bool,
+}
+
+impl Lines {
+    fn of(chunk: &[u8]) -> Self {
+        let mut lines = Self {
+            ends: false,
+            ended: false,
+            tail: false,
+        };
+        for &b in chunk {
+            match b {
+                b'\n' => {
+                    lines.ends = true;
+                    lines.ended |= lines.tail;
+                    lines.tail = false;
+                }
+                b'\r' => {}
+                _ => lines.tail = true,
+            }
+        }
+        lines
+    }
+}
+
+/// A block's status says job control stopped its command (Ctrl-Z, a background read of the
+/// terminal): the shell reports 128 plus the signal, whose number is this host's (zsh on macOS
+/// reports 146 for SIGTSTP, on Linux 148).
+fn stopped(status: i32) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            status.checked_sub(128),
+            Some(libc::SIGTSTP | libc::SIGSTOP | libc::SIGTTIN | libc::SIGTTOU)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        false
+    }
 }
 
 const fn state(s: probe::RunState) -> ProcState {
@@ -771,9 +1035,9 @@ pub(crate) mod tests {
     }
 
     /// Each tab keeps its key, number and shell, and takes the terminal word
-    /// handed for its key.
+    /// and the reader's feed handed for its key.
     #[test]
-    fn a_tab_keeps_its_session_key_shell_and_number_and_its_own_terminal_word() {
+    fn a_tab_keeps_its_session_key_shell_and_number_and_its_own_terminal_word_and_feed() {
         let root = |key, label: &str| TabRoot {
             key,
             tab: key,
@@ -786,12 +1050,265 @@ pub(crate) mod tests {
             echo: false,
             stamped_ms: 7,
         };
-        let tabs = job_tabs(&[root(41, "Tab 3"), root(42, "Tab 4")], &[(41, raw)]);
+        let fed = TabFeed {
+            output_ms: Some(9),
+            line_output_ms: Some(8),
+            output_bytes: 120,
+            block: Some(Block {
+                id: 3,
+                started_ms: 5,
+                open: true,
+                command: "make".into(),
+                status: None,
+                stopped: false,
+            }),
+            ended: Some(Block {
+                id: 2,
+                started_ms: 1,
+                open: false,
+                command: "ls".into(),
+                status: Some(146),
+                stopped: true,
+            }),
+            shell_ms: Some(4),
+        };
+        let tabs = job_tabs(
+            &[root(41, "Tab 3"), root(42, "Tab 4")],
+            &[(41, raw)],
+            &[(42, fed.clone())],
+        );
         assert_eq!(
             (tabs[0].key, tabs[0].number, tabs[0].shell_pid, tabs[0].tty),
             (41, 3, 941, Some(raw))
         );
+        assert_eq!(
+            (tabs[0].output_ms, tabs[0].output_bytes, &tabs[0].block),
+            (None, 0, &None)
+        );
         assert_eq!((tabs[1].key, tabs[1].tty), (42, None));
+        assert_eq!(
+            TabFeed {
+                output_ms: tabs[1].output_ms,
+                line_output_ms: tabs[1].line_output_ms,
+                output_bytes: tabs[1].output_bytes,
+                block: tabs[1].block.clone(),
+                ended: tabs[1].ended.clone(),
+                shell_ms: tabs[1].shell_ms,
+            },
+            fed
+        );
+    }
+
+    /// THE READER'S FEED ON THE ENGINE'S CLOCK: every read counts its bytes,
+    /// only a line feed with text of its read (in its chunk, or in one the
+    /// parse cut before it) stamps a line (a progress bar's `\r` redraw is
+    /// none, nor the echo of a typed Enter, but a record led by its line
+    /// feed is),
+    /// only a feed that moved the screen stamps output (a colour reset at rest
+    /// is none), and each stamp is ms past the probe thread's zero.
+    #[test]
+    fn a_line_feed_stamps_a_line_and_only_a_moving_feed_stamps_output() {
+        const RESET: &[u8] = b"\x1b[39m\x1b[0m";
+        let epoch = Instant::now();
+        let feed = JobFeed::default();
+        let term = aterm_core::terminal::Terminal::new(24, 80);
+        assert_eq!(feed.at(epoch), TabFeed::default(), "nothing read");
+        for (bytes, moved, ms) in [
+            (&b"64 bytes from 127.0.0.1\r\n"[..], true, 1_000),
+            (b"\r 50%", true, 2_500),
+            (RESET, false, 4_000),
+            (b"\r\n", false, 5_000),
+        ] {
+            feed.read(bytes);
+            feed.fed(&term, bytes, moved, || epoch + Duration::from_millis(ms));
+        }
+        let read = feed.at(epoch);
+        assert_eq!(
+            (read.output_ms, read.line_output_ms, read.output_bytes),
+            (Some(2_500), Some(1_000), 41)
+        );
+        let long = [b'x'; 16];
+        feed.read(&[&long[..], b"\r\n"].concat());
+        feed.fed(&term, &long, true, || epoch + Duration::from_millis(6_000));
+        feed.fed(&term, b"\r\n", true, || {
+            epoch + Duration::from_millis(6_001)
+        });
+        assert_eq!(
+            feed.at(epoch).line_output_ms,
+            Some(6_001),
+            "a line whose line feed the parse cut from its text"
+        );
+        let record = b"\r\nThu Oct 23 12:00:05";
+        feed.read(record);
+        feed.fed(&term, record, true, || epoch + Duration::from_millis(7_000));
+        assert_eq!(
+            feed.at(epoch).line_output_ms,
+            Some(7_000),
+            "a writer that leads with its line feed"
+        );
+        feed.fed(&term, b"", true, || epoch);
+        assert_eq!(
+            feed.at(epoch).output_ms,
+            Some(1),
+            "a stamp is at least 1 ms"
+        );
+    }
+
+    /// THE NEWEST BLOCK THAT RAN, AS THE READER LEFT IT: open from OSC 133 C
+    /// with the command the shell ran, closed by D with its status while
+    /// keeping its start and command, and held through the next prompt until
+    /// another block runs. The shell writes D and the next A in one burst, so
+    /// a feed that sees both still closes the block with D's status. A
+    /// terminal with no shell integration has none, and a feed that moved
+    /// nothing stamps no output. The block a newer one replaces is the ended
+    /// one, with its status even when it ended in the feed that ran the next.
+    /// The shell's own marks are stamped, and a line parsed with them shares
+    /// their stamp; a command's output is none of them, nor a reset while it
+    /// runs, which leaves its block open until the next prompt. A block Ctrl-Z
+    /// ended is stopped.
+    #[test]
+    fn the_feed_holds_the_newest_block_that_ran_and_its_status() {
+        let epoch = Instant::now();
+        let feed = JobFeed::default();
+        let put = |term: &mut aterm_core::terminal::Terminal, bytes: &[u8], moved, ms| {
+            term.process(bytes);
+            feed.fed(term, bytes, moved, || epoch + Duration::from_millis(ms));
+        };
+        let mut term = aterm_core::terminal::Terminal::new(24, 80);
+        put(&mut term, b"$ ls\n", false, 100);
+        assert_eq!(feed.at(epoch).block, None, "no shell integration");
+        put(
+            &mut term,
+            b"\x1b]133;A\x07$ \x1b]133;B\x07while true; do date; sleep 5; done\n",
+            false,
+            200,
+        );
+        let typed = feed.at(epoch).block.expect("the prompt's block");
+        assert!(!typed.open, "typed, not run: {typed:?}");
+        put(&mut term, b"\x1b]133;C\x07", false, 300);
+        let running = feed.at(epoch).block.expect("the running block");
+        assert_eq!(
+            (
+                running.id,
+                running.open,
+                running.started_ms,
+                running.command.as_str(),
+                running.status
+            ),
+            (
+                typed.id,
+                true,
+                300,
+                "while true; do date; sleep 5; done",
+                None
+            )
+        );
+        put(&mut term, b"Thu Oct 23\n", false, 5_300);
+        assert_eq!(
+            feed.at(epoch).block.as_ref(),
+            Some(&running),
+            "output keeps it"
+        );
+        put(&mut term, b"^C\x1b]133;D;130\x07", false, 9_000);
+        let ended = feed.at(epoch).block.expect("the ended block");
+        assert_eq!(
+            (
+                ended.id,
+                ended.open,
+                ended.status,
+                ended.started_ms,
+                &ended.command
+            ),
+            (running.id, false, Some(130), 300, &running.command)
+        );
+        put(&mut term, b"\x1b]133;A\x07$ ", false, 9_100);
+        assert_eq!(
+            feed.at(epoch).block,
+            Some(ended.clone()),
+            "the next prompt holds it"
+        );
+        put(
+            &mut term,
+            b"\x1b]133;B\x07make\n\x1b]133;C\x07",
+            false,
+            9_200,
+        );
+        let make = feed.at(epoch).block.expect("the next running block");
+        assert!(make.id != running.id && make.open, "{make:?}");
+        assert_eq!(feed.at(epoch).ended, Some(ended), "the block it replaced");
+        put(&mut term, b"\x1b]133;D;2\x07\x1b]133;A\x07$ ", false, 9_900);
+        let failed = feed.at(epoch).block.expect("the failed block");
+        assert_eq!(
+            (failed.id, failed.open, failed.status, failed.started_ms),
+            (make.id, false, Some(2), 9_200),
+            "D and A in one feed"
+        );
+        put(
+            &mut term,
+            b"\x1b]133;B\x07top\n\x1b]133;C\x07",
+            false,
+            10_000,
+        );
+        let top = feed.at(epoch).block.expect("top runs");
+        put(
+            &mut term,
+            b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07less\n\x1b]133;C\x07",
+            false,
+            11_000,
+        );
+        let less = feed.at(epoch).block.expect("less runs");
+        let now = feed.at(epoch);
+        assert_eq!(
+            now.block.map(|b| (b.open, b.command, b.started_ms)),
+            Some((true, "less".to_owned(), 11_000))
+        );
+        assert_eq!(
+            now.ended
+                .map(|b| (b.id, b.open, b.status, b.command, b.started_ms)),
+            Some((top.id, false, Some(0), top.command, 10_000)),
+            "a block that ended and the next that ran in one feed"
+        );
+        assert_eq!(feed.at(epoch).output_ms, None, "no feed moved the screen");
+        assert_eq!(
+            (feed.at(epoch).shell_ms, feed.at(epoch).line_output_ms),
+            (Some(11_000), Some(11_000)),
+            "the shell's marks, and a line parsed with them shares their stamp"
+        );
+        put(&mut term, b"README\n", true, 12_000);
+        assert_eq!(
+            feed.at(epoch).shell_ms,
+            Some(11_000),
+            "a command's output is none of the shell's marks"
+        );
+        put(&mut term, b"\x1bc", true, 13_000);
+        assert_eq!(
+            (
+                feed.at(epoch).block.map(|b| (b.id, b.open)),
+                feed.at(epoch).shell_ms
+            ),
+            (Some((less.id, true)), Some(11_000)),
+            "a reset leaves the command running, and is none of the shell's marks"
+        );
+        put(&mut term, b"\x1b]133;A\x07$ ", false, 14_000);
+        assert_eq!(
+            feed.at(epoch).block.map(|b| (b.id, b.open, b.status)),
+            Some((less.id, false, None)),
+            "the next prompt closes it, its D lost to the reset"
+        );
+        assert!(!failed.stopped, "an exit is no stop");
+        #[cfg(unix)]
+        {
+            put(
+                &mut term,
+                b"\x1b]133;B\x07vim\n\x1b]133;C\x07",
+                false,
+                15_000,
+            );
+            let stop = format!("\x1b]133;D;{}\x07\x1b]133;A\x07$ ", 128 + libc::SIGTSTP);
+            put(&mut term, stop.as_bytes(), false, 16_000);
+            let vim = feed.at(epoch).block.expect("vim stopped");
+            assert!(vim.stopped && !vim.open, "Ctrl-Z's status: {vim:?}");
+        }
     }
 
     /// The pass on this host's real process table: this test process stands
@@ -812,17 +1329,35 @@ pub(crate) mod tests {
         }];
         let mut pass = JobsPass::new();
         let first = pass
-            .tick(10_000, Some(&sweep.procs), &tabs, &[], me, false, false)
+            .tick(
+                10_000,
+                Some(&sweep.procs),
+                &tabs,
+                &[],
+                &[],
+                me,
+                false,
+                false,
+            )
             .expect("a view");
         let again = pass
-            .tick(10_500, Some(&sweep.procs), &tabs, &[], me, false, false)
+            .tick(
+                10_500,
+                Some(&sweep.procs),
+                &tabs,
+                &[],
+                &[],
+                me,
+                false,
+                false,
+            )
             .expect("the same view");
         assert!(
             Arc::ptr_eq(&first, &again),
             "inside the cadence nothing is re-read"
         );
         assert!(
-            pass.tick(10_600, None, &tabs, &[], me, false, true)
+            pass.tick(10_600, None, &tabs, &[], &[], me, false, true)
                 .is_some(),
             "a reading without a sweep keeps the last view"
         );
@@ -847,14 +1382,32 @@ pub(crate) mod tests {
         }];
         let mut pass = JobsPass::new();
         let first = pass
-            .tick(10_000, Some(&sweep.procs), &tabs, &[], me, false, false)
+            .tick(
+                10_000,
+                Some(&sweep.procs),
+                &tabs,
+                &[],
+                &[],
+                me,
+                false,
+                false,
+            )
             .expect("a view");
         let paced = pass
-            .tick(11_900, Some(&sweep.procs), &tabs, &[], me, false, false)
+            .tick(
+                11_900,
+                Some(&sweep.procs),
+                &tabs,
+                &[],
+                &[],
+                me,
+                false,
+                false,
+            )
             .expect("the last view");
         assert!(Arc::ptr_eq(&first, &paced), "paced: the engine waits");
         let edge = pass
-            .tick(11_900, Some(&sweep.procs), &tabs, &[], me, false, true)
+            .tick(11_900, Some(&sweep.procs), &tabs, &[], &[], me, false, true)
             .expect("a new view");
         assert!(!Arc::ptr_eq(&first, &edge), "an edge's reading looks");
     }
@@ -978,7 +1531,7 @@ pub(crate) mod tests {
             stand_in: || Some(21),
         };
         let view = pass
-            .tick(10_000, Some(&sweep), &[], &[], 10, false, true)
+            .tick(10_000, Some(&sweep), &[], &[], &[], 10, false, true)
             .expect("a view");
         let held: Vec<(u32, &str, Option<u64>)> = view
             .findings

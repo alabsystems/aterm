@@ -93,10 +93,10 @@ impl Origin {
 /// Which System Settings page a hand-over brings up, aterm's panel beside it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Page {
-    /// Privacy & Security ▸ Developer Tools (owner ask 2026-10-15).
+    /// Privacy & Security ▸ Developer Tools.
     #[default]
     DeveloperTools,
-    /// Privacy & Security ▸ Full Disk Access (owner ask 2026-10-16: aterm on a new Mac starts out asking for file access everywhere): the window's own hand-over at the first quiet moment of a launch that reads it off ([`admit_fda`]), and the panel beside the page the Security card's and the digest's *Open Settings* open.
+    /// Privacy & Security ▸ Full Disk Access (without it, aterm on a new Mac starts out asking for file access everywhere): the window's own hand-over at the first quiet moment of a launch that reads it off ([`admit_fda`]), and the panel beside the page the Security card's and the digest's *Open Settings* open.
     FullDiskAccess,
 }
 

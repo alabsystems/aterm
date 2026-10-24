@@ -1422,6 +1422,66 @@ fn a_tree_without_publish_wants_no_wasm32_pin() {
 }
 
 #[test]
+fn only_linux_holds_the_rustup_row_to_the_guest_agents_musl_std() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let row = super::row("rustup").unwrap();
+    let host = Fake::new();
+    assert!(
+        matches!(check(row, &m, &host), State::Present(_)),
+        "{:?}",
+        check(row, &m, &host)
+    );
+    let linux = parse(&["--linux".to_string()]).unwrap();
+    match check_for(row, &linux, &m, &host) {
+        State::Missing(why) => assert!(
+            why.contains("rustup target add --toolchain stable aarch64-unknown-linux-musl"),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A run that provides (no `--check`) carries `--linux` down to stable: on a machine
+/// whose stable has every target but the guest agent's musl std, a plain run finds the
+/// rustup row in place and a `--linux` run asks stable for that std. This rustup refuses
+/// every change, so the add it was asked for is named in the run's lines.
+#[test]
+fn a_linux_run_asks_stable_for_the_guest_agents_musl_std_and_a_plain_run_does_not() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let host = Fake::new();
+    let add = "rustup target add --toolchain stable aarch64-unknown-linux-musl";
+    let asked = |said: &[String]| {
+        said.iter()
+            .any(|l| l.contains("aarch64-unknown-linux-musl"))
+    };
+
+    let mut said = Vec::new();
+    let plain = parse(&["rustup".to_string()]).unwrap();
+    assert_eq!(
+        run(&plain, &m, &host, &mut |l| said.push(l.to_string())),
+        crate::exit::PASS,
+        "{said:#?}"
+    );
+    assert!(!asked(&said), "{said:#?}");
+
+    let mut said = Vec::new();
+    let linux = parse(&["--linux".to_string(), "rustup".to_string()]).unwrap();
+    assert!(!linux.check);
+    assert_eq!(
+        run(&linux, &m, &host, &mut |l| said.push(l.to_string())),
+        crate::exit::FAILED,
+        "{said:#?}"
+    );
+    assert!(
+        said.iter().any(|l| l.starts_with("FAIL — rustup: `")
+            && l.contains(&format!("/rustup {}` failed", &add["rustup ".len()..]))),
+        "`{add}` was asked for: {said:#?}"
+    );
+}
+
+#[test]
 fn a_stamp_for_another_host_or_build_is_not_the_pin() {
     let home = aterm_tempfile::tempdir().unwrap();
     let m = machine(home.path());

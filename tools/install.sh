@@ -865,14 +865,14 @@ random_suffix() {
 # is the SAME seed-stripped app in a disk image — the manifest's required
 # `dmg` key still binds its name — and a current release never has it
 # elected here. The batteries-included DMG pair (the bare DMG sealing the
-# arm64 toolchain, `aterm-<v>-x86_64.dmg` the Intel one) was RETIRED
-# 2026-08-26: no release cuts the pair. A release that names no zip in its
-# manifest predates the lean container, so the default falls back to the bare DMG
-# that release was cut for. Only a fork's such release installs: every
-# official one (v0.6.0–v0.11.0) carries an empty team_id, which
-# required_team_for refuses before the download, and with ATERM_TEAM_ID pinning
-# the official team v0.11.0 was downloaded and refused at the signature check
-# (measured 2026-10-20 in a macOS 27 guest).
+# arm64 toolchain, `aterm-<v>-x86_64.dmg` the Intel one) is retired: no release
+# cuts it. A release that names no zip in its manifest predates the lean
+# container, so the default falls back to the bare DMG that release was cut
+# for. Only a fork's such release installs: every official one (v0.6.0–v0.11.0)
+# carries an empty team_id, which required_team_for refuses before the
+# download, and with ATERM_TEAM_ID pinning the official team v0.11.0 was
+# downloaded and refused at the signature check (measured 2026-10-20 in a
+# macOS 27 guest).
 #
 # Pure decision logic, extracted from install_app so the whole election matrix
 # is pinned by crates/aterm-update/tests/install_sh without a network. The
@@ -1337,27 +1337,35 @@ unwritable_remedy() { # <dir> <setting>
 # them back. Only what the build writes is asked: target/ itself and
 # release/ in it (cargo_build_pinned runs the store's targo by its physical
 # path, or rustup's proxy, never atpkg's targo shim, which would put a
-# build.noindex/ beside them); cargo's home itself, its registry/, its git/
-# when Cargo.lock names a git source or there is no Cargo.lock to say, and its
-# lock and cache files. A folder is named by its physical path, since
-# `chown -R` on a link changes only the link. Root changes anything; a folder
-# whose parent is not this account's is never named (it is someone else's to
-# give).
+# build.noindex/ beside them); cargo's home itself and the folders new
+# downloads land in: registry/, its cache/, src/ and index/ and the per-index
+# folder in each, and, when Cargo.lock names a git source or there is no
+# Cargo.lock to say, git/, its db/ and checkouts/ and the folders in those. A
+# crate or index file root's in a folder of the account's fails nothing, and
+# cargo treats a lock or cache file it cannot write (.package-cache,
+# .global-cache) as a cache to read. A folder is named by its physical path,
+# since `chown -R` on a link changes only the link; a folder whose parent is
+# not this account's is never named (it is someone else's to give). Under
+# root the question is another one (root_build_preflight).
 source_build_preflight() {
-	local d p me stale=""
+	local d p me stale="" f
 	me="$(id -u)"
-	[[ "$me" != 0 ]] || return 0
+	if [[ "$me" == 0 ]]; then
+		root_build_preflight
+		return
+	fi
 	for d in "$ROOT/target" "${CARGO_HOME:-$HOME/.cargo}"; do
 		p="$(cd -P -- "$d" 2>/dev/null && pwd -P)" || continue
 		[[ -n "$p" && -O "${p%/*}" ]] || continue
 		if [[ "$d" == "$ROOT/target" ]]; then
-			set -- release
+			f="$(not_owned_in "$me" "$p" release)"
 		else
-			set -- registry .package-cache .package-cache-mutate .global-cache
+			set -- registry registry/cache registry/src registry/index
 			[[ -f "$ROOT/Cargo.lock" ]] && ! grep -q '^source = "git+' "$ROOT/Cargo.lock" 2>/dev/null ||
-				set -- "$@" git
+				set -- "$@" git git/db git/checkouts
+			f="$(folders_not_owned_in "$me" "$p" "$@")"
 		fi
-		[[ -n "$(not_owned_in "$me" "$p" "$@")" ]] || continue
+		[[ -n "$f" ]] || continue
 		stale+=" $(shell_word "$p")"
 	done
 	[[ -n "$stale" ]] || return 0
@@ -1377,6 +1385,96 @@ not_owned_in() { # <uid> <dir> <sub>...
 			find "$dir/$sub" \( -name "*"$'\n'"*" -prune \) -o \( ! -type l ! -user "$uid" -print \)
 		done
 	} 2>/dev/null | head -n 1
+}
+
+# The first folder not <uid>'s of <dir> itself, of each <sub> under it and of
+# the folders directly in each <sub>; nothing when there is none.
+folders_not_owned_in() { # <uid> <dir> <sub>...
+	local uid="$1" dir="$2" sub
+	shift 2
+	{
+		find "$dir" -maxdepth 0 ! -user "$uid" -print
+		for sub in "$@"; do
+			[[ -e "$dir/$sub" ]] || continue
+			find "$dir/$sub" -maxdepth 1 \( -name "*"$'\n'"*" -prune \) -o \( -type d ! -user "$uid" -print \)
+		done
+	} 2>/dev/null | head -n 1
+}
+
+# Under root, a source build runs what it builds: the checkout's build
+# scripts and proc macros and every crate it compiles, what target/ already
+# holds that cargo may reuse, git over the checkout's git dir (the version
+# stamp, aterm's build script), the config cargo reads in a .cargo/ in each
+# folder from / down to the checkout and in cargo's own home ([build] rustc,
+# a linker, a rustc-wrapper), the programs it finds on PATH, and those its
+# environment names. So it happens only when no other account can change what
+# it reads or where it finds programs: the checkout, every .cargo/ above it,
+# the git dir and common dir a .git file names, and cargo's home (while it
+# does not exist, the folder it would be made in) pass root_tree_failing; the
+# folder of the lane's cargo, which the build puts first on PATH, passes
+# root_bin_dir (root_build_path keeps the rest of PATH to such folders, and
+# ROOT_GIT_ENV keeps git, from 2.32 on, to the checkout's own config). Of the
+# programs root's own environment names, those that run in place of the
+# compiler the toolchain refusal judges are asked too: each rustc wrapper,
+# and on rustup's lane, which does not scrub them, RUSTC and
+# CARGO_BUILD_RUSTC, is a program may_run allows, a bare name looked up as
+# the build looks it up (the lane's folders, then root_build_path's). A CC,
+# CXX or AR, a linker the environment names, and any program a config of
+# root's names are root's word and are not asked. Else CARGO_RESOLVE_REASON
+# names the first that fails, and status 1.
+root_build_preflight() {
+	local here d v w o="" home="${CARGO_HOME:-$HOME/.cargo}"
+	local -a vars=(RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER)
+	here="$(cd -P -- "$ROOT" 2>/dev/null && pwd)" || here=""
+	o="$(root_tree_failing "$ROOT")"
+	if [[ -z "$o" && -f "$here/.git" ]]; then
+		d="$(sed -n 's/^gitdir: //p' "$here/.git" 2>/dev/null | head -n 1)"
+		[[ "$d" == /* ]] || d="$here/$d"
+		o="$(root_tree_failing "$d")"
+		if [[ -z "$o" && -f "$d/commondir" ]]; then
+			v="$(head -n 1 "$d/commondir" 2>/dev/null)"
+			[[ "$v" == /* ]] || v="$d/$v"
+			o="$(root_tree_failing "$v")"
+		fi
+	fi
+	d="$here"
+	while [[ -z "$o" && -n "$here" ]]; do
+		if [[ -e "$d/.cargo" || -L "$d/.cargo" ]]; then
+			o="$(root_tree_failing "$d/.cargo")"
+		fi
+		[[ -n "$d" && "$d" != / ]] || break
+		d="${d%/*}"
+	done
+	[[ -z "$o" ]] || { root_build_refusal "$o" checkout; return 1; }
+	[[ "$home" == /* ]] || home="$here/$home"
+	o="$(root_tree_failing "$home")"
+	[[ -z "$o" ]] || { root_build_refusal "$o" "cargo home"; return 1; }
+	d="$(dirname "$CARGO_BIN")"
+	if ! root_bin_dir "$d"; then
+		CARGO_RESOLVE_REASON="root does not run a toolchain another account can change, and $d, which the build puts first on PATH, holds a program another account can change — run install.sh as the account whose toolchain it is, without sudo"
+		return 1
+	fi
+	[[ "${CARGO_LANE:-}" == store ]] || vars+=(RUSTC CARGO_BUILD_RUSTC)
+	for v in "${vars[@]}"; do
+		w="${!v:-}"
+		[[ -n "$w" ]] || continue
+		case "$w" in
+		/*) ;;
+		*/*) w="$here/$w" ;;
+		*)
+			d="$(root_build_path)"
+			d="$(build_path_lead)${d:+:$d}"
+			w="$(PATH="$d" && type -P -- "$w")" || w="${!v}"
+			;;
+		esac
+		root_may_run_toolchain "$w" || return 1
+	done
+}
+
+# root_build_preflight's refusal of <path>, part of what the build reads that
+# is <whose> (the checkout, or cargo's home).
+root_build_refusal() { # <path> <whose>
+	CARGO_RESOLVE_REASON="root builds nothing another account can change, and $1 is such (it, or a folder on its way from /, is not root's alone, or it is a link that leads out of the folder root checked) — run install.sh as the account whose $2 it is, without sudo"
 }
 
 # --- the cargo that honours the pin (source-build lane) ----------------------
@@ -1578,12 +1676,17 @@ find_managed_targo() { # <root>
 	MANAGED_BUILD=""
 	MANAGED_DECLINE=""
 	MANAGED_SEEN=""
+	MANAGED_ROOT_REFUSED=""
 	pin="$(gate_pinned_channel "$root")"
 	if [[ "$pin" != trust ]]; then
 		MANAGED_DECLINE="rust-toolchain.toml pins '${pin:-nothing}', not 'trust', so the aterm-managed Trust store is not this checkout's toolchain"
 		return 1
 	fi
-	if aterm="$(command -v aterm 2>/dev/null)" && [[ -n "$aterm" ]] && may_run "$aterm"; then
+	if aterm="$(command -v aterm 2>/dev/null)" && [[ -n "$aterm" ]] && ! may_run "$aterm"; then
+		# Root does not ask it; the PATH walk below only reads files. Kept for
+		# the refusal when nothing else is in reach (find_cargo_and_rustup).
+		MANAGED_ROOT_REFUSED="$aterm"
+	elif [[ -n "$aterm" ]]; then
 		out="$("$aterm" pkg which targo 2>/dev/null | head -n 1 || true)"
 		case "$out" in
 		*" — SHADOWED by "*)
@@ -1627,16 +1730,20 @@ find_managed_targo() { # <root>
 }
 
 # The trust pin's one remedy when no rustup is installed: `aterm pkg install
-# trust` where an `aterm` is in reach to run it (on PATH, or install.sh's
-# $BIN_DIR), else the one path left on a machine with no `aterm` — rustup plus
-# the hand-linked Trust tarballs, since rustup alone cannot download the pin.
+# trust` where an `aterm` this run may run (may_run) is in reach to run it (on
+# PATH, or install.sh's $BIN_DIR), else the one path left on a machine with no
+# such `aterm` — rustup plus the hand-linked Trust tarballs, since rustup alone
+# cannot download the pin.
 # Trust is published for macOS only (atpkg's trust package and the toolchain
 # tarballs alike), so elsewhere the remedy is rustup and a Trust built from
 # source (trust_link_remedy).
 gate_trust_remedy() {
+	local a
+	a="$(command -v aterm 2>/dev/null)" || a=""
 	if [[ "$(uname -s)" != Darwin ]]; then
 		printf '%s\n' "install rustup (https://rustup.rs), then $(trust_link_remedy)"
-	elif command -v aterm >/dev/null 2>&1 || [[ -n "${BIN_DIR:-}" && -x "${BIN_DIR:-}/aterm" ]]; then
+	elif { [[ -n "$a" ]] && may_run "$a"; } ||
+		{ [[ -n "${BIN_DIR:-}" && -x "${BIN_DIR:-}/aterm" ]] && may_run "$BIN_DIR/aterm"; }; then
 		printf '%s\n' "aterm pkg install trust"
 	else
 		printf '%s\n' "install rustup (https://rustup.rs), then unpack the Trust toolchain tarballs (https://github.com/alabsystems/trust/releases) into one prefix and: rustup toolchain link trust <prefix>"
@@ -1668,7 +1775,9 @@ trust_link_remedy() { # [name]
 # which the store cannot serve, rustup's remedy alone. Under root, a cargo or
 # rustup another account can change is refused before it runs
 # (root_may_run_toolchain), as cargo_honours_pin refuses the cargo, rustc or
-# trustc it would run next.
+# trustc it would run next; and when nothing root may run is in reach, but an
+# `aterm` root would not ask was (MANAGED_ROOT_REFUSED), the refusal names
+# that aterm, never `aterm pkg install trust`, which would run it as root.
 find_cargo_and_rustup() { # [root]
 	local root="${1:-}" home="${CARGO_HOME:-$HOME/.cargo}" beside="" seen managed=1 declined=""
 	CARGO_BIN=""
@@ -1677,6 +1786,7 @@ find_cargo_and_rustup() { # [root]
 	CARGO_RESOLVE_REASON=""
 	MANAGED_DECLINE=""
 	MANAGED_SEEN=""
+	MANAGED_ROOT_REFUSED=""
 	if [[ -n "$root" ]]; then
 		if find_managed_targo "$root"; then
 			CARGO_LANE=store
@@ -1705,7 +1815,12 @@ find_cargo_and_rustup() { # [root]
 		CARGO_BIN="$home/bin/cargo"
 	elif ! CARGO_BIN="$(command -v cargo 2>/dev/null)" || [[ -z "$CARGO_BIN" ]]; then
 		CARGO_BIN=""
-		if [[ -n "$RUSTUP_BIN" && "$managed" -eq 1 ]]; then
+		if [[ -n "$MANAGED_ROOT_REFUSED" ]] && { [[ -z "$RUSTUP_BIN" ]] || ! may_run "$RUSTUP_BIN"; }; then
+			# Under root, with nothing root may run in reach: the toolchain is
+			# whatever the aterm root did not ask would have named.
+			root_may_run_toolchain "$MANAGED_ROOT_REFUSED"
+			CARGO_RESOLVE_REASON+="$declined"
+		elif [[ -n "$RUSTUP_BIN" && "$managed" -eq 1 ]]; then
 			CARGO_RESOLVE_REASON="building from source needs a toolchain that honours rust-toolchain.toml, and none is in reach: no aterm-managed Trust store (aterm pkg install trust lays one), and no cargo — no proxy beside $RUSTUP_BIN (at $beside), none at $home/bin/cargo, none on PATH — reinstall rustup (https://rustup.rs), which lays its proxies beside its own binary$declined"
 		elif [[ -n "$RUSTUP_BIN" ]]; then
 			CARGO_RESOLVE_REASON="building from source needs cargo, and none is in reach: no proxy beside $RUSTUP_BIN (at $beside), none at $home/bin/cargo, none on PATH — reinstall rustup (https://rustup.rs), which lays its proxies beside its own binary$declined"
@@ -1877,12 +1992,15 @@ cargo_honours_pin() {
 # The managed lane: the store's targo on its explicit `--unverified` lane (a
 # bare `targo build` refuses to make an implicitly unverified artifact), which
 # appends `-Ztrust-verify=off` to every unit of that invocation;
-# .cargo/config.toml carries no off-switch (docs/ISSUE-trust-unlaned-offswitch-2026-10-07.md).
+# .cargo/config.toml carries no off-switch (its header says why).
 # The store's bin dir goes first on PATH, never rustup's, so a build script
 # that runs a bare `rustc` finds the store's sibling. An ambient RUSTC or
 # CARGO_BUILD_RUSTC would steer the compiler, so both are scrubbed: the
 # compiler the gate proved ($CARGO_RUSTC, trustc beside targo) is the one that
-# runs.
+# runs, unless a cargo config's [build] rustc or a rustc wrapper names another
+# (under root, root_build_preflight holds every config cargo reads to one no
+# other account can change, and a wrapper the environment names to a program
+# may_run allows; what a config of root's names is root's word).
 #
 # rustup's lane: the same cargo from the same root, with RUSTUP_TOOLCHAIN
 # scrubbed as from every probe, and $CARGO_HOME/bin then the cargo's own dir
@@ -1897,20 +2015,64 @@ cargo_honours_pin() {
 #
 # Both lanes: no --target triple, and CARGO_BUILD_TARGET unset — an explicit
 # target makes cargo withhold .cargo/config.toml's [target.*] rustflags (and
-# CARGO_UNVERIFIED_LANE with them) from host units.
+# CARGO_UNVERIFIED_LANE with them) from host units. Under root, PATH after the
+# lane's own folders keeps only those root_build_path allows: the build runs
+# cc, ar and ld from it, and a root run's PATH may be the account's that ran
+# sudo; and the build's git, aterm's build script's among them, runs under
+# ROOT_GIT_ENV.
 CARGO_UNVERIFIED_LANE="target.'cfg(trust_verify)'.rustflags=[\"-Ztrust-verify=off\"]"
 cargo_build_pinned() { # <root>
+	local rest=":$PATH"
+	local -a genv=()
+	if [[ "$(id -u)" == 0 ]]; then
+		rest="$(root_build_path)"
+		rest="${rest:+:$rest}"
+		genv=("${ROOT_GIT_ENV[@]}")
+	fi
 	if [[ "${CARGO_LANE:-}" == store ]]; then
-		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN -u RUSTC -u CARGO_BUILD_RUSTC PATH="$(dirname "$CARGO_BIN"):$PATH" "$CARGO_BIN" --unverified build --release -p aterm --target-dir "$1/target")
+		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN -u RUSTC -u CARGO_BUILD_RUSTC ${genv[@]+"${genv[@]}"} PATH="$(build_path_lead)$rest" "$CARGO_BIN" --unverified build --release -p aterm --target-dir "$1/target")
 	else
-		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$(dirname "$CARGO_BIN"):$PATH" "$CARGO_BIN" build --release -p aterm --target-dir "$1/target" --config "$CARGO_UNVERIFIED_LANE")
+		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN ${genv[@]+"${genv[@]}"} PATH="$(build_path_lead)$rest" "$CARGO_BIN" build --release -p aterm --target-dir "$1/target" --config "$CARGO_UNVERIFIED_LANE")
 	fi
 }
 # The rustup lane in the block above serves a tree whose pin names a stock channel,
 # or a `trust` link rustup resolves with no aterm-managed store in reach. The public
-# snapshot pins `trust` like the dev tree (2026-09-29), so on a machine with aterm
-# both take the store lane. A dev build of the tree is `targo --unverified ship
+# snapshot pins `trust` like the dev tree, so on a machine with aterm both take
+# the store lane. A dev build of the tree is `targo --unverified ship
 # dev-app`, on the Trust toolchain the release cutter resolves.
+
+# The folders a source build puts first on PATH, its lane's: the store's bin
+# dir, or $CARGO_HOME/bin and then the proved cargo's own dir.
+build_path_lead() {
+	if [[ "${CARGO_LANE:-}" == store ]]; then
+		dirname "$CARGO_BIN"
+	else
+		printf '%s\n' "${CARGO_HOME:-$HOME/.cargo}/bin:$(dirname "$CARGO_BIN")"
+	fi
+}
+
+# What a root run's git reads of git's config: with git 2.32 or later, the
+# checkout's own alone, which root_build_preflight holds to root's.
+# GIT_CONFIG_GLOBAL=/dev/null keeps it from ~/.gitconfig and
+# $XDG_CONFIG_HOME/git/config (HOME may be another account's, and a
+# core.fsmonitor or a filter there names a program git runs), and
+# GIT_CONFIG_NOSYSTEM from its system config (a git found on PATH looks for
+# one under its own prefix).
+ROOT_GIT_ENV=(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1)
+
+# git over the checkout, as the build runs it: under root, the first git in
+# root_build_path's folders, run under ROOT_GIT_ENV, and none when there are
+# no such folders; as the account, PATH's.
+checkout_git() { # <arg>...
+	local d
+	if [[ "$(id -u)" != 0 ]]; then
+		git "$@"
+		return
+	fi
+	d="$(root_build_path)"
+	[[ -n "$d" ]] || return 1
+	env "${ROOT_GIT_ENV[@]}" PATH="$d" git "$@"
+}
 
 # Does <name> parse as a rustup dist toolchain, one `rustup toolchain install`
 # can fetch? rustup's grammar (`rustup help toolchain`, 1.29.1):
@@ -2768,13 +2930,11 @@ linux_store_preflight() { # <store>
 
 # --- ownership: one set of tests for both directions ---------------------------
 #
-# The uninstaller always refused to delete what it did not place; the installer
-# used to move aside whatever sat at $DEST/aterm.app and `ln -sfn` over whatever
-# sat at $BIN_DIR/aterm without looking. These are the uninstaller's own tests,
-# hoisted so the install path asks the same questions and prints the same
-# SKIPPED line (docs/AUDIT-distribution-channel-2026-08-31.md, "ownership
-# asymmetry"). Defined above the library guard so
-# crates/aterm-update/tests/install_sh pins them.
+# The installer replaces, and the uninstaller deletes, only what is aterm's.
+# These are the uninstaller's own tests, shared so the install path asks the
+# same questions of $DEST/aterm.app and $BIN_DIR/aterm and prints the same
+# SKIPPED line (docs/AUDIT-distribution-channel-2026-08-31.md). Defined above
+# the library guard so crates/aterm-update/tests/install_sh pins them.
 
 # The one SKIPPED line both directions print for an entry that is not ours.
 ownership_skip() { # <path> <reason>
@@ -2830,16 +2990,24 @@ app_dest_verdict() { # <app-dir>
 }
 
 # Whether <bundle> and everything in it is root's, with no file in it that a
-# group other than root's can write (root_entry).
+# group other than root's can write (root_entry), and nothing every account
+# can write or that carries an ACL.
 bundle_is_roots() { # <bundle>
 	bundle_is_only 0 "$1"
 }
 
-# Whether <bundle> and everything in it is <uid>'s, with no file in it that a
-# group other than gid 0 can write.
+# Whether <bundle> and everything in it is <uid>'s, with nothing in it (a link
+# aside) that every account can write, no file a group other than gid 0 can
+# write, and, on macOS, no entry with an ACL. own_bundle_as_root strips every
+# ACL, so any ACL there is one no root run left, and one entry can give
+# write, append, delete or a chmod (writesecurity) to anyone whatever the
+# modes say: telling a harmless one from those is not this check's to do.
 bundle_is_only() { # <uid> <bundle>
-	[[ -d "$2" && -z "$(find "$2" \( ! -user "$1" -o \( -type f -perm -020 ! -group 0 \) \) -print 2>/dev/null |
-		head -n 1)" ]]
+	[[ -d "$2" && -z "$(find "$2" \( ! -user "$1" -o \( ! -type l -perm -002 \) -o \
+		\( -type f -perm -020 ! -group 0 \) \) -print 2>/dev/null | head -n 1)" ]] || return 1
+	# `ls -le` prints each entry's ACL as ` <n>: <entry>` lines below it.
+	[[ "$(uname -s)" != Darwin ]] ||
+		ls_entry -leRA -- "$2" 2>/dev/null | awk '/^ [0-9]+: / { n = 1 } END { exit n }'
 }
 
 # Make the staged bundle <stage> a root run's: root's, and as writable as
@@ -2848,13 +3016,112 @@ bundle_is_only() { # <uid> <bundle>
 # none, and that account could change the app every account and root run. Its
 # folders take <dest>'s group and, when that group can write <dest>, its write
 # (/Applications: admin, as an admin's updater renames and removes the bundle);
-# its files stay root's alone to write, so no group changes what root runs.
+# its files stay root's alone to write, so no group changes what root runs. No
+# entry keeps an ACL: one <dest> passes down to what ditto makes in it (an
+# inheritable ACE) would grant what the modes do not.
 own_bundle_as_root() { # <stage> <dest>
 	local mode links uid gid rest
 	read -r mode links uid gid rest <<<"$(ls_entry -nd -- "$2")"
-	chown -R "0:${gid:-0}" "$1"
-	chmod -R go-w "$1"
+	chown -R "0:${gid:-0}" "$1" && chmod -R go-w "$1" || return 1
+	[[ "$(uname -s)" != Darwin ]] || chmod -R -N "$1" || return 1
 	[[ "${mode:5:1}" != w ]] || find "$1" -type d -exec chmod g+w {} +
+}
+
+# Copy the verified bundle <app> into <dest> as STAGE, the copy the swap
+# renames into place. As this account, under the visible, unpredictable name
+# install_app's swap explains: what ditto makes is this account's, which is
+# whose the app is. Under root, ditto keeps the container's owner
+# (own_bundle_as_root), so for the length of the copy every folder of the
+# copy is that account's, and it could change the app before root makes it
+# root's: the copy is made inside STAGE_DIR, a folder mktemp makes in <dest>,
+# and made root's there. An inheritable ACL entry on <dest> (SIP keeps one
+# off /Applications, not off another folder) passes down to STAGE_DIR, and
+# until it is stripped an account it names may enter, replace, chmod or take
+# the folder, or hold a descriptor that later looks up names in it without
+# the search right. So STAGE_DIR loses its ACL and must then be
+# staging_folder_sealed's, and the copy goes into a second folder mktemp
+# makes in it: made after the strip, that one inherits nothing, and no
+# descriptor on STAGE_DIR can search it. Status 1 when any of it fails;
+# drop_stage removes what this made.
+stage_bundle() { # <app> <dest>
+	local d
+	STAGE=""
+	STAGE_DIR=""
+	if [[ "$(id -u)" != 0 ]]; then
+		STAGE="$2/aterm.app.installing.$(random_suffix)"
+		ditto "$1" "$STAGE"
+		return
+	fi
+	STAGE_DIR="$(mktemp -d "$2/aterm.app.installing.XXXXXX")" || return 1
+	[[ "$(uname -s)" != Darwin ]] || chmod -N "$STAGE_DIR" || return 1
+	staging_folder_sealed "$STAGE_DIR" || return 1
+	d="$(mktemp -d "$STAGE_DIR/copy.XXXXXX")" || return 1
+	STAGE="$d/aterm.app"
+	ditto "$1" "$STAGE" && own_bundle_as_root "$STAGE" "$2"
+}
+
+# Whether <dir>, a root run's staging folder, is root's alone with mode 0700,
+# holds no entry, and on macOS carries no ACL. `ls -l` shows a `+` for an ACL
+# only on an entry with no extended attribute, so the ACL is read from the
+# entries `ls -le` lists, and an entry named with a newline still prints a
+# path for find.
+staging_folder_sealed() { # <dir>
+	local mode links uid rest
+	read -r mode links uid rest <<<"$(ls_entry -nld -- "$1" 2>/dev/null)"
+	[[ "${mode:0:10}" == drwx------ && "$uid" == 0 ]] || return 1
+	[[ -z "$(find "$1" -mindepth 1 -maxdepth 1 -print 2>/dev/null | head -n 1)" ]] || return 1
+	[[ "$(uname -s)" != Darwin ]] ||
+		ls_entry -lde -- "$1" 2>/dev/null | awk '/^ [0-9]+: / { n = 1 } END { exit n }'
+}
+
+# Rename STAGE onto <dest>/aterm.app, the bundle there set aside first (OLD)
+# and removed last, and remove STAGE_DIR, which holds nothing of the copy
+# once it is renamed.
+swap_staged_bundle() { # <dest>
+	if [[ -e "$1/aterm.app" ]]; then
+		OLD="$1/.aterm.app.old.$(random_suffix)"
+		mv "$1/aterm.app" "$OLD"
+	fi
+	mv "$STAGE" "$1/aterm.app"
+	STAGE=""
+	if [[ -n "${STAGE_DIR:-}" ]]; then
+		rm -rf "$STAGE_DIR"
+		STAGE_DIR=""
+	fi
+	if [[ -n "${OLD:-}" ]]; then
+		rm -rf "$OLD" 2>/dev/null ||
+			echo "install.sh: NOTE: could not fully remove the previous copy (left at $OLD; remove with: sudo rm -rf '$OLD')" >&2
+		OLD=""
+	fi
+}
+
+# Remove what stage_bundle made and the swap did not take: an interrupted or
+# failed run's copy, and under root the folder it was made in.
+drop_stage() {
+	[[ -z "${STAGE:-}" ]] || rm -rf "$STAGE"
+	[[ -z "${STAGE_DIR:-}" ]] || rm -rf "$STAGE_DIR"
+	STAGE=""
+	STAGE_DIR=""
+}
+
+# install_app's EXIT trap, over the TMP, MNT, STAGE, STAGE_DIR and OLD it sets
+# and the run's DEST and CONTAINER_KIND.
+install_app_cleanup() {
+	# Best-effort only, and never let a cleanup failure rewrite the exit status.
+	set +e
+	# Only a DMG is mounted; the lean zip is expanded into this same path, and
+	# `rm -rf "$TMP"` below is all it needs.
+	if [[ "${CONTAINER_KIND:-dmg}" == dmg && -d "$MNT" ]]; then
+		hdiutil detach "$MNT" -quiet >/dev/null 2>&1 ||
+			{ sleep 2; hdiutil detach "$MNT" -force -quiet >/dev/null 2>&1; }
+	fi
+	drop_stage
+	# If the swap was interrupted after the old bundle was set aside, restore it.
+	if [[ -n "$OLD" && -d "$OLD" && ! -e "$DEST/aterm.app" ]]; then
+		mv "$OLD" "$DEST/aterm.app"
+	fi
+	[[ -n "$OLD" ]] && rm -rf "$OLD"
+	rm -rf "$TMP"
 }
 
 # Enable at Startup, aterm Caffeine's login job (crates/aterm-caffeine
@@ -2975,22 +3242,124 @@ may_run() { # <program>
 # Whether <dir> and each folder above it are root_entry ones, as written and as
 # cd -P resolves it.
 root_folders() { # <dir>
+	[[ -z "$(folder_failing root_entry "$1")" ]]
+}
+
+# The first of <dir> and each folder above it, as written and then as cd -P
+# resolves it, that fails <test>, or <dir> when it does not resolve; nothing
+# when each one passes.
+folder_failing() { # <test> <dir>
 	local d
-	for d in "${1:-/}" "$(cd -P -- "${1:-/}" 2>/dev/null && pwd)"; do
-		[[ -n "$d" ]] || return 1
+	for d in "${2:-/}" "$(cd -P -- "${2:-/}" 2>/dev/null && pwd)"; do
+		if [[ -z "$d" ]]; then
+			printf '%s\n' "${2:-/}"
+			return 0
+		fi
 		while :; do
-			root_entry "${d:-/}" || return 1
+			if ! "$1" "${d:-/}"; then
+				printf '%s\n' "${d:-/}"
+				return 0
+			fi
 			[[ -n "$d" && "$d" != / ]] || break
 			d="${d%/*}"
 		done
 	done
 }
 
+# Whether <path> is root's and, unless it is a link, no account but root can
+# add to it or rewrite it: no group but root's can write it, folder or file,
+# and no account can through a sticky bit, which lets every account add an
+# entry (a .cargo/ among them) to a folder. A source build under root reads
+# what such folders hold for minutes, so root_entry's room for a folder a
+# group can write is not left here.
+sealed_entry() { # <path>
+	local mode links uid gid rest
+	read -r mode links uid gid rest <<<"$(ls_entry -nd -- "$1" 2>/dev/null)"
+	[[ "$uid" == 0 && ( "${mode:0:1}" == l || ( "${mode:8:1}" != w && ( "${mode:5:1}" != w || "$gid" == 0 ) ) ) ]]
+}
+
+# The first entry at or below folder <dir> (a physical path) that another
+# account could change: one, a link aside, that is not root's, or that every
+# account or a group but root's can write; else the first link in it that
+# leads anywhere but into <dir>, or nowhere; nothing when there is none. A
+# name with a newline, which would read as two paths, is named by the folder
+# that holds it.
+root_tree_offender() { # <dir>
+	local f l t
+	f="$(find "$1" \( -name "*"$'\n'"*" -prune -exec dirname {} \; \) -o \
+		\( ! -type l \( ! -user 0 -o -perm -002 -o \( -perm -020 ! -group 0 \) \) -print \) 2>/dev/null |
+		head -n 1)"
+	if [[ -n "$f" ]]; then
+		printf '%s\n' "$f"
+		return 0
+	fi
+	while IFS= read -r l; do
+		[[ -n "$l" ]] || continue
+		if [[ -d "$l" ]]; then
+			t="$(cd -P -- "$l" 2>/dev/null && pwd)" || t=""
+		elif t="$(gate_physical_path "$l")"; then
+			t="${t%/*}"
+		else
+			t=""
+		fi
+		[[ -n "$t" ]] && in_folder "$t" "$1" && continue
+		printf '%s\n' "$l"
+		return 0
+	done <<<"$(find "$1" \( -name "*"$'\n'"*" -prune \) -o \( -type l -print \) 2>/dev/null)"
+}
+
+# What a root source build asks of <path>, a folder it reads (or, while it
+# does not exist, would make): the first folder on its way from / that is not
+# sealed_entry's (the one it would be made in, while it does not exist), else
+# the first root_tree_offender in it; nothing when there is none.
+root_tree_failing() { # <path>
+	local p="$1" o
+	while [[ ! -e "$p" && ! -L "$p" && "$p" == */* ]]; do
+		p="${p%/*}"
+	done
+	o="$(folder_failing sealed_entry "${p:-/}")"
+	if [[ -n "$o" || "$p" != "$1" ]]; then
+		[[ -z "$o" ]] || printf '%s\n' "$o"
+		return 0
+	fi
+	p="$(cd -P -- "$p" 2>/dev/null && pwd)" || p=""
+	if [[ -z "$p" ]]; then
+		printf '%s\n' "$1"
+		return 0
+	fi
+	root_tree_offender "$p"
+}
+
+# Whether root may take programs from folder <dir> by name, as a build takes
+# cc, ar, ld or git from PATH: root_folders allows it, and nothing directly in
+# it that is a file, through its link when it is one, is another uid's or one
+# every account or a group but root's can write.
+root_bin_dir() { # <dir>
+	[[ "$1" == /* ]] && root_folders "$1" &&
+		[[ -z "$(find -L "$1/" -mindepth 1 -maxdepth 1 \( -name "*"$'\n'"*" -prune \) -o \
+			\( -type f \( ! -user 0 -o -perm -002 -o \( -perm -020 ! -group 0 \) \) -print \) 2>/dev/null |
+			head -n 1)" ]]
+}
+
+# PATH's folders that root_bin_dir allows, in PATH's order: the PATH a root
+# source build runs on after the folders its lane puts first.
+root_build_path() {
+	local d out="" dirs
+	IFS=: read -ra dirs <<<"${PATH:-}"
+	for d in ${dirs[@]+"${dirs[@]}"}; do
+		root_bin_dir "$d" && out+="${out:+:}$d"
+	done
+	printf '%s\n' "$out"
+}
+
 # Whether <path> itself is root's and, unless it is a sticky folder or a link,
 # not one every account can write, nor, when it is a file, one a group other
 # than root's can write (that group could rewrite it in place; a folder a group
 # can write lets it move entries, but what it moves in is either not root's or
-# root's from another folder it can write, which it still cannot rewrite). A
+# a root file it brought from elsewhere on the volume, renamed from a folder it
+# can write or hard-linked from any folder, which macOS does not stop, and it
+# still cannot rewrite that file: root then runs a program root's own file
+# holds, though not always the one it named). A
 # link's mode is nothing (Linux shows every link as lrwxrwxrwx, /bin among
 # them): no account rewrites a link in place, only through its folder, and the
 # walks judge that folder and where it leads.
@@ -3463,25 +3832,21 @@ print_install_plan() {
 # --- WHOLE-FILE EXECUTION GUARD ------------------------------------------------
 # Everything from here down executes ONLY through the `main "$@"` on this
 # file's LITERAL LAST LINE. The documented invocation is `curl … | bash`, and
-# bash runs a pipe as it arrives: without this wrapper, a transfer truncated
-# after the argument loop still executed a PREFIX of the run — empirically,
-# `head -n <pre-dispatch> install.sh | bash` created ~/.local/bin, spent
-# anonymous GitHub API budget, and exited 0. (Round 10 refuted a truncation
-# hazard on the grounds that every DESTRUCTIVE operation lives in a function
-# with the dispatch as the tail — true for the app swap, but the TOP-LEVEL
-# pre-flight between the two already carried side effects, so the refutation
-# did not cover the file. docs/INSTALL-UPDATE-AUDITS-2026-08.md records the
-# original verdict; this guard supersedes it — do not remove it on that
-# document's authority.)
+# bash runs a pipe as it arrives: unwrapped, a transfer truncated after the
+# argument loop would execute a PREFIX of the run (`head -n <pre-dispatch>
+# install.sh | bash` created ~/.local/bin, spent anonymous GitHub API budget,
+# and exited 0). Keeping every DESTRUCTIVE operation in a function with the
+# dispatch as the tail is not enough: the top-level pre-flight between the two
+# has side effects too, so the guard wraps the whole run. Do not remove it.
 # Wrapped, truncation has exactly two outcomes, both inert: a cut inside the
 # body is a parse error (bash executes none of an unterminated compound), and
 # a cut that keeps the body but loses the last line defines everything and
 # runs nothing. No side effect can happen unless the final byte arrived — the
 # same tail-call guard rustup and uv ship. Tested at every top-level cut point
 # by crates/aterm-update/tests/install_sh.
-# The body below keeps its pre-wrap indentation ON PURPOSE: re-indenting
-# ~1,600 lines would bury the guard's real diff in mechanical churn and risk
-# pushing literal tabs into multi-line strings.
+# The body below is not indented under main() ON PURPOSE: re-indenting ~1,200
+# lines would be mechanical churn and risk pushing literal tabs into multi-line
+# strings.
 main() {
 ARGV=("$@")
 TAG=""
@@ -3631,16 +3996,16 @@ LINUX_ASSET=""
 LINUX_HEAD_TAG=""
 LINUX_MANIFEST_ASSET=aterm-appcast.toml
 # The store needs a directory of its own. With ATERM_STORE_DIR naming
-# ATERM_BIN_DIR, the store's `aterm` and the PATH link were one file:
-# claim_bin_aterm removed the binary just placed as a "pre-store" leftover and
-# linked `aterm` to itself, and the run still said "ONE command on PATH"
-# (2026-10-02 audit). A store inside the PATH directory, or around it, mixes
-# the store's entries with PATH's the same way. Refused up front, before any
-# network or write, whenever a half that may fill the store is on: the cli half
-# (its source-build lane) or Linux's app half. The PATH directories are the ones
-# the uninstall sweep walks — ATERM_BIN_DIR, and ~/.local/bin, where the app
-# plants its own links whatever ATERM_BIN_DIR says — so no install lays down a
-# store the uninstall must leave behind as part of a PATH directory.
+# ATERM_BIN_DIR, the store's `aterm` and the PATH link would be one file:
+# claim_bin_aterm would remove the binary just placed as a "pre-store" leftover
+# and link `aterm` to itself, while the run said "ONE command on PATH". A store
+# inside the PATH directory, or around it, mixes the store's entries with PATH's
+# the same way. Refused up front, before any network or write, whenever a half
+# that may fill the store is on: the cli half (its source-build lane) or Linux's
+# app half. The PATH directories are the ones the uninstall sweep walks —
+# ATERM_BIN_DIR, and ~/.local/bin, where the app plants its own links whatever
+# ATERM_BIN_DIR says — so no install lays down a store the uninstall must leave
+# behind as part of a PATH directory.
 if [[ "$DO_CLI" -eq 1 || ("$DO_APP" -eq 1 && "$LINUX_RELEASE" -eq 1) ]]; then
 	for OVERLAP_DIR in "$BIN_DIR" "$HOME/.local/bin"; do
 		if dir_within "$STORE_DIR" "$OVERLAP_DIR" || dir_within "$OVERLAP_DIR" "$STORE_DIR"; then
@@ -3762,9 +4127,10 @@ if [[ "$DO_APP" -eq 1 ]]; then
 				installed_bundle_verified "$DEST/aterm.app" "$SKIP_TEAM" || SKIP_STATUS=$?
 				if [[ "$SKIP_STATUS" -eq 0 && "$(id -u)" == 0 ]] && ! bundle_is_roots "$DEST/aterm.app"; then
 					# A root run's bundle is root's (own_bundle_as_root): one in
-					# which an earlier root run left the builder's uid, or files
-					# its folder's group can write, is installed again.
-					echo "install.sh: installed aterm matches the elected version but another account owns files in it or a group can write them — reinstalling it as root's" >&2
+					# which an earlier root run left the builder's uid, files its
+					# folder's group can write, an entry every account can write
+					# or an ACL, is installed again.
+					echo "install.sh: installed aterm matches the elected version but another account owns files in it, or a group, every account or an ACL can change them — reinstalling it as root's" >&2
 				elif [[ "$SKIP_STATUS" -eq 0 ]]; then
 					APP_ALREADY="${TAG#v}"
 				elif [[ "$SKIP_STATUS" -eq 124 ]]; then
@@ -3908,25 +4274,9 @@ install_app() {
 	TMP="$(mktemp -d "${TMPDIR:-/tmp}/aterm-install.XXXXXX")"
 	MNT="$TMP/mnt"
 	STAGE=""
+	STAGE_DIR=""
 	OLD=""
-	cleanup() {
-		# Best-effort only, and never let a cleanup failure rewrite the exit status.
-		set +e
-		# Only a DMG is mounted; the lean zip is expanded into this same path, and
-		# `rm -rf "$TMP"` below is all it needs.
-		if [[ "${CONTAINER_KIND:-dmg}" == dmg && -d "$MNT" ]]; then
-			hdiutil detach "$MNT" -quiet >/dev/null 2>&1 ||
-				{ sleep 2; hdiutil detach "$MNT" -force -quiet >/dev/null 2>&1; }
-		fi
-		[[ -n "$STAGE" ]] && rm -rf "$STAGE"
-		# If the swap was interrupted after the old bundle was set aside, restore it.
-		if [[ -n "$OLD" && -d "$OLD" && ! -e "$DEST/aterm.app" ]]; then
-			mv "$OLD" "$DEST/aterm.app"
-		fi
-		[[ -n "$OLD" ]] && rm -rf "$OLD"
-		rm -rf "$TMP"
-	}
-	trap cleanup EXIT
+	trap install_app_cleanup EXIT
 
 	# The manifest, from the tag's own URL, held to the size the host names.
 	MANIFEST_SIZE="$(release_asset_size "$TAG" aterm-appcast.toml "$MANIFEST_MAX_BYTES")" || exit 1
@@ -4089,30 +4439,24 @@ install_app() {
 
 	# Stage next to the destination, swap by rename, delete the old copy last — either
 	# the old or the new bundle exists at $DEST/aterm.app at every instant, and an
-	# interrupt mid-swap restores the old one (see cleanup).
+	# interrupt mid-swap restores the old one (see install_app_cleanup).
 	# The staging name must be visible (no leading dot): Spotlight never indexes
 	# content under dot-paths, and the final rename does not backfill the index.
 	# And unpredictable: /Applications is shared, admin-writable space, so a
 	# guessable staging name could be pre-created by another local user to ambush
-	# the swap. Same rule for the set-aside path.
-	STAGE="$DEST/aterm.app.installing.$(random_suffix)"
-	ditto "$MNT/aterm.app" "$STAGE"
-	[[ "$(id -u)" != 0 ]] || own_bundle_as_root "$STAGE" "$DEST"
-	if [[ -e "$DEST/aterm.app" ]]; then
-		OLD="$DEST/.aterm.app.old.$(random_suffix)"
-		mv "$DEST/aterm.app" "$OLD"
-	fi
-	mv "$STAGE" "$DEST/aterm.app"
-	STAGE=""
-	if [[ -n "$OLD" ]]; then
-		rm -rf "$OLD" 2>/dev/null ||
-			echo "install.sh: NOTE: could not fully remove the previous copy (left at $OLD; remove with: sudo rm -rf '$OLD')" >&2
-		OLD=""
-	fi
+	# the swap. Same rule for the set-aside path, and for the folder a root run
+	# stages in (stage_bundle).
+	stage_bundle "$MNT/aterm.app" "$DEST" || {
+		echo "install.sh: could not stage aterm.app in $DEST — nothing was installed" >&2
+		exit 1
+	}
+	swap_staged_bundle "$DEST"
 
-	# Nudge Spotlight (the staged folder was indexed as a plain directory; the
-	# rename just made it an .app bundle) and LaunchServices, so the app is
-	# findable the moment the installer exits.
+	# Nudge Spotlight (a run as the account staged a folder whose name is no
+	# bundle's, indexed as a plain directory until the rename made it an .app
+	# bundle; a root run staged aterm.app in a folder of its own, and the
+	# rename moved it) and LaunchServices, so the app is findable at its final
+	# path the moment the installer exits.
 	mdimport "$DEST/aterm.app" >/dev/null 2>&1 || true
 	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
 		-f "$DEST/aterm.app" >/dev/null 2>&1 || true
@@ -4286,7 +4630,7 @@ install_cli() {
 }
 
 install_cli_from_source() {
-	echo "install.sh: building aterm from $ROOT at $(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo '(not a git checkout)')"
+	echo "install.sh: building aterm from $ROOT at $(checkout_git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo '(not a git checkout)')"
 	# Pin the target dir (a global CARGO_TARGET_DIR / build.target-dir redirect
 	# would strand the fresh binaries elsewhere) but NEVER a --target triple:
 	# cargo withholds [target.*] rustflags from HOST units (build scripts, proc
@@ -4323,7 +4667,7 @@ install_cli_from_source() {
 	local built=0
 	cargo_build_pinned "$ROOT" || built=$?
 	if [[ "$built" -ne 0 ]]; then
-		# Under `set -e` the failed build used to end the run with cargo's own
+		# Under `set -e` a failed build would end the run with cargo's own
 		# status and no line of this script's: say what it means here.
 		echo "install.sh: the source build failed (cargo exit $built, its error above) — the \`aterm\` command was not installed" >&2
 		exit 1

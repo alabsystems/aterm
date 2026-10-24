@@ -57,7 +57,8 @@ impl CursorStyle {
         )
     }
 
-    /// The same shape with its blink bit set to `blink`.
+    /// The same shape with its blink bit set to `blink`; `Hidden`, `HollowBlock` and `Bolt` pass
+    /// through.
     #[inline]
     #[must_use]
     pub const fn with_blink(self, blink: bool) -> Self {

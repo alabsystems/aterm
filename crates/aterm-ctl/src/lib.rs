@@ -64,7 +64,8 @@ OPTIONS:
                   spawn agent=claude [cwd=<absolute>] - < task, await task
                   @<w> since=0 (the first wait; later ones @<w>:<rev>),
                   @<w> result|status|text|screen|turn|key|send|close,
-                  hold <w> on|off. `aterm help workers`.
+                  hold <w> on|off. `aterm help workers`. `--host H survey` is
+                  `survey --host H`, a fleet read that needs no drive grant.
     --timeout SECS
                   deadline on each socket read and write, in seconds (default
                   900, 0 = none; --timeout=SECS also works). Raise it for a
@@ -73,8 +74,12 @@ OPTIONS:
                   watch (frames so far are flushed, then exit 124); without
                   one, or with 0, the watch runs until the stream ends. The
                   wait for a successor (exit 75) spends what is left of it.
+    --completions SHELL
+                  print a bash, zsh or fish completion script and exit.
     -h, --help    print this help and exit.
     -V, --version print version information and exit.
+    --sock=PATH, --pid=PID, --host=H and --completions=SHELL also work, and
+    `--` ends the options.
 
 EXIT CODES:
     0    the server answered OK; for `ls`/`instances`/`windows`, at least one
@@ -83,73 +88,82 @@ EXIT CODES:
          `windows`: the socket directory was read and holds no instance — the
          only case that prints `no live aterm instances found`.
     2    could not reach: the instance accepted the connection but did not
-         serve it within 10 s (or a shorter --timeout), so the request was not
-         sent. For `ls`/`instances`/`windows`: no socket found answered, or the
-         directory is missing, unreadable or unresolvable ($HOME and
-         $XDG_RUNTIME_DIR unset); stderr names each socket's cause and a hint.
+         serve it within 10 s (or a shorter --timeout; --timeout 0 waits
+         without bound), so the request was not sent. For `ls`/`instances`/
+         `windows`: no socket found answered, or the directory is missing,
+         unreadable or unresolvable (every variable it is read from unset);
+         stderr names each socket's cause and a hint.
     124  timeout: the client's deadline fired, or the server reported one (a
          `turn` with status=timeout, or `OK timeout` from await/ready/wait);
          for `ls`/`instances`/`windows`, every socket found timed out.
-    75   the instance went away mid-exchange (a failed update, a crash, a
-         quit) and nothing replaced it within 30 s, or within what an explicit
-         --timeout had left. A self-update is followed (a --pid call follows
-         only its own process): `subscribe` resumes on the successor, stderr
-         says so, and each target restarts from its current state after a
+    75   a `subscribe`, a blocking read (`text`, `wait`, `ready`, `await`,
+         `inbox`), a `turn` or a `post` whose instance went away mid-exchange
+         (a failed update, a crash, a quit) and nothing replaced it within
+         30 s, or before the call's deadline ran out; any other verb cut that
+         way exits 1. A self-update is followed (a --pid call follows only its
+         own process): `subscribe` resumes on the successor, stderr says so,
+         and each target restarts from its current state after a
          `GAP <local> replaced` line (a single-target stream's block and turn
-         events resume after the last ones relayed); a blocking read (`text`,
-         `wait`, `ready`, `await`, `inbox`) is asked once more. Still 75, with
-         a note on what to do: a read anchored in the old process (`await
-         seq|block|consent`, `await inbox since=`, `inbox get <id>`, `inbox
-         since=`, an `@<n>` selector); a `turn`, whose text may already be
-         typed; a `post`, which may already be queued (re-post only with the
-         same `key=`, or after finding its `post`/`post-landed` rows in
-         `timeline`); a `dial` whose remote closes first. Never 0: an update
-         is not \"session over\".
+         events resume after the last ones relayed); a blocking read is asked
+         once more. Still 75, with a note on what to do: a read anchored in
+         the old process (`await seq|block|consent`, an `await log` with no
+         `since=`, `await inbox|agent since=`, `await edit ticket=`, `inbox
+         get <id>`, `inbox since=`, an `@<n>` selector); a `turn`, whose text
+         may already be typed; a `post`, which may already be queued (re-post
+         only with the same `key=`, or after finding its `post`/`post-landed`
+         rows in `timeline`). Never 0: an update is not \"session over\".
 
 OUTPUT:
-    To a pipe or a file, stdout and stderr carry the server's bytes exactly.
+    To a pipe or a file, stdout carries the server's bytes exactly; on stderr,
+    the server's status line and this client's notes start `aterm-ctl: `.
     To a terminal, every character a terminal acts on or reorders text around
     (C0 but newline and tab, DEL, C1, the bidi controls, U+2028/U+2029) and
     every byte that is not UTF-8 prints as an escape (\\x1b, \\r, \\u{202e},
-    \\xff), so text another party wrote (`inbox get`, a `dial`ed remote's
+    \\xff), so text another party wrote (`inbox get`, a `--host` peer's
     reply, a screen) cannot retitle the tab, move the cursor or write the
     clipboard. Redirect (`> file`, `| cat`) for the bytes themselves.
 
 STDIN PAYLOADS:
     Inline arguments are joined with single spaces and may not contain a
-    newline. These forms read STDIN instead, every byte kept (<= 256 KiB):
-    feed-bin      feed the STDIN bytes to the PTY verbatim (a length-prefixed
-                  frame; no inline argument); prints the server's OK <n> bytes.
+    newline or carriage return. These forms read STDIN instead, every byte
+    kept:
+    feed-bin      feed the STDIN bytes (<= 256 KiB) to the PTY verbatim (a
+                  length-prefixed frame; no inline argument); prints the
+                  server's OK <n> bytes.
     send --stdin | send -
                   the same raw feed as feed-bin.
     paste --stdin | paste -
-                  paste the STDIN bytes with the server's paste handling
-                  (control bytes sanitized; ESC[200~/201~ bracketing when the
-                  app enabled DECSET 2004), not as a raw feed.
-    operator-propose-bin
-                  one JSON proposal for the embedded operator (<= 64 KiB; no
-                  selector or argument).
+                  paste the STDIN bytes (<= 256 KiB) with the server's paste
+                  handling (control bytes sanitized; ESC[200~/201~ bracketing
+                  when the app enabled DECSET 2004), not as a raw feed.
+    spawn agent=<a> [model=<m>] [cwd=<path>] -
+                  the worker's task (1 byte to 64 KiB); the client writes len=
+                  itself, adds from=$ATERM_PARENT_SESSION_ID and cwd=<this
+                  directory> when absent, and makes a relative cwd= absolute.
 
 SOCKET RESOLUTION:
-    --sock PATH, else --pid PID (<dir>/aterm-<PID>.sock), else, from a shell
-    inside an aterm session, the instance hosting it (found through
-    $ATERM_PARENT_SESSION_ID's <dir>/graph/<sid> entry, even when a newer
-    instance owns the alias), else <dir>/aterm.sock, the link to the newest
-    instance's socket — or, when nothing accepts there, the newest
+    --sock PATH, else --pid PID (<dir>/aterm-<PID>.sock), else, for a request
+    naming @<sid>, the instance hosting that session (<dir>/graph/<sid>),
+    else, from a shell inside an aterm session, the instance hosting it
+    (found through $ATERM_PARENT_SESSION_ID's <dir>/graph/<sid> entry, even
+    when a newer instance owns the alias), else <dir>/aterm.sock, the link to
+    the newest instance's socket — or, when nothing accepts there, the newest
     <dir>/aterm-<pid>.sock that does. <dir> is $XDG_RUNTIME_DIR/aterm when
-    that is set, else ~/Library/Application Support/aterm (on every Unix). No
-    environment variable selects a socket. When the socket is dead but aterm
-    is running, a flagless call's error names each live instance with the
-    --pid or --sock that reaches it; a --sock or --pid call is told only how
-    many are live, never handed another instance to drive.
+    that is set (not on Windows), else the per-user default:
+    ~/Library/Application Support/aterm on macOS,
+    ${XDG_STATE_HOME:-~/.local/state}/aterm/run on other Unixes, %TMP%\\aterm
+    on Windows. No environment variable names a socket path. When the socket
+    is dead but aterm is running, a flagless call's error names each live
+    instance with the --pid or --sock that reaches it; a --sock or --pid call
+    is told only how many are live, never handed another instance to drive.
 
     DISCOVERY (`ls`, `instances`, `windows`) dials every <dir>/aterm-<pid>.sock
     and every --control-sock instance listed under <dir>/graph, 2 s each. With
-    $XDG_RUNTIME_DIR set, ~/Library/Application Support/aterm is not
-    consulted. A private --control-sock instance whose token this user cannot
-    read is not dialled (`instances` names it on stderr). A stale socket is
-    skipped silently while another instance answers; when none does, the
-    report names each socket and its cause (EXIT CODES 1 and 2).
+    $XDG_RUNTIME_DIR set, the per-user default is not consulted. A private
+    --control-sock instance whose token this user cannot read is not dialled
+    (`instances` names it on stderr). Sockets that do not answer (stale,
+    busy, timed out) are skipped silently while another instance answers;
+    when none does, the report names each socket's cause (EXIT CODES 1 and 2).
 
 CROSS-TERMINAL DRIVING:
     Prefix a verb with @<sid> (`subscribe` takes it after the verb) to address
@@ -165,7 +179,9 @@ PUSH FRAMES (subscribe):
     and stdout carries these frames (as OUTPUT above), each tagged with a
     <local> channel id, not the sid. A BYTES body may contain newlines: once
     `bytes` is requested, do not parse the stream line by line.
-      sub <local> <sid>          one per target, right after the ack.
+      sub <local> <sid>[ log_seq=<seq> log_ep=<e>]
+                                 one per target, right after the ack; log_seq=
+                                 and log_ep= only with the `log` stream.
       DELTA <local> seq=<n> screen <nrows>   then <nrows> rows: a screen
                                  snapshot at seq <n> (a skipped seq is
                                  coalescing, not loss).
@@ -176,14 +192,16 @@ PUSH FRAMES (subscribe):
                                  JSON and a newline: a lossless state delta.
       EVENT <local> <kind> ...   a lifecycle line, <kind> one of turn,
                                  block-complete, meta, title, bell, agent,
-                                 status, human, harness-policy, resize,
-                                 render, the fabric kinds (inbox, inbox-seen,
-                                 post, fetch, post-landed, hold, topic),
-                                 closing, then exited. The `sessions` stream
-                                 adds `EVENT * session-created`,
-                                 `session-exited` and `fabric-retire`.
-                                 `subscribe --help` gives each one's fields.
+                                 task, status, human, harness-policy, job,
+                                 resize, render, the fabric kinds (inbox,
+                                 inbox-seen, post, fetch, post-landed, hold,
+                                 topic), closing, then exited. The `sessions`
+                                 stream adds `EVENT * session-created`,
+                                 `session-exited`, `fabric-retire` and
+                                 `bye <quit|handoff>`. `subscribe --help`
+                                 gives each one's fields.
       BYTES <local> <len>        then <len> raw PTY bytes and a newline.
+      LOG <local> <record>       one session-log record (`log` stream).
       MAIL <local> id=<n> off=<n> from=<p> kind=<k>[ re=<n>][ topic=<t>]
                                  one per row delivered to the session's inbox
                                  (`mail` stream); metadata only, `inbox get
@@ -199,7 +217,9 @@ PUSH FRAMES (subscribe):
                                  ledger; records below <floor> are gone);
                                  `events-dropped=<n>` or `mail-dropped=<n>`
                                  (the timeline or the inbox ring evicted <n>
-                                 this watch had not been shown); `replaced`
+                                 this watch had not been shown); `log-lost=<n>
+                                 why=<w> resync_to=<seq> ep=<e>` (log records
+                                 the ring no longer holds); `replaced`
                                  (written by this client when the stream
                                  resumed on a successor: output, mail and
                                  records between the two were not delivered;
@@ -227,7 +247,7 @@ CLIENT VERBS (answered by aterm-ctl itself; not in the protocol table):
                   calling terminal's own session:
                   <pid> <local> <sid> <parent|-> <state> <title> meta=<0|1> nonce=<hex32>
                   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->
-                  identity=<name|-> path=<frozen|live> program=<name|-> agent=<word|->
+                  path=<frozen|live> program=<name|-> agent=<word|->
                   agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|->
                   agent_fp=<hex16|-> human_ms=<ms|-> role=<pct|-> attention=<pct|->
                   user_title=<pct|-> supervisor=<holder|->
@@ -244,7 +264,8 @@ CLIENT VERBS (answered by aterm-ctl itself; not in the protocol table):
     instances     one line per live same-user instance:
                   <pid> <session-count> <sock>[ self]
                   (self = the instance hosting the calling terminal).
-    windows       one line per window across the fleet, folded from `sessions`:
+    windows       one line per window of every live instance on this Mac,
+                  folded from `sessions`:
                   <pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]
                   focused= marks aterm's most recently focused window (one per
                   instance; a minimize or an app switch does not clear it);
@@ -269,13 +290,14 @@ CLIENT VERBS (answered by aterm-ctl itself; not in the protocol table):
                   detected_by= is shell-integration (the integration marked
                   the pane), session-base ($ATERM_MUX_BASE, the multiplexer
                   environment the session shell recorded, differs from this
-                  one) or environment ($TMUX/$STY corroborated by $TERM or
+                  one) or environment (no $ATERM_MUX_BASE, inside an aterm
+                  session, and $TERM naming screen/tmux or $TMUX with
                   TERM_PROGRAM=tmux). aterm hosts one session for the whole
                   multiplexer, so a flagless or @self call from a pane would
                   drive the terminal running screen/tmux: such calls are
                   refused, naming the sid and the explicit form to use. Verbs
                   that address no session (version, sessions, who, whoami,
-                  grant, flows, dial-*, help) still run. OSC 133 marks do not
+                  grant, flows, help) still run. OSC 133 marks do not
                   cross the boundary, so blocks, exit codes and cwd are absent
                   (not empty) from inside; the first call from a multiplexer
                   says so once (ATERM_MUX_NOTICE=0 silences that and the
@@ -292,7 +314,7 @@ fn completion_verb_list() -> String {
     s
 }
 
-const COMPLETION_FLAGS: &str = "--sock --pid --timeout --help --version";
+const COMPLETION_FLAGS: &str = "--sock --pid --host --timeout --help --version";
 
 fn completion_script(shell: &str) -> Option<String> {
     let verbs = completion_verb_list();
@@ -358,6 +380,7 @@ fn push_zsh_ctl_arguments(s: &mut String, indent: &str, array: &str) {
         "_arguments -C \\\n",
         "    '--sock[control socket path]:path:_files' \\\n",
         "    '--pid[instance pid]:pid' \\\n",
+        "    '--host[fleet peer to drive]:host' \\\n",
         "    '--timeout[per-op deadline in seconds]:seconds' \\\n",
         "    '(- *)--help[print help and exit]' \\\n",
         "    '(- *)--version[print version and exit]' \\\n",
@@ -391,6 +414,7 @@ fn push_fish_ctl_flags(s: &mut String, preamble: &str) {
     for line in [
         "-l sock -r -d 'control socket path'\n",
         "-l pid -r -d 'instance pid'\n",
+        "-l host -r -d 'fleet peer to drive'\n",
         "-l timeout -r -d 'per-op deadline in seconds'\n",
         "-l help -d 'print help and exit'\n",
         "-l version -d 'print version and exit'\n",
@@ -1110,7 +1134,7 @@ fn mux_none_explanation(mux: Option<&str>, in_session: bool) -> String {
             .to_string()
     } else {
         "not inside an aterm session: a flagless call drives the newest aterm instance; pick \
-         another with --pid or --sock (`aterm ctl ls`)"
+         another with --pid or --sock (`aterm ctl instances` lists each pid and socket)"
             .to_string()
     }
 }
@@ -1863,7 +1887,7 @@ fn enumerate_instances(dir: &Path, entries: std::fs::ReadDir) -> Vec<Target> {
             };
             let pid = control_socket::graph_entry_pid(&body).unwrap_or(0);
             if pid != 0 && graph_hygiene::writer_gone(pid, written) {
-                // Only a dead pid's entry is removed (`graph_hygiene` says why).
+                // Only a dead pid's entry is removed; a live pid's stale one is skipped and kept.
                 if !aterm_uds::process::pid_alive(pid) {
                     graph_hygiene::prune_dead_entry(&e.path(), &body);
                 }
@@ -2764,7 +2788,9 @@ fn dead_target_remedy_due(probes: &[(u32, String, Probe)]) -> bool {
 fn dominant_hint(probes: &[(u32, String, Probe)], scoped: Option<usize>) -> Option<String> {
     let hint = match dominant_cause(probes)? {
         Cause::Denied => {
-            "the control socket is refused by this sandbox — nothing to configure".to_string()
+            "a sandbox, or another user's socket, refused the connect — nothing in aterm to \
+             configure"
+                .to_string()
         }
         Cause::NoToken => "the token beside a socket must be readable by THIS user (it is \
                            mode 0600); another user's instance cannot be driven"
@@ -3491,7 +3517,7 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             let verb = &request_parts[0];
             eprintln!(
                 "note: `--help` describes `{verb}`; to send it as literal text, \
-                 pipe it -- printf %s -- --help | aterm ctl {verb} --stdin"
+                 pipe it: printf %s --help | aterm ctl {verb} --stdin"
             );
         }
         request_parts = rewritten;

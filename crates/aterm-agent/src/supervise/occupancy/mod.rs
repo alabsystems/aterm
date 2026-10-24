@@ -30,7 +30,7 @@ pub use fact_word::{FactWord, NoteOutcome};
 pub use hold::{Close, HoldChange, HoldClock, HoldEvent, waiting_declared};
 pub use reading::{OccupancyReading, SlotsSeen};
 pub use rules::{Books, Guards, HoldSeen, RuleId, Verdict, decide};
-pub use said::{OccupancySaid, SaidHold, SaidRule, SaidVerdict};
+pub use said::{OccupancySaid, SaidHold, SaidReadyIdle, SaidRule, SaidVerdict};
 pub use templates::FactLine;
 pub use wakes_seen::{WakeClaim, WakeDoor, WakeSeen, WakesSeen};
 

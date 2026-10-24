@@ -1185,7 +1185,7 @@ pub(crate) struct Adopted {
     pub autopilot_end: Option<String>,
 }
 
-/// A seamless update's carried end onto an adopted session's timeline, before the session is registered (`docs/DESIGN-harness-autopilot- 2026-10-15.md` §11.2.3, item 8).
+/// A seamless update's carried end onto an adopted session's timeline, before the session is registered (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3, item 8).
 pub(crate) fn seed_adopted_end(
     timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     row: Option<&str>,
@@ -1762,6 +1762,7 @@ pub(crate) fn spawn_session(
         typed: Default::default(),
         bells: Default::default(),
         screen_moves: Default::default(),
+        job_feed: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),
@@ -1827,6 +1828,10 @@ pub(crate) fn spawn_session(
             &mut adopt_history,
         );
         adopt_history.watch_input(&ctx.output_echo);
+        // A restored block can be running: the jobs feed holds it before any reading, even
+        // while this session's reader waits to start.
+        ctx.job_feed
+            .fed(&term_lock(&term), &[], false, Instant::now);
         if adopted {
             fit_adopted_log(&term, &ctx.timeline);
         }
@@ -3301,8 +3306,11 @@ fn attach_reader_inner(
     }
     {
         let (probe, shell) = (factory.program_probe, session.pid);
-        crate::term_lock(&session.term)
-            .set_program_probe(Some(Box::new(move |since_ms| probe(shell, since_ms))));
+        let mut t = crate::term_lock(&session.term);
+        t.set_program_probe(Some(Box::new(move |since_ms| probe(shell, since_ms))));
+        // The jobs feed starts from the engine as it stands: a restored engine can hold a block
+        // that runs before its program writes a byte.
+        session.ctx.job_feed.fed(&t, &[], false, Instant::now);
     }
     let (cast_epoch, cast_watermark) = {
         let rec = session.ctx.cast.lock().unwrap_or_else(|p| p.into_inner());
@@ -3395,6 +3403,7 @@ fn attach_reader_inner(
         },
         timeline: session.ctx.timeline.clone(),
         screen_moves: session.ctx.screen_moves.clone(),
+        job_feed: session.ctx.job_feed.clone(),
         card_probe: factory.card_probe,
         person: session.ctx.human_input.clone(),
         launch: session.ctx.launch.clone(),
@@ -6133,6 +6142,7 @@ struct PtyReaderWiring {
     fg: ForegroundWiring,
     timeline: Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>,
     screen_moves: Arc<crate::vitals_host::ScreenMoves>,
+    job_feed: Arc<crate::vitals_jobs::JobFeed>,
     card_probe: bool,
     person: Arc<crate::human_input::HumanInputStamp>,
     launch: Arc<crate::launch_witness::LaunchWitness>,
@@ -6179,6 +6189,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
         fg,
         timeline,
         screen_moves,
+        job_feed,
         card_probe: card_probe_on,
         person,
         launch,
@@ -6361,6 +6372,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         &last_output_ns,
                         (at.saturating_duration_since(lat_epoch).as_nanos() as u64).max(1),
                     );
+                    job_feed.read(buf);
                     crate::echo_rtt::note_output_burst(id);
                 }
                 if edge.is_some() {
@@ -6643,7 +6655,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 }
                             }
                             backlog = t.lazy_backlog_len();
-                            screen_moves.fed(crate::control::screen_gen(&t));
+                            let moved = screen_moves.fed(crate::control::screen_gen(&t));
+                            job_feed.fed(&t, &bytes[off..end], moved, Instant::now);
                             if let (Some(tx), Some(pre), Some(copy)) =
                                 (&temporal_tx, spine_pre, &spine_copy)
                                 && end > off
@@ -7502,7 +7515,7 @@ pub(crate) fn askpass_env(
     out
 }
 
-/// The one `("PATH", value)` pair the baseline `env_add` carries, composed because `aterm_pty::build_child_env` applies `env_add` by key overwrite (`docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching path").
+/// The one `("PATH", value)` pair the baseline `env_add` carries, composed because `aterm_pty::build_child_env` applies `env_add` by key overwrite (`docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching PATH").
 pub(crate) fn reroute_path_env(
     reroute_dir: Option<&str>,
     agents_dir: Option<&str>,

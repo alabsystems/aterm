@@ -138,7 +138,8 @@ impl Cdp {
         }
     }
 
-    /// Waits for console line `marker` from `session`, resetting the hang detector on each event.
+    /// Waits for console line `marker` from `session`, resetting the hang detector on each message
+    /// the page sends.
     pub(crate) fn wait_console(&mut self, session: &str, marker: &str) -> Result<(), String> {
         let from_page = |m: &Value| m.get("sessionId").and_then(Value::as_str) == Some(session);
         let is = |m: &Value| {

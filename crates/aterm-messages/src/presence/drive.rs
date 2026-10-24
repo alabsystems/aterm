@@ -85,9 +85,9 @@ impl<V: Host> Table<V> {
     /// supervisor's is the later of the lapse last read into the table and
     /// the claim's live one (`live`, [`Desk::supervisor_lapse`]): a renewal
     /// is no change (`meta set supervisor` by the holder it names posts no
-    /// wake), so a deadline held at the lapse read before it woke the loop
-    /// once a lease only to find the claim renewed — every 70 to 90 s for
-    /// each supervised tab of a quiet desktop (the Together run, 2026-10-16).
+    /// wake), so a deadline held at the lapse last read would wake the loop
+    /// once a lease only to find the claim renewed, every 70 to 90 s for
+    /// each supervised tab of a quiet desktop.
     fn deadline(&self, now: Instant, live: impl Fn(u64) -> Option<Instant>) -> Option<Instant> {
         let leases = self.slots.values().filter_map(|slot| slot.lease_until);
         let supervisors = self

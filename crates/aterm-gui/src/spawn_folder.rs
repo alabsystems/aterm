@@ -1453,7 +1453,7 @@ mod tests {
     /// A FOLDER BEHIND MACOS'S FIXED ALIASES IS JUDGED BY THE MOUNT BEHIND
     /// THEM, read lexically from the root's links and `/usr/share/firmlinks`
     /// as this machine has them: `/home` is the automounter's map on the data
-    /// volume (not local), so a network home is no longer judged by `/`; a
+    /// volume (not local), so a network home is not judged by `/`; a
     /// share recorded as `/Volumes/share` holds the same folder spelled on the
     /// data volume; and a local disk mounted inside a firmlinked folder still
     /// wins over a share recorded around it the other way.

@@ -19,11 +19,13 @@ pub const USAGE: &str =
                 check --commit <it> --cut`)? Asked by that commit's own cutter:
                 ATERM_RELEASE_CUTTER (the running release's) when set, else one built
                 in a throwaway worktree of it. Exit 0 yes, 1 a gate refuses (named),
-                2 it could not be asked, 3 a gate could not run
+                2 it could not be asked, 3 a gate could not run; any other code is the
+                cutter's own (its failed build's, or 128+N for signal N)
   post-promote  `ship site`; its promote-time run (PUB_STAGING_COMMIT set, no --latest)
                 does nothing
   transforms    rewrite the export at EXPORT by CAPTURED_COMMIT's own rules (default
-                HEAD; ROOT: the repository); exit 0 done, 1 refused or failed (named)";
+                HEAD; ROOT: the repository); exit 0 done, 1 refused or failed (named);
+                any other code is that commit's cutter's own, as above";
 
 /// `ship hook …`: the hook's exit code.
 #[must_use]

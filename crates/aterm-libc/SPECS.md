@@ -8,10 +8,10 @@
 > deleted. Two of the three (LIBC-2, LIBC-3) need their subject code moved out of the test file
 > first (§4).
 
-> Status 2026-10-17: the tests-and-gates audit deleted `tests/target_gate.rs` (fd110c6c94), the
-> crate's only test file, with its 4 tests and the test-only helpers they sampled. LIBC-2 and
-> LIBC-3 were specs of those helpers and went with them, and so did §5's five items, which were
-> all about that file. LIBC-1 is the one spec left. Nothing here is proved yet.
+> Status 2026-10-17: the tests-and-gates audit deleted the crate's only test file (fd110c6c94),
+> with its 4 tests and the test-only helpers they sampled. LIBC-2 and LIBC-3 were specs of those
+> helpers and went with them, and so did §5's five items, which were all about that file. LIBC-1
+> is the one spec left. Nothing here is proved yet.
 
 Source: `crates/aterm-libc` (read only). The lib has `test = false` and no `#[test]` in `src/`, and
 the crate has no integration tests now. Nothing was compiled or run. The claims below come from
@@ -61,7 +61,7 @@ None.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-None open. The five items here were all about `tests/target_gate.rs`, which is deleted.
+None open. The five items here were all about the crate's one test file, deleted in fd110c6c94.
 
 ## 6. Proof order (easiest, high value first)
 

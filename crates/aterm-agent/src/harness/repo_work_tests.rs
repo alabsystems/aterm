@@ -7,7 +7,7 @@ use std::path::PathBuf;
 /// `git <args>` in `dir`, hermetic: no system or global config, a fixed
 /// author.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn scratch_git(dir: &Path, args: &[&str]) {
+pub(crate) fn scratch_git(dir: &Path, args: &[&str]) {
     let out = aterm_uds::deadline::output_until(
         aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
             .args([
@@ -39,7 +39,7 @@ fn scratch_git(dir: &Path, args: &[&str]) {
 /// A repository at `<tmp>/work` with one commit, pushed to a bare remote at
 /// `<tmp>/remote.git` when `remote`.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn repo(tmp: &Path, remote: bool) -> PathBuf {
+pub(crate) fn repo(tmp: &Path, remote: bool) -> PathBuf {
     let work = tmp.join("work");
     std::fs::create_dir_all(&work).expect("work");
     scratch_git(&work, &["init", "-q", "."]);
@@ -59,7 +59,14 @@ fn repo(tmp: &Path, remote: bool) -> PathBuf {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn found(dir: &Path) -> Option<RepoWork> {
-    probe(dir, Some(dir), PROBE_LIMIT)
+    finished(probe(dir, Some(dir), PROBE_LIMIT))
+}
+
+/// A probe that finished: its finding, `None` for a clean repository.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn finished(read: RepoRead) -> Option<RepoWork> {
+    assert!(!read.is_unread(), "the probe finished within its limit");
+    read.into_found()
 }
 
 #[test]
@@ -171,6 +178,7 @@ fn the_probe_finds_uncommitted_unpushed_and_stashed_work_and_nothing_once_pushed
 /// one-minute hang detector): its first read starved 11 s, past the ten
 /// seconds the probe had before (on the probe's clock: the time is taken as
 /// gone, with no sleep), the probe finds the one commit no remote has.
+/// A read cut by the shorter deadline is unread.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_probe_whose_reads_are_starved_still_finds_the_unpushed_commit() {
@@ -189,9 +197,55 @@ fn a_probe_whose_reads_are_starved_still_finds_the_unpushed_commit() {
     read_stall::set(11_000);
     let cut = probe(&work, Some(&work), Duration::from_secs(10));
     read_stall::set(0);
-    let w = whole.expect("the unpushed commit, found by the starved probe");
+    let w = whole
+        .into_found()
+        .expect("the unpushed commit, found by the starved probe");
     assert_eq!((w.unpushed, w.unlanded, w.changed), (1, 1, 0), "{w:?}");
-    assert_eq!(cut, None, "the starved probe cut at ten seconds");
+    assert_eq!(
+        cut,
+        RepoRead::Unread,
+        "the starved probe cut at ten seconds"
+    );
+}
+
+/// A PROBE CUT AT ANY READ IS NEVER A CLEAN REPOSITORY ([`RepoRead::Unread`]):
+/// over a repository holding one unpushed commit and over one holding one
+/// changed file, a probe whose `k`-th read is starved past its limit (on the
+/// probe's clock, no sleep) reads as the work it found or as unread, for
+/// every `k`. NEGATIVE CONTROL: the same repositories pushed and clean, with
+/// no read starved, read clean.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_probe_cut_at_any_read_is_never_a_clean_repository() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let pushed = repo(&tmp.path().join("pushed"), true);
+    let alone = repo(&tmp.path().join("alone"), false);
+    assert_eq!(found(&pushed), None, "clean and pushed");
+    assert_eq!(found(&alone), None, "a repository with no remote");
+    std::fs::write(pushed.join("b.txt"), "two\n").expect("b.txt");
+    scratch_git(&pushed, &["add", "b.txt"]);
+    scratch_git(&pushed, &["commit", "-q", "-m", "two"]);
+    std::fs::write(alone.join("a.txt"), "changed\n").expect("a.txt");
+    for work in [&pushed, &alone] {
+        let whole = found(work).expect("the work, read whole");
+        let mut unread = 0;
+        for k in 0..24 {
+            read_stall::set_after(k, 11_000);
+            let read = probe(work, Some(work), Duration::from_secs(10));
+            read_stall::set(0);
+            match read {
+                RepoRead::Clean => panic!("read {k} cut: read as clean over {whole:?}"),
+                RepoRead::Unread => unread += 1,
+                RepoRead::Found(_) => {}
+            }
+        }
+        assert!(unread > 0, "the first read cut reads as unread");
+        assert_eq!(
+            probe(work, Some(work), Duration::from_secs(10)),
+            RepoRead::Found(whole),
+            "the reads past the last one starve nothing"
+        );
+    }
 }
 
 #[test]
@@ -243,7 +297,7 @@ fn the_persons_global_excludes_hold() {
     std::fs::write(work.join(".DS_Store"), "x").expect("ds");
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
-    let probe_at = |xdg: Option<&Path>| probe_with(&work, Some(&home), xdg, PROBE_LIMIT);
+    let probe_at = |xdg: Option<&Path>| finished(probe_with(&work, Some(&home), xdg, PROBE_LIMIT));
     let w = probe_at(None).expect("untracked");
     assert_eq!(
         (w.untracked, w.paths.as_slice()),
@@ -296,7 +350,7 @@ fn the_repositorys_own_excludes_win_over_the_persons() {
     let own = tmp.path().join("repo-ignore");
     std::fs::write(&own, "local.tmp\n").expect("own ignore");
     let untracked = || {
-        probe_with(&work, Some(&home), None, PROBE_LIMIT)
+        finished(probe_with(&work, Some(&home), None, PROBE_LIMIT))
             .map(|w| w.paths)
             .unwrap_or_default()
     };
@@ -324,7 +378,7 @@ fn the_persons_excludes_set_through_an_include_hold() {
         "[core]\n\texcludesFile = ~/my-ignore\n",
     )
     .expect("extra");
-    let probe_at = || probe_with(&work, Some(&home), None, PROBE_LIMIT);
+    let probe_at = || finished(probe_with(&work, Some(&home), None, PROBE_LIMIT));
     std::fs::write(
         home.join(".gitconfig"),
         "[include]\n\tpath = ~/extra.gitconfig\n",
@@ -365,7 +419,7 @@ fn the_persons_excludes_set_for_this_repository_by_an_include_if_hold() {
         )
     };
     std::fs::write(home.join(".gitconfig"), gitdir(&work)).expect("gitconfig");
-    let probe_at = || probe_with(&work, Some(&home), None, PROBE_LIMIT);
+    let probe_at = || finished(probe_with(&work, Some(&home), None, PROBE_LIMIT));
     assert_eq!(probe_at(), None, "the conditional excludes hold");
     std::fs::write(home.join(".gitconfig"), gitdir(&home)).expect("gitconfig");
     assert_eq!(
@@ -390,14 +444,15 @@ fn a_repositorys_own_home_relative_path_is_read_under_the_persons_home() {
     std::fs::create_dir_all(&home).expect("home");
     std::fs::write(home.join("repo-ignore"), "local.tmp\n").expect("ignore");
     scratch_git(&work, &["config", "core.excludesFile", "~/repo-ignore"]);
-    let w = probe_with(&work, Some(&home), None, PROBE_LIMIT).expect("the untracked file");
+    let w =
+        finished(probe_with(&work, Some(&home), None, PROBE_LIMIT)).expect("the untracked file");
     assert_eq!(w.paths, ["notes.md"], "{w:?}");
     std::fs::write(
         home.join(".gitconfig"),
         "[core]\n\texcludesFile = ~/no-such-file\n[status]\n\tshowUntrackedFiles = no\n",
     )
     .expect("gitconfig");
-    let w = probe_with(&work, Some(&home), None, PROBE_LIMIT).expect("still read");
+    let w = finished(probe_with(&work, Some(&home), None, PROBE_LIMIT)).expect("still read");
     assert_eq!(w.paths, ["notes.md"], "{w:?}");
 }
 
@@ -521,12 +576,12 @@ fn a_guarded_folder_is_never_probed() {
         Some(work.clone())
     );
     assert_eq!(unattended_dir(&docs, Some(&home), &table), None);
-    assert_eq!(probe(&docs, Some(&home), PROBE_LIMIT), None);
+    assert_eq!(probe(&docs, Some(&home), PROBE_LIMIT), RepoRead::Clean);
     assert_eq!(unattended_dir(&work, None, &table), None);
-    assert_eq!(probe(&work, None, PROBE_LIMIT), None);
+    assert_eq!(probe(&work, None, PROBE_LIMIT), RepoRead::Clean);
     assert_eq!(
         probe(Path::new("/Volumes/unasked"), None, PROBE_LIMIT),
-        None
+        RepoRead::Clean
     );
     assert_eq!(
         unattended_dir(
