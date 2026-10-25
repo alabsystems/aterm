@@ -812,7 +812,8 @@ pub fn drawn_is_face(c: &Chip) -> bool {
 }
 
 /// Whether harness `program` draws no chip (its line `face=- drawn=- why=no-footer`): Gemini CLI.
-fn footless(program: &str) -> bool {
+/// `autopilot-captures` reads it too, for which harnesses take a hovered title.
+pub(crate) fn footless(program: &str) -> bool {
     program == "gemini"
 }
 

@@ -23,8 +23,6 @@ const POLLIN: i16 = 0x1;
 
 const POLLHUP: i16 = 0x10;
 
-const ESRCH: i32 = 3;
-
 /// Whether every writer of the pipe `fd` reads has closed it.
 pub(super) fn writers_gone(fd: BorrowedFd<'_>) -> bool {
     let mut fds = [PollFd {
@@ -40,6 +38,11 @@ pub(super) fn descendant_may_hold(fd: BorrowedFd<'_>, group: Option<u32>) -> boo
     !writers_gone(fd) && group.is_none_or(group_left)
 }
 
+/// Whether `group` has a member a signal reaches. `ESRCH` (no such group) and `EPERM` are
+/// none: Darwin answers `EPERM` for a group it still lists with only zombies in it, which
+/// hold no descriptor, and a reaped child's group under load answered so past the grace.
+/// A live member of another user's, which `EPERM` also answers for, reads as none too: the
+/// read then waits for the pipe to close or the deadline, which bounds it.
 fn group_left(group: u32) -> bool {
     let Ok(group) = i32::try_from(group) else {
         return true;
@@ -48,9 +51,8 @@ fn group_left(group: u32) -> bool {
         fn kill(pid: i32, sig: i32) -> i32;
     }
     // SAFETY: a plain syscall; signal 0 delivers nothing.
-    let none =
-        unsafe { kill(-group, 0) } != 0 && io::Error::last_os_error().raw_os_error() == Some(ESRCH);
-    !none
+    let answer = unsafe { kill(-group, 0) };
+    answer == 0
 }
 
 #[cfg_attr(trust_verify, trust::skip)]

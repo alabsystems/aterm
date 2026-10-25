@@ -72,6 +72,47 @@ impl Header {
                 .previous
                 .is_none_or(|p| self.parents.binary_search(&p).is_ok())
     }
+
+    // Only shaped headers reach this helper: a predecessor then has sequence >= 2.
+    fn claims(&self) -> impl Iterator<Item = (u64, Digest)> + '_ {
+        std::iter::once((self.sequence, self.id))
+            .chain(self.previous.map(|id| (self.sequence - 1, id)))
+    }
+}
+
+/// Two retained source headers whose dense-chain claims contradict one another.
+/// These are references, not an authentication certificate: the application
+/// must verify the exact headers and their signatures in the enclosing scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Fork {
+    pub actor: Actor,
+    /// Lexicographically smaller source record ID.
+    pub first: Digest,
+    /// Lexicographically larger source record ID; not a missing predecessor ID.
+    pub second: Digest,
+}
+impl Fork {
+    /// Recognize contradictory claims in two distinct, well-shaped headers of
+    /// one actor. This performs no signature, payload or authorization check.
+    pub fn between(a: &Header, b: &Header) -> Option<Self> {
+        if a.actor != b.actor || a.id == b.id || !a.shaped() || !b.shaped() {
+            return None;
+        }
+        a.claims()
+            .any(|(seq, id)| {
+                b.claims()
+                    .any(|(other_seq, other_id)| seq == other_seq && id != other_id)
+            })
+            .then_some(Self::sources(a.actor, a.id, b.id))
+    }
+
+    fn sources(actor: Actor, a: Digest, b: Digest) -> Self {
+        Self {
+            actor,
+            first: a.min(b),
+            second: a.max(b),
+        }
+    }
 }
 
 /// Rebuildable, bounded causal index for ONE dataset/audience generation.
@@ -88,7 +129,8 @@ pub struct Projection {
     pub ordered: Vec<Digest>,
     /// Maximal visible records; include these in a new operation's dependencies.
     pub heads: BTreeSet<Digest>,
-    /// Every actor that signed distinct records at the same dense sequence.
+    /// Every actor whose authenticated headers claim distinct digests at one
+    /// dense sequence, including claims made by predecessor links.
     pub quarantined: BTreeSet<Actor>,
     /// Records missing prerequisites, with impossible links, or depending on quarantine.
     pub pending: BTreeSet<Digest>,
@@ -135,6 +177,30 @@ impl Index {
         self.records.get(id)
     }
 
+    /// One deterministic witness per conflicting actor. Each pair references
+    /// retained records, even when a contradictory predecessor is missing.
+    /// The lexicographically least pair is independent of arrival order.
+    /// Applications can transfer authenticated source records as restrictive
+    /// evidence without treating their payloads as authorized operations.
+    pub fn forks(&self) -> BTreeMap<Actor, Fork> {
+        let mut out = BTreeMap::<Actor, Fork>::new();
+        let mut dots = BTreeMap::new();
+        for header in self.records.values() {
+            for (sequence, id) in header.claims() {
+                let (first_id, source) = *dots
+                    .entry((header.actor, sequence))
+                    .or_insert((id, header.id));
+                if first_id != id {
+                    let fork = Fork::sources(header.actor, source, header.id);
+                    out.entry(header.actor)
+                        .and_modify(|old| *old = (*old).min(fork))
+                        .or_insert(fork);
+                }
+            }
+        }
+        out
+    }
+
     /// Whether `later` transitively names `earlier` as a dependency. Equality is
     /// reflexive only for a retained record. Missing history never proves observation.
     pub fn observes(&self, later: &Digest, earlier: &Digest) -> bool {
@@ -168,15 +234,10 @@ impl Index {
     /// is withheld by the same exact-parent closure as missing or forked history.
     /// The policy must derive from authenticated retained facts, not arrival time.
     pub fn project_excluding(&self, excluded: &BTreeSet<Digest>) -> Projection {
-        let mut out = Projection::default();
-        let mut dots = BTreeMap::new();
-        for header in self.records.values() {
-            if let Some(old) = dots.insert((header.actor, header.sequence), header.id) {
-                if old != header.id {
-                    out.quarantined.insert(header.actor);
-                }
-            }
-        }
+        let mut out = Projection {
+            quarantined: self.forks().into_keys().collect(),
+            ..Projection::default()
+        };
         let mut waiting = BTreeMap::<Digest, u64>::new();
         let mut children = BTreeMap::<Digest, Vec<Digest>>::new();
         let mut ready = BTreeSet::new();
@@ -350,5 +411,104 @@ mod tests {
             3,
             "the evidence set is unchanged"
         );
+    }
+
+    #[test]
+    fn predecessor_claims_expose_forks_before_the_missing_branch_arrives() {
+        let records = [
+            header(1, 1, 1, None, &[]),
+            header(3, 1, 2, Some(2), &[2]),
+            header(4, 2, 1, None, &[1]),
+            header(5, 3, 1, None, &[]),
+        ];
+        permutations(&records, &mut |order| {
+            let mut index = Index::new(8);
+            for h in order {
+                index.insert(h.clone()).unwrap();
+            }
+            for excluded in [BTreeSet::new(), BTreeSet::from([[3; 32]])] {
+                let view = index.project_excluding(&excluded);
+                assert_eq!(view.quarantined, BTreeSet::from([[1; 48]]));
+                assert_eq!(view.ordered, [[5; 32]]);
+                assert_eq!(view.pending, BTreeSet::from([[1; 32], [3; 32], [4; 32]]));
+                assert_eq!(index.inventory().count(), 4);
+            }
+            // Arrival of the committed predecessor adds evidence; it cannot
+            // repair the already inconsistent dot or revive its dependents.
+            index.insert(header(2, 1, 1, None, &[])).unwrap();
+            assert_eq!(index.project().ordered, [[5; 32]]);
+            assert_eq!(index.project().quarantined, BTreeSet::from([[1; 48]]));
+        });
+    }
+
+    #[test]
+    fn matching_predecessor_claims_and_sequence_boundaries_are_not_forks() {
+        let mut index = Index::new(8);
+        index.insert(header(1, 1, 1, None, &[])).unwrap();
+        index.insert(header(2, 1, 2, Some(1), &[1])).unwrap();
+        index.insert(header(3, 2, u64::MAX, Some(4), &[4])).unwrap();
+        assert!(index.project().quarantined.is_empty());
+        assert_eq!(index.project().ordered, [[1; 32], [2; 32]]);
+        index
+            .insert(header(5, 2, u64::MAX - 1, Some(6), &[6]))
+            .unwrap();
+        assert_eq!(index.project().quarantined, BTreeSet::from([[2; 48]]));
+    }
+
+    #[test]
+    fn fork_witnesses_name_retained_sources_and_are_canonical_in_every_order() {
+        let records = [
+            header(1, 1, 1, None, &[]),
+            header(3, 1, 2, Some(2), &[2]),
+            header(5, 1, 1, None, &[]),
+            header(7, 2, 1, None, &[]),
+        ];
+        permutations(&records, &mut |order| {
+            let mut index = Index::new(8);
+            for h in order {
+                index.insert(h.clone()).unwrap();
+            }
+            let mut expected = BTreeMap::<Actor, Fork>::new();
+            for a in &records {
+                for b in &records {
+                    if let Some(fork) = Fork::between(a, b) {
+                        expected
+                            .entry(fork.actor)
+                            .and_modify(|old| *old = (*old).min(fork))
+                            .or_insert(fork);
+                    }
+                }
+            }
+            let forks = index.forks();
+            assert_eq!(forks, expected);
+            assert_eq!(forks[&[1; 48]].first, [1; 32]);
+            assert_eq!(forks[&[1; 48]].second, [3; 32]);
+            for fork in forks.values() {
+                assert_eq!(
+                    Fork::between(
+                        index.get(&fork.first).unwrap(),
+                        index.get(&fork.second).unwrap()
+                    ),
+                    Some(*fork)
+                );
+            }
+            assert_eq!(index.project().quarantined, forks.into_keys().collect());
+        });
+    }
+
+    #[test]
+    fn a_fork_pair_requires_distinct_shaped_headers_of_the_same_actor() {
+        let a = header(1, 1, 1, None, &[]);
+        let b = header(3, 1, 2, Some(2), &[2]);
+        assert_eq!(
+            Fork::between(&a, &b),
+            Some(Fork::sources([1; 48], [1; 32], [3; 32]))
+        );
+        assert_eq!(Fork::between(&b, &a), Fork::between(&a, &b));
+        assert_eq!(Fork::between(&a, &a), None);
+        assert_eq!(Fork::between(&a, &header(2, 2, 1, None, &[])), None);
+        assert_eq!(Fork::between(&a, &header(2, 1, 2, Some(1), &[1])), None);
+        assert_eq!(Fork::between(&a, &header(2, 1, 0, Some(1), &[1])), None);
+        assert_eq!(Fork::between(&a, &header(2, 1, 2, Some(1), &[])), None);
     }
 }

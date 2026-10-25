@@ -771,7 +771,9 @@ fn each_level_emits_exactly_its_fields() {
         "role",
         "supervisor",
         "attention",
+        "goal",
         "needs",
+        "needs_by",
         "hold_by",
         "held_from",
         "typed_by",
@@ -1190,6 +1192,7 @@ fn codex_survey() -> CodexSurvey {
         },
         branch: Some("feat/parser".into()),
         task: None,
+        goal: None,
     }
 }
 
@@ -1230,7 +1233,7 @@ fn a_codex_row_reads_its_own_state_and_its_rollouts_facts() {
 
     let mut tl = codex.ctx.timeline.lock().unwrap();
     assert!(tl.set_codex_survey(CODEX_PGID, codex_survey()));
-    tl.note_program_state(shown(W::Working, None));
+    tl.note_program_state(shown(W::Working, None), 1);
     drop(tl);
     let working = row();
     for (key, want) in [
@@ -1261,7 +1264,7 @@ fn a_codex_row_reads_its_own_state_and_its_rollouts_facts() {
             .timeline
             .lock()
             .unwrap()
-            .note_program_state(shown(state, kind));
+            .note_program_state(shown(state, kind), 1);
         assert_eq!(row()["agent"], word, "{state:?} {kind:?}");
     }
     assert_eq!(
@@ -1271,7 +1274,7 @@ fn a_codex_row_reads_its_own_state_and_its_rollouts_facts() {
     );
 
     let mut tl = codex.ctx.timeline.lock().unwrap();
-    tl.note_program_state(None);
+    tl.note_program_state(None, 1);
     drop(tl);
     assert_eq!(
         row()["agent"],
@@ -1310,7 +1313,7 @@ fn a_codex_row_reads_its_own_state_and_its_rollouts_facts() {
         .timeline
         .lock()
         .unwrap()
-        .note_program_state(shown(W::Idle, None));
+        .note_program_state(shown(W::Idle, None), 1);
     store.write().unwrap().register(claude);
     let out = survey_rows(&store, SurveyLevel::Content, usize::MAX, &here());
     let claude_row = fields(out.lines().nth(3).expect("the claude row"));
@@ -1319,4 +1322,46 @@ fn a_codex_row_reads_its_own_state_and_its_rollouts_facts() {
         "a word its reader names stands"
     );
     assert_eq!(claude_row["model"], "Opus 5.5");
+}
+
+/// THE AGENT'S ACTIVE GOAL: a Claude row's from its footer facts, a codex row's from its rollout
+/// tap's facts, the words at `content` and a flag at `facts`; a session with none says `-`.
+#[test]
+fn a_row_names_the_agents_active_goal() {
+    let store = crate::session_store::new_store();
+    let shell = crate::session_store::test_handle(3);
+    let claude = crate::session_store::test_handle(5);
+    let codex = crate::session_store::test_handle(7);
+    claude_session(&claude);
+    codex_session(&codex);
+    {
+        let mut tl = claude.ctx.timeline.lock().unwrap();
+        let mut facts = tl.claude_footer().cloned().expect("the footer facts");
+        facts.goal = Some("implement the aos aterm vision".into());
+        assert!(tl.set_claude_footer(4242, None, Some(facts)));
+    }
+    assert!(codex.ctx.timeline.lock().unwrap().set_codex_survey(
+        CODEX_PGID,
+        CodexSurvey {
+            goal: Some("port the lexer".into()),
+            ..codex_survey()
+        }
+    ));
+    for h in [&shell, &claude, &codex] {
+        store.write().unwrap().register(h.clone());
+    }
+    let rows = |level| {
+        let out = survey_rows(&store, level, usize::MAX, &here());
+        out.lines().skip(2).map(fields).collect::<Vec<_>>()
+    };
+    let content = rows(SurveyLevel::Content);
+    assert_eq!(content[0]["goal"], "-", "a shell has no goal");
+    assert_eq!(content[1]["goal"], "implement the aos aterm vision");
+    assert_eq!(content[2]["goal"], "port the lexer");
+    let facts = rows(SurveyLevel::Facts);
+    assert_eq!(
+        [&facts[0]["goal"], &facts[1]["goal"], &facts[2]["goal"]],
+        ["-", "1", "1"],
+        "facts flag a goal, never its words"
+    );
 }

@@ -312,6 +312,74 @@ fn a_resume_line_validates_only_as_the_live_process_ran() {
     assert_eq!(validate(&good, 4243, &live()), Err("pid"));
 }
 
+/// Codex's real resume writer keeps child options after `resume`. The window's
+/// identity check must accept that command without moving either config scope.
+#[cfg(unix)]
+#[test]
+fn a_resume_line_keeps_root_and_child_flags_in_their_launch_scopes() {
+    let twin = "/Users//u/.aterm/agents/codex";
+    let child = "--dangerously-bypass-approvals-and-sandbox";
+    let make_live = |args: &[&str]| Live {
+        argv: args.iter().map(|s| (*s).to_string()).collect(),
+        ..live()
+    };
+    let launched = make_live(&["codex", "resume", child, UUID]);
+    let actual = record(&[twin, "resume", child, UUID], &[]);
+    assert_eq!(
+        validate(&actual, 4242, &launched).map(|resume| resume.argv),
+        actual.resume_argv.clone().ok_or("no-resume-line"),
+        "the live producer's resume-with-child-option form"
+    );
+
+    let launched = make_live(&[
+        "codex", "-c", "a=1", "fork", "--last", "-c", "a=2", "-m", "gpt-5",
+    ]);
+    let exact = [
+        twin, "-c", "a=1", "resume", "-c", "a=2", "-m", "gpt-5", UUID,
+    ];
+    let good = record(&exact, &[]);
+    assert!(
+        validate(&good, 4242, &launched).is_ok(),
+        "a fork resumes its own new root"
+    );
+    for changed in [
+        // Same tokens and values, different root/child scopes.
+        vec![
+            twin, "resume", "-c", "a=1", "-c", "a=2", "-m", "gpt-5", UUID,
+        ],
+        vec![
+            twin, "-c", "a=1", "-c", "a=2", "resume", "-m", "gpt-5", UUID,
+        ],
+        // A changed value, dropped override, or extra flag is no identity proof.
+        vec![
+            twin, "-c", "a=1", "resume", "-c", "a=3", "-m", "gpt-5", UUID,
+        ],
+        vec![twin, "-c", "a=1", "resume", "-m", "gpt-5", UUID],
+        vec![
+            twin, "-c", "a=1", "resume", "-c", "a=2", "-m", "gpt-5", child, UUID,
+        ],
+    ] {
+        assert_eq!(
+            validate(&record(&changed, &[]), 4242, &launched),
+            Err("foreign-argv")
+        );
+    }
+    let mut wrong_session = good.clone();
+    *wrong_session
+        .resume_argv
+        .as_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap() = "0199f2a4-6c1e-7a52-9d3b-000000000000".to_string();
+    assert_eq!(validate(&wrong_session, 4242, &launched), Err("no-resume"));
+    let mut wrong_path = good.clone();
+    wrong_path.resume_argv.as_mut().unwrap()[0] = "/other/codex".to_string();
+    assert_eq!(validate(&wrong_path, 4242, &launched), Err("launch-path"));
+    let mut wrong_cwd = good;
+    wrong_cwd.cwd = Some("/other".to_string());
+    assert_eq!(validate(&wrong_cwd, 4242, &launched), Err("cwd"));
+}
+
 #[test]
 fn the_exit_is_decided_from_the_copy_alone() {
     let copy = |seen: Seen| Copy {

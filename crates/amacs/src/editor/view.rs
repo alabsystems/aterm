@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::sync::Arc;
 
 use aterm_buffer::Seq;
 use aterm_grapheme::GraphemeClusters;
@@ -73,6 +74,7 @@ pub struct EditorBufferView {
     viewport_lines: usize,
     pub folds: Vec<Range<usize>>,
     pub minibuffer: Minibuffer,
+    input_lifetime: Arc<()>,
     /// The last accepted query belongs to this view, never to a terminal or another editor view.
     pub(super) last_search_query: String,
     /// `set-mark-command` activates a persistent region anchor.
@@ -99,6 +101,7 @@ impl EditorBufferView {
             viewport_lines: 4,
             folds: Vec::new(),
             minibuffer: Minibuffer::Inactive,
+            input_lifetime: Arc::new(()),
             last_search_query: String::new(),
             mark_active: false,
             prefix_hud: None,
@@ -117,6 +120,19 @@ impl EditorBufferView {
         self.selections
             .get(self.primary.min(self.selections.len().saturating_sub(1)))
             .unwrap_or(&NO_SELECTION)
+    }
+
+    /// Identity of the current document or minibuffer input lifetime. Hosts
+    /// compare captured tokens with [`Arc::ptr_eq`] before delivering delayed
+    /// input; ordinary query edits and document rebases keep this identity.
+    pub fn input_lifetime(&self) -> Arc<()> {
+        Arc::clone(&self.input_lifetime)
+    }
+
+    /// Close the minibuffer and retire delayed input without moving selections.
+    pub fn clear_minibuffer(&mut self) {
+        self.minibuffer = Minibuffer::Inactive;
+        self.input_lifetime = Arc::new(());
     }
 
     /// Find may start or repeat a search without interrupting another prompt.
@@ -259,7 +275,7 @@ impl EditorBufferView {
         self.chord_prefix.clear();
         self.prefix_hud = None;
         self.prefix_argument = None;
-        self.minibuffer = Minibuffer::Inactive;
+        self.clear_minibuffer();
         self.mark_active = false;
         self.last_command = None;
     }
@@ -339,6 +355,7 @@ impl EditorBufferView {
         self.chord_prefix.clear();
         self.prefix_hud = None;
         self.minibuffer = minibuffer;
+        self.input_lifetime = Arc::new(());
     }
 
     /// Rebase view-local coordinates after a commit initiated by another controller.

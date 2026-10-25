@@ -6,6 +6,9 @@
 //! authentication is evidence, not current application authorization. Durable
 //! storage, catalog cutoffs and resource admission belong above this boundary.
 
+pub mod conflict;
+pub mod store;
+
 use crate::{
     Error, Result,
     crypto::{self, Causal, MAX_BODY, MAX_OPERATION, Reader},
@@ -17,7 +20,7 @@ use aterm_secrets::{
     commons::{
         bootstrap::Bootstrap,
         journal::{Journal, Trust},
-        roster::{Access, Role},
+        roster::{Access, Historical, Role},
     },
 };
 use ring::aead;
@@ -26,7 +29,7 @@ use zeroize::Zeroizing;
 const DOMAIN: &[u8] = b"aterm/commons/table-operation/1\0";
 const SCOPE_LEN: usize = 16 + 32 + 32 + 16 + 8;
 
-fn failure(error: aterm_secrets::Error) -> Error {
+pub(crate) fn failure(error: aterm_secrets::Error) -> Error {
     Error::new(&error.to_string())
 }
 
@@ -121,14 +124,113 @@ impl Record {
     }
 }
 
-/// A current, secrets-backed membership observation and its journal lock. No raw
-/// keys are saved, no identity is generated, and no new admission root is created.
+/// A current, secrets-backed membership observation and its journal lock. Verified
+/// historical handles live only for this locked session; no raw keys are saved.
 pub struct Session<'a> {
     bootstrap: &'a Bootstrap,
     journal: Journal,
     access: Access,
+    history: std::cell::RefCell<std::collections::BTreeMap<Digest, Historical>>,
 }
 impl<'a> Session<'a> {
+    pub(crate) fn observation(&self) -> Result<[u8; 64]> {
+        let aterm_secrets::commons::journal::State::Ready { head, .. } = self.journal.state()
+        else {
+            return Err(Error::new("table repair needs complete control history"));
+        };
+        let mut observation = [0; 64];
+        observation[..32].copy_from_slice(&head);
+        observation[32..].copy_from_slice(self.access.basis());
+        Ok(observation)
+    }
+
+    /// Current peer membership for an already channel-authenticated actor.
+    pub(crate) fn peer(&self, actor: Actor) -> Result<aterm_secrets::commons::binding::Binding> {
+        if !self.access.is_current(&self.journal) {
+            return Err(Error::new("Commons membership changed during table repair"));
+        }
+        self.access
+            .members()
+            .iter()
+            .find(|member| member.binding().actor() == actor)
+            .map(|member| member.binding().clone())
+            .ok_or_else(|| Error::new("table repair peer is not a current member"))
+    }
+
+    /// Probe a bounded window of selected historical rosters, even when a lost
+    /// handoff prevents opening an existing table. Requests confer no authority.
+    pub(crate) fn history_needs(
+        &self,
+        after: Option<Digest>,
+        limit: usize,
+    ) -> Result<(Vec<Digest>, Option<Digest>)> {
+        let aterm_secrets::commons::journal::State::Ready { head, .. } = self.journal.state()
+        else {
+            return Err(Error::new("table repair needs complete control history"));
+        };
+        let mut selected = std::collections::BTreeSet::new();
+        let mut cursor = Some(head);
+        for _ in 0..aterm_secrets::commons::journal::MAX_NODES {
+            let Some(id) = cursor else { break };
+            let node = self
+                .journal
+                .node(&id)
+                .ok_or_else(|| Error::new("selected control node is missing"))?;
+            if node.kind() != aterm_secrets::commons::node::Kind::Recovery {
+                selected.insert(id);
+            }
+            cursor = node.selected().or_else(|| node.parents().first().copied());
+        }
+        if cursor.is_some() {
+            return Err(Error::new("selected history exceeds its bound"));
+        }
+        let window: Vec<_> = selected
+            .iter()
+            .filter(|id| after.is_none_or(|after| **id > after))
+            .chain(
+                selected
+                    .iter()
+                    .filter(|id| after.is_some_and(|after| **id <= after)),
+            )
+            .take(limit)
+            .copied()
+            .collect();
+        let next = window.last().copied();
+        let needed = window
+            .into_iter()
+            .filter(|id| {
+                self.bootstrap
+                    .historical(&self.journal, &self.access, *id)
+                    .is_err()
+            })
+            .collect();
+        Ok((needed, next))
+    }
+
+    pub(crate) fn handoffs(&self, peer: Actor, sources: &[Digest]) -> Result<Vec<Option<Vec<u8>>>> {
+        let peer = self.peer(peer)?;
+        Ok(sources
+            .iter()
+            .map(|source| {
+                self.bootstrap
+                    .history_handoff(&self.journal, &self.access, *source, &peer)
+                    .ok()
+                    .map(|handoff| handoff.bytes().to_vec())
+            })
+            .collect())
+    }
+
+    pub(crate) fn import_handoff(&self, source: Digest, bytes: &[u8]) -> Result<()> {
+        let handoff = aterm_secrets::commons::history::Handoff::decode(bytes).map_err(failure)?;
+        if handoff.source() != &source {
+            return Err(Error::new("history response names another source"));
+        }
+        self.bootstrap
+            .import_history(&self.journal, &self.access, bytes)
+            .map_err(failure)?;
+        Ok(())
+    }
+
     pub fn open(bootstrap: &'a Bootstrap) -> Result<Self> {
         let journal =
             Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust()).map_err(failure)?;
@@ -140,6 +242,7 @@ impl<'a> Session<'a> {
             bootstrap,
             journal,
             access,
+            history: std::cell::RefCell::default(),
         })
     }
     pub fn actor(&self) -> Actor {
@@ -168,8 +271,8 @@ impl<'a> Session<'a> {
         }
         Ok(())
     }
-    /// Seal using the current epoch and local writer. The caller supplies a
-    /// durably reserved causal position; sealing itself is not a durable commit.
+    /// Internal envelope codec for the store's locked commit path and protocol
+    /// fixtures. These signed bytes must never escape before durable storage.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -178,7 +281,7 @@ impl<'a> Session<'a> {
             project = "aterm_db::table::tests::envelope_transition"
         )
     )]
-    pub fn seal(&self, scope: Scope, causal: Causal<'_>, payload: &[u8]) -> Result<Vec<u8>> {
+    fn seal(&self, scope: Scope, causal: Causal<'_>, payload: &[u8]) -> Result<Vec<u8>> {
         let authored_ms = aterm_time::unix_millis()
             .ok_or_else(|| Error::new("system clock cannot represent an author timestamp"))?;
         self.seal_at(scope, causal, payload, authored_ms)
@@ -305,7 +408,102 @@ impl<'a> Session<'a> {
         )
     )]
     pub fn authenticate(&self, scope: Scope, wire: &[u8]) -> Result<Record> {
+        self.open_envelope(scope, self.envelope(scope, wire)?)
+    }
+
+    fn envelope<'w>(&self, scope: Scope, wire: &'w [u8]) -> Result<Envelope<'w>> {
         self.context(scope)?;
+        Envelope::parse(scope, wire)
+    }
+
+    fn open_envelope(&self, scope: Scope, envelope: Envelope<'_>) -> Result<Record> {
+        let Envelope {
+            roster,
+            epoch,
+            header,
+            authored_ms,
+            salt,
+            aad,
+            body,
+        } = envelope;
+        let actor = header.actor;
+        if !self.history.borrow().contains_key(&roster) {
+            let history = self
+                .bootstrap
+                .historical(&self.journal, &self.access, roster)
+                .map_err(failure)?;
+            self.history.borrow_mut().insert(roster, history);
+        }
+        let histories = self.history.borrow();
+        let history = &histories[&roster];
+        if history.generation() != epoch
+            || !history
+                .members()
+                .iter()
+                .any(|member| member.binding().actor() == actor && member.role() == Role::Writer)
+        {
+            return Err(Error::new("record lacks an exact historical writer grant"));
+        }
+        let mut payload = Zeroizing::new(body.to_vec());
+        let len = history
+            .with_key(&self.journal, |network_key| {
+                crypto::cipher(&scope.key(&roster, epoch, network_key), &salt, aad)?
+                    .open_in_place(
+                        aead::Nonce::assume_unique_for_key([0; 12]),
+                        aead::Aad::from(aad),
+                        &mut payload,
+                    )
+                    .map(|plain| plain.len())
+                    .map_err(|_| Error::new("table payload authentication failed"))
+            })
+            .map_err(failure)??;
+        payload.truncate(len);
+        Ok(Record {
+            scope,
+            roster,
+            epoch,
+            header,
+            authored_ms,
+            payload: SecretBytes::new(std::mem::take(&mut *payload)),
+        })
+    }
+
+    // Only classifies source metadata. The store must first prove these exact
+    // bytes were already witnessed; this never authorizes remote ingestion.
+    fn discarded_source(&self, envelope: &Envelope<'_>) -> bool {
+        use aterm_secrets::commons::{constraints::Fact, journal::State, node::Kind};
+        let State::Ready { head, .. } = self.journal.state() else {
+            return false;
+        };
+        let Some(node) = self.journal.node(&envelope.roster) else {
+            return false;
+        };
+        node.kind() != Kind::Recovery
+            && !self.journal.selected_ancestor(envelope.roster, head)
+            && node.facts().iter().any(|fact| {
+                matches!(fact,
+                Fact::Epoch { generation, .. } if *generation == envelope.epoch)
+            })
+            && node.facts().iter().any(|fact| {
+                matches!(fact,
+                Fact::Bind { binding } if binding.actor() == envelope.header.actor)
+            })
+    }
+}
+
+// A valid signature and bounded shape are not a historical writer grant.
+// Keep this structural envelope private to the table and its custody store.
+struct Envelope<'w> {
+    roster: Digest,
+    epoch: u64,
+    header: Header,
+    authored_ms: u64,
+    salt: [u8; 32],
+    aad: &'w [u8],
+    body: &'w [u8],
+}
+impl<'w> Envelope<'w> {
+    fn parse(scope: Scope, wire: &'w [u8]) -> Result<Self> {
         if wire.len() > MAX_OPERATION {
             return Err(Error::new("table operation exceeds its bound"));
         }
@@ -354,43 +552,14 @@ impl<'a> Session<'a> {
             parents,
         };
         check_shape(header.clone())?;
-        let history = self
-            .bootstrap
-            .historical(&self.journal, &self.access, roster)
-            .map_err(failure)?;
-        if history.generation() != epoch
-            || !history
-                .members()
-                .iter()
-                .any(|member| member.binding().actor() == actor && member.role() == Role::Writer)
-        {
-            return Err(Error::new("record lacks an exact historical writer grant"));
-        }
-        let mut payload = Zeroizing::new(body.to_vec());
-        let len = history
-            .with_key(&self.journal, |network_key| {
-                crypto::cipher(
-                    &scope.key(&roster, epoch, network_key),
-                    &salt,
-                    &wire[..aad_end],
-                )?
-                .open_in_place(
-                    aead::Nonce::assume_unique_for_key([0; 12]),
-                    aead::Aad::from(&wire[..aad_end]),
-                    &mut payload,
-                )
-                .map(|plain| plain.len())
-                .map_err(|_| Error::new("table payload authentication failed"))
-            })
-            .map_err(failure)??;
-        payload.truncate(len);
-        Ok(Record {
-            scope,
+        Ok(Self {
             roster,
             epoch,
             header,
             authored_ms,
-            payload: SecretBytes::new(std::mem::take(&mut *payload)),
+            salt,
+            aad: &wire[..aad_end],
+            body,
         })
     }
 }
@@ -403,4 +572,4 @@ fn check_shape(header: Header) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -12438,6 +12438,159 @@ fn a_later_autocompact_offer_is_stepped_afresh_after_an_idle_read() {
     );
 }
 
+/// Claude Code's auto-mode setup offer as captured, and the same screen once it is answered.
+fn auto_mode_offer(text: &str) -> (Vec<String>, Vec<String>) {
+    let rows = aterm_phase::prompt::fixtures::screen(text);
+    let p = aterm_phase::parse_prompt_v2(&rows).expect("the offer");
+    let mut gone = rows.clone();
+    gone.drain(p.span.0 - 1..=p.span.1);
+    (rows, gone)
+}
+
+#[test]
+fn the_auto_mode_setup_offer_is_put_off_at_every_level_and_the_turn_continued() {
+    use aterm_phase::prompt::fixtures as f;
+    // A background shell left running holds the turn's end for its own wait, not a continuation.
+    for (text, approve, continues) in [
+        (f::AUTO_MODE_SETUP_FULLSCREEN, "all", true),
+        (f::AUTO_MODE_SETUP, "safe", true),
+        (f::AUTO_MODE_SETUP_FULLSCREEN_60COL, "none", true),
+        (f::AUTO_MODE_SETUP_FULLSCREEN_40COL, "safe", true),
+        (f::AUTO_MODE_SETUP_FULLSCREEN_SHELL, "none", false),
+        (f::AUTO_MODE_SETUP_FULLSCREEN_SHELL_MODE, "all", false),
+    ] {
+        let (dir, ledger) = ledger_file("auto-mode-setup");
+        let (jdir, journal) = journal_file("auto-mode-setup");
+        let mut cfg = SupervisorConfig::default();
+        cfg.set("approve", approve).expect("a level");
+        let opts = SuperviseOpts {
+            max: Duration::from_secs(30),
+            journal: Some(journal.clone()),
+            ..SuperviseOpts::hosted_with(&cfg)
+        };
+        let (offer, gone) = auto_mode_offer(text);
+        let p = aterm_phase::parse_prompt_v2(&offer).expect("the offer");
+        let title = crate::supervise::policy::row_guard(
+            aterm_phase::prompt::title_row(&p, &offer).expect("the title row"),
+        );
+        let mut m = fenced(vec![busy_screen(), offer, gone]);
+        m.human_seq = Some(3);
+        m.vanish_after = Some(2);
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_env(owner_env());
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_autocompact_settle(Duration::ZERO);
+            s.set_turn_end_timing(TurnEndTiming {
+                min_work: Duration::ZERO,
+                ..TurnEndTiming::default()
+            });
+        });
+        let (records, _) = journal_records(&journal);
+        let noted: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        let presses = m.presses();
+        assert!(
+            presses
+                .first()
+                .is_some_and(|p| p.starts_with("key if-human=3 if-gen=")
+                    && p.ends_with(&format!(" if={title} 2"))),
+            "{approve}: `2` (Not now) under the title's guard first: {presses:#?}"
+        );
+        assert_eq!(
+            presses.iter().filter(|p| p.ends_with(" 2")).count(),
+            1,
+            "{approve}: one answer: {presses:#?}"
+        );
+        let approved = lines
+            .iter()
+            .position(|l| {
+                l.starts_with("APPROVED seq=")
+                    && l.contains("Teach auto mode about your environment? => Not now")
+            })
+            .unwrap_or_else(|| panic!("{approve}: {lines:#?}"));
+        let continued = lines.iter().position(|l| l.starts_with("CONTINUED "));
+        assert_eq!(
+            continued.is_some_and(|c| approved < c),
+            continues,
+            "{approve}: the turn's end continued after the answer: {lines:#?}\n{noted:#?}"
+        );
+        let rows = ledger_rows(&ledger);
+        assert!(
+            rows.iter().any(|r| r.contains("auto-mode-setup@v1")
+                && r.contains("approved")
+                && r.contains("Not now")),
+            "{approve}: {rows:#?}"
+        );
+        assert!(
+            !m.requests
+                .iter()
+                .any(|r| r.starts_with("meta set attention owner=supervisor claude auto-mode")),
+            "{approve}: nothing asked of the owner: {:#?}",
+            m.requests
+        );
+        assert!(
+            !noted.iter().any(|l| l.contains("typed, not submitted")),
+            "{approve}: {noted:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&jdir);
+    }
+}
+
+#[test]
+fn the_auto_mode_setup_offer_waits_out_a_persons_typing() {
+    use aterm_phase::prompt::fixtures as f;
+    let (offer, _) = auto_mode_offer(f::AUTO_MODE_SETUP_FULLSCREEN);
+    let mut m = recent_person(vec![offer], TRUST_PUBLISHED_1S);
+    m.human_ms = Some(1_000);
+    let (_, noted) = full_power_watch_with(&mut m, "auto-mode-held", |s| {
+        s.set_autocompact_settle(Duration::ZERO);
+    });
+    assert_held("a person typed a second ago", &m, &noted);
+}
+
+/// The negative control: a look-alike of the offer in other words is not pressed at `safe`.
+#[test]
+fn a_look_alike_of_the_auto_mode_setup_offer_is_not_pressed() {
+    use aterm_phase::prompt::fixtures as f;
+    let (offer, _) = auto_mode_offer(f::AUTO_MODE_SETUP);
+    for (from, to) in [
+        (
+            "Teach auto mode about your environment?",
+            "Teach auto mode about your project?",
+        ),
+        ("2. Not now", "2. Later"),
+    ] {
+        let alike: Vec<String> = offer.iter().map(|r| r.replace(from, to)).collect();
+        let mut m = fenced(vec![alike]);
+        m.vanish_after = Some(0);
+        let (jdir, journal) = journal_file("auto-mode-alike");
+        let opts = SuperviseOpts {
+            journal: Some(journal.clone()),
+            ..auto(60)
+        };
+        let _ = watch_lines_with(&mut m, &opts, |s| s.set_autocompact_settle(Duration::ZERO));
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&jdir);
+        let noted: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        assert!(
+            m.presses().is_empty(),
+            "{to}: {noted:#?}\n{:#?}",
+            m.requests
+        );
+        assert!(
+            !noted.iter().any(|l| l.contains("auto-mode-setup@v1")),
+            "{to}: {noted:#?}"
+        );
+        assert!(
+            m.attention
+                .as_deref()
+                .is_some_and(|a| a.starts_with("claude other: ")),
+            "{to}: a box of no kind aterm reads is a person's: {:?}",
+            m.attention
+        );
+    }
+}
+
 #[test]
 fn a_torn_frame_between_stepper_keys_keeps_the_record() {
     let opts = SuperviseOpts {
@@ -12570,6 +12723,47 @@ fn the_autocompact_offer_waits_its_own_settle_before_any_key() {
     assert!(
         run_since(m.waits.as_deref(), start) >= settle,
         "the key waited out the settle: {:?}",
+        m.requests
+    );
+}
+
+/// The auto-mode setup offer drops a key pressed within 500 ms of its mount, so it is judged only
+/// once its own settle has passed, however short every other box's settle is.
+#[test]
+fn the_auto_mode_setup_offer_waits_its_own_settle_before_any_key() {
+    let settle = Duration::from_millis(200);
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted_with(&crate::supervise::SupervisorConfig::default())
+    };
+    let (offer, _) = auto_mode_offer(aterm_phase::prompt::fixtures::AUTO_MODE_SETUP_FULLSCREEN);
+    let mut m = fenced(vec![offer]);
+    m.human_seq = Some(0);
+    m.stall_sleep = Some(settle / 4);
+    m.vanish_after = Some(8);
+    m.exit_when = Some(|m| !m.presses().is_empty());
+    let mut start = None;
+    watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_env(owner_env());
+        s.set_box_settle(Duration::ZERO);
+        s.set_autocompact_settle(settle);
+        s.set_mono_standing();
+        start = Some(s.test_clock().mono());
+    });
+    let start = start.expect("the run's clock");
+    let key = m
+        .requests
+        .iter()
+        .position(|r| r.starts_with("key "))
+        .unwrap_or_else(|| panic!("a key: {:?}", m.requests));
+    assert!(
+        m.requests[key].ends_with(" 2"),
+        "Not now: {:?}",
+        m.requests[key]
+    );
+    assert!(
+        run_since(m.waits.as_deref(), start) >= settle,
+        "the key waited out the offer's settle: {:?}",
         m.requests
     );
 }

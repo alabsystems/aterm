@@ -917,11 +917,13 @@ fn the_hover_title_never_moves_the_switch() {
                     &lockup_key(lockup, run, switch, palette, false),
                     &mut rest,
                     Some(version),
+                    None,
                 );
                 compose_top(
                     &lockup_key(lockup, run, switch, palette, true),
                     &mut hovered,
                     Some(version),
+                    None,
                 );
                 keeps_the_layout(&rest, &hovered, run).unwrap_or_else(|e| panic!("{at}: {e}"));
                 let full = rest.lockup.len() == mark.lockup_cells(build);
@@ -948,6 +950,7 @@ fn the_hover_title_never_moves_the_switch() {
                     &lockup_key(lockup, run, switch, palette, true),
                     &mut loose,
                     Some(version),
+                    None,
                     0,
                 );
                 if keeps_the_layout(&rest, &loose, run).is_err() {

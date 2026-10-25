@@ -841,6 +841,44 @@ mod tests {
         child.id()
     }
 
+    /// A child that led a process group of its own and exited, left unreaped: a group whose
+    /// one member is a zombie, which Darwin answers a signal for with `EPERM`, not `ESRCH`.
+    /// Dropping it reaps it.
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn a_group_left_only_a_zombie() -> crate::spawnfd::Child {
+        const P_PID: i32 = 1;
+        const WNOHANG: i32 = 0x01;
+        const WEXITED: i32 = 0x04;
+        const WNOWAIT: i32 = 0x20;
+        unsafe extern "C" {
+            fn waitid(idtype: i32, id: u32, info: *mut u8, options: i32) -> i32;
+        }
+        let child = crate::spawnfd::command("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .expect("a child");
+        let since = Instant::now();
+        loop {
+            let mut info = [0u8; 128];
+            // SAFETY: `info` is writable and larger than Darwin's 104-byte `siginfo_t`, which `waitid` fills and does not retain; `WNOWAIT` leaves the child waitable, so its `Child` still reaps it.
+            let rc = unsafe {
+                waitid(
+                    P_PID,
+                    child.id(),
+                    info.as_mut_ptr(),
+                    WEXITED | WNOWAIT | WNOHANG,
+                )
+            };
+            assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
+            if info[12..16] != [0; 4] {
+                return child;
+            }
+            assert!(since.elapsed() < HANG, "the child never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// `pipe`'s writer writes `more` and closes a moment from now: a holder outside the
     /// child's group letting go at its exec.
     #[cfg(unix)]

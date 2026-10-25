@@ -419,10 +419,21 @@ pub const fn typed_glyph_class(typed: Option<char>) -> u8 {
 const PENTA: [f32; 5] = [1.0, 1.125, 1.25, 1.5, 1.666_666_7];
 
 #[inline]
-fn penta(base: f32, degree: i32) -> f32 {
+const fn pow2i(oct: i32) -> f32 {
+    if oct < -126 {
+        0.0
+    } else if oct > 127 {
+        f32::INFINITY
+    } else {
+        f32::from_bits(((127 + oct) as u32) << 23)
+    }
+}
+
+#[inline]
+const fn penta(base: f32, degree: i32) -> f32 {
     let oct = degree.div_euclid(5);
     let step = degree.rem_euclid(5) as usize;
-    base * PENTA[step] * (2.0_f32).powi(oct)
+    base * PENTA[step] * pow2i(oct)
 }
 
 const PENTA_MINOR: [f32; 5] = [1.0, 1.2, 1.333_333_3, 1.5, 1.8];
@@ -548,9 +559,16 @@ const fn shift_gain(ev: &SoundEvent, kind: SoundKind) -> f32 {
     }
 }
 
+const SHIFT_GLYPH_RATIO: f32 =
+    crate::color_math::powf_pos_f32(2.0, SHIFT_GLYPH_LIFT as f32 / PENTA.len() as f32);
+
 #[inline]
-fn shift_ratio(ev: &SoundEvent, kind: SoundKind) -> f32 {
-    (2.0f32).powf(shift_lift(ev, kind) as f32 / PENTA.len() as f32)
+const fn shift_ratio(ev: &SoundEvent, kind: SoundKind) -> f32 {
+    if shift_lift(ev, kind) != 0 {
+        SHIFT_GLYPH_RATIO
+    } else {
+        1.0
+    }
 }
 
 #[inline]
@@ -1198,12 +1216,12 @@ impl Bed {
         sky_detune: 0.0,
     };
     #[inline]
-    fn lfo_u1(&self) -> f32 {
+    const fn lfo_u1(&self) -> f32 {
         0.5 * (1.0 + sin01(self.lfo1))
     }
 
     #[inline]
-    fn lfo_u2(&self) -> f32 {
+    const fn lfo_u2(&self) -> f32 {
         0.5 * (1.0 + sin01(self.lfo2))
     }
 }
@@ -1729,8 +1747,8 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn space_root_hz(&self, anchor: f32, step: u8) -> f32 {
-        let deg = i32::from(SONG_BASS[usize::from(step)]) + i32::from(self.song_key);
+    const fn space_root_hz(&self, anchor: f32, step: u8) -> f32 {
+        let deg = (SONG_BASS[step as usize] as i32) + (self.song_key as i32);
         bass_octave(self.melody_hz(anchor, deg)) * 2.0
     }
 
@@ -1741,11 +1759,11 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn melody_hz(&self, base: f32, degree: i32) -> f32 {
+    const fn melody_hz(&self, base: f32, degree: i32) -> f32 {
         let (table, transpose) = tone_tables(self.tone);
         let oct = degree.div_euclid(5);
         let step = degree.rem_euclid(5) as usize;
-        base * transpose * table[step] * (2.0_f32).powi(oct)
+        base * transpose * table[step] * pow2i(oct)
     }
 
     #[inline]
@@ -4841,7 +4859,7 @@ static SIN_TAB: [f32; SIN_TAB_LEN + 1] = [
 ];
 
 #[inline]
-fn sin01(ph: f32) -> f32 {
+const fn sin01(ph: f32) -> f32 {
     let x = ph - ph.floor();
     let z = x * SIN_TAB_LEN as f32;
     let j = z as usize;

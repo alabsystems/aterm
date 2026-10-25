@@ -807,6 +807,27 @@ fn a_peer_header_keeps_its_counts_and_its_reply_cap() {
         )
     );
     assert!(cut_name.contains("… pid 77065 ·"), "{cut_name}");
+    let long = header(
+        "Andrews-MacBook-Pro-long.local:57564 at 127.0.0.1",
+        "Andrews-MacBook-Pro.local",
+        "0.135.0",
+        "",
+    );
+    assert!(
+        long.starts_with("== fleet Andrews-MacBook-Pro-long.local:57564 at 127.0.0.1 pid 77065 ·"),
+        "the label whole, its `(host …)` gone first: {long}"
+    );
+    let longer = header(
+        &format!("{}:57564 at 127.0.0.1", x(150)),
+        &y(20),
+        "0.135.0",
+        "",
+    );
+    assert!(chars(&longer) <= HEADER_CHARS, "{longer}");
+    assert!(
+        longer.contains("x…:57564 at 127.0.0.1 pid 77065 ·"),
+        "the name gives way, never the address: {longer}"
+    );
 }
 
 #[test]
@@ -1092,6 +1113,27 @@ fn an_unanswered_line_keeps_its_label() {
         line.starts_with("== Andrews-MacBook-Pro-of-… did not answer: "),
         "{line}"
     );
+    let line = unanswered_line(&format!("{name}:57564"), &why);
+    assert!(
+        line.starts_with("== Andrews-MacBook-P…:57564 did not answer: "),
+        "the port it dialled stays whole: {line}"
+    );
+    for ula in [
+        "fd12:3456:789a:1:1c2b:3d4e:5f60:7182",
+        "[fd12:3456:789a:1:1c2b:3d4e:5f60:7182]:7101",
+        "lab-mini.local:7101 at fd12:3456:789a:1:1c2b:3d4e:5f60:7182",
+    ] {
+        let line = unanswered_line(ula, &why);
+        assert!(
+            chars(&line) <= UNANSWERED_CHARS,
+            "{} > cap: {line}",
+            chars(&line)
+        );
+        assert!(
+            line.contains(":5f60:7182") && line.ends_with("… trust=screen"),
+            "the address stays whole and the reason gives way: {line}"
+        );
+    }
 }
 
 #[test]
@@ -1553,6 +1595,22 @@ fn an_agent_at_a_box_nobody_presses_reads_asking() {
         lines[1].starts_with("s-00000000000000000006 claude prompt 4s Bash"),
         "{pressed}"
     );
+    let claimed = wire_row(&[
+        ("sid", "s-00000000000000000006"),
+        ("program", "codex"),
+        ("program_kind", "agent"),
+        ("agent", "prompt"),
+        ("agent_ms", "4000"),
+        ("needs", "approval"),
+        ("needs_by", "program"),
+    ]);
+    let text = render_text(&[reply(7, vec![claimed])], DEFAULT_BUDGET, None);
+    assert!(
+        text.lines().nth(1).is_some_and(
+            |line| line.starts_with("s-00000000000000000006 codex asking (its own report) 4s")
+        ),
+        "a need codex's own report raised says so: {text}"
+    );
     for word in ["busy", "idle", "question", "wall:usage", "unknown"] {
         for rank in 0..=6 {
             assert_eq!(agent_word_shown(word, rank), word);
@@ -1664,6 +1722,13 @@ fn the_peers_that_allow_facts_alone_are_named() {
         assert!(!many.contains(&format!("lab-{counted:02}")), "{many}");
     }
     assert!(many.contains("3 more"), "{many}");
+    let mut long = at(1, "facts");
+    long.label = "Andrews-MacBook-Pro-of-the-third-floor-lab.local:57564 at 127.0.0.1".to_owned();
+    let long = facts_note(&[long]).expect("named");
+    assert!(
+        long.starts_with("Andrews-MacBook-Pro-of-the-t…:57564 at 127.0.0.1 allows"),
+        "{long}"
+    );
 }
 
 #[test]
@@ -1917,7 +1982,11 @@ fn a_peers_typist_reads_in_its_own_words() {
             ),
             (
                 "Andrews-MacBook-Pro.local (node bc104d9c) over the fleet",
-                "Andrews-MacBook-Pro.loca… (node bc104d9c) over the fleet",
+                "Andrews-MacBook-Pro.local (node bc104d9c) over the fleet",
+            ),
+            (
+                "Andrews-MacBook-Pro-long.local (node bc104d9c) over the fleet",
+                "Andrews-MacBook-Pro-long.local (node bc104d9c) over the fleet",
             ),
             (
                 "node bc104d9c over the fleet",
@@ -1929,6 +1998,7 @@ fn a_peers_typist_reads_in_its_own_words() {
             let mut answer = reply(1, vec![typed(by)]);
             answer.remote = remote;
             let text = render_text(&[answer], DEFAULT_BUDGET, None);
+            assert_line_caps(&text);
             assert!(
                 text.contains(&format!(" typed by {shows} 1m ago")),
                 "remote={remote} {by}: {text}"
@@ -1975,7 +2045,7 @@ fn a_peers_typist_reads_in_its_own_words() {
         (
             mac,
             &[][..],
-            " typed by Andrews-MacBook-Pro.loca… (node bc104d9c) over the fleet 1m ago",
+            " typed by Andrews-MacBook-Pro.local (node bc104d9c) over the fleet 1m ago",
         ),
         (
             mac,
@@ -2008,4 +2078,47 @@ fn a_peers_typist_reads_in_its_own_words() {
             "{busy:?}: {line}"
         );
     }
+}
+
+#[test]
+fn an_agents_active_goal_is_quoted_under_its_line_before_what_it_was_asked() {
+    let working = wire_row(&[
+        ("sid", "s-0000000000000000000a"),
+        ("program", "claude"),
+        ("program_kind", "agent"),
+        ("agent", "busy"),
+        ("agent_ms", "60000"),
+        ("goal", "implement the aos aterm vision"),
+        ("prompt", "keep going"),
+        ("said", "Running the tests now."),
+    ]);
+    let replies = [reply(9, vec![working])];
+    let text = render_text(&replies, DEFAULT_BUDGET, None);
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.starts_with("s-0000000000000000000a claude busy"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert_eq!(
+        lines[at + 1..at + 4],
+        [
+            "    goal: implement the aos aterm vision",
+            "    asked: keep going",
+            "    said: Running the tests now."
+        ],
+        "{text}"
+    );
+    let flagged = wire_row(&[
+        ("sid", "s-0000000000000000000b"),
+        ("program", "claude"),
+        ("program_kind", "agent"),
+        ("agent", "busy"),
+        ("goal", "1"),
+    ]);
+    let s = Fields::of(&flagged);
+    assert!(
+        excerpts(&s, true).iter().all(|e| e.word != "goal"),
+        "a facts reply's goal flag is no words to quote"
+    );
+    assert_eq!(excerpts(&s, false)[0].word, "goal");
 }

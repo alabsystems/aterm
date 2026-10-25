@@ -4,7 +4,7 @@
 //! Headless recording replay engine ([`ReplayEngine::fork`]).
 
 use aterm_core::grid::{ResizeLaw, ResizePolicy};
-use aterm_core::terminal::{Terminal, TerminalCheckpoint};
+use aterm_core::terminal::{ClockReading, Terminal, TerminalCheckpoint};
 
 /// A headless engine replaying one session's recorded output and resizes.
 pub struct ReplayEngine {
@@ -26,15 +26,14 @@ impl ReplayEngine {
         )
     }
 
-    /// Restores an engine from keyframe `cp` that resizes under `policy`.
+    /// Restores an engine from `cp`, a keyframe this process took of the engine it replays ([`Terminal::replay_from_checkpoint`]), that resizes under `policy` and verifies shell marks with the nonce `cp` carries.
     #[must_use]
     pub fn from_checkpoint(cp: &TerminalCheckpoint, policy: ResizePolicy) -> Self {
-        Self::configured(
-            Terminal::from_checkpoint(cp),
-            policy,
-            ResizeLaw::default(),
-            false,
-        )
+        let mut term = Terminal::replay_from_checkpoint(cp);
+        if let Some(nonce) = cp.shell_integration_nonce {
+            term.authorize_shell_integration(nonce.0);
+        }
+        Self::configured(term, policy, ResizeLaw::default(), false)
     }
 
     /// Sets `law` as the resize layout law for subsequent resizes.
@@ -70,6 +69,11 @@ impl ReplayEngine {
     /// Feed recorded output through the parser.
     pub fn process(&mut self, bytes: &[u8]) {
         self.term.process(bytes);
+    }
+
+    /// Feed recorded output through the parser at the clock reading the live engine parsed it under.
+    pub fn process_at(&mut self, bytes: &[u8], clock: ClockReading) {
+        self.term.process_at(bytes, clock);
     }
 
     /// Apply a recorded resize under the session's seam policy.

@@ -54,6 +54,10 @@ pub struct InitialSetupHandlers {
     /// subscriber, removes the record of the person's opt-out and reads the
     /// row again (design §3.3). Returns whether that worker started.
     pub sync_on: fn() -> bool,
+    /// The window verified its own Full Disk Access grant without an admitted
+    /// access revision to record it under. Refresh observations and finish any
+    /// previously owed preference work on a worker, without admitting prompts.
+    pub fda_granted: fn(),
 }
 
 #[cfg(test)]
@@ -68,6 +72,7 @@ impl InitialSetupHandlers {
             stop: || {},
             settle: || {},
             sync_on: || false,
+            fda_granted: || {},
         }
     }
 }
@@ -304,6 +309,14 @@ impl App {
     #[cfg(test)]
     pub(crate) fn set_system_state_handlers_for_test(&mut self, handlers: InitialSetupHandlers) {
         self.system_state_host.handlers = Some(handlers);
+    }
+
+    /// A verified grant without a recordable revision still refreshes the rows
+    /// and lets the worker finish already-owed preferences. It admits no access step.
+    pub(crate) fn notify_initial_setup_fda_granted(&self) {
+        if let Some(handlers) = self.system_state_handlers() {
+            (handlers.fda_granted)();
+        }
     }
 
     /// The event loop has ended: an offer nobody answered is let go, and setup
@@ -789,6 +802,30 @@ impl App {
             .collect()
     }
 
+    /// A person returning from System Settings may have changed this Mac
+    /// while the page stayed visible. Its accepted reading is stale then;
+    /// the next tick reads again, keeping a refused start's retry deadline.
+    pub(crate) fn system_state_focus_returned(&mut self, wid: crate::WindowId) {
+        let visible = self
+            .windows
+            .get(&wid)
+            .is_some_and(|window| !window.occluded && window.overlay.is_none())
+            && self
+                .active_native_view(wid)
+                .is_some_and(|(instance, view)| {
+                    matches!(
+                        self.native_runtime.app(instance),
+                        Some(NativeApp::SystemState(_))
+                    ) && self
+                        .active_visible_leaf_plan(wid)
+                        .is_some_and(|plan| plan.leaf(view).is_some())
+                });
+        if visible {
+            self.system_state_host.shown = false;
+            self.system_state_host.next_tick = Some(Instant::now());
+        }
+    }
+
     /// Whether the page has been presented in a focused window and is still
     /// in front there: the moment the first-run offer applies (§3.5).
     fn system_state_presented_active(
@@ -843,7 +880,7 @@ impl App {
             return Observe::Started;
         };
         let plan = match self.native_runtime.app(instance) {
-            Some(NativeApp::SystemState(state)) if state.plan_known() => state.reviewed_plan(),
+            Some(NativeApp::SystemState(state)) if state.plan_known() => state.observation_plan(),
             Some(NativeApp::SystemState(_)) => match &self.system_state_host.latest_status.plan {
                 Some(plan) => plan.clone(),
                 None => return Observe::NoPlan,

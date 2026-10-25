@@ -371,8 +371,9 @@ mod tests {
             workspace
                 .insert_text(&mut store, &mut writer, inserted)
                 .unwrap();
-            let (seq, deltas) = workspace.take_last_commit(document).unwrap();
-            view.observe_external(seq, &deltas);
+            for (seq, deltas) in workspace.take_commits(document) {
+                view.observe_external(seq, &deltas);
+            }
             let before_submit = store.snapshot(document).unwrap();
             let expected = expected_match.map(|index| {
                 let (start, query) = before_submit

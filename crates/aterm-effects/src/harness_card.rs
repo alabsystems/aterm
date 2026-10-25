@@ -810,7 +810,7 @@ impl CardPalette {
     /// Returns the legible text color at normalized position `t` (`0.0..=1.0`) by theme polarity.
     #[must_use]
     #[inline]
-    pub fn letter(self, t: f32, dark: bool) -> u32 {
+    pub const fn letter(self, t: f32, dark: bool) -> u32 {
         let base = self.at(t);
         if dark {
             lift_to_luminance(base, LINE_DARK_LUMA_FLOOR)
@@ -824,7 +824,7 @@ impl CardPalette {
     /// paper the print law's ink.
     #[must_use]
     #[inline]
-    pub fn letter_on(self, t: f32, ground: u32) -> u32 {
+    pub const fn letter_on(self, t: f32, ground: u32) -> u32 {
         let ground = ground & 0x00FF_FFFF;
         if dark_ground(ground) {
             line_floor(self.letter(t, true), ground)
@@ -882,7 +882,7 @@ impl CardPalette {
     }
 
     #[inline]
-    fn text_at(self, t: f32, ground: u32) -> u32 {
+    const fn text_at(self, t: f32, ground: u32) -> u32 {
         match self {
             Self::Off => paper_silver_ink(self.art_at(t, false), ground),
             Self::Cruise | Self::Land => paper_mark_ink(self.art_at(t, false), ground),
@@ -891,19 +891,21 @@ impl CardPalette {
 }
 
 #[inline]
-fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
+const fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let y_bg = crate::color_math::relative_luminance_with(table, ground & 0x00FF_FFFF);
-    let holds = |c: u32| {
+    #[inline]
+    const fn holds(table: &crate::color_math::RelativeLuminanceTable, y_bg: f32, c: u32) -> bool {
         let y = crate::color_math::relative_luminance_with(table, c);
         (y.max(y_bg) + 0.05) / (y.min(y_bg) + 0.05) >= PAPER_MARK_CONTRAST
-    };
-    if holds(rgb) {
+    }
+    if holds(table, y_bg, rgb) {
         return rgb;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (0u32, rgb);
-    for i in 0..24 {
+    let mut i = 0;
+    while i < 24 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = mix_rgb(rgb, 0, 1.0 - mid);
         let passes = if mid_rgb == lo_rgb {
@@ -911,7 +913,7 @@ fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
         } else if mid_rgb == hi_rgb {
             false
         } else {
-            holds(mid_rgb)
+            holds(table, y_bg, mid_rgb)
         };
         if passes {
             lo = mid;
@@ -923,6 +925,7 @@ fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
         if i >= 1 && lo_rgb == hi_rgb {
             break;
         }
+        i += 1;
     }
     lo_rgb
 }
@@ -1458,7 +1461,7 @@ struct KittyInk {
 
 impl KittyInk {
     #[inline]
-    fn new(coat: u32, eye: u32, dark: bool) -> Self {
+    const fn new(coat: u32, eye: u32, dark: bool) -> Self {
         let coat = coat & 0x00FF_FFFF;
         let outline = if dark && relative_luminance(coat) < 0.06 {
             mix_rgb(coat, WHITE, 0.45)
@@ -1809,17 +1812,22 @@ impl Glints {
     };
 
     #[inline]
-    fn spots(&self) -> &[GlintSpot] {
-        &self.spots[..self.n]
+    const fn spots(&self) -> &[GlintSpot] {
+        self.spots.split_at(self.n).0
     }
 }
 
 #[inline]
-fn glint_arms(g: &Geo, dark: bool, h: i64, amp: i64) -> (i64, i64) {
+const fn glint_arms(g: &Geo, dark: bool, h: i64, amp: i64) -> (i64, i64) {
     let tax = if dark { 1.0 } else { STAR_ARM_INK };
-    let fits = ((h - 2 * amp - 1) / 2 - 1).max(0);
-    let arm = |ratio: f32| i64::from(star_arm_px(star_arm(g.ch as f32, ratio * tax))).min(fits);
-    (arm(STAR_ARM_STD), arm(STAR_ARM_HERO))
+    let raw_fits = (h - 2 * amp - 1) / 2 - 1;
+    let fits = if raw_fits > 0 { raw_fits } else { 0 };
+    let std_arm = star_arm_px(star_arm(g.ch as f32, STAR_ARM_STD * tax)) as i64;
+    let hero_arm = star_arm_px(star_arm(g.ch as f32, STAR_ARM_HERO * tax)) as i64;
+    (
+        if std_arm < fits { std_arm } else { fits },
+        if hero_arm < fits { hero_arm } else { fits },
+    )
 }
 
 #[cfg(test)]
@@ -2581,28 +2589,37 @@ impl HarnessCard {
 /// where it already reads, lifted toward white on a dim ground, and darkened on a mid ground on
 /// which black reads better than white, so a sweep's white never washes it out.
 #[inline]
-fn line_floor(rgb: u32, ground: u32) -> u32 {
+const fn line_floor(rgb: u32, ground: u32) -> u32 {
     floor_contrast_keeping_hue(rgb, ground, LINE_CONTRAST)
 }
 
 /// Mixes `rgb` toward white to reach WCAG relative luminance `floor` on a `2^-14` step grid.
 #[inline]
-pub(crate) fn lift_to_luminance(rgb: u32, floor: f32) -> u32 {
+pub(crate) const fn lift_to_luminance(rgb: u32, floor: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     if crate::color_math::relative_luminance_with(table, rgb) >= floor {
         return rgb;
     }
-    let reaches =
-        |t: f32| crate::color_math::relative_luminance_with(table, mix_rgb(rgb, WHITE, t)) >= floor;
+    #[inline]
+    const fn reaches(
+        table: &crate::color_math::RelativeLuminanceTable,
+        rgb: u32,
+        floor: f32,
+        t: f32,
+    ) -> bool {
+        crate::color_math::relative_luminance_with(table, mix_rgb(rgb, WHITE, t)) >= floor
+    }
     let (mut short, mut step) = (0.0f32, 0.25f32);
-    for _ in 0..7 {
+    let mut i = 0;
+    while i < 7 {
         let (a, b, c) = (
-            reaches(short + step),
-            reaches(short + 2.0 * step),
-            reaches(short + 3.0 * step),
+            reaches(table, rgb, floor, short + step),
+            reaches(table, rgb, floor, short + 2.0 * step),
+            reaches(table, rgb, floor, short + 3.0 * step),
         );
-        short += step * f32::from(u8::from(!a) + u8::from(!b) + u8::from(!c));
+        short += step * ((!a as u8) + (!b as u8) + (!c as u8)) as f32;
         step *= 0.25;
+        i += 1;
     }
     mix_rgb(rgb, WHITE, short + 4.0 * step)
 }
@@ -2610,7 +2627,7 @@ pub(crate) fn lift_to_luminance(rgb: u32, floor: f32) -> u32 {
 /// Returns `true` when background `bg` (`0x00RRGGBB`) has WCAG relative luminance below `0.5`.
 #[must_use]
 #[inline]
-pub fn dark_ground(bg: u32) -> bool {
+pub const fn dark_ground(bg: u32) -> bool {
     relative_luminance(bg) < 0.5
 }
 
@@ -2768,9 +2785,11 @@ impl<'a> Emit<'a> {
     }
 
     #[inline]
-    fn rides(&self) -> bool {
-        self.seat
-            .is_some_and(|seat| ride_span(&self.geo, self.scene, &seat).is_some())
+    const fn rides(&self) -> bool {
+        match self.seat {
+            Some(seat) => ride_span(&self.geo, self.scene, &seat).is_some(),
+            None => false,
+        }
     }
 
     #[inline]
@@ -2903,11 +2922,11 @@ impl<'a> Emit<'a> {
     }
 
     #[inline]
-    fn stripe_paint(&self, k: usize, (w, ring): (f32, f32)) -> Paint {
+    const fn stripe_paint(&self, k: usize, (w, ring): (f32, f32)) -> Paint {
         let base = self.scene.palette.stripe(k, self.scene.dark);
         if self.scene.dark {
             let w = w.max(GLINT_CREST_DARK * ring);
-            light(mix_rgb(base, WHITE, w), f32::from(TRAIL_COV))
+            light(mix_rgb(base, WHITE, w), TRAIL_COV as f32)
         } else {
             let edge = k == 0 || k + 1 == TRAIL_STOPS.len();
             let share = if edge { LIGHT_GLINT_EDGE } else { 1.0 };
@@ -3015,13 +3034,14 @@ impl<'a> Emit<'a> {
     }
 
     #[inline]
-    fn trail_cover(&self, lay: &TrailLay, k: i64) -> Rect {
+    const fn trail_cover(&self, lay: &TrailLay, k: i64) -> Rect {
         let d = self.wave(lay, k);
         let xa = lay.tx0 + k * lay.seg;
+        let xb = xa + lay.seg;
         Rect {
             x0: xa,
             y0: lay.ya - d,
-            x1: (xa + lay.seg).min(lay.drawn),
+            x1: if xb < lay.drawn { xb } else { lay.drawn },
             y1: lay.yb - d,
         }
     }
@@ -3074,7 +3094,7 @@ impl<'a> Emit<'a> {
     }
 
     #[inline]
-    fn mark_ink(&self, k: usize, dark: u32) -> u32 {
+    const fn mark_ink(&self, k: usize, dark: u32) -> u32 {
         if self.scene.dark {
             dark
         } else {
@@ -3477,8 +3497,8 @@ impl Default for TrailInk {
 
 impl TrailInk {
     #[inline]
-    fn covers(&self) -> &[Rect] {
-        &self.covers[..self.n]
+    const fn covers(&self) -> &[Rect] {
+        self.covers.split_at(self.n).0
     }
 }
 

@@ -96,13 +96,16 @@ reaches no network for them and changes none of them: `aterm init --develop` doe
 The first Mac window opens System State. aterm's own permissions are set up on every
 Mac; the rest of the profile is set up by itself only on an ALab Mac (a vault member, a
 fleet member, or one where the ALab vault answers). Elsewhere those groups start at
-Leave as is, and their rows still show the value now and the value setup wants. A later
-launch that finds the ALab signal widens the plan aterm chose by itself; a plan you
-shaped is never changed. Setup starts as soon as the tab is shown, with no countdown. A
-group's Set up / Leave as is takes effect at once, and Stop, beside the headline while a
-run is going, ends that run between steps. Closing the tab never cancels. System State
-remains available to rerun setup or restore preferences. Terminal and ssh sessions, -e
-commands, headless runs, private lab homes and utilities never start setup.
+Leave as is, and their rows still show the value now and the value setup wants. Once
+aterm finds the ALab signal, in the same launch or a later one, it widens the plan it
+chose by itself and says so on the page, and a Stop while it widens puts that plan
+back; a plan you shaped, or a Restore left, is never changed, and pressing any group,
+even to what it already is, makes the plan yours. Setup starts as soon as the tab is
+shown, with no countdown. A group's Set up / Leave as is takes effect at once, and
+Stop, beside the headline while a run is going, ends that run between steps. Closing
+the tab never cancels. System State remains available to rerun setup or restore
+preferences. Terminal and ssh sessions, -e commands, headless runs, private lab homes
+and utilities never start setup.
 
 Setup choices:
   Caps Lock as Control; natural scrolling off; trackpad momentum scrolling on
@@ -117,26 +120,38 @@ Setup choices:
     this Mac is in; editable)
   Authenticate GitHub via synced credentials and clone accessible repositories
 
-Approved setup resumes unfinished steps on later launches, silently. A row that waits
-for you is not retried until you act, press Check again, or launch aterm again; a vault
-approval waits the same way, and the run goes on once an admin Mac approves. A join
-turns sync on; with sync turned off since, the join lands once you turn it on again
-(`aterm secrets agent on`), and the run does not wait for it. Rows are read without
-changing anything when the tab is shown, after each step and on Check again; GitHub
-repositories is read only while it is set up, or on Check again. Completed setup
-preserves later local changes: a group turned to Set up later sets only its own
-preferences, and a Join or a group turned to Leave as is sets none. Rust in Spotlight
-keeps aterm's own build caches out, and aterm keeps its own Rust toolchain out by
-itself (the toolchain it is using moves at its next update, which the row notes);
-your projects' build folders Spotlight indexes are yours, counted in the row's note
-and never moved.
+Approved setup resumes unfinished steps on later launches, silently, and so does a
+choice cut short by a quit or a crash, which still sets only what it changed. A choice
+made while another setup step holds the records waits up to ten seconds for it to
+finish. A row that waits for you is not retried until you act, press Check again, or
+launch aterm again; a vault approval waits the same way, and the run goes on once an
+admin Mac approves. A join turns sync on; with sync turned off since, the join lands
+once you turn it on again (`aterm secrets agent on`), and the run does not wait for it.
+While the vault is at Set up and no Stop holds the run, each launch and every 30
+minutes after quietly installs again a sync process whose copy of aterm is gone, or one
+a join could not install, never over sync turned off. Rows are read without changing
+anything when the tab is shown, after each step and on Check again; GitHub repositories
+is read only while it is set up, or on Check again. macOS never tells an app whether it
+may use the local network: Local Network reads On once aterm reached the LAN, Off once
+macOS refused it (your answer, which aterm leaves), and otherwise shows — with a short
+note, so System State never waits on it. Completed setup preserves later local changes:
+a group turned to Set up later sets only its own preferences, and a Join or a group
+turned to Leave as is sets none. So it is after an older aterm's setup: its plan gains
+aterm's permissions, and a choice never resets its Dock or signs out again. Rust in
+Spotlight keeps aterm's own build caches out, and aterm keeps its own Rust toolchain out
+by itself (the toolchain it is using moves at its next update, which the row notes);
+your projects' build folders Spotlight indexes are yours, counted in the row's note and
+never moved.
 
 Only changed preference keys are backed up (no credentials). Restore preferences puts
 them back, stops automatic setup and turns Keyboard & Trackpad and Desktop & Dock to
 Leave as is, leaving cloned repos, credentials, sign-outs and aterm's permissions in
-place (its permission steps go on by themselves); turning one of
-those groups back to Set up sets only that group, and a Join or a group turned to
-Leave as is sets none. The Caps Lock key, a scroll direction the Mac had never set,
+place (its permission steps go on by themselves, also after a Restore or `doctor
+--apply` a quit or a crash cut short, which the next launch finishes; after a Restore
+that left no run to carry them, an older aterm's or one pressed before you answered the
+first offer, aterm sets them up with nothing else, at once or at the next launch);
+turning one of those groups back to Set up sets only that group, and a Join or a group
+turned to Leave as is sets none. The Caps Lock key, a scroll direction the Mac had never set,
 Trackpad scrolling, and any setting whose app did not relaunch, come back at your next
 login (System State says so in its one line about the Restore, in its row names, and
 reads a row whose live value it can read as `Control · until login` until then; `doctor
@@ -144,8 +159,10 @@ reads a row whose live value it can read as `Control · until login` until then;
 is, which is no failure either; only a setting Restore could not put back is one, which
 System State names as Restore's. Without
 Full Disk Access it leaves Notification Center's widget list alone, keeps its original
-in the backup and puts it back by itself once aterm has the grant, unless Desktop &
-Dock was turned back to Set up since. `doctor --apply` applies the preference and
+in the backup and puts it back by itself once aterm has the grant (in that launch, once
+any other setup step holding its records lets go), unless Desktop & Dock was turned back
+to Set up since, or Set up now set it; no choice, Set up now or
+Join in between drops that put-back. `doctor --apply` applies the preference and
 account profile and adds aterm's permissions to the plan, unless setup was cancelled
 (a Restore withdraws none), and finishes a run a Restore ended; System State also
 does Spotlight, the vault and repositories. The Messages and FaceTime sign-outs run
@@ -655,7 +672,8 @@ WHAT IT IS
   * Questions and decisions: answered with the recommended option (`question_priority`,
     or `answer_text` in prose) while `answer_questions = true`.
   * Surveys and offers: Claude Code rating cards are dismissed with `0`; the
-    autocompact offer is answered per `autocompact_offer`.
+    autocompact offer is answered per `autocompact_offer`; the auto-mode setup
+    offer (`Teach auto mode about your environment?`) is put off with `Not now`.
   * Usage limits: waits at the limit dialog, resumes after the reset, rotates across
     configured accounts (`accounts`), or takes an eligible reset (`limit_reset`) or
     usage credits (`usage_credits`); a model-bucket limit falls back to

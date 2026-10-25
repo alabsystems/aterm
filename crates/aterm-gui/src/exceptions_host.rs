@@ -698,7 +698,7 @@ impl App {
                 let refused = said == AccountsSaid::Refused;
                 let logins_unread = said == AccountsSaid::LoginsUnread;
                 let unread = refused || logins_unread;
-                let (labels, credits, full, due, none_soon, wrong) = match said {
+                let (labels, credits, full, due, none_soon, wrong, no_sign_in) = match said {
                     AccountsSaid::Nothing | AccountsSaid::Refused | AccountsSaid::LoginsUnread => {
                         Default::default()
                     }
@@ -709,7 +709,16 @@ impl App {
                         due,
                         none_soon,
                         wrong,
-                    } => (signed_out, credits, window_full, due, none_soon, wrong),
+                        no_sign_in,
+                    } => (
+                        signed_out,
+                        credits,
+                        window_full,
+                        due,
+                        none_soon,
+                        wrong,
+                        no_sign_in,
+                    ),
                 };
                 let lines = [
                     (
@@ -727,6 +736,10 @@ impl App {
                     (
                         message_reporters::ACCOUNTS_CREDITS_KEY,
                         message_reporters::accounts_credits_entry(&credits),
+                    ),
+                    (
+                        message_reporters::ACCOUNTS_NO_SIGN_IN_KEY,
+                        message_reporters::accounts_no_sign_in_entry(&no_sign_in),
                     ),
                     (
                         message_reporters::ACCOUNTS_WINDOW_FULL_KEY,

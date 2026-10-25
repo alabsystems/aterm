@@ -2621,6 +2621,7 @@ impl SettingsViewState {
     fn clear_field_edit(&mut self) {
         self.font_text_entry = None;
         if let Some(key) = self.editing_field.take() {
+            self.common.retire_input();
             let owned_focus = self.editing_field_has_focus(&key);
             if let Some(input) = self.field_inputs.get_mut(&key) {
                 input.cancel_preedit();
@@ -2629,6 +2630,38 @@ impl SettingsViewState {
                 self.common.last_focus = None;
             }
         }
+    }
+
+    /// The selected text in the field that currently owns keyboard input.
+    pub(crate) fn selected_text(&self) -> Option<&str> {
+        let input = if self.theme_filter_has_focus() {
+            self.choice_picker
+                .as_ref()
+                .and_then(|picker| picker.themes.as_ref())
+                .map(|themes| &themes.filter)
+        } else if let Some(target) = self.showcase_text_focus() {
+            match target {
+                showcase_page::ShowcaseText::Filter => Some(&self.showcase.filter),
+                showcase_page::ShowcaseText::SaveName => {
+                    self.showcase.save.as_ref().map(|save| &save.name)
+                }
+                showcase_page::ShowcaseText::PaletteSlot => {
+                    self.showcase.slot.as_ref().map(|slot| &slot.input)
+                }
+            }
+        } else if let Some(key) = self
+            .editing_field
+            .as_ref()
+            .filter(|key| self.editing_field_has_focus(key))
+        {
+            self.field_inputs.get(key)
+        } else if self.search_has_focus() {
+            Some(&self.search_input)
+        } else {
+            None
+        }?;
+        let text = input.selected_text();
+        (!text.is_empty()).then_some(text)
     }
 
     /// Clear the original field's marked text even after focus moved. Its
@@ -2660,6 +2693,7 @@ impl SettingsViewState {
     fn discard_field_edit(&mut self) {
         self.font_text_entry = None;
         if let Some(key) = self.editing_field.take() {
+            self.common.retire_input();
             if self.editing_field_has_focus(&key) {
                 self.common.focus_visible = true;
             }

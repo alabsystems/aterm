@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Startup's first record observation must belong to a resolved account home.
+//! Startup's scope: a launch on the account's own home may start first-run setup and one on a
+//! scratch home never does, and startup's first record observation must belong to a resolved
+//! account home.
 
-use super::{PreparedSetup, SetupAdmission, SetupStartup, prepare_setup};
+use super::{
+    PreparedSetup, SetupAdmission, SetupStartup, doctor_startup_env, doctor_startup_env_from,
+    first_run_window_eligible, prepare_setup,
+};
 use aterm_cli::macos_doctor::{
     AutomaticSetupClaim, InitialSetupObservation, InitialSetupSnapshot, ProvisionalSetupWatchTest,
-    claim_initial_setup_rerun_at, initial_setup_scope_ready_at,
+    claim_initial_setup_rerun_at, initial_setup_scope_ready_at, lasting_scope_refusal_at,
 };
 use aterm_gui::WorkstationSetupDecision;
 use aterm_types::macos_setup::Plan;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 struct Startup {
@@ -20,6 +26,8 @@ struct Startup {
     claims: usize,
     backoffs: usize,
     failures: Vec<String>,
+    /// The backoffs and binds before each bring-forward.
+    brought: Vec<(usize, usize)>,
 }
 
 impl Startup {
@@ -42,6 +50,10 @@ impl SetupStartup for Startup {
             &self.home,
             self.account_home.as_deref().unwrap_or(&self.home),
         )
+    }
+
+    fn bring_forward(&mut self) {
+        self.brought.push((self.backoffs, self.binds));
     }
 
     fn bind_authorization(&mut self) -> Result<u64, String> {
@@ -130,7 +142,42 @@ fn startup(home: &Path) -> Startup {
         claims: 0,
         backoffs: 0,
         failures: Vec::new(),
+        brought: Vec::new(),
     }
+}
+
+/// The window gate's scope input is the doctor's lasting refusal, through the one composition
+/// the launch reads: the account's own home keeps first-run setup, a scratch home never starts
+/// it, and the environment's markers still refuse on the account's home.
+#[test]
+fn a_real_home_keeps_first_run_setup_and_a_scratch_home_never_starts_it() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let account = scratch.path().join("account");
+    let other = scratch.path().join("scratch-home");
+    std::fs::create_dir(&account).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let window = [OsString::from("--window")];
+    let at =
+        |home: &Path| doctor_startup_env_from(|_| None, lasting_scope_refusal_at(home, &account));
+
+    let own = at(&account);
+    assert!(!own.outside_person_scope);
+    assert!(first_run_window_eligible(&window, own));
+    assert!(first_run_window_eligible(&[], own), "a Dock launch");
+    let foreign = at(&other);
+    assert!(foreign.outside_person_scope);
+    assert!(!first_run_window_eligible(&window, foreign));
+    for marker in ["ATERM_STATE_HOME", "CI", "SSH_CONNECTION", "SSH_TTY"] {
+        let env = doctor_startup_env_from(
+            |key| (key == marker).then(|| OsString::from("1")),
+            lasting_scope_refusal_at(&account, &account),
+        );
+        assert!(!first_run_window_eligible(&window, env), "{marker}");
+    }
+
+    // The launch's own reader: a test binary runs under its private state root, a lasting
+    // refusal, so this process is never the person's.
+    assert!(doctor_startup_env().outside_person_scope);
 }
 
 #[test]
@@ -148,6 +195,10 @@ fn startup_scope_refusal_never_captures_or_claims() {
         PreparedSetup::Unavailable
     ));
     assert_eq!((host.binds, host.claims, host.backoffs), (0, 0, 0));
+    assert!(
+        host.brought.is_empty(),
+        "nothing is brought forward for a refused scope"
+    );
     assert!(host.failures.is_empty());
     assert_eq!(host.snapshot().unwrap().observation, before);
 }
@@ -170,6 +221,11 @@ fn startup_scope_recovery_captures_the_revealed_pending_run_once() {
     assert_eq!(host.binds, 1);
     assert_eq!(host.claims, 1, "scope waits before taking a claim");
     assert_eq!(host.backoffs, 1);
+    assert_eq!(
+        host.brought,
+        [(1, 0)],
+        "a restored setup is brought forward once the home resolves, before the records bind"
+    );
     assert_eq!(host.failures.len(), 1);
     assert_eq!(host.snapshot().unwrap().observation, before);
 }

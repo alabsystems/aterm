@@ -4,6 +4,8 @@
 //! Self-rendered command palette ([`PaletteState`], [`PaletteRow`]) built from [`crate::menu::MENU_MODEL`].
 
 use std::borrow::Cow;
+#[cfg(any(target_os = "linux", test))]
+use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(test)]
@@ -359,6 +361,8 @@ impl PaletteState {
         Self {
             rows,
             query: String::new(),
+            #[cfg(any(target_os = "linux", test))]
+            input_lifetime: Arc::new(()),
             selected: 0,
             scroll: 0,
             pointer_over: None,
@@ -1109,6 +1113,9 @@ pub(crate) struct PaletteState {
     rows: Vec<PaletteRow>,
     /// The type-to-filter query ([`Self::filtered`]).
     query: String,
+    /// Delayed clipboard text belongs to this opening of the filter field.
+    #[cfg(any(target_os = "linux", test))]
+    input_lifetime: Arc<()>,
     /// The cursor position within the filtered set (not `rows`).
     selected: usize,
     /// First filtered row shown in the command band (scroll offset).
@@ -1128,6 +1135,11 @@ pub(crate) struct PaletteState {
 }
 
 impl PaletteState {
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn input_lifetime(&self) -> Arc<()> {
+        Arc::clone(&self.input_lifetime)
+    }
+
     /// All resolved rows in display order.
     #[cfg(test)]
     pub(crate) fn rows(&self) -> &[PaletteRow] {

@@ -129,6 +129,7 @@ fn reading(st: &State, worked: Option<Duration>, measured: Instant) -> TurnEndRe
         answered: None,
         worked_doubt: Duration::ZERO,
         ran_tools: worked.is_some_and(|w| w >= REAL_WORK),
+        tools_unread: false,
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,

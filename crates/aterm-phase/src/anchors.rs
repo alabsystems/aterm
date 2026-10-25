@@ -367,6 +367,18 @@ pub const ANCHORS: &[Anchor] = &[
         "More text above: scroll up, or enlarge the terminal",
         "2.1.302",
     ),
+    lit(
+        "automode.title",
+        "Teach auto mode about your environment?",
+        "2.1.310",
+    ),
+    lit(
+        "automode.body",
+        "Auto mode works better when it knows your environment. Takes about a minute.",
+        "2.1.310",
+    ),
+    lit("automode.not_now", "Not now", "2.1.310"),
+    lit("automode.never", "Don't show again", "2.1.310"),
     lit("busy.interrupt", "esc to interrupt", "2.1.267"),
     lit("footer.shortcuts", "? for shortcuts", "2.1.283"),
     hint("footer.clear", "esc to clear", "2.1.283"),

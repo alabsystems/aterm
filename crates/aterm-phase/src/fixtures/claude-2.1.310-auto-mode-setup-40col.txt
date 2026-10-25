@@ -1,0 +1,33 @@
+# claude-code 2.1.310 · MEASURED 2026-10-24, `aterm ctl text` of a private headless aterm (40x40, aterm 0.136.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the auto-mode environment offer in the inline renderer at 40 columns, its title and body wrapped, under the composer's footer at turn end (scratch .claude.json as in auto-mode-setup; [harness] enabled = false; claude --permission-mode auto, one turn)
+           Claude Code v2.1.310
+ ▐▛███▛█   Opus 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a
+  model. (reply 2)
+
+✻ Worked for 0s · done 8:41 PM
+
+────────────────────────────────────────
+❯
+────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+                    ◐ medium · /effort
+
+────────────────────────────────────────
+  Teach auto mode about your
+  environment?
+
+  Auto mode works better when it knows
+  your environment. Takes about a
+  minute.
+
+  ❯ 1. Yes
+    2. Not now
+    3. Don't show again
+
+  Enter to confirm · Esc to cancel

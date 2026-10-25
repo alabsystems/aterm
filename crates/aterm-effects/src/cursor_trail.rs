@@ -748,12 +748,12 @@ impl Default for CadenceParams {
 }
 
 #[inline]
-fn decay_heat(heat: f32, dt: Duration, half_life: Duration) -> f32 {
+const fn decay_heat(heat: f32, dt: Duration, half_life: Duration) -> f32 {
     if heat <= 0.0 || dt.is_zero() {
         return heat.max(0.0);
     }
     let hl = half_life.as_secs_f32().max(1e-3);
-    heat * 0.5f32.powf(dt.as_secs_f32() / hl)
+    heat * crate::color_math::powf_pos_f32(0.5, dt.as_secs_f32() / hl)
 }
 
 /// Smoothstep mapping of `heat` between `knee_lo` and `knee_hi` into `0.0..=1.0`.

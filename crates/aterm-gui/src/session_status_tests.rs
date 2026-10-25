@@ -1090,6 +1090,47 @@ fn the_badge_switch_quiets_chrome_without_stopping_classification() {
     );
 }
 
+/// `goal=` is the active goal of the agent in front ([`crate::session_timeline::SessionTimeline::goal`]),
+/// percent-encoded; `-` with none.
+#[test]
+fn the_status_record_names_the_agents_active_goal() {
+    let app = crate::App::headless_for_test();
+    let goal = |app: &crate::App| {
+        let record = app.session_status_record(0).expect("live session");
+        record
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("goal="))
+            .unwrap_or_else(|| panic!("goal= in {record}"))
+            .to_string()
+    };
+    assert_eq!(goal(&app), "-", "no agent, no goal");
+    let ctx = app.pool.get(0).expect("live session").ctx.clone();
+    let facts = |goal: Option<&str>| aterm_agent::harness::footer::FooterFacts {
+        goal: goal.map(str::to_owned),
+        ..Default::default()
+    };
+    {
+        let mut tl = ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(4242);
+        tl.set_program(4242, Some("claude".into()));
+        assert!(tl.set_claude_footer(
+            4242,
+            None,
+            Some(facts(Some("implement the aos aterm vision")))
+        ));
+    }
+    assert_eq!(
+        goal(&app),
+        "implement%20the%20aos%20aterm%20vision",
+        "the agent's active goal, percent-encoded"
+    );
+    {
+        let mut tl = ctx.timeline.lock().unwrap();
+        assert!(tl.set_claude_footer(4242, None, Some(facts(None))));
+    }
+    assert_eq!(goal(&app), "-", "a goal met or cleared is no goal");
+}
+
 #[test]
 fn the_status_record_and_the_roster_carry_land_at_and_task() {
     use aterm_agent::harness::acts::TaskFace;
@@ -1112,7 +1153,7 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     assert!(
         record.contains(
             " flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- end=- end_seen=- \
-             end_cheered=- task_state=- task_rev=0 log_seq=1 log_ep=1 run=- \
+             end_cheered=- goal=- task_state=- task_rev=0 log_seq=1 log_ep=1 run=- \
              turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
@@ -1123,7 +1164,6 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
         "{}",
         roster(&app)
     );
-
     let ctx = app.pool.get(0).unwrap().ctx.clone();
     let sid = ctx.self_id.as_str().to_string();
     ctx.meta.lock().unwrap().land_at = Some(1_792_249_200_999);
@@ -1268,7 +1308,7 @@ fn the_status_record_and_the_roster_carry_the_pause_after_task() {
     assert!(
         record.contains(&format!(
             " task=- pause={AT} land_held=- land_nudges=- land_since=- end=- end_seen=- end_cheered=- \
-             task_state=- task_rev=0 log_seq="
+             goal=- task_state=- task_rev=0 log_seq="
         )),
         "{record}"
     );
@@ -1651,7 +1691,7 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              human_ms human_seq launch launch_seq path_evidence copy upgrade history_lost \
              journal journal_off integration_rev born render \
              resizes flaps land_at task pause land_held land_nudges land_since end end_seen \
-             end_cheered task_state task_rev \
+             end_cheered goal task_state task_rev \
              log_seq log_ep run turn step need need_since_ms rollout rollout_asks editing bells \
              bells_sounded last_bell gen seq hash"
         ),
@@ -2300,7 +2340,7 @@ fn the_status_record_carries_the_task_record() {
     assert!(
         none.contains(
             " pause=- land_held=- land_nudges=- land_since=- end=- end_seen=- end_cheered=- \
-             task_state=- task_rev=0 log_seq="
+             goal=- task_state=- task_rev=0 log_seq="
         ),
         "{none}"
     );
@@ -2311,7 +2351,7 @@ fn the_status_record_carries_the_task_record() {
     assert!(
         record.contains(
             " task=- pause=- land_held=- land_nudges=- land_since=- end=- end_seen=- end_cheered=- \
-             task_state=done task_rev=2 log_seq="
+             goal=- task_state=done task_rev=2 log_seq="
         ),
         "{record}"
     );
@@ -2533,4 +2573,473 @@ fn a_report_that_rode_a_foreground_move_never_shows_under_the_program_now_in_fro
             "once {successor_name} is named in front"
         );
     }
+}
+
+/// A CODEX TAB'S BOX NEEDS YOU ON EVERY READER, WITH ONE BANNER: the real sweep
+/// (`App::observe_session_statuses`, then the presence refresh each changed session gets)
+/// reads codex's own `blocked` report off the bytes it writes, and the tab whose reader names
+/// no state publishes the program-claim need: `status needs=approval` beside `agent=unknown`
+/// and `program_state=blocked:permission`, the survey's `needs=approval`, one need on the
+/// glance. A re-read of the same box keeps its key; the next box is a new one; a foreground
+/// move off codex takes the need away. One box gives one banner in either order codex writes
+/// it: where its own notification came first (its draw, then its pre-draw report) the herald
+/// posts nothing (`HeraldQuiet::Told`); where the report came first (its transcript overlay)
+/// the herald's banner goes out and codex's late notification for the box is dropped, while
+/// its turn's own notification after the box passes. NEGATIVE CONTROL: the first order's
+/// notification and the turn's notification reach the program's callback.
+#[test]
+fn a_codex_box_needs_you_on_every_reader_and_gives_one_banner() {
+    use super::program::{LeaderFacts, ProgramResolver};
+    use crate::app_tabs::{HERALD_POSTS, HERALD_REFUSAL};
+    const CODEX: i32 = i32::MAX - 21;
+    const SHELL: i32 = i32::MAX - 22;
+    const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
+    const BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\";
+    const BOX_NOTICE: &[u8] = b"\x1b]9;Approval requested: rm -rf build\x07";
+    const TURN_DONE: &[u8] = b"\x1b]9;Agent turn complete\x07";
+    const DONE: &[u8] = b"\x1b]7501;state=done:app=codex\x1b\\";
+    let field = |line: &str, key: &str| {
+        line.split(' ')
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+            .map(str::to_string)
+    };
+    let take_posts = || HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    for codex_first in [true, false] {
+        let mut app = crate::App::headless_for_test();
+        app.session_factory.fg_probe = |master| master;
+        app.session_status.programs = ProgramResolver::with_lookup(|pgid, _shell| LeaderFacts {
+            program: match pgid {
+                CODEX => Some("codex".into()),
+                SHELL => Some("zsh".into()),
+                _ => None,
+            },
+            ..LeaderFacts::default()
+        });
+        let sid = app.next_session_id;
+        app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
+        app.headless = false;
+        app.config.desktop_alerts = Some(true);
+        app.notify_suppress.lock().unwrap().clear();
+        HERALD_REFUSAL.set(None);
+        let (term, ctx) = {
+            let pooled = app.pool.get(sid).expect("pooled");
+            (std::sync::Arc::clone(&pooled.term), pooled.ctx.clone())
+        };
+        let passed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        {
+            let mut t = crate::term_lock(&term);
+            let _ = t.apply_config(&aterm_core::config::TerminalConfig {
+                allow_notifications: true,
+                ..aterm_core::config::TerminalConfig::default()
+            });
+            t.set_notification_admission(ctx.box_banner.admission());
+            let sink = std::sync::Arc::clone(&passed);
+            t.set_notification_callback(move |body| sink.lock().unwrap().push(body.to_string()));
+        }
+        let front = |app: &mut crate::App, group: i32| {
+            app.pool
+                .sessions
+                .get_mut(&sid)
+                .expect("pooled")
+                .session
+                .master = group;
+        };
+        let mut t = std::time::Instant::now();
+        let mut sweep = |app: &mut crate::App| {
+            t += std::time::Duration::from_secs(1);
+            for id in app.observe_session_statuses(t) {
+                app.refresh_presence_session(id);
+            }
+        };
+        let status = |app: &crate::App, key: &str| {
+            field(&app.session_status_record(sid).expect("a record"), key).unwrap_or_default()
+        };
+        let named = |app: &mut crate::App, sweep: &mut dyn FnMut(&mut crate::App), want: &str| {
+            let named = aterm_spec::wait::within(
+                aterm_spec::wait::MUST_HAPPEN,
+                std::time::Duration::from_millis(1),
+                || {
+                    sweep(app);
+                    let program = ctx.timeline.lock().unwrap().agent().program.clone();
+                    (program.as_deref() == Some(want)).then_some(())
+                },
+            );
+            assert!(named.is_some(), "never named {want}");
+        };
+        let need = || ctx.timeline.lock().unwrap().need().need.clone();
+        front(&mut app, CODEX);
+        named(&mut app, &mut sweep, "codex");
+        crate::term_lock(&term).process(WORKING);
+        sweep(&mut app);
+        assert_eq!(status(&app, "program_state"), "working", "PRECONDITION");
+        assert_eq!(
+            status(&app, "needs"),
+            "-",
+            "PRECONDITION: working is no need"
+        );
+        let _ = take_posts();
+        if codex_first {
+            crate::term_lock(&term).process(&[BOX_NOTICE, BLOCKED].concat());
+        } else {
+            crate::term_lock(&term).process(BLOCKED);
+        }
+        sweep(&mut app);
+        let told = app.presence.herald.last_quiet();
+        let record = app.session_status_record(sid).expect("a record");
+        assert_eq!(
+            (
+                field(&record, "needs").as_deref(),
+                field(&record, "agent").as_deref(),
+                field(&record, "program_state").as_deref(),
+            ),
+            (
+                Some("approval"),
+                Some("unknown"),
+                Some("blocked:permission")
+            ),
+            "{record}"
+        );
+        let here = crate::survey::Here {
+            host: None,
+            instances: 1,
+            drive: false,
+        };
+        let survey = crate::survey::survey_rows(
+            &app.store,
+            crate::survey::SurveyLevel::Facts,
+            usize::MAX,
+            &here,
+        );
+        let row = survey
+            .lines()
+            .find(|line| line.starts_with("session ") && line.contains(ctx.self_id.as_str()))
+            .expect("the session's survey row");
+        assert_eq!(field(row, "needs").as_deref(), Some("approval"), "{row}");
+        assert_eq!(app.status_glance().need_count(), 1);
+        let boxed = need().expect("the program-claim need");
+        assert_eq!(boxed.what, crate::needs::CODEX_APPROVAL_WORDS);
+        let posts = take_posts();
+        if codex_first {
+            assert_eq!(
+                *passed.lock().unwrap(),
+                vec!["Approval requested: rm -rf build".to_string()],
+                "CONTROL: codex's own banner passed"
+            );
+            assert!(posts.is_empty(), "codex's banner told the box: {posts:?}");
+            assert_eq!(told, Some(crate::status_item::HeraldQuiet::Told));
+        } else {
+            assert_eq!(posts.len(), 1, "aterm tells the box");
+            assert!(
+                posts[0].body.ends_with("approval (codex's own report)"),
+                "{:?}",
+                posts[0].body
+            );
+            crate::term_lock(&term).process(BOX_NOTICE);
+            assert!(
+                passed.lock().unwrap().is_empty(),
+                "codex's late banner for the told box is dropped"
+            );
+        }
+        passed.lock().unwrap().clear();
+        crate::term_lock(&term).process(BLOCKED);
+        sweep(&mut app);
+        assert_eq!(
+            need().map(|n| n.key),
+            Some(boxed.key),
+            "the same box re-sent"
+        );
+        assert!(take_posts().is_empty(), "the same box, no second banner");
+        crate::term_lock(&term).process(&[WORKING, TURN_DONE, DONE].concat());
+        sweep(&mut app);
+        assert_eq!(status(&app, "needs"), "-", "the box answered");
+        assert_eq!(
+            *passed.lock().unwrap(),
+            vec!["Agent turn complete".to_string()],
+            "CONTROL: the turn's own notification passes"
+        );
+        crate::term_lock(&term).process(&[WORKING, BLOCKED].concat());
+        sweep(&mut app);
+        let next = need().expect("the next box");
+        assert_ne!(next.key, boxed.key, "a new box, a new key");
+        front(&mut app, SHELL);
+        named(&mut app, &mut sweep, "zsh");
+        assert_eq!(status(&app, "needs"), "-", "codex left the front");
+        assert_eq!(status(&app, "program_state"), "-");
+    }
+}
+
+/// The one-banner rig: a headless app with one stub tab whose program in front is named by
+/// its foreground group (`codex` at [`BOX_CODEX`], `zsh` at [`BOX_SHELL`]), desktop alerts on,
+/// the session's own admission (`BoxBanner`) wired to its engine, and a callback that records
+/// every program notification that passes.
+struct BoxRig {
+    app: crate::App,
+    sid: u64,
+    term: Arc<Mutex<aterm_core::terminal::Terminal>>,
+    ctx: Arc<crate::SessionCtx>,
+    passed: Arc<Mutex<Vec<String>>>,
+    at: Instant,
+}
+
+const BOX_CODEX: i32 = i32::MAX - 31;
+const BOX_SHELL: i32 = i32::MAX - 32;
+const BOX_WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
+const BOX_BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\";
+const BOX_NOTICE: &[u8] = b"\x1b]9;Approval requested: rm -rf build\x07";
+
+impl BoxRig {
+    fn new() -> Self {
+        use super::program::{LeaderFacts, ProgramResolver};
+        let mut app = crate::App::headless_for_test();
+        app.session_factory.fg_probe = |master| master;
+        app.session_status.programs = ProgramResolver::with_lookup(|pgid, _shell| LeaderFacts {
+            program: match pgid {
+                BOX_CODEX => Some("codex".into()),
+                BOX_SHELL => Some("zsh".into()),
+                _ => None,
+            },
+            ..LeaderFacts::default()
+        });
+        let sid = app.next_session_id;
+        app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
+        app.headless = false;
+        app.config.desktop_alerts = Some(true);
+        app.notify_suppress.lock().unwrap().clear();
+        crate::app_tabs::HERALD_REFUSAL.set(None);
+        let (term, ctx) = {
+            let pooled = app.pool.get(sid).expect("pooled");
+            (Arc::clone(&pooled.term), pooled.ctx.clone())
+        };
+        let passed = Arc::new(Mutex::new(Vec::<String>::new()));
+        {
+            let mut t = crate::term_lock(&term);
+            let _ = t.apply_config(&aterm_core::config::TerminalConfig {
+                allow_notifications: true,
+                ..aterm_core::config::TerminalConfig::default()
+            });
+            t.set_notification_admission(ctx.box_banner.admission());
+            let sink = Arc::clone(&passed);
+            t.set_notification_callback(move |body| sink.lock().unwrap().push(body.to_string()));
+        }
+        let mut rig = Self {
+            app,
+            sid,
+            term,
+            ctx,
+            passed,
+            at: Instant::now(),
+        };
+        rig.front(BOX_CODEX, "codex");
+        rig.write(BOX_WORKING);
+        rig.sweep();
+        let _ = Self::posts();
+        rig
+    }
+
+    fn write(&self, bytes: &[u8]) {
+        crate::term_lock(&self.term).process(bytes);
+    }
+
+    /// One sweep, then the presence refresh each changed session gets.
+    fn sweep(&mut self) {
+        self.at += Duration::from_secs(1);
+        for id in self.app.observe_session_statuses(self.at) {
+            self.app.refresh_presence_session(id);
+        }
+    }
+
+    /// Put `group` in front and sweep until the program in front is named `want`.
+    fn front(&mut self, group: i32, want: &str) {
+        self.app
+            .pool
+            .sessions
+            .get_mut(&self.sid)
+            .expect("pooled")
+            .session
+            .master = group;
+        let named = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(1),
+            || {
+                self.sweep();
+                let program = self.ctx.timeline.lock().unwrap().agent().program.clone();
+                (program.as_deref() == Some(want)).then_some(())
+            },
+        );
+        assert!(named.is_some(), "never named {want}");
+    }
+
+    fn need(&self) -> Option<crate::needs::Need> {
+        self.ctx.timeline.lock().unwrap().need().need.clone()
+    }
+
+    fn passed(&self) -> Vec<String> {
+        std::mem::take(&mut *self.passed.lock().unwrap())
+    }
+
+    /// The herald's banners on this thread since the last call.
+    fn posts() -> Vec<crate::status_item::HeraldNotice> {
+        crate::app_tabs::HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()))
+    }
+
+    /// The sessions owed a banner once every limit has passed.
+    fn owed(&self) -> Vec<u64> {
+        let later = Instant::now() + Duration::from_secs(120);
+        self.app.presence.herald.due(later).0
+    }
+}
+
+/// A TOLD BOX'S MARK DIES WITH IT: codex dies at a box the herald told (SIGKILL, so no
+/// `clear`), and the shell comes back in front. The engine still holds codex's `blocked`
+/// report, but the GUI shows no box, so a later program's notification in the tab passes.
+/// CONTROL: while the box is shown, codex's late notification for it is dropped.
+#[test]
+fn a_dead_codexs_told_box_drops_no_later_programs_notification() {
+    let mut rig = BoxRig::new();
+    rig.write(BOX_BLOCKED);
+    rig.sweep();
+    assert_eq!(BoxRig::posts().len(), 1, "PRECONDITION: aterm told the box");
+    rig.write(BOX_NOTICE);
+    assert!(
+        rig.passed().is_empty(),
+        "CONTROL: the told box shown drops it"
+    );
+    rig.front(BOX_SHELL, "zsh");
+    assert!(rig.need().is_none(), "PRECONDITION: no need");
+    assert!(
+        rig.ctx.timeline.lock().unwrap().program_shown().is_none(),
+        "PRECONDITION: no report shown"
+    );
+    rig.write(b"\x1b]9;build finished\x07");
+    assert_eq!(
+        rig.passed(),
+        vec!["build finished".to_string()],
+        "the next program's notification passes"
+    );
+}
+
+/// ONE BANNER WHEN AUTOPILOT OFF GIVES A BOX BACK: codex-alab, carrying the tab under its
+/// proven claim, left a box to a person (its own ask, which the herald told); a person's
+/// Autopilot Off gives the claim back, then clears the ask, and the program-claim need the
+/// same box now raises is told already: no second banner, posted or owed.
+#[test]
+fn autopilot_off_on_a_box_codex_alab_left_owes_no_second_banner() {
+    let mut rig = BoxRig::new();
+    rig.ctx.meta.lock().unwrap().supervisor = Some(crate::session_timeline::SupervisorClaim {
+        holder: "codex-alab@4242".to_string(),
+        conn: Some(1),
+        expires_us: None,
+        proven: Some(crate::self_claim::Proven {
+            pid: 4242,
+            start: "Mon Oct 20 16:37:58 2026".to_string(),
+        }),
+    });
+    rig.app.refresh_presence_session(rig.sid);
+    rig.write(BOX_BLOCKED);
+    rig.sweep();
+    assert!(rig.need().is_none(), "PRECONDITION: the claim carries it");
+    rig.ctx
+        .meta
+        .lock()
+        .unwrap()
+        .set_attention_owned(
+            crate::task_record::SELF_CLAIM_ATTENTION_OWNER,
+            Some("approval: left to a person (limits)".into()),
+        )
+        .unwrap();
+    rig.app.refresh_presence_session(rig.sid);
+    assert_eq!(
+        BoxRig::posts().len(),
+        1,
+        "PRECONDITION: its ask told the box"
+    );
+    rig.ctx.meta.lock().unwrap().supervisor = None;
+    rig.app.refresh_presence_session(rig.sid);
+    rig.ctx
+        .meta
+        .lock()
+        .unwrap()
+        .set_attention_owned(crate::task_record::SELF_CLAIM_ATTENTION_OWNER, None)
+        .unwrap();
+    rig.app.refresh_presence_session(rig.sid);
+    assert_eq!(
+        rig.need().map(|need| need.word),
+        Some(aterm_types::needs::NeedWord::Approval),
+        "PRECONDITION: the box is the person's now"
+    );
+    assert_eq!(
+        rig.app.presence.herald.last_quiet(),
+        Some(crate::status_item::HeraldQuiet::Told)
+    );
+    assert!(BoxRig::posts().is_empty(), "the same box, told once");
+    assert!(!rig.owed().contains(&rig.sid), "and nothing owed for it");
+}
+
+/// A SECOND BOX BETWEEN TWO SWEEPS IS A NEW BOX: codex goes `working` and then to a second box
+/// with the same words before the next sweep: the need takes a new key and report, so the
+/// herald owes the second box its own banner.
+#[test]
+fn a_second_box_between_two_sweeps_is_a_new_need() {
+    let mut rig = BoxRig::new();
+    rig.write(BOX_BLOCKED);
+    rig.sweep();
+    let first = rig.need().expect("the first box");
+    assert_eq!(BoxRig::posts().len(), 1, "PRECONDITION: aterm told it");
+    rig.write(&[BOX_WORKING, BOX_BLOCKED].concat());
+    rig.sweep();
+    let second = rig.need().expect("the second box");
+    assert_ne!(second.key, first.key, "a new box, a new key");
+    assert_ne!(second.report, first.report, "and its own report");
+    let told = BoxRig::posts().len() + usize::from(rig.owed().contains(&rig.sid));
+    assert_eq!(told, 1, "the second box gets its own banner");
+}
+
+/// A REFUSED BANNER TELLS NO BOX: the notifier's queue refuses the herald's banner for a box
+/// whose report came first (codex's transcript overlay), so the box is not marked told:
+/// codex's own late notification for it passes, and the herald's owed retry then finds the box
+/// told by it and posts nothing.
+#[test]
+fn a_refused_box_banner_lets_codexs_own_notification_tell_it() {
+    let mut rig = BoxRig::new();
+    crate::app_tabs::HERALD_REFUSAL.set(Some("the notifier's queue is full"));
+    rig.write(BOX_BLOCKED);
+    rig.sweep();
+    assert!(
+        BoxRig::posts().is_empty(),
+        "PRECONDITION: the queue refused it"
+    );
+    assert!(rig.owed().contains(&rig.sid), "PRECONDITION: owed again");
+    rig.write(BOX_NOTICE);
+    assert_eq!(
+        rig.passed(),
+        vec!["Approval requested: rm -rf build".to_string()],
+        "codex's own banner passes"
+    );
+    rig.app.herald_session(rig.sid);
+    assert_eq!(
+        rig.app.presence.herald.last_quiet(),
+        Some(crate::status_item::HeraldQuiet::Told)
+    );
+    assert!(BoxRig::posts().is_empty(), "the retry posts nothing");
+    assert!(!rig.owed().contains(&rig.sid), "nothing owed");
+}
+
+/// A BOX SURVIVES A SEAMLESS UPDATE: the predecessor's engine carries codex's standing
+/// `blocked` report in its checkpoint, and once the successor's engine adopts it, the sweep
+/// shows the box and the tab needs you again, though codex writes nothing new.
+#[test]
+fn a_carried_box_needs_you_in_the_successor() {
+    let mut rig = BoxRig::new();
+    let mut predecessor = aterm_core::terminal::Terminal::new(24, 80);
+    predecessor.process(&[BOX_WORKING, BOX_BLOCKED].concat());
+    let carry = predecessor.checkpoint_carry(0).expect("Ground");
+    crate::term_lock(&rig.term).restore_checkpoint(&carry);
+    rig.sweep();
+    assert_eq!(
+        rig.need().map(|need| (need.word, need.what)),
+        Some((
+            aterm_types::needs::NeedWord::Approval,
+            crate::needs::CODEX_APPROVAL_WORDS.to_string()
+        ))
+    );
 }

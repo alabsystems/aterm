@@ -836,13 +836,18 @@ pub(super) fn expired(st: &St, now: u64, k: &dyn AlabKernel) -> Option<(&'static
 }
 
 /// A codex-alab's run, read while it runs ([`super::super::relaunch::snapshot`] vetted job, tab and terminal).
-pub(super) fn snapshot(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the explicit primary is an extra proven fact beside the unchanged kernel snapshot inputs"
+)]
+pub(super) fn snapshot_with_claim(
     opts: &Opts,
     tab: &str,
     pid: u32,
     start: String,
     shell: u32,
     args: &atpkg::caller_shell::ProcArgs,
+    claim: Option<&super::super::self_claimed::Copy>,
     k: &dyn AlabKernel,
 ) -> Result<super::super::relaunch::Snapshot, &'static str> {
     if !ca::is_tui_argv(&args.argv) {
@@ -860,7 +865,7 @@ pub(super) fn snapshot(
     // matched too, for a read that names a lock as it was opened.
     let locks = home.join("thread-writer-locks");
     let resolved = canonical(&locks);
-    let held: Vec<String> = files
+    let mut held: Vec<String> = files
         .iter()
         .filter(|f| {
             f.parent()
@@ -868,10 +873,29 @@ pub(super) fn snapshot(
         })
         .filter_map(|f| ca::lock_thread(&f.file_name()?.to_string_lossy()).map(str::to_owned))
         .collect();
-    let thread = match held.as_slice() {
-        [thread] => Some(thread.clone()),
-        [] => ca::resumed_thread(&args.argv),
-        _ => return Err("threads-ambiguous"),
+    held.sort_unstable();
+    held.dedup();
+    let primary = claim
+        .filter(|copy| copy.pid == pid && copy.start == start && canonical(&copy.home) == home)
+        .and_then(|copy| {
+            let resume = copy.resume.as_ref().ok()?;
+            let super::super::self_claimed::Seen::Present(record) = &copy.seen else {
+                return None;
+            };
+            (record.pid == pid
+                && record.exit.is_none()
+                && record.session_id.as_deref() == Some(resume.session.as_str())
+                && record.resume_argv.as_ref() == Some(&resume.argv))
+            .then_some(resume)
+        });
+    let thread = match primary {
+        Some(resume) if held.contains(&resume.session) => Some(resume.session.clone()),
+        Some(_) => return Err("threads-ambiguous"),
+        None => match held.as_slice() {
+            [thread] => Some(thread.clone()),
+            [] => ca::resumed_thread(&args.argv),
+            _ => return Err("threads-ambiguous"),
+        },
     };
     Ok(super::super::relaunch::Snapshot {
         tab: tab.to_string(),
@@ -886,7 +910,7 @@ pub(super) fn snapshot(
         run: super::super::relaunch::AgentRun::Codex(super::super::relaunch::CodexRun {
             home,
             home_env: args.env_var(ca::HOME_ENV).map(str::to_owned),
-            self_claimed: None,
+            self_claimed: primary.cloned(),
         }),
         dialect: (shell != NO_SHELL)
             .then(|| shell_dialect(shell, k, Vec::new))
@@ -897,6 +921,19 @@ pub(super) fn snapshot(
         stored_login: false,
         profile: None,
     })
+}
+
+/// A codex-alab's run without an explicit proven primary claim.
+pub(super) fn snapshot(
+    opts: &Opts,
+    tab: &str,
+    pid: u32,
+    start: String,
+    shell: u32,
+    args: &atpkg::caller_shell::ProcArgs,
+    k: &dyn AlabKernel,
+) -> Result<super::super::relaunch::Snapshot, &'static str> {
+    snapshot_with_claim(opts, tab, pid, start, shell, args, None, k)
 }
 
 /// Remove Codex records nothing will visit again.

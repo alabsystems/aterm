@@ -106,6 +106,9 @@ impl ProgramState {
 pub struct ProgramStateReport {
     /// Moves with every accepted report, `clear` and full reset included.
     pub seq: u64,
+    /// The `seq` of the report that began the one standing now: a report equal to the one
+    /// before it (a writer's re-send) keeps it, so one box re-sent is still one box.
+    pub began: u64,
     /// The report standing now; `None` after a `clear`, a reset, or before any.
     pub state: Option<ProgramState>,
     /// How many turns the accepted reports began: a `working` or `blocked` report begins one unless
@@ -121,7 +124,7 @@ impl ProgramStateReport {
         match parse(body) {
             Some(next) => {
                 self.seq = self.seq.wrapping_add(1);
-                self.state = match next {
+                let state = match next {
                     Body::Clear => None,
                     Body::Report(state) => {
                         if begins_a_turn(self.last, state.state) {
@@ -131,9 +134,47 @@ impl ProgramStateReport {
                         Some(state)
                     }
                 };
+                if state != self.state {
+                    self.began = self.seq;
+                }
+                self.state = state;
                 true
             }
             None => false,
+        }
+    }
+
+    /// The report standing now as the OSC 7501 body that says it
+    /// (`state=<word>:app=codex[:kind=<kind>]`), which a checkpoint carries ([`Self::restore`]);
+    /// `None` while none stands.
+    pub(super) fn carried(&self) -> Option<String> {
+        self.state.map(|state| match state.kind {
+            Some(kind) => format!(
+                "state={}:app=codex:kind={}",
+                state.state.as_str(),
+                kind.as_str()
+            ),
+            None => format!("state={}:app=codex", state.state.as_str()),
+        })
+    }
+
+    /// Install the report a checkpoint carried (`body`, [`Self::carried`]), read by this
+    /// reader's own parser, as a new report that begins no turn: a later report is judged
+    /// against it (a re-send of it keeps where it began). `None`, or a body this reader does not
+    /// take, leaves none standing. The sequence only moves forward.
+    pub(super) fn restore(&mut self, body: Option<&str>) {
+        let state = match body.and_then(parse) {
+            Some(Body::Report(state)) => Some(state),
+            Some(Body::Clear) | None => None,
+        };
+        if state == self.state {
+            return;
+        }
+        self.seq = self.seq.wrapping_add(1);
+        self.began = self.seq;
+        self.state = state;
+        if let Some(state) = state {
+            self.last = Some(state.state);
         }
     }
 
@@ -142,6 +183,7 @@ impl ProgramStateReport {
     pub(super) const fn reset(&mut self) {
         if self.state.is_some() {
             self.seq = self.seq.wrapping_add(1);
+            self.began = self.seq;
             self.state = None;
         }
     }
@@ -275,6 +317,78 @@ mod tests {
         assert!(report.accept("state=idle:app=codex"));
         report.reset();
         assert_eq!((report.seq, report.state), (5, None));
+    }
+
+    /// WHERE THE STANDING REPORT BEGAN: a report equal to the one standing (a writer's re-send)
+    /// keeps `began`; a different report, a kind that moved, a `clear` and a reset each begin
+    /// anew. NEGATIVE CONTROL: the re-sends, whose `seq` moves while `began` does not.
+    #[test]
+    fn a_report_sent_again_keeps_where_it_began() {
+        let mut report = ProgramStateReport::default();
+        let mut take = |body: &str| {
+            assert!(report.accept(body), "{body:?}");
+            (report.seq, report.began)
+        };
+        assert_eq!(take("state=blocked:app=codex:kind=permission"), (1, 1));
+        assert_eq!(
+            take("state=blocked:app=codex:kind=permission"),
+            (2, 1),
+            "a re-send"
+        );
+        assert_eq!(
+            take("state=blocked:app=codex:kind=question"),
+            (3, 3),
+            "the kind moved"
+        );
+        assert_eq!(take("state=working:app=codex"), (4, 4));
+        assert_eq!(take("state=working:app=codex"), (5, 4), "a re-send");
+        assert_eq!(take("state=clear"), (6, 6));
+        assert_eq!(take("state=clear"), (7, 6), "a clear sent again");
+        assert_eq!(take("state=blocked:app=codex"), (8, 8));
+        report.reset();
+        assert_eq!(
+            (report.seq, report.began),
+            (9, 9),
+            "a reset begins none standing"
+        );
+    }
+
+    /// A CARRIED REPORT: the standing report's body reads back as the same report, which
+    /// begins no turn, and a re-send of it keeps where it began; a body this reader does not
+    /// take, a `clear` and none leave none standing. NEGATIVE CONTROL: the same report taken
+    /// as a first report begins a turn.
+    #[test]
+    fn a_carried_report_stands_again_and_begins_no_turn() {
+        let mut live = ProgramStateReport::default();
+        assert!(live.accept("state=blocked:app=codex:kind=permission"));
+        assert_eq!(live.turns, 1, "CONTROL: a first report begins a turn");
+        let body = live.carried();
+        assert_eq!(
+            body.as_deref(),
+            Some("state=blocked:app=codex:kind=permission")
+        );
+        let mut restored = ProgramStateReport::default();
+        restored.restore(body.as_deref());
+        assert_eq!(restored.state, live.state);
+        assert_eq!((restored.seq, restored.began, restored.turns), (1, 1, 0));
+        assert!(restored.accept("state=blocked:app=codex:kind=permission"));
+        assert_eq!(
+            (restored.began, restored.turns),
+            (1, 0),
+            "a re-send of the carried box is the same box"
+        );
+        assert!(restored.accept("state=working:app=codex"));
+        assert_eq!(restored.turns, 0, "the carried turn goes on");
+        for body in [None, Some("state=clear"), Some("state=sleeping:app=codex")] {
+            let mut none = ProgramStateReport::default();
+            none.restore(body);
+            assert_eq!(none, ProgramStateReport::default(), "{body:?}");
+        }
+        let mut idle = ProgramStateReport::default();
+        assert!(idle.accept("state=idle:app=codex"));
+        assert_eq!(idle.carried().as_deref(), Some("state=idle:app=codex"));
+        idle.restore(None);
+        assert_eq!((idle.seq, idle.began, idle.state), (2, 2, None));
     }
 
     /// THE TURN COUNT: a turn begins at `working` or `blocked` after a report

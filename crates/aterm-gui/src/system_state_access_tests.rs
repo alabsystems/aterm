@@ -518,6 +518,103 @@ fn focus(app: &mut App, focused: bool) {
     }
 }
 
+/// A verified grant is also a recovery fact when Stop holds Permissions: an
+/// already-requested Restore still finishes, without a made-up access record.
+#[test]
+fn a_verified_fda_grant_recovers_a_waiting_restore_with_permissions_held() {
+    use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
+    use aterm_types::macos_setup::{PutBack, RestoreOutcome};
+
+    thread_local! {
+        static RECOVERY: RefCell<(bool, u32, u32)> = const { RefCell::new((false, 0, 0)) };
+    }
+
+    fn app() -> App {
+        RECOVERY.with(|state| *state.borrow_mut() = (false, 0, 0));
+        let mut app = App::headless_for_test();
+        app.access_steps.set_reach(stepping());
+        app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(FdaProbe {
+            state: FdaState::Granted,
+            label: ProbeLabel::OpenOk,
+        });
+        app.set_system_state_handlers_for_test(crate::InitialSetupHandlers {
+            fda_granted: || {
+                RECOVERY.with(|state| {
+                    let mut state = state.borrow_mut();
+                    state.1 += 1;
+                    if std::mem::take(&mut state.0) {
+                        state.2 += 1;
+                    }
+                });
+            },
+            ..crate::InitialSetupHandlers::inert_for_test()
+        });
+        app
+    }
+
+    let now = Instant::now();
+    let before = records().len();
+    let mut nothing_owed = app();
+    nothing_owed.note_macos_access_granted(now);
+    assert_eq!(RECOVERY.with(|state| state.borrow().2), 0);
+    assert_eq!(records().len(), before, "no invented access revision");
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut foreign = app();
+        foreign
+            .consent
+            .set_responsible_for_test(|pids| pids.iter().map(|_| Ok(1)).collect());
+        RECOVERY.with(|state| state.borrow_mut().0 = true);
+        foreign.note_macos_access_granted(now);
+        assert_eq!(RECOVERY.with(|state| *state.borrow()), (true, 0, 0));
+        assert_eq!(
+            records().len(),
+            before,
+            "a parent's grant is no FDA fact here"
+        );
+    }
+
+    // An approved grant keeps its existing record/append route: one line for
+    // the outcome, without also starting the no-revision fallback.
+    let mut approved = app();
+    approve(&mut approved, 8_310);
+    approved.note_macos_access_granted(now);
+    approved.note_macos_access_granted(now);
+    assert_eq!(
+        &records()[before..],
+        [(8_310, Access::FullDiskAccess, AccessOutcome::Granted)]
+    );
+    assert_eq!(RECOVERY.with(|state| state.borrow().1), 0);
+
+    let mut held = app();
+    approve(&mut held, 8_311);
+    held.stop_initial_setup_permissions();
+    let waiting = crate::system_state::restore_rows(&RestoreOutcome::of([(
+        Some(Setting::Widgets),
+        PutBack::Waits,
+    )]));
+    held.publish_system_state(SetupStatus {
+        plan: Some(Plan::default()),
+        rows: waiting,
+        ..SetupStatus::default()
+    });
+    RECOVERY.with(|state| state.borrow_mut().0 = true);
+    let before = records().len();
+    held.resolve_fda_need(false, now);
+    assert_eq!(RECOVERY.with(|state| *state.borrow()), (true, 0, 0));
+    held.note_macos_access_granted(now);
+    assert_eq!(
+        RECOVERY.with(|state| state.borrow().2),
+        1,
+        "the verified grant must reach the waiting Restore despite Stop"
+    );
+    assert!(!RECOVERY.with(|state| state.borrow().0));
+    assert_eq!(records().len(), before, "a completed fact is no admission");
+    assert!(held.access_revision().is_none());
+    assert!(held.admitted_access().is_none());
+}
+
 /// The Local Network step: nothing before an approved revision; then once per revision, first,
 /// recorded `triggered`, its alert counted as up for its hold (no later step meanwhile); a new
 /// revision asks again.
@@ -4168,58 +4265,4 @@ fn a_switch_toggled_twice_brings_the_page_once() {
         assert_eq!(test_arms::fda_counts().0 - opens, 1, "{off}: one page");
         assert!(!app.consent_card_host.launch_held, "{off}: nothing held");
     }
-}
-
-/// Through the real tick, while System State offers the Debugger row's `Turn On…` the window takes
-/// its own reading of debugger access, so the person's first press finds this aterm's hardening
-/// read rather than starting nothing; with nothing offered it takes none, and one reading in hand
-/// is not taken again.
-#[cfg(target_os = "macos")]
-#[test]
-fn an_offered_debugger_turn_on_has_the_windows_reading_in_hand() {
-    use crate::devtools_helper::test_arms;
-    use crate::native_app::NativeApp;
-    let debugger = Subject::Access(Access::Debugger);
-    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
-    app.access_steps.set_reach(stepping());
-    set_front(true);
-    assert!(app.open_system_state_tab());
-    let wid = app.frontmost_window.unwrap();
-    let (instance, _) = app.active_native_view(wid).unwrap();
-    let offered = |app: &App| {
-        matches!(app.native_runtime.app(instance),
-            Some(NativeApp::SystemState(page)) if page.can_open_access(Access::Debugger))
-    };
-
-    app.publish_system_state(status(
-        Selection::all(),
-        vec![observed(debugger, Standing::InPlace, None)],
-    ));
-    assert!(
-        !offered(&app),
-        "PRECONDITION: on already, so nothing offered"
-    );
-    app.tick_consent_lanes(Instant::now());
-    assert!(
-        app.consent.debugger_slot_idle_for_test(),
-        "nothing offered, nothing read"
-    );
-
-    app.publish_system_state(status(
-        Selection::all(),
-        vec![observed(debugger, Standing::NeedsYou, None)],
-    ));
-    assert!(offered(&app), "PRECONDITION: Turn On… offered");
-    app.tick_consent_lanes(Instant::now());
-    let gate = app.config.privacy_probe_gate();
-    aterm_spec::wait::until_within(
-        aterm_spec::wait::MUST_HAPPEN,
-        "the window's own reading of debugger access",
-        || app.consent.debugger_cached(gate).map(|_| ()),
-    );
-    app.tick_consent_lanes(Instant::now());
-    assert!(
-        !app.consent.debugger_in_flight_for_test(),
-        "a reading in hand is not taken again"
-    );
 }

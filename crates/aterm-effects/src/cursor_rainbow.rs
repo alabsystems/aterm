@@ -16,7 +16,7 @@ use crate::cursor_glow::{
     RAINBOW_CARET_LIGHT_FLOOR, RAINBOW_FIELD_LEVEL, RAINBOW_SPARKLE_LIGHT_SHARE,
     rainbow_phase_from_unit_turn, rainbow_sweep_at, rainbow_sweep_reflect, rainbow_thing_of,
 };
-use crate::effect_util::{lerp, mix_rgb};
+use crate::effect_util::{lerp, lerp_rgb as mix_rgb};
 use crate::rainbow_kitty::timing::spring_snap;
 
 /// Base colour the rainbow blooms from when the host names none.
@@ -156,7 +156,7 @@ struct RimMemo {
 
 /// Extrapolate a released envelope `ahead` seconds past its last sample pair.
 #[inline]
-fn release_forecast(now_v: f32, prev_v: f32, dt: f32, ahead: f32) -> Option<f32> {
+const fn release_forecast(now_v: f32, prev_v: f32, dt: f32, ahead: f32) -> Option<f32> {
     if now_v <= 0.0 {
         return Some(0.0);
     }
@@ -164,10 +164,14 @@ fn release_forecast(now_v: f32, prev_v: f32, dt: f32, ahead: f32) -> Option<f32>
         return None;
     }
     if dt <= 0.0 || prev_v <= now_v {
-        return (now_v <= SETTLED_ENERGY).then_some(now_v);
+        return if now_v <= SETTLED_ENERGY {
+            Some(now_v)
+        } else {
+            None
+        };
     }
     let ratio = (now_v / prev_v).clamp(1e-3, 1.0);
-    Some(now_v * ratio.powf(ahead / dt))
+    Some(now_v * crate::color_math::powf_pos_f32(ratio, ahead / dt))
 }
 
 /// Resolved per-frame inputs.
@@ -1238,7 +1242,7 @@ fn push_ring_rect(
 
 /// Sample the family spectrum at `sweep + off`.
 #[inline]
-fn spectrum_at(sweep: f32, off: f32) -> u32 {
+const fn spectrum_at(sweep: f32, off: f32) -> u32 {
     rainbow_thing_of(rainbow_sweep_reflect(sweep + off))
 }
 
@@ -1264,14 +1268,17 @@ const fn shade(rgb: u32, s: f32, v: f32) -> u32 {
 const CARET_LIGHT_KNEE: f32 = 0.25;
 
 /// Lift a colour toward white until its relative luminance reaches `floor`.
-pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
+pub(crate) const fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
     let floor = floor.clamp(0.0, 255.0);
     if floor <= 0.0 || (rgb & 0x00FF_FFFF) == 0x00FF_FFFF {
         return rgb;
     }
     let table = crate::color_math::relative_luminance_table();
-    let light = |c: u32| crate::color_math::relative_luminance_with(table, c) * 255.0;
-    if light(rgb) >= floor {
+    #[inline]
+    const fn light(table: &crate::color_math::RelativeLuminanceTable, c: u32) -> f32 {
+        crate::color_math::relative_luminance_with(table, c) * 255.0
+    }
+    if light(table, rgb) >= floor {
         return rgb;
     }
     if floor >= 255.0 {
@@ -1279,7 +1286,9 @@ pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (rgb & 0x00FF_FFFF, 0x00FF_FFFF);
-    for _ in 0..20 {
+    let mut step = 0;
+    while step < 20 {
+        step += 1;
         let mid = 0.5 * (lo + hi);
         let mid_rgb = mix_rgb(rgb, 0x00FF_FFFF, mid);
         if mid_rgb == lo_rgb {
@@ -1290,7 +1299,7 @@ pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
             hi = mid;
             continue;
         }
-        if light(mid_rgb) < floor {
+        if light(table, mid_rgb) < floor {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -1323,7 +1332,7 @@ const fn light_on_glass_with(
 }
 
 /// Solve one ring's premultiplied colour on `page` for [`RIM_LIGHT`].
-fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
+const fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     debug_assert!(
         (crate::color_math::relative_luminance_with(table, RIM_LIGHT_GREY) - RIM_LIGHT).abs()
@@ -1335,24 +1344,27 @@ fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
         ((page >> 8) & 0xff) as usize,
         (page & 0xff) as usize,
     );
-    let light = |premul: u32| -> f32 { light_on_glass_with(table, page_rgb, premul) };
     let base = crate::color_math::relative_luminance_rgb(table, page_rgb.0, page_rgb.1, page_rgb.2);
-    let target = (light(premul_rgb(RIM_LIGHT_GREY, cov)) - base) * scale;
-    let candidate = |u: f32| -> u32 {
+    let target =
+        (light_on_glass_with(table, page_rgb, premul_rgb(RIM_LIGHT_GREY, cov)) - base) * scale;
+    #[inline]
+    const fn candidate(arc: u32, cov: u8, u: f32) -> u32 {
         if u < 0.0 {
             premul_rgb(mix_rgb(arc, 0x0000_0000, -u), cov)
         } else {
             premul_rgb(mix_rgb(arc, 0x00FF_FFFF, u), cov)
         }
-    };
+    }
     let (mut lo, mut hi) = (-1.0f32, 1.0f32);
-    let lo_c = candidate(lo);
-    let hi_c = candidate(hi);
-    let mut lo_eval = (lo_c, light(lo_c) - base);
-    let mut hi_eval = (hi_c, light(hi_c) - base);
-    for _ in 0..22 {
+    let lo_c = candidate(arc, cov, lo);
+    let hi_c = candidate(arc, cov, hi);
+    let mut lo_eval = (lo_c, light_on_glass_with(table, page_rgb, lo_c) - base);
+    let mut hi_eval = (hi_c, light_on_glass_with(table, page_rgb, hi_c) - base);
+    let mut step = 0;
+    while step < 22 {
+        step += 1;
         let mid = 0.5 * (lo + hi);
-        let c = candidate(mid);
+        let c = candidate(arc, cov, mid);
         if c == lo_eval.0 && lo_eval.1 < target {
             lo = mid;
             continue;
@@ -1361,7 +1373,7 @@ fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
             hi = mid;
             continue;
         }
-        let added = light(c) - base;
+        let added = light_on_glass_with(table, page_rgb, c) - base;
         if added < target {
             lo = mid;
             lo_eval = (c, added);
@@ -1374,7 +1386,6 @@ fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
         }
     }
     let target_light = base + target;
-    let err = |premul: u32| (light(premul) - target_light).abs();
     let (a, err_a) = (lo_eval.0, (lo_eval.1 - target).abs());
     let (b, err_b) = (hi_eval.0, (hi_eval.1 - target).abs());
     let (mut best, mut best_err) = if err_a <= err_b {
@@ -1382,59 +1393,57 @@ fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
     } else {
         (b, err_b)
     };
-    let ch = |c: u32| {
-        [
-            ((c >> 16) & 0xff) as i32,
-            ((c >> 8) & 0xff) as i32,
-            (c & 0xff) as i32,
-        ]
-    };
-    let sector_of = |c: [i32; 3]| {
-        [
-            (c[0] - c[1]).signum(),
-            (c[1] - c[2]).signum(),
-            (c[0] - c[2]).signum(),
-        ]
-    };
-    let seed = ch(best);
-    let sector = sector_of(seed);
-    for dr in -1..=1 {
+    let seed = [
+        ((best >> 16) & 0xff) as i32,
+        ((best >> 8) & 0xff) as i32,
+        (best & 0xff) as i32,
+    ];
+    let sector = [
+        (seed[0] - seed[1]).signum(),
+        (seed[1] - seed[2]).signum(),
+        (seed[0] - seed[2]).signum(),
+    ];
+    let mut dr = -1;
+    while dr <= 1 {
         let r = seed[0] + dr;
-        if !(0..=255).contains(&r) {
-            continue;
+        if r >= 0 && r <= 255 {
+            let r_packed = (r as u32) << 16;
+            let mut dg = -1;
+            while dg <= 1 {
+                let g = seed[1] + dg;
+                if g >= 0 && g <= 255 {
+                    let rg_sig = (r - g).signum();
+                    if rg_sig == 0 || rg_sig == sector[0] {
+                        let rg_packed = r_packed | ((g as u32) << 8);
+                        let mut db = -1;
+                        while db <= 1 {
+                            if !(dr == 0 && dg == 0 && db == 0) {
+                                let b = seed[2] + db;
+                                if b >= 0 && b <= 255 {
+                                    let gb_sig = (g - b).signum();
+                                    let rb_sig = (r - b).signum();
+                                    if (gb_sig == 0 || gb_sig == sector[1])
+                                        && (rb_sig == 0 || rb_sig == sector[2])
+                                    {
+                                        let packed = rg_packed | b as u32;
+                                        let e = (light_on_glass_with(table, page_rgb, packed)
+                                            - target_light)
+                                            .abs();
+                                        if e < best_err {
+                                            best_err = e;
+                                            best = packed;
+                                        }
+                                    }
+                                }
+                            }
+                            db += 1;
+                        }
+                    }
+                }
+                dg += 1;
+            }
         }
-        let r_packed = (r as u32) << 16;
-        for dg in -1..=1 {
-            let g = seed[1] + dg;
-            if !(0..=255).contains(&g) {
-                continue;
-            }
-            let rg_sig = (r - g).signum();
-            if rg_sig != 0 && rg_sig != sector[0] {
-                continue;
-            }
-            let rg_packed = r_packed | ((g as u32) << 8);
-            for db in -1..=1 {
-                if dr == 0 && dg == 0 && db == 0 {
-                    continue;
-                }
-                let b = seed[2] + db;
-                if !(0..=255).contains(&b) {
-                    continue;
-                }
-                let gb_sig = (g - b).signum();
-                let rb_sig = (r - b).signum();
-                if (gb_sig != 0 && gb_sig != sector[1]) || (rb_sig != 0 && rb_sig != sector[2]) {
-                    continue;
-                }
-                let packed = rg_packed | b as u32;
-                let e = err(packed);
-                if e < best_err {
-                    best_err = e;
-                    best = packed;
-                }
-            }
-        }
+        dr += 1;
     }
     best
 }

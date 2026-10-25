@@ -1284,6 +1284,24 @@ impl WindowLights {
         self.selection_painted = false;
     }
 
+    /// Let `session`'s turning state go once `face` has reached the side it was turning toward.
+    pub(crate) fn note_switch_face(
+        &mut self,
+        session: u64,
+        face: Option<crate::autopilot::HarnessSwitch>,
+    ) {
+        if let Some(s) = self.sessions.get_mut(&session)
+            && let Some((on, _)) = s.switch_turning
+            && !matches!(
+                (on, face),
+                (true, Some(crate::autopilot::HarnessSwitch::Off(_)))
+                    | (false, Some(crate::autopilot::HarnessSwitch::On))
+            )
+        {
+            s.switch_turning = None;
+        }
+    }
+
     /// Fold in `session`'s Autopilot as this frame's footer read it.
     fn note_autopilot_at(
         &mut self,
@@ -1296,20 +1314,12 @@ impl WindowLights {
         let s = self.sessions.entry(session).or_default();
         s.autopilot = Some(view);
         s.glass = glass;
-        if let Some((on, _)) = s.switch_turning
-            && !matches!(
-                (on, crate::autopilot::HarnessSwitch::of(view)),
-                (true, Some(crate::autopilot::HarnessSwitch::Off(_)))
-                    | (false, Some(crate::autopilot::HarnessSwitch::On))
-            )
-        {
-            s.switch_turning = None;
-        }
         if s.autopilot_pending
             .is_some_and(|(want, until)| word == Some(want) || until <= now())
         {
             s.autopilot_pending = None;
         }
+        self.note_switch_face(session, crate::autopilot::HarnessSwitch::of(view));
     }
 
     /// Fold in whether `session`'s mode pill is relabelled on its pane's glass this frame.

@@ -1255,9 +1255,9 @@ impl<C: Ctl> Session<'_, C> {
                 None => self.turn_read_whole(screen, reader, true),
             };
             // Rows read up to the history's start are all the turn the terminal holds.
-            reading.ran_tools = read
-                .filter(|(rows, start)| *start || !reader.turn_opens_above(rows))
-                .is_none_or(|(rows, _)| reader.turn_ran_tools(&rows));
+            let whole = read.filter(|(rows, start)| *start || !reader.turn_opens_above(rows));
+            reading.tools_unread = whole.is_none();
+            reading.ran_tools = whole.is_none_or(|(rows, _)| reader.turn_ran_tools(&rows));
         }
         if check == Check::Decide {
             reading.repo = self.repo_read(&reading, host, worked.is_some());
@@ -3252,7 +3252,9 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// Escalate when text was typed into the composer but not submitted.
+    /// Escalate when text was typed into the composer but not submitted, unless Claude Code's
+    /// auto-mode setup offer rose over it: that box is the harness's to answer at every level,
+    /// and the turn's end is decided again once it is gone.
     fn left_typed(
         &mut self,
         point: &Turn,
@@ -3260,6 +3262,15 @@ impl<C: Ctl> Session<'_, C> {
         why: &str,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        if self.offer_rose(&point.screen.rows) {
+            review.note(&format!(
+                "SKIPPED seq={} typed, not submitted ({why}): `{}`; the auto-mode setup offer \
+                 rose over it: it is answered, then the turn's end is decided again",
+                point.screen.seq,
+                clip(text)
+            ));
+            return Ok(());
+        }
         let reason = format!("typed, not submitted ({why}): `{}`", clip(text));
         let attention = escalate::attention_text(self.reader(&point.screen.rows), point, &reason);
         self.escalate(
@@ -3271,6 +3282,15 @@ impl<C: Ctl> Session<'_, C> {
         )?;
         self.turn_end_badge = true;
         Ok(())
+    }
+
+    /// Whether Claude Code's auto-mode setup offer is up on `rows`: it rises at a turn's end over
+    /// keys just written and takes them, and the approval loop answers it before the turn's end
+    /// is decided again.
+    fn offer_rose(&self, rows: &[String]) -> bool {
+        self.reader(rows)
+            .prompt(rows)
+            .is_some_and(|p| p.kind == aterm_phase::PromptKind::AutoModeSetup)
     }
 
     /// Type and submit `text` via [`Self::type_fenced`] when supported ([`Self::type_guarded`]).
@@ -4282,6 +4302,18 @@ impl<C: Ctl> Session<'_, C> {
                     // Input the worker has not drawn: no act goes behind it on
                     // this screen ([`Self::input_unread`]).
                     self.input_unread_at = Some((now.seq, self.fx.mono()));
+                }
+                let stands = self
+                    .reader(&now.rows)
+                    .composer(&now.rows)
+                    .is_some_and(|(_, lines)| squashed(&lines.concat()) == squashed(USAGE_COMMAND));
+                if self.offer_rose(&now.rows) && !stands {
+                    return not(
+                        ProbeMiss::NotWritten,
+                        "the auto-mode setup offer rose over the write; it is answered, then the \
+                         probe is tried again",
+                        Probed::Again,
+                    );
                 }
                 let miss = if why == ECHO_PERSON {
                     ProbeMiss::Person

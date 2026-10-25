@@ -155,10 +155,13 @@ fn the_installed_bundle_gate_verifies_like_a_fresh_install() {
 /// answer. The files callers name in BOUNDED_TEMPS go with the run, those of
 /// each caller a nested one extends. The script resets the run's INT trap, as
 /// the subshells and command substitutions bounded mostly runs in do, so
-/// bounded's own traps are what end it and what remove them (the temps row);
-/// first_line_bounded sets the run's again (end_on_ctrl_c), whose trap removes
-/// them as well, its own file among them (the line row). In every row CMD is
-/// killed. A Ctrl-\ (the quit row) kills it too: bounded's subshell used to die
+/// bounded's own traps are what end it and what remove them (the temps row,
+/// where nothing else could). In the line row first_line_bounded sets the
+/// run's trap again (end_on_ctrl_c), and either trap removes its file and its
+/// caller's: that row holds it to extending its caller's array, never
+/// shadowing it. The read row of a_ctrl_c_in_a_check_leaves_none_of_its_files
+/// holds the run's trap. In every row
+/// CMD is killed. A Ctrl-\ (the quit row) kills it too: bounded's subshell used to die
 /// of the signal and leave CMD running, in a process group of its own the
 /// terminal's signal never reaches. CMD's output goes nowhere the call reads, so
 /// one that lives on is named (orphan) and killed once the call's minute is up;
@@ -417,8 +420,8 @@ fn a_ctrl_c_never_empties_the_config() {
 #!/bin/sh
 case \"$1:$SIG\" in
 *:) ;;
-*/aterm-config.*:INT | */aterm-config.*:QUIT) kill -s \"$SIG\" 0 ;;
-*/aterm-config.*:*) kill -s \"$SIG\" \"$PPID\" ;;
+*/.aterm-config.*:INT | */.aterm-config.*:QUIT) kill -s \"$SIG\" 0 ;;
+*/.aterm-config.*:*) kill -s \"$SIG\" \"$PPID\" ;;
 esac
 exec /bin/cat \"$@\"
 EOF
@@ -441,7 +444,7 @@ if [ \"$1\" = made ]; then
 \t}
 elif [ \"$1\" = removed ]; then
 \trm() {
-\t\tcase \"$*\" in */aterm-config.*) [ -e \"$TMPDIR/sent-removed\" ] || { : >\"$TMPDIR/sent-removed\"; kill -s TERM $$; } ;; esac
+\t\tcase \"$*\" in */.aterm-config.*) [ -e \"$TMPDIR/sent-removed\" ] || { : >\"$TMPDIR/sent-removed\"; kill -s TERM $$; } ;; esac
 \t\tcommand rm \"$@\"
 \t}
 fi
@@ -470,7 +473,7 @@ EOF",
                     "echo \"$({}) $(cat \"$TMPDIR/cleaned-{sig}\" 2>/dev/null)\" \
                      $(printf '[packages]\\nauto_install = false\\nkeep = 1\\n' | cmp -s - \"$TMPDIR/aterm-{sig}.toml\" && echo whole) \
                      $(printf '[packages]\\nkeep = 1\\n' | cmp -s - \"$TMPDIR/aterm-{sig}.toml\" && echo untouched) \
-                     $(ls \"$TMPDIR\" | grep -c '^aterm-config') $(cat \"$TMPDIR/later-{sig}\" 2>/dev/null)",
+                     $(ls -A \"$TMPDIR\" | grep -c '^[.]aterm-config[.]') $(cat \"$TMPDIR/later-{sig}\" 2>/dev/null)",
                     group_run(&format!("\"$TMPDIR/config.bash\" {sig}"))
                 ),
                 &[],
@@ -490,15 +493,137 @@ EOF",
     }
 }
 
-/// A Ctrl-C at any instant of a check leaves none of its temporary files: the
-/// mktemp stand-in sends it once mktemp has run. Before, mktemp made the file
-/// and the step named it in BOUNDED_TEMPS only after, so one caught in between
-/// stayed in TMPDIR. Asked for a name alone (-u), the stand-in makes the file
-/// and removes it again after the Ctrl-C, as macOS's mktemp does (mkstemp, then
-/// unlink), so one the Ctrl-C ended in between leaves a file nothing named,
-/// whatever mktemp the host has. first_line_bounded runs in a command
-/// substitution, whose subshell starts with the run's traps reset, so its file
-/// stayed when the Ctrl-C landed outside bounded (the read row: in its head).
+/// A rewrite that cannot finish loses nothing: cat's redirection empties the
+/// file before cat refills it, so when cat fails (a full volume, a quota) the
+/// copy is the config's only whole text. It stays, next to the file, and the
+/// NOTE names it with the command that puts it back, which the test runs.
+/// Before, it went with the rest, and the run said only that it could not write
+/// the file; and kept in TMPDIR, the OS could empty it before the cp ran. A
+/// config this run cannot read is never said to be written (unread): the plan's
+/// awk failed, and the empty plan fell through to the line saying the key was
+/// written, over a file still saying `auto_install = true`. One it can read but
+/// not write (readonly) is left as it is, with no copy and no NOTE: the
+/// refill's open failed with the file untouched, and the NOTE said it might be
+/// empty. So is one an ACL lets it append to but not write (macOS's chmod +a,
+/// deny write), which an append that wrote nothing let through to that NOTE,
+/// while one an ACL lets it write but not append to (deny append) is written,
+/// where that append refused it. A config it can write in a folder that takes
+/// no new file (shut) is written, its copy made in TMPDIR: refused a copy
+/// beside it, the run left it unwritten. When its refill fails there (shut
+/// full), the NOTE's command puts it back without sudo, which the test runs only
+/// once it has seen none: asked of the folder, the NOTE said sudo to a file this
+/// account can write. The cat stand-in fails as a full volume does, after the
+/// redirection has emptied the file.
+#[test]
+fn a_config_rewrite_that_cannot_finish_loses_nothing() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(
+        "mkdir -p \"$TMPDIR/full\" && printf '#!/bin/sh\\nexit 1\\n' >\"$TMPDIR/full/cat\" && chmod +x \"$TMPDIR/full/cat\"",
+    );
+    let full = lib.call(
+        "mkdir -p \"$HOME/full\"; cfg=\"$HOME/full/aterm.toml\"; printf '[packages]\\nkeep = 1\\n' >\"$cfg\"; s=0; \
+         note=\"$(PATH=\"$TMPDIR/full:$PATH\" persist_no_toolchain \"$cfg\" 2>&1 >/dev/null)\" || s=$?; \
+         left=\"$(wc -c <\"$cfg\" | tr -d ' ') $(ls -A \"$HOME/full\" | grep -c '^[.]aterm-config[.]')\"; \
+         eval \"$(printf '%s\\n' \"$note\" | sed -n 's/.*(put it back with: \\(.*\\))$/\\1/p')\"; \
+         echo \"$s $left $(printf '[packages]\\nauto_install = false\\nkeep = 1\\n' | cmp -s - \"$cfg\" && echo whole)\"",
+        &[],
+    );
+    let unread = lib.call(
+        "cfg=\"$HOME/unread.toml\"; printf '[packages]\\nauto_install = true\\n' >\"$cfg\"; chmod 000 \"$cfg\"; s=0; \
+         said=\"$(persist_no_toolchain \"$cfg\" 2>/dev/null)\" || s=$?; chmod 600 \"$cfg\"; \
+         echo \"$s [$said] $(tr '\\n' ' ' <\"$cfg\")\"",
+        &[],
+    );
+    let readonly = lib.call(
+        "mkdir -p \"$HOME/readonly\"; cfg=\"$HOME/readonly/aterm.toml\"; printf '[packages]\\nkeep = 1\\n' >\"$cfg\"; chmod 444 \"$cfg\"; s=0; \
+         said=\"$(persist_no_toolchain \"$cfg\" 2>&1)\" || s=$?; chmod 644 \"$cfg\"; \
+         echo \"$s $(ls -A \"$HOME/readonly\" | grep -c '^[.]aterm-config[.]') $([[ \"$said\" == *NOTE* ]] && echo note || echo quiet) \
+         $(printf '[packages]\\nkeep = 1\\n' | cmp -s - \"$cfg\" && echo untouched)\"",
+        &[],
+    );
+    let shut = lib.call(
+        "mkdir -p \"$HOME/shut\" \"$TMPDIR/copies\"; cfg=\"$HOME/shut/aterm.toml\"; printf '[packages]\\nkeep = 1\\n' >\"$cfg\"; \
+         chmod 555 \"$HOME/shut\"; s=0; TMPDIR=\"$TMPDIR/copies\" persist_no_toolchain \"$cfg\" >/dev/null 2>&1 || s=$?; chmod 755 \"$HOME/shut\"; \
+         echo \"$s $(ls -A \"$HOME/shut\" \"$TMPDIR/copies\" | grep -c 'aterm-config[.]') \
+         $(printf '[packages]\\nauto_install = false\\nkeep = 1\\n' | cmp -s - \"$cfg\" && echo whole)\"",
+        &[],
+    );
+    let shut_full = lib.call(
+        "mkdir -p \"$HOME/shutfull\" \"$TMPDIR/copied\"; cfg=\"$HOME/shutfull/aterm.toml\"; printf '[packages]\\nkeep = 1\\n' >\"$cfg\"; \
+         chmod 555 \"$HOME/shutfull\"; s=0; full=\"$TMPDIR/full\"; \
+         note=\"$(TMPDIR=\"$TMPDIR/copied\" PATH=\"$full:$PATH\" persist_no_toolchain \"$cfg\" 2>&1 >/dev/null)\" || s=$?; \
+         cmd=\"$(printf '%s\\n' \"$note\" | sed -n 's/.*(put it back with: \\(.*\\))$/\\1/p')\"; \
+         if [[ -z \"$cmd\" || \"$cmd\" == sudo* ]]; then said=\"[$cmd]\"; else eval \"$cmd\"; said=plain; fi; chmod 755 \"$HOME/shutfull\"; \
+         echo \"$s $(ls -A \"$TMPDIR/copied\" | grep -c '^aterm-config[.]') $said \
+         $(printf '[packages]\\nauto_install = false\\nkeep = 1\\n' | cmp -s - \"$cfg\" && echo whole)\"",
+        &[],
+    );
+    let acl = cfg!(target_os = "macos").then(|| {
+        ["write", "append"].map(|deny| {
+            lib.call(
+                format!(
+                    "mkdir -p \"$HOME/acl-{deny}\"; cfg=\"$HOME/acl-{deny}/aterm.toml\"; printf '[packages]\\nkeep = 1\\n' >\"$cfg\"; \
+                     chmod +a \"$(id -un) deny {deny}\" \"$cfg\"; s=0; said=\"$(persist_no_toolchain \"$cfg\" 2>&1)\" || s=$?; chmod -N \"$cfg\"; \
+                     echo \"$s $(ls -A \"$HOME/acl-{deny}\" | grep -c '^[.]aterm-config[.]') $([[ \"$said\" == *NOTE* ]] && echo note || echo quiet) \
+                     $(tr '\\n' ' ' <\"$cfg\")\""
+                ),
+                &[],
+            )
+        })
+    });
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[full].out, "1 0 1 whole", "{}", recs[full].err);
+    assert_eq!(
+        recs[readonly].out, "1 0 quiet untouched",
+        "{}",
+        recs[readonly].err
+    );
+    assert_eq!(
+        recs[unread].out, "1 [] [packages] auto_install = true ",
+        "{}",
+        recs[unread].err
+    );
+    assert_eq!(recs[shut].out, "0 0 whole", "{}", recs[shut].err);
+    assert_eq!(
+        recs[shut_full].out, "1 1 plain whole",
+        "{}",
+        recs[shut_full].err
+    );
+    if let Some([write, append]) = acl {
+        assert_eq!(
+            recs[write].out, "1 0 quiet [packages] keep = 1 ",
+            "{}",
+            recs[write].err
+        );
+        assert_eq!(
+            recs[append].out, "0 0 quiet [packages] auto_install = false keep = 1 ",
+            "{}",
+            recs[append].err
+        );
+    }
+}
+
+/// A Ctrl-C at any instant of a check leaves none of its temporary files, nor
+/// does one while the run makes a copy or a folder of its own: each is named
+/// for the cleanup before it exists (probe_temp, temp_dir). Before, mktemp made
+/// the file and the step named it in BOUNDED_TEMPS only after, so one caught in
+/// between stayed: a check's file in TMPDIR, the store's partial copy
+/// (place_store_binary), a root run's staging folder in the Applications folder
+/// (stage_bundle), and the download folder install_app and install_linux_app
+/// made before setting their cleanup (make_download_dir). The Ctrl-C comes once
+/// a file is made and named (probe_temp's `printf -v`), once a folder is made (a
+/// mkdir stand-in), or, from a mktemp stand-in, once mktemp has made the file or
+/// folder and before its name reaches the shell; asked for a name alone (-u),
+/// the stand-in then removes what it made, as macOS's mktemp does (mkstemp,
+/// then unlink). One while a name is drawn ends the run at once (the draw row,
+/// whose od stand-in then sleeps past the hang detector's minute, so a run it
+/// does not end ends by itself): drawn by mktemp -u with the signals ignored,
+/// the name held a Ctrl-C until the draw returned.
+/// first_line_bounded runs in a command substitution, whose subshell starts
+/// with the run's traps reset, so its file stayed when the Ctrl-C landed
+/// outside bounded (the read row: in its head). Each row has a TMPDIR of its
+/// own.
 #[test]
 fn a_ctrl_c_in_a_check_leaves_none_of_its_files() {
     let scratch = Scratch::new();
@@ -507,11 +632,17 @@ fn a_ctrl_c_in_a_check_leaves_none_of_its_files() {
     lib.step(
         "mkdir -p \"$TMPDIR/bin\" \"$TMPDIR/app/Contents/MacOS\" && cat >\"$TMPDIR/bin/mktemp\" <<'EOF'
 #!/bin/sh
-s=0 f=
-if [ \"$1\" = -u ]; then shift; f=\"$(\"$REAL_MKTEMP\" \"$@\")\" || exit; else \"$REAL_MKTEMP\" \"$@\" || s=$?; fi
-[ \"$ROW\" = read ] || [ -e \"$TMPDIR/sent-$ROW\" ] || { : >\"$TMPDIR/sent-$ROW\"; kill -s INT 0; }
-[ -z \"$f\" ] || { rm -f \"$f\"; echo \"$f\"; }
-exit $s
+u=
+[ \"$1\" != -u ] || { u=1; shift; }
+f=\"$(\"$REAL_MKTEMP\" \"$@\")\" || exit
+[ \"$ROW\" = read ] || [ -e \"$O/sent-$ROW\" ] || { : >\"$O/sent-$ROW\"; kill -s INT 0; }
+[ -z \"$u\" ] || rm -f \"$f\"
+echo \"$f\"
+EOF
+cat >\"$TMPDIR/bin/mkdir\" <<'EOF'
+#!/bin/sh
+\"$REAL_MKDIR\" \"$@\" || exit
+case $ROW in stage | app | linux) [ -e \"$O/sent-$ROW\" ] || { : >\"$O/sent-$ROW\"; kill -s INT 0; } ;; esac
 EOF
 cat >\"$TMPDIR/bin/head\" <<'EOF'
 #!/bin/sh
@@ -519,25 +650,63 @@ cat >\"$TMPDIR/bin/head\" <<'EOF'
 exec \"$REAL_HEAD\" \"$@\"
 EOF
 printf '#!/bin/sh\\necho aterm 1.0\\n' >\"$TMPDIR/aterm\" && \
-chmod +x \"$TMPDIR/bin/mktemp\" \"$TMPDIR/bin/head\" \"$TMPDIR/aterm\" && cat >\"$TMPDIR/make.bash\" <<'EOF'
+chmod +x \"$TMPDIR/bin/mktemp\" \"$TMPDIR/bin/mkdir\" \"$TMPDIR/bin/head\" \"$TMPDIR/aterm\" && \
+cat >\"$TMPDIR/make.bash\" <<'EOF'
 ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
-export ROW=$1 REAL_MKTEMP=\"$(command -v mktemp)\" REAL_HEAD=\"$(command -v head)\"
-printf '[packages]\\nkeep = 1\\n' >\"$TMPDIR/cfg-$1.toml\"
-PATH=\"$TMPDIR/bin:$PATH\"
-trap 'echo cleaned >\"$TMPDIR/cleaned-$ROW\"' EXIT
-case \"$1\" in
-version) linux_candidate_answers_tag \"$TMPDIR/aterm\" v1.0 ;;
-line | read) said=\"$(first_line_bounded \"$TMPDIR/aterm\" --version)\" ;;
-showed) showed_it_ran \"$TMPDIR/aterm\" ;;
-inventory) bundle_showed_it_ran \"$TMPDIR/app\" ;;
-config) persist_no_toolchain \"$TMPDIR/cfg-$1.toml\" ;;
+export ROW=$1 O=$TMPDIR REAL_MKTEMP=\"$(command -v mktemp)\" REAL_HEAD=\"$(command -v head)\" REAL_MKDIR=\"$(command -v mkdir)\"
+export TMPDIR=\"$O/rows/$1\"
+mkdir -p \"$TMPDIR/store\" \"$TMPDIR/dest\"
+printf '[packages]\\nkeep = 1\\n' >\"$TMPDIR/cfg.toml\"
+PATH=\"$O/bin:$PATH\"
+trap 'drop_stage; echo cleaned >\"$O/cleaned-$ROW\"' EXIT
+case $1 in
+version | line | inventory | config | showed | store)
+\tprintf() {
+\t\t[ \"$1\" != -v ] || [ -e \"$O/sent-$ROW\" ] || { : >\"$O/sent-$ROW\"; kill -s INT 0; }
+\t\tbuiltin printf \"$@\"
+\t}
+\t;;
+draw)
+\tod() {
+\t\t[ -e \"$O/sent-$ROW\" ] || { : >\"$O/sent-$ROW\"; kill -s INT 0; }
+\t\tsleep 90
+\t}
+\t;;
+app | linux)
+\teval \"real_$(declare -f install_app_cleanup)\"
+\teval \"real_$(declare -f install_linux_app_cleanup)\"
+\tinstall_app_cleanup() { real_install_app_cleanup; echo cleaned >\"$O/cleaned-$ROW\"; }
+\tinstall_linux_app_cleanup() { real_install_linux_app_cleanup; echo cleaned >\"$O/cleaned-$ROW\"; }
+\t;;
+esac
+case $1 in
+version | draw) linux_candidate_answers_tag \"$O/aterm\" v1.0 ;;
+line | read) said=\"$(first_line_bounded \"$O/aterm\" --version)\" ;;
+showed) showed_it_ran \"$O/aterm\" ;;
+inventory) bundle_showed_it_ran \"$O/app\" ;;
+config) persist_no_toolchain \"$TMPDIR/cfg.toml\" ;;
+store) STORE_DIR=\"$TMPDIR/store\"; place_store_binary \"$O/aterm\" ;;
+stage) installer_uid() { echo 0; }; place_bundle \"$O/app\" \"$TMPDIR/dest\" ;;
+app) MNT= STAGE= STAGE_DIR= OLD= DEST=\"$TMPDIR/dest\"; make_download_dir install_app_cleanup ;;
+linux) make_download_dir install_linux_app_cleanup ;;
 esac
 echo \"went on ($?)\"
 EOF",
     );
     // showed_it_ran asks a program only on macOS.
-    let mut tags = vec!["version", "line", "read", "inventory", "config"];
+    let mut tags = vec![
+        "version",
+        "draw",
+        "line",
+        "read",
+        "inventory",
+        "config",
+        "store",
+        "stage",
+        "app",
+        "linux",
+    ];
     if cfg!(target_os = "macos") {
         tags.push("showed");
     }
@@ -547,7 +716,7 @@ EOF",
             lib.call(
                 format!(
                     "echo \"$({}) $(cat \"$TMPDIR/cleaned-{tag}\" 2>/dev/null)\" \
-                     $(ls \"$TMPDIR\" | grep -cE '^aterm-(probe|programs|config)[.]')",
+                     $(cd \"$TMPDIR/rows/{tag}\" && ls -A . store dest | grep -cE '^[.]?aterm-[a-z]+[.]|^aterm[.]app[.]installing[.]')",
                     group_run(&format!("\"$TMPDIR/make.bash\" {tag}"))
                 ),
                 &[],
@@ -562,6 +731,29 @@ EOF",
             recs[call].err
         );
     }
+}
+
+/// A store folder this run cannot write is named, not left to end the build in
+/// silence: probe_temp says nothing when it fails, where mktemp, which made the
+/// staged copy before, said why.
+#[test]
+fn a_store_it_cannot_write_to_is_named() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    let call = lib.call(
+        "mkdir -p \"$TMPDIR/store\"; printf '#!/bin/sh\\necho aterm 1.0\\n' >\"$TMPDIR/aterm\"; \
+         chmod 755 \"$TMPDIR/aterm\"; chmod 555 \"$TMPDIR/store\"; s=0; \
+         said=\"$(STORE_DIR=\"$TMPDIR/store\" place_store_binary \"$TMPDIR/aterm\" 2>&1)\" || s=$?; \
+         chmod 755 \"$TMPDIR/store\"; echo \"$s $(ls -A \"$TMPDIR/store\" | wc -l | tr -d ' ') ${said//$TMPDIR/T}\"",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    assert_eq!(
+        recs[call].out,
+        "1 0 install.sh: could not create a file in T/store to stage the aterm binary — nothing was installed there",
+        "{}",
+        recs[call].err
+    );
 }
 
 /// A Ctrl-C in a check whose answer goes to a file ends the run with the
@@ -620,8 +812,9 @@ EOF",
 /// A binary asked what it is answers with the first line it printed, and what
 /// it writes to stderr goes nowhere: bounded opens both of first_line_bounded's
 /// files in its own subshell (BOUNDED_OUT, BOUNDED_ERR). Off macOS this is the
-/// one check of BOUNDED_ERR: showed_it_ran, the other caller that names an
-/// error file, asks a program only there.
+/// one check of BOUNDED_ERR: showed_it_ran, the one caller that reads its error
+/// file, asks a program only on macOS, and no test that runs elsewhere reads
+/// the stderr of the other callers' calls.
 #[test]
 fn a_binary_asked_what_it_is_answers_its_first_line_alone() {
     let scratch = Scratch::new();

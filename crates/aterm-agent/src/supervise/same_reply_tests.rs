@@ -16,12 +16,13 @@ const CAPTURED: i64 = 1_792_815_886;
 /// Its wall's reset, Oct 25 at 5:00 PM PDT.
 const RESET: i64 = 1_792_972_800;
 
-/// One point: its screen, its time from the loop's base, the turn it ended, when a person typed before it, and the history above the screen the host serves.
+/// One point: its screen, its time from the loop's base, the turn it ended, when a person typed before it and whether their keys ended on an Enter over what they typed (the session's submit count one up), and the history above the screen the host serves.
 struct R {
     rows: Vec<String>,
     at: i64,
     worked: Option<u64>,
     typed: Option<i64>,
+    entered: bool,
     above: Option<Vec<String>>,
 }
 
@@ -31,7 +32,17 @@ fn r(rows: &[String], at: i64, worked: Option<u64>) -> R {
         at,
         worked,
         typed: None,
+        entered: false,
         above: None,
+    }
+}
+
+/// `p` after a person's keys at `typed` that ended on an Enter over what they typed.
+fn sent(typed: i64, p: R) -> R {
+    R {
+        typed: Some(typed),
+        entered: true,
+        ..p
     }
 }
 
@@ -53,6 +64,9 @@ struct Driver<'a> {
     seq: u64,
     /// How far the loop's clocks run past each point's whole second, as the shipped loop's do.
     jitter: Duration,
+    /// The session's submit count (`text --json`'s `submits`): one up at each act taken and each person's Enter; served unless `uncounted`.
+    submits: u64,
+    uncounted: bool,
 }
 
 impl<'a> Driver<'a> {
@@ -102,7 +116,44 @@ impl<'a> Driver<'a> {
             at: first,
             seq: 0,
             jitter: Duration::ZERO,
+            submits: 0,
+            uncounted: false,
         }
+    }
+
+    /// The loop over a session whose submit count the loop before it left at `n`.
+    const fn submitted(mut self, n: u64) -> Self {
+        self.submits = n;
+        self
+    }
+
+    /// The loop over screens that carry no submit count (`submits` unknown).
+    const fn uncounted(mut self) -> Self {
+        self.uncounted = true;
+        self
+    }
+
+    /// The `/usage` probe at `t`: its Enter, the session's submits one up, between its typed and closed ledger rows as `probe_owes` and `probe_closed` write them; the policy's memory unmoved.
+    fn probed(&mut self, t: i64) {
+        use crate::supervise::policy::turn_end::RULE_USAGE_PROBE;
+        self.to(t);
+        let (typed, closed) = (approvals::Outcome::Typed, approvals::Outcome::Waiting);
+        self.s.ledger_row(
+            RULE_USAGE_PROBE,
+            typed,
+            "/usage",
+            approvals::PROBE_TYPED_REASON,
+            self.seq,
+        );
+        self.submits += 1;
+        self.to(t + 5);
+        self.s.ledger_row(
+            RULE_USAGE_PROBE,
+            closed,
+            "/usage",
+            approvals::PROBE_CLOSED_REASON,
+            self.seq,
+        );
     }
 
     /// The loop's monotonic clock runs `333 µs` past each point, so the wall clock's milliseconds lag it as the shipped loop's do.
@@ -125,6 +176,7 @@ impl<'a> Driver<'a> {
             self.to(typed);
             self.s.person = Some(self.s.fx.mono());
         }
+        self.submits += u64::from(p.entered);
         self.to(p.at);
         if let Some(above) = &p.above {
             self.s.ctl.alt_screen = Some(false);
@@ -133,7 +185,12 @@ impl<'a> Driver<'a> {
         }
         self.seq += 1;
         self.s.program = Some(self.program.to_owned());
-        let point = point_at(&self.s, p.rows.clone(), self.seq);
+        let point = self.s.turn_of(Screen {
+            rows: p.rows.clone(),
+            seq: self.seq,
+            submits: (!self.uncounted).then_some(self.submits),
+            ..Screen::default()
+        });
         let a = self
             .s
             .turn_end_at_point(&point, p.worked.map(Duration::from_secs), &self.opts)
@@ -148,6 +205,7 @@ impl<'a> Driver<'a> {
         if a.rule_id().is_some() {
             let read = self.s.turn_end_reading(&point.screen, None, &self.opts);
             self.s.turn_end.acted(&a, &read, self.s.fx.mono());
+            self.submits += 1;
         }
         Out {
             act,
@@ -180,10 +238,24 @@ fn replay_as(
     seeded: bool,
     points: &[R],
 ) -> Vec<Out> {
+    replay_counted(program, ledger, autopilot, base, (seeded, 0), points).0
+}
+
+/// [`replay_as`] over a session whose submit count the loop before it left at `submits`: what each point decided, and the count it leaves.
+fn replay_counted(
+    program: &'static str,
+    ledger: &Path,
+    autopilot: Autopilot,
+    base: i64,
+    (seeded, submits): (bool, u64),
+    points: &[R],
+) -> (Vec<Out>, u64) {
     let mut m = Mock::new(vec![busy_screen()]);
     let first = points.first().map_or(0, |p| p.typed.unwrap_or(p.at));
-    let mut d = Driver::new(&mut m, program, ledger, autopilot, (base, first), seeded);
-    points.iter().map(|p| d.point(p)).collect()
+    let mut d =
+        Driver::new(&mut m, program, ledger, autopilot, (base, first), seeded).submitted(submits);
+    let out = points.iter().map(|p| d.point(p)).collect();
+    (out, d.submits)
 }
 
 /// The live screen before the person's `hi`: the harness's last continuation answered by the wall.
@@ -219,10 +291,7 @@ fn muse_codes_dated_two_line_wall_is_waited_out_to_its_reset_a_persons_hi_includ
             &[
                 r(&before, -3600, Some(3)),
                 r(&before, -1800, None),
-                R {
-                    typed: Some(-200),
-                    ..r(&after, 0, Some(2))
-                },
+                sent(-200, r(&after, 0, Some(2))),
                 r(&after, 3600, None),
                 r(&after, RESET - CAPTURED + 3600, None),
             ],
@@ -330,10 +399,7 @@ fn a_wall_no_reader_names_is_typed_into_at_most_once_more_then_held_until_it_cha
             true,
             &[
                 r(&unnamed(&[None, None]), 60, None),
-                R {
-                    typed: Some(100),
-                    ..r(&unnamed(&[None, None, Some("hi")]), 200, Some(2))
-                },
+                sent(100, r(&unnamed(&[None, None, Some("hi")]), 200, Some(2))),
                 r(&unnamed(&[None, None, Some("hi")]), 7200, None),
                 r(&unnamed(&[None, None, Some("hi"), None]), 7260, Some(3)),
                 r(&unnamed(&[None, None, Some("hi"), None]), 9000, None),
@@ -774,34 +840,55 @@ fn a_vendor_row_no_reader_names_is_typed_into_at_most_once_more_then_held() {
                 "{program}: no reader names the wall: {r:#?}"
             );
         }
-        for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-            let tag = format!("same-reply-{program}-{autopilot:?}");
-            let (dir, ledger) = ledger_at(&tag);
-            let out = replay_as(
-                program,
-                &ledger,
-                autopilot,
-                CAPTURED,
-                false,
-                &[
-                    r(&rows(&[]), 0, Some(600)),
-                    r(&rows(&[None]), 60, Some(3)),
-                    r(&rows(&[None]), 300, None),
-                    r(&rows(&[None, None]), 360, Some(3)),
-                    r(&rows(&[None, None]), 2 * 86_400, None),
-                    R {
-                        typed: Some(2 * 86_400 + 60),
-                        ..r(&rows(&[None, None, Some("hi")]), 2 * 86_400 + 120, Some(2))
-                    },
-                    r(&rows(&[None, None, Some("hi")]), 2 * 86_400 + 7200, None),
-                    r(
+        // The person's turn timed or not: a point sees its busy spell, or only what it drew, which lifts nothing.
+        for (autopilot, took_hi) in [Autopilot::Cruise, Autopilot::Land]
+            .into_iter()
+            .flat_map(|a| [Some(2), None].map(|t| (a, t)))
+        {
+            let tag = format!("same-reply-{program}-{autopilot:?}-{took_hi:?}");
+            let hi = rows(&[None, None, Some("hi")]);
+            let points = [
+                r(&rows(&[]), 0, Some(600)),
+                r(&rows(&[None]), 60, Some(3)),
+                r(&rows(&[None]), 300, None),
+                r(&rows(&[None, None]), 360, Some(3)),
+                r(&rows(&[None, None]), 2 * 86_400, None),
+                sent(2 * 86_400 + 60, r(&hi, 2 * 86_400 + 120, took_hi)),
+                r(&hi, 2 * 86_400 + 7200, None),
+                // The one act it lets go answered the same, or the screen as it stood.
+                match took_hi {
+                    Some(_) => r(
                         &rows(&[None, None, Some("hi"), None]),
                         2 * 86_400 + 7260,
                         Some(3),
                     ),
-                ],
+                    None => r(&hi, 2 * 86_400 + 10_800, None),
+                },
+            ];
+            let (dir, ledger) = ledger_at(&tag);
+            let out = replay_as(program, &ledger, autopilot, CAPTURED, false, &points);
+            let _ = std::fs::remove_dir_all(dir);
+            // A loop taking over at the person's `hi`, the session's submit count carried on.
+            let (dir, ledger) = ledger_at(&format!("{tag}-takeover"));
+            let (before, submits) = replay_counted(
+                program,
+                &ledger,
+                autopilot,
+                CAPTURED,
+                (false, 0),
+                &points[..5],
+            );
+            let (after, _) = replay_counted(
+                program,
+                &ledger,
+                autopilot,
+                CAPTURED,
+                (true, submits),
+                &points[5..],
             );
             let _ = std::fs::remove_dir_all(dir);
+            assert_eq!(before, out[..5], "{tag}: the same loop up to the hold");
+            let taken: Vec<&str> = after.iter().map(|o| o.act.as_str()).collect();
             let acts: Vec<&str> = out.iter().map(|o| o.act.as_str()).collect();
             assert!(
                 acts[0].starts_with("act ") && acts[1] == "wait" && acts[2].starts_with("act "),
@@ -813,11 +900,114 @@ fn a_vendor_row_no_reader_names_is_typed_into_at_most_once_more_then_held() {
                 "{tag}: the same reply again holds every act: {out:#?}"
             );
             assert!(out[3..5].iter().all(|o| o.told == held), "{tag}: {out:#?}");
-            assert!(
-                acts[6].starts_with("act ") && acts[7] == "nothing",
-                "{tag}: a person's turn lets one more act go, and the same reply holds again: {out:#?}"
-            );
+            if took_hi.is_some() {
+                assert!(
+                    acts[6].starts_with("act ") && acts[7] == "nothing",
+                    "{tag}: a person's turn a point saw busy lets one more act go, and the same \
+                     reply holds again: {out:#?}"
+                );
+                assert!(
+                    taken[1].starts_with("act ") && taken[2] == "nothing",
+                    "{tag}-takeover: so does one the new loop's first point saw busy: {after:#?}"
+                );
+            } else {
+                assert!(
+                    out[5..]
+                        .iter()
+                        .chain(&after)
+                        .all(|o| !o.act.starts_with("act "))
+                        && out[6..].iter().chain(&after[1..]).all(|o| o.told == held),
+                    "{tag}: a person's turn no point saw busy lifts nothing, in the loop or at a \
+                     takeover: {out:#?} {after:#?}"
+                );
+            }
         }
+    }
+}
+
+/// Claude Code's reply in words no reader names, headed by `⏺` so the screen names the prompt it answers ([`aterm_phase::answered_prompt`]).
+fn claude_said(_: usize) -> Vec<String> {
+    vec![
+        "⏺ Allowance spent for now · back at 5:11pm (America/Los_Angeles)".to_owned(),
+        String::new(),
+        "✻ Cogitated for 0s · done 3:11 PM".to_owned(),
+    ]
+}
+
+#[test]
+fn a_persons_new_prompt_row_lifts_a_claude_hold_only_where_a_point_saw_it_busy() {
+    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let rows = |asks: &[Option<&str>]| vendor_walled("claude", asks, claude_said);
+    let reader = reader_of("claude");
+    for asks in [&[None][..], &[None, None, Some("hi")]] {
+        let r = rows(asks);
+        assert!(
+            reader.wall(&r).is_none() && reader.health_wall(&r).is_none(),
+            "no reader names the wall: {r:#?}"
+        );
+        assert_eq!(
+            aterm_phase::answered_prompt(&r).as_deref(),
+            asks.last().map(|a| a.unwrap_or(ASK)),
+            "the screen names the prompt answered: {r:#?}"
+        );
+    }
+    let stood = rows(&[None, None]);
+    let scrolled = stood[up(&stood)..].to_vec();
+    let hi = rows(&[None, None, Some("hi")]);
+    let (again, resumed) = (
+        rows(&[None, None, Some("hi"), Some("still there?")]),
+        rows(&[None, None, Some("hi"), Some("still there?"), None]),
+    );
+    let t = 2 * 86_400;
+    let keys = |typed: i64, rows: &[String], at: i64, took: Option<u64>| R {
+        typed: Some(typed),
+        ..r(rows, at, took)
+    };
+    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
+        let tag = format!("claude-prompt-row-{autopilot:?}");
+        let (dir, ledger) = ledger_at(&tag);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut d =
+            Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false).uncounted();
+        let out: Vec<Out> = [
+            r(&rows(&[]), 0, Some(600)),
+            r(&rows(&[None]), 60, Some(3)),
+            r(&rows(&[None]), 300, None),
+            r(&stood, 360, Some(3)),
+            r(&stood, t, None),
+            // Keys over the conversation scrolled a row: no new prompt row.
+            keys(t + 30, &scrolled, t + 60, None),
+            r(&scrolled, t + 3600, None),
+            // The person's `hi`, its busy spell unseen and its Enter uncounted: its prompt row alone shows it.
+            keys(t + 3660, &hi, t + 3720, None),
+            r(&hi, t + 7200, None),
+            // Their next prompt, its busy spell seen.
+            keys(t + 10_740, &again, t + 10_800, Some(2)),
+            r(&again, t + 18_000, None),
+            r(&resumed, t + 18_060, Some(3)),
+        ]
+        .iter()
+        .map(|p| d.point(p))
+        .collect();
+        let _ = std::fs::remove_dir_all(dir);
+        let acts: Vec<&str> = out.iter().map(|o| o.act.as_str()).collect();
+        assert!(
+            acts[0].starts_with("act ") && acts[1] == "wait" && acts[2].starts_with("act "),
+            "{tag}: {out:#?}"
+        );
+        assert!(
+            acts[5..9].iter().all(|a| !a.starts_with("act "))
+                && [3, 4, 6, 8]
+                    .iter()
+                    .all(|&i| acts[i] == "nothing" && out[i].told == held),
+            "{tag}: held, keys and a new prompt row no point saw busy included: {out:#?}"
+        );
+        assert!(
+            acts[9..11].iter().filter(|a| a.starts_with("act ")).count() == 1
+                && acts[11] == "nothing"
+                && out[11].told == held,
+            "{tag}: the prompt a point saw busy lets one more act go, then held again: {out:#?}"
+        );
     }
 }
 
@@ -860,6 +1050,7 @@ fn own_turns(
     let (mut out, mut turns, mut person) = (Vec::new(), 0, false);
     while out.len() < 24 {
         let o = d.point(&R {
+            entered: typed.is_some(),
             typed: typed.take(),
             ..r(&self_started(&opens), at, took.take())
         });
@@ -1143,8 +1334,12 @@ fn stood(d: &mut Driver<'_>, points: usize) -> (Vec<Out>, usize) {
 #[test]
 fn a_read_limit_standing_past_its_reset_is_resumed_through_its_tries_then_held() {
     let futile = Some("futile The limit still stands an hour after its reset.".to_owned());
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("stood-limit-{autopilot:?}");
+    // The person's turn timed or not: a point sees its busy spell, or only what it drew.
+    for (autopilot, took_hi) in [Autopilot::Cruise, Autopilot::Land]
+        .into_iter()
+        .flat_map(|a| [Some(2), None].map(|t| (a, t)))
+    {
+        let tag = format!("stood-limit-{autopilot:?}-{took_hi:?}");
         let (dir, ledger) = ledger_at(&tag);
         let mut m = Mock::new(vec![busy_screen()]);
         let mut d = Driver::new(&mut m, "muse", &ledger, autopilot, (CAPTURED, 0), false);
@@ -1165,25 +1360,88 @@ fn a_read_limit_standing_past_its_reset_is_resumed_through_its_tries_then_held()
         );
 
         let at = d.at + 86_400;
-        let rows = answered(&before_hi(), &vec![None; answers]);
-        let mut hi = vec![None; answers];
-        hi.push(Some("hi"));
-        let hi = answered(&before_hi(), &hi);
+        let wall = muse_held(answers);
         let then = [
-            d.point(&r(&rows, at, None)),
+            d.point(&r(&wall.rows, at, None)),
+            // A person's keys that drew no turn, read an hour on.
             d.point(&R {
-                typed: Some(at + 60),
-                ..r(&hi, at + 120, Some(2))
+                typed: Some(at + 30),
+                ..r(&wall.rows, at + 3600, None)
             }),
-            d.point(&r(&hi, at + 7200, None)),
         ];
-        assert_eq!(then[0].act, "nothing", "{tag}: {then:#?}");
-        assert_eq!(
-            then[2].act, "act usage-resume@v1",
-            "{tag}: a person's turn lets one more resume go: {then:#?}"
-        );
-
+        let hi = hi_at(&mut d, &wall, at + 3720, took_hi);
         let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(then[0].act, "nothing", "{tag}: {then:#?}");
+        assert!(
+            !then[1].act.starts_with("act "),
+            "{tag}: keys alone: {then:#?}"
+        );
+        wall.judged(&tag, took_hi, &hi);
+
+        // A loop taking over the held wall: the person's keys before its first point drew nothing, then their `hi`.
+        let tag = format!("{tag}-takeover");
+        let (dir, ledger) = ledger_at(&tag);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut d = Driver::new(&mut m, "muse", &ledger, autopilot, (CAPTURED, 0), false);
+        let (out, answers) = stood(&mut d, 16);
+        assert_eq!(out[out.len() - 1].told, futile, "{tag}: {out:#?}");
+        let at = d.at + 86_400;
+        let wall = muse_held(answers);
+        let first = d.point(&r(&wall.rows, at, None));
+        let submits = d.submits;
+        drop(d);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut d = Driver::new(
+            &mut m,
+            "muse",
+            &ledger,
+            autopilot,
+            (CAPTURED, at + 30),
+            true,
+        )
+        .submitted(submits);
+        let keys = d.point(&R {
+            typed: Some(at + 30),
+            ..r(&wall.rows, at + 3600, None)
+        });
+        let hi = hi_at(&mut d, &wall, at + 3720, took_hi);
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(first.act, "nothing", "{tag}: {first:#?}");
+        assert!(
+            !keys.act.starts_with("act "),
+            "{tag}: keys alone at the new loop's first point: {keys:#?}"
+        );
+        wall.judged(&tag, took_hi, &hi);
+
+        // A loop taking over at the person's `hi`, answered by the same wall.
+        let tag = format!("{tag}-answered");
+        let (dir, ledger) = ledger_at(&tag);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut d = Driver::new(&mut m, "muse", &ledger, autopilot, (CAPTURED, 0), false);
+        let (out, answers) = stood(&mut d, 16);
+        assert_eq!(out[out.len() - 1].told, futile, "{tag}: {out:#?}");
+        let at = d.at + 86_400;
+        let wall = muse_held(answers);
+        let first = d.point(&r(&wall.rows, at, None));
+        let submits = d.submits;
+        drop(d);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut d = Driver::new(
+            &mut m,
+            "muse",
+            &ledger,
+            autopilot,
+            (CAPTURED, at + 3660),
+            true,
+        )
+        .submitted(submits);
+        let hi = hi_at(&mut d, &wall, at + 3720, took_hi);
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(first.act, "nothing", "{tag}: {first:#?}");
+        wall.judged(&tag, took_hi, &hi);
+    }
+    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
+        let tag = format!("stood-limit-{autopilot:?}");
         let (dir, ledger) = ledger_at(&format!("{tag}-moved"));
         let mut m = Mock::new(vec![busy_screen()]);
         let mut d = Driver::new(&mut m, "muse", &ledger, autopilot, (CAPTURED, 0), false);
@@ -1415,10 +1673,7 @@ fn a_reset_moving_forward_with_each_answer_keeps_the_walls_tries() {
             let at = d2.at + 600;
             let mut asks = vec![None; answers];
             asks.push(Some("hi"));
-            let hi = R {
-                typed: Some(at - 60),
-                ..r(&wall.rows(&asks, at, words), at, Some(2))
-            };
+            let hi = sent(at - 60, r(&wall.rows(&asks, at, words), at, Some(2)));
             let then = follow_r(
                 &mut d2,
                 &hi,
@@ -1570,10 +1825,7 @@ fn a_read_wall_with_no_usable_reset_is_tried_through_its_ladder_then_held() {
             let hi = answered(&limit_drawn(wall, 0), &hi);
             let at = d.at + 86_400;
             let then = [
-                d.point(&R {
-                    typed: Some(at),
-                    ..r(&hi, at + 60, Some(2))
-                }),
+                d.point(&sent(at, r(&hi, at + 60, Some(2)))),
                 d.point(&r(&hi, at + 7200, None)),
             ];
             let _ = std::fs::remove_dir_all(dir);
@@ -1909,13 +2161,22 @@ fn a_git_only_answer_that_says_the_same_is_work_each_time() {
             );
         }
     }
-    // The control: the same answer with the row in words is held.
-    let rows = build_fails("  Pushed to main, then waited for the checks");
-    for (autopilot, busy) in [Autopilot::Cruise, Autopilot::Land]
+    // The control: the same answer with the row in words, a lone plain ref's included, is held.
+    for (autopilot, busy, words) in [Autopilot::Cruise, Autopilot::Land]
         .into_iter()
         .flat_map(|a| [30, 550].map(|b| (a, b)))
+        .flat_map(|(a, b)| {
+            [
+                "  Pushed to main, then waited for the checks",
+                "  Merged cleanly",
+                "  Pushed to production",
+            ]
+            .map(|w| (a, b, w))
+        })
     {
-        let tag = format!("git-words-{autopilot:?}-{busy}");
+        let rows = build_fails(words);
+        assert!(!reader.turn_ran_tools(&rows(2)), "{words:?} is words");
+        let tag = format!("git-words-{autopilot:?}-{busy}-{}", words.len());
         let (dir, ledger) = ledger_at(&tag);
         let mut m = Mock::new(vec![busy_screen()]);
         let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
@@ -1953,7 +2214,7 @@ fn a_reply_ending_in_a_git_clauses_words_said_the_same_is_held() {
         "  Waiting on PR #12",
         "  Pushed to main",
         "  Merged cleanly",
-        "  Pushed to main, rebased onto origin/main",
+        "  Pushed to production",
         "⏺ Pushed to main",
     ] {
         let rows = paragraph_ends(paragraph);
@@ -1973,6 +2234,67 @@ fn a_reply_ending_in_a_git_clauses_words_said_the_same_is_held() {
                 "{tag}: {paragraph:?} said the same holds after two acts: {out:#?}"
             );
         }
+    }
+}
+
+/// A Claude Code answer that ran no other tool: the same words each turn, then `row(k)`, its `k`th answer's own group row, ending the turn.
+fn landed_ends(row: fn(usize) -> String) -> impl Fn(usize) -> Vec<String> {
+    move |k: usize| {
+        vendor_walled("claude", &vec![None; k], |j| {
+            vec![
+                "⏺ Landed the parser fix.".to_owned(),
+                String::new(),
+                row(j),
+                String::new(),
+                "✻ Worked for 3s".to_owned(),
+            ]
+        })
+    }
+}
+
+#[test]
+fn a_reply_ending_in_its_commits_row_is_work_each_time() {
+    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let reader = aterm_phase::Program::Claude.reader();
+    // Each answer's commit is its own; its sha is what a sentence lacks, wherever the row stands, alone or before a push.
+    let commits: [fn(usize) -> String; 2] = [
+        |j| format!("  Committed {:07x}, pushed to main", 0x1a2b3c4 + 16 * j),
+        |j| format!("  Committed {:07x}", 0x1a2b3c4 + 16 * j),
+    ];
+    let words = landed_ends(|_| "  Pushed to main".to_owned());
+    assert!(
+        !reader.turn_ran_tools(&words(2)),
+        "the control's row is words"
+    );
+    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
+        for (n, commit) in commits.into_iter().enumerate() {
+            let rows = landed_ends(commit);
+            assert!(reader.turn_ran_tools(&rows(2)), "the commit row is read");
+            let tag = format!("commit-row-{autopilot:?}-{n}");
+            let (dir, ledger) = ledger_at(&tag);
+            let mut m = Mock::new(vec![busy_screen()]);
+            let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
+            let (out, answers) = follow(&mut d, &r(&rows(0), 0, Some(600)), (60, 3), &rows, 10);
+            let _ = std::fs::remove_dir_all(dir);
+            assert!(
+                answers > 2 && out.iter().all(|o| o.act != "nothing" && o.told.is_none()),
+                "{tag}: each commit is work, every act typed: {out:#?}"
+            );
+        }
+        // The control: the same answers ending in a lone `  Pushed to main` are held after two acts.
+        let tag = format!("commit-words-{autopilot:?}");
+        let (dir, ledger) = ledger_at(&tag);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
+        let (out, answers) = follow(&mut d, &r(&words(0), 0, Some(600)), (60, 3), &words, 12);
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            answers == 2
+                && out
+                    .last()
+                    .is_some_and(|o| o.act == "nothing" && o.told == held),
+            "{tag}: {out:#?}"
+        );
     }
 }
 
@@ -2434,6 +2756,83 @@ fn a_long_report_scrolled_over_its_calls_is_work_unless_its_whole_turn_shows_non
     }
 }
 
+#[test]
+fn keys_over_a_long_report_held_with_its_prompt_above_the_screen_lift_nothing() {
+    let held = Some(format!("stalled {}", Exception::repeats().why));
+    type Drawn = fn(bool) -> Box<dyn Fn(usize) -> Vec<String>>;
+    let programs: [(&'static str, Drawn); 2] = [
+        ("claude", |calls| Box::new(reported(calls))),
+        ("muse", |calls| Box::new(muse_reported(calls))),
+    ];
+    for ((program, drawn), (autopilot, takeover)) in programs.into_iter().flat_map(|p| {
+        [Autopilot::Cruise, Autopilot::Land]
+            .into_iter()
+            .flat_map(|a| [false, true].map(|k| (a, k)))
+            .map(move |c| (p, c))
+    }) {
+        let tag = format!("report-keys-{program}-{autopilot:?}-{takeover}");
+        let rows = drawn(false);
+        let (dir, ledger) = ledger_at(&tag);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut d = Driver::new(&mut m, program, &ledger, autopilot, (CAPTURED, 0), false);
+        let (out, answers) = follow_r(
+            &mut d,
+            &viewed(&rows(0), true, 0, Some(600)),
+            (60, 550),
+            |k, at, took| viewed(&rows(k), true, at, took),
+            8,
+        );
+        // The held report's 40 rows a row up, the history served above them: its prompt above the screen either way.
+        let full = rows(answers);
+        let cut = full.len() - 40;
+        let reader = reader_of(program);
+        assert!(
+            reader.turn_opens_above(&full[cut..]) && reader.turn_opens_above(&full[cut + 1..]),
+            "{tag}: the turn opens above the screen on either read"
+        );
+        let scrolled = |at: i64| R {
+            above: Some(full[..=cut].to_vec()),
+            ..r(&full[cut + 1..], at, None)
+        };
+        let (at, submits) = (d.at, d.submits);
+        let mut m2 = Mock::new(vec![busy_screen()]);
+        // In a loop the books-turn arm holds the keys; a loop that takes over leaves keys typed after it started to the person, as main does.
+        let mut d = if takeover {
+            drop(d);
+            Driver::new(
+                &mut m2,
+                program,
+                &ledger,
+                autopilot,
+                (CAPTURED, at + 30),
+                true,
+            )
+            .submitted(submits)
+        } else {
+            d
+        };
+        // The person's keys ending on an Enter over the empty composer, the screen a row up.
+        let then = [
+            d.point(&sent(at + 30, scrolled(at + 60))),
+            d.point(&scrolled(at + 3600)),
+            d.point(&scrolled(at + 7200)),
+        ];
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            answers == 2
+                && out[out.len() - 3..]
+                    .iter()
+                    .all(|o| o.act == "nothing" && o.told == held),
+            "{tag}: held: {out:#?}"
+        );
+        assert!(
+            then.iter().all(|o| !o.act.starts_with("act "))
+                && then[1..].iter().all(|o| o.told == held),
+            "{tag}: keys that submitted nothing lift nothing: {then:#?}"
+        );
+    }
+}
+
 /// agy's measured 429 block of `text` answering each act, its `retryDelay` `delay(k)` seconds at the `k`th answer and its Error ID fresh.
 fn agy_quota(text: &'static str, delay: fn(usize) -> u64) -> impl Fn(usize) -> Vec<String> {
     move |answers: usize| {
@@ -2631,5 +3030,645 @@ fn work_scrolled_above_a_529_keeps_the_retries_going() {
                 );
             }
         }
+    }
+}
+
+/// A wall held for good and what a person's turn at it draws ([`held_wall`]).
+struct Held {
+    /// The screen the hold stands at.
+    rows: Vec<String>,
+    /// The person's `hi` answered by the wall, then the one act it lets go answered the same.
+    hi: Vec<String>,
+    resumed: Vec<String>,
+    /// The act that one more turn lets go, where it is the wall's own, and the exception the hold stands under.
+    act: Option<&'static str>,
+    told: &'static str,
+}
+
+impl Held {
+    /// `o` holds: nothing typed, under the hold's exception.
+    fn holds(&self, o: &Out) -> bool {
+        o.act == "nothing" && o.told.as_deref().is_some_and(|t| t.starts_with(self.told))
+    }
+
+    /// What the person's `hi` decided ([`hi_at`]): one more act, the wall's own where it has one, then held again, where a point saw it busy; held throughout where none did.
+    fn judged(&self, tag: &str, took_hi: Option<u64>, out: &[Out]) {
+        let acts: Vec<&str> = out[..2]
+            .iter()
+            .map(|o| o.act.as_str())
+            .filter(|a| a.starts_with("act "))
+            .collect();
+        if took_hi.is_some() {
+            assert!(
+                acts.len() == 1 && self.act.is_none_or(|a| acts[0] == a) && self.holds(&out[2]),
+                "{tag}: the person's `hi` a point saw busy lets one more act go, then held again: \
+                 {out:#?}"
+            );
+        } else {
+            assert!(
+                acts.is_empty() && self.holds(&out[1]) && self.holds(&out[2]),
+                "{tag}: the person's `hi` no point saw busy lifts nothing: {out:#?}"
+            );
+        }
+    }
+}
+
+/// The person's `hi` with its Enter at `at`, read again two hours on, then the one act it let go answered the same, or the screen as it stood.
+fn hi_at(d: &mut Driver<'_>, held: &Held, at: i64, took_hi: Option<u64>) -> Vec<Out> {
+    let mut out = vec![
+        d.point(&sent(at - 60, r(&held.hi, at, took_hi))),
+        d.point(&r(&held.hi, at + 7200, None)),
+    ];
+    let last = if out.iter().any(|o| o.act.starts_with("act ")) {
+        r(&held.resumed, at + 7260, Some(3))
+    } else {
+        r(&held.hi, at + 10_800, None)
+    };
+    out.push(d.point(&last));
+    out
+}
+
+/// Muse Code's dated wall held past its reset after `answers` answers ([`stood`]).
+fn muse_held(answers: usize) -> Held {
+    let drawn = |hi: bool, more: usize| {
+        let mut asks = vec![None; answers];
+        asks.extend(hi.then_some(Some("hi")));
+        asks.extend(vec![None; more]);
+        answered(&before_hi(), &asks)
+    };
+    Held {
+        rows: drawn(false, 0),
+        hi: drawn(true, 0),
+        resumed: drawn(true, 1),
+        act: Some("act usage-resume@v1"),
+        told: "futile ",
+    }
+}
+
+/// A loop of `program`'s at a wall held for good: Muse Code's dated wall stood past its reset with its tries spent ([`stood`]), or a vendor row no reader names said again ([`vendor_walled`]), `claude-said` Claude Code's `⏺` reply in such words, under the prompt the screen names ([`claude_said`]).
+fn held_wall<'a>(
+    m: &'a mut Mock,
+    program: &'static str,
+    ledger: &Path,
+    autopilot: Autopilot,
+) -> (Driver<'a>, Held) {
+    let (program, wall): (&'static str, WallRows) = match program {
+        "claude" => ("claude", claude_wall),
+        "claude-said" => ("claude", claude_said),
+        "agy" => ("agy", agy_wall),
+        "muse" => ("muse", claude_wall),
+        _ => ("node", gemini_wall),
+    };
+    let mut d = Driver::new(m, program, ledger, autopilot, (CAPTURED, 0), false);
+    if program == "muse" {
+        let (_, answers) = stood(&mut d, 16);
+        return (d, muse_held(answers));
+    }
+    let rows = |asks: &[Option<&str>]| vendor_walled(program, asks, wall);
+    for p in [
+        r(&rows(&[]), 0, Some(600)),
+        r(&rows(&[None]), 60, Some(3)),
+        r(&rows(&[None]), 300, None),
+        r(&rows(&[None, None]), 360, Some(3)),
+    ] {
+        d.point(&p);
+    }
+    let held = Held {
+        rows: rows(&[None, None]),
+        hi: rows(&[None, None, Some("hi")]),
+        resumed: rows(&[None, None, Some("hi"), None]),
+        act: None,
+        told: "stalled ",
+    };
+    (d, held)
+}
+
+/// How many top rows a scroll carries off to change the letters above the composer: through the first with any.
+fn up(rows: &[String]) -> usize {
+    rows.iter()
+        .position(|r| r.chars().any(char::is_alphabetic))
+        .expect("a row with letters")
+        + 1
+}
+
+/// `rows` with a person's two-line draft in the composer, each row it wraps onto indented as Muse Code draws one (muse-1.4.10-R6427.1-draft-wrapped.txt): the composer taller, the conversation [`up`] rows up, and the hint agy and Gemini CLI blank while a draft stands gone (agy-1.4.0-draft.txt, gemini-0.46.0-draft.txt).
+fn drafted(rows: &[String]) -> Vec<String> {
+    let input = rows
+        .iter()
+        .rposition(|r| r.trim_start().starts_with(['❯', '>']))
+        .expect("the composer's row");
+    let row = &rows[input];
+    let lead = &row[..row.len() - row.trim_start().len()];
+    let marker = row.trim_start().chars().next().unwrap_or('>');
+    let mut out = rows[up(rows)..input].to_vec();
+    out.push(format!(
+        "{lead}{marker} when the limit lifts, please rerun the division suite on the lane fix and then"
+    ));
+    out.push(format!("{lead}  report the number"));
+    out.extend(rows[input + 1..].iter().cloned());
+    out.iter()
+        .map(|r| r.replace("? for shortcuts", &" ".repeat(15)))
+        .collect()
+}
+
+/// What a person's keys at a held wall draw ([`person_at`]).
+#[derive(Debug, Clone, Copy)]
+enum Keys {
+    /// Keys that submit nothing over the conversation scrolled up.
+    Scroll,
+    /// The same keys ending on an Enter over the empty composer (after an arrow or an Escape): the session's submits one up.
+    ScrollEntered,
+    /// Keys into a two-line draft that grows the composer ([`drafted`]).
+    Draft,
+    /// The same draft, its keys ending on an Enter over them that left it standing (a `\`+Enter newline, a menu's completion): the session's submits one up.
+    Entered,
+    /// The same draft, the keys that clear it ending on an Enter over the emptied composer: the session's submits one up.
+    Cleared,
+}
+
+/// A person at `held` from `at` on: `keys`, more keys that clear what they drew, then their `hi` with its Enter ([`hi_at`]).
+fn person_at(
+    d: &mut Driver<'_>,
+    held: &Held,
+    at: i64,
+    took_hi: Option<u64>,
+    keys: Keys,
+) -> Vec<Out> {
+    let (keyed, cleared) = match keys {
+        Keys::Scroll | Keys::ScrollEntered => {
+            let scrolled = held.rows[up(&held.rows)..].to_vec();
+            (scrolled.clone(), scrolled)
+        }
+        Keys::Draft | Keys::Entered | Keys::Cleared => (drafted(&held.rows), held.rows.clone()),
+    };
+    let mut out: Vec<Out> = [
+        R {
+            typed: Some(at + 30),
+            entered: matches!(keys, Keys::ScrollEntered | Keys::Entered),
+            ..r(&keyed, at + 60, None)
+        },
+        r(&keyed, at + 3600, None),
+        R {
+            typed: Some(at + 3630),
+            entered: matches!(keys, Keys::Cleared),
+            ..r(&cleared, at + 3660, None)
+        },
+        r(&cleared, at + 7200, None),
+    ]
+    .iter()
+    .map(|p| d.point(p))
+    .collect();
+    out.extend(hi_at(d, held, at + 10_800, took_hi));
+    out
+}
+
+#[test]
+fn a_person_at_a_held_wall_lifts_its_hold_only_by_a_turn_a_point_saw_busy() {
+    for program in ["muse", "claude", "claude-said", "agy", "node"] {
+        for (autopilot, took_hi, takeover, keys) in [Autopilot::Cruise, Autopilot::Land]
+            .into_iter()
+            .flat_map(|a| [Some(2), None].map(|t| (a, t)))
+            .flat_map(|(a, t)| [false, true].map(|k| (a, t, k)))
+            .flat_map(|(a, t, k)| {
+                [
+                    Keys::Scroll,
+                    Keys::ScrollEntered,
+                    Keys::Draft,
+                    Keys::Entered,
+                    Keys::Cleared,
+                ]
+                .map(|f| (a, t, k, f))
+            })
+        {
+            let tag = format!("person-at-{program}-{autopilot:?}-{took_hi:?}-{takeover}-{keys:?}");
+            let (dir, ledger) = ledger_at(&tag);
+            let mut m = Mock::new(vec![busy_screen()]);
+            let (mut d, held) = held_wall(&mut m, program, &ledger, autopilot);
+            let mark = |rows: &[String]| {
+                let read = reader_of(d.program).read(rows, None);
+                crate::supervise::policy::turn_end::conversation_mark(&read, rows)
+            };
+            let stands = mark(&held.rows);
+            assert!(
+                mark(&held.rows[up(&held.rows)..]) != stands
+                    && mark(&drafted(&held.rows)) != stands,
+                "{tag}: a scroll or a draft changes the letters above the composer"
+            );
+            let at = d.at + 86_400;
+            let first = d.point(&r(&held.rows, at, None));
+            assert!(held.holds(&first), "{tag}: {first:#?}");
+            let out = if takeover {
+                let (submits, program) = (d.submits, d.program);
+                drop(d);
+                let mut m = Mock::new(vec![busy_screen()]);
+                let mut d = Driver::new(
+                    &mut m,
+                    program,
+                    &ledger,
+                    autopilot,
+                    (CAPTURED, at + 30),
+                    true,
+                )
+                .submitted(submits);
+                person_at(&mut d, &held, at, took_hi, keys)
+            } else {
+                person_at(&mut d, &held, at, took_hi, keys)
+            };
+            let _ = std::fs::remove_dir_all(dir);
+            assert!(
+                out[..4].iter().all(|o| !o.act.starts_with("act ")),
+                "{tag}: keys that submit no turn type nothing, a draft standing never submitted: \
+                 {out:#?}"
+            );
+            assert!(
+                held.holds(&out[1]) && held.holds(&out[3]),
+                "{tag}: held past the person's grace: {out:#?}"
+            );
+            held.judged(&tag, took_hi, &out[4..]);
+        }
+    }
+}
+
+/// `rows` with the `/usage` probe's inline rows over the person's `hi`, or the composer's top rule where none stands ([`aterm_phase::prompt::fixtures::USAGE_DISMISSED_INLINE_2_1_307`]: `❯ /usage` and the dismissal under it).
+fn probed_over(rows: &[String]) -> Vec<String> {
+    let inline = screen(aterm_phase::prompt::fixtures::USAGE_DISMISSED_INLINE_2_1_307);
+    let probe = inline
+        .iter()
+        .position(|r| r == "❯ /usage")
+        .expect("the probe's row");
+    let caret = rows
+        .iter()
+        .rposition(|r| r.starts_with('❯'))
+        .expect("the composer");
+    let under = rows.iter().position(|r| r == "❯ hi").unwrap_or(caret - 1);
+    let mut out = rows[..under].to_vec();
+    out.extend(inline[probe..probe + 2].iter().cloned());
+    out.push(String::new());
+    out.extend(rows[under..].iter().cloned());
+    out
+}
+
+#[test]
+fn the_harnesss_own_enter_at_a_held_claude_wall_is_no_persons_turn() {
+    use aterm_phase::prompt::fixtures::{
+        USAGE_DISMISSED_FULLSCREEN_2_1_307 as FULLSCREEN, USAGE_DISMISSED_INLINE_2_1_307 as INLINE,
+    };
+    let probe_row = |rows: Vec<String>| rows.iter().any(|r| r == "❯ /usage");
+    assert!(
+        !probe_row(screen(FULLSCREEN)) && probe_row(screen(INLINE)),
+        "the measured probes: fullscreen draws no row of its own, inline its `❯ /usage`"
+    );
+    // Fullscreen, the renderer the probe runs in, leaves the conversation as it stood (claude-2.1.307-usage-dismissed-fullscreen.txt); inline draws the probe's rows, its own message, as a host's step may draw its own.
+    for (autopilot, took_hi, (inline, host), (takeover, entered)) in
+        [Autopilot::Cruise, Autopilot::Land]
+            .into_iter()
+            .flat_map(|a| [Some(2), None].map(|t| (a, t)))
+            .flat_map(|(a, t)| [(false, false), (true, false), (true, true)].map(|o| (a, t, o)))
+            .flat_map(|(a, t, o)| {
+                [(false, false), (false, true), (true, false), (true, true)].map(|k| (a, t, o, k))
+            })
+    {
+        let tag = format!("probed-{autopilot:?}-{took_hi:?}-{inline}-{host}-{takeover}-{entered}");
+        let (dir, ledger) = ledger_at(&tag);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let (mut d, mut held) = held_wall(&mut m, "claude", &ledger, autopilot);
+        let at = d.at + 86_400;
+        let first = d.point(&r(&held.rows, at, None));
+        if host {
+            d.s.turn_end.host_moved();
+            d.submits += 1;
+        } else {
+            d.probed(at + 60);
+        }
+        if inline {
+            held = Held {
+                rows: probed_over(&held.rows),
+                hi: probed_over(&held.hi),
+                resumed: probed_over(&held.resumed),
+                ..held
+            };
+        }
+        let mut out: Vec<Out> = [
+            r(&held.rows, at + 120, None),
+            r(&held.rows, at + 3600, None),
+        ]
+        .iter()
+        .map(|p| d.point(p))
+        .collect();
+        // The loop goes on, or one takes over past the ledger's last point row; then a person's stray key, or keys ending on an Enter over the empty composer.
+        let (submits, at_keys) = (d.submits, at + 3630);
+        let mut m2 = Mock::new(vec![busy_screen()]);
+        let mut d = if takeover {
+            drop(d);
+            Driver::new(
+                &mut m2,
+                "claude",
+                &ledger,
+                autopilot,
+                (CAPTURED, at_keys),
+                true,
+            )
+            .submitted(submits)
+        } else {
+            d
+        };
+        out.extend(
+            [
+                R {
+                    typed: Some(at_keys),
+                    entered,
+                    ..r(&held.rows, at + 7200, None)
+                },
+                r(&held.rows, at + 10_800, None),
+            ]
+            .iter()
+            .map(|p| d.point(p)),
+        );
+        out.extend(hi_at(&mut d, &held, at + 18_000, took_hi));
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(held.holds(&first), "{tag}: {first:#?}");
+        assert!(
+            out[..4].iter().all(|o| !o.act.starts_with("act "))
+                && [0, 1, 3].iter().all(|&i| held.holds(&out[i])),
+            "{tag}: the harness's Enter, what it drew and keys that submitted nothing are no \
+             person's turn: {out:#?}"
+        );
+        held.judged(&tag, took_hi, &out[4..]);
+    }
+}
+
+#[test]
+fn keys_over_a_claude_hold_scrolled_past_its_prompt_lift_nothing_whatever_history_is_served() {
+    let reader = reader_of("claude");
+    let stood = vendor_walled("claude", &[None, None], claude_said);
+    // The cuts that carry the last prompt row off the top and leave the reply on the screen: a turn opening above it, whose tools only a history read shows.
+    let cuts: Vec<usize> = (1..stood.len())
+        .filter(|&k| {
+            reader.turn_opens_above(&stood[k..])
+                && stood[k..]
+                    .iter()
+                    .any(|r| r.starts_with("⏺ Allowance spent"))
+        })
+        .collect();
+    assert!(
+        !cuts.is_empty(),
+        "a cut past the prompt keeps the reply: {stood:#?}"
+    );
+    for (k, autopilot, takeover, history) in cuts.iter().flat_map(|&k| {
+        [Autopilot::Cruise, Autopilot::Land]
+            .into_iter()
+            .flat_map(|a| [false, true].map(|t| (a, t)))
+            .flat_map(move |(a, t)| [false, true].map(|h| (k, a, t, h)))
+    }) {
+        let tag = format!("past-prompt-{k}-{autopilot:?}-{takeover}-{history}");
+        let (dir, ledger) = ledger_at(&tag);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let (mut d, held) = held_wall(&mut m, "claude-said", &ledger, autopilot);
+        assert_eq!(held.rows, stood, "{tag}");
+        let at = d.at + 86_400;
+        let first = d.point(&r(&held.rows, at, None));
+        let cut = |t: i64| R {
+            above: history.then(|| held.rows[..k].to_vec()),
+            ..r(&held.rows[k..], t, None)
+        };
+        let (submits, program) = (d.submits, d.program);
+        let mut m2 = Mock::new(vec![busy_screen()]);
+        let mut d = if takeover {
+            drop(d);
+            Driver::new(
+                &mut m2,
+                program,
+                &ledger,
+                autopilot,
+                (CAPTURED, at + 20),
+                true,
+            )
+            .submitted(submits)
+        } else {
+            d
+        };
+        let mut out = Vec::new();
+        if takeover {
+            out.push(d.point(&r(&held.rows, at + 25, None)));
+        }
+        // The person's keys ending on an Enter over the empty composer, the screen redrawn past the prompt.
+        out.extend([
+            d.point(&sent(at + 30, cut(at + 3600))),
+            d.point(&cut(at + 7200)),
+            d.point(&cut(at + 10_800)),
+        ]);
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(held.holds(&first), "{tag}: {first:#?}");
+        let n = out.len();
+        assert!(
+            out.iter().all(|o| !o.act.starts_with("act "))
+                && out[n - 2..].iter().all(|o| held.holds(o)),
+            "{tag}: keys that submitted no turn lift nothing, though no tool read was made: \
+             {out:#?}"
+        );
+    }
+}
+
+#[test]
+fn keys_over_a_taller_pane_lift_nothing_at_a_takeover() {
+    for program in ["muse", "claude", "agy", "node"] {
+        for (autopilot, entered) in [Autopilot::Cruise, Autopilot::Land]
+            .into_iter()
+            .flat_map(|a| [false, true].map(|e| (a, e)))
+        {
+            let tag = format!("taller-pane-{program}-{autopilot:?}-{entered}");
+            let (dir, ledger) = ledger_at(&tag);
+            let mut m = Mock::new(vec![busy_screen()]);
+            let (mut d, held) = held_wall(&mut m, program, &ledger, autopilot);
+            let at = d.at + 86_400;
+            let first = d.point(&r(&held.rows, at, None));
+            // The pane grows a row: one more row of the history shows above the conversation, and no point moves.
+            let taller: Vec<String> =
+                std::iter::once("Earlier: the lane fix landed on its branch.")
+                    .map(str::to_owned)
+                    .chain(held.rows.iter().cloned())
+                    .collect();
+            let grown = d.point(&r(&taller, at + 600, None));
+            let submits = d.submits;
+            drop(d);
+            let mut m = Mock::new(vec![busy_screen()]);
+            let mut d = Driver::new(
+                &mut m,
+                program,
+                &ledger,
+                autopilot,
+                (CAPTURED, at + 630),
+                true,
+            )
+            .submitted(submits);
+            // The person's keys, ending on an Enter over the empty composer where `entered`.
+            let then = [
+                d.point(&R {
+                    typed: Some(at + 630),
+                    entered,
+                    ..r(&taller, at + 3600, None)
+                }),
+                d.point(&r(&taller, at + 7200, None)),
+            ];
+            let _ = std::fs::remove_dir_all(dir);
+            assert!(
+                held.holds(&first) && held.holds(&grown),
+                "{tag}: {first:#?} {grown:#?}"
+            );
+            assert!(
+                !then[0].act.starts_with("act ") && held.holds(&then[1]),
+                "{tag}: keys that submitted nothing at the new loop's first point lift nothing: \
+                 {then:#?}"
+            );
+        }
+    }
+}
+
+/// A Claude Code session's `k`th answer: `runs` runs of its suites (at most two), then `last` at each answer after.
+fn suites_then(runs: usize, last: &'static str) -> impl Fn(usize) -> Vec<String> {
+    move |k: usize| match k {
+        _ if k < runs => {
+            let (lane, said, took) = [
+                (
+                    "parser",
+                    "The parser tests pass; the lexer is next.",
+                    "3m 10s",
+                ),
+                (
+                    "lexer",
+                    "The lexer tests pass too; shall I wire them together?",
+                    "40s",
+                ),
+            ][k];
+            vec![
+                format!("⏺ Bash(targo --unverified test -p {lane} 2>&1 | tail -3)"),
+                "  ⎿  test result: ok. 12 passed".to_owned(),
+                String::new(),
+                format!("⏺ {said}"),
+                String::new(),
+                format!("✻ Worked for {took}"),
+            ]
+        }
+        _ => vec![last.to_owned(), String::new(), "✻ Worked for 2s".to_owned()],
+    }
+}
+
+#[test]
+fn a_persons_message_said_again_no_point_saw_busy_is_judged_as_one_in_new_words() {
+    for (autopilot, runs) in [Autopilot::Cruise, Autopilot::Land]
+        .into_iter()
+        .flat_map(|a| [2, 1].map(|n| (a, n)))
+    {
+        for (name, last) in [
+            ("done", "⏺ All done: nothing is left to do here."),
+            (
+                "landed",
+                "⏺ Nothing left: the parser and lexer are merged to main and pushed.",
+            ),
+            ("plain", "⏺ The lexer is wired in; the parser reads it now."),
+        ] {
+            let rows =
+                |asks: &[Option<&str>]| vendor_walled("claude", asks, suites_then(runs, last));
+            // The person's `continue` a point saw busy, then their `second` answered by `last` while no point looked; with one run, the harness's continuation and both of theirs answered the same.
+            let decided = |second: &str| {
+                let fin = rows(&[None, Some("continue"), Some(second)]);
+                let points = [
+                    r(&rows(&[]), 0, Some(600)),
+                    r(&rows(&[None]), 60, Some(190)),
+                    sent(100, r(&rows(&[None, Some("continue")]), 160, Some(40))),
+                    sent(200, r(&fin, 230, None)),
+                    r(&fin, 800, None),
+                    r(&fin, 2000, None),
+                    r(&fin, 3800, None),
+                    r(&fin, 8000, None),
+                ];
+                let (dir, ledger) =
+                    ledger_at(&format!("said-again-{autopilot:?}-{runs}-{name}-{second}"));
+                let out = replay_as("claude", &ledger, autopilot, CAPTURED, false, &points);
+                let _ = std::fs::remove_dir_all(dir);
+                out
+            };
+            let tag = format!("said-again-{autopilot:?}-{runs}-{name}");
+            let (again, other) = (decided("continue"), decided("continue please"));
+            assert_eq!(
+                again, other,
+                "{tag}: the same message said again is a turn as one in other words is, the \
+                 short streak's back-off included"
+            );
+            let want = match (autopilot, name) {
+                (Autopilot::Land, _) => "act land-nudge@v1",
+                (_, "plain") => "act continue@v1",
+                _ => "act continue-done-check@v1",
+            };
+            let acts: Vec<&str> = again.iter().map(|o| o.act.as_str()).collect();
+            if runs == 1 && name != "plain" {
+                assert!(
+                    acts[3..].iter().all(|a| *a == "nothing"),
+                    "{tag}: the person's short exchange after the claim is left to them: {again:#?}"
+                );
+            } else {
+                assert!(
+                    acts[3] == "wait" && acts[4] == want && acts[5..] == ["wait", "wait", want],
+                    "{tag}: the reply answered after the short streak's back-off, by the prompt it \
+                     gets: {again:#?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_lead_agents_prompt_lets_one_act_go_only_above_claude_codes_reply_with_no_person_at_the_keys() {
+    const LEAD: &str = "Rerun the division suite on the lane fix and report the number.";
+    for (program, autopilot, person, took) in ["claude-said", "agy", "node"]
+        .into_iter()
+        .flat_map(|p| [Autopilot::Cruise, Autopilot::Land].map(|a| (p, a)))
+        .flat_map(|(p, a)| [false, true].map(|k| (p, a, k)))
+        .flat_map(|(p, a, k)| [None, Some(2)].map(|t| (p, a, k, t)))
+    {
+        let tag = format!("lead-at-{program}-{autopilot:?}-{person}-{took:?}");
+        let (dir, ledger) = ledger_at(&tag);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let (mut d, held) = held_wall(&mut m, program, &ledger, autopilot);
+        let (drawn, wall): (&str, WallRows) = match program {
+            "claude-said" => ("claude", claude_said),
+            "agy" => ("agy", agy_wall),
+            _ => ("node", gemini_wall),
+        };
+        let rows = |asks: &[Option<&str>]| vendor_walled(drawn, asks, wall);
+        let (sent_rows, resumed) = (
+            rows(&[None, None, Some(LEAD)]),
+            rows(&[None, None, Some(LEAD), None]),
+        );
+        let at = d.at + 86_400;
+        let first = d.point(&r(&held.rows, at, None));
+        // The lead's `aterm ctl send`: its prompt row and Enter, the session's submits one up and no person's keys, or beside a person's stray key; a point saw its busy spell or none did.
+        let mut out = vec![
+            d.point(&R {
+                typed: person.then_some(at + 30),
+                entered: true,
+                ..r(&sent_rows, at + 60, took)
+            }),
+            d.point(&r(&sent_rows, at + 7200, None)),
+        ];
+        let resumes = out.iter().any(|o| o.act.starts_with("act "));
+        out.push(d.point(&if resumes {
+            r(&resumed, at + 7260, Some(3))
+        } else {
+            r(&sent_rows, at + 10_800, None)
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(held.holds(&first), "{tag}: {first:#?}");
+        let acts = out[..2]
+            .iter()
+            .filter(|o| o.act.starts_with("act "))
+            .count();
+        // Claude Code's screen names the prompt its reply answers; the other programs' readers name none, so the lead's prompt and its answer are that program's own turn.
+        let lifts = (program == "claude-said" && !person) || (person && took.is_some());
+        assert!(
+            acts == usize::from(lifts) && held.holds(&out[2]) && (lifts || held.holds(&out[1])),
+            "{tag}: a lead's prompt above Claude Code's reply, or a person's turn a point saw \
+             busy, lets one more act go, then held again; nothing else lifts it: {out:#?}"
+        );
     }
 }

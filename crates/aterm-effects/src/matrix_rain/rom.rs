@@ -3,8 +3,6 @@
 
 //! Phosphor glyph ROM: 64 glyphs rasterized onto a 24×48 1-bit master grid, with optional terminal-output material overrides.
 
-use std::sync::OnceLock;
-
 /// Master glyph cell width in bits (one `u32` row per scanline).
 pub const MASTER_W: usize = 24;
 /// Master glyph cell height in scanlines.
@@ -237,31 +235,48 @@ impl RomMaster {
     #[must_use]
     #[inline]
     pub const fn row(&self, glyph: usize, y: usize) -> u32 {
-        self.rows.as_slice()[glyph * MASTER_H + y]
+        let rows = if self.rows.is_empty() {
+            DECORATIVE_ROWS.as_slice()
+        } else {
+            self.rows.as_slice()
+        };
+        rows[glyph * MASTER_H + y]
     }
 }
 
+const fn build_decorative_rows() -> [u32; ROM_GLYPHS * MASTER_H] {
+    let mut rows = [0u32; ROM_GLYPHS * MASTER_H];
+    let mut g = 0;
+    while g < ROM_GLYPHS {
+        let recipe = RECIPES[g];
+        let base = g * MASTER_H;
+        let mut s = 0;
+        while s < recipe.len() {
+            match recipe[s] {
+                L(x0, y0, x1, y1) => stamp_line(&mut rows, base, x0, y0, x1, y1),
+                D(x, y) => stamp_dot(&mut rows, base, x, y),
+            }
+            s += 1;
+        }
+        g += 1;
+    }
+    rows
+}
+
+static DECORATIVE_ROWS: [u32; ROM_GLYPHS * MASTER_H] = build_decorative_rows();
+static DECORATIVE_MASTER: RomMaster = RomMaster { rows: Vec::new() };
+
 /// Rasterizes the full 64-glyph ROM master using integer math.
 #[must_use]
-pub fn rasterize_master() -> RomMaster {
-    let mut rows = vec![0u32; ROM_GLYPHS * MASTER_H];
-    for (g, recipe) in RECIPES.iter().enumerate() {
-        let glyph = &mut rows[g * MASTER_H..(g + 1) * MASTER_H];
-        for stroke in *recipe {
-            match *stroke {
-                L(x0, y0, x1, y1) => stamp_line(glyph, x0, y0, x1, y1),
-                D(x, y) => stamp_dot(glyph, x, y),
-            }
-        }
-    }
-    RomMaster { rows }
+#[inline]
+pub const fn rasterize_master() -> RomMaster {
+    RomMaster { rows: Vec::new() }
 }
 
 /// Returns the decorative ROM master, rasterized at most once per process.
 #[inline]
-pub(crate) fn decorative_master() -> &'static RomMaster {
-    static DECORATIVE: OnceLock<RomMaster> = OnceLock::new();
-    DECORATIVE.get_or_init(rasterize_master)
+pub(crate) const fn decorative_master() -> &'static RomMaster {
+    &DECORATIVE_MASTER
 }
 
 /// Returns the embedded 8×8 bitmap for a supported terminal-output character.
@@ -274,7 +289,7 @@ pub const fn material_bitmap(c: char) -> Option<[u8; 8]> {
 /// Authors a hybrid 64-slot master with `chars` in the leading slots and decorative ROM in the tail.
 #[must_use]
 pub fn rasterize_material_master(chars: &[char]) -> RomMaster {
-    let mut master = decorative_master().clone();
+    let mut master = rasterize_master();
     for (glyph_index, &ch) in chars.iter().take(ROM_GLYPHS).enumerate() {
         let _ = author_material_glyph(&mut master, glyph_index, ch);
     }
@@ -285,6 +300,9 @@ fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) -> bool 
     let Some(bitmap) = material_bitmap(ch) else {
         return false;
     };
+    if master.rows.is_empty() {
+        master.rows.extend_from_slice(&DECORATIVE_ROWS);
+    }
     let glyph = &mut master.rows[slot * MASTER_H..(slot + 1) * MASTER_H];
     glyph.fill(0);
     for (sy, bits) in bitmap.into_iter().enumerate() {
@@ -314,40 +332,49 @@ pub fn reauthor_material_glyph(master: &mut RomMaster, slot: usize, ch: Option<c
     {
         return;
     }
-    let range = slot * MASTER_H..(slot + 1) * MASTER_H;
-    master.rows[range.clone()].copy_from_slice(&decorative_master().rows[range]);
+    if !master.rows.is_empty() {
+        let range = slot * MASTER_H..(slot + 1) * MASTER_H;
+        master.rows[range.clone()].copy_from_slice(&DECORATIVE_ROWS[range]);
+    }
 }
 
 /// Set pixel `(x, y)` if in bounds.
 #[inline]
-const fn plot(glyph: &mut [u32], x: i32, y: i32) {
+const fn plot(rows: &mut [u32; ROM_GLYPHS * MASTER_H], base: usize, x: i32, y: i32) {
     if x >= 0 && x < MASTER_W as i32 && y >= 0 && y < MASTER_H as i32 {
-        glyph[y as usize] |= 1 << x;
+        rows[base + y as usize] |= 1 << x;
     }
 }
 
 /// Stamp a `THICK×THICK` square centered-ish on `(x, y)` (offset −1 keeps the
 /// stroke visually centered on the authored line).
 #[inline]
-const fn stamp_thick(glyph: &mut [u32], x: i32, y: i32) {
+const fn stamp_thick(rows: &mut [u32; ROM_GLYPHS * MASTER_H], base: usize, x: i32, y: i32) {
     let mut dy = -1;
     while dy < THICK - 1 {
         let mut dx = -1;
         while dx < THICK - 1 {
-            plot(glyph, x + dx, y + dy);
+            plot(rows, base, x + dx, y + dy);
             dx += 1;
         }
         dy += 1;
     }
 }
 
-const fn stamp_line(glyph: &mut [u32], x0: i32, y0: i32, x1: i32, y1: i32) {
+const fn stamp_line(
+    rows: &mut [u32; ROM_GLYPHS * MASTER_H],
+    base: usize,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+) {
     let (dx, dy) = ((x1 - x0).abs(), (y1 - y0).abs());
     let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
     let mut err = dx - dy;
     let (mut x, mut y) = (x0, y0);
     loop {
-        stamp_thick(glyph, x, y);
+        stamp_thick(rows, base, x, y);
         if x == x1 && y == y1 {
             break;
         }
@@ -363,13 +390,13 @@ const fn stamp_line(glyph: &mut [u32], x0: i32, y0: i32, x1: i32, y1: i32) {
     }
 }
 
-const fn stamp_dot(glyph: &mut [u32], x: i32, y: i32) {
+const fn stamp_dot(rows: &mut [u32; ROM_GLYPHS * MASTER_H], base: usize, x: i32, y: i32) {
     let mut dy = -2;
     while dy <= 2 {
         let mut dx = -2;
         while dx <= 2 {
             if dx * dx + dy * dy <= DOT_R2 {
-                plot(glyph, x + dx, y + dy);
+                plot(rows, base, x + dx, y + dy);
             }
             dx += 1;
         }

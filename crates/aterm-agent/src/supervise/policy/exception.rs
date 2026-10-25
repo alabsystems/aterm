@@ -137,7 +137,7 @@ impl Exception {
             why: "Its program answers aterm's acts with the same reply and no work, so aterm types nothing more."
                 .to_string(),
             action: "Open the tab and do what its last reply asks.".to_string(),
-            clears: "a different reply, someone's turn, or the agent working",
+            clears: "a different reply, a person's turn a point saw busy, a lead's new prompt above Claude Code's reply, or the agent working",
             escalated: false,
             notice: None,
         }
@@ -156,7 +156,7 @@ impl Exception {
             }
             .to_string(),
             action: futile_action(program).to_string(),
-            clears: "a new reset or wall, someone's turn, or the agent working",
+            clears: "a new reset or wall, a person's turn a point saw busy, or the agent working",
             escalated: false,
             notice: None,
         }
@@ -952,7 +952,7 @@ pub fn exception_for(
                 when: Urgency::Later,
                 why: "The limit still stands an hour after its reset.".to_string(),
                 action: futile_action(reading.program).to_string(),
-                clears: "a new reset or wall, someone's turn, or the agent working",
+                clears: "a new reset or wall, a person's turn a point saw busy, or the agent working",
                 escalated: false,
                 notice: None,
             })

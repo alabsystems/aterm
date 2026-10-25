@@ -27183,3 +27183,49 @@ fn the_harness_token_is_never_in_the_options_debug() {
         "{shown}"
     );
 }
+
+/// A session file that cannot be parsed fails the roster only while its writer may live: a
+/// process of this user's at its number. Root's process at that number (`kill` answers `EPERM`,
+/// which [`alive`] counts as alive) or an unreaped zombie (`kill` answers 0) cannot be this
+/// user's Claude Code writing it, and Claude Code's own sweep leaves such a file in place.
+/// Negative control: judged by [`alive`], each of those fails the roster.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn an_unparsable_session_file_fails_the_roster_only_while_this_users_process_may_write_it() {
+    let scratch = aterm_tempfile::tempdir().expect("tempdir");
+    let claude_dir = scratch.path().join(".claude");
+    let sessions = claude_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let half = |pid: u32| {
+        std::fs::write(sessions.join(format!("{pid}.json")), b"{\"pid\":").expect("a torn record");
+    };
+    half(1);
+    assert_eq!(
+        session_files_in(&claude_dir).map(|f| f.len()),
+        Some(0),
+        "launchd's number: root's process writes no session of this user's"
+    );
+    let zombie = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("a child");
+    let pid = zombie.id();
+    let started = Instant::now();
+    while aterm_uds::process::read_short_info(i32::try_from(pid).expect("a pid")).is_some() {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the child never exited"
+        );
+        std::thread::yield_now();
+    }
+    half(pid);
+    let with_zombie = session_files_in(&claude_dir).map(|f| f.len());
+    drop(zombie);
+    assert_eq!(with_zombie, Some(0), "an unreaped zombie writes nothing");
+    std::fs::remove_file(sessions.join(format!("{pid}.json"))).expect("the zombie's record");
+    half(std::process::id());
+    assert!(
+        session_files_in(&claude_dir).is_none(),
+        "this user's live process may be writing its record"
+    );
+}

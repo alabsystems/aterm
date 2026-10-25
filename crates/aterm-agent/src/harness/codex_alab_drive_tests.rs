@@ -22,6 +22,270 @@ const TUI: u32 = 4_000_001;
 const SHELL: u32 = 4_000_002;
 const NEW: u32 = 4_000_003;
 
+fn primary_copy(rig: &Rig, thread: &str) -> crate::harness::self_claimed::Copy {
+    let line = vec![
+        rig.twin.to_string_lossy().into_owned(),
+        "resume".to_string(),
+        thread.to_string(),
+    ];
+    let home = rig.home.to_string_lossy().into_owned();
+    let record = Record {
+        pid: TUI,
+        session_id: Some(thread.to_string()),
+        resume_argv: Some(line),
+        env: vec![("CODEX_HOME".to_string(), home.clone())],
+        status: Some("idle".to_string()),
+        exit: None,
+        cwd: Some("/w".to_string()),
+        draft_empty: Some(true),
+        frame: Some("idle".to_string()),
+        initializing: false,
+    };
+    let live = ClaimedLive {
+        exec_path: rig.twin.to_string_lossy().into_owned(),
+        image: Some(rig.twin.clone()),
+        argv: vec![rig.twin.to_string_lossy().into_owned()],
+        codex_home: Some(home),
+        cwd: Some(PathBuf::from("/w")),
+        ..ClaimedLive::default()
+    };
+    let resume = validate(&record, TUI, &live)
+        .expect("the primary record is validated against its live launch");
+    crate::harness::self_claimed::Copy {
+        pid: TUI,
+        start: "Thu Oct 16 08:00:00 2026".to_string(),
+        home: rig.home.clone(),
+        seen: crate::harness::self_claimed::Seen::Present(record),
+        resume: Ok(resume),
+    }
+}
+
+#[test]
+fn a_proven_primary_resolves_multiple_codex_writer_threads() {
+    let mut rig = Rig::new("snapshot-proven-root", &[]);
+    rig.kernel.tui_alive = true;
+    let copy = primary_copy(&rig, T2);
+    let exe = rig.twin.clone();
+    let args = atpkg::caller_shell::ProcArgs {
+        exec_path: exe.to_string_lossy().into_owned(),
+        argv: vec![exe.to_string_lossy().into_owned()],
+        env: vec![format!("CODEX_HOME={}", rig.home.display())],
+    };
+    let held = Crashed {
+        exe: Some(exe),
+        files: [
+            T1,
+            T2,
+            "00000000-1111-2222-3333-444455556666",
+            "00000001-1111-2222-3333-444455556666",
+        ]
+        .into_iter()
+        .map(|thread| {
+            rig.home
+                .join("thread-writer-locks")
+                .join(format!("{thread}.lock"))
+        })
+        .collect(),
+        ..rig.kernel.clone_world()
+    };
+    let snap = snapshot_with_claim(
+        &rig.opts,
+        TAB,
+        TUI,
+        copy.start.clone(),
+        SHELL,
+        &args,
+        Some(&copy),
+        &held,
+    )
+    .expect("the exact proven primary disambiguates its sibling writer threads");
+    assert_eq!(snap.session.as_deref(), Some(T2));
+    assert_eq!(
+        crate::harness::relaunch::self_claimed_line(&snap),
+        copy.resume.as_ref().ok()
+    );
+    let switched = primary_copy(&rig, T1);
+    let snap = snapshot_with_claim(
+        &rig.opts,
+        TAB,
+        TUI,
+        switched.start.clone(),
+        SHELL,
+        &args,
+        Some(&switched),
+        &held,
+    )
+    .expect("the next validated root is captured independently in the same process");
+    assert_eq!(snap.session.as_deref(), Some(T1));
+    assert_eq!(
+        crate::harness::relaunch::self_claimed_line(&snap),
+        switched.resume.as_ref().ok()
+    );
+}
+
+#[test]
+fn multiple_codex_writers_reject_missing_stale_or_foreign_primary_claims() {
+    let rig = Rig::new("snapshot-wrong-root", &[]);
+    let copy = primary_copy(&rig, T2);
+    let args = atpkg::caller_shell::ProcArgs {
+        exec_path: rig.twin.to_string_lossy().into_owned(),
+        argv: vec![rig.twin.to_string_lossy().into_owned()],
+        env: vec![format!("CODEX_HOME={}", rig.home.display())],
+    };
+    let held = Crashed {
+        exe: Some(rig.twin.clone()),
+        files: [T1, T2]
+            .into_iter()
+            .map(|thread| {
+                rig.home
+                    .join("thread-writer-locks")
+                    .join(format!("{thread}.lock"))
+            })
+            .collect(),
+        ..rig.kernel.clone_world()
+    };
+    let mut wrong_pid = copy.clone();
+    wrong_pid.pid += 1;
+    let mut wrong_start = copy.clone();
+    wrong_start.start.push_str(" stale");
+    let mut wrong_home = copy.clone();
+    wrong_home.home = rig.dir.join("foreign-home");
+    let mut unvalidated = copy.clone();
+    unvalidated.resume = Err("no-resume");
+    let mut absent_record = copy.clone();
+    absent_record.seen = crate::harness::self_claimed::Seen::Never;
+    let mut ended_record = copy.clone();
+    if let crate::harness::self_claimed::Seen::Present(record) = &mut ended_record.seen {
+        record.exit = Some("signal:15".to_string());
+    }
+    for claim in [
+        None,
+        Some(&wrong_pid),
+        Some(&wrong_start),
+        Some(&wrong_home),
+        Some(&unvalidated),
+        Some(&absent_record),
+        Some(&ended_record),
+    ] {
+        assert_eq!(
+            snapshot_with_claim(
+                &rig.opts,
+                TAB,
+                TUI,
+                copy.start.clone(),
+                SHELL,
+                &args,
+                claim,
+                &held
+            )
+            .err(),
+            Some("threads-ambiguous")
+        );
+    }
+    let unlocked = primary_copy(&rig, "00000000-1111-2222-3333-444455556666");
+    assert_eq!(
+        snapshot_with_claim(
+            &rig.opts,
+            TAB,
+            TUI,
+            copy.start.clone(),
+            SHELL,
+            &args,
+            Some(&unlocked),
+            &held
+        )
+        .err(),
+        Some("threads-ambiguous")
+    );
+    for files in [
+        vec![
+            rig.home
+                .join("thread-writer-locks")
+                .join(format!("{T1}.lock")),
+        ],
+        Vec::new(),
+    ] {
+        let one = Crashed {
+            files,
+            ..held.clone_world()
+        };
+        assert_eq!(
+            snapshot_with_claim(
+                &rig.opts,
+                TAB,
+                TUI,
+                copy.start.clone(),
+                SHELL,
+                &args,
+                Some(&copy),
+                &one
+            )
+            .err(),
+            Some("threads-ambiguous"),
+            "an explicit primary is never replaced with a contradictory or missing writer"
+        );
+    }
+}
+
+#[test]
+fn duplicate_codex_writer_descriptors_name_one_conversation() {
+    let rig = Rig::new("snapshot-duplicate-fd", &[]);
+    let lock = rig
+        .home
+        .join("thread-writer-locks")
+        .join(format!("{T2}.lock"));
+    let kernel = Crashed {
+        exe: Some(rig.twin.clone()),
+        files: vec![lock.clone(), lock],
+        ..rig.kernel.clone_world()
+    };
+    let args = atpkg::caller_shell::ProcArgs {
+        exec_path: rig.twin.to_string_lossy().into_owned(),
+        argv: vec![rig.twin.to_string_lossy().into_owned()],
+        env: vec![format!("CODEX_HOME={}", rig.home.display())],
+    };
+    let snap = snapshot(
+        &rig.opts,
+        TAB,
+        TUI,
+        "Thu Oct 16 08:00:00 2026".to_string(),
+        SHELL,
+        &args,
+        &kernel,
+    )
+    .expect("duplicate descriptors do not create a different thread");
+    assert_eq!(snap.session.as_deref(), Some(T2));
+    assert!(crate::harness::relaunch::self_claimed_line(&snap).is_none());
+}
+
+#[test]
+fn a_published_codex_root_rejects_a_new_primary_under_the_same_process() {
+    let rig = Rig::new("snapshot-root-switch", &[]);
+    let root = primary_copy(&rig, T2);
+    let mut snap = rig.snap(root.resume.as_ref().ok().and_then(|r| r.codex_home.clone()));
+    snap.codex_mut().unwrap().self_claimed = root.resume.clone().ok();
+    assert!(
+        crate::harness::relaunch::same_self_claim(&snap, &root),
+        "the exact root remains restartable"
+    );
+    let switched = primary_copy(&rig, T1);
+    assert!(
+        !crate::harness::relaunch::same_self_claim(&snap, &switched),
+        "a same-process root switch cannot restart the older primary"
+    );
+    let mut moved_line = root.clone();
+    moved_line
+        .resume
+        .as_mut()
+        .unwrap()
+        .argv
+        .insert(1, "--no-alt-screen".to_string());
+    assert!(
+        !crate::harness::relaunch::same_self_claim(&snap, &moved_line),
+        "a different current validated command cannot borrow an older root snapshot"
+    );
+}
+
 fn scratch(name: &str) -> ScratchDir {
     ScratchDir::new("cxa", name)
 }

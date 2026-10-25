@@ -2717,6 +2717,12 @@ impl DebuggerStepQueue {
         self.queued
     }
 
+    /// The step retired a read of the rule that brought no reading and reads it again itself,
+    /// at its own pace ([`StepWait::ProbeUnread`]).
+    pub(crate) fn rereads_unread(&self) -> bool {
+        self.queued && self.waiting == Some(StepWait::ProbeUnread)
+    }
+
     /// No standing yes: stop looking, with nothing written, until
     /// [`Self::unpark`]. The folder warm-up, which waits while the step is
     /// queued, does not wait on a parked one.

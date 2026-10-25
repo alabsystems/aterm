@@ -505,7 +505,7 @@ pub const fn name_ink(mark: CliMark, letter: usize, dark: bool) -> u32 {
 
 /// Contrast-floored foreground RGB for letter `letter` of `mark`'s name on `ground`.
 #[must_use]
-pub fn name_fg(mark: CliMark, letter: usize, ground: u32) -> u32 {
+pub const fn name_fg(mark: CliMark, letter: usize, ground: u32) -> u32 {
     let ink = name_ink(mark, letter, dark_ground(ground));
     floor_contrast_keeping_hue(ink, ground, NAME_CONTRAST)
 }
@@ -515,17 +515,17 @@ pub fn name_fg(mark: CliMark, letter: usize, ground: u32) -> u32 {
 pub fn icon_palette(mark: CliMark, ground: u32) -> Vec<FxInk> {
     let b = brand(mark);
     let inks = b.icon.on(dark_ground(ground));
-    let mut cache = [None::<u32>; MAX_ICON_INKS];
-    let mut floored = |i: u8| {
-        let idx = usize::from(i);
-        *cache[idx]
-            .get_or_insert_with(|| floor_contrast_keeping_hue(inks[idx], ground, ICON_CONTRAST))
-    };
+    let mut floored = [0u32; MAX_ICON_INKS];
+    for (slot, &ink) in floored.iter_mut().zip(inks) {
+        *slot = floor_contrast_keeping_hue(ink, ground, ICON_CONTRAST);
+    }
     b.texels
         .iter()
         .map(|&t| match t {
-            Texel::Ink(i) => FxInk::over(floored(i), 255),
-            Texel::Half(i) => FxInk::over(premul_rgb(floored(i), HALF_ALPHA), HALF_ALPHA),
+            Texel::Ink(i) => FxInk::over(floored[usize::from(i)], 255),
+            Texel::Half(i) => {
+                FxInk::over(premul_rgb(floored[usize::from(i)], HALF_ALPHA), HALF_ALPHA)
+            }
             Texel::Hole(rgb) => FxInk::over(rgb, 255),
         })
         .collect()

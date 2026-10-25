@@ -529,7 +529,7 @@ mod tests {
     }
 
     /// Every char the renderer draws as a band icon is the engine's icon of that char, and
-    /// no other char is an engine icon; every icon is the engine's, a glass mark or a deck
+    /// no other char is an engine icon; every icon is the engine's, a glass mark or a need
     /// pictogram, and only the engine's have a band glyph.
     #[test]
     fn band_icon_ids_match_the_renderers() {

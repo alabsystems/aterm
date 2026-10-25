@@ -146,6 +146,7 @@ mod autopilot;
 mod autopilot_menu;
 mod autopilot_timers;
 mod bell_ledger;
+mod box_banner;
 mod build_badge;
 mod build_info;
 #[cfg(test)]
@@ -292,15 +293,47 @@ mod workstation_setup;
 #[cfg(target_os = "macos")]
 pub use devtools_helper_drive::run_devtools_helper_drive;
 pub use quit_reopen::{REOPEN_VERB, run_reopen_after};
+#[cfg(unix)]
+pub use system_state::note_journal_refused;
 pub use system_state::{
-    Admission as InitialSetupAdmission, InitialSetupPermissionPolicy, SetupCheck, SetupOperation,
-    SetupStatus, SetupStatusRow, pass_rows, restore_rows,
+    Admission as InitialSetupAdmission, CHECK_FAILED_NOTE, InitialSetupPermissionPolicy,
+    RESTORE_FAILED_NOTE, SETUP_ROW, STATE_UNREAD_NOTE, SetupCheck, SetupOperation, SetupStatus,
+    SetupStatusRow, journal_refused_entry, pass_rows, restore_rows,
 };
 /// Mend this Mac's vault subscriber off the event loop, at once and every
 /// `secrets_join::MEND_EVERY` (`secrets_join::spawn_mend_lane`): for a windowed launch whose
-/// setup is finished, or a run that just finished. One mend lane per process.
+/// setup is finished, or a run that just finished. One mend lane per process; each of its reads
+/// waits for [`set_secrets_sync_gate`]'s word that System State's plan in force keeps the vault
+/// in sync.
 pub fn mend_secrets_subscriber() {
     mend_secrets_subscriber_once(false);
+}
+
+/// Whether System State's plan in force keeps this Mac's vault in sync now, as the aterm
+/// binary reads its setup records ([`set_secrets_sync_gate`]).
+type SecretsSyncGate = (fn() -> bool, fn(&mut dyn FnMut()) -> bool);
+static SECRETS_SYNC_GATE: std::sync::OnceLock<SecretsSyncGate> = std::sync::OnceLock::new();
+
+/// Say how the vault subscriber's mend learns whether System State's plan in force keeps this
+/// Mac's vault in sync: its Secrets vault group at Set up, and no person's Stop holding its run
+/// (System State design §3.3). `wanted` admits the read; `while_wanted` holds that choice current
+/// through its effects after the read. Set once, before the window starts; a later call is ignored.
+pub fn set_secrets_sync_gate(wanted: fn() -> bool, while_wanted: fn(&mut dyn FnMut()) -> bool) {
+    let _ = SECRETS_SYNC_GATE.set((wanted, while_wanted));
+}
+
+/// [`set_secrets_sync_gate`]'s answer now. A process that never set one keeps nothing in sync
+/// by itself: only a person's press starts the subscriber there.
+#[cfg(target_os = "macos")]
+pub(crate) fn secrets_sync_wanted() -> bool {
+    SECRETS_SYNC_GATE.get().is_some_and(|gate| gate.0())
+}
+
+/// Keep the plan current while a mend acts on its reading. With no gate installed or a newer
+/// choice withholding sync, nothing is invoked.
+#[cfg(target_os = "macos")]
+pub(crate) fn secrets_sync_while_wanted(work: &mut dyn FnMut()) -> bool {
+    SECRETS_SYNC_GATE.get().is_some_and(|gate| gate.1(work))
 }
 
 fn mend_secrets_subscriber_once(headless: bool) {
@@ -316,7 +349,7 @@ pub use system_state_host::{
 };
 pub use workstation_setup::{
     SetupAnswer, WorkstationSetupDecision, await_initial_setup_answer_while,
-    await_window_focus_after, on_window_focus_gained, window_focus_gains,
+    on_window_focus_gained, window_focus_gains,
 };
 #[cfg(any(test, debug_assertions))]
 pub use workstation_setup::{drive_initial_setup_answer_for_test, gain_window_focus_for_test};
@@ -362,20 +395,6 @@ pub fn overlay_card_cost(frames: usize) -> Vec<(String, f64, f64, f64)> {
                 c.p99_us,
             )
         })
-        .collect()
-}
-#[cfg(all(feature = "bench-support", debug_assertions))]
-mod deck_frame_probe;
-/// What the `deck_frame_cost` bench measures: per stage, what it timed, the deck's prim count
-/// and µs per call at p50, p90 and p99. Its scenes are the debug-gated deck fixtures, so it
-/// builds where debug assertions are on (`--profile opt-test`).
-#[cfg(all(feature = "bench-support", debug_assertions))]
-#[doc(hidden)]
-#[must_use]
-pub fn deck_frame_cost(frames: usize) -> Vec<(String, usize, f64, f64, f64)> {
-    deck_frame_probe::deck_frame_cost(frames)
-        .into_iter()
-        .map(|c| (c.what, c.prims, c.p50_us, c.p90_us, c.p99_us))
         .collect()
 }
 /// What the `c_cut_cost` bench measures.
@@ -564,7 +583,6 @@ mod logging;
 mod manual_reset;
 mod markdown;
 mod menu;
-mod merged_marks;
 mod metrics;
 use aterm_effects::motion;
 mod bounded_child;
@@ -634,7 +652,6 @@ mod kitty_animation;
 mod login_notice_verb;
 #[cfg(target_os = "macos")]
 mod memory_pressure;
-mod merged_plan;
 mod needs;
 mod predict_seen;
 #[cfg(any(test, debug_assertions))]
@@ -697,7 +714,6 @@ mod startup_token;
 mod stats_deck;
 mod stats_lens;
 mod stats_live;
-mod stats_merged;
 mod stats_paint;
 mod stats_plan;
 mod stats_sill;
@@ -3357,7 +3373,7 @@ enum Wake {
     #[cfg(target_os = "linux")]
     PasteReady {
         wid: WindowId,
-        session: Option<u64>,
+        owner: app_input::ClipboardRecipient,
         text: String,
         source: Source,
     },
@@ -5260,6 +5276,8 @@ pub(crate) struct SessionCtx {
     pub(crate) screen_moves: Arc<vitals_host::ScreenMoves>,
     /// What the PTY reader read, for the stuck engine's pass to read at its tick.
     pub(crate) job_feed: Arc<vitals_jobs::JobFeed>,
+    /// Who told the box the program stands on: its own notification or the herald's banner.
+    pub(crate) box_banner: Arc<box_banner::BoxBanner>,
 }
 
 struct Session {
@@ -11079,7 +11097,7 @@ impl App {
                     .is_none_or(|age| age <= debugger_access::ASK_PROBE_FRESH)
         });
         match fresh {
-            Some(row) if row.probe().mode == DebuggerMode::Unknown && row.probe_age().is_some() => {
+            Some(row) if row.unread_age().is_some() => {
                 // A read with no reading (`-status` timed out, did not start, or answered
                 // what the classifier does not claim) is retired and the rule read again, for
                 // a bounded span: this Mac is recorded already. A closed gate's row, which no
@@ -12261,10 +12279,14 @@ impl App {
             // Verified here: a later approval in this process brings no page back.
             self.note_fda_unverified_here(false);
             self.note_fda_regression(false);
-            self.record_access_step(
-                aterm_types::macos_setup::Access::FullDiskAccess,
-                aterm_types::macos_setup::AccessOutcome::Granted,
-            );
+            if self.access_revision().is_some() {
+                self.record_access_step(
+                    aterm_types::macos_setup::Access::FullDiskAccess,
+                    aterm_types::macos_setup::AccessOutcome::Granted,
+                );
+            } else {
+                self.notify_initial_setup_fda_granted();
+            }
             self.show_macos_access_granted(now);
             self.clear_macos_access_opened_marker();
             if (self.devtools_helper.reach().grant_stable)() {
@@ -13753,6 +13775,7 @@ impl App {
             pool,
             view_store,
             link_estimates,
+            native_runtime,
             ..
         } = self;
         let Some(ws) = windows.get_mut(&wid) else {
@@ -13797,6 +13820,12 @@ impl App {
             front_content::WindowFocus::Content(view)
         });
         if front_changed {
+            if let Some(front_content::FrontContent::Native { view, .. }) = previous_front {
+                native_runtime.change_view_state(view, |state| {
+                    state.common_mut().retire_input();
+                    false
+                });
+            }
             ws.page_buttons = 0;
             ws.fx.front_replaced(Instant::now());
             ws.fx
@@ -15165,6 +15194,7 @@ impl App {
     }
 
     fn window_focus_event(&mut self, wid: WindowId, focused: bool) {
+        let gained = focused && self.windows.get(&wid).is_some_and(|window| !window.focused);
         if focused {
             workstation_setup::window_focus_gained();
             if cfg!(target_os = "macos") && !self.headless {
@@ -15198,6 +15228,9 @@ impl App {
             self.claude_glass_focus(wid, false);
         }
         self.on_focus(wid, focused);
+        if gained {
+            self.system_state_focus_returned(wid);
+        }
         let _ = self.carried_window_show_focus_event(wid);
     }
 
@@ -15502,8 +15535,23 @@ impl App {
         self.paste_clipboard_into(wid);
     }
 
+    /// Overlay fields take human clipboard gestures before the terminal behind them.
+    fn clipboard_session_in(&self, wid: WindowId) -> Option<u64> {
+        self.windows
+            .get(&wid)
+            .filter(|window| !window.overlay_open())?;
+        self.focused_session_id(wid)
+    }
+
     fn paste_clipboard_into(&mut self, wid: WindowId) {
-        let session = self.focused_session_id(wid);
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|window| window.overview().is_some())
+        {
+            return;
+        }
+        let session = self.clipboard_session_in(wid);
         #[cfg(not(target_os = "linux"))]
         {
             if let Some(text) = debug_paste_text().or_else(control::pbpaste) {
@@ -15528,6 +15576,9 @@ impl App {
             let Some(proxy) = self.proxy.clone() else {
                 return;
             };
+            let Some(owner) = self.clipboard_recipient(wid) else {
+                return;
+            };
             std::thread::Builder::new()
                 .name("aterm-x11-paste".into())
                 .spawn(move || {
@@ -15535,7 +15586,7 @@ impl App {
                     if let Some(text) = control::pbpaste() {
                         let _ = proxy.send_event(Wake::PasteReady {
                             wid,
-                            session,
+                            owner,
                             text,
                             source: Source::Human,
                         });
@@ -15551,6 +15602,13 @@ impl App {
                 .pool
                 .get(owner)
                 .map(|owner| term_lock(&owner.term).modes().bracketed_paste),
+            None if self
+                .windows
+                .get(&wid)
+                .is_some_and(|window| window.overlay_open()) =>
+            {
+                None
+            }
             None => self
                 .front_terminal(wid)
                 .map(|terminal| term_lock(&terminal.term).modes().bracketed_paste),
@@ -15799,12 +15857,22 @@ impl App {
     /// Paste the X11 PRIMARY selection into `wid` through the clipboard's pipeline and guard.
     #[cfg(target_os = "linux")]
     pub(crate) fn paste_primary_into(&mut self, wid: WindowId) {
-        let session = self.focused_session_id(wid);
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|window| window.overview().is_some())
+        {
+            return;
+        }
+        let session = self.clipboard_session_in(wid);
         if let Some(text) = control::primary_get_owned() {
             self.deliver_paste(wid, session, text, Source::Human);
             return;
         }
         let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        let Some(owner) = self.clipboard_recipient(wid) else {
             return;
         };
         std::thread::Builder::new()
@@ -15814,7 +15882,7 @@ impl App {
                 if let Some(text) = control::primary_get() {
                     let _ = proxy.send_event(Wake::PasteReady {
                         wid,
-                        session,
+                        owner,
                         text,
                         source: Source::Human,
                     });
@@ -19230,10 +19298,10 @@ impl App {
             #[cfg(target_os = "linux")]
             Wake::PasteReady {
                 wid,
-                session,
+                owner,
                 text,
                 source,
-            } => self.deliver_paste(wid, session, text, source),
+            } => self.complete_clipboard_paste_in(wid, owner, text, source),
             #[cfg(target_os = "linux")]
             Wake::FindPasteReady { wid, owner, text } => {
                 self.complete_search_paste_in(wid, owner, text);
@@ -26757,6 +26825,7 @@ fn ptyless_session(id: u64, self_id: SessionId, term: Terminal, sink: Arc<SinkWr
         bells: Default::default(),
         screen_moves: Default::default(),
         job_feed: Default::default(),
+        box_banner: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),

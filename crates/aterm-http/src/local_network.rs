@@ -15,6 +15,12 @@
 
 use std::time::Duration;
 
+/// What a lookup of a `.local` name macOS refuses this process says after its host
+/// (`dns: <host>: …`): a caller that must tell macOS's refusal from silence matches these
+/// words ([`crate::LOCAL_NETWORK_REFUSED`]).
+pub const REFUSED: &str =
+    "macOS does not let this app use the local network (Local Network privacy)";
+
 /// Whether `host` is a local DNS name (`.local`, or `.local.`), the one kind of
 /// name Local Network privacy gates (TN3179: a non-local name resolves through
 /// the system resolver without it).

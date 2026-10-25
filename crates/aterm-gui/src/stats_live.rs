@@ -284,7 +284,6 @@ impl crate::App {
     fn live_facts(&self, wid: crate::WindowId) -> Option<LiveFacts> {
         let ws = self.windows.get(&wid)?;
         if self.stats_bars_form() != crate::stats_deck::StatsBars::Deck
-            || self.deck_style() != crate::stats_deck::DeckStyle::V2
             || !crate::stats_deck::stats_drawn_on(ws)
             || ws.occluded
         {

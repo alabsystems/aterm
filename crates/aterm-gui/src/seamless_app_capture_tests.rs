@@ -2196,6 +2196,7 @@ fn what_the_owner_was_told_and_has_seen_crosses_the_update() {
         worker_of: None,
         age_ms: None,
         what: None,
+        claim: None,
     };
     let fleet = crate::fleet_glance::escalation(&mac, &need);
     app.herald_deliver(fleet.session, Some(&fleet), false);

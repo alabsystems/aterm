@@ -36,6 +36,8 @@ pub(crate) struct CodexSurvey {
     pub(crate) branch: Option<String>,
     /// Task prompt head from [`task_prompt_of_env`].
     pub(crate) task: Option<String>,
+    /// The thread's active goal, from codex-alab's own goal store ([`aterm_agent::harness::goal`]).
+    pub(crate) goal: Option<String>,
 }
 
 impl CodexSurvey {
@@ -449,7 +451,7 @@ struct Row {
 }
 
 fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: u64) -> Row {
-    let (agent, gauges, task, footer, excerpts, codex, shown, needs, hold_by, ask) = {
+    let (agent, gauges, task, footer, excerpts, codex, shown, needs, needs_by, hold_by, ask, goal) = {
         let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let need = timeline.need();
         (
@@ -461,11 +463,19 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
             timeline.codex_survey().cloned(),
             timeline.program_shown(),
             need.needs_word(),
+            // Where the need came from: the program's own report (a program-claim need) is a
+            // claim, said so in its own field.
+            if need.need.as_ref().is_some_and(|need| need.report.is_some()) {
+                "program"
+            } else {
+                "-"
+            },
             need.hold_word(),
             need.need
                 .as_ref()
                 .filter(|need| need.word == aterm_types::needs::NeedWord::Ask)
                 .map(|need| need.key),
+            timeline.goal().map(str::to_owned),
         )
     };
     let (user_title, role, supervisor, attention) = {
@@ -511,6 +521,10 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
         SurveyLevel::Facts => attention.as_ref().map_or("-", |_| "1").to_string(),
         SurveyLevel::Content => excerpt_token(attention.as_deref()),
     };
+    let goal = match level {
+        SurveyLevel::Facts => goal.as_ref().map_or("-", |_| "1").to_string(),
+        SurveyLevel::Content => excerpt_token(goal.as_deref()),
+    };
     let typed = h.ctx.typed.last();
     let typed_by = typed.as_ref().and_then(|t| match level {
         SurveyLevel::Facts => t.by.facts(),
@@ -521,8 +535,8 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
         "session local={} sid={} state={} program={} program_kind={} agent={} agent_detail={} \
          agent_ms={} human_ms={} bg={} task={} task_rev={} task_from={} task_ms={} model={} \
          effort={} ctx_left_pct={} detail={} doing={} role={} supervisor={} \
-         attention={attention} needs={needs} hold_by={hold_by} held_from={} typed_by={} \
-         typed_ms={} {}",
+         attention={attention} goal={goal} needs={needs} needs_by={needs_by} hold_by={hold_by} \
+         held_from={} typed_by={} typed_ms={} {}",
         h.local_id,
         h.sid.as_str(),
         h.state.as_str(),

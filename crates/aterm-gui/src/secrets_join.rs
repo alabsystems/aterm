@@ -8,7 +8,8 @@
 //! that runs none, and every [`MEND_EVERY`] after, a configured Mac's subscriber is read off
 //! the event loop ([`mend`]) and installed again from this aterm when its plist runs a copy
 //! that is gone or does not last, or when this window owes the Mac one ([`OWED_RECORD`]) and
-//! it has none or one that stays down; never over the person's off. Nothing is asked or
+//! it has none or one that stays down; never over the person's off, and only while System
+//! State's plan in force keeps the vault in sync ([`MendReach::wanted`]). Nothing is asked or
 //! posted.
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -320,8 +321,17 @@ pub(crate) fn note_owed(config_path: Option<&Path>, host: Option<&str>, still_ow
     }
 }
 
+type MendGuard = dyn Fn(&mut dyn FnMut()) -> bool + Send;
+
 /// What the mend reads and does, injected so it is tested without a home or launchd.
 pub(crate) struct MendReach {
+    /// Whether System State's plan in force keeps this Mac's vault in sync now: its Secrets
+    /// vault group at Set up, and no person's Stop holding its run (`crate::secrets_sync_wanted`).
+    /// While it does not, the mend reads and changes nothing.
+    pub(crate) wanted: Box<dyn Fn() -> bool + Send>,
+    /// Recheck and keep that choice current through the mend's effects after its read.
+    /// `false` invokes nothing and leaves no result.
+    pub(crate) while_wanted: Box<MendGuard>,
     /// This Mac's vault configuration, or why it cannot be read.
     pub(crate) configured: Box<dyn Fn() -> Result<Configured, String> + Send>,
     /// Install the subscriber from this aterm ([`plan`]'s `install`): `false` when it was left
@@ -332,9 +342,13 @@ pub(crate) struct MendReach {
 }
 
 /// The mend: a configured Mac's read, acted on ([`plan`]): the owed line forgotten once paid and
-/// the subscriber installed when the plan says so. `None` for a Mac with no vault configured, or
-/// one whose configuration cannot be read (logged).
+/// the subscriber installed when the plan says so. `None` while System State's plan in force
+/// does not keep the vault in sync ([`MendReach::wanted`]), for a Mac with no vault configured,
+/// or one whose configuration cannot be read (logged).
 pub(crate) fn mend(reach: &MendReach) -> Option<Settled> {
+    if !(reach.wanted)() {
+        return None;
+    }
     let setup = match (reach.configured)() {
         Ok(Configured::Some(setup)) => setup,
         Ok(Configured::None) => return None,
@@ -343,39 +357,43 @@ pub(crate) fn mend(reach: &MendReach) -> Option<Settled> {
             return None;
         }
     };
-    let plan = plan(&setup);
-    if plan.paid {
-        (reach.paid)();
-    }
-    let subscriber = if plan.install {
-        match &setup.plist {
-            Plist::Stale(program) => aterm_log::info!(
-                "secrets vault: the subscriber runs {program}, which is gone or does not last; installing it from this aterm"
-            ),
-            Plist::Down => aterm_log::info!(
-                "secrets vault: the subscriber stays down; installing it again from this aterm"
-            ),
-            Plist::Absent | Plist::Sound | Plist::Unread(_) => {}
+    let mut settled = None;
+    let kept = (reach.while_wanted)(&mut || {
+        let plan = plan(&setup);
+        if plan.paid {
+            (reach.paid)();
         }
-        match (reach.install)() {
-            Ok(true) => Subscriber::Installed,
-            Ok(false) => Subscriber::Off,
-            Err(why) => Subscriber::Missing(why),
-        }
-    } else {
-        match &setup.plist {
-            Plist::Sound => Subscriber::Installed,
-            Plist::Unread(why) if !setup.turned_off => Subscriber::Missing(Unsynced::Failed(
-                format!("launchd could not say whether the subscriber runs: {why}"),
-            )),
-            _ => Subscriber::Off,
-        }
-    };
-    Some(Settled {
-        member: setup.member,
-        subscriber,
-        unfinished: plan.unfinished,
-    })
+        let subscriber = if plan.install {
+            match &setup.plist {
+                Plist::Stale(program) => aterm_log::info!(
+                    "secrets vault: the subscriber runs {program}, which is gone or does not last; installing it from this aterm"
+                ),
+                Plist::Down => aterm_log::info!(
+                    "secrets vault: the subscriber stays down; installing it again from this aterm"
+                ),
+                Plist::Absent | Plist::Sound | Plist::Unread(_) => {}
+            }
+            match (reach.install)() {
+                Ok(true) => Subscriber::Installed,
+                Ok(false) => Subscriber::Off,
+                Err(why) => Subscriber::Missing(why),
+            }
+        } else {
+            match &setup.plist {
+                Plist::Sound => Subscriber::Installed,
+                Plist::Unread(why) if !setup.turned_off => Subscriber::Missing(Unsynced::Failed(
+                    format!("launchd could not say whether the subscriber runs: {why}"),
+                )),
+                _ => Subscriber::Off,
+            }
+        };
+        settled = Some(Settled {
+            member: setup.member,
+            subscriber,
+            unfinished: plan.unfinished,
+        });
+    });
+    kept.then_some(settled).flatten()
 }
 
 /// One line for `aterm.log` of what [`mend`] found.
@@ -460,6 +478,8 @@ fn live_mend_reach(config_path: Option<PathBuf>) -> MendReach {
     let read_config = config_path.clone();
     let install_config = config_path.clone();
     MendReach {
+        wanted: Box::new(crate::secrets_sync_wanted),
+        while_wanted: Box::new(crate::secrets_sync_while_wanted),
         configured: Box::new(move || {
             let paths = Paths::live().map_err(|error| error.to_string())?;
             read_configured(&paths, owed(read_config.as_deref(), host_uuid().as_deref()))
@@ -549,8 +569,25 @@ mod tests {
         configured: Result<Configured, String>,
         install: Result<bool, Unsynced>,
     ) -> (Option<Settled>, Script) {
+        mend_while(true, configured, install)
+    }
+
+    /// [`mend_with`] while System State's plan in force keeps the vault in sync (`wanted`), or
+    /// does not.
+    fn mend_while(
+        wanted: bool,
+        configured: Result<Configured, String>,
+        install: Result<bool, Unsynced>,
+    ) -> (Option<Settled>, Script) {
         let script = Arc::new(Mutex::new(Script::default()));
         let reach = MendReach {
+            wanted: Box::new(move || wanted),
+            while_wanted: Box::new(move |work| {
+                if wanted {
+                    work();
+                }
+                wanted
+            }),
             configured: Box::new(move || configured.clone()),
             install: Box::new({
                 let script = Arc::clone(&script);
@@ -715,6 +752,111 @@ mod tests {
             assert_eq!(settled, None);
             assert_eq!((script.installs, script.paid), (0, 0));
         }
+    }
+
+    /// The mend runs only while System State's plan in force keeps the vault in sync (its
+    /// Secrets vault group at Set up, no person's Stop holding its run): otherwise a stale plist,
+    /// an owed one that is absent or down, and a paid debt are all left as they are, and nothing
+    /// is logged or posted.
+    #[test]
+    fn the_mend_changes_nothing_while_the_plan_in_force_leaves_the_vault_as_is() {
+        let stale = Plist::Stale("/Volumes/aterm/aterm.app/Contents/MacOS/aterm".into());
+        for plist in [Plist::Absent, Plist::Down, Plist::Sound, stale] {
+            for owed in [false, true] {
+                let read = Ok(Configured::Some(Setup {
+                    plist: plist.clone(),
+                    owed,
+                    ..setup()
+                }));
+                let (settled, script) = mend_while(false, read.clone(), Ok(true));
+                assert_eq!(settled, None, "{plist:?}, owed {owed}");
+                assert_eq!(
+                    (script.installs, script.paid),
+                    (0, 0),
+                    "{plist:?}, owed {owed}"
+                );
+                // The same read, with the plan keeping the vault in sync, is mended as before.
+                let (_, kept) = mend_while(true, read, Ok(true));
+                let mends = plan(&Setup {
+                    plist: plist.clone(),
+                    owed,
+                    ..setup()
+                });
+                assert_eq!(
+                    (kept.installs, kept.paid),
+                    (usize::from(mends.install), usize::from(mends.paid)),
+                    "{plist:?}, owed {owed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_mend_does_not_act_when_the_choice_changes_during_its_read() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut outcomes = Vec::new();
+        for (plist, permitted) in [
+            (Plist::Stale("/gone".into()), (1, 0)),
+            (Plist::Sound, (0, 1)),
+        ] {
+            let wanted = Arc::new(AtomicBool::new(true));
+            let revoke = Arc::new(AtomicBool::new(true));
+            let script = Arc::new(Mutex::new(Script::default()));
+            let reach = MendReach {
+                wanted: Box::new({
+                    let wanted = Arc::clone(&wanted);
+                    move || wanted.load(Ordering::SeqCst)
+                }),
+                while_wanted: Box::new({
+                    let wanted = Arc::clone(&wanted);
+                    move |work| {
+                        if !wanted.load(Ordering::SeqCst) {
+                            return false;
+                        }
+                        work();
+                        true
+                    }
+                }),
+                configured: Box::new({
+                    let wanted = Arc::clone(&wanted);
+                    let revoke = Arc::clone(&revoke);
+                    move || {
+                        if revoke.swap(false, Ordering::SeqCst) {
+                            assert!(wanted.swap(false, Ordering::SeqCst));
+                        }
+                        Ok(Configured::Some(Setup {
+                            plist: plist.clone(),
+                            owed: true,
+                            ..setup()
+                        }))
+                    }
+                }),
+                install: Box::new({
+                    let script = Arc::clone(&script);
+                    move || {
+                        script.lock().unwrap().installs += 1;
+                        Ok(true)
+                    }
+                }),
+                paid: Box::new({
+                    let script = Arc::clone(&script);
+                    move || script.lock().unwrap().paid += 1
+                }),
+            };
+            let settled = mend(&reach);
+            {
+                let script = script.lock().unwrap();
+                outcomes.push((settled, script.installs, script.paid));
+            }
+            wanted.store(true, Ordering::SeqCst);
+            // Once admitted again, the same stale or owed setup is repaired normally.
+            let repaired = mend(&reach).expect("a current choice permits the mend");
+            assert_eq!(repaired.subscriber, Subscriber::Installed);
+            let script = script.lock().unwrap();
+            assert_eq!((script.installs, script.paid), permitted);
+        }
+        assert_eq!(outcomes, [(None, 0, 0), (None, 0, 0)]);
     }
 
     /// Only a stale plist, or an absent or down one that is owed, is installed, and none the

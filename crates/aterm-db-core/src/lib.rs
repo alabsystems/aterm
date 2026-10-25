@@ -37,6 +37,13 @@ contract! {
     { current && (members && epoch) }
 }
 contract! {
+    /// The caller verifies the complete custody prefix before supplying its
+    /// length. Only a discarded source strictly inside it may be quarantined.
+    pub fn quarantine_eligible(acknowledged: u64, offset: u64, discarded: bool) -> bool
+    clauses [ensures result == (offset < acknowledged && discarded) by quarantine_eligible_is_exact]
+    { offset < acknowledged && discarded }
+}
+contract! {
     /// Certification requires all independently checked authority, audience and
     /// writer predicates. Possession and current-history checks precede this gate.
     pub fn member_approval(authority: bool, eligible: bool, writer: bool) -> bool
@@ -83,6 +90,10 @@ verify_island! {
             trust_import_aterm_db_core__member_approval authority eligible writer =
                 (authority && eligible && writer) := by
           simp only [trust_import_aterm_db_core__member_approval]
+        theorem quarantine_eligible_is_exact (acknowledged offset : UInt64) (discarded : Bool) :
+            trust_import_aterm_db_core__quarantine_eligible acknowledged offset discarded =
+                (decide (offset < acknowledged) && discarded) := by
+          simp only [trust_import_aterm_db_core__quarantine_eligible]
         theorem prefix_candidate_is_exact (last sequence : UInt64) (same_actor : Bool) :
             trust_import_aterm_db_core__prefix_candidate last sequence same_actor =
                 (decide (sequence > 0) && decide (sequence <= last) && same_actor) := by
@@ -123,6 +134,15 @@ verify_island! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quarantine_never_promotes_the_boundary_or_a_live_source() {
+        assert!(!quarantine_eligible(0, 0, true));
+        assert!(quarantine_eligible(1, 0, true));
+        assert!(!quarantine_eligible(1, 1, true));
+        assert!(!quarantine_eligible(u64::MAX, u64::MAX, true));
+        assert!(quarantine_eligible(u64::MAX, u64::MAX - 1, true));
+        assert!(!quarantine_eligible(u64::MAX, 0, false));
+    }
     #[test]
     fn full_width_accounting_does_not_wrap_or_reclaim_an_absent_peers_share() {
         assert!(u64::MAX.checked_add(1).is_none());

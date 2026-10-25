@@ -764,9 +764,18 @@ enum Item {
 }
 
 impl Item {
+    /// Whether `clause`, read as naming this, shows what a sentence lacks: a sha, a ref with a `/`.
+    fn shows(self, clause: &str) -> bool {
+        match self {
+            Self::Sha => true,
+            Self::Ref => clause.contains('/'),
+            Self::Server => false,
+        }
+    }
+
     fn reads(self, s: &str) -> bool {
         match self {
-            Self::Sha => s.len() >= 4 && s.bytes().all(|b| b.is_ascii_hexdigit()),
+            Self::Sha => (7..=40).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit()),
             Self::Ref => {
                 !s.is_empty()
                     && !s.ends_with(['.', '/'])
@@ -803,14 +812,20 @@ enum Clause {
     Thought,
 }
 
-/// Whether row `i` is Claude Code's collapsed tool group of a tool run, read across the rows it wraps onto: a `⏺ ` or two-space row of clauses (`⏺ Thought for 3s, read 1 file, pushed to main (ctrl+o to expand)`), the first the renderer's and any one a tool's, before the expand hint; with no hint, every clause the renderer's and its counts of [`GROUP_NOUNS`], a two-space row standing alone under a blank row, another group or the screen's top (`  Read 1 file`), never a reply's next row, and one whose tool clauses are all git or pull request clauses [`apart`] from a reply's words. A stop hook's summary and a `PreToolUse` hooks' are none.
+/// Whether row `i` is Claude Code's collapsed tool group of a tool run, read across the rows it wraps onto: a `⏺ ` or two-space row of clauses (`⏺ Thought for 3s, read 1 file, pushed to main (ctrl+o to expand)`), the first the renderer's and any one a tool's, before the expand hint; with no hint, every clause the renderer's and its counts of [`GROUP_NOUNS`], a two-space row standing alone under a blank row or the screen's top (`  Read 1 file`; under another group it adds nothing, that one ran), never a reply's next row, and one whose tool clauses are all git or pull request clauses only by what a sentence lacks ([`group_ran`]), wherever it stands. A row a `⏺ ` or two-space line above wraps onto is that line's, read once from its first row. A stop hook's summary and a `PreToolUse` hooks' are none.
 fn tool_group(rows: &[String], i: usize, until: usize, width: usize) -> bool {
     let row = rows[i].as_str();
     let headed = row.starts_with("⏺ ");
     if !headed && !(row.starts_with("  ") && leading_spaces(row) == 2) {
         return false;
     }
+    let above = i.checked_sub(1).map(|k| rows[k].as_str());
+    if !headed && above.is_some_and(|a| wraps_onto(a, row, width)) {
+        group_read(1);
+        return false;
+    }
     let (end, line) = crate::phase::line_at(rows, i, until, width);
+    group_read(end + 1 - i);
     let text = crate::text::trim(&line);
     let text = text.strip_prefix('⏺').map_or(text, crate::text::trim_start);
     let hinted = text.strip_suffix(const { crate::anchor!("turn.group.expand") });
@@ -819,48 +834,66 @@ fn tool_group(rows: &[String], i: usize, until: usize, width: usize) -> bool {
     match hinted {
         Some(_) => group_ran(text, false).is_some(),
         None => {
-            let alone = headed
-                || i == 0
-                || crate::text::trim(&rows[i - 1]).is_empty()
-                || tool_group(rows, i - 1, until, width);
-            alone && group_ran(text, true).is_some_and(|tool| tool || apart(rows, i, end, until))
+            (headed || above.is_none_or(crate::text::blank)) && group_ran(text, true) == Some(true)
         }
     }
 }
 
-/// Whether the hint-less group row `i..=end` stands apart from a reply's words, as the renderer draws a group between messages: a `⏺` row comes next, or no reply's `⏺` row heads it. A reply's own paragraph in a git or pull request clause's words (`  Pushed to main`, `  Merged PR #12`) does neither where it ends the turn.
-fn apart(rows: &[String], i: usize, end: usize, until: usize) -> bool {
-    let next = (end + 1..until)
-        .map(|k| rows[k].as_str())
-        .find(|r| !crate::text::blank(r));
-    let head = (0..=i)
-        .rev()
-        .map(|k| rows[k].as_str())
-        .find(|r| !crate::text::blank(r) && !r.starts_with(' '));
-    next.is_some_and(|r| r.starts_with('⏺'))
-        || !head.is_some_and(|r| r.starts_with('⏺') && !is_tool_call(r))
+/// Whether `row` is the rest of the `⏺ ` or two-space line on the row `above` it, both drawn from column 2, as [`crate::phase::line_at`] reads that line.
+fn wraps_onto(above: &str, row: &str, width: usize) -> bool {
+    let said = match above.strip_prefix("⏺ ") {
+        Some(said) => said,
+        None if leading_spaces(above) == 2 && !crate::text::trim_start(above).starts_with('⎿') => {
+            above
+        }
+        None => return false,
+    };
+    crate::wrap::continues(crate::text::trim(said), 2, row, crate::wrap::room(2, width))
 }
 
-/// Whether a group row's `text` ran a tool by its clauses, which 2.1.268's renderer joins with `, `: the first the renderer's and any one a tool's; `strict`, every one the renderer's. `Some(false)` where every tool clause is a git or pull request one.
+#[cfg(test)]
+thread_local! {
+    /// The rows [`tool_group`] read on this thread: its work count.
+    static GROUP_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count `n` rows [`tool_group`] read (tests only).
+#[cfg(test)]
+fn group_read(n: usize) {
+    GROUP_ROWS.with(|c| c.set(c.get() + n));
+}
+
+/// The shipped build counts nothing.
+#[cfg(not(test))]
+const fn group_read(_: usize) {}
+
+/// Whether a group row's `text` ran a tool by its clauses, which 2.1.268's renderer joins with `, `: the first the renderer's and any one a tool's; `strict`, every one the renderer's. `Some(false)` where every tool clause is a git or pull request one, none showing what a sentence lacks ([`Item::shows`], a request's number) and no second clause beside it (`  Pushed to main, rebased onto origin/main`): `  Merged cleanly` and `  Pushed to production` are words.
 fn group_ran(text: &str, strict: bool) -> Option<bool> {
     // A lone agent's few words, never an error the vendor cut at 1000 characters and drew the hint under.
     let described = !strict && text.len() <= DESCRIBED;
-    let (mut ran, mut tool, mut list) = (false, false, None);
+    let (mut ran, mut shown, mut list, mut clauses) = (false, false, None, 0);
     for (k, clause) in text.split(", ").map(crate::text::trim_end).enumerate() {
-        match group_clause(clause, k == 0, strict, described) {
+        let read = group_clause(clause, k == 0, strict, described);
+        clauses += usize::from(read.is_some());
+        match read {
             Some(Clause::ToEnd) => return Some(true),
-            Some(Clause::Tool(item)) => (ran, tool, list) = (true, true, item),
-            Some(Clause::Git(item)) => (ran, list) = (true, item),
+            Some(Clause::Tool(item)) => (ran, shown, list) = (true, true, item),
+            Some(Clause::Git(item)) => {
+                (ran, list) = (true, item);
+                shown |= item.is_none_or(|item| item.shows(clause));
+            }
             Some(Clause::Thought) => list = None,
-            None if list.is_some_and(|item| item.reads(clause)) => {}
+            None if list.is_some_and(|item| item.reads(clause)) => {
+                shown |= list.is_some_and(|item| item.shows(clause));
+            }
             None if strict || k == 0 => return None,
             None => list = None,
         }
     }
-    ran.then_some(tool)
+    ran.then_some(shown || clauses > 1)
 }
 
-/// The longest hinted group row a lone agent's conjugated description is read in ([`group_ran`]).
+/// The longest hinted group row a lone agent's conjugated description is read in ([`group_ran`]): a heuristic, no vendor constant, half the vendor's 1000-character cut (EPe) so an error cut and hinted there is never one.
 const DESCRIBED: usize = 500;
 
 /// One clause of a group row, `first` where it opens the row; `named`, a count's nouns one of [`GROUP_NOUNS`]; `described`, a lone agent's description may stand as one ([`lone_agent`]).
@@ -1896,14 +1929,27 @@ mod tests {
         ]));
         cut.extend(composer("  ? for shortcuts"));
         assert!(!turn_ran_tools(&cut), "the control: a cut error");
-        // A reply's own paragraph in a git or pull request clause's words, ending the turn, is words; between messages, as the renderer draws a group, a tool run.
+        // A git or pull request clause is a tool run by what a sentence lacks, ending the turn under a reply or between messages alike.
         for (row, git) in [
-            ("  Pushed to main", true),
-            ("  Merged cleanly", true),
             ("  Merged PR #12", true),
+            ("  Created PR #12", true),
+            ("  Committed 1a2b3c4", true),
             ("  Committed 1a2b3c4, pushed to main", true),
+            ("  Committed abc1234, pushed to main", true),
             ("  Pushed to main, rebased onto origin/main", true),
-            ("⏺ Pushed to main", true),
+            ("  Pushed to origin/main", true),
+            ("  Merged feature/parser", true),
+            ("⏺ Committed 1a2b3c4", true),
+            ("  Pushed to main", false),
+            ("  Merged cleanly", false),
+            ("  Pushed to production", false),
+            ("  Rebased onto main", false),
+            ("  Committed 1a2b3c", false),
+            ("  Pushed to origin/main.", false),
+            ("  Committed 1a2b3c4.", false),
+            ("  Created PR #12.", false),
+            ("  Pushed to main, release", false),
+            ("⏺ Pushed to main", false),
             ("  Waiting on PR #12", false),
             ("  Blocked on PR #12", false),
             ("  See PR #12", false),
@@ -1920,11 +1966,34 @@ mod tests {
             }
             paragraph.extend([row, "", "✻ Worked for 3s"]);
             let ends = framed(&paragraph, "  ? for shortcuts");
-            assert!(!turn_ran_tools(&ends), "a reply's paragraph: {row:?}");
+            assert_eq!(turn_ran_tools(&ends), git, "ending the turn: {row:?}");
             let at = paragraph.len() - 1;
             paragraph.splice(at..at, ["⏺ Landed.", ""]);
             let between = framed(&paragraph, "  ? for shortcuts");
             assert_eq!(turn_ran_tools(&between), git, "between messages: {row:?}");
+        }
+        // A row a reply's wrapped line runs onto, from its `⏺` row or a two-space one, is that line's: a conjugated word and the hint there are no lone agent's group.
+        let full = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor \
+                    incididunt ut labore et dolore magna";
+        let agent = "  Reviewed the route and it timed out again (ctrl+o to expand)";
+        let tail = |lines: usize, gap: &[&str]| {
+            let mut r = rows(&["❯ go on", ""]);
+            r.push(format!("⏺ {full}"));
+            r.extend((1..lines).map(|_| format!("  {full}")));
+            r.extend(rows(gap));
+            r.extend(rows(&[agent, "", "✻ Worked for 3s"]));
+            r.extend(composer("  ? for shortcuts"));
+            r
+        };
+        for lines in [1, 2] {
+            assert!(
+                !turn_ran_tools(&tail(lines, &[])),
+                "a wrapped line's tail, the line {lines} rows before it"
+            );
+            assert!(
+                turn_ran_tools(&tail(lines, &[""])),
+                "the control: under a blank row, a group ({lines})"
+            );
         }
         // A reply's next row is its words, whatever clause it reads as.
         let said = framed(
@@ -1939,6 +2008,39 @@ mod tests {
             "  ? for shortcuts",
         );
         assert!(!turn_ran_tools(&said), "the control: a reply's next row");
+    }
+
+    #[test]
+    fn a_turns_group_read_visits_each_row_a_bounded_number_of_times() {
+        let word = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor \
+                    incididunt ut labore et dolore magna";
+        let full = format!("  {word}");
+        assert!(
+            crate::wrap::continues(word, 2, &full, crate::wrap::room(2, 120)),
+            "each paragraph row wraps onto the next"
+        );
+        // One reply over `k` two-space rows: a paragraph each row of which is as full as the next (one wrapped line), then a list's short items.
+        type Row = fn(&str, usize) -> String;
+        let shapes: [(&str, Row); 2] = [
+            ("a wrapped paragraph", |word, _| format!("  {word}")),
+            ("a list", |_, n| format!("  - item {n}")),
+        ];
+        for (shape, row) in shapes {
+            for k in [50, 100, 200, 400] {
+                let mut turn = rows(&["❯ go on", ""]);
+                turn.push(format!("⏺ {word}"));
+                turn.extend((0..k).map(|n| row(word, n)));
+                turn.extend(rows(&["", "✻ Worked for 3s"]));
+                turn.extend(composer("  ? for shortcuts"));
+                GROUP_ROWS.with(|c| c.set(0));
+                assert!(!turn_ran_tools(&turn), "{shape}, {k} rows: words");
+                let read = GROUP_ROWS.with(std::cell::Cell::get);
+                assert!(
+                    read <= 3 * (k + 1),
+                    "{shape}: {read} rows read for {k}, linear in the rows"
+                );
+            }
+        }
     }
 
     #[test]

@@ -143,7 +143,7 @@ pub struct EditorWorkspace {
     pub(super) last_macro: Vec<MacroStep>,
     pub(super) playing_macro: bool,
     pub(super) last_yank: Option<YankRecord>,
-    pub(super) last_commit: Option<(DocumentId, Seq, Vec<EditDelta>)>,
+    pub(super) pending_commits: Vec<(DocumentId, Seq, Vec<EditDelta>)>,
     /// What the last command left ([`LeftBy`]).
     pub(super) last_left: Option<LeftBy>,
     /// Whether the kill ring's newest entry changed since the face was last handed it.
@@ -172,7 +172,7 @@ impl EditorWorkspace {
             last_macro: Vec::new(),
             playing_macro: false,
             last_yank: None,
-            last_commit: None,
+            pending_commits: Vec::new(),
             last_left: None,
             kill_ring_changed: false,
         }
@@ -224,13 +224,8 @@ impl EditorWorkspace {
         {
             self.last_yank = None;
         }
-        if self
-            .last_commit
-            .as_ref()
-            .is_some_and(|(committed, ..)| *committed == document)
-        {
-            self.last_commit = None;
-        }
+        self.pending_commits
+            .retain(|(committed, ..)| *committed != document);
     }
 
     pub fn attach(

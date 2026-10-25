@@ -6903,10 +6903,13 @@ mod log_stream_tests {
                 class_turn: true,
             },
         );
-        tl.lock().unwrap().note_program_state(Some(ProgramState {
-            state: ProgramStateWord::Working,
-            kind: None,
-        }));
+        tl.lock().unwrap().note_program_state(
+            Some(ProgramState {
+                state: ProgramStateWord::Working,
+                kind: None,
+            }),
+            1,
+        );
         let got = text(&frames_for_watch(&mut all, streams, true));
         assert!(
             got.lines().any(|l| l.starts_with("LOG 1 ")

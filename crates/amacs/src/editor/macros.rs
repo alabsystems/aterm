@@ -71,6 +71,72 @@ mod tests {
     use crate::store::DocumentStore;
 
     #[test]
+    fn macro_publication_rebases_siblings_through_every_recorded_edit() {
+        for parts in [["x", "y"], ["🦀", "λ"]] {
+            for replay_at_start in [true, false] {
+                let (mut store, mut workspace, mut writer, document) = editor("needle tail");
+                let mut reader = workspace
+                    .attach(&mut store, document, crate::store::DocumentViewId(92))
+                    .unwrap();
+                workspace
+                    .execute(&mut store, &mut writer, EditorCommand::StartMacro)
+                    .unwrap();
+                for text in parts {
+                    workspace
+                        .insert_text(&mut store, &mut writer, text)
+                        .unwrap();
+                    for (seq, deltas) in workspace.take_commits(document) {
+                        reader.observe_external(seq, &deltas);
+                    }
+                }
+                workspace
+                    .execute(&mut store, &mut writer, EditorCommand::EndMacro)
+                    .unwrap();
+                let prefix = parts.concat();
+                reader.selections = vec![Selection {
+                    anchor: prefix.len(),
+                    head: prefix.len() + "needle".len(),
+                }];
+                assert_eq!(
+                    store
+                        .snapshot(document)
+                        .unwrap()
+                        .text
+                        .get(reader.primary_selection().range()),
+                    Some("needle")
+                );
+                if replay_at_start {
+                    workspace
+                        .execute(&mut store, &mut writer, EditorCommand::BeginningOfBuffer)
+                        .unwrap();
+                }
+                workspace
+                    .execute(&mut store, &mut writer, EditorCommand::PlayMacro)
+                    .unwrap();
+                for (seq, deltas) in workspace.take_commits(document) {
+                    reader.observe_external(seq, &deltas);
+                }
+                let snapshot = store.snapshot(document).unwrap();
+                assert_eq!(
+                    snapshot.text.as_ref(),
+                    format!("{prefix}{prefix}needle tail")
+                );
+                assert_eq!(reader.anchor_seq(), snapshot.seq);
+                assert_eq!(
+                    snapshot.text.get(reader.primary_selection().range()),
+                    Some("needle"),
+                    "parts={parts:?}, replay_at_start={replay_at_start}, reader={:?}",
+                    reader.primary_selection()
+                );
+                assert_eq!(
+                    reader.primary_selection().range(),
+                    2 * prefix.len()..2 * prefix.len() + "needle".len()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_macro_replays_each_commands_own_argument() {
         let text = (0..10)
             .map(|line| format!("line {line}\n"))

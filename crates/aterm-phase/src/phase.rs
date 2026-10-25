@@ -968,7 +968,7 @@ pub(crate) fn has_shell_mode_frame(rows: &[String]) -> bool {
 
 /// The frame of Claude Code's prompt box in shell mode: the lowest `!` caret row (alone, or
 /// before a space) under a rule, down to the first rule under it.
-fn shell_mode_frame(rows: &[String]) -> Option<Frame> {
+pub(crate) fn shell_mode_frame(rows: &[String]) -> Option<Frame> {
     (1..rows.len()).rev().find_map(|i| {
         let caret = rows[i]
             .strip_prefix('!')

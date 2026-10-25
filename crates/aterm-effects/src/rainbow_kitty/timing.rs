@@ -43,12 +43,11 @@ pub const IMPACT_MAX: f32 = 3.5;
 /// How hard a jump lands.
 #[inline]
 #[must_use]
-pub fn impact(cells: f32) -> f32 {
+pub const fn impact(cells: f32) -> f32 {
     if !cells.is_finite() || cells <= 0.0 {
         return 1.0;
     }
-    (cells / f32::from(JUMP_MIN_CELLS))
-        .powf(IMPACT_EXP)
+    crate::color_math::powf_pos_f32(cells / JUMP_MIN_CELLS as f32, IMPACT_EXP)
         .clamp(1.0, IMPACT_MAX)
 }
 
@@ -224,16 +223,16 @@ pub const fn edge_in(age_s: f32) -> f32 {
 /// `enter-at-speed`.
 #[inline]
 #[must_use]
-pub fn enter_at_speed(u: f32) -> f32 {
+pub const fn enter_at_speed(u: f32) -> f32 {
     let u = clamp01(u);
-    1.0 - (1.0 - FLIGHT_P0) * (1.0 - u).powf(FLIGHT_ENTER_EXP)
+    1.0 - (1.0 - FLIGHT_P0) * crate::color_math::powf_pos_f32(1.0 - u, FLIGHT_ENTER_EXP)
 }
 
 /// `suck-in`: `u^1.8` (§2.5).
 #[inline]
 #[must_use]
-pub fn suck_in(u: f32) -> f32 {
-    clamp01(u).powf(1.8)
+pub const fn suck_in(u: f32) -> f32 {
+    crate::color_math::powf_pos_f32(clamp01(u), 1.8)
 }
 
 /// `spend`: `(1 − u)²` (§2.5).
@@ -247,14 +246,14 @@ pub const fn spend(u: f32) -> f32 {
 /// `half-life`: `1` for a hold `H`, then `2^(−(age − H)/τ)` (§2.5, §5.6).
 #[inline]
 #[must_use]
-pub fn half_life(age_s: f32, hold_s: f32, tau_s: f32) -> f32 {
+pub const fn half_life(age_s: f32, hold_s: f32, tau_s: f32) -> f32 {
     if !age_s.is_finite() || age_s <= hold_s {
         return 1.0;
     }
     if tau_s <= 0.0 {
         return 0.0;
     }
-    (-(age_s - hold_s) / tau_s * std::f32::consts::LN_2).exp()
+    crate::color_math::exp_f32(-(age_s - hold_s) / tau_s * std::f32::consts::LN_2)
 }
 
 /// Star cull floor (D3).
@@ -279,7 +278,7 @@ pub const SPRING_SNAP_OMEGA: f32 = 2.0 * std::f32::consts::PI / SPRING_SNAP_RESP
 /// `spring-snap`.
 #[inline]
 #[must_use]
-pub fn spring_snap(age_s: f32) -> f32 {
+pub const fn spring_snap(age_s: f32) -> f32 {
     if !age_s.is_finite() || age_s <= 0.0 {
         return 0.0;
     }
@@ -287,7 +286,7 @@ pub fn spring_snap(age_s: f32) -> f32 {
     if wt >= 20.0 {
         return 1.0;
     }
-    1.0 - (1.0 + wt) * (-wt).exp()
+    1.0 - (1.0 + wt) * crate::color_math::exp_f32(-wt)
 }
 
 /// `spring-whip`'s natural frequency, rad/s (§2.5).
@@ -307,12 +306,12 @@ const _: () = assert!(
 /// `spring-whip`.
 #[inline]
 #[must_use]
-pub fn spring_whip(age_s: f32) -> f32 {
+pub const fn spring_whip(age_s: f32) -> f32 {
     if !age_s.is_finite() || age_s <= 0.0 {
         return 0.0;
     }
-    let (s, c) = (SPRING_WHIP_WD * age_s).sin_cos();
-    let env = (-SPRING_WHIP_ZETA * SPRING_WHIP_OMEGA * age_s).exp();
+    let (s, c) = crate::supernova::sin_cos_f32(SPRING_WHIP_WD * age_s);
+    let env = crate::color_math::exp_f32(-SPRING_WHIP_ZETA * SPRING_WHIP_OMEGA * age_s);
     1.0 - env * (c + SPRING_WHIP_Z_OVER_ROOT * s)
 }
 

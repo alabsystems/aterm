@@ -143,23 +143,43 @@ impl Terminal {
         &mut self,
         restore_modes: bool,
     ) -> Option<ForegroundHandback> {
+        self.foreground_handback_scoped_at(restore_modes, ClockReading::now())
+    }
+
+    /// [`Self::foreground_handback_scoped`], its bytes parsed at the caller's `clock`.
+    #[inline]
+    pub fn foreground_handback_scoped_at(
+        &mut self,
+        restore_modes: bool,
+        clock: ClockReading,
+    ) -> Option<ForegroundHandback> {
         let owned = restore_modes && self.program_owns_terminal();
-        self.handback(owned, false)
+        self.handback(owned, false, clock)
     }
 
     /// Manual terminal reset (`reset` control verb, Edit ▸ Reset Terminal).
     pub fn manual_handback(&mut self) -> ForegroundHandback {
-        self.handback(true, true).unwrap_or(ForegroundHandback {
-            bytes: Vec::new(),
-            reverted: Vec::new(),
-        })
+        self.manual_handback_at(ClockReading::now())
     }
 
-    /// The shared body of [`Self::foreground_handback_scoped`] (`owned` = the
-    /// gate's verdict, `manual` false) and [`Self::manual_handback`] (both
-    /// true).
-    fn handback(&mut self, owned: bool, manual: bool) -> Option<ForegroundHandback> {
-        let clock = ClockReading::now();
+    /// [`Self::manual_handback`], its bytes parsed at the caller's `clock`.
+    pub fn manual_handback_at(&mut self, clock: ClockReading) -> ForegroundHandback {
+        self.handback(true, true, clock)
+            .unwrap_or(ForegroundHandback {
+                bytes: Vec::new(),
+                reverted: Vec::new(),
+            })
+    }
+
+    /// The shared body of [`Self::foreground_handback_scoped_at`] (`owned` = the
+    /// gate's verdict, `manual` false) and [`Self::manual_handback_at`] (both
+    /// true), every byte parsed at `clock`.
+    fn handback(
+        &mut self,
+        owned: bool,
+        manual: bool,
+        clock: ClockReading,
+    ) -> Option<ForegroundHandback> {
         let mut bytes: Vec<u8> = Vec::new();
         let mut reverted: Vec<&'static str> = Vec::new();
         if !self.parser_is_ground() {

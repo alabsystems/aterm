@@ -186,6 +186,7 @@ fn reading(
         worked_doubt: Duration::ZERO,
         // A turn of real work ran a tool.
         ran_tools: worked.is_some_and(|w| w >= LONG),
+        tools_unread: false,
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
@@ -1022,4 +1023,59 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
         verdict(&decided(&real, &st, &policy()), &st),
         Verdict::Nothing
     );
+
+    // A person's keys that submit no turn lift neither hold, though the letters above the composer changed (a scroll, a pane resized, a draft that grows the composer): no new prompt, the session's submits as they were, or one up by an Enter over the emptied composer or one that left their draft standing (a `\`+Enter newline, a menu's completion).
+    let same = [
+        "HumanWork",
+        "Continue",
+        "WorkedShort",
+        "BackoffDue",
+        "Continue",
+        "WorkedShortSame",
+        "BackoffDue",
+    ];
+    let mut run = vec!["HumanWork"];
+    for _ in 0..NO_WORK_ACTS {
+        run.extend(["Continue", "WorkedShort", "BackoffDue"]);
+    }
+    for path in [&same[..], &run[..]] {
+        for (keyed, entered) in [("PersonTypes", 0), ("PersonTypes", 1), ("DraftLeft", 1)] {
+            let (mut st, mut real) = replay(&m, path, base);
+            let drawn = |real: &Real, st: &State, mark, submits, person| TurnEndReading {
+                screen_mark: Some(mark),
+                submits: Some(submits),
+                person,
+                ..reading((st, real.earlier), None, real.unanswered, real.taskless())
+            };
+            let held = drawn(&real, &st, 1, 5, None);
+            real.st.observe(&held, real.now);
+            assert_eq!(
+                verdict(&decide_turn_end(&real.st, &held, &policy(), real.now), &st),
+                Verdict::Nothing,
+                "held after {path:?}"
+            );
+            assert!(m.fire(keyed, &mut st), "{st:?}");
+            assert!(m.fire("GraceEnds", &mut st), "{st:?}");
+            assert_eq!(expected(&m, &st), Verdict::Nothing, "{st:?}");
+            let ago = Duration::from_secs(300);
+            real.now += 2 * ago;
+            let keys = drawn(&real, &st, 2, 5 + entered, Some(ago));
+            assert_eq!(
+                keys.composer,
+                if keyed == "DraftLeft" {
+                    Composer::Typed
+                } else {
+                    Composer::Empty
+                },
+                "{st:?}"
+            );
+            real.st.observe(&keys, real.now);
+            assert_eq!(
+                verdict(&decide_turn_end(&real.st, &keys, &policy(), real.now), &st),
+                Verdict::Nothing,
+                "a person's {keyed} with {entered} more submits that submitted no turn lifts no hold \
+                 after {path:?}"
+            );
+        }
+    }
 }

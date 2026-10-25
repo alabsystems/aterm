@@ -17,6 +17,9 @@ pub(crate) struct ProgramStateGate {
     floor_seq: u64,
     /// The report shown, and since when.
     shown: Option<(ProgramState, Instant)>,
+    /// Where the report shown began in the engine (`ProgramStateReport::began`): a `blocked`
+    /// report that began anew is a new box though its words are the same.
+    shown_began: Option<u64>,
     /// When the report shown began on the clock that counts sleep
     /// (`aterm_uds::process::continuous_ms`), which the survey's `agent_ms=`
     /// runs on too: `program_state_ms=` ([`Self::shown_age_ms`]).
@@ -56,7 +59,15 @@ impl ProgramStateGate {
         let next = report
             .state
             .filter(|_| honoured && report.seq > self.floor_seq);
-        if self.shown.map(|(state, _)| state) == next && (!group_moved || next.is_none()) {
+        // A box, then a `working` this sweep missed, then the next box: the same words, a new box.
+        let new_box = next.is_some_and(|state| {
+            state.state == aterm_core::terminal::program_state::ProgramStateWord::Blocked
+                && self.shown_began != Some(report.began)
+        });
+        if self.shown.map(|(state, _)| state) == next
+            && (!group_moved || next.is_none())
+            && !new_box
+        {
             return false;
         }
         let before = if group_moved {
@@ -72,6 +83,7 @@ impl ProgramStateGate {
             self.turn_started = Some(now);
         }
         self.shown = next.map(|state| (state, now));
+        self.shown_began = next.map(|_| report.began);
         self.shown_continuous_ms = next.and_then(|_| aterm_uds::process::continuous_ms());
         true
     }
@@ -318,6 +330,34 @@ mod tests {
         term.process(done);
         still.observe(term.program_state(), true, false, t0);
         assert_eq!(still.turn_ends(), 1, "control: no move, a turn end");
+    }
+
+    /// A NEW BOX IS A MOVE: a `blocked` report, then a `working` and a second `blocked` with the
+    /// same words between two sweeps, moves the gate (the second box began anew); a re-send of
+    /// the box shown does not. Neither counts a turn the gate did not see.
+    #[test]
+    fn a_second_box_between_two_sweeps_is_a_move() {
+        let mut term = Terminal::new(24, 80);
+        let mut gate = ProgramStateGate::default();
+        let t0 = Instant::now();
+        term.process(WORKING);
+        assert!(gate.observe(term.program_state(), true, false, t0));
+        term.process(BLOCKED_PERMISSION);
+        assert!(gate.observe(term.program_state(), true, false, t0));
+        let turns = (gate.turn_starts(), gate.turn_ends());
+        term.process(BLOCKED_PERMISSION);
+        assert!(
+            !gate.observe(term.program_state(), true, false, t0),
+            "CONTROL: the box re-sent is no move"
+        );
+        term.process(&[WORKING, BLOCKED_PERMISSION].concat());
+        assert!(
+            gate.observe(term.program_state(), true, false, t0),
+            "the next box is a move"
+        );
+        assert_eq!(shown(&gate).as_deref(), Some("blocked:permission"));
+        assert_eq!((gate.turn_starts(), gate.turn_ends()), turns);
+        assert!(!gate.observe(term.program_state(), true, false, t0));
     }
 
     /// A turn end is `working` then `done`|`idle` as the gate showed them:

@@ -286,6 +286,8 @@ pub struct TranscriptUsage {
     /// Moves whenever the series or the working time does
     /// ([`Self::generation`]).
     generation: u64,
+    /// What the rows say of the conversation's `/goal` ([`Self::goal`]).
+    goal: super::goal::ClaudeGoal,
 }
 
 /// The time Claude was working in one transcript: the union of its main
@@ -638,6 +640,13 @@ impl TranscriptUsage {
         if line.is_empty() {
             return Fold::Blank;
         }
+        if super::goal::ClaudeGoal::may_be(line)
+            && let Ok(row) = super::transcript::goal(line)
+            && let Some(row) = row.as_object()
+            && self.goal.row(row)
+        {
+            return Fold::NotAssistant;
+        }
         if cannot_be_assistant(line) {
             return Fold::NotAssistant;
         }
@@ -726,6 +735,13 @@ impl TranscriptUsage {
                 Fold::Conflict
             }
         }
+    }
+
+    /// The conversation's active `/goal`, as the rows folded so far leave it
+    /// ([`super::goal::ClaudeGoal`]).
+    #[must_use]
+    pub fn goal(&self) -> Option<&str> {
+        self.goal.active()
     }
 
     /// Unix seconds of the newest response the API served in this file.

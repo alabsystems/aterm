@@ -302,9 +302,25 @@ fn fetch_text(sys: &dyn System, url: &str, max: u64) -> Result<String, String> {
     }
 }
 
+/// The whole-file guard's last line in `text`: `main "$@"; }` in an install.sh whose
+/// whole-file group a line of `{` opens at its top (the brace closes it), else the bare
+/// `main "$@"` of the releases before that group, which a cut just after `main` ran.
+/// The bare line begins the new one, so taking either line from any file passed a
+/// new install.sh cut four bytes short.
+fn guard_line(text: &str) -> &'static str {
+    if text.lines().any(|l| l == "{") {
+        "main \"$@\"; }"
+    } else {
+        "main \"$@\""
+    }
+}
+
 /// Fetch release `version`'s install.sh into the cache and return its SHA-256. It must
-/// look like the official script: the whole-file guard (`main "$@"` as its last line, so
-/// a cut-off download is refused) and the official Team ID pin.
+/// look like the official script: the whole-file guard (its `guard_line`, and the newline
+/// that ends it, as the file's last bytes, so a cut-off download is refused) and the
+/// official Team ID pin. Every release with a guard ends so; a download cut one byte
+/// short, the guard line's newline lost, passed a check of the last line alone, and was
+/// pinned under a hash no whole download has.
 fn fetch_install_sh(sys: &dyn System, paths: &Paths, version: &str) -> Result<String, String> {
     let _one = FETCHING
         .lock()
@@ -318,14 +334,10 @@ fn fetch_install_sh(sys: &dyn System, paths: &Paths, version: &str) -> Result<St
         .map_err(|e| format!("{}: {e}", tmp.display()))
         .and_then(|bytes| {
             let text = String::from_utf8_lossy(&bytes);
-            let last = text
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("");
-            if last.trim() != "main \"$@\"" {
+            let guard = guard_line(&text);
+            if !text.ends_with(&format!("\n{guard}\n")) {
                 return Err(format!(
-                    "{url} does not end with install.sh's `main \"$@\"` line"
+                    "{url} does not end with install.sh's `{guard}` line"
                 ));
             }
             if !text.contains(&format!("OFFICIAL_TEAM_ID=\"{TEAM_ID}\"")) {
@@ -932,5 +944,44 @@ install_sh_sha256 = "dd92e2224c1c5a8e2c69992c4bafdf79142cf27f36a5bacfbfaa8efe129
         let why = fetch_install_sh(&sys, &paths(), "0.104.0").unwrap_err();
         assert!(why.contains("main \"$@\""), "{why}");
         assert!(sys.written(&part("install-script", 0)).is_none());
+    }
+
+    /// Fetch `script` as release 0.104.0's install.sh on a fresh host.
+    fn fetched(script: &[u8]) -> Result<String, String> {
+        let sys = Fake::root();
+        let key = curl_key(
+            &install_sh_url("0.104.0"),
+            &part("install-script", 0),
+            MAX_SCRIPT_BYTES,
+        );
+        sys.on(&key, ok(""));
+        sys.on_write(&key, Path::new(&part("install-script", 0)), script);
+        fetch_install_sh(&sys, &paths(), "0.104.0")
+    }
+
+    #[test]
+    fn an_install_sh_ending_in_its_layout_s_guard_line_is_cached_and_one_cut_inside_it_is_not() {
+        let head = "#!/usr/bin/env bash\nOFFICIAL_TEAM_ID=\"A66A9P66Z7\"\n";
+        let grouped = format!("{head}{{\nmain() {{ :; }}\nmain \"$@\"; }}\n");
+        let bare = format!("{head}main() {{ :; }}\nmain \"$@\"\n");
+        for script in [&grouped, &bare] {
+            assert_eq!(
+                fetched(script.as_bytes()),
+                Ok(sha_of(script.as_bytes())),
+                "{script}"
+            );
+        }
+        // Cut four bytes short, the grouped file ends in the bare line; cut one
+        // short, either ends in its guard line without the newline.
+        for (script, guard, cut) in [
+            (&grouped, "main \"$@\"; }", 4),
+            (&grouped, "main \"$@\"; }", 3),
+            (&grouped, "main \"$@\"; }", 1),
+            (&bare, "main \"$@\"", 1),
+        ] {
+            let short = &script[..script.len() - cut];
+            let why = fetched(short.as_bytes()).unwrap_err();
+            assert!(why.contains(&format!("`{guard}` line")), "{short}: {why}");
+        }
     }
 }

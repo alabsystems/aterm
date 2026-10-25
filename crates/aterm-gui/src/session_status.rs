@@ -2475,7 +2475,17 @@ impl crate::App {
                     .timeline
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .note_program_state(shown);
+                    .note_program_state(shown, program_report.began);
+                // The herald's mark on a box stands only while the GUI shows that box
+                // (`box_banner`): a move off it, a foreground move's floor included, lifts it.
+                session.ctx.box_banner.shown(
+                    shown
+                        .filter(|state| {
+                            state.state
+                                == aterm_core::terminal::program_state::ProgramStateWord::Blocked
+                        })
+                        .map(|_| program_report.began),
+                );
                 if shown.is_some_and(|state| {
                     state.state == aterm_core::terminal::program_state::ProgramStateWord::Done
                 }) {
@@ -3119,6 +3129,7 @@ impl crate::App {
             face,
             (pause, held),
             slog,
+            goal,
         ) = {
             let mut timeline = pooled
                 .ctx
@@ -3143,6 +3154,7 @@ impl crate::App {
                 timeline.task_face().map(|(face, _)| face),
                 (timeline.pause(), timeline.land_held()),
                 slog,
+                goal_field(timeline.goal()),
             )
         };
         let supervised_agent =
@@ -3246,7 +3258,7 @@ impl crate::App {
                  {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
                  human_seq={human_seq} {launch} {owner} \
                  history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
-                 land_at={land_at} task={task} pause={pause}{land}{end} {task_record} {slog} editing={editing} {bells} gen={generation} seq={seq} hash={hash}",
+                 land_at={land_at} task={task} pause={pause}{land}{end} goal={goal} {task_record} {slog} editing={editing} {bells} gen={generation} seq={seq} hash={hash}",
                 opt(subject.as_deref()),
                 opt(detail.as_deref()),
                 consent.attribution.as_str(),
@@ -3280,7 +3292,7 @@ impl crate::App {
              {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
              human_seq={human_seq} {launch} {owner} \
              history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
-             land_at={land_at} task={task} pause={pause}{land}{end} {task_record} {slog} editing={editing} {bells} gen={generation} seq={seq} hash={hash}",
+             land_at={land_at} task={task} pause={pause}{land}{end} goal={goal} {task_record} {slog} editing={editing} {bells} gen={generation} seq={seq} hash={hash}",
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),
@@ -3310,6 +3322,11 @@ impl crate::App {
             });
         end_fields(end)
     }
+}
+
+/// `status`'s `goal=`: the agent's active goal percent-encoded ([`crate::session_timeline::SessionTimeline::goal`]), `-` while it has none.
+pub(crate) fn goal_field(goal: Option<&str>) -> String {
+    goal.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode)
 }
 
 /// Formats the `land_held` and `land_detail` fields for `status` output.

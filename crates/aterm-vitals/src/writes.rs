@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The last hour of bytes written per program and scope ([`WriteHour`]), with the time its
-//! readings covered: what the deck's Disk row names as its top writer ("rustc writes 68 GB/h")
-//! and `sys disk` lists as `program` rows.
+//! readings covered: what `sys disk` lists as `program` rows.
 //!
 //! A program is the processes of one name in one scope (aterm, a tab, the rest of the Mac), as
 //! [`Writer`] groups them each sweep. The figure is a floor: the counter

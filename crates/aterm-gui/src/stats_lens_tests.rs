@@ -1509,6 +1509,75 @@ fn the_body_over_the_shells_raster_is_the_whole_lens() {
     }
 }
 
+/// A reading's card drawn with the glyphs the readings before it kept is the card a fresh canvas
+/// draws, byte for byte: the CPU close-up (Why now in it) and the Deck, each ink after the other,
+/// at both scales; and a second reading of each rasterizes no glyph.
+#[test]
+fn a_reading_over_kept_glyphs_draws_the_card_a_fresh_canvas_draws() {
+    use crate::stats_deck::{DeckGeom, deck_paint, deck_px};
+    use crate::tray_raster::{forget_kept_glyphs, glyph_rasters, kept_glyphs, rasterize_tray};
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let spotlight = engine_1032();
+    let trouble = lens_scene(Scene::Trouble);
+    let mut cards: Vec<(String, Vec<DrawPrim>, u32, u32)> = Vec::new();
+    for s in [2.0_f32, 1.0] {
+        for (ground, inks) in [("dark", dark_inks()), ("light", light_inks())] {
+            for (name, snap) in [("spotlight", &spotlight), ("trouble", &trouble)] {
+                let lg = shell(1024.0, 250.0, s);
+                let prims = lens_paint(&lg, &input(snap, inks), &pinned(Instrument::Cpu));
+                let (w, h) = (lg.w as u32, lg.h as u32);
+                cards.push((format!("lens {name} {ground} {s}x"), prims, w, h));
+            }
+            let deck = input(&trouble, inks);
+            let cell = (14.0 * s) as usize;
+            let g = DeckGeom {
+                w: 1119.0 * s,
+                h: deck_px(StatsBars::Deck, DeckForm::Full, f64::from(s), cell) as f32,
+                pad: 12.0 * s,
+                scale: s,
+                font_px: 13.0 * s,
+            };
+            let (prims, _) = deck_paint(&g, &deck);
+            let (w, h) = (g.w as u32, g.h as u32);
+            cards.push((format!("deck {ground} {s}x"), prims, w, h));
+        }
+    }
+    let raster = |prims: &[DrawPrim], w: u32, h: u32| rasterize_tray(prims, w, h, 1.0, [0; 4]).0;
+    let fresh: Vec<Vec<u8>> = cards
+        .iter()
+        .map(|(_, prims, w, h)| {
+            forget_kept_glyphs();
+            raster(prims, *w, *h)
+        })
+        .collect();
+    forget_kept_glyphs();
+    for reading in 0..2 {
+        for ((name, prims, w, h), fresh) in cards.iter().zip(&fresh) {
+            let rasters = glyph_rasters();
+            assert!(
+                raster(prims, *w, *h) == *fresh,
+                "{name}, reading {reading}: the kept glyphs drew another card"
+            );
+            if reading == 1 {
+                assert_eq!(
+                    glyph_rasters(),
+                    rasters,
+                    "{name}: a glyph was rasterized again"
+                );
+            }
+        }
+    }
+    assert!(kept_glyphs() > 0);
+    // Negative control: a card draws its glyphs from the kept ones, so a spoiled one shows.
+    crate::tray_raster::spoil_kept_glyphs_for_test();
+    let (name, prims, w, h) = &cards[0];
+    assert!(
+        raster(prims, *w, *h) != fresh[0],
+        "{name}: a spoiled kept glyph changed nothing"
+    );
+    forget_kept_glyphs();
+}
+
 #[test]
 fn a_cjk_line_of_the_lens_wraps_between_its_characters() {
     let m = FaceMetrics::helvetica_neue();

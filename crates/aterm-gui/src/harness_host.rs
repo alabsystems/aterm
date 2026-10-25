@@ -2003,6 +2003,10 @@ pub(crate) enum AccountsSaid {
         none_soon: bool,
         /// The line of renewals that answered another account (`accounts::wrong_accounts`).
         wrong: Vec<String>,
+        /// The rows whose automatic sign-in failed and that still have no login to run on, each
+        /// with the routes it tried (`accounts::failing_sign_ins`): a fact for later, since aterm
+        /// tries each again by itself.
+        no_sign_in: Vec<(String, String)>,
     },
 }
 
@@ -2019,6 +2023,7 @@ impl AccountsSaid {
                 due,
                 none_soon,
                 wrong,
+                no_sign_in,
             } => {
                 !signed_out.is_empty()
                     || !credits.is_empty()
@@ -2026,6 +2031,7 @@ impl AccountsSaid {
                     || !due.is_empty()
                     || *none_soon
                     || !wrong.is_empty()
+                    || !no_sign_in.is_empty()
             }
         }
     }
@@ -2059,6 +2065,10 @@ impl AccountsSaid {
                 accounts::NONE_SOON_S,
             ),
             wrong: accounts::wrong_accounts(roster, logins),
+            no_sign_in: accounts::failing_sign_ins(roster, state, logins, now)
+                .into_iter()
+                .map(|(label, attempt)| (label, attempt.routes))
+                .collect(),
         }
     }
 }
@@ -4198,10 +4208,10 @@ impl IdleHost for WorkerIdle {
         let seat = (self.hooks.acts.account_seat)()?;
         let roster = match roster_read(&seat) {
             Ok(roster) => roster,
-            Err(AccountsSaid::Refused | AccountsSaid::LoginsUnread) => {
+            Err(RosterUnread::Refused | RosterUnread::LoginsUnread) => {
                 return Some(RosterWord::Unread);
             }
-            Err(_) => return Some(RosterWord::Unlisted),
+            Err(RosterUnread::Nothing) => return Some(RosterWord::Unlisted),
         };
         let Some(look) = self.account_look(&roster) else {
             return Some(RosterWord::Unread);
@@ -5205,8 +5215,8 @@ impl WorkerIdle {
         let seat = (self.hooks.acts.account_seat)()?;
         let roster = match roster_read(&seat) {
             Ok(roster) => roster,
-            Err(said) => {
-                let none = said == AccountsSaid::Nothing;
+            Err(unread) => {
+                let none = unread == RosterUnread::Nothing;
                 let own = none && self.switches.reset_on();
                 let said = if none && notes {
                     accounts_said(
@@ -5217,7 +5227,7 @@ impl WorkerIdle {
                         &self.login_latches.carried_rows(),
                     )
                 } else {
-                    Some(said)
+                    Some(unread.into())
                 };
                 if let Some(said) = said {
                     accounts_tell(&self.switches, &self.hooks, said, false);
@@ -6406,9 +6416,15 @@ fn publish_snapshot_from(sid: &str, snap: Option<&Snapshot>, handed: bool) -> bo
 /// A proven self-claimed codex-alab's snapshot carries its validated line.
 fn with_self_claimed_line(sid: &str, mut snap: Snapshot, handed: bool) -> Snapshot {
     let (pid, start) = (snap.pid, snap.start.clone());
+    let session = snap.session.clone();
     if let Some(run) = snap.codex_mut() {
         run.self_claimed = match crate::self_claim::copy_of_tab(sid) {
-            Some(copy) if copy.pid == pid && copy.start == start => copy.resume.ok(),
+            Some(copy) if copy.pid == pid && copy.start == start => {
+                copy.resume.ok().filter(|resume| {
+                    session.as_deref() == Some(resume.session.as_str())
+                        && run.self_claimed.as_ref().is_none_or(|old| old == resume)
+                })
+            }
             None if handed => run.self_claimed.take(),
             Some(_) | None => None,
         };
@@ -13387,6 +13403,15 @@ fn self_idle_now(store: &Store, sid: &str, pid: u32, start: &str) -> bool {
     ctx.is_some_and(|ctx| crate::self_claim::idle_now(&ctx, pid, start))
 }
 
+fn self_copy_now(store: &Store, sid: &str) -> Option<self_claimed::Copy> {
+    let ctx = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .map(|h| Arc::clone(&h.ctx))?;
+    crate::self_claim::live_copy(&ctx)
+}
+
 /// [`Acts::launch`], live.
 fn launch_of(store: &Store, sid: &str) -> Option<i64> {
     let h = store
@@ -13608,6 +13633,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
     let carry_store = store.clone();
     let offered_store = store.clone();
     let idle_store = store.clone();
+    let snapshot_store = store.clone();
     let row = live_row(store.clone());
     let [w1, w2, w3, w4, w5, w6, w7, w8, w9, w10] = std::array::from_fn(|_| Arc::clone(&row));
     let opts = move |sid: &str, grace: u32| {
@@ -13716,7 +13742,12 @@ fn live_acts(store: Store, sock: String) -> Acts {
             r.step
         }),
         snapshot: Arc::new(move |sid| {
-            let (read, took) = laps::within(|| o3(sid, 0).map(|o| relaunch::snapshot(&o)));
+            let (read, took) = laps::within(|| {
+                o3(sid, 0).map(|o| {
+                    let copy = self_copy_now(&snapshot_store, sid);
+                    relaunch::snapshot_with_claim(&o, copy.as_ref())
+                })
+            });
             if took.total() >= SLOW_STEP {
                 aterm_log::info!(
                     "harness @{sid}: a relaunch snapshot read took {} ms ({took})",
@@ -14826,22 +14857,43 @@ fn account_roster(seat: &AccountSeat) -> Option<accounts::Roster> {
 fn account_roster_or_own(seat: &AccountSeat) -> Option<accounts::Roster> {
     match roster_read(seat) {
         Ok(roster) => Some(roster),
-        Err(AccountsSaid::Nothing) => Some(accounts::Roster::own()),
-        Err(_) => None,
+        Err(RosterUnread::Nothing) => Some(accounts::Roster::own()),
+        Err(RosterUnread::Refused | RosterUnread::LoginsUnread) => None,
     }
 }
 
 /// One bounded read of `seat`'s roster file.
-fn roster_read(seat: &AccountSeat) -> Result<accounts::Roster, AccountsSaid> {
+fn roster_read(seat: &AccountSeat) -> Result<accounts::Roster, RosterUnread> {
     let Some(path) = seat.roster.as_deref() else {
-        return Err(AccountsSaid::Nothing);
+        return Err(RosterUnread::Nothing);
     };
     match accounts::Roster::load(path) {
-        Ok(roster) if roster.rows.is_empty() => Err(AccountsSaid::Nothing),
+        Ok(roster) if roster.rows.is_empty() => Err(RosterUnread::Nothing),
         Ok(roster) => accounts::Store::at(&seat.state)
             .bound(&roster, seat.now)
-            .map_err(|_| AccountsSaid::LoginsUnread),
-        Err(_) => Err(AccountsSaid::Refused),
+            .map_err(|_| RosterUnread::LoginsUnread),
+        Err(_) => Err(RosterUnread::Refused),
+    }
+}
+
+/// Why [`roster_read`] has no roster: the [`AccountsSaid`] it says, kept small.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RosterUnread {
+    /// [`AccountsSaid::Nothing`]: no roster, or one that lists no account.
+    Nothing,
+    /// [`AccountsSaid::Refused`].
+    Refused,
+    /// [`AccountsSaid::LoginsUnread`].
+    LoginsUnread,
+}
+
+impl From<RosterUnread> for AccountsSaid {
+    fn from(unread: RosterUnread) -> Self {
+        match unread {
+            RosterUnread::Nothing => Self::Nothing,
+            RosterUnread::Refused => Self::Refused,
+            RosterUnread::LoginsUnread => Self::LoginsUnread,
+        }
     }
 }
 
@@ -14857,13 +14909,13 @@ fn accounts_said(
         return Some(AccountsSaid::Nothing);
     }
     let roster = match roster_read(seat) {
-        Err(AccountsSaid::Nothing) if notes => accounts::Roster::own(),
+        Err(RosterUnread::Nothing) if notes => accounts::Roster::own(),
         _ if !rotation && !logins => return Some(AccountsSaid::Nothing),
         Ok(roster) if !rotation && !renewable_listed(&roster) => {
             return Some(AccountsSaid::Nothing);
         }
         Ok(roster) => roster,
-        Err(said) => return Some(said),
+        Err(unread) => return Some(unread.into()),
     };
     let store = accounts::Store::at(&seat.state);
     let (state, None) = store.load(seat.now).ok()? else {
@@ -17578,8 +17630,13 @@ fn maintain_accounts_live(step: UpkeepStep) {
     let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) else {
         return;
     };
+    aterm_agent::harness::accounts_sync::log_sign_ins_to(|line| {
+        aterm_log::info!("harness: accounts-upkeep: {line}");
+    });
     let upkept = upkeep_live(&home, &state, &roster, now, step);
-    if let Upkept::Configured { renewal: true, .. } = upkept {
+    if let Upkept::Configured { renewal: true, .. } | Upkept::Unconfigured { renewal: true, .. } =
+        upkept
+    {
         aterm_log::info!(
             "harness: accounts-upkeep: a sign-in started or a saved account choice completed"
         );
@@ -17590,7 +17647,12 @@ fn maintain_accounts_live(step: UpkeepStep) {
             roster,
             renewal: false,
         },
-        unconfigured @ Upkept::Unconfigured { .. } => unconfigured,
+        Upkept::Unconfigured {
+            fleet_file_ignored, ..
+        } => Upkept::Unconfigured {
+            fleet_file_ignored,
+            renewal: false,
+        },
     };
     let mut said = SAID
         .lock()
@@ -17600,10 +17662,13 @@ fn maintain_accounts_live(step: UpkeepStep) {
     }
     *said = Some(found);
     match found {
-        Upkept::Unconfigured { fleet_file_ignored } => aterm_log::info!(
+        Upkept::Unconfigured {
+            fleet_file_ignored, ..
+        } => aterm_log::info!(
             "harness: accounts-upkeep=unconfigured{}: no fleet accounts source is configured \
              (`[fleet] accounts_source`, or a fleet-accounts.toml a sync handed its source \
-             wrote), so no roster is fetched and no automatic sign-in is started",
+             wrote), so no roster is fetched; the rows of a roster that stands are still signed \
+             in automatically",
             if fleet_file_ignored {
                 " fleet-file=ignored"
             } else {

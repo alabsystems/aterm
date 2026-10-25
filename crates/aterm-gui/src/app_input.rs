@@ -696,13 +696,41 @@ struct ImeRecipient {
     native: Option<NativeImeRecipient>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct NativeImeRecipient {
+#[derive(Clone, Debug)]
+pub(crate) struct NativeImeRecipient {
     instance: crate::native_app::AppInstanceId,
     view: crate::tab_model::ViewId,
     generation: u64,
     review: u64,
     field: Option<crate::native_ui::UiKey>,
+    /// Leaving the field retires this lifetime even if focus returns before Commit.
+    input_lifetime: Arc<()>,
+}
+
+impl PartialEq for NativeImeRecipient {
+    fn eq(&self, other: &Self) -> bool {
+        self.instance == other.instance
+            && self.view == other.view
+            && self.generation == other.generation
+            && self.review == other.review
+            && self.field == other.field
+            && Arc::ptr_eq(&self.input_lifetime, &other.input_lifetime)
+    }
+}
+
+impl Eq for NativeImeRecipient {}
+
+/// A foreign clipboard reply may outlive its original native text field.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug)]
+pub(crate) enum ClipboardRecipient {
+    Palette(Arc<()>),
+    Terminal(u64),
+    Native {
+        recipient: NativeImeRecipient,
+        lifetime: Arc<()>,
+        editor_lifetime: Option<Arc<()>>,
+    },
 }
 
 pub(crate) struct ImeComposition {
@@ -6850,14 +6878,9 @@ impl App {
             ) {
                 keybinding::ChordResolution::Action(action) => {
                     if action == keybinding::Action::Copy {
-                        let _ = self.copy_native_selection(wid);
+                        let _ = self.copy_selection_in(wid);
                     } else if action == keybinding::Action::SelectAll {
-                        let _ = self.dispatch_native_event(
-                            wid,
-                            crate::native_app::AppEvent::TextInput(
-                                crate::native_app::TextInputEvent::SelectAll,
-                            ),
-                        );
+                        self.select_all_in(wid);
                     } else if native_binding_allowed(action) {
                         self.dispatch_action(wid, action);
                     }
@@ -6891,12 +6914,12 @@ impl App {
                 return true;
             }
             if character.eq_ignore_ascii_case("c") {
-                let _ = self.copy_native_selection(wid);
+                let _ = self.copy_selection_in(wid);
                 self.note_consumed_press(wid, ev);
                 return true;
             }
             if character.eq_ignore_ascii_case("v") {
-                self.paste_clipboard();
+                self.paste_clipboard_into(wid);
                 self.note_consumed_press(wid, ev);
                 return true;
             }
@@ -6993,44 +7016,49 @@ impl App {
 
     /// Resolve only text selected by the active native view.
     pub(crate) fn native_selection_text(&self, wid: WindowId) -> Option<String> {
+        self.with_native_selection(wid, |parts| parts.join("\n"))
+    }
+
+    /// Menu readiness checks the same ranges without copying their bytes.
+    pub(crate) fn native_has_selection(&self, wid: WindowId) -> bool {
+        self.with_native_selection(wid, |_| ()).is_some()
+    }
+
+    fn with_native_selection<R>(
+        &self,
+        wid: WindowId,
+        read: impl FnOnce(&[&str]) -> R,
+    ) -> Option<R> {
         let (instance, view) = self.active_native_view(wid)?;
-        let text = match self.native_runtime.view_state(view) {
+        match self.native_runtime.view_state(view) {
             Some(crate::native_app::AppViewState::Editor(state)) => {
                 let buffer = state.buffer.as_ref()?;
+                if buffer.minibuffer_active() {
+                    return None;
+                }
                 let snapshot = self.document_store.snapshot(buffer.document)?;
                 let selected = buffer
                     .selections
                     .iter()
                     .filter_map(|selection| {
-                        let range = selection.range();
-                        (!range.is_empty()
-                            && range.end <= snapshot.text.len()
-                            && snapshot.text.is_char_boundary(range.start)
-                            && snapshot.text.is_char_boundary(range.end))
-                        .then(|| snapshot.text[range].to_string())
+                        snapshot
+                            .text
+                            .get(selection.range())
+                            .filter(|text| !text.is_empty())
                     })
                     .collect::<Vec<_>>();
-                selected.join("\n")
+                (!selected.is_empty()).then(|| read(&selected))
             }
             Some(crate::native_app::AppViewState::Markdown(state)) => {
                 let range = state.selection.clone()?;
                 let document = self.native_runtime.document_id(instance)?;
                 let snapshot = self.document_store.snapshot(document)?;
-                if range.end > snapshot.text.len()
-                    || !snapshot.text.is_char_boundary(range.start)
-                    || !snapshot.text.is_char_boundary(range.end)
-                {
-                    return None;
-                }
-                snapshot.text[range].to_string()
+                let text = snapshot.text.get(range).filter(|text| !text.is_empty())?;
+                Some(read(&[text]))
             }
             Some(crate::native_app::AppViewState::Settings(state)) => {
-                let input = state
-                    .editing_field
-                    .as_ref()
-                    .and_then(|key| state.field_inputs.get(key))
-                    .unwrap_or(&state.search_input);
-                input.selected_text().to_string()
+                let text = state.selected_text()?;
+                Some(read(&[text]))
             }
             Some(crate::native_app::AppViewState::SystemState(state)) => {
                 let crate::native_app::NativeApp::SystemState(app) =
@@ -7039,18 +7067,11 @@ impl App {
                     return None;
                 };
                 let key = state.common.last_focus.as_ref()?;
-                app.text_input(key.as_str())?.selected_text().to_string()
+                let text = app.text_input(key.as_str())?.selected_text();
+                (!text.is_empty()).then(|| read(&[text]))
             }
-            Some(crate::native_app::AppViewState::Recovery(_)) => return None,
-            None => return None,
-        };
-        (!text.is_empty()).then_some(text)
-    }
-
-    /// Copy only text selected by the active native view.
-    fn copy_native_selection(&self, wid: WindowId) -> bool {
-        self.native_selection_text(wid)
-            .is_some_and(|text| crate::control::pbcopy(&text))
+            Some(crate::native_app::AppViewState::Recovery(_)) | None => None,
+        }
     }
 
     #[cfg_attr(
@@ -7348,7 +7369,7 @@ impl App {
         }
         if hardcoded_paste_chord(mods, &ev) {
             self.snap_to_bottom(wid);
-            self.paste_clipboard();
+            self.paste_clipboard_into(wid);
             self.note_consumed_press(wid, &ev);
             return;
         }
@@ -8161,14 +8182,14 @@ impl App {
             }
             Action::Paste => {
                 self.snap_to_bottom(wid);
-                self.paste_clipboard();
+                self.paste_clipboard_into(wid);
             }
             Action::PasteSelection => {
                 self.snap_to_bottom(wid);
                 #[cfg(target_os = "linux")]
                 self.paste_primary_into(wid);
                 #[cfg(not(target_os = "linux"))]
-                self.paste_clipboard();
+                self.paste_clipboard_into(wid);
             }
             Action::Find => self.find_requested_in(wid),
             Action::FontIncrease => self.set_font_size(self.font_size + FONT_ZOOM_STEP),
@@ -8253,9 +8274,7 @@ impl App {
             }
             Action::OpenLedger => self.open_session_ledger(wid),
             Action::SelectAll => {
-                if self.find_field_window().is_none() {
-                    self.select_all();
-                }
+                self.select_all_in(wid);
             }
             Action::ToggleFullscreen => {
                 let _ = self.toggle_fullscreen();
@@ -8619,6 +8638,11 @@ impl App {
                     .common()
                     .last_focus
                     .clone(),
+                input_lifetime: self
+                    .native_runtime
+                    .view_state(view)?
+                    .common()
+                    .input_lifetime(),
             })
         });
         ImeRecipient {
@@ -8626,6 +8650,108 @@ impl App {
             view: self.active_visible_leaf_plan(wid).map(|plan| plan.focused),
             native,
         }
+    }
+
+    /// Retire asynchronous input when another surface takes this native view's keys.
+    pub(crate) fn retire_native_input_in(&mut self, wid: WindowId) {
+        if let Some((_, view)) = self.active_native_view(wid) {
+            self.native_runtime.change_view_state(view, |state| {
+                state.common_mut().retire_input();
+                false
+            });
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn native_clipboard_input_is_available(&self, wid: WindowId) -> bool {
+        self.windows
+            .get(&wid)
+            .is_some_and(|ws| ws.tab_menu.is_none() && ws.rename_edit.is_none())
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn clipboard_recipient(&mut self, wid: WindowId) -> Option<ClipboardRecipient> {
+        let window = self.windows.get(&wid)?;
+        if let Some(palette) = window.palette() {
+            return Some(ClipboardRecipient::Palette(palette.input_lifetime()));
+        }
+        if window.overlay_open() {
+            return None;
+        }
+        if let Some(session) = self.focused_session_id(wid) {
+            return Some(ClipboardRecipient::Terminal(session));
+        }
+        if !self.native_clipboard_input_is_available(wid) {
+            return None;
+        }
+        let (_, view) = self.active_native_view(wid)?;
+        // Direct host focus changes need the same lifetime boundary as reducers.
+        self.native_runtime.change_view_state(view, |_| false);
+        let recipient = self.ime_recipient(wid).native?;
+        let state = self.native_runtime.view_state(view)?;
+        let editor_lifetime = match state {
+            crate::native_app::AppViewState::Editor(state) => state
+                .buffer
+                .as_ref()
+                .map(crate::native_editor::EditorBufferView::input_lifetime),
+            _ => None,
+        };
+        Some(ClipboardRecipient::Native {
+            recipient,
+            lifetime: state.common().input_lifetime(),
+            editor_lifetime,
+        })
+    }
+
+    /// A reply is delivered only while its original native field still owns input.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn complete_clipboard_paste_in(
+        &mut self,
+        wid: WindowId,
+        owner: ClipboardRecipient,
+        text: String,
+        source: Source,
+    ) {
+        let session = match owner {
+            ClipboardRecipient::Palette(owner) => {
+                let Some(palette) = self.windows.get(&wid).and_then(|window| window.palette())
+                else {
+                    return;
+                };
+                if !Arc::ptr_eq(&owner, &palette.input_lifetime()) {
+                    return;
+                }
+                None
+            }
+            ClipboardRecipient::Terminal(session) => Some(session),
+            ClipboardRecipient::Native {
+                recipient,
+                lifetime,
+                editor_lifetime,
+            } => {
+                let Some(ClipboardRecipient::Native {
+                    recipient: current,
+                    lifetime: current_lifetime,
+                    editor_lifetime: current_editor,
+                }) = self.clipboard_recipient(wid)
+                else {
+                    return;
+                };
+                let same_editor = match (editor_lifetime, current_editor) {
+                    (Some(owner), Some(current)) => Arc::ptr_eq(&owner, &current),
+                    (None, None) => true,
+                    _ => false,
+                };
+                if recipient != current
+                    || !Arc::ptr_eq(&lifetime, &current_lifetime)
+                    || !same_editor
+                {
+                    return;
+                }
+                None
+            }
+        };
+        self.deliver_paste(wid, session, text, source);
     }
 
     fn cancel_ime_projection(&mut self, recipient: &ImeRecipient) {
@@ -8821,6 +8947,18 @@ impl App {
             .then_some(wid)
     }
 
+    /// Edit's Paste follows the visible field, including an overlay above Find.
+    fn paste_into_front_field(&mut self) {
+        if self.front().is_some_and(crate::WindowState::overlay_open) {
+            self.paste_clipboard();
+            return;
+        }
+        match self.find_field_window() {
+            Some(wid) => self.search_paste_in(wid),
+            None => self.paste_clipboard(),
+        }
+    }
+
     /// Keep a menu command from running through an open inline rename editor.
     pub(crate) fn divert_menu_action_around_rename(&mut self, action: menu::MenuAction) -> bool {
         use crate::platform::{AppRt, RenameEditorEdit};
@@ -8865,6 +9003,31 @@ impl App {
         }
     }
 
+    /// Dispatch the document commands that need no event-loop handle.
+    pub(crate) fn dispatch_document_menu_action(&mut self, action: menu::MenuAction) {
+        use menu::MenuAction;
+        if self.front().is_some_and(crate::WindowState::overlay_open) {
+            self.pending_action_refusal =
+                Some("Close the palette or Overview before using this command.".into());
+            return;
+        }
+        match action {
+            MenuAction::Save => {
+                if let Err(why) = self.save_front_document() {
+                    self.pending_action_refusal = Some(why);
+                }
+            }
+            MenuAction::Find => self.find_requested(),
+            MenuAction::FindNext | MenuAction::FindPrev => {
+                let forward = matches!(action, MenuAction::FindNext);
+                if let Err(why) = self.search_find_again(forward) {
+                    self.pending_action_refusal = Some(why.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Dispatch a menu-bar click into the `App` command method the matching keybinding already
     /// uses.
     pub(crate) fn dispatch_menu_action(&mut self, el: &ActiveEventLoop, action: menu::MenuAction) {
@@ -8905,10 +9068,8 @@ impl App {
             MenuAction::OpenEditor => {
                 self.choose_and_open_document(crate::native_app::AppKind::Editor);
             }
-            MenuAction::Save => {
-                if let Err(why) = self.save_front_document() {
-                    self.pending_action_refusal = Some(why);
-                }
+            MenuAction::Save | MenuAction::Find | MenuAction::FindNext | MenuAction::FindPrev => {
+                self.dispatch_document_menu_action(action);
             }
             MenuAction::ReopenClosedTab => {
                 let _ = self.reopen_last_closed_tab();
@@ -9011,10 +9172,7 @@ impl App {
             MenuAction::Copy => {
                 let _ = self.copy_selection();
             }
-            MenuAction::Paste => match self.find_field_window() {
-                Some(wid) => self.search_paste_in(wid),
-                None => self.paste_clipboard(),
-            },
+            MenuAction::Paste => self.paste_into_front_field(),
             MenuAction::CopySessionId | MenuAction::CopyCwd | MenuAction::RenameSession => {
                 if let Some(window) = self.frontmost_window
                     && let Some(tab) = self
@@ -9026,16 +9184,7 @@ impl App {
                 }
             }
             MenuAction::SelectAll => {
-                if self.find_field_window().is_none() {
-                    self.select_all();
-                }
-            }
-            MenuAction::Find => self.find_requested(),
-            MenuAction::FindNext | MenuAction::FindPrev => {
-                let forward = matches!(action, MenuAction::FindNext);
-                if let Err(why) = self.search_find_again(forward) {
-                    self.pending_action_refusal = Some(why.to_string());
-                }
+                self.select_all();
             }
             MenuAction::ToggleFullScreen => {
                 if let Err(why) = self.toggle_fullscreen() {
@@ -9671,6 +9820,10 @@ mod menu_only_action_dispatch_tests {
 #[cfg(test)]
 #[path = "app_input_native_keyboard_boundary_tests.rs"]
 mod native_keyboard_boundary_tests;
+
+#[cfg(test)]
+#[path = "app_input_native_clipboard_owner_tests.rs"]
+mod native_clipboard_owner_tests;
 
 #[cfg(test)]
 mod local_repeat_behavior_tests {

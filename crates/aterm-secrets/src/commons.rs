@@ -12,6 +12,8 @@ pub mod binding;
 pub mod bootstrap;
 pub mod constraints;
 #[cfg(unix)]
+pub mod history;
+#[cfg(unix)]
 pub mod journal;
 pub mod membership;
 pub mod node;

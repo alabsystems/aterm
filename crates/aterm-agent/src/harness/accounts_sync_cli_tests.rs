@@ -332,7 +332,14 @@ fn upkeep_over(bed: &Bed, step: UpkeepStep) -> usize {
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
+        rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &guard,
+        find_browser: &|_: &Path| false,
+        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+        spawn_vault: &|_work| Ok(()),
+        mailbox: &ladder_mailbox_files,
+        log: std::sync::Arc::new(|_: &str| {}),
+        run_attempt: None,
     };
     let _ = upkeep(
         &bed.home,
@@ -724,7 +731,14 @@ region = \"global\"
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
+        rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &fresh_guard,
+        find_browser: &|_: &Path| false,
+        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+        spawn_vault: &|_work| Ok(()),
+        mailbox: &ladder_mailbox_files,
+        log: std::sync::Arc::new(|_: &str| {}),
+        run_attempt: None,
     };
     assert!(renew_pool_due(
         Cli::Kimi,
@@ -854,7 +868,14 @@ region = \"global\"
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
+        rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &pool_guard,
+        find_browser: &|_: &Path| false,
+        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+        spawn_vault: &|_work| Ok(()),
+        mailbox: &ladder_mailbox_files,
+        log: std::sync::Arc::new(|_: &str| {}),
+        run_attempt: None,
     };
     assert!(renew_pool_due(
         Cli::Kimi,
@@ -1039,7 +1060,14 @@ region = \"global\"
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
+        rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &idle_guard,
+        find_browser: &|_: &Path| false,
+        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+        spawn_vault: &|_work| Ok(()),
+        mailbox: &ladder_mailbox_files,
+        log: std::sync::Arc::new(|_: &str| {}),
+        run_attempt: None,
     };
     assert!(
         !renew_pool_due(
@@ -1101,7 +1129,14 @@ region = \"global\"
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
+        rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &wall_guard,
+        find_browser: &|_: &Path| false,
+        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+        spawn_vault: &|_work| Ok(()),
+        mailbox: &ladder_mailbox_files,
+        log: std::sync::Arc::new(|_: &str| {}),
+        run_attempt: None,
     };
     assert!(renew_pool_due(
         Cli::Kimi,
@@ -1125,7 +1160,7 @@ region = \"global\"
     );
 
     // CONTROL 2: once an enrolled ready successor exists (`kimi-1` signed in and unwalled),
-    // `auto_renew_candidates_for` stops emitting tier-0 `NotEnrolled` rows.
+    // `needed_renew_candidates_for` stops emitting tier-0 `NotEnrolled` rows.
     let mut ready_note = None;
     store
         .transact_logins(now + 10, &mut ready_note, |state, _logins| {
@@ -1138,7 +1173,7 @@ region = \"global\"
     let (ready_state, _) = store.load(now + 10).unwrap();
     let (ready_logins, _) = store.load_logins(now + 10).unwrap();
     assert!(
-        auto_renew_candidates_for(
+        needed_renew_candidates_for(
             Cli::Kimi,
             Some(&store),
             &roster,
@@ -1287,7 +1322,14 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
         fetch: &fetch,
         spawn_renewal: &noop_spawn,
         sync_cooldown: &cooldown,
+        rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &guard,
+        find_browser: &|_: &Path| false,
+        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+        spawn_vault: &|_work| Ok(()),
+        mailbox: &ladder_mailbox_files,
+        log: std::sync::Arc::new(|_: &str| {}),
+        run_attempt: None,
     };
     let _ = upkeep(
         &bed.home,

@@ -6,9 +6,10 @@ use super::super::policy::WorkerEnv;
 use super::super::policy::approval::RULE_RM_BREAKER_WARN;
 use super::super::policy::approval::{
     AnswerTarget, ApprovalCtx, Choice, DeclineStep, LimitTry, QuestionPriority,
-    RULE_AUTOCOMPACT_OFFER, RULE_LIMIT_RESET, RULE_LIMIT_RETRY, RULE_LIMIT_STOP, RULE_LIMIT_WAIT,
-    RULE_TRUST_ANY, RULE_TRUST_DIALOG, decide, keeps_trying_its_limit, limit_no_reset_reason,
-    limit_stopped_reason, proof_would_lift, unvoiced_tools,
+    RULE_AUTO_MODE_SETUP, RULE_AUTOCOMPACT_OFFER, RULE_LIMIT_RESET, RULE_LIMIT_RETRY,
+    RULE_LIMIT_STOP, RULE_LIMIT_WAIT, RULE_TRUST_ANY, RULE_TRUST_DIALOG, decide,
+    keeps_trying_its_limit, limit_no_reset_reason, limit_stopped_reason, proof_would_lift,
+    unvoiced_tools,
 };
 use super::super::policy::box_call;
 use super::super::policy::box_facts::{BoxFacts, QuestionFacts};
@@ -69,7 +70,8 @@ fn person_grace(opts: &SuperviseOpts) -> Duration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dialog {
     /// A choice that grants nothing and spends nothing (a question, a plan-mode switch, a goal, a
-    /// model or effort switch, the autocompact offer): [`QUESTION_PERSON_GRACE`] at most.
+    /// model or effort switch, the autocompact offer, the auto-mode setup offer):
+    /// [`QUESTION_PERSON_GRACE`] at most.
     Choice,
     /// A permission box, which grants a command, a tool, a file, the network, a folder, an app or
     /// a server its reach: [`QUESTION_PERSON_GRACE`] at most while nobody has touched it since it
@@ -93,7 +95,8 @@ impl Dialog {
             | PromptKind::PlanExit
             | PromptKind::GoalProposal
             | PromptKind::ModelSwitch
-            | PromptKind::AutocompactOffer => Self::Choice,
+            | PromptKind::AutocompactOffer
+            | PromptKind::AutoModeSetup => Self::Choice,
             PromptKind::Bash
             | PromptKind::Edit
             | PromptKind::Write
@@ -953,6 +956,7 @@ impl<C: Ctl> Session<'_, C> {
                 .is_some_and(|p| {
                     p.kind == PromptKind::Question
                         || p.kind == PromptKind::McpServer
+                        || p.kind == PromptKind::AutoModeSetup
                         || login_carry
                         || login_back
                         || login_renewed
@@ -1505,7 +1509,10 @@ impl<C: Ctl> Session<'_, C> {
                 now
             }
         };
-        let settle = if kind == PromptKind::AutocompactOffer {
+        let settle = if matches!(
+            kind,
+            PromptKind::AutocompactOffer | PromptKind::AutoModeSetup
+        ) {
             self.setup.box_settle.max(self.setup.autocompact_settle)
         } else {
             self.setup.box_settle
@@ -2475,6 +2482,7 @@ impl<C: Ctl> Session<'_, C> {
                 || rule_id == RULE_LIMIT_STOP
                 || rule_id == RULE_LIMIT_RESET
                 || rule_id == RULE_AUTOCOMPACT_OFFER
+                || rule_id == RULE_AUTO_MODE_SETUP
                 || rule_id == super::super::policy::login::RULE_LOGIN_METHOD)
     }
 

@@ -4128,6 +4128,18 @@ fn fx_engine_state_desk() -> FxDesk {
     vt52.process(b"./vt52-menu\r\n\x1b[?2l\x1bY%");
     shells.push(("vt52-menu", vt52, "/home/dev"));
 
+    let mut codex = fx_shell(ROWS, COLS, 12, cwd, 2);
+    codex.process(
+        b"codex\r\n\x1b]7501;state=working:app=codex\x1b\\\
+          \x1b]7501;state=blocked:app=codex:kind=permission\x1b\\",
+    );
+    assert_eq!(
+        codex.program_state().state.map(|s| s.state),
+        Some(aterm_core::terminal::program_state::ProgramStateWord::Blocked),
+        "codex stands at a box it reported"
+    );
+    shells.push(("codex", codex, cwd));
+
     let rev_nonce = [0xa1; 32];
     let rev_id = fx_hex(&rev_nonce);
     let mut rev = fx_signed_shell(ROWS, COLS, rev_nonce, cwd, 3);

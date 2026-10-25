@@ -325,7 +325,7 @@ pub fn standing(row: &ItemReport) -> Standing {
 const fn rank(standing: Standing) -> u8 {
     match standing {
         Standing::NotNeeded => 0,
-        Standing::InPlace => 1,
+        Standing::InPlace | Standing::Untold => 1,
         Standing::AtLogin => 2,
         Standing::Unknown => 3,
         Standing::Differs => 4,
@@ -353,7 +353,7 @@ pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
     let marked = standing == Standing::Differs && until_login(setting, rows);
     let now = match standing {
         Standing::InPlace | Standing::AtLogin => Some(wanted.clone()),
-        Standing::NotNeeded | Standing::Unknown => None,
+        Standing::NotNeeded | Standing::Unknown | Standing::Untold => None,
         Standing::Differs if marked => Some(aterm_types::macos_setup::until_login(&wanted)),
         Standing::Differs | Standing::Waiting | Standing::NeedsYou | Standing::Failed => {
             now(setting, rows)

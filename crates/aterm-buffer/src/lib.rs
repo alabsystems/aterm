@@ -40,6 +40,10 @@ pub struct BlobId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KeyframeId(pub u64);
 
+/// A handle into the live-witness store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WitnessId(pub u64);
+
 /// A committed-line identity, stable across scroll and eviction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LineId(pub u64);
@@ -118,6 +122,8 @@ pub enum Op {
     },
     /// A keyframe (serialized `TerminalCheckpoint`) taken at a parser-ground boundary.
     Keyframe(KeyframeId),
+    /// A snapshot of the live screen a replay to this point must equal.
+    Witness(WitnessId),
 }
 
 /// A subscription cursor, the synchronous read face of the event log.
@@ -433,6 +439,7 @@ pub const fn encode_spine_event_wire(event: &Event) -> [u8; SPINE_EVENT_WIRE_BYT
         Op::Reply(id) => (5u8, id.0),
         Op::Resize { rows, cols } => (6u8, ((rows as u64) << 16) | (cols as u64)),
         Op::Keyframe(id) => (7u8, id.0),
+        Op::Witness(id) => (8u8, id.0),
     };
     let [s0, s1, s2, s3, s4, s5, s6, s7] = event.seq.0.to_le_bytes();
     let pb = payload.to_le_bytes();
@@ -476,6 +483,7 @@ pub const fn decode_spine_event_wire(bytes: &[u8]) -> Option<Event> {
             }
         }
         7 => Op::Keyframe(KeyframeId(payload)),
+        8 => Op::Witness(WitnessId(payload)),
         _ => return None,
     };
     Some(Event { seq, op, ts })
@@ -846,6 +854,7 @@ mod tests {
             Op::Reply(BlobId(5)),
             Op::Resize { rows: 24, cols: 80 },
             Op::Keyframe(KeyframeId(7)),
+            Op::Witness(WitnessId(8)),
         ] {
             let ev = Event {
                 seq: Seq(42),

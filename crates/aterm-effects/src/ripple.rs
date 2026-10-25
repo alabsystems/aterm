@@ -65,7 +65,9 @@ const _: () = {
 /// rise ahead of it, `1` at the front.
 #[inline]
 fn profile(x: f32) -> f32 {
-    if x >= 0.0 {
+    if x >= 5.0 || x <= -2.5 {
+        0.0
+    } else if x >= 0.0 {
         (-x / GLINT_TAIL_CELLS).exp()
     } else {
         (x / GLINT_RISE_CELLS).exp()
@@ -90,7 +92,13 @@ const fn quantise(v: f32) -> f32 {
 #[inline]
 pub fn claude_glint(d_cells: f32, ms: u64) -> f32 {
     let x = front(ms) - d_cells;
-    quantise(profile(x).max(GLINT_ECHO_GAIN * profile(x - GLINT_ECHO_CELLS)))
+    let main = profile(x);
+    let level = if main >= GLINT_ECHO_GAIN {
+        main
+    } else {
+        main.max(GLINT_ECHO_GAIN * profile(x - GLINT_ECHO_CELLS))
+    };
+    quantise(level)
 }
 
 /// The ring train at `x = T − d`, the rings born so far one [`GLINT_LAP`]
@@ -114,7 +122,13 @@ fn train(x: f32) -> f32 {
 #[inline]
 pub fn glint(d_cells: f32, ms: u64) -> f32 {
     let x = front(ms) - d_cells;
-    quantise(train(x).max(GLINT_ECHO_GAIN * train(x - GLINT_ECHO_CELLS)))
+    let main = train(x);
+    let level = if main >= GLINT_ECHO_GAIN {
+        main
+    } else {
+        main.max(GLINT_ECHO_GAIN * train(x - GLINT_ECHO_CELLS))
+    };
+    quantise(level)
 }
 
 /// The field's distance, in cells, of a point `dx_cells` columns and `dy_rows` rows from the wand.

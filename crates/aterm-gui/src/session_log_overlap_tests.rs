@@ -793,7 +793,7 @@ fn the_program_marks_keep_the_rows_under_their_retention_rule() {
     for (i, (state, kind)) in moves.into_iter().enumerate() {
         hand.set(1_000 * (i as u64 + 1));
         let mut g = h.ctx.timeline.lock().unwrap();
-        g.note_program_state(Some(program_report(state, kind)));
+        g.note_program_state(Some(program_report(state, kind)), 1);
     }
     assert_eq!(
         rows(&h.ctx.timeline.lock().unwrap()),
@@ -813,7 +813,7 @@ fn the_program_marks_keep_the_rows_under_their_retention_rule() {
         for i in 0..60 {
             let state = if i % 2 == 0 { W::Working } else { W::Blocked };
             let kind = (state == W::Blocked).then_some(ProgramBlockedKind::Auth);
-            g.note_program_state(Some(program_report(state, kind)));
+            g.note_program_state(Some(program_report(state, kind)), 1);
         }
     }
     let newest = |g: &SessionTimeline| rows(g).last().cloned();
@@ -1638,7 +1638,7 @@ fn every_writer(h: &SessionHandle, store: &Store, round: u64) {
         } else {
             W::Done
         };
-        g.note_program_state(Some(program_report(state, None)));
+        g.note_program_state(Some(program_report(state, None)), 1);
     }
     let edit = if round.is_multiple_of(2) {
         crate::session_timeline::MetaEdit::Set("look here")
@@ -1980,7 +1980,7 @@ fn the_view_keeps_its_newest_rows_under_a_flood() {
             W::Blocked
         };
         let kind = (state == W::Blocked).then_some(ProgramBlockedKind::Auth);
-        g.note_program_state(Some(program_report(state, kind)));
+        g.note_program_state(Some(program_report(state, kind)), 1);
         program += 1;
         for _ in 0..2 {
             hand.advance(10);

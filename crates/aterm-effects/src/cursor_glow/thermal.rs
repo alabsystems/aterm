@@ -55,19 +55,22 @@ impl CursorGlow {
     /// The forge cursor fill for the fire style, always warm metal on the black-body ramp: a glowing ember at rest, climbing toward the hot end with sustained momentum, inside the page's [`ForgeBand`].
     #[inline]
     #[must_use]
-    pub fn forge_fill(&self) -> Option<u32> {
-        let band = self
-            .forge_band
-            .unwrap_or_else(|| ForgeBand::solve(Self::STREAK_REF_GROUND, true));
+    pub const fn forge_fill(&self) -> Option<u32> {
+        const REF_BAND: ForgeBand = ForgeBand::solve(CursorGlow::STREAK_REF_GROUND, true);
+        let band = match self.forge_band {
+            Some(b) => b,
+            None => REF_BAND,
+        };
         let t = ((self.cursor_temp - Self::FORGE_MIN_TEMP) / (1.0 - Self::FORGE_MIN_TEMP))
             .clamp(0.0, 1.0);
-        let breathe = 0.045 * t * (self.flame_phase * 1.7).sin();
+        let (s, _) = crate::supernova::sin_cos_f32(self.flame_phase * 1.7);
+        let breathe = 0.045 * t * s;
         Some(fire_ramp(band.at(t, breathe)))
     }
 
     /// Re-solve the [`ForgeBand`] when the page under the caret changed (a theme switch, DECSCNM): one bisection per new ground, nothing per frame.
     #[inline]
-    pub(super) fn refresh_forge_band(&mut self, cfg: &GlowConfig) {
+    pub(super) const fn refresh_forge_band(&mut self, cfg: &GlowConfig) {
         let ground = if cfg.theme_bg & 0xFF00_0000 != 0 {
             // No resolved page (`COLOR_UNSET`): the reference ground of the
             // ground's side.
@@ -79,10 +82,11 @@ impl CursorGlow {
         } else {
             cfg.theme_bg
         };
-        if self
-            .forge_band
-            .is_none_or(|b| b.ground != ground || b.dark != cfg.dark_theme)
-        {
+        let needs_solve = match self.forge_band {
+            Some(b) => b.ground != ground || b.dark != cfg.dark_theme,
+            None => true,
+        };
+        if needs_solve {
             self.forge_band = Some(ForgeBand::solve(ground, cfg.dark_theme));
         }
     }
@@ -208,53 +212,80 @@ impl ForgeBand {
     pub(super) const MIN_ARC: f32 = 0.22;
 
     /// Solve the band for `ground`, preferring the side `dark` names.
-    pub(super) fn solve(ground: u32, dark: bool) -> Self {
+    pub(super) const fn solve(ground: u32, dark: bool) -> Self {
         let table = crate::color_math::relative_luminance_table();
-        let lum_of = |c: u32| crate::color_math::relative_luminance_with(table, c);
-        let lum = lum_of(ground);
-        let ratio = |p: f32| {
-            let l = lum_of(fire_ramp(p));
+        #[inline]
+        const fn ratio(table: &crate::color_math::RelativeLuminanceTable, lum: f32, p: f32) -> f32 {
+            let l = crate::color_math::relative_luminance_with(table, fire_ramp(p));
             (l.max(lum) + 0.05) / (l.min(lum) + 0.05)
-        };
-        let lit_rgb = |rgb: u32| {
-            let l = lum_of(rgb);
-            l > lum && (l + 0.05) / (lum + 0.05) >= Self::PAGE_CONTRAST
-        };
-        let lit = |p: f32| lit_rgb(fire_ramp(p));
-        let bright = lit(Self::TOP).then(|| {
-            let lo = if lit(Self::COLD) {
+        }
+        #[inline]
+        const fn lit_rgb(
+            table: &crate::color_math::RelativeLuminanceTable,
+            lum: f32,
+            rgb: u32,
+        ) -> bool {
+            let l = crate::color_math::relative_luminance_with(table, rgb);
+            l > lum && (l + 0.05) / (lum + 0.05) >= ForgeBand::PAGE_CONTRAST
+        }
+        #[inline]
+        const fn deep_ok_rgb(
+            table: &crate::color_math::RelativeLuminanceTable,
+            lum: f32,
+            rgb: u32,
+        ) -> bool {
+            let l = crate::color_math::relative_luminance_with(table, rgb);
+            l < lum && (lum + 0.05) / (l + 0.05) >= ForgeBand::PAGE_CONTRAST
+        }
+        let lum = crate::color_math::relative_luminance_with(table, ground);
+        let bright = if lit_rgb(table, lum, fire_ramp(Self::TOP)) {
+            let lo = if lit_rgb(table, lum, fire_ramp(Self::COLD)) {
                 Self::COLD
             } else {
-                bisect_edge(Self::COLD, Self::TOP, |rgb| !lit_rgb(rgb)).1
+                bisect_edge(table, lum, Self::COLD, Self::TOP, true).1
             };
-            (lo, (lo + Self::MIN_ARC).clamp(Self::HOT, Self::TOP))
-        });
-        let deep_ok_rgb = |rgb: u32| {
-            let l = lum_of(rgb);
-            l < lum && (lum + 0.05) / (l + 0.05) >= Self::PAGE_CONTRAST
+            Some((lo, (lo + Self::MIN_ARC).clamp(Self::HOT, Self::TOP)))
+        } else {
+            None
         };
-        let deep_ok = |p: f32| deep_ok_rgb(fire_ramp(p));
-        let deep = deep_ok(0.0).then(|| {
-            let hi = if deep_ok(Self::HOT) {
+        let deep = if deep_ok_rgb(table, lum, fire_ramp(0.0)) {
+            let hi = if deep_ok_rgb(table, lum, fire_ramp(Self::HOT)) {
                 Self::HOT
             } else {
-                bisect_edge(0.0, Self::HOT, deep_ok_rgb).0
+                bisect_edge(table, lum, 0.0, Self::HOT, false).0
             };
-            (Self::COLD.min(hi), hi)
-        });
-        let pick = if dark {
-            bright.map(|b| (true, b)).or(deep.map(|d| (false, d)))
+            Some((Self::COLD.min(hi), hi))
         } else {
-            deep.map(|d| (false, d)).or(bright.map(|b| (true, b)))
+            None
         };
-        let (bright, (lo, hi)) = pick.unwrap_or_else(|| {
-            // Neither side reads: the ramp end that comes closest.
-            if ratio(Self::TOP) >= ratio(0.0) {
-                (true, (Self::TOP, Self::TOP))
-            } else {
-                (false, (0.0, 0.0))
+        let pick = if dark {
+            match bright {
+                Some(b) => Some((true, b)),
+                None => match deep {
+                    Some(d) => Some((false, d)),
+                    None => None,
+                },
             }
-        });
+        } else {
+            match deep {
+                Some(d) => Some((false, d)),
+                None => match bright {
+                    Some(b) => Some((true, b)),
+                    None => None,
+                },
+            }
+        };
+        let (bright, (lo, hi)) = match pick {
+            Some(pair) => pair,
+            None => {
+                // Neither side reads: the ramp end that comes closest.
+                if ratio(table, lum, Self::TOP) >= ratio(table, lum, 0.0) {
+                    (true, (Self::TOP, Self::TOP))
+                } else {
+                    (false, (0.0, 0.0))
+                }
+            }
+        };
         Self {
             ground,
             dark,
@@ -276,22 +307,38 @@ impl ForgeBand {
 /// well under one ramp step; the caller has checked it holds at `lo` and
 /// fails at `hi`.
 #[inline]
-fn bisect_edge(mut lo: f32, mut hi: f32, holds_rgb: impl Fn(u32) -> bool) -> (f32, f32) {
+const fn bisect_edge(
+    table: &crate::color_math::RelativeLuminanceTable,
+    lum: f32,
+    mut lo: f32,
+    mut hi: f32,
+    want_not_lit: bool,
+) -> (f32, f32) {
     let (mut lo_rgb, mut hi_rgb) = (fire_ramp(lo), fire_ramp(hi));
-    for _ in 0..16 {
+    let mut i = 0;
+    while i < 16 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = fire_ramp(mid);
         if mid_rgb == lo_rgb {
             lo = mid;
         } else if mid_rgb == hi_rgb {
             hi = mid;
-        } else if holds_rgb(mid_rgb) {
-            lo = mid;
-            lo_rgb = mid_rgb;
         } else {
-            hi = mid;
-            hi_rgb = mid_rgb;
+            let l = crate::color_math::relative_luminance_with(table, mid_rgb);
+            let holds = if want_not_lit {
+                !(l > lum && (l + 0.05) / (lum + 0.05) >= ForgeBand::PAGE_CONTRAST)
+            } else {
+                l < lum && (lum + 0.05) / (l + 0.05) >= ForgeBand::PAGE_CONTRAST
+            };
+            if holds {
+                lo = mid;
+                lo_rgb = mid_rgb;
+            } else {
+                hi = mid;
+                hi_rgb = mid_rgb;
+            }
         }
+        i += 1;
     }
     (lo, hi)
 }

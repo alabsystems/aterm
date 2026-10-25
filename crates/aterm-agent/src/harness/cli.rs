@@ -335,6 +335,12 @@ VERBS:
     Creates `<state>/accounts/logins/<label>` (0700) and appends the row to `accounts.toml`
     (the first `add` also lists the default login as `main`). Labels match
     `[a-z0-9][a-z0-9._-]{0,63}` (not `help`). A row stays `not-enrolled` until signed in.
+    Where a fleet file on this machine writes the roster (`fleet-accounts.toml` beside it,
+    and its copy in `~/.secrets` where that lists this machine alone), the row is listed
+    there too, for this machine, so the next sync keeps it (it then needs `--email`); where
+    `[fleet] accounts_source` or the vault's files write it, `add` writes nothing and names
+    that source. The report's `list:` line (`--json`: `list.origin`) says which it is:
+    `discovered` for a list found on this Mac.
   - `accounts adopt-default <label> --email <e> [--browser <b>]`
     Lists the machine's default login (no `dir`) as a renewable row.
   - `accounts login <label>`
@@ -445,21 +451,46 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     but no Kimi worker starts yet.
     `ledger accounts --cli <id>` reads the pool's ledger.
 
-FLEET ACCOUNTS (off unless this machine names a source):
+FLEET ACCOUNTS (fetched where a source is named, signed in wherever a roster stands):
   - Opt in with `[fleet] accounts_source = \"<source>\"` in aterm.toml, by running
     `accounts sync <source>` once (its `fleet-accounts.toml` then says `opt_in = \"named\"`),
     or by keeping `fleet-accounts.toml`, `ai-accounts.csv`, `ai-mailbox.toml` or
     `mailbox.toml` in `~/.secrets/`, which a window syncs from. A `fleet-accounts.toml`
-    without `opt_in = \"named\"` opts nothing in. To opt out, remove the key, delete
-    `fleet-accounts.toml`, and move those `~/.secrets/` files away.
+    without `opt_in = \"named\"` (or `\"discovered\"`) opts nothing in. To opt out, remove
+    the key, delete `fleet-accounts.toml`, and move those `~/.secrets/` files away.
+  - Where no source was found, a sync keeps the accounts this machine's own logins,
+    profiles and transcripts show (`opt_in = \"discovered\"`; a `named` fleet of this
+    machine's rows alone is taken as one), and a window adds each one it finds later (it
+    reads them again every 15 minutes). A fleet from `[fleet] accounts_source`, or one that
+    lists other machines' accounts, is never added to here.
+  - When the default login's account changes (a `/login` in a tab), a window whose roster
+    a source writes syncs at its next upkeep: the default login's row is that account's (a
+    new row where no row lists it), and the row it replaced, whose login was written over,
+    is signed out (a `displaced` ledger event) and signed in by itself like any row without
+    a login here.
   - Where a source is configured, a window running under this account's own HOME syncs a
-    missing `accounts.toml` (at most once in 10 minutes) and starts a walled login's
-    successor's sign-in in the background (`claude auth login --claudeai --email <row's
-    email>`, answered from `<state>/accounts/mailbox` where that folder exists). An instance
-    with a scratch HOME or a private state root keeps no fleet accounts.
-  - Where none is, the window fetches and starts nothing and logs
-    `accounts-upkeep=unconfigured` once (`fleet-file=ignored` where a fleet file opts nothing
-    in). `accounts renew` by hand needs no source.
+    missing `accounts.toml` (at most once in 10 minutes). An instance with a scratch HOME or
+    a private state root keeps no fleet accounts.
+  - A window's upkeep and the first-run setup's retries sync a roster that stands only when
+    something it is made from changed (the files above, the default login, a local file
+    `[fleet] accounts_source` names), and a sync writes only the files whose bytes differ.
+    The rows a sync leaves with no login here go to the sign-in below at once.
+  - Wherever an `accounts.toml` stands, source or none, that window signs in by itself, one
+    at a time, each row with an email and no login here (`claude auth login --claudeai
+    --email <row's email>`), the rows a walled, low or warned session would move to first
+    (`[harness] logins = \"off\"` or `enabled = false` turns this off). A row a fleet
+    discovery listed only because a credential names it (a mailbox password, Muse Code) is
+    signed in only once a session needs it. `accounts renew --due` and the fact menu's
+    rotation start only what a session needs now. Its
+    routes: the mailbox (`<state>/accounts/mailbox`, or a mailbox file), a stored browser
+    profile in a headless browser, and a vault member's bounded `aterm secrets sync` when
+    neither is there. It opens no window and asks no one. A row no route signs in is an error
+    on record naming each route tried (the report's `sign-in:` line, one `sign-in` ledger
+    event per finding, an `aterm.log` line per try), tried again once what a route reads
+    changes, and at the latest after a wait that doubles from 15 minutes to 6 hours.
+  - Where no source is, the window fetches nothing and logs `accounts-upkeep=unconfigured`
+    once (`fleet-file=ignored` where a fleet file opts nothing in). `accounts renew` by hand
+    needs no source.
 ";
 
 const HELP_UPGRADE: &str = "\
@@ -2637,10 +2668,17 @@ fn limits_accounts_line(env: &Env, target: &str) -> Option<String> {
         .not
         .iter()
         .map(|(label, why)| match why {
-            accounts::WhyNot::NotEnrolled => format!(
-                "{label}: not-enrolled (run `aterm harness accounts {} {label}`)",
-                roster.row(label).map_or("login", sign_in_verb)
-            ),
+            accounts::WhyNot::NotEnrolled
+                if roster.row(label).is_some_and(|row| row.email.is_some()) =>
+            {
+                format!(
+                    "{label}: not-enrolled (aterm signs it in by itself; `aterm harness accounts \
+                     renew {label}` runs that now)"
+                )
+            }
+            accounts::WhyNot::NotEnrolled => {
+                format!("{label}: not-enrolled (run `aterm harness accounts login {label}`)")
+            }
             _ => format!("{label}: {}", why_not_words(*why)),
         })
         .collect();
@@ -5879,6 +5917,9 @@ fn accounts_text(
                 task.action.next_step(cli, &row.label)
             ));
         }
+        if let Some(line) = sign_in_attempt_words(row, state, logins, here, now) {
+            text.push_str(&format!("  {line}\n"));
+        }
     }
     let next = accounts_next(roster, state, enrolled, now);
     text.push_str(&match (&next.to, next.wait_until) {
@@ -5906,10 +5947,15 @@ fn accounts_text(
                     None if cli != Cli::Claude => {
                         format!("{label}: {} (no login made yet)", why.as_str())
                     }
+                    None if roster.row(label).is_some_and(|row| row.email.is_some()) => format!(
+                        "{label}: {} (no login made yet: aterm signs it in by itself; `aterm \
+                         harness accounts renew {label}` runs that now)",
+                        why.as_str()
+                    ),
                     None => format!(
-                        "{label}: {} (no login made yet: run `aterm harness accounts {} {label}`)",
-                        why.as_str(),
-                        roster.row(label).map_or("login", sign_in_verb)
+                        "{label}: {} (no login made yet: run `aterm harness accounts login \
+                         {label}`)",
+                        why.as_str()
                     ),
                 },
                 _ => format!("{label}: {}", why_not_words(*why)),
@@ -5961,6 +6007,50 @@ fn login_words(
     words
 }
 
+/// The row's last automatic sign-in, where it says something now: a failure while the row is
+/// still without a login it can be run on (`sign-in: error no-route since <t>: tried profile(none)
+/// mailbox(none configured) …`), or the route of the one that signed it in.
+fn sign_in_attempt_words(
+    row: &accounts::Row,
+    state: &accounts::State,
+    logins: &accounts::Logins,
+    here: bool,
+    now: i64,
+) -> Option<String> {
+    let attempt = logins.get(&row.label)?.sign_in_attempt.as_ref()?;
+    let since = rfc3339_utc(attempt.since);
+    if attempt.outcome.failing() {
+        matches!(
+            accounts::condition(row, state, here, now),
+            accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
+        )
+        .then(|| {
+            format!(
+                "sign-in: error {} since {since}: tried {}",
+                attempt.outcome.as_str(),
+                attempt.routes
+            )
+        })
+    } else {
+        Some(format!(
+            "sign-in: {} by its {} route at {since}",
+            attempt.outcome.as_str(),
+            attempt.routes
+        ))
+    }
+}
+
+fn sign_in_attempt_json(logins: &accounts::Logins, label: &str) -> Value {
+    let Some(attempt) = logins.get(label).and_then(|b| b.sign_in_attempt.as_ref()) else {
+        return Value::Null;
+    };
+    let mut view = Map::new();
+    view.insert("outcome".into(), Value::from(attempt.outcome.as_str()));
+    view.insert("routes".into(), Value::from(attempt.routes.clone()));
+    put_time(&mut view, "since", Some(attempt.since));
+    Value::Object(view)
+}
+
 fn sign_in_task_json(cli: Cli, label: &str, logins: &accounts::Logins) -> Value {
     let Some(task) = logins.get(label).and_then(|b| b.sign_in_task) else {
         return Value::Null;
@@ -5998,7 +6088,7 @@ fn accounts_refused_json(path: &Path, why: &str, now: i64) -> String {
 
 fn accounts_json(
     cli: Cli,
-    path: &Path,
+    (path, origin): (&Path, Option<&super::accounts_sync::FleetOrigin>),
     roster: &Roster,
     (state, logins): (&accounts::State, &accounts::Logins),
     enrolled: &BTreeSet<String>,
@@ -6007,6 +6097,13 @@ fn accounts_json(
 ) -> String {
     let mut o = accounts_json_head(path, now);
     o.insert("refused".to_owned(), Value::Null);
+    // Where the rows come from (Claude Code's pool): `discovered` for a list found on this Mac.
+    if let Some(origin) = origin {
+        let mut list = Map::new();
+        list.insert("origin".to_owned(), Value::from(origin.word()));
+        list.insert("source".to_owned(), Value::from(origin.source()));
+        o.insert("list".to_owned(), Value::Object(list));
+    }
     // Only Claude Code's sessions are carried by a supervisor that moves them; another pool is
     // listed and recorded, and none of its sessions moves yet.
     let moves = cli == Cli::Claude;
@@ -6076,6 +6173,10 @@ fn accounts_json(
             m.insert(
                 "sign_in_task".into(),
                 sign_in_task_json(cli, &row.label, logins),
+            );
+            m.insert(
+                "sign_in_attempt".into(),
+                sign_in_attempt_json(logins, &row.label),
             );
             m.insert("renews".to_owned(), Value::from(row.email.is_some()));
             m.insert(
@@ -6263,18 +6364,33 @@ fn run_accounts_report(
     let roster = accounts::bound(&if own { Roster::own() } else { roster }, &logins);
     let enrolled = accounts::enrolled_for(cli, &roster);
     let read = (&state, &logins);
+    let origin = (cli == Cli::Claude && !own).then(|| {
+        super::accounts_sync::fleet_origin(env.home.as_deref(), env.config.as_deref(), &path)
+    });
     let _ = if json {
         writeln!(
             out,
             "{}",
-            accounts_json(cli, &path, &roster, read, &enrolled, by, env.now)
+            accounts_json(
+                cli,
+                (&path, origin.as_ref()),
+                &roster,
+                read,
+                &enrolled,
+                by,
+                env.now
+            )
         )
     } else {
-        write!(
-            out,
-            "{}",
-            accounts_text(cli, &path, &roster, read, &enrolled, env.now)
-        )
+        let mut text = accounts_text(cli, &path, &roster, read, &enrolled, env.now);
+        // Where the rows come from, where a fleet writes them: found on this Mac, a source a
+        // sync was handed, a configured source or the vault.
+        if let Some(origin) =
+            origin.filter(|origin| *origin != super::accounts_sync::FleetOrigin::Roster)
+        {
+            text.push_str(&format!("list: {}\n", origin.words()));
+        }
+        write!(out, "{text}")
     };
     ExitCode::SUCCESS
 }
@@ -6303,6 +6419,13 @@ fn run_accounts_add(
                 added.roster.display()
             );
             let _ = writeln!(out, "login directory: {}", added.dir.display());
+            for fleet in &added.fleets {
+                let _ = writeln!(
+                    out,
+                    "listed in {} too, so the next sync keeps it",
+                    fleet.display()
+                );
+            }
             if added.dir_held_files {
                 let _ = writeln!(
                     err,
@@ -6338,6 +6461,8 @@ struct Added {
     dir: PathBuf,
     listed_own: bool,
     dir_held_files: bool,
+    /// The fleet files the row was listed in too, so the next sync keeps it.
+    fleets: Vec<PathBuf>,
 }
 
 fn file_mode(path: &Path) -> Option<u32> {
@@ -6443,6 +6568,7 @@ fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, Str
         dir: Some(dir_text.to_owned()),
         ..asked.clone()
     };
+    let fleets = fleet_rows_for_add(cli, env, &path, &asked)?;
     let rows = if listed_own {
         vec![own, asked]
     } else {
@@ -6463,6 +6589,20 @@ fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, Str
     aterm_types::fs_restricted::ensure_private_dir(&store.logins_dir())
         .and_then(|()| aterm_types::fs_restricted::ensure_private_dir(&dir))
         .map_err(|e| format!("{}: {e}", dir.display()))?;
+    // The fleet first: a fleet that lists the row and a roster that does not yet is mended by
+    // the next sync, never the other way round.
+    for (fleet, fleet_text) in &fleets {
+        let (fleet_to, fleet_mode) = roster_target(fleet)?;
+        super::upgrade_models::write_atomic_mode(&fleet_to, fleet_text, fleet_mode).map_err(
+            |e| {
+                format!(
+                    "{}: {e}; the roster is unchanged (the login directory {} was made)",
+                    fleet_to.display(),
+                    dir.display()
+                )
+            },
+        )?;
+    }
     super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode).map_err(|e| {
         format!(
             "{}: {e}; the roster is unchanged (the login directory {} was made)",
@@ -6475,7 +6615,45 @@ fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, Str
         dir,
         listed_own,
         dir_held_files,
+        fleets: fleets.into_iter().map(|(fleet, _)| fleet).collect(),
     })
+}
+
+/// Where `accounts add` lists `asked` beside the roster at `path` so that the next sync keeps it
+/// ([`super::accounts_sync::fleet_origin`]): nowhere for a roster no fleet writes or another
+/// CLI's (its sync removes no row); each local fleet file of Claude Code's, with the text it then
+/// holds ([`super::accounts_sync::list_in_local_fleet`]).
+/// # Errors
+/// The roster is written from a source this machine reads and does not write (`[fleet]
+/// accounts_source`, the vault's files), which would drop the row at its next sync; or the
+/// local fleet refuses the row.
+fn fleet_rows_for_add(
+    cli: Cli,
+    env: &Env,
+    path: &Path,
+    asked: &accounts::Row,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    use super::accounts_sync::{FleetOrigin, fleet_origin, list_in_local_fleet};
+    if cli != Cli::Claude {
+        return Ok(Vec::new());
+    }
+    let origin = fleet_origin(env.home.as_deref(), env.config.as_deref(), path);
+    let from = match &origin {
+        FleetOrigin::Roster => return Ok(Vec::new()),
+        FleetOrigin::Local { files, .. } => return list_in_local_fleet(env, files, asked),
+        FleetOrigin::Key(_) => "list the account there",
+        FleetOrigin::Vault(_) => {
+            "list the account in the vault's copy (on a Mac that edits the vault)"
+        }
+    };
+    Err(format!(
+        "this machine's accounts come from {}, which a sync writes {} from and this machine does \
+         not write, so a row listed here alone would be dropped at the next sync: {from} (its \
+         email, and this machine among its `machines`), then run `aterm harness accounts sync`; \
+         nothing was written",
+        origin.words(),
+        path.display()
+    ))
 }
 
 fn ask_login(host: &dyn AccountsHost, dir: Option<&str>, made: bool) -> LoginCheck {
@@ -7252,8 +7430,10 @@ fn run_accounts_renew(
                 .is_some_and(|a| a.limited_until(now).is_some())
         });
         if !has_non_limited_due {
+            // What a session needs now (a walled session's successor, a due login), never the
+            // rows the upkeep signs in by itself before any session needs them.
             let candidates =
-                super::accounts_sync::auto_renew_candidates(&file_roster, &state, &logins, now);
+                super::accounts_sync::needed_renew_candidates(&file_roster, &state, &logins, now);
             let target = candidates
                 .iter()
                 .find(|r| {
@@ -8002,7 +8182,7 @@ fn run_accounts_renew_for(
             }
         }
         if !has_non_limited_due && cli.accounts().signin.is_some() {
-            let candidates = super::accounts_sync::auto_renew_candidates_for(
+            let candidates = super::accounts_sync::needed_renew_candidates_for(
                 cli,
                 Some(&store),
                 &file_roster,

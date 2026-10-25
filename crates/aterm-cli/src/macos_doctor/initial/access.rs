@@ -10,21 +10,140 @@
 //! Not now in this approval) is honored as the row's wanted state and never asks for a person.
 
 use super::{Row, WAITING};
+use aterm_json::{Value, json};
 use aterm_types::macos_setup::opt_out::OptOut;
 use aterm_types::macos_setup::{
-    Access, AccessOutcome, Observation, Selection, Setting, Standing, Subject, access_record,
-    opt_out,
+    Access, AccessOutcome, LOCAL_NETWORK_ASKED, LOCAL_NETWORK_UNTOLD, Observation, Selection,
+    Setting, Standing, Subject, access_record, opt_out,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::Path;
+use std::sync::Mutex;
 
-/// Whether a LAN reach to the ALab vault succeeded in this process: the only
-/// evidence an app has that macOS lets it use the local network (§3.3).
-static LAN_REACHED: AtomicBool = AtomicBool::new(false);
-
-/// Record that a request to a `.local` address on this LAN was answered.
-pub(super) fn lan_reached() {
-    LAN_REACHED.store(true, Ordering::Release);
+/// What a look at the LAN heard of macOS's Local Network switch, the only evidence an app has
+/// of it (§3.3): macOS never reports the switch itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LanAnswer {
+    /// Something on this LAN answered a request to a `.local` address: the switch is on.
+    Reached,
+    /// macOS refused aterm a `.local` name (`aterm_secrets::client::refused_by_local_network`):
+    /// the person answered Don't Allow, or turned aterm off since.
+    Refused,
 }
+
+impl LanAnswer {
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Reached => "reached",
+            Self::Refused => "refused",
+        }
+    }
+
+    fn of(word: &str) -> Option<Self> {
+        match word {
+            "reached" => Some(Self::Reached),
+            "refused" => Some(Self::Refused),
+            _ => None,
+        }
+    }
+}
+
+/// The last answer a LAN look heard in this process, with its time (Unix seconds).
+static HEARD: Mutex<Option<(LanAnswer, u64)>> = Mutex::new(None);
+
+/// The record, in aterm's doctor state, of the last answer a LAN look heard and when: a later
+/// launch reads Local Network from it, since a joined ALab Mac's launch looks for nothing and a
+/// Mac with no ALab vault on its LAN hears no answer to a look.
+const KEPT: &str = "local-network.json";
+
+/// Note what a look at the LAN heard, now: for this process, and kept for later launches unless
+/// the record holds a later answer. A record that cannot be written leaves later launches what
+/// they read before; this process still reads its own answer.
+pub(super) fn lan_answered(answer: LanAnswer) {
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    if let Ok(mut heard) = HEARD.lock() {
+        *heard = Some((answer, at));
+    }
+    let _kept = super::state_root().and_then(|root| keep_answer(&root, answer, at));
+}
+
+/// Keep `answer`, heard at `at`, in `root` unless the record there holds a later one.
+fn keep_answer(root: &Path, answer: LanAnswer, at: u64) -> Result<(), String> {
+    if kept_answer(root).is_some_and(|(_, kept)| kept > at) {
+        return Ok(());
+    }
+    super::write_json(
+        &root.join(KEPT),
+        &json!({"profile":super::PROFILE,"answer":answer.word(),"at":at}),
+    )
+}
+
+/// The answer kept in `root`, and when it was heard; `None` when there is none, or the record
+/// cannot be read (a reading that says nothing, never a guess).
+fn kept_answer(root: &Path) -> Option<(LanAnswer, u64)> {
+    let bytes = std::fs::read(root.join(KEPT)).ok()?;
+    let value: Value = aterm_json::from_slice(&bytes).ok()?;
+    if value["profile"].as_str() != Some(super::PROFILE) {
+        return None;
+    }
+    Some((
+        LanAnswer::of(value["answer"].as_str()?)?,
+        value["at"].as_u64()?,
+    ))
+}
+
+/// The later of this process's last answer and the one kept from earlier launches.
+fn last_answer() -> Option<LanAnswer> {
+    let heard = HEARD.lock().ok().and_then(|heard| *heard);
+    let kept = super::state_root().ok().and_then(|root| kept_answer(&root));
+    latest([heard, kept])
+}
+
+/// The answer heard last of `answers`, each with when it was heard.
+fn latest(answers: [Option<(LanAnswer, u64)>; 2]) -> Option<LanAnswer> {
+    answers
+        .into_iter()
+        .flatten()
+        .max_by_key(|(_, at)| *at)
+        .map(|(answer, _)| answer)
+}
+
+/// Local Network as aterm knows it (§3.3), from the last answer a LAN look heard (`heard`) and
+/// this approval's step (`records`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Lan {
+    /// A look reached the LAN, or the window recorded the grant in this approval.
+    On,
+    /// macOS refused a look the LAN: the person's answer, which aterm leaves as it is.
+    Off,
+    /// The window raised macOS's question in this approval, and no answer since says how it
+    /// went.
+    Asked,
+    /// Nothing says.
+    Untold,
+}
+
+impl Lan {
+    pub(super) fn of(heard: Option<LanAnswer>, records: &[(Access, AccessOutcome)]) -> Self {
+        let recorded = records
+            .iter()
+            .rev()
+            .find_map(|(row, outcome)| (*row == Access::LocalNetwork).then_some(*outcome));
+        match (recorded, heard) {
+            (_, Some(LanAnswer::Reached)) => Self::On,
+            (_, Some(LanAnswer::Refused)) => Self::Off,
+            (Some(AccessOutcome::Granted), None) => Self::On,
+            (Some(AccessOutcome::Triggered), None) => Self::Asked,
+            _ => Self::Untold,
+        }
+    }
+}
+
+/// The Local Network row's description once macOS refused aterm the LAN: the person's answer,
+/// honored as the row's wanted state (§4), so it never asks them again.
+pub(super) const LAN_REFUSED: &str =
+    "You answered Don't Allow or turned it off, so aterm leaves it off.";
 
 /// Full Disk Access as the prompt-free probe reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +187,7 @@ pub(super) struct Grants {
     pub stable: bool,
     pub devtools: DevTools,
     pub debugger: Debugger,
-    pub lan_reached: bool,
+    pub lan: Lan,
     /// AXIsProcessTrusted, read only while a sign-out is managed.
     pub accessibility: Option<bool>,
     /// Why the person opted each grant out, in [`Access::ALL`] order ([`opted_out`]).
@@ -131,10 +250,10 @@ pub(super) fn read(selection: Selection, records: &[(Access, AccessOutcome)]) ->
         debugger.probe.mode,
     ) {
         (SelfHardening::NotHardened, ..) => {
-            Debugger::NotNeeded("this aterm is not hardened, so a debugger attaches without it")
+            Debugger::NotNeeded("This aterm is not hardened, so a debugger attaches without it.")
         }
         (_, DebuggerMember::NotMember, _) => Debugger::NotNeeded(
-            "this account is neither an admin nor a developer, so macOS does not let it turn on",
+            "This account is neither an admin nor a developer, so macOS does not let it turn on.",
         ),
         (_, _, DebuggerMode::Enabled) => Debugger::On,
         (_, _, DebuggerMode::Disabled) => Debugger::Off,
@@ -152,7 +271,7 @@ pub(super) fn read(selection: Selection, records: &[(Access, AccessOutcome)]) ->
         stable: !matches!(privacy.dr, DrClass::Cdhash | DrClass::Unsigned),
         devtools: devtools_listing(),
         debugger,
-        lan_reached: LAN_REACHED.load(Ordering::Acquire),
+        lan: Lan::of(last_answer(), records),
         accessibility,
         opted_out: [None; 5],
     };
@@ -161,18 +280,32 @@ pub(super) fn read(selection: Selection, records: &[(Access, AccessOutcome)]) ->
         records,
         Access::ALL.map(|access| grants.reads_off(access)),
     );
+    grants.refused_lan();
     grants
 }
 
 impl Grants {
     /// Whether `access` reads a definite off. Full Disk Access never does (a refused probe reads
-    /// `Not confirmed`), nor does Local Network, which macOS does not report to an app.
+    /// `Not confirmed`); Local Network only where macOS refused aterm the LAN.
     pub(super) fn reads_off(&self, access: Access) -> bool {
         match access {
             Access::DeveloperTools => self.devtools == DevTools::Off,
             Access::Debugger => self.debugger == Debugger::Off,
             Access::Accessibility => self.accessibility == Some(false),
-            Access::FullDiskAccess | Access::LocalNetwork => false,
+            Access::LocalNetwork => self.lan == Lan::Off,
+            Access::FullDiskAccess => false,
+        }
+    }
+
+    /// A Local Network macOS refused aterm is the person's answer ([`LAN_REFUSED`]), unless
+    /// they opted it out otherwise already.
+    pub(super) fn refused_lan(&mut self) {
+        if self.lan == Lan::Off {
+            let slot = Access::ALL
+                .iter()
+                .position(|row| *row == Access::LocalNetwork)
+                .unwrap_or_default();
+            self.opted_out[slot].get_or_insert(LAN_REFUSED);
         }
     }
 }
@@ -276,11 +409,15 @@ pub(super) fn observation(access: Access, grants: &Grants, selection: Selection)
                 Debugger::NotNeeded(why) => (Standing::NotNeeded, None, None, Some(why)),
                 Debugger::Unknown => (Standing::Unknown, None, None, None),
             },
-            Access::LocalNetwork if grants.lan_reached => {
-                (Standing::InPlace, Some("On"), None, None)
-            }
-            // macOS does not tell an app whether it may use the local network.
-            Access::LocalNetwork => (Standing::Unknown, None, None, None),
+            // macOS does not tell an app whether it may use the local network: only a look
+            // that reached the LAN, or one macOS refused, says. Otherwise the row is `—` with a
+            // calm note, and nothing in this launch reads more of it.
+            Access::LocalNetwork => match grants.lan {
+                Lan::On => (Standing::InPlace, Some("On"), None, None),
+                Lan::Off => (person, Some("Off"), None, None),
+                Lan::Asked => (Standing::Untold, None, Some(LOCAL_NETWORK_ASKED), None),
+                Lan::Untold => (Standing::Untold, None, Some(LOCAL_NETWORK_UNTOLD), None),
+            },
             Access::Accessibility if !managed => (
                 Standing::NotNeeded,
                 None,
@@ -323,16 +460,15 @@ fn opted(grants: &Grants, access: Access) -> Option<&'static str> {
 }
 
 /// A grant the person opted out of, honored as the row's wanted state (§4): a
-/// definite reading is what they want, so it reads in place; an unread or
-/// unconfirmed one is not needed. Either way nothing asks for a person.
+/// definite reading is what they want, so it reads in place; an unread,
+/// untold or unconfirmed one is not needed. Either way nothing asks for a person.
 fn honor_opt_out(seen: Observation, why: &'static str) -> Observation {
     if matches!(seen.standing, Standing::InPlace | Standing::NotNeeded) {
         return seen;
     }
-    let definite = seen
-        .now
-        .clone()
-        .filter(|now| now != "Not confirmed" && seen.standing != Standing::Unknown);
+    let definite = seen.now.clone().filter(|now| {
+        now != "Not confirmed" && !matches!(seen.standing, Standing::Unknown | Standing::Untold)
+    });
     Observation {
         standing: if definite.is_some() {
             Standing::InPlace
@@ -348,8 +484,8 @@ fn honor_opt_out(seen: Observation, why: &'static str) -> Observation {
 
 /// The Permissions stage's rows for the revision `records` belong to, complete per §6 once every
 /// grant is in place, not needed, waiting on Full Disk Access, unreadable here (all but Local
-/// Network), or has a step recorded. Any other row waits for the window's lane or a person
-/// ([`WAITING`]): the pass parks, never retries it.
+/// Network, which macOS never reports), or has a step recorded. Any other row waits for the
+/// window's lane or a person ([`WAITING`]): the pass parks, never retries it.
 pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -> Vec<Row> {
     let selection = {
         let mut selection = Selection::none();
@@ -446,7 +582,7 @@ mod tests {
             stable: true,
             devtools: DevTools::NeedsFullDiskAccess,
             debugger: Debugger::Off,
-            lan_reached: false,
+            lan: Lan::Untold,
             accessibility: Some(false),
             opted_out: [None; 5],
         }
@@ -476,11 +612,8 @@ mod tests {
             (Standing::NeedsYou, Some("Off"))
         );
         let lan = observation(Access::LocalNetwork, &g, managed());
-        assert_eq!((lan.standing, lan.now), (Standing::Unknown, None));
-        let reached = Grants {
-            lan_reached: true,
-            ..g
-        };
+        assert_eq!((lan.standing, lan.now), (Standing::Untold, None));
+        let reached = Grants { lan: Lan::On, ..g };
         let lan = observation(Access::LocalNetwork, &reached, managed());
         assert_eq!(
             (lan.standing, lan.now.as_deref()),
@@ -533,7 +666,7 @@ mod tests {
                 "{name}"
             );
         }
-        // Local Network reads Unknown until the window asks: that one waits.
+        // Local Network, which nothing told aterm of, waits for the window to ask.
         assert_eq!(row("Local Network").status, WAITING);
     }
 
@@ -736,5 +869,122 @@ mod tests {
             (Standing::InPlace, Some("Off"), "Off")
         );
         assert_eq!(row.detail.as_deref(), Some(DEBUGGER_ANSWERED));
+    }
+
+    #[test]
+    fn local_network_reads_the_last_answer_heard_else_this_approvals_step() {
+        use AccessOutcome::{Granted, Triggered};
+        use LanAnswer::{Reached, Refused};
+        for (heard, step, lan) in [
+            (None, None, Lan::Untold),
+            (None, Some(Triggered), Lan::Asked),
+            (None, Some(Granted), Lan::On),
+            (Some(Reached), None, Lan::On),
+            (Some(Reached), Some(Triggered), Lan::On),
+            (Some(Refused), None, Lan::Off),
+            (Some(Refused), Some(Triggered), Lan::Off),
+            (Some(Refused), Some(Granted), Lan::Off),
+        ] {
+            let records: Vec<_> = step
+                .into_iter()
+                .map(|outcome| (Access::LocalNetwork, outcome))
+                .collect();
+            assert_eq!(Lan::of(heard, &records), lan, "{heard:?} {step:?}");
+        }
+        // Another row's step says nothing of the network.
+        assert_eq!(
+            Lan::of(None, &[(Access::FullDiskAccess, Granted)]),
+            Lan::Untold
+        );
+    }
+
+    #[test]
+    fn a_kept_answer_is_read_back_and_only_a_later_one_replaces_it() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        assert_eq!(kept_answer(root.path()), None, "nothing kept yet");
+        keep_answer(root.path(), LanAnswer::Reached, 100).unwrap();
+        assert_eq!(kept_answer(root.path()), Some((LanAnswer::Reached, 100)));
+        keep_answer(root.path(), LanAnswer::Refused, 50).unwrap();
+        assert_eq!(
+            kept_answer(root.path()),
+            Some((LanAnswer::Reached, 100)),
+            "an earlier answer never replaces a later one"
+        );
+        keep_answer(root.path(), LanAnswer::Refused, 200).unwrap();
+        assert_eq!(kept_answer(root.path()), Some((LanAnswer::Refused, 200)));
+        std::fs::write(root.path().join(KEPT), b"{").unwrap();
+        assert_eq!(
+            kept_answer(root.path()),
+            None,
+            "an unreadable record says nothing"
+        );
+        // This process's answer and the kept one: the later decides.
+        let reached = Some((LanAnswer::Reached, 10));
+        let refused = Some((LanAnswer::Refused, 20));
+        assert_eq!(latest([reached, refused]), Some(LanAnswer::Refused));
+        assert_eq!(latest([refused, reached]), Some(LanAnswer::Refused));
+        assert_eq!(latest([None, reached]), Some(LanAnswer::Reached));
+        assert_eq!(latest([None, None]), None);
+    }
+
+    /// macOS never tells an app its Local Network switch: the row reads what a look heard, or
+    /// `—` with one calm note that settles, never a check under way; a refusal is the person's.
+    #[test]
+    fn local_network_reads_on_off_or_a_calm_dash_and_never_a_check() {
+        let triggered = [(Access::LocalNetwork, AccessOutcome::Triggered)];
+        for (lan, records, standing, now, note, stage) in [
+            (
+                Lan::On,
+                &[][..],
+                Standing::InPlace,
+                Some("On"),
+                None,
+                "on".to_owned(),
+            ),
+            (
+                Lan::Off,
+                &[][..],
+                Standing::InPlace,
+                Some("Off"),
+                None,
+                format!("as you chose: {LAN_REFUSED}"),
+            ),
+            (
+                Lan::Asked,
+                &triggered[..],
+                Standing::Untold,
+                None,
+                Some(LOCAL_NETWORK_ASKED),
+                "macOS's own step started in this revision".to_owned(),
+            ),
+            (
+                Lan::Untold,
+                &[][..],
+                Standing::Untold,
+                None,
+                Some(LOCAL_NETWORK_UNTOLD),
+                "waits for System State to hand its step to macOS while it is the visible view"
+                    .to_owned(),
+            ),
+        ] {
+            let mut g = Grants { lan, ..grants() };
+            g.refused_lan();
+            let row = observation(Access::LocalNetwork, &g, managed());
+            assert_eq!(
+                (row.standing, row.now.as_deref(), row.note.as_deref()),
+                (standing, now, note),
+                "{lan:?}"
+            );
+            assert!(row.standing.settled(), "{lan:?} settles the page");
+            assert_eq!(
+                row.detail.as_deref() == Some(LAN_REFUSED),
+                lan == Lan::Off,
+                "{lan:?}: {:?}",
+                row.detail
+            );
+            let rows = stage_rows(&g, records);
+            let row = rows.iter().find(|row| row.name == "Local Network").unwrap();
+            assert_eq!(row.detail, stage, "{lan:?}");
+        }
     }
 }

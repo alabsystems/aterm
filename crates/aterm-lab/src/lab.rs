@@ -1030,6 +1030,18 @@ pub(crate) fn names_this_lab(run: &Run, pid: i32) -> bool {
     }
 }
 
+/// `pid` while it is still the process that started at `start` ([`procs::start_time`]), else 0
+/// (an unread start included, so nothing is signalled). [`down`] checks each saved pid once
+/// ([`names_this_lab`]) and signals it again only after its TERM and a wait, when its exit is
+/// expected and its number may already be another process's.
+fn still_started(pid: i32, start: &str) -> i32 {
+    if pid > 1 && !start.is_empty() && procs::start_time(pid) == start {
+        pid
+    } else {
+        0
+    }
+}
+
 /// Whether `up` may make the lab `run` names at `now`: what an earlier lab of the tag left is
 /// stamped ([`stamp_holds`]) and swept ([`sweep_copies`]).
 /// # Errors
@@ -1571,6 +1583,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     if !ours[2] {
         r.sampler_pid = 0;
     }
+    let started = [r.instance_pid, r.stub_pid, r.sampler_pid].map(procs::start_time);
     let pids = procs::jail_members(&r);
     let mut recorded = crate::runtime_dirs::read_record(&r.run)
         .into_iter()
@@ -1588,6 +1601,8 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     while pids.iter().any(|&p| alive(p)) && std::time::Instant::now() < end {
         std::thread::sleep(Duration::from_millis(50));
     }
+    r.instance_pid = still_started(r.instance_pid, &started[0]);
+    r.stub_pid = still_started(r.stub_pid, &started[1]);
     for p in procs::jail_members(&r) {
         if alive(p) {
             eprintln!("aterm-lab: pid {p} ignored TERM -> KILL");
@@ -1605,13 +1620,14 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
         eprintln!("aterm-lab: still in the jail after KILL: {}", l.join(" "));
     }
     let unstamped = !stamp_holds(&r.run);
+    r.sampler_pid = still_started(r.sampler_pid, &started[2]);
     if alive(r.sampler_pid) {
         let _ = crate::sys::kill(r.sampler_pid, libc::SIGTERM);
         let end = std::time::Instant::now() + Duration::from_secs(2);
         while alive(r.sampler_pid) && std::time::Instant::now() < end {
             std::thread::sleep(Duration::from_millis(50));
         }
-        if alive(r.sampler_pid) {
+        if still_started(r.sampler_pid, &started[2]) != 0 {
             eprintln!("aterm-lab: pid {} ignored TERM -> KILL", r.sampler_pid);
             let _ = crate::sys::kill(r.sampler_pid, libc::SIGKILL);
         }
@@ -2968,6 +2984,34 @@ mod tests {
             ..elsewhere
         };
         assert!(names_this_lab(&ours, me), "{line}");
+    }
+
+    #[test]
+    fn a_saved_pid_is_signalled_only_while_it_is_the_process_that_started_then() {
+        let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+            .arg("600")
+            .spawn()
+            .expect("a child");
+        let pid = i32::try_from(child.id()).expect("a pid");
+        let start = procs::start_time(pid);
+        assert!(!start.is_empty(), "the child's start is read");
+        assert_eq!(still_started(pid, &start), pid, "still that process");
+        assert_eq!(
+            still_started(pid, "Thu Jan  1 00:00:00 1970"),
+            0,
+            "another start"
+        );
+        assert_eq!(still_started(pid, ""), 0, "a start never read");
+        for none in [0, 1, -1] {
+            assert_eq!(still_started(none, &start), 0, "{none}");
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            still_started(pid, &start),
+            0,
+            "gone: its number is no one's of then"
+        );
     }
 
     fn half_made(root: &Path) -> Run {

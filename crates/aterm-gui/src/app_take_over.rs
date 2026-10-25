@@ -1673,6 +1673,7 @@ mod tests {
             key: 1,
             what: String::new(),
             harness: None,
+            report: None,
         }));
         app.publish_agents_live(false, now + Duration::from_millis(500));
         assert!(
@@ -2025,6 +2026,7 @@ mod tests {
                     key: 7,
                     what: String::new(),
                     harness: None,
+                    report: None,
                 }),
                 ..crate::needs::Verdict::default()
             });
@@ -2052,6 +2054,7 @@ mod tests {
                         key,
                         what: "approve?".to_string(),
                         harness: None,
+                        report: None,
                     }),
                     ..crate::needs::Verdict::default()
                 });

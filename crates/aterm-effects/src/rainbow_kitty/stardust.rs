@@ -500,14 +500,14 @@ pub const fn stream_travel_px(px_per_s: f32) -> f32 {
 
 #[inline]
 #[must_use]
-fn stream_unit(age_ms: f32) -> f32 {
+const fn stream_unit(age_ms: f32) -> f32 {
     if age_ms <= 0.0 {
         return 0.0;
     }
     if age_ms >= STREAM_END_MS {
         return 1.0;
     }
-    ((1.0 - (-age_ms / STREAM_TAU_MS).exp()) / STREAM_SPENT).min(1.0)
+    ((1.0 - crate::color_math::exp_f32(-age_ms / STREAM_TAU_MS)) / STREAM_SPENT).min(1.0)
 }
 
 /// The mend's pull window, ms: a key that mends a typo run ([`super::Mend`], §23) takes its strike
@@ -829,10 +829,10 @@ enum Motion {
 
 impl Motion {
     #[inline]
-    fn k_at(self, age_ms: f32) -> f32 {
+    const fn k_at(self, age_ms: f32) -> f32 {
         match self {
             Self::Lift => age_ms,
-            Self::Drag => DRAG_TAU_MS * (1.0 - (-age_ms / DRAG_TAU_MS).exp()),
+            Self::Drag => DRAG_TAU_MS * (1.0 - crate::color_math::exp_f32(-age_ms / DRAG_TAU_MS)),
             Self::Throw(window_ms) => window_ms * (1.0 - spend(age_ms / window_ms)),
         }
     }
@@ -856,6 +856,8 @@ pub struct Finish {
     /// own retract for a field star.
     pub span_s: f32,
 }
+
+const STAR_CULL_SPAN_SHARE: f32 = 1.0 - crate::color_math::sqrt_f32(STAR_CULL_ALPHA);
 
 impl Finish {
     /// The finish's unit progress at `now`, `0..=1`.
@@ -891,10 +893,7 @@ impl Finish {
     #[inline]
     #[must_use]
     fn cull_at(&self) -> Instant {
-        self.at
-            + std::time::Duration::from_secs_f32(
-                self.span_s.max(0.0) * (1.0 - STAR_CULL_ALPHA.sqrt()),
-            )
+        self.at + std::time::Duration::from_secs_f32(self.span_s.max(0.0) * STAR_CULL_SPAN_SHARE)
     }
 }
 
@@ -1179,7 +1178,7 @@ impl Star {
     }
 
     #[inline]
-    fn stream_px(&self, age_ms: f32) -> i32 {
+    const fn stream_px(&self, age_ms: f32) -> i32 {
         if self.stream <= 0.0 {
             return 0;
         }
@@ -1227,7 +1226,7 @@ impl Star {
 
     #[inline]
     #[must_use]
-    fn pos_at_age(&self, age_s: f32) -> (i32, i32) {
+    const fn pos_at_age(&self, age_s: f32) -> (i32, i32) {
         let age_ms = age_s * 1000.0;
         let (x, y) = if self.v0.0 == 0.0 && self.v0.1 == 0.0 {
             self.origin()
@@ -1242,7 +1241,7 @@ impl Star {
     /// ([`Stardust::settle`]): a core never lands on a probed glyph.
     #[inline]
     #[must_use]
-    pub fn rest(&self) -> (i32, i32) {
+    pub const fn rest(&self) -> (i32, i32) {
         let motion = self.lane.motion();
         let end_ms = motion.end_ms(self.life_s() * 1000.0);
         let (x, y) = if self.v0.0 == 0.0 && self.v0.1 == 0.0 {
@@ -3960,15 +3959,15 @@ const fn fan_rise(reach: f32, at_px: (f32, f32), geom: Geom) -> (f32, f32) {
 }
 
 #[inline]
-fn fan_ray(a: f32, reach: f32, up: f32, down: f32, j: f32) -> (f32, f32) {
-    let (sa, ca) = a.sin_cos();
+const fn fan_ray(a: f32, reach: f32, up: f32, down: f32, j: f32) -> (f32, f32) {
+    let (sa, ca) = crate::supernova::sin_cos_f32(a);
     let (dx, dy) = (ca * reach, sa * reach);
     let cap = if dy < 0.0 { up } else { down };
     let cap = cap * (FAN_RISE_JITTER_MIN + (1.0 - FAN_RISE_JITTER_MIN) * j);
     if dy.abs() <= cap {
         return (dx, dy);
     }
-    let along = (reach * reach - cap * cap).max(0.0).sqrt();
+    let along = crate::color_math::sqrt_f32((reach * reach - cap * cap).max(0.0));
     (along.copysign(dx), cap.copysign(dy))
 }
 
@@ -4157,7 +4156,7 @@ impl Veil {
 /// ([`Veil::envelope`]).
 #[inline]
 #[must_use]
-pub fn field_lane_envelope(age_s: f32, idle_s: f32, fin: f32, reduced_motion: bool) -> f32 {
+pub const fn field_lane_envelope(age_s: f32, idle_s: f32, fin: f32, reduced_motion: bool) -> f32 {
     if reduced_motion {
         let fade = REDUCED_MOTION_FADE_MS / 1000.0;
         return clamp01((FIELD_LIFE_S - age_s) / fade.max(f32::EPSILON))
@@ -4774,17 +4773,20 @@ impl PaperInkMemo {
     };
 
     #[inline]
-    fn get(&mut self, tint: u32, cfg: &Config) -> u32 {
+    const fn get(&mut self, tint: u32, cfg: &Config) -> u32 {
         let theme = (cfg.theme_fg & 0x00FF_FFFF, cfg.theme_bg & 0x00FF_FFFF);
-        if self.theme != theme {
+        if self.theme.0 != theme.0 || self.theme.1 != theme.1 {
             self.theme = theme;
             self.len = 0;
         }
-        let len = usize::from(self.len);
-        for &(t, rgb) in &self.entries[..len] {
+        let len = self.len as usize;
+        let mut i = 0;
+        while i < len {
+            let (t, rgb) = self.entries[i];
             if t == tint {
                 return rgb;
             }
+            i += 1;
         }
         let rgb = star_ink_on_paper(tint, cfg);
         if len < self.entries.len() {
@@ -4796,7 +4798,7 @@ impl PaperInkMemo {
 }
 
 #[inline]
-fn star_ink_on_paper(tint: u32, cfg: &Config) -> u32 {
+const fn star_ink_on_paper(tint: u32, cfg: &Config) -> u32 {
     let (r, g, b) = ((tint >> 16) & 0xff, (tint >> 8) & 0xff, tint & 0xff);
     if r == g && g == b {
         cfg.theme_fg & 0x00FF_FFFF
@@ -4825,18 +4827,42 @@ pub(crate) fn push_twinkle_over_twin(
     if cov == 0 || mass < 0.75 {
         return;
     }
-    static LAY_ALPHA: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
-    let lay_alpha = LAY_ALPHA.get_or_init(|| {
-        std::array::from_fn(|cap_a| {
-            let cap_a = cap_a as u32;
-            if cap_a == 0 {
-                return 0;
+    const LAY_ALPHA: [u32; 256] = {
+        let mut lut = [0u32; 256];
+        let mut c = 1usize;
+        while c < 256 {
+            let cap_a = c as u32;
+            if c == 255 {
+                lut[c] = 255u32 << 24;
+            } else {
+                let a = (c as f32 / 255.0) as f64;
+                let x = 1.0 - a;
+                let x3 = x * x * x;
+                let exp = (STAR_OVER_CENTRE_LAYS / STAR_OVER_LAYS as f32) as f64;
+                let mut y = 1.0 - exp * a;
+                let mut step = 0;
+                while step < 20 {
+                    let y2 = y * y;
+                    let y4 = y2 * y2;
+                    y = (4.0 * y + x3 / y4) / (STAR_OVER_LAYS as f64);
+                    step += 1;
+                }
+                let lay = (1.0 - y as f32) * 255.0;
+                let v = lay.round() as u32;
+                let clamped = if v < 1 {
+                    1
+                } else if v > cap_a {
+                    cap_a
+                } else {
+                    v
+                };
+                lut[c] = clamped << 24;
             }
-            let a = cap_a as f32 / 255.0;
-            let lay = (1.0 - (1.0 - a).powf(STAR_OVER_CENTRE_LAYS / STAR_OVER_LAYS as f32)) * 255.0;
-            (lay.round() as u32).clamp(1, cap_a) << 24
-        })
-    });
+            c += 1;
+        }
+        lut
+    };
+    let lay_alpha = &LAY_ALPHA;
     let lay_of = |cap_a: u32| -> u32 { (rgb & 0x00FF_FFFF) | lay_alpha[cap_a as usize] };
     let core_cap = u32::from(cov).clamp(1, InkRole::Leading.alpha_cap() as u32);
     let arm_cap = u32::from(cov).clamp(1, InkRole::OverText.alpha_cap() as u32);
@@ -4916,17 +4942,29 @@ pub(crate) fn push_twinkle_over_twin(
 }
 
 #[inline]
-fn stacked_ink_alpha(cov: u8, role: InkRole) -> u32 {
-    static CENTRE_ALPHA: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
-    let table = CENTRE_ALPHA.get_or_init(|| {
-        std::array::from_fn(|b| {
+const fn stacked_ink_alpha(cov: u8, role: InkRole) -> u32 {
+    const CENTRE_ALPHA: [f32; 256] = {
+        let lays = STAR_OVER_CENTRE_LAYS as usize;
+        let mut lut = [0.0f32; 256];
+        let mut b = 0usize;
+        while b < 256 {
             let a = b as f32 / 255.0;
-            (1.0 - (1.0 - a).powf(STAR_OVER_CENTRE_LAYS)) * 255.0
-        })
-    });
+            let rem = 1.0 - a;
+            let mut p = 1.0f32;
+            let mut k = 0;
+            while k < lays {
+                p *= rem;
+                k += 1;
+            }
+            lut[b] = (1.0 - p) * 255.0;
+            b += 1;
+        }
+        lut
+    };
     let cap_b = role.alpha_cap() as u8;
-    let ceiling = table[usize::from(cap_b)];
-    table[usize::from(cov.min(cap_b))].clamp(1.0, ceiling) as u32
+    let ceiling = CENTRE_ALPHA[cap_b as usize];
+    let idx = if cov < cap_b { cov } else { cap_b } as usize;
+    CENTRE_ALPHA[idx].clamp(1.0, ceiling) as u32
 }
 
 #[cfg(test)]

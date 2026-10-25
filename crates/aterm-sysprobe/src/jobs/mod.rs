@@ -474,6 +474,8 @@ pub struct ProcFacts {
     pub sid: Option<u32>,
     /// When it started, compared for equality only: µs since the epoch on macOS, clock ticks since boot on Linux; `None` where unread.
     pub start: Option<u64>,
+    /// How long it had run when this reading took it, ms: the wall clock less its start on macOS, the boot clock (`/proc/uptime`) less its start on Linux; `None` where unread.
+    pub age_ms: Option<u64>,
     /// Its user; `None` where unread.
     pub uid: Option<u32>,
     /// Its short name (`p_comm`, `comm`).
@@ -615,6 +617,17 @@ pub fn read_start_in(
 #[must_use]
 pub fn at_start(pid: u32) -> Option<AtStart> {
     read_start(pid, now_us()).map(|f| judge_start(&f))
+}
+
+/// How long a process whose start reads `start` had run, ms: at `now_us` (µs since the epoch, the
+/// macOS start's clock), or on Linux at `boot_ms` (the boot clock its start counts `hz` ticks a
+/// second on).
+fn age_ms(start: u64, now_us: u64, boot_ms: Option<u64>, hz: u64) -> Option<u64> {
+    if cfg!(target_os = "macos") {
+        Some(now_us.saturating_sub(start) / 1000)
+    } else {
+        boot_ms.map(|b| b.saturating_sub(start.saturating_mul(1000) / hz.max(1)))
+    }
 }
 
 /// The wall clock in µs since the epoch, as the kernel counts a process's start; 0 before the epoch.
@@ -770,11 +783,17 @@ impl JobsReader {
         let mounts = std::cell::OnceCell::new();
         let mut out = Vec::with_capacity(reqs.len());
         let mut execd = HashMap::new();
+        let boot_ms = (!cfg!(target_os = "macos"))
+            .then(|| std::fs::read_to_string(self.root.join("uptime")).ok())
+            .flatten()
+            .and_then(|t| crate::linux::parse_uptime_ns(&t))
+            .map(|ns| ns / 1_000_000);
         for r in reqs {
             let Some((mut facts, start, runs_its_exec)) = self.read_raw(r.pid, r.fds, lanes, now)
             else {
                 continue;
             };
+            facts.age_ms = facts.start.and_then(|s| age_ms(s, now, boot_ms, self.hz));
             if runs_its_exec {
                 execd.insert(facts_key(r.pid, facts.start), facts.name.clone());
             }

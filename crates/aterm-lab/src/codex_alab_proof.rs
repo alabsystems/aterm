@@ -125,7 +125,73 @@ enum Folder {
 
 const NOTES: &str = "notes.txt";
 
-fn needs_raised(meta: &str) -> bool {
+/// How a leg [`legs`] and `autopilot-captures` both open starts: its prompt, its folder and the
+/// Autopilot its tab is set to before codex starts (`None`: the default, Cruise).
+#[derive(Clone, Copy)]
+struct Opening {
+    prompt: &'static str,
+    folder: Folder,
+    autopilot: Option<&'static str>,
+}
+
+/// The legs whose scenes `autopilot-captures` shows ([`Proof::open_leg`]): `land` (landing, then
+/// its nudges), `reland` (a clean defense: landed), `off` (Autopilot Off on its first turn),
+/// `needs` (a `NEEDS YOU:` need) and `continue` (Cruise). The model answers each by its name
+/// ([`model::answer`]).
+const OPENINGS: [(&str, Opening); 5] = [
+    (
+        "land",
+        Opening {
+            prompt: "Land the work.",
+            folder: Folder::Plain,
+            autopilot: Some("land"),
+        },
+    ),
+    (
+        "reland",
+        Opening {
+            prompt: "Land the work.",
+            folder: Folder::Plain,
+            autopilot: Some("land"),
+        },
+    ),
+    (
+        "off",
+        Opening {
+            prompt: "Write a plan, then stop.",
+            folder: Folder::Scratch,
+            autopilot: None,
+        },
+    ),
+    (
+        "needs",
+        Opening {
+            prompt: "Build the release.",
+            folder: Folder::Scratch,
+            autopilot: None,
+        },
+    ),
+    (
+        "continue",
+        Opening {
+            prompt: "Write a plan, then stop.",
+            folder: Folder::Scratch,
+            autopilot: None,
+        },
+    ),
+];
+
+/// Why the proof's rig is not ready for its legs ([`Proof::ready_rig`]).
+enum Unready {
+    /// The package was not linked: why.
+    Unlinked(String),
+    /// The instance did not answer its socket.
+    NoSocket(Fail),
+    /// Interrupted while the bus was awaited.
+    Stopped(Stopped),
+}
+
+pub(crate) fn needs_raised(meta: &str) -> bool {
     field(meta, "attention_kinds")
         .map(|k| pct_decode(&k))
         .is_some_and(|k| k.split(',').any(|e| e == "ask:needs"))
@@ -146,7 +212,7 @@ fn acted_in_log(log: &str, act: &str, holder: &str) -> bool {
         })
 }
 
-fn task_face(status: &str) -> String {
+pub(crate) fn task_face(status: &str) -> String {
     field(status, "task").unwrap_or_else(|| "-".to_string())
 }
 
@@ -626,7 +692,7 @@ impl Typed {
     }
 }
 
-struct Proof {
+pub(crate) struct Proof {
     inst: Instance,
     /// The scratch root and HOME.
     s: PathBuf,
@@ -639,6 +705,8 @@ struct Proof {
     fails: Vec<String>,
     /// The bus the Autopilot Off step's mail rides.
     fabric: Fabric,
+    /// The scratch world (kept), said when the rig is dropped.
+    _world: World,
 }
 
 fn sleep(d: Duration) -> Result<(), Stopped> {
@@ -656,18 +724,18 @@ impl Proof {
         held
     }
 
-    fn on(&self, sid: &str, args: &[&str]) -> instance::Reply {
+    pub(crate) fn on(&self, sid: &str, args: &[&str]) -> instance::Reply {
         let at = format!("@{sid}");
         let mut v = vec![at.as_str()];
         v.extend_from_slice(args);
         self.inst.ctl(&v)
     }
 
-    fn status(&self, sid: &str) -> String {
+    pub(crate) fn status(&self, sid: &str) -> String {
         self.on(sid, &["status"]).first()
     }
 
-    fn proven_pid(&self, sid: &str) -> Option<i32> {
+    pub(crate) fn proven_pid(&self, sid: &str) -> Option<i32> {
         let st = self.status(sid);
         if field(&st, "supervisor_proven").as_deref() != Some("1") {
             return None;
@@ -678,7 +746,7 @@ impl Proof {
             .ok()
     }
 
-    fn acts(&self, sid: &str) -> Vec<String> {
+    pub(crate) fn acts(&self, sid: &str) -> Vec<String> {
         self.on(sid, &["timeline"])
             .stdout
             .lines()
@@ -808,6 +876,102 @@ impl Proof {
         autopilot: Option<&str>,
     ) -> Result<Leg, Fail> {
         self.start_leg(name, Some(prompt), extra, folder, autopilot)
+    }
+
+    /// The leg `name` of [`OPENINGS`], opened as it says.
+    fn open_leg(&mut self, name: &'static str) -> Result<Leg, Fail> {
+        let Some((_, o)) = OPENINGS.iter().find(|(n, _)| *n == name) else {
+            return Err(Fail::die(format!("codex-alab-proof: no leg named {name}")));
+        };
+        self.spawn_leg(name, o.prompt, "", o.folder, o.autopilot)
+    }
+
+    /// `autopilot-captures`' codex-alab rig: the proof's own ([`start`]) on `aterm` (else the
+    /// lab's), its instance's grid `args` and the `theme` it is launched in, made ready as the
+    /// proof's legs are ([`Proof::ready_rig`]). A missing package, or a bus that never came up,
+    /// is a NOT RUN (exit 3).
+    /// # Errors
+    /// No aterm or package, or the rig did not come up.
+    pub(crate) fn captures_rig(
+        aterm: Option<String>,
+        args: Vec<String>,
+        theme: &str,
+    ) -> Result<Proof, Fail> {
+        let not_run = |why: String| Fail::exit(3, format!("NOT RUN: {why}"));
+        let aterm = instance::resolve_aterm(aterm).map_err(not_run)?;
+        let home = crate::paths::paths().need_store_home().map_err(not_run)?;
+        let pkg = package(None, home).map_err(not_run)?;
+        let top = format!("theme = {theme:?}\n");
+        let mut proof = start(aterm, (&pkg, None), false, (args, &top))?;
+        let pkg_a = proof.s.join("pkg-a");
+        let ready = proof.ready_rig(&pkg_a);
+        let fail = match ready {
+            Ok((true, _)) => return Ok(proof),
+            Ok((false, _)) => Fail::exit(3, "NOT RUN: the lab's bus did not connect within 120 s"),
+            Err(Unready::Unlinked(why)) => {
+                Fail::die(format!("codex-alab: the package is not linked: {why}"))
+            }
+            Err(Unready::NoSocket(f)) => f,
+            Err(Unready::Stopped(stopped)) => stopped.into(),
+        };
+        proof.end_all();
+        Err(fail)
+    }
+
+    /// The rig made ready for its legs: `pkg` linked as the owner links it (the front door lays
+    /// agents/codex and the stable exec path before any tab), the socket answering and `ready`
+    /// said, then the lab's bus awaited, since codex-alab reads its tab's Autopilot and reports
+    /// its needs over it and a leg opened before the bridge connects runs as Cruise and raises
+    /// nothing. Whether the bus came up, and when the socket answered.
+    /// # Errors
+    /// Why it is not ready ([`Unready`]).
+    fn ready_rig(&mut self, pkg: &Path) -> Result<(bool, Instant), Unready> {
+        self.link(pkg).map_err(Unready::Unlinked)?;
+        self.inst
+            .await_socket(instance::BOOT)
+            .map_err(Unready::NoSocket)?;
+        let _ = self.inst.ctl(&["ready"]);
+        let answered = Instant::now();
+        let bus = self.bus_up().map_err(Unready::Stopped)?;
+        Ok((bus, answered))
+    }
+
+    /// The leg `name` of [`OPENINGS`] opened in a tab of its own: its session id.
+    /// # Errors
+    /// Its folder or tab could not be made, or its launch line was not typed.
+    pub(crate) fn open_scene(&mut self, name: &'static str) -> Result<String, Fail> {
+        self.open_leg(name).map(|leg| leg.sid)
+    }
+
+    /// `ctl <args>` on the rig's instance.
+    pub(crate) fn rig_ctl(&self, args: &[&str]) -> instance::Reply {
+        self.inst.ctl(args)
+    }
+
+    /// The directory `ctl image <name>` writes into.
+    pub(crate) fn images_dir(&self) -> PathBuf {
+        self.inst
+            .sock
+            .parent()
+            .map_or_else(PathBuf::new, |d| d.join("images"))
+    }
+
+    /// The package's version (`alab-build.json`'s), for the captures' headers.
+    pub(crate) fn package_version(&self) -> String {
+        std::fs::read_to_string(
+            self.s
+                .join("pkg-a")
+                .join(aterm_agent::harness::codex_alab::ALAB_BUILD_JSON),
+        )
+        .ok()
+        .and_then(|t| J::parse(&t).ok())
+        .and_then(|b| b.get("version").and_then(J::as_str).map(str::to_string))
+        .unwrap_or_else(|| "?".to_string())
+    }
+
+    /// Every process the rig started ended, by pid, and the instance stopped.
+    pub(crate) fn finish(mut self) {
+        self.end_all();
     }
 
     fn start_leg(
@@ -1292,6 +1456,96 @@ impl Proof {
         self.check(
             "approval: the approved command ran (ran.txt) and its output went back to the model",
             ran.contains("approved-run") && ran_back,
+        );
+        Ok(())
+    }
+
+    /// A box nobody answers is a need: the approval leg's box under Autopilot Off, where
+    /// codex-alab holds no claim and presses nothing, so codex's own OSC 7501 `blocked` report
+    /// raises the tab's need, said as codex's report (`needs_by=program`), beside an `agent=`
+    /// that stays aterm's own reading; once the box is answered the need goes with it.
+    fn box_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
+        let name = leg.name;
+        let minute = Duration::from_secs(60);
+        let read = |line: &str, k: &str| field(line, k).unwrap_or_else(|| "-".to_string());
+        let said = |s: &Option<J>, k: &str| {
+            s.as_ref()
+                .and_then(|s| s.get(k).and_then(J::as_str).map(str::to_string))
+                .unwrap_or_else(|| "-".to_string())
+        };
+        let asked = self.await_tag(leg, "call", minute)?;
+        let mut status = String::new();
+        let boxed = Self::wait_for(minute, Duration::from_millis(250), || {
+            status = self.status(&leg.sid);
+            field(&status, "agent").as_deref() == Some("unknown")
+                && field(&status, "program_state").is_some_and(|s| s.starts_with("blocked:"))
+                && field(&status, "needs").as_deref() == Some("approval")
+                && field(&status, "supervisor_proven").as_deref() != Some("1")
+        })?;
+        self.check(
+            &format!(
+                "{name}: under Autopilot Off nobody answers codex's approval box (the model asked \
+                 for the escalated exec: {asked}), and codex's own report is the tab's need: \
+                 status needs=approval beside aterm's own agent=unknown, no proven claim speaking \
+                 for it (agent={} program_state={} needs={} supervisor={} supervisor_proven={})",
+                read(&status, "agent"),
+                read(&status, "program_state"),
+                read(&status, "needs"),
+                read(&status, "supervisor"),
+                read(&status, "supervisor_proven"),
+            ),
+            asked && boxed,
+        );
+        let (mut row, mut line) = (None, String::new());
+        let surveyed = Self::wait_for(minute, Duration::from_millis(500), || {
+            row = self.survey_of(&leg.sid);
+            line = self
+                .inst
+                .ctl(&["survey", "--sid", &leg.sid])
+                .stdout
+                .lines()
+                .find(|l| l.starts_with(leg.sid.as_str()))
+                .unwrap_or_default()
+                .to_string();
+            said(&row, "needs") == "approval"
+                && said(&row, "needs_by") == "program"
+                && line.contains("(its own report)")
+        })?;
+        self.check(
+            &format!(
+                "{name}: its survey record says the need is codex's own report (needs={} \
+                 needs_by={} agent={}; `aterm ctl survey --sid` reads {line:?})",
+                said(&row, "needs"),
+                said(&row, "needs_by"),
+                said(&row, "agent"),
+            ),
+            surveyed,
+        );
+        let sent = self.on(&leg.sid, &["send", "y"]);
+        let (mut after, mut row) = (String::new(), None);
+        let cleared = Self::wait_for(minute, Duration::from_millis(250), || {
+            after = self.status(&leg.sid);
+            row = self.survey_of(&leg.sid);
+            !field(&after, "program_state").is_some_and(|s| s.starts_with("blocked"))
+                && field(&after, "needs").as_deref() == Some("-")
+                && said(&row, "needs") == "-"
+                && said(&row, "needs_by") == "-"
+        })?;
+        let ran = std::fs::read_to_string(leg.proj.join("ran.txt")).unwrap_or_default();
+        self.check(
+            &format!(
+                "{name}: answered (`send y`, codex's Yes, proceed: {}), the box and the need it \
+                 raised go together: status needs=- and survey needs=- needs_by=- (the need \
+                 rose: {boxed}; program_state={} needs={}; survey needs={} needs_by={}; the \
+                 command ran: {})",
+                sent.first(),
+                read(&after, "program_state"),
+                read(&after, "needs"),
+                said(&row, "needs"),
+                said(&row, "needs_by"),
+                ran.contains("approved-run"),
+            ),
+            boxed && sent.code == 0 && cleared,
         );
         Ok(())
     }
@@ -2947,11 +3201,64 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     } else if upgrade_only || raw_upgrade_only {
         println!("upgrade target: the same package bytes at another private path");
     }
-    let mut world = World::new(
-        "agents_auto_prime = false\n[update]\nenabled = false\nauto_apply = false\n\
+    let mut proof = start(
+        aterm,
+        (&pkg, upgrade_pkg.as_deref()),
+        keep,
+        (
+            ["--columns", "120", "--lines", "40"]
+                .map(str::to_string)
+                .to_vec(),
+            "",
+        ),
+    )?;
+    let (pkg_a, pkg_b) = (proof.s.join("pkg-a"), proof.s.join("pkg-b"));
+    let outcome = if raw_upgrade_only {
+        upgrade_proof::raw_legs(&mut proof, &pkg_a, &pkg_b)
+    } else if upgrade_only {
+        upgrade_proof::legs(&mut proof, &pkg_a, &pkg_b)
+    } else if policy_only {
+        policy_proof::legs(&mut proof, &pkg_a)
+    } else {
+        legs(&mut proof, &pkg_a, &pkg_b)
+    };
+    proof.end_all();
+    if let Err(f) = outcome
+        && (f.stopped.is_some() || proof.fails.is_empty())
+    {
+        return Err(f);
+    }
+    if proof.fails.is_empty() {
+        println!("PASS");
+        Ok(0)
+    } else {
+        println!("FAIL: {} check(s)", proof.fails.len());
+        for f in &proof.fails {
+            println!("  - {f}");
+        }
+        Ok(1)
+    }
+}
+
+/// The proof's rig: its scratch world (always kept), the fake model on one loopback port, the
+/// lab's bus, the package (`pkg`, and `upgrade` for the handoff, else `pkg` again) copied in as
+/// `pkg-a` and `pkg-b`, and a headless sandboxed aterm started with `args` (its grid) and `top`
+/// at the head of its `aterm.toml` (`autopilot-captures`' theme; the proof's own is empty). No
+/// package is linked and no leg runs: [`legs`] does that, and so does `autopilot-captures`
+/// ([`Proof::captures_rig`]).
+/// # Errors
+/// The world, the bus, a copy or the instance could not be made.
+fn start(
+    aterm: PathBuf,
+    (pkg, upgrade): (&Path, Option<&Path>),
+    keep: bool,
+    (args, top): (Vec<String>, &str),
+) -> Result<Proof, Fail> {
+    let mut world = World::new(&format!(
+        "{top}agents_auto_prime = false\n[update]\nenabled = false\nauto_apply = false\n\
          [packages]\nenabled = false\n[machine]\nuniversal_control = \"leave\"\n\
          [harness]\nenabled = true\nheadless = true\nhuman_grace_s = 5\n",
-    )?;
+    ))?;
     if keep {
         world.keep();
     }
@@ -2994,8 +3301,8 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         .map_err(|e| format!("codex-alab-proof: {e}"))?;
     let (pkg_a, pkg_b) = (s.join("pkg-a"), s.join("pkg-b"));
     for (from, to) in [
-        (&pkg, &pkg_a),
-        (upgrade_pkg.as_ref().unwrap_or(&pkg), &pkg_b),
+        (pkg, pkg_a.as_path()),
+        (upgrade.unwrap_or(pkg), pkg_b.as_path()),
     ] {
         let cloned = aterm_uds::spawnfd::command("/bin/cp")
             .arg("-cR")
@@ -3040,16 +3347,14 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         Launch {
             aterm,
             headless: true,
-            args: ["--columns", "120", "--lines", "40"]
-                .map(str::to_string)
-                .to_vec(),
+            args,
             env,
             cwd: s.clone(),
             sandbox: Some(sandbox),
             reroute: false,
         },
     )?;
-    let mut proof = Proof {
+    Ok(Proof {
         inst,
         s,
         h,
@@ -3059,47 +3364,23 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         port,
         fails: Vec::new(),
         fabric,
-    };
-    let outcome = if raw_upgrade_only {
-        upgrade_proof::raw_legs(&mut proof, &pkg_a, &pkg_b)
-    } else if upgrade_only {
-        upgrade_proof::legs(&mut proof, &pkg_a, &pkg_b)
-    } else if policy_only {
-        policy_proof::legs(&mut proof, &pkg_a)
-    } else {
-        legs(&mut proof, &pkg_a, &pkg_b)
-    };
-    proof.end_all();
-    if let Err(f) = outcome
-        && (f.stopped.is_some() || proof.fails.is_empty())
-    {
-        return Err(f);
-    }
-    if proof.fails.is_empty() {
-        println!("PASS");
-        Ok(0)
-    } else {
-        println!("FAIL: {} check(s)", proof.fails.len());
-        for f in &proof.fails {
-            println!("  - {f}");
-        }
-        Ok(1)
-    }
+        _world: world,
+    })
 }
 
 fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
-    // The front door lays agents/codex and the stable exec path before any tab: linked as the owner links it.
-    if let Err(why) = proof.link(pkg) {
-        proof.check(&format!("the package is linked ({why})"), false);
-        return Ok(());
-    }
-    if let Err(f) = proof.inst.await_socket(instance::BOOT) {
-        proof.check("the headless aterm answers its socket", false);
-        return Err(f);
-    }
-    let _ = proof.inst.ctl(&["ready"]);
-    let began = Instant::now();
-    let bus = proof.bus_up()?;
+    let (bus, began) = match proof.ready_rig(pkg) {
+        Ok(ready) => ready,
+        Err(Unready::Unlinked(why)) => {
+            proof.check(&format!("the package is linked ({why})"), false);
+            return Ok(());
+        }
+        Err(Unready::NoSocket(f)) => {
+            proof.check("the headless aterm answers its socket", false);
+            return Err(f);
+        }
+        Err(Unready::Stopped(stopped)) => return Err(stopped.into()),
+    };
     let manager = {
         let spawned = proof
             .inst
@@ -3121,8 +3402,8 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
         "legs (one instance, each a tab; the model answers by the leg its prompt names and the act aterm's words name)"
     );
     let first = proof.spawn_leg("first", "Say hello and finish.", "", Folder::Scratch, None)?;
-    let land = proof.spawn_leg("land", "Land the work.", "", Folder::Plain, Some("land"))?;
-    let reland = proof.spawn_leg("reland", "Land the work.", "", Folder::Plain, Some("land"))?;
+    let land = proof.open_leg("land")?;
+    let reland = proof.open_leg("reland")?;
     let repo = proof.spawn_leg(
         "repo",
         "Write the release notes.",
@@ -3143,16 +3424,12 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
         &format!("hold: put on while its first turn runs ({})", on.first()),
         on.first().contains("hold=1"),
     );
-    let off = proof.spawn_leg("off", "Write a plan, then stop.", "", Folder::Scratch, None)?;
-    let needs = proof.spawn_leg("needs", "Build the release.", "", Folder::Scratch, None)?;
-    let cont = proof.spawn_leg(
-        "continue",
-        "Write a plan, then stop.",
-        "",
-        Folder::Scratch,
-        None,
-    )?;
+    let off = proof.open_leg("off")?;
+    let needs = proof.open_leg("needs")?;
+    let cont = proof.open_leg("continue")?;
     let approval = proof.spawn_leg("approval", "Run the build.", "", Folder::Scratch, None)?;
+    // The approval leg's box under Autopilot Off from the start: no claim, nobody presses.
+    let unanswered = proof.spawn_leg("box", "Run the build.", "", Folder::Scratch, Some("off"))?;
     let question = proof.spawn_leg(
         "question",
         "Set up the database.",
@@ -3230,6 +3507,9 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     proof.approval_leg(&approval)?;
     timed(proof, "approval", t);
     let t = Instant::now();
+    proof.box_leg(&unanswered)?;
+    timed(proof, "box (Autopilot Off)", t);
+    let t = Instant::now();
     proof.question_leg(&question)?;
     timed(proof, "question", t);
     let t = Instant::now();
@@ -3292,6 +3572,7 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     timed(proof, "landed (past the upgrade)", t);
     if !proof.fails.is_empty() {
         proof.diagnose(&all);
+        proof.diagnose(&[&unanswered]);
     }
     Ok(())
 }

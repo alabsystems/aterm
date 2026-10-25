@@ -1710,14 +1710,52 @@ impl PetWorld {
     /// The nearest REST SEAT.
     #[must_use]
     /// Nearest clean-ground rest seat to `near` within `max_distance`.
-    pub fn nearest_clear_perch(
+    pub const fn nearest_clear_perch(
         &self,
         near: PetRect,
         margin: f32,
         max_distance: f32,
         from: Option<PetRect>,
     ) -> Option<PetRect> {
-        self.stamp?;
+        const fn fill(extent: f32, margin: f32) -> Option<(usize, f32)> {
+            let cells = (extent + 2.0 * margin + 2.0 * PERCH_SLACK).ceil();
+            if cells.is_finite() && cells >= 1.0 {
+                Some((
+                    cells as usize,
+                    margin + (cells - extent - 2.0 * margin) * 0.5,
+                ))
+            } else {
+                None
+            }
+        }
+        const fn cell_range_blocked(r0_row: &[u16], r1_row: &[u16], c0: usize, c1: usize) -> bool {
+            (r1_row[c1] + r0_row[c0] - r1_row[c0] - r0_row[c1]) > 0
+        }
+        const fn band_hull_span(
+            hull: &[(u16, u16)],
+            r0: usize,
+            r1: usize,
+            c0: u16,
+            c1: u16,
+        ) -> Option<(u16, u16)> {
+            let mut met: Option<(u16, u16)> = None;
+            let mut r = r0;
+            while r < r1 {
+                let (lo, hi) = hull[r];
+                if lo < hi && c0 < hi && c1 > lo {
+                    met = Some(match met {
+                        Some((a, b)) => (if a < lo { a } else { lo }, if b > hi { b } else { hi }),
+                        None => (lo, hi),
+                    });
+                }
+                r += 1;
+            }
+            met
+        }
+
+        let Some(_) = self.stamp else {
+            return None;
+        };
         if !near.valid()
             || !margin.is_finite()
             || margin < 0.0
@@ -1726,44 +1764,61 @@ impl PetWorld {
         {
             return None;
         }
-        let fill = |extent: f32| -> Option<(usize, f32)> {
-            let cells = (extent + 2.0 * margin + 2.0 * PERCH_SLACK).ceil();
-            (cells.is_finite() && cells >= 1.0).then_some((
-                cells as usize,
-                margin + (cells - extent - 2.0 * margin) * 0.5,
-            ))
+        let Some((span_r, inset_r)) = fill(near.rows, margin) else {
+            return None;
         };
-        let (span_r, inset_r) = fill(near.rows)?;
-        let (span_c, inset_c) = fill(near.cols)?;
+        let Some((span_c, inset_c)) = fill(near.cols, margin) else {
+            return None;
+        };
         let cov = self.coverage;
         if span_r > cov.rows || span_c > cov.cols {
             return None;
         }
-        let from = from.and_then(|from| match self.window(from, 0.0) {
-            Window::Cells(r0, c0, r1, c1) => Some(((r0, c0, r1, c1), from.row + from.rows)),
-            Window::Degenerate | Window::Outside => None,
-        });
+        let from = match from {
+            Some(from) => match self.window(from, 0.0) {
+                Window::Cells(r0, c0, r1, c1) => Some(((r0, c0, r1, c1), from.row + from.rows)),
+                Window::Degenerate | Window::Outside => None,
+            },
+            None => None,
+        };
+        const fn clamp_i64(v: i64, lo: i64, hi: i64) -> i64 {
+            if v < lo {
+                lo
+            } else if v > hi {
+                hi
+            } else {
+                v
+            }
+        }
         let last_band = (cov.rows - span_r) as i64;
         let last_col = (cov.cols - span_c) as i64;
         let cov_row_f = cov.row as f32;
         let cov_col_f = cov.col as f32;
         let span_c_i64 = span_c as i64;
         let span_c_u16 = span_c as u16;
-        let home_band = ((near.row - inset_r - cov_row_f).round() as i64).clamp(0, last_band);
+        let home_band = clamp_i64(
+            (near.row - inset_r - cov_row_f).round() as i64,
+            0,
+            last_band,
+        );
         let home_x = near.col - inset_c - cov_col_f;
-        let home_col = (home_x.round() as i64).clamp(0, last_col);
-        let top = |band: i64| cov_row_f + band as f32 + inset_r;
-        let left = |col: i64| cov_col_f + col as f32 + inset_c;
+        let home_col = clamp_i64(home_x.round() as i64, 0, last_col);
         let prefix = self.ground_prefixes().0;
+        let hull_slice = self.hull.as_slice();
         let mut best = None;
         let mut best_distance = f32::INFINITY;
-        for step in 0..=last_band {
+        let mut step = 0i64;
+        while step <= last_band {
             let mut live_band = false;
-            for band in [home_band + step, home_band - step] {
-                if !(0..=last_band).contains(&band) || (step == 0 && band != home_band) {
+            let bands = [home_band + step, home_band - step];
+            let mut bi = 0;
+            while bi < 2 {
+                let band = bands[bi];
+                bi += 1;
+                if band < 0 || band > last_band || (step == 0 && band != home_band) {
                     continue;
                 }
-                let band_top = top(band);
+                let band_top = cov_row_f + band as f32 + inset_r;
                 let row_distance = (band_top - near.row).abs() * 2.0;
                 let reach = max_distance.min(best_distance);
                 if row_distance > max_distance || row_distance >= best_distance {
@@ -1784,90 +1839,109 @@ impl PetWorld {
                 if reach_hi < reach_lo + span_c {
                     continue;
                 }
-                let span = (reach * reach - row_distance * row_distance)
-                    .max(0.0)
-                    .sqrt();
-                let lo = ((home_x - span).ceil() as i64).max(reach_lo as i64);
-                let hi = ((home_x + span).floor() as i64)
-                    .min(last_col)
-                    .min((reach_hi - span_c) as i64);
+                let span = crate::color_math::sqrt_f32(
+                    (reach * reach - row_distance * row_distance).max(0.0),
+                );
+                let lo_raw = (home_x - span).ceil() as i64;
+                let reach_lo_i64 = reach_lo as i64;
+                let lo = if lo_raw > reach_lo_i64 {
+                    lo_raw
+                } else {
+                    reach_lo_i64
+                };
+                let hi_raw = (home_x + span).floor() as i64;
+                let hi1 = if hi_raw < last_col { hi_raw } else { last_col };
+                let reach_hi_col = (reach_hi - span_c) as i64;
+                let hi = if hi1 < reach_hi_col {
+                    hi1
+                } else {
+                    reach_hi_col
+                };
                 if lo > hi {
                     continue;
                 }
                 let (c_lo, c_hi) = (lo as usize, hi as usize + span_c);
                 let width = (c_hi - c_lo) as u16;
-                if (r0..r1).any(|r| width - self.blocked(prefix, r, c_lo, r + 1, c_hi) < span_c_u16)
-                {
+                let mut any_row_short = false;
+                let mut rr = r0;
+                while rr < r1 {
+                    if width - self.blocked(prefix, rr, c_lo, rr + 1, c_hi) < span_c_u16 {
+                        any_row_short = true;
+                        break;
+                    }
+                    rr += 1;
+                }
+                if any_row_short {
                     continue;
                 }
-                let r0_row = &prefix[r0 * (MAX_WORLD_COLS + 1)..];
-                let r1_row = &prefix[r1 * (MAX_WORLD_COLS + 1)..];
-                let band_hulls = &self.hull[r0..r1];
-                let seat_blocked = |c: i64| {
-                    let c0 = c as usize;
-                    let c1 = c0 + span_c;
-                    (r1_row[c1] + r0_row[c0] - r1_row[c0] - r0_row[c1]) > 0
-                };
-                let column_blocked = |c: i64| {
-                    let c0 = c as usize;
-                    let c1 = c0 + 1;
-                    (r1_row[c1] + r0_row[c0] - r1_row[c0] - r0_row[c1]) > 0
-                };
-                let hulls = |c: i64| {
-                    let (c0, c1) = (c as u16, (c as usize + span_c) as u16);
-                    band_hulls
-                        .iter()
-                        .filter(|&&(lo, hi)| lo < hi && c0 < hi && c1 > lo)
-                        .fold(None, |met: Option<(u16, u16)>, &(lo, hi)| {
-                            Some(met.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))))
-                        })
-                };
+                let (_, r0_row) = prefix.split_at(r0 * (MAX_WORLD_COLS + 1));
+                let (_, r1_row) = prefix.split_at(r1 * (MAX_WORLD_COLS + 1));
                 let mut right = None;
-                let mut c = home_col.max(lo);
+                let mut c = if home_col > lo { home_col } else { lo };
                 while c <= hi {
-                    if seat_blocked(c) {
+                    let c0 = c as usize;
+                    if cell_range_blocked(r0_row, r1_row, c0, c0 + span_c) {
                         let mut x = c + span_c_i64 - 1;
-                        while x > c && !column_blocked(x) {
+                        while x > c
+                            && !cell_range_blocked(r0_row, r1_row, x as usize, x as usize + 1)
+                        {
                             x -= 1;
                         }
                         c = x + 1;
-                    } else if let Some((_, end)) = hulls(c) {
-                        c = i64::from(end);
+                    } else if let Some((_, end)) =
+                        band_hull_span(hull_slice, r0, r1, c as u16, (c0 + span_c) as u16)
+                    {
+                        c = end as i64;
                     } else {
                         right = Some(c);
                         break;
                     }
                 }
-                let r_dx = right.map_or(f32::INFINITY, |r_col| (left(r_col) - near.col).abs());
+                let r_dx = match right {
+                    Some(r_col) => (cov_col_f + r_col as f32 + inset_c - near.col).abs(),
+                    None => f32::INFINITY,
+                };
                 let mut leftward = None;
-                let mut c = (home_col - 1).min(hi);
-                while c >= lo && near.col - left(c) < r_dx {
-                    if seat_blocked(c) {
+                let mut c = if home_col - 1 < hi { home_col - 1 } else { hi };
+                while c >= lo && near.col - (cov_col_f + c as f32 + inset_c) < r_dx {
+                    let c0 = c as usize;
+                    if cell_range_blocked(r0_row, r1_row, c0, c0 + span_c) {
                         let end = c + span_c_i64 - 1;
                         let mut x = c;
-                        while x < end && !column_blocked(x) {
+                        while x < end
+                            && !cell_range_blocked(r0_row, r1_row, x as usize, x as usize + 1)
+                        {
                             x += 1;
                         }
                         c = x - span_c_i64;
-                    } else if let Some((start, _)) = hulls(c) {
-                        c = i64::from(start) - span_c_i64;
+                    } else if let Some((start, _)) =
+                        band_hull_span(hull_slice, r0, r1, c as u16, (c0 + span_c) as u16)
+                    {
+                        c = start as i64 - span_c_i64;
                     } else {
                         leftward = Some(c);
                         break;
                     }
                 }
-                for col in [right, leftward].into_iter().flatten() {
-                    let col_left = left(col);
-                    let distance = row_distance.hypot((col_left - near.col).abs());
-                    if distance <= max_distance && distance < best_distance {
-                        best = Some(PetRect::new(band_top, col_left, near.rows, near.cols));
-                        best_distance = distance;
+                let candidates = [right, leftward];
+                let mut ci = 0;
+                while ci < 2 {
+                    if let Some(col) = candidates[ci] {
+                        let col_left = cov_col_f + col as f32 + inset_c;
+                        let distance =
+                            crate::color_math::hypot_f32(row_distance, (col_left - near.col).abs());
+                        if distance <= max_distance && distance < best_distance {
+                            best = Some(PetRect::new(band_top, col_left, near.rows, near.cols));
+                            best_distance = distance;
+                        }
                     }
+                    ci += 1;
                 }
             }
             if !live_band && step > 0 {
                 break;
             }
+            step += 1;
         }
         best
     }

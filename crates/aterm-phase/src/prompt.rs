@@ -58,6 +58,8 @@ pub enum PromptKind {
     AutocompactOffer,
     /// Project `.mcp.json` server approval dialog.
     McpServer,
+    /// `Teach auto mode about your environment?` auto-mode setup offer.
+    AutoModeSetup,
     /// Unrecognized dialog box header.
     Other,
 }
@@ -91,6 +93,7 @@ impl PromptKind {
             PromptKind::ModelSwitch => "model-switch",
             PromptKind::AutocompactOffer => "autocompact-offer",
             PromptKind::McpServer => "mcp-server",
+            PromptKind::AutoModeSetup => "auto-mode-setup",
             PromptKind::Other => "other",
         }
     }
@@ -795,6 +798,22 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
         };
         return Some((v1, v2));
     }
+    // Claude Code's auto-mode environment offer: under the composer's footer, or (fullscreen)
+    // right on the composer, where no reader below takes a box. Read whole, or not at all.
+    if let Some(v2) = crate::auto_mode::offer_box(rows) {
+        let v1 = Prompt {
+            kind: v2.kind,
+            command: v2.command.clone(),
+            description: v2.description.clone(),
+            notes: Vec::new(),
+            options: v2
+                .options
+                .iter()
+                .filter_map(|o| Some((o.n?, o.label.clone())))
+                .collect(),
+        };
+        return Some((v1, v2));
+    }
     let rows = &*unwrapped(rows);
     let mut b = find_box(rows)?;
     let (title_end, title) = if b.head_off_screen || b.question.is_some() {
@@ -1492,7 +1511,9 @@ fn reads_as_prose(row: &str) -> bool {
 
 /// Returns the inclusive `(first_row, last_row)` span of the approval box on `rows`.
 pub fn prompt_box_span(rows: &[String]) -> Option<(usize, usize)> {
-    if let Some(offer) = crate::autocompact::offer_box(rows) {
+    if let Some(offer) =
+        crate::autocompact::offer_box(rows).or_else(|| crate::auto_mode::offer_box(rows))
+    {
         return Some(offer.span);
     }
     find_box(&unwrapped(rows)).map(|b| (b.title, b.last))
@@ -1508,7 +1529,9 @@ pub fn title_row<'a>(p: &PromptV2, rows: &'a [String]) -> Option<&'a str> {
 
 /// Returns the first screen row belonging to the approval box on `rows`.
 pub fn prompt_box_first_row(rows: &[String]) -> Option<usize> {
-    if let Some(offer) = crate::autocompact::offer_box(rows) {
+    if let Some(offer) =
+        crate::autocompact::offer_box(rows).or_else(|| crate::auto_mode::offer_box(rows))
+    {
         return Some(offer.span.0);
     }
     find_box(&unwrapped(rows)).map(|b| b.title)
@@ -3951,6 +3974,21 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.282-setup-remote-control.txt");
     pub const SESSION_PAUSED: &str = include_str!("fixtures/claude-2.1.282-session-paused.txt");
     pub const MCP_SERVER_ONE: &str = include_str!("fixtures/claude-2.1.301-mcp-server-one.txt");
+    pub const AUTO_MODE_SETUP: &str = include_str!("fixtures/claude-2.1.310-auto-mode-setup.txt");
+    pub const AUTO_MODE_SETUP_60COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-60col.txt");
+    pub const AUTO_MODE_SETUP_FULLSCREEN: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen.txt");
+    pub const AUTO_MODE_SETUP_FULLSCREEN_60COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-60col.txt");
+    pub const AUTO_MODE_SETUP_FULLSCREEN_SHELL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-shell.txt");
+    pub const AUTO_MODE_SETUP_FULLSCREEN_SHELL_MODE: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-shell-mode.txt");
+    pub const AUTO_MODE_SETUP_40COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-40col.txt");
+    pub const AUTO_MODE_SETUP_FULLSCREEN_40COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-40col.txt");
     pub const MCP_SERVER_TWO: &str = include_str!("fixtures/claude-2.1.301-mcp-server-two.txt");
     pub const MCP_SERVER_NARROW: [&str; 24] = [
         include_str!("fixtures/claude-2.1.302-mcp-server-one-40col.txt"),

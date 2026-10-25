@@ -164,14 +164,15 @@ impl Word {
     /// `false` (and nothing written) when the character does not fit — which
     /// the caller's character count already rules out.
     #[inline]
-    fn push(&mut self, c: char) -> bool {
-        let start = usize::from(self.len);
+    const fn push(&mut self, c: char) -> bool {
+        let start = self.len as usize;
         let end = start.saturating_add(c.len_utf8());
-        let Some(slot) = self.bytes.get_mut(start..end) else {
+        if end > self.bytes.len() || end > u8::MAX as usize {
             return false;
-        };
-        c.encode_utf8(slot);
-        self.len = u8::try_from(end).unwrap_or(u8::MAX);
+        }
+        let (_, rest) = self.bytes.split_at_mut(start);
+        c.encode_utf8(rest);
+        self.len = end as u8;
         true
     }
 
@@ -617,17 +618,21 @@ impl TrickListener {
 
     /// Drop `session` from the dirty memory; whether it was there.
     #[inline]
-    fn forget(&mut self, session: u64) -> bool {
-        let Some(at) = self.dirty.iter().position(|s| *s == Some(session)) else {
-            return false;
-        };
-        if let Some(rest) = self.dirty.get_mut(at..) {
-            rest.rotate_left(1);
+    const fn forget(&mut self, session: u64) -> bool {
+        let mut at = 0;
+        while at < SESSION_MEMORY {
+            if matches!(self.dirty[at], Some(s) if s == session) {
+                let mut i = at;
+                while i + 1 < SESSION_MEMORY {
+                    self.dirty[i] = self.dirty[i + 1];
+                    i += 1;
+                }
+                self.dirty[SESSION_MEMORY - 1] = None;
+                return true;
+            }
+            at += 1;
         }
-        if let Some(last) = self.dirty.last_mut() {
-            *last = None;
-        }
-        true
+        false
     }
 
     /// One typed character (the shifted glyph; Space arrives here too).

@@ -5,7 +5,7 @@
 
 use std::sync::{Mutex, PoisonError};
 
-use aterm_core::terminal::Terminal;
+use aterm_core::terminal::{ClockReading, Terminal};
 
 use crate::human_input::HumanInputStamp;
 
@@ -81,15 +81,16 @@ pub(crate) struct LaunchWitness {
 }
 
 impl LaunchWitness {
-    /// One slice of the program's output through the engine, as the PTY reader's parse stage feeds it, under the terminal lock the caller holds (`t`): the started-command count, the slice, then the mark ([`Self::at_hold`]) in that same hold.
+    /// One slice of the program's output through the engine at the reader's `clock`, as the PTY reader's parse stage feeds it, under the terminal lock the caller holds (`t`): the started-command count, the slice, then the mark ([`Self::at_hold`]) in that same hold.
     pub(crate) fn process(
         &self,
         t: &mut Terminal,
         bytes: &[u8],
+        clock: ClockReading,
         person: &HumanInputStamp,
     ) -> Option<Unread> {
         let before = t.started_command_seq();
-        t.process(bytes);
+        t.process_at(bytes, clock);
         self.at_hold(t, before, person)
     }
 
@@ -274,7 +275,7 @@ mod tests {
     fn hold(term: &Mutex<Terminal>, bytes: &[u8], person: &HumanInputStamp, w: &LaunchWitness) {
         let unread = {
             let mut t = term.lock().expect("term");
-            w.process(&mut t, bytes, person)
+            w.process(&mut t, bytes, ClockReading::now(), person)
         };
         if let Some(unread) = unread {
             w.read_screen(unread);
@@ -480,7 +481,12 @@ mod tests {
         let (person, w) = (HumanInputStamp::default(), LaunchWitness::default());
         person.note(0, enter());
         let unread = w
-            .process(&mut t, &preexec("codex", &hex), &person)
+            .process(
+                &mut t,
+                &preexec("codex", &hex),
+                ClockReading::now(),
+                &person,
+            )
             .expect("a screen to read");
         assert_eq!(w.read(1).map(|l| l.why), Some(Why::Pending));
         assert_eq!(w.json(1), "{\"why\":\"pending\"}");

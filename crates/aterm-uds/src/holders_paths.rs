@@ -51,6 +51,10 @@ pub fn scan_path_users_of(pids: &[u32], dirs: &[PathBuf], skip: &[u32]) -> io::R
             Ok(Some(found)) if !unexeced_fork(pid, skip) => scan.users.push(found),
             Ok(Some(_)) => {}
             Ok(None) | Err((super::Failed::Exited, _)) => {}
+            // A process of this user's that became a set-user-ID program (`/bin/ps`, `top`)
+            // since the listing is refused (`EPERM`) and outside the scan, as it is once listed
+            // so ([`super::runs_as_another_user`]).
+            Err(_) if super::runs_as_another_user(pid) => {}
             Err((
                 super::Failed::Closed
                 | super::Failed::Dead
@@ -533,6 +537,10 @@ pub fn scan_path_users_of(pids: &[u32], dirs: &[PathBuf], skip: &[u32]) -> io::R
             Ok(Some(found)) if !unexeced_fork(pid, skip) => scan.users.push(found),
             Ok(Some(_)) => {}
             Ok(None) => {}
+            // A process of this user's that became a set-user-ID program (`sudo`, `su`) since
+            // the listing is refused (`EACCES`: the exec made it non-dumpable, its links root's)
+            // and outside the scan, as it is once listed so ([`super::runs_as_another_user`]).
+            Err(()) if super::runs_as_another_user(pid) => {}
             Err(()) => scan
                 .unreadable
                 .push((pid, std::fs::read_link(proc_dir.join("exe")).ok())),
@@ -1533,6 +1541,48 @@ mod writes_tests {
         })
     }
 
+    /// A process of this user's that became a set-user-ID program after the listing (`/bin/ps`
+    /// run from a shell, measured refusing the disk sweep's scan under a `ps` loop) is outside
+    /// the scan, not unread; `top` is one that stays to be read, handed to the scan as the
+    /// listing would have before its exec. Negative control: without the guard it is unread.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_process_that_became_a_set_user_id_program_is_outside_the_path_scan() {
+        // SAFETY: `geteuid` is a side-effect-free getter.
+        let me = unsafe { super::super::ffi::geteuid() };
+        assert_ne!(me, 0, "a scan as root reads every process");
+        let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
+        let dir = tmp.path().canonicalize().expect("canonical scratch dir");
+        let mut top = crate::spawnfd::command("/usr/bin/top")
+            .args(["-l", "0", "-s", "60"])
+            .stdin(crate::spawnfd::Stdio::null())
+            .stdout(crate::spawnfd::Stdio::null())
+            .stderr(crate::spawnfd::Stdio::null())
+            .spawn()
+            .expect("spawn top");
+        let pid = top.id();
+        let started = std::time::Instant::now();
+        while crate::process::read_short_info(i32::try_from(pid).expect("a pid"))
+            .is_none_or(|info| info.pbsi_uid == me)
+        {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "top never ran as its owner"
+            );
+            std::thread::yield_now();
+        }
+        let scan = super::scan_path_users_of(&[pid], std::slice::from_ref(&dir), &[]);
+        let _ = top.kill();
+        let _ = top.wait();
+        let scan = scan.expect("scan");
+        assert_eq!(scan.scanned, 1, "{scan:?}");
+        assert!(
+            scan.unreadable.is_empty(),
+            "outside this user's scan: {scan:?}"
+        );
+        assert!(scan.users.is_empty(), "{scan:?}");
+    }
+
     #[test]
     fn the_writes_reader_names_the_regular_files_open_for_writing_and_nothing_else() {
         let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
@@ -2259,13 +2309,9 @@ mod tests {
         );
         let refused = super::scan_path_users_of(&[1], dirs, &[]).expect("scan");
         assert_eq!(
-            refused
-                .unreadable
-                .iter()
-                .map(|(p, _)| *p)
-                .collect::<Vec<_>>(),
-            [1],
-            "a refused table is unreadable"
+            (refused.scanned, refused.users, refused.unreadable),
+            (1, Vec::new(), Vec::new()),
+            "launchd's refused table: root's process, outside this user's scan"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -3,22 +3,23 @@
 
 use super::*;
 mod historical;
+mod publication;
 use crate::{
     commons::binding::{Pending, Request},
     text::{Audience, Document},
 };
 
-const ROOT: [u8; 32] = [11; 32];
-const NETWORK: [u8; 16] = [7; 16];
-struct Fixture {
+pub(crate) const ROOT: [u8; 32] = [11; 32];
+pub(crate) const NETWORK: [u8; 16] = [7; 16];
+pub(crate) struct Fixture {
     _directory: aterm_tempfile::TempDir,
-    identities: Vec<Identity>,
-    requests: Vec<Request>,
-    eligibility: Eligibility,
-    genesis: Node,
-    journal: Journal,
+    pub(crate) identities: Vec<Identity>,
+    pub(crate) requests: Vec<Request>,
+    pub(crate) eligibility: Eligibility,
+    pub(crate) genesis: Node,
+    pub(crate) journal: Journal,
 }
-fn proof(identity: &Identity, request: &Request, seed: &[u8; 32]) -> Possession {
+pub(crate) fn proof(identity: &Identity, request: &Request, seed: &[u8; 32]) -> Possession {
     let (mut pending, challenge) =
         Pending::issue(request, NETWORK, authority(&ROOT).unwrap()).unwrap();
     pending
@@ -27,6 +28,9 @@ fn proof(identity: &Identity, request: &Request, seed: &[u8; 32]) -> Possession 
 }
 impl Fixture {
     fn new(count: usize) -> Self {
+        Self::enrolled(count, count)
+    }
+    pub(crate) fn enrolled(count: usize, enrolled: usize) -> Self {
         let identities: Vec<_> = (0..count)
             .map(|n| Identity::from_secret_bytes([n as u8 + 19; 32]))
             .collect();
@@ -61,6 +65,7 @@ impl Fixture {
             .iter()
             .zip(&requests)
             .enumerate()
+            .take(enrolled)
             .map(|(n, (identity, request))| {
                 Enrollment::new(
                     format!("m{}", n + 1),
@@ -90,7 +95,7 @@ impl Fixture {
             journal,
         }
     }
-    fn grants(&self, count: usize) -> Vec<Grant> {
+    pub(crate) fn grants(&self, count: usize) -> Vec<Grant> {
         self.requests
             .iter()
             .take(count)
@@ -128,7 +133,7 @@ impl Fixture {
         self.genesis.open(&self.identities[0]).unwrap()
     }
 }
-fn key(access: &Access, journal: &Journal) -> [u8; 32] {
+pub(crate) fn key(access: &Access, journal: &Journal) -> [u8; 32] {
     access.with_key(journal, |key| *key).unwrap()
 }
 

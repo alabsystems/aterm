@@ -2961,6 +2961,7 @@ fn take_held_panes(
         checkpoint.shell_integration_nonce = None;
         checkpoint.secure_keyboard_entry = false;
         checkpoint.taskbar_progress = None;
+        checkpoint.output_state.program_state = None;
         checkpoint.parser = None;
         checkpoint.parser_ground = true;
         let sid = carry

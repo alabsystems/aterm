@@ -79,6 +79,7 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         answered: None,
         worked_doubt: Duration::ZERO,
         ran_tools: false,
+        tools_unread: false,
         record_turn: None,
         credits: None,
         repo: crate::harness::repo_work::RepoRead::Clean,

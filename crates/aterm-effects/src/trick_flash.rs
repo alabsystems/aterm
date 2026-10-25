@@ -9,13 +9,13 @@ use aterm_core::terminal::RenderCell;
 use aterm_hash::{FNV64_OFFSET, fnv_mix_u64};
 use aterm_lexicon::{TrickLexicon, is_no_space_script, is_token_char};
 use aterm_render::InkCell;
-use aterm_scene::{mix_rgb, smoothstep};
+use aterm_scene::smoothstep;
 use aterm_time::Instant;
 
 use crate::color_math::hsv2rgb;
 #[cfg(test)]
 use crate::color_math::relative_luminance;
-use crate::effect_util::TWINKLE_FLASH_BOUND_HZ;
+use crate::effect_util::{TWINKLE_FLASH_BOUND_HZ, lerp_rgb as mix_rgb};
 use crate::spec::{MIN_ANIMATION_MS, RAINBOW_SAT, RAINBOW_SPAN_DEG, RAINBOW_VAL};
 use crate::word_decorations::{
     INK_FADE_MS, INK_RAMP_IN_MS, MIN_INK_CONTRAST, TYPED_EDIT_REACH_COLS, TYPED_EDIT_WITNESS_MS,
@@ -605,7 +605,7 @@ fn flash_hue(hue0: f32, i: usize, n: usize, t: u64) -> f32 {
 /// The rainbow colorway's theme rule: a light background takes deep candy
 /// tones that can clear the contrast bound on white.
 #[inline]
-fn resolve_sat_val(bg: u32) -> (f32, f32) {
+const fn resolve_sat_val(bg: u32) -> (f32, f32) {
     let table = crate::color_math::relative_luminance_table();
     if crate::color_math::relative_luminance_with(table, bg) > 0.5 {
         (1.0, 0.62)
@@ -618,7 +618,7 @@ fn resolve_sat_val(bg: u32) -> (f32, f32) {
 /// [`FLASH_STRENGTH`] in eighths, at which the flash is legible at every hue it
 /// passes through.
 #[inline]
-fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
+const fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
     let table = crate::color_math::relative_luminance_table();
     let lum_bg = crate::color_math::relative_luminance_with(table, bg);
     let floor = MIN_INK_CONTRAST;
@@ -638,7 +638,9 @@ fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
     let step = FLASH_STRENGTH / 8.0;
     let mut strength = FLASH_STRENGTH;
     'guard: while strength > 0.0 {
-        for corner in corners {
+        let mut idx = 0;
+        while idx < corners.len() {
+            let corner = corners[idx];
             let lum =
                 crate::color_math::relative_luminance_with(table, mix_rgb(fg, corner, strength));
             let contrast = (lum.max(lum_bg) + 0.05) / (lum.min(lum_bg) + 0.05);
@@ -646,6 +648,7 @@ fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
                 strength = (strength - step).max(0.0);
                 continue 'guard;
             }
+            idx += 1;
         }
         break;
     }

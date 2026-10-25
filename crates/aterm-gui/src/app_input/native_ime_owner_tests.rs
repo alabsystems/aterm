@@ -154,6 +154,72 @@ fn a_password_composition_cannot_follow_ax_focus_into_an_address() {
     }
 }
 
+fn password_composition_after_focus_round_trip(
+    leave_and_return: impl FnOnce(&mut App, WindowId, ViewId),
+) {
+    let (mut app, wid, instance, view, _) = page(false);
+    focus(&mut app, wid, view, "system-state/password");
+    app.on_ime_commit(wid, "kept".into());
+    let before = values(&app, instance);
+    app.on_ime_preedit(wid, COMPOSED.into(), None);
+    leave_and_return(&mut app, wid, view);
+
+    // No platform event arrived while another field or tab owned input. The
+    // empty preedit and Commit still belong to the old composition.
+    commit(&mut app, wid);
+    assert_eq!(
+        values(&app, instance),
+        before,
+        "returning to a field cannot revive its retired composition"
+    );
+    assert!(app.windows[&wid].preedit.is_empty());
+
+    // Retirement ends with that sequence, not with the field: a subsequent
+    // standalone commit and a new composition both reach the current field.
+    app.on_ime_commit(wid, "new".into());
+    assert_eq!(values(&app, instance), (ADDRESS.into(), "•".repeat(7)));
+    app.on_ime_preedit(wid, COMPOSED.into(), None);
+    commit(&mut app, wid);
+    assert_eq!(
+        values(&app, instance),
+        (ADDRESS.into(), "•".repeat(7 + COMPOSED.chars().count()))
+    );
+}
+
+#[test]
+fn ime_focus_round_trip_does_not_revive_a_password_composition() {
+    password_composition_after_focus_round_trip(|app, wid, view| {
+        focus(app, wid, view, "system-state/url");
+        focus(app, wid, view, "system-state/password");
+    });
+}
+
+#[test]
+fn ime_focus_round_trip_through_a_tab_does_not_revive_a_password_composition() {
+    password_composition_after_focus_round_trip(|app, wid, view| {
+        app.switch_tab_in(wid, 0);
+        assert!(app.active_native_view(wid).is_none());
+        assert!(app.open_system_state_tab());
+        assert_eq!(
+            app.active_native_view(wid).map(|(_, active)| active),
+            Some(view)
+        );
+    });
+}
+
+#[test]
+fn ime_focus_round_trip_unchanged_field_keeps_its_password_composition() {
+    let (mut app, wid, instance, view, _) = page(false);
+    focus(&mut app, wid, view, "system-state/password");
+    app.on_ime_preedit(wid, COMPOSED.into(), None);
+    focus(&mut app, wid, view, "system-state/password");
+    commit(&mut app, wid);
+    assert_eq!(
+        values(&app, instance),
+        (ADDRESS.into(), "•".repeat(COMPOSED.chars().count()))
+    );
+}
+
 #[test]
 fn a_replaced_setup_plan_retires_its_composition_even_with_the_same_field_focused() {
     let (mut app, wid, instance, first, _) = page(false);

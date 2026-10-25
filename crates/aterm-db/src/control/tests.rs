@@ -756,6 +756,7 @@ pub fn repair_transition(
             2 => Some([count as u8 * 2 - 1; 32]),
             _ => unreachable!(),
         },
+        ..Repair::default()
     };
     let old_cursor = repair.cursor;
     let page = repair.next(&local, &remote);
@@ -826,4 +827,56 @@ fn control_repair_model_conforms_and_rejects_freezing_after_deferral() {
         !model.successors("RefusedFirst", &initial).contains(&bad),
         "negative control must catch a cursor pinned to refused history"
     );
+}
+
+#[test]
+fn failed_responder_hello_reports_current_peer_without_stale_application_success() {
+    struct FailedReply(Cursor<Vec<u8>>);
+    impl Read for FailedReply {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(bytes)
+        }
+    }
+    impl Write for FailedReply {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "reply lost",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let lab = Lab::new();
+    for cached in [false, true] {
+        let endpoint = lab.endpoint(1);
+        let peer = lab.endpoint(0);
+        if cached {
+            let mut saved = Repair::default();
+            saved.prepare(lab.trust, peer.actor);
+            saved.cursor = Some([9; 32]);
+            saved.application = Some(crate::replica::Report::default());
+            drop(endpoint.inbound.acquire(peer.actor, &mut saved).unwrap());
+        }
+        let mut repair = Repair::default();
+        repair.prepare(lab.trust, endpoint.actor);
+        repair.cursor = Some([7; 32]);
+        repair.application = Some(crate::replica::Report::default());
+        let proof = NodeProof {
+            node: peer.identity.node().into(),
+            key: peer.identity.key(),
+        };
+        let mut bytes = (peer.hello.len() as u32).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&peer.hello);
+        let mut stream = FailedReply(Cursor::new(bytes));
+        assert!(
+            endpoint
+                .connected(&mut stream, Some(&proof), Side::Responder, &mut repair)
+                .is_err()
+        );
+        assert_eq!(repair.actor(), Some(peer.actor));
+        assert!(repair.application().is_none());
+        assert_eq!(repair.cursor, if cached { Some([9; 32]) } else { None });
+    }
 }

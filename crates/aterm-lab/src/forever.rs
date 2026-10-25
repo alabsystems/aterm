@@ -575,7 +575,7 @@ impl Harness {
         Harness::ALL.into_iter().find(|h| h.name() == word)
     }
 
-    fn bin_ver(self, run: &Run) -> (&str, &str) {
+    pub(crate) fn bin_ver(self, run: &Run) -> (&str, &str) {
         match self {
             Harness::Claude => (&run.claude_bin, &run.claude_ver),
             Harness::Gemini => (&run.gemini_bin, &run.gemini_ver),
@@ -4000,6 +4000,59 @@ fn could_not(m: &str) -> Fail {
     Fail::exit(3, format!("forever: COULD NOT RUN: {m}"))
 }
 
+/// A chain's tab spawned in `dir` and let settle idle, as the forever lab opens each one (and
+/// `autopilot-captures` and its typing take): its session id.
+/// # Errors
+/// The control socket failed, or `spawn` named no session (a COULD NOT RUN).
+pub(crate) fn spawn_tab(door: &Door<'_>, dir: &Path) -> Result<String, Fail> {
+    let r = door.ctl(&["spawn", &format!("cwd={}", dir.display())])?;
+    let sid = r
+        .stdout
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("OK "))
+        .and_then(|l| l.split_whitespace().next())
+        .map(str::to_string)
+        .ok_or_else(|| could_not(&format!("spawn: {}{}", r.stdout, r.stderr)))?;
+    let _ = on(door, &sid, &["await", "idle", "400", "timeout=30000"]);
+    Ok(sid)
+}
+
+/// `chain`'s program launched in tab `sid` as the forever lab launches it: its Autopilot set, a
+/// tasked chain's task marked working, then `script` typed and entered. What it said: the
+/// Autopilot it set and `meta set`'s reply, and the task's.
+/// # Errors
+/// A tasked chain's task was not marked working (a COULD NOT RUN).
+pub(crate) fn launch_tab(
+    door: &Door<'_>,
+    sid: &str,
+    chain: Chain,
+    script: &Path,
+) -> Result<String, Fail> {
+    let set = on(door, sid, &["meta", "set", "autopilot", chain.autopilot()]);
+    let task = if chain.tasked() {
+        let r = on(door, sid, &["task", "mark", "working", "from=ctl"]);
+        if !r.contains("state=working") {
+            return Err(could_not(&format!(
+                "{}: task mark working: {}",
+                chain.name(),
+                r.trim()
+            )));
+        }
+        format!(", task {}", crate::util::one_line(r.trim(), 120))
+    } else {
+        String::new()
+    };
+    let line = format!("sh {}", shell_quote(&script.to_string_lossy()));
+    let _ = on(door, sid, &["send", &line]);
+    let _ = on(door, sid, &["key", "enter"]);
+    Ok(format!(
+        "autopilot {} ({}){task}",
+        chain.autopilot(),
+        set.trim()
+    ))
+}
+
 fn git(home: &Path, dir: &Path, args: &[&str]) -> Result<(), String> {
     let out = aterm_uds::spawnfd::command("/usr/bin/git")
         .args([
@@ -4034,7 +4087,7 @@ fn git(home: &Path, dir: &Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
-fn lay_repo(run: &Run, chain: Chain) -> Result<PathBuf, String> {
+pub(crate) fn lay_repo(run: &Run, chain: Chain) -> Result<PathBuf, String> {
     let dir = Path::new(&run.proj).join(chain.name());
     let bare = Path::new(&run.sockdir).join(format!("origin-{}.git", chain.name()));
     lay_repo_at(run, &dir, &bare, &chain.token(), chain.repo())
@@ -4146,7 +4199,7 @@ pub fn gemini_trusted_project(proj: &str) -> String {
     J::Obj(rows).dump(crate::pyjson::PY)
 }
 
-fn launcher(
+pub(crate) fn launcher(
     run: &Run,
     h: Harness,
     dirs: &[PathBuf],
@@ -4318,7 +4371,7 @@ struct Tab {
     over: bool,
 }
 
-fn on(door: &Door<'_>, sid: &str, args: &[&str]) -> String {
+pub(crate) fn on(door: &Door<'_>, sid: &str, args: &[&str]) -> String {
     let at = format!("@{sid}");
     let mut v = vec![at.as_str()];
     v.extend_from_slice(args);
@@ -4336,7 +4389,7 @@ const COMPOSER_HANG: Duration = Duration::from_secs(60);
 
 /// How a wait for an agent's empty composer ended ([`composer_wait`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ComposerWait {
+pub(crate) enum ComposerWait {
     /// The composer stood empty.
     Ready,
     /// The composer held text before the lab typed anything: input no one gave reached the
@@ -4351,7 +4404,7 @@ enum ComposerWait {
 
 impl ComposerWait {
     /// Why the wait failed, for `agent` (`None`: it did not).
-    fn why(&self, agent: &str) -> Option<String> {
+    pub(crate) fn why(&self, agent: &str) -> Option<String> {
         match self {
             Self::Ready => None,
             Self::Draft(text) => Some(format!(
@@ -4425,7 +4478,11 @@ fn composer_wait<S: PartialEq>(
 ///
 /// # Errors
 /// The run was interrupted.
-fn empty_composer(door: &Door<'_>, sid: &str, agent: &str) -> Result<ComposerWait, Fail> {
+pub(crate) fn empty_composer(
+    door: &Door<'_>,
+    sid: &str,
+    agent: &str,
+) -> Result<ComposerWait, Fail> {
     Ok(composer_wait(
         || {
             let text = on(door, sid, &["text"]);
@@ -4444,7 +4501,7 @@ fn empty_composer(door: &Door<'_>, sid: &str, agent: &str) -> Result<ComposerWai
     )?)
 }
 
-fn tab_turn(door: &Door<'_>, sid: &str, agent: &str, text: &str) -> Result<bool, Fail> {
+pub(crate) fn tab_turn(door: &Door<'_>, sid: &str, agent: &str, text: &str) -> Result<bool, Fail> {
     let at = format!("@{sid}");
     if door.ctl(&[&at, "send", text])?.code != 0 {
         return Ok(false);
@@ -6510,16 +6567,7 @@ fn run_check(
         if chain.opening() == Opening::Spawned {
             continue;
         }
-        let r = door.ctl(&["spawn", &format!("cwd={}", dir.display())])?;
-        let sid = r
-            .stdout
-            .lines()
-            .next()
-            .and_then(|l| l.strip_prefix("OK "))
-            .and_then(|l| l.split_whitespace().next())
-            .map(str::to_string)
-            .ok_or_else(|| could_not(&format!("spawn: {}{}", r.stdout, r.stderr)))?;
-        let _ = on(&door, &sid, &["await", "idle", "400", "timeout=30000"]);
+        let sid = spawn_tab(&door, dir)?;
         let titled = if let Some(d) = &desk {
             let r = on(&door, &sid, &["meta", "set", "title", chain.name()]);
             let w = surfaces::window_of(&door.out(&["ls"]), &sid).unwrap_or_default();
@@ -6534,37 +6582,15 @@ fn run_check(
         } else {
             String::new()
         };
-        let set = on(
-            &door,
-            &sid,
-            &["meta", "set", "autopilot", chain.autopilot()],
-        );
-        let task = if chain.tasked() {
-            let r = on(&door, &sid, &["task", "mark", "working", "from=ctl"]);
-            if !r.contains("state=working") {
-                return Err(could_not(&format!(
-                    "{}: task mark working: {}",
-                    chain.name(),
-                    r.trim()
-                )));
-            }
-            format!(", task {}", crate::util::one_line(r.trim(), 120))
-        } else {
-            String::new()
-        };
         let script = match &scroll_script {
             Some(own) if chain == Chain::TallScroll => own,
             _ => &script,
         };
-        let line = format!("sh {}", shell_quote(&script.to_string_lossy()));
-        let _ = on(&door, &sid, &["send", &line]);
-        let _ = on(&door, &sid, &["key", "enter"]);
+        let said = launch_tab(&door, &sid, chain, script)?;
         println!(
-            "  tab       {} @{sid} in {}: autopilot {} ({}){task}{titled}, launched",
+            "  tab       {} @{sid} in {}: {said}{titled}, launched",
             chain.name(),
             dir.display(),
-            chain.autopilot(),
-            set.trim()
         );
         tabs.push(Tab {
             chain,

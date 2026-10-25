@@ -40,13 +40,19 @@ pub struct DriveRefused {
     pub why: String,
     /// Whether the same dial a moment later may be served.
     pub again: bool,
+    /// This machine's node, kept by a leave, when the dial found no fleet's key here.
+    pub left: Option<String>,
 }
 
 impl DriveRefused {
     /// A refusal a dial again would meet the same way.
     #[must_use]
     pub const fn once(why: String) -> Self {
-        Self { why, again: false }
+        Self {
+            why,
+            again: false,
+            left: None,
+        }
     }
 }
 
@@ -166,10 +172,30 @@ pub(crate) fn run(
     let mut request = request_line(&parts)?;
     validate_request_line_len(&request, Some(verb))?;
     request.push('\n');
-    exchange(
-        drive(host, DRIVE_WITHIN).map_err(io::Error::other)?,
-        &request,
-        verb,
+    let link = drive(host, DRIVE_WITHIN).map_err(|refused| match (&refused.left, args) {
+        (Some(node), [sid, off, ..]) if verb == "hold" && off == "off" => {
+            io::Error::other(left_holding(host, sid, node))
+        }
+        _ => io::Error::other(refused),
+    })?;
+    exchange(link, &request, verb)
+}
+
+/// Why a `hold <sid> off` cannot be sent by this machine, node `node`, out of the fleet now, and
+/// what lifts a hold it took on `host` before it left: a join again only where it left as a
+/// member, since an issuer's fleet went with its leave.
+fn left_holding(host: &str, sid: &str, node: &str) -> String {
+    let (host, sid) = (
+        aterm_codec::tty::one_line(host, 80),
+        aterm_codec::tty::one_line(sid, 40),
+    );
+    format!(
+        "this machine is in no fleet now, so it reaches {host} no more to hand {sid} back: a \
+         hold it took there before it left stands until that Mac's person takes the tab (Take \
+         Over) or runs `aterm fleet peers rm {}` there; if this machine left a fleet it joined, \
+         `aterm ctl --host {host} hold {sid} off` hands it back once it joins that fleet again \
+         (a fleet it issued went with its leave)",
+        node.get(..8).unwrap_or(node)
     )
 }
 

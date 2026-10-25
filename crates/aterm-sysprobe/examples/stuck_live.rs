@@ -423,6 +423,7 @@ fn job_proc(p: &ProcFacts) -> JobProc {
         pgid: p.pgid,
         sid: p.sid,
         start: p.start,
+        age_ms: p.age_ms,
         uid: p.uid,
         name: p.name.clone(),
         exe: p.exe.clone(),

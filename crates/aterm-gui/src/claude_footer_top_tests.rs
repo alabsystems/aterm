@@ -310,7 +310,7 @@ fn the_switch_sits_where_the_scan_put_it_with_no_ghost() {
                         frame_row: region.strip + 20,
                         ..key_for(program, run, switch, palette, blank, KeyFace::default())
                     };
-                    compose_top(&key, &mut top, None);
+                    compose_top(&key, &mut top, None, None);
                     let (laid, _) = laid_run(&key);
                     if what.starts_with("voice label") {
                         let mut after = before.clone();
@@ -406,8 +406,8 @@ fn the_switch_sits_where_the_scan_put_it_with_no_ghost() {
                     )
                 };
                 let (mut whole, mut short) = (ComposedTop::default(), ComposedTop::default());
-                compose_top(&key(run.len), &mut whole, None);
-                compose_top(&key(run.len - 1), &mut short, None);
+                compose_top(&key(run.len), &mut whole, None, None);
+                compose_top(&key(run.len - 1), &mut short, None, None);
                 assert_ne!(
                     whole.cells, short.cells,
                     "CONTROL {cols}: a shorter run composes otherwise"
@@ -663,6 +663,7 @@ fn composed_as(
             ..key_for(program, run, switch, palette, blank(), face)
         },
         &mut top,
+        None,
         None,
     );
     top
@@ -2062,7 +2063,7 @@ fn marks_write_only_the_run() {
                     frame_row: strip + 20,
                     ..key_for(program, run, switch, palette, blank, face)
                 };
-                compose_top(&key, &mut top, None);
+                compose_top(&key, &mut top, None, None);
                 let (laid, label) = laid_run(&key);
                 writes_only_the_run(&before, laid, &top).unwrap_or_else(|e| {
                     panic!("{what} at {cols}, {switch:?} {palette:?}: {e}: {drawn:?}")
@@ -2102,7 +2103,7 @@ fn marks_write_only_the_run() {
                 if muse && muse_seen.is_none() {
                     let plain = TopRun { voice: None, ..run };
                     let mut kept = ComposedTop::default();
-                    compose_top(&TopKey { run: plain, ..key }, &mut kept, None);
+                    compose_top(&TopKey { run: plain, ..key }, &mut kept, None, None);
                     if !kept.cells.is_empty() {
                         muse_seen = Some((before.clone(), plain, kept));
                     }

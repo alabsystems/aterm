@@ -132,6 +132,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         worked_doubt: Duration::ZERO,
         // A hand-built turn of real work ran a tool.
         ran_tools: worked.is_some_and(|w| w >= MIN_WORK),
+        tools_unread: false,
         record_turn: None,
         credits: None,
         repo: crate::harness::repo_work::RepoRead::Clean,

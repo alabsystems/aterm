@@ -4,7 +4,8 @@
 
 //! In-flight terminal output state carried across a [`TerminalCheckpoint`](super::TerminalCheckpoint):
 //! REP (`CSI b`), SGR 58 underline colour, open OSC 8 hyperlink, pending VT52 `ESC Y` address,
-//! pending ZWJ (U+200D), XTPUSHSGR stack (`CSI # {`), and XTSAVE'd DEC private modes (`CSI ? Ps s`).
+//! pending ZWJ (U+200D), XTPUSHSGR stack (`CSI # {`), XTSAVE'd DEC private modes (`CSI ? Ps s`),
+//! and the program's own state report standing (OSC 7501, which a re-send of it relies on).
 //! [`OutputStateRepr`] crosses as one optional `CheckpointMeta` key, omitted when default.
 
 use super::transient_state::Vt52CursorState;
@@ -113,6 +114,13 @@ pub struct OutputStateRepr {
         serde(default, skip_serializing_if = "Vec::is_empty")
     )]
     pub saved_modes: Vec<SavedModeRepr>,
+    /// The program's own state report standing (OSC 7501), as the body that says it: a restore
+    /// reads it with the engine's own parser and installs it as a report that begins no turn.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub program_state: Option<String>,
 }
 
 impl OutputStateRepr {
@@ -192,6 +200,7 @@ impl Terminal {
                 saved.sort_unstable_by_key(|saved| saved.mode);
                 saved
             },
+            program_state: self.program_state.carried(),
         }
     }
 
@@ -242,5 +251,6 @@ impl Terminal {
             .map(|SavedModeRepr { mode, set }| (mode, set))
             .collect();
         self.transient.update_has_transient_extras();
+        self.program_state.restore(repr.program_state.as_deref());
     }
 }

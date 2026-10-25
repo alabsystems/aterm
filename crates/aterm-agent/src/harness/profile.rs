@@ -1747,6 +1747,24 @@ pub fn muse_resume_for(
     super::upgrade_muse::told_line(&session, &relaunch_env)
 }
 
+/// The active goal of a live `muse` session ([`super::goal::Store::Muse`]): the
+/// [`super::goal::MUSE_GOALS`] store beside its session lock, keyed by its session id, read
+/// through `held` (again only when the store moved).
+#[must_use]
+pub fn muse_goal_for(
+    pid: u32,
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+    files: Option<&[PathBuf]>,
+    held: &mut super::goal::StoreGoal,
+) -> Option<String> {
+    let (session, lock) = muse_active_session_lock(pid, argv, env, user_home, files)?;
+    let db = lock?.with_file_name(super::goal::MUSE_GOALS);
+    held.read(super::goal::Store::Muse, &db, &session)
+        .map(str::to_owned)
+}
+
 /// Reads the survey [`super::excerpt::Excerpts`] (`prompts`, `said`, `said_end`,
 /// `doing`) and `transcript_len` for an active `muse` session from
 /// `<data>/muse/sessions/YYYY/MM/DD/<uuid>/session.jsonl`.

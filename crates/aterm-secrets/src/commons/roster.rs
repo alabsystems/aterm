@@ -430,7 +430,37 @@ impl Access {
             trust: self.trust,
             head: self.head,
             basis: self.basis,
-            past,
+            source: past.basis,
+            generation: past.generation,
+            members: past.members,
+            key: past.key,
+        })
+    }
+
+    pub(crate) fn historical_with_key(
+        &self,
+        journal: &Journal,
+        identity: &Identity,
+        basis: [u8; 32],
+        file_key: &[u8; 16],
+        key: &[u8; 32],
+    ) -> Result<Historical> {
+        if !self.is_current(journal) || self.local().binding.recipient() != identity.recipient() {
+            return Err(Error::new(
+                "history handoff requires current local membership",
+            ));
+        }
+        let snapshot = journal.historical_with_key(basis, file_key)?;
+        let roster = decode(snapshot.payload.as_slice())?;
+        validate_evidence(journal, &snapshot, &roster, key, false)?;
+        Ok(Historical {
+            trust: self.trust,
+            head: self.head,
+            basis: self.basis,
+            source: basis,
+            generation: roster.generation,
+            members: roster.capsules.into_iter().map(|c| c.member).collect(),
+            key: SecretBytes::from(key.as_slice()),
         })
     }
 }
@@ -443,17 +473,20 @@ pub struct Historical {
     trust: Trust,
     head: [u8; 32],
     basis: [u8; 32],
-    past: Access,
+    source: [u8; 32],
+    generation: u64,
+    members: Vec<Member>,
+    key: SecretBytes,
 }
 impl Historical {
     pub const fn source(&self) -> &[u8; 32] {
-        &self.past.basis
+        &self.source
     }
     pub const fn generation(&self) -> u64 {
-        self.past.generation
+        self.generation
     }
     pub fn members(&self) -> &[Member] {
-        &self.past.members
+        &self.members
     }
     /// A changed, forked, pending or uncertain journal invalidates this handle.
     pub fn with_key<T>(
@@ -472,7 +505,7 @@ impl Historical {
                 "historical key observation is no longer current",
             ));
         }
-        Ok(use_key(self.past.key.as_slice().try_into().unwrap()))
+        Ok(use_key(self.key.as_slice().try_into().unwrap()))
     }
 }
 
@@ -573,26 +606,6 @@ fn validate(
     latest: bool,
 ) -> Result<Access> {
     let roster = decode(current.payload.as_slice())?;
-    let trust = journal.trust();
-    if roster.network != trust.network || roster.authority != trust.authority {
-        return Err(Error::new("Commons roster has another trust context"));
-    }
-    let basis = journal
-        .node(&current.basis)
-        .ok_or_else(|| Error::new("Commons roster basis is missing"))?;
-    let members_valid = basis
-        .facts()
-        .iter()
-        .filter(|fact| matches!(fact, Fact::Bind { .. } | Fact::Epoch { .. }))
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        == facts(&roster)
-        && roster.capsules.iter().all(|capsule| {
-            current
-                .constraints
-                .check_recorded_device(&capsule.member.binding)
-                .is_ok()
-        });
     let local = roster
         .capsules
         .iter()
@@ -622,12 +635,107 @@ fn validate(
         ));
     }
     let key: &[u8; 32] = bytes[45 + BINDING_LEN..].try_into().unwrap();
+    validate_evidence(journal, &current, &roster, key, latest)?;
+    Ok(Access {
+        trust: journal.trust(),
+        head: current.head,
+        basis: current.basis,
+        generation: roster.generation,
+        members,
+        local,
+        key: SecretBytes::from(key.as_slice()),
+    })
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbHistoricalPublication",
+        action = "Original",
+        project = "aterm_secrets::commons::roster::tests::publication::publication_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbHistoricalPublication",
+        action = "FutureDescendant",
+        project = "aterm_secrets::commons::roster::tests::publication::publication_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbHistoricalPublication",
+        action = "ReusedSource",
+        project = "aterm_secrets::commons::roster::tests::publication::publication_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbHistoricalPublication",
+        action = "FutureSibling",
+        project = "aterm_secrets::commons::roster::tests::publication::publication_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbHistoricalPublication",
+        action = "MergedPastCopy",
+        project = "aterm_secrets::commons::roster::tests::publication::publication_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbHistoricalPublication",
+        action = "DiscardedSource",
+        project = "aterm_secrets::commons::roster::tests::publication::publication_transition"
+    )
+)]
+fn validate_evidence(
+    journal: &Journal,
+    current: &Current,
+    roster: &Roster,
+    key: &[u8; 32],
+    latest: bool,
+) -> Result<()> {
+    let trust = journal.trust();
+    if roster.network != trust.network || roster.authority != trust.authority {
+        return Err(Error::new("Commons roster has another trust context"));
+    }
+    let basis = journal
+        .node(&current.basis)
+        .ok_or_else(|| Error::new("Commons roster basis is missing"))?;
+    let members_valid = basis
+        .facts()
+        .iter()
+        .filter(|fact| matches!(fact, Fact::Bind { .. } | Fact::Epoch { .. }))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        == facts(roster)
+        && roster.capsules.iter().all(|capsule| {
+            current
+                .constraints
+                .check_recorded_device(&capsule.member.binding)
+                .is_ok()
+        });
     let epoch_valid = current
         .constraints
         .check_key(roster.generation, key)
         .is_ok()
         && key_commitment(trust.network, key) == roster.commitment
-        && journal.single_key_publication(roster.generation, roster.commitment);
+        && if latest {
+            journal.single_key_publication(roster.generation, roster.commitment)
+        } else {
+            journal.single_historical_key_publication(
+                current.basis,
+                roster.generation,
+                roster.commitment,
+            )
+        };
     let same_head = !latest
         || (!journal.payload_superseded(current.basis)
             && journal.state()
@@ -640,15 +748,7 @@ fn validate(
             "Commons roster or key is not currently authorized",
         ));
     }
-    Ok(Access {
-        trust,
-        head: current.head,
-        basis: current.basis,
-        generation: roster.generation,
-        members,
-        local,
-        key: SecretBytes::from(key.as_slice()),
-    })
+    Ok(())
 }
 
 fn authority(seed: &[u8; 32]) -> Result<[u8; 32]> {
@@ -857,4 +957,4 @@ pub(crate) fn rotate_retiring(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

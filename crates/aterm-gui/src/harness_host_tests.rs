@@ -5034,6 +5034,7 @@ fn a_self_claimed_snapshot_publishes_the_line_its_copy_validated() {
     ];
     let codex = Snapshot {
         start: a.start_of(sid, snap(sid).pid),
+        session: Some("0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77".to_string()),
         run: aterm_agent::harness::relaunch::AgentRun::Codex(CodexRun {
             home: "/u/.codex".into(),
             home_env: None,
@@ -13742,6 +13743,7 @@ fn signed_out(labels: &[&str]) -> AccountsSaid {
         due: Vec::new(),
         none_soon: false,
         wrong: Vec::new(),
+        no_sign_in: Vec::new(),
     }
 }
 
@@ -13882,6 +13884,7 @@ fn own_on_credits(a: &Accts) -> AccountsSaid {
         due: Vec::new(),
         none_soon: false,
         wrong: Vec::new(),
+        no_sign_in: Vec::new(),
     }
 }
 
@@ -26590,6 +26593,69 @@ fn a_login_signed_back_in_at_the_tab_is_ok_again_for_its_own_account_alone() {
     idle.login_back();
     assert_eq!(a.state().account("main").auth, accounts::Auth::Ok);
     assert!(due().is_empty(), "{:?}", due());
+}
+
+/// A row whose automatic sign-in found no route, and that has no login to run on, is the
+/// digest's no-sign-in fact with the routes it tried, and a line of the digest stands for it;
+/// once a login is made and bound to the row, it is off that fact.
+#[test]
+fn a_row_no_route_signs_in_is_the_digests_fact_until_its_login_is_made() {
+    let tmp = aterm_tempfile::TempDir::new().expect("scratch");
+    let w3_dir = tmp.path().join("logins").join("w3");
+    std::fs::create_dir_all(&w3_dir).unwrap();
+    let w3_text = w3_dir.to_string_lossy().into_owned();
+    let roster = accounts::Roster {
+        rows: vec![
+            accounts::Row {
+                label: "main".to_string(),
+                email: Some("main@example.test".to_string()),
+                ..accounts::Row::default()
+            },
+            accounts::Row {
+                label: "w3".to_string(),
+                dir: Some(w3_text.clone()),
+                email: Some("w3@example.test".to_string()),
+                ..accounts::Row::default()
+            },
+        ],
+    };
+    let mut state = accounts::State::default();
+    let mut logins = accounts::Logins::default();
+    let routes = "profile(none) mailbox(none configured) vault(not a member) \
+                  headless-browser(none installed) hosts(none configured)";
+    let _ = accounts::note_sign_in_attempt(
+        &mut logins,
+        "w3",
+        accounts::AttemptOutcome::NoRoute,
+        routes,
+        ACCT_NOW,
+    );
+    let no_sign_in = |state: &accounts::State, logins: &accounts::Logins| {
+        let bound = accounts::bound(&roster, logins);
+        let said = AccountsSaid::listed(&bound, state, logins, ACCT_NOW + 60, &BTreeSet::new());
+        let stands = said.stands();
+        match said {
+            AccountsSaid::Listed { no_sign_in, .. } => (no_sign_in, stands),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(
+        no_sign_in(&state, &logins),
+        (vec![("w3".to_string(), routes.to_string())], true)
+    );
+    let made = tmp.path().join("logins").join("w3+1");
+    std::fs::create_dir_all(&made).unwrap();
+    std::fs::write(made.join(".credentials.json"), "fixture login").unwrap();
+    let _ = accounts::note_renewed(
+        &mut state,
+        &mut logins,
+        "w3",
+        Some(&w3_text),
+        &made.to_string_lossy(),
+        None,
+        ACCT_NOW + 30,
+    );
+    assert!(no_sign_in(&state, &logins).0.is_empty());
 }
 
 #[test]

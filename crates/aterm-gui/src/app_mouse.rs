@@ -816,6 +816,7 @@ impl App {
             }
             w.request_redraw();
         }
+        self.retire_native_input_in(wid);
         self.settle_pointer_drags(wid);
         let _ = claim(self, wid);
         if let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) {
@@ -1545,6 +1546,13 @@ impl App {
 
     /// Cmd-C: copy the selected text to the system clipboard (`pbcopy`), leaving the selection so repeated copies work.
     pub(crate) fn copy_selection_in(&self, wid: WindowId) -> bool {
+        if self
+            .windows
+            .get(&wid)
+            .is_none_or(|ws| ws.overlay_open() || ws.rename_edit.is_some())
+        {
+            return false;
+        }
         // A pinned or keyboard lens's ⌘C copies its instrument's sentence.
         if self.windows.get(&wid).is_some_and(|ws| {
             ws.stats_lens
@@ -1552,6 +1560,11 @@ impl App {
                 .is_some_and(|l| l.how != crate::stats_lens::Opened::Hover)
         }) {
             return self.copy_stats_sentence(wid);
+        }
+        if self.active_native_view(wid).is_some() {
+            return self
+                .native_selection_text(wid)
+                .is_some_and(|text| control::pbcopy(&text));
         }
         let Some(text) = self.window_selection_text(wid) else {
             return false;
@@ -5251,7 +5264,34 @@ impl App {
 
     /// Edit ▸ Select All.
     pub(crate) fn select_all(&mut self) {
-        let Some(ws) = self.front() else { return };
+        if let Some(wid) = self.frontmost_window {
+            self.select_all_in(wid);
+        }
+    }
+
+    /// Select only the document or terminal that owns this window's input.
+    pub(crate) fn select_all_in(&mut self, wid: WindowId) {
+        let Some(ws) = self.windows.get(&wid) else {
+            return;
+        };
+        if ws.overlay_open() || ws.rename_edit.is_some() {
+            return;
+        }
+        if self.active_native_view(wid).is_some() {
+            let _ = self.dispatch_native_event(
+                wid,
+                crate::native_app::AppEvent::TextInput(
+                    crate::native_app::TextInputEvent::SelectAll,
+                ),
+            );
+            return;
+        }
+        let Some(ws) = self.windows.get(&wid) else {
+            return;
+        };
+        if ws.search.is_some() {
+            return;
+        }
         let Some(terminal) = ws.front_terminal() else {
             return;
         };

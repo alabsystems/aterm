@@ -7,6 +7,181 @@ use super::*;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+struct Wire {
+    replies: std::io::Cursor<Vec<u8>>,
+    sent: Vec<u8>,
+}
+
+impl std::io::Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut self.replies, buf)
+    }
+}
+
+impl std::io::Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.sent.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn wire(replies: &str) -> RelayClient<Wire> {
+    RelayClient::new(Wire {
+        replies: std::io::Cursor::new(replies.as_bytes().to_vec()),
+        sent: Vec::new(),
+    })
+}
+
+#[test]
+fn held_snapshot_reads_keep_numeric_status_lines_and_counted_bodies_separate() {
+    let mut client =
+        wire("OK 4 26 1 blinking_block\nOK 2\nfirst\nsecond\nOK matched=7\nERR denied\n");
+    let cursor = relay_reply(&mut client, &["cursor"], ReplyShape::Line).unwrap();
+    assert_eq!(cursor.stdout, "OK 4 26 1 blinking_block\n");
+    let text = relay_reply(&mut client, &["text"], ReplyShape::Counted).unwrap();
+    assert_eq!(text.stdout, "first\nsecond\n");
+    let ready = relay_reply(
+        &mut client,
+        &["await", "match", "redraw.restored"],
+        ReplyShape::Line,
+    )
+    .unwrap();
+    assert_eq!(ready.code, 0);
+    let refused = relay_reply(&mut client, &["trail", "status"], ReplyShape::Counted).unwrap();
+    assert_eq!(refused.code, 1);
+    assert!(refused.stdout.is_empty());
+    assert_eq!(
+        client.transport().sent,
+        b"cursor\ntext\nawait match redraw.restored\ntrail status\n"
+    );
+}
+
+fn png_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut encoder = aterm_png::Encoder::new(&mut bytes, 1, 1);
+    encoder.set_color(aterm_png::ColorType::Rgb);
+    encoder.set_depth(aterm_png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&[1, 2, 3]).unwrap();
+    writer.finish().unwrap();
+    bytes
+}
+
+#[test]
+fn inline_capture_validates_png_bytes_and_dimensions_without_an_artifact_ack() {
+    let png = png_bytes();
+    let encoded = aterm_codec::base64::encode(&png).unwrap();
+    let metadata = "image-meta image-meta-version=3 frame-kind=terminal";
+    let body = format!("{metadata}\n1 1 {} {encoded}\n", png.len());
+    let mut client = wire(&format!("OK 2\n{body}OK 1\ntrail next\n"));
+    let reply = relay_reply(
+        &mut client,
+        &["image", "--meta", "--bytes"],
+        ReplyShape::Counted,
+    )
+    .unwrap();
+    let (decoded, meta) = image_bytes(&reply.stdout).unwrap();
+    assert_eq!(decoded, png);
+    assert_eq!(meta, metadata);
+    assert_eq!(
+        relay_reply(&mut client, &["trail", "status"], ReplyShape::Counted)
+            .unwrap()
+            .stdout,
+        "trail next\n"
+    );
+
+    for bad in [
+        body.replacen("\n1 1 ", "\n2 1 ", 1),
+        format!("{metadata}\n1 1 {} {encoded}\n", png.len() + 1),
+        format!("{metadata}\n1 1 18446744073709551615 {encoded}\n"),
+        format!(
+            "{metadata}\n1 1 {} {}!\n",
+            png.len(),
+            &encoded[..encoded.len() - 1]
+        ),
+        format!("{body}extra\n"),
+        "image-meta frame-kind=terminal\n1 1 3 YWJj\n".to_string(),
+    ] {
+        assert!(image_bytes(&bad).is_err());
+    }
+}
+
+#[test]
+fn an_open_capture_never_waits_for_its_own_frame_to_close() {
+    let mut client = wire(
+        "OK 1\ntrail open\nOK 1\ntrail returned\nOK 4 26 1 blinking_block\nOK 1\nreturned text\n",
+    );
+    let open = frame_evidence(FrameRead::Open, |request, shape| {
+        relay_reply(&mut client, request, shape).unwrap()
+    });
+    assert!(open.cursor.is_none() && open.text.is_none());
+    assert_eq!(client.transport().sent, b"trail status\n");
+    let returned = frame_evidence(FrameRead::Returned, |request, shape| {
+        relay_reply(&mut client, request, shape).unwrap()
+    });
+    assert_eq!(returned.status.stdout, "trail returned\n");
+    assert_eq!(
+        returned.cursor.unwrap().stdout,
+        "OK 4 26 1 blinking_block\n"
+    );
+    assert_eq!(returned.text.unwrap().stdout, "returned text\n");
+    assert_eq!(
+        client.transport().sent,
+        b"trail status\ntrail status\ncursor\ntext\n"
+    );
+}
+
+#[test]
+fn a_return_without_a_live_rainbow_is_inconclusive_but_other_styles_are_not() {
+    let live = "trail resolved=rainbow-kitty config_enabled=true effective=true intensity=1.00 ribbon_segments=12 ribbon_drawn=30";
+    let status = |line: String| Reply {
+        stdout: line,
+        ..Reply::default()
+    };
+    assert_eq!(
+        return_measurement(&status(live.into())).unwrap(),
+        ReturnMeasurement::LiveRibbon
+    );
+    for dead in [
+        live.replace("segments=12", "segments=0"),
+        live.replace("drawn=30", "drawn=0"),
+    ] {
+        assert_eq!(
+            return_measurement(&status(dead)).unwrap(),
+            ReturnMeasurement::Inconclusive
+        );
+    }
+    for other in [
+        live.replace("rainbow-kitty", "comet"),
+        live.replace("rainbow-kitty", "off"),
+        live.replace("config_enabled=true", "config_enabled=false"),
+        live.replace("effective=true", "effective=false"),
+        live.replace("intensity=1.00", "intensity=0.00"),
+    ] {
+        assert_eq!(
+            return_measurement(&status(other)).unwrap(),
+            ReturnMeasurement::NotApplicable
+        );
+    }
+    for missing in [
+        live.replace("ribbon_drawn=30", ""),
+        live.replace("intensity=1.00", "intensity=NaN"),
+    ] {
+        assert!(return_measurement(&status(missing)).is_err());
+    }
+    assert!(
+        return_measurement(&Reply {
+            code: 1,
+            ..Reply::default()
+        })
+        .is_err()
+    );
+}
+
 fn args(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_string()).collect()
 }

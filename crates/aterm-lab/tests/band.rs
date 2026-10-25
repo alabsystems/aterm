@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Tests that an `aterm-lab band-launch` job runs its program as an app in its own coalition and
-//! is removed once that program ends.
+//! is removed once that program ends, and that a keeper as the job's process (a windowed `lab
+//! instance`) holds its program in that coalition, as its own responsible process.
 
 #![cfg(target_os = "macos")]
 
@@ -163,4 +164,217 @@ fn an_app_band_job_runs_its_program_as_an_app_in_its_own_coalition_and_is_remove
         "one start, at role UI_FOCAL, an APP-type task whose own role change takes, with no QoS \
          clamp: a user-interactive request lands at the UI band (log: {job_log:?})"
     );
+}
+
+/// The pid a `band-standin --kept` wrote to `runs`, once it has.
+fn kept_pid(runs: &Path) -> i32 {
+    wait_for("the kept program's pid", || {
+        std::fs::read_to_string(runs)
+            .ok()
+            .filter(|s| s.ends_with('\n'))
+            .and_then(|s| s.trim().parse().ok())
+    })
+}
+
+/// `responsibility_get_pid_responsible_for_pid(pid)`: the process macOS charges `pid`'s TCC
+/// questions to.
+fn responsible_for(pid: i32) -> i32 {
+    type Responsible = unsafe extern "C" fn(libc::pid_t) -> libc::pid_t;
+    // SAFETY: a NUL-terminated C string literal; `RTLD_DEFAULT` is dlfcn.h's pseudo-handle for a
+    // global search.
+    let found = unsafe {
+        libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"responsibility_get_pid_responsible_for_pid".as_ptr(),
+        )
+    };
+    assert!(
+        !found.is_null(),
+        "libSystem exports responsibility_get_pid_responsible_for_pid"
+    );
+    // SAFETY: dyld resolved the name to the libquarantine function whose C prototype is
+    // `pid_t f(pid_t)`, exactly `Responsible`.
+    let responsible = unsafe { std::mem::transmute::<*mut libc::c_void, Responsible>(found) };
+    // SAFETY: one plain integer argument.
+    unsafe { responsible(pid) }
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: a plain `kill(2)` probe of a pid this test started, above 1.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// What a windowed `lab instance` is in the app band: the job's process is
+/// `aterm-lab keeper --disclaim`, its program (the window's aterm) the keeper's child.
+struct KeptJob {
+    label: String,
+    keeper: i32,
+    kept: i32,
+    log: std::path::PathBuf,
+    held: Option<OwnedFd>,
+    _world: aterm_tempfile::TempDir,
+}
+
+impl KeptJob {
+    /// `tag`'s job; `disclaim`, its keeper runs as a windowed `lab instance`'s does (`keeper
+    /// --disclaim`), else as plain `keeper`.
+    fn start(tag: &str, disclaim: bool) -> KeptJob {
+        let owned_world = aterm_tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("exclusive scratch world");
+        let dir = owned_world.path().to_path_buf();
+        let held = world(&dir);
+        let label = format!(
+            "aterm-lab.test.band-{tag}.{}",
+            dir.file_name()
+                .expect("exclusive world basename")
+                .to_string_lossy()
+        );
+        let lab = env!("CARGO_BIN_EXE_aterm-lab");
+        let (runs, log) = (dir.join("runs"), dir.join("log"));
+        let d = dir.to_str().expect("utf-8");
+        let launched = aterm_uds::spawnfd::command(lab)
+            .args([
+                "band-launch",
+                d,
+                &label,
+                "--cwd",
+                d,
+                "--log",
+                log.to_str().expect("utf-8"),
+                "--",
+                lab,
+                "keeper",
+            ])
+            .args(disclaim.then_some("--disclaim"))
+            .args([
+                "--",
+                lab,
+                "band-standin",
+                runs.to_str().expect("utf-8"),
+                "--kept",
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(launched, "aterm-lab band-launch");
+        let keeper: i32 = wait_for("the job's pid file", || {
+            std::fs::read_to_string(dir.join("band.pid"))
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+        });
+        let kept = kept_pid(&runs);
+        KeptJob {
+            label,
+            keeper,
+            kept,
+            log,
+            held: Some(held),
+            _world: owned_world,
+        }
+    }
+
+    fn removed(&self) {
+        wait_for("the job's removal", || {
+            (!launchctl(&["print", &target(&self.label)])).then_some(())
+        });
+        wait_for("the kept program's end", || {
+            (!alive(self.kept)).then_some(())
+        });
+    }
+}
+
+impl Drop for KeptJob {
+    fn drop(&mut self) {
+        let _ = launchctl(&["bootout", &target(&self.label)]);
+        if alive(self.kept) {
+            // SAFETY: a plain `kill(2)` of the stand-in this test's job started, above 1.
+            unsafe { libc::kill(self.kept, libc::SIGKILL) };
+        }
+    }
+}
+
+#[test]
+fn a_keeper_job_holds_its_program_in_the_jobs_own_coalition_and_ends_with_its_lifeline() {
+    let mut job = KeptJob::start("kept", true);
+    let ours = coalition(i32::try_from(std::process::id()).expect("pid"));
+    let children = aterm_uds::process::child_pids(job.keeper);
+    let (keeper, kept) = (coalition(job.keeper), coalition(job.kept));
+    let control_dir = aterm_tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("the control's scratch dir");
+    let (lifeline, far) =
+        aterm_uds::lifeline::Lifeline::open(control_dir.path()).expect("the control's lifeline");
+    let control_runs = control_dir.path().join("runs");
+    let lab = env!("CARGO_BIN_EXE_aterm-lab");
+    let mut control = aterm_uds::spawnfd::command(lab)
+        .args(["keeper", "--", lab, "band-standin"])
+        .arg(&control_runs)
+        .arg("--kept")
+        .setsid(true)
+        .stdin(Stdio::from(far))
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("the control's keeper, this test's child");
+    let theirs = coalition(kept_pid(&control_runs));
+    lifeline.cut();
+    let control_end = control.wait().ok().and_then(|s| s.code());
+    let printed = std::fs::read_to_string(&job.log).unwrap_or_default();
+    drop(job.held.take());
+    job.removed();
+    assert_eq!(
+        theirs, ours,
+        "the control: the program of a keeper this test starts (`--band agent`) shares this test's coalition"
+    );
+    assert_eq!(
+        control_end,
+        Some(0),
+        "the control's keeper ends with its lifeline"
+    );
+
+    assert_eq!(
+        children,
+        Some(vec![job.kept]),
+        "the program is the keeper's one child"
+    );
+    assert_ne!(job.kept, job.keeper);
+    assert_ne!(
+        keeper[0], ours[0],
+        "the keeper heads a resource coalition of its own"
+    );
+    assert_ne!(keeper[1], ours[1], "and a jetsam coalition of its own");
+    assert_eq!(kept, keeper, "the program runs in the keeper's coalitions");
+    assert!(
+        printed.contains(&format!("kept {}\n", job.kept)),
+        "the program's stdout is the job's log: {printed:?}"
+    );
+}
+
+/// A windowed `lab instance`'s aterm is its own responsible process, as aterm.app is, so macOS
+/// asks its privacy questions of aterm and not of the keeper (`keeper --disclaim`); the control,
+/// a job whose keeper does not disclaim, has its program charged to the keeper.
+#[test]
+fn a_disclaiming_keeper_jobs_program_is_its_own_responsible_process() {
+    let own = KeptJob::start("own", true);
+    let charged = KeptJob::start("charged", false);
+    let (of_own, of_charged) = (responsible_for(own.kept), responsible_for(charged.kept));
+    assert_eq!(
+        (responsible_for(charged.keeper), of_charged),
+        (charged.keeper, charged.keeper),
+        "the control: a job's keeper is its own responsible process, and its plain program is \
+         charged to it"
+    );
+    assert_eq!(
+        of_own, own.kept,
+        "a --disclaim keeper's program is its own responsible process, not keeper {}'s",
+        own.keeper
+    );
+}
+
+#[test]
+fn a_keeper_jobs_program_killed_by_its_pid_ends_the_job() {
+    let job = KeptJob::start("killed", true);
+    // SAFETY: a plain `kill(2)` of the stand-in this test's job started, above 1.
+    let sent = unsafe { libc::kill(job.kept, libc::SIGTERM) } == 0;
+    assert!(sent, "SIGTERM the kept program");
+    job.removed();
+    assert!(!alive(job.keeper), "the keeper ended with its program");
 }

@@ -34,7 +34,7 @@ use aterm_vz::client::{ClientError, Detached, Lab, Session, UpError};
 use aterm_vz::layers::{Base, Layers, PartialBake, Prepared, System, VM};
 use aterm_vz::plan::{COMMAND_LINE, CPUS, Disk, MEMORY, Plan, ShareEntry, mac_for};
 use aterm_vz::proto::{Attach, PROTO, Phase};
-use aterm_vz::record::{Kernel, Paths, Pids as _, Record};
+use aterm_vz::record::{Kernel, Paths, Record};
 use aterm_vz_agent::wire::{self, Exec, Exit, Frame, Hello, Share, Stdin};
 
 use crate::linux::{Out, not_run};
@@ -805,7 +805,7 @@ pub fn wait_ended(paths: &Paths, record: &Record) -> Result<(), String> {
             .sum::<u64>()
     };
     let (mut last, mut since) = (size(), Instant::now());
-    while Kernel.uniq(record.pid) == Some(record.uniq) {
+    while aterm_vz::record::is_live(record, &Kernel) {
         let now = size();
         if now != last {
             (last, since) = (now, Instant::now());

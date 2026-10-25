@@ -1112,14 +1112,30 @@ impl App {
     /// window reads its own, and aterm's hardening with it, only when asked, and a press that
     /// finds none (the first after a launch, such as Full Disk Access's Quit & Reopen) is
     /// refused: only a reading tells a press that the build is hardened and the right is off.
+    /// A reading in hand is kept, however old (a press reads the rule again past its minute); a
+    /// read that brought no reading is retired and read again once it is
+    /// [`devtools_helper::RECHECK_EVERY`] old, so one read is out at a time and the next waits
+    /// that long after the last fails. Neither while a read is out (retiring the row would void
+    /// it) nor while the launch step, which retired one, reads the rule again itself at that pace.
     pub(crate) fn warm_debugger_reading(&mut self) {
-        if self.headless || !cfg!(target_os = "macos") {
+        if self.headless || !cfg!(target_os = "macos") || self.debugger_launch.rereads_unread() {
             return;
         }
         let gate = self.config.privacy_probe_gate();
-        if !gate.permits() || self.consent.debugger_cached(gate).is_some() {
+        if !gate.permits() {
             return;
         }
+        let retire = match self.consent.debugger_cached(gate) {
+            None => false,
+            Some(row)
+                if row
+                    .unread_age()
+                    .is_some_and(|age| age >= devtools_helper::RECHECK_EVERY) =>
+            {
+                !self.consent.debugger_in_flight()
+            }
+            Some(_) => return,
+        };
         let offered = self
             .native_runtime
             .instance_by_kind(crate::native_app::AppKind::SystemState)
@@ -1127,10 +1143,15 @@ impl App {
                 matches!(self.native_runtime.app(instance),
                     Some(crate::native_app::NativeApp::SystemState(state)) if state.can_open_access(Access::Debugger))
             });
-        if offered {
-            // Dispatches the reading; its wake observes it ([`App::on_debugger_probe_ready`]).
-            let _ = self.consent.debugger(gate);
+        if !offered {
+            return;
         }
+        if retire {
+            self.consent.invalidate_debugger();
+        }
+        // Dispatches the reading unless one is out (or ends one that never started); its wake
+        // observes it ([`App::on_debugger_probe_ready`]).
+        let _ = self.consent.debugger(gate);
     }
 
     /// A new access revision approved while aterm runs (Permissions off and on, or Set up)

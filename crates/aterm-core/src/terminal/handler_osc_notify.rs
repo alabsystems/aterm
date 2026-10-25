@@ -33,6 +33,9 @@ impl TerminalHandler<'_> {
         if message.is_empty() {
             return;
         }
+        if self.notifications.callback.is_none() || !self.notifications.admits(self.program_state) {
+            return;
+        }
         if let Some(ref mut callback) = self.notifications.callback {
             callback(&message);
         }
@@ -107,7 +110,10 @@ impl TerminalHandler<'_> {
         }
 
         if done {
-            if entry.has_content() {
+            if entry.has_content()
+                && self.notifications.advanced_callback.is_some()
+                && self.notifications.admits(self.program_state)
+            {
                 if let Some(ref mut callback) = self.notifications.advanced_callback {
                     callback(entry);
                 }
@@ -145,6 +151,11 @@ impl TerminalHandler<'_> {
             body,
             urgency: NotificationUrgency::Normal,
         };
+        if self.notifications.advanced_callback.is_none()
+            || !self.notifications.admits(self.program_state)
+        {
+            return;
+        }
         if let Some(ref mut callback) = self.notifications.advanced_callback {
             callback(notification);
         }
@@ -507,5 +518,72 @@ mod tests {
                 "the gate decides delivery, not the count"
             );
         }
+    }
+
+    /// The host's admission is asked once per notification a callback would take, with the
+    /// program's own report as it stands at that byte: one written before the notification is
+    /// taken, one after it in the same output is not yet. A `false` reaches neither callback.
+    #[test]
+    fn the_admission_sees_the_report_standing_at_the_notifications_byte() {
+        use crate::terminal::program_state::ProgramStateWord as W;
+        let mut term = Terminal::new(24, 80);
+        let asked = Arc::new(Mutex::new(Vec::<(u64, Option<W>)>::new()));
+        let fired = Arc::new(Mutex::new(Vec::<String>::new()));
+        let refuse_seq = Arc::new(Mutex::new(None::<u64>));
+        let (a, r) = (Arc::clone(&asked), Arc::clone(&refuse_seq));
+        term.set_notification_admission(move |report| {
+            a.lock()
+                .expect("poisoned")
+                .push((report.seq, report.state.map(|s| s.state)));
+            *r.lock().expect("poisoned") != Some(report.seq)
+        });
+        let (f, g) = (Arc::clone(&fired), Arc::clone(&fired));
+        term.set_notification_callback(move |m| f.lock().expect("poisoned").push(m.to_string()));
+        term.set_advanced_notification_callback(move |n| {
+            g.lock()
+                .expect("poisoned")
+                .push(n.body.or(n.title).unwrap_or_default());
+        });
+        term.authorize_notifications();
+        term.process(b"\x1b]7501;state=working:app=codex\x1b\\");
+        term.process(
+            b"\x1b]9;Approval requested: rm\x07\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\",
+        );
+        term.process(b"\x1b]9;late\x07");
+        *refuse_seq.lock().expect("poisoned") = Some(2);
+        term.process(b"\x1b]9;refused\x07\x1b]99;i=1;refused\x07\x1b]777;notify;T;refused\x07");
+        term.process(b"\x1b]7501;state=working:app=codex\x1b\\\x1b]777;notify;T;after\x07");
+        assert_eq!(
+            *asked.lock().expect("poisoned"),
+            vec![
+                (1, Some(W::Working)),
+                (2, Some(W::Blocked)),
+                (2, Some(W::Blocked)),
+                (2, Some(W::Blocked)),
+                (2, Some(W::Blocked)),
+                (3, Some(W::Working)),
+            ],
+            "each notification is judged by the report before it, never one after it"
+        );
+        assert_eq!(
+            *fired.lock().expect("poisoned"),
+            vec!["Approval requested: rm", "late", "after"],
+            "a refused notification reaches neither callback"
+        );
+        let mut quiet = Terminal::new(24, 80);
+        let asked_quiet = Arc::new(Mutex::new(0_u32));
+        let q = Arc::clone(&asked_quiet);
+        quiet.set_notification_admission(move |_| {
+            *q.lock().expect("poisoned") += 1;
+            true
+        });
+        quiet.process(b"\x1b]9;not allowed\x07");
+        quiet.authorize_notifications();
+        quiet.process(b"\x1b]9;no callback\x07");
+        assert_eq!(
+            *asked_quiet.lock().expect("poisoned"),
+            0,
+            "only a notification a callback would take is asked about"
+        );
     }
 }

@@ -47,10 +47,13 @@ dirs, a private control socket, a lifeline; ended by its process group, never by
 Per instance <name> = <style-slug>-<theme>[-<scenario>] (typing has no suffix): <name>.<frame>.png and its
 .clean.png, .cursor.txt and .text.txt; <name>.frames.tsv (frame, ms since the instance came up, @event rows);
 <name>.dims.txt, .status.txt, .status-end.txt (`trail status`), .admissions.txt (`trail 40`), .gui.log; and
-gallery.pids. The crate's documentation (crates/aterm-lab/src/trail_gallery.rs) has the frames of each scenario
-and which scenario each check uses.
+gallery.pids. Each terminal frame also keeps its .status.txt and image metadata. The open `redraw-stall`
+frame has .read-notes.txt instead of cursor/text reads, which would wait for the very frame the fixture
+has not yet closed. Its restored frame reports whether an enabled rainbow ribbon was still live;
+an inconclusive return is retained and exits 1, not counted as a continuity pass.
 
-exit: 0 every frame taken and every instance ended; 1 a frame or an instance failed, or one outlived the run;
+exit: 0 every frame taken and every instance ended; 1 a frame or an instance failed, a redraw return was
+inconclusive, or an instance outlived the run;
 2 usage; 3 not run (no aterm, no roster)
 ";
 
@@ -645,6 +648,177 @@ fn reply_text(r: &Reply) -> String {
     format!("{}{}", r.stdout, r.stderr)
 }
 
+#[derive(Clone, Copy)]
+enum ReplyShape {
+    Line,
+    Counted,
+}
+
+fn relay_reply<S: std::io::Read + std::io::Write>(
+    wire: &mut RelayClient<S>,
+    request: &[&str],
+    shape: ReplyShape,
+) -> std::io::Result<Reply> {
+    let line = request.join(" ");
+    let (header, body) = match shape {
+        ReplyShape::Line => (wire.request_line(&line)?, None),
+        ReplyShape::Counted => {
+            let (header, body) = wire.request_counted(&line)?;
+            (header, Some(body))
+        }
+    };
+    let ok = header == "OK" || header.starts_with("OK ");
+    Ok(match (ok, body) {
+        (true, Some(body)) => Reply {
+            code: 0,
+            stdout: body,
+            stderr: format!("{header}\n"),
+        },
+        (true, None) => Reply {
+            code: 0,
+            stdout: format!("{header}\n"),
+            stderr: String::new(),
+        },
+        (false, _) => Reply {
+            code: 1,
+            stdout: String::new(),
+            stderr: format!("{header}\n"),
+        },
+    })
+}
+
+/// The counted `image --meta --bytes` body; unlike a filename reply, it needs no artifact ACK.
+fn image_bytes(body: &str) -> Result<(Vec<u8>, &str), String> {
+    let limit = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
+    let mut lines = body.lines();
+    let metadata = lines.next().ok_or("image metadata is missing")?;
+    if metadata.len() > limit || !metadata.starts_with("image-meta ") {
+        return Err("image metadata is missing or exceeds its bound".into());
+    }
+    let payload = lines.next().ok_or("image bytes are missing")?;
+    if payload.len() > limit || lines.next().is_some() {
+        return Err("image payload exceeds its line bound or has extra rows".into());
+    }
+    let mut fields = payload.split_whitespace();
+    let number = |token: Option<&str>| token.and_then(|s| s.parse::<usize>().ok());
+    let width = number(fields.next())
+        .filter(|&n| n > 0)
+        .ok_or("bad image width")?;
+    let height = number(fields.next())
+        .filter(|&n| n > 0)
+        .ok_or("bad image height")?;
+    let declared = number(fields.next())
+        .filter(|&n| n <= limit)
+        .ok_or("bad image length")?;
+    let encoded = fields.next().ok_or("image base64 is missing")?;
+    if fields.next().is_some() || aterm_codec::base64::encoded_len(declared) != Some(encoded.len())
+    {
+        return Err("image encoded length does not match its declaration".into());
+    }
+    let png = aterm_codec::base64::decode(encoded).map_err(|e| format!("image base64: {e}"))?;
+    if png.len() != declared {
+        return Err("image byte length does not match its declaration".into());
+    }
+    {
+        let reader = aterm_png::Decoder::new(std::io::Cursor::new(&png))
+            .read_info()
+            .map_err(|e| format!("image PNG: {e}"))?;
+        if usize::try_from(reader.info().width).ok() != Some(width)
+            || usize::try_from(reader.info().height).ok() != Some(height)
+        {
+            return Err("image PNG dimensions do not match its declaration".into());
+        }
+    }
+    Ok((png, metadata))
+}
+
+#[derive(Clone, Copy)]
+enum FrameRead {
+    Whole,
+    Open,
+    Returned,
+}
+
+struct FrameEvidence {
+    status: Reply,
+    cursor: Option<Reply>,
+    text: Option<Reply>,
+}
+
+fn frame_evidence(
+    phase: FrameRead,
+    mut request: impl FnMut(&[&str], ReplyShape) -> Reply,
+) -> FrameEvidence {
+    let status = request(&["trail", "status"], ReplyShape::Counted);
+    let (cursor, text) = if matches!(phase, FrameRead::Open) {
+        (None, None)
+    } else {
+        (
+            Some(request(&["cursor"], ReplyShape::Line)),
+            Some(request(&["text"], ReplyShape::Counted)),
+        )
+    };
+    FrameEvidence {
+        status,
+        cursor,
+        text,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReturnMeasurement {
+    NotApplicable,
+    LiveRibbon,
+    Inconclusive,
+}
+
+fn return_measurement(status: &Reply) -> Result<ReturnMeasurement, String> {
+    if status.code != 0 {
+        return Err(format!(
+            "could not read the returning frame's trail: {}",
+            reply_text(status)
+        ));
+    }
+    let field = |key: &str| {
+        status
+            .stdout
+            .split_whitespace()
+            .find_map(|word| {
+                word.strip_prefix(key)
+                    .and_then(|rest| rest.strip_prefix('='))
+            })
+            .ok_or_else(|| format!("trail status has no {key}"))
+    };
+    let boolean = |key| match field(key)? {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("trail status has invalid {key}")),
+    };
+    let resolved = field("resolved")?;
+    let enabled = boolean("config_enabled")?;
+    let effective = boolean("effective")?;
+    let intensity = field("intensity")?
+        .parse::<f32>()
+        .ok()
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .ok_or("trail status has invalid intensity")?;
+    if resolved != "rainbow-kitty" || !enabled || !effective || intensity == 0.0 {
+        return Ok(ReturnMeasurement::NotApplicable);
+    }
+    let count = |key| {
+        field(key)?
+            .parse::<u64>()
+            .map_err(|_| format!("trail status has invalid {key}"))
+    };
+    let segments = count("ribbon_segments")?;
+    let drawn = count("ribbon_drawn")?;
+    Ok(if segments > 0 && drawn > 0 {
+        ReturnMeasurement::LiveRibbon
+    } else {
+        ReturnMeasurement::Inconclusive
+    })
+}
+
 /// One instance's capture: its clock, its held connection and its tallies.
 struct Shot<'a> {
     inst: &'a Instance,
@@ -660,6 +834,7 @@ struct Shot<'a> {
     clean: bool,
     frames: u32,
     fails: u32,
+    inconclusive: u32,
 }
 
 impl Shot<'_> {
@@ -686,6 +861,25 @@ impl Shot<'_> {
 
     fn since_start(&self, t: Instant) -> u128 {
         t.duration_since(self.start).as_millis()
+    }
+
+    fn request(&mut self, request: &[&str], shape: ReplyShape) -> Reply {
+        if let Some(wire) = self.wire.as_mut() {
+            match relay_reply(wire, request, shape) {
+                Ok(reply) => return reply,
+                Err(e) => {
+                    self.wire = None;
+                    self.note(&format!(
+                        "the held control connection failed ({e}); using `ctl` client runs from here"
+                    ));
+                    self.row(&format!(
+                        "@transport-client\t{}",
+                        self.since_start(Instant::now())
+                    ));
+                }
+            }
+        }
+        self.inst.ctl(request)
     }
 
     /// A frame rendered and thrown away, so time passes for the effects.
@@ -733,32 +927,44 @@ impl Shot<'_> {
         }
     }
 
-    /// `ctl image …` (`OK <w> <h> <path>`, a file under the instance's
-    /// socket dir), copied to `dest` at once.
-    fn grab(&mut self, request: &[&str], dest: &Path) -> bool {
-        let r = self.inst.ctl(request);
-        let line = r.stdout.lines().next().unwrap_or("");
-        let parts: Vec<&str> = line.splitn(4, ' ').collect();
-        let copied = match parts.as_slice() {
-            ["OK", _, _, path] => std::fs::copy(path.trim(), dest).is_ok(),
-            _ => false,
+    /// Capture inline PNG bytes without the filename form's artifact acknowledgement.
+    fn grab(&mut self, clean: bool, dest: &Path) -> bool {
+        let request = if clean {
+            &["image", "clean", "--meta", "--bytes"][..]
+        } else {
+            &["image", "--meta", "--bytes"][..]
         };
-        if !copied {
+        let reply = self.request(request, ReplyShape::Counted);
+        let saved = (|| {
+            if reply.code != 0 {
+                return Err(reply_text(&reply));
+            }
+            let (png, metadata) = image_bytes(&reply.stdout)?;
+            std::fs::write(dest, png).map_err(|e| format!("{}: {e}", dest.display()))?;
+            let meta = dest.with_extension("image-meta.txt");
+            std::fs::write(&meta, format!("{metadata}\n"))
+                .map_err(|e| format!("{}: {e}", meta.display()))
+        })();
+        if let Err(error) = &saved {
             self.note(&format!(
                 "{} failed: {}",
                 request.join(" "),
-                reply_text(&r).trim_end()
+                error.trim_end()
             ));
             self.fails += 1;
         }
-        copied
+        saved.is_ok()
     }
 
     /// A kept frame, its row in frames.tsv, and its sidecars.
     fn snap(&mut self, frame: &str) {
+        self.snap_phase(frame, FrameRead::Whole);
+    }
+
+    fn snap_phase(&mut self, frame: &str, phase: FrameRead) {
         let t = Instant::now();
         let dest = self.path(&format!("{frame}.png"));
-        if !self.grab(&["image", &format!("{frame}.png")], &dest) {
+        if !self.grab(false, &dest) {
             return;
         }
         self.frames += 1;
@@ -767,11 +973,48 @@ impl Shot<'_> {
         if !self.terminal {
             return;
         }
-        self.keep(&format!("{frame}.cursor.txt"), &self.inst.ctl(&["cursor"]));
-        self.keep(&format!("{frame}.text.txt"), &self.inst.ctl(&["text"]));
+        let evidence = frame_evidence(phase, |request, shape| self.request(request, shape));
+        self.keep(&format!("{frame}.status.txt"), &evidence.status);
+        match evidence.cursor {
+            Some(reply) => self.keep(&format!("{frame}.cursor.txt"), &reply),
+            None => self.keep(&format!("{frame}.read-notes.txt"), &Reply {
+                stdout: "cursor/text were not requested: DEC 2026 is deliberately open; whole-frame reads would delay its release. No later state is substituted.\n".into(),
+                ..Reply::default()
+            }),
+        }
+        if let Some(reply) = evidence.text {
+            self.keep(&format!("{frame}.text.txt"), &reply);
+        }
+        if matches!(phase, FrameRead::Returned) {
+            let note = match return_measurement(&evidence.status) {
+                Ok(ReturnMeasurement::NotApplicable) => {
+                    "not applicable: no effective enabled rainbow ribbon was requested"
+                }
+                Ok(ReturnMeasurement::LiveRibbon) => {
+                    "measurable: a live ribbon remains at return capture; continuity has not been judged"
+                }
+                Ok(ReturnMeasurement::Inconclusive) => {
+                    self.inconclusive += 1;
+                    self.note("inconclusive: no live ribbon at return capture");
+                    "inconclusive: no live ribbon at return capture; expiry or another rendering cause cannot be distinguished by this frame"
+                }
+                Err(error) => {
+                    self.fails += 1;
+                    self.note(&error);
+                    "unmeasured: the returning frame's trail status could not be validated"
+                }
+            };
+            self.keep(
+                &format!("{frame}.measurement.txt"),
+                &Reply {
+                    stdout: format!("{note}\n"),
+                    ..Reply::default()
+                },
+            );
+        }
         if self.clean {
             let dest = self.path(&format!("{frame}.clean.png"));
-            self.grab(&["image", "clean", &format!("{frame}.clean.png")], &dest);
+            self.grab(true, &dest);
         }
     }
 
@@ -958,16 +1201,18 @@ impl Shot<'_> {
                 self.press("ctrl+g");
                 self.mark("redraw-start");
                 self.tick_until(500, Duration::from_millis(16))?;
-                self.snap("stalled");
+                self.snap_phase("stalled", FrameRead::Open);
                 self.press("ctrl+g");
-                let ready = self
-                    .inst
-                    .ctl(&["await", "match", "redraw restored", "timeout=60000"]);
+                self.mark("redraw-return");
+                let ready = self.request(
+                    &["await", "match", "redraw.restored", "timeout=60000"],
+                    ReplyShape::Line,
+                );
                 if ready.code != 0 {
                     self.note("the redraw fixture did not restore its text");
                     self.fails += 1;
                 }
-                self.snap("restored");
+                self.snap_phase("restored", FrameRead::Returned);
             }
             Scenario::FoldRest => {
                 self.tick();
@@ -986,7 +1231,8 @@ impl Shot<'_> {
                     self.press(key);
                 }
                 sleep(40)?;
-                let ready = self.inst.ctl(&["await", "match", "z", "timeout=60000"]);
+                let ready =
+                    self.request(&["await", "match", "z", "timeout=60000"], ReplyShape::Line);
                 if ready.code != 0 {
                     self.note("the fold fixture did not echo its final glyph");
                     self.fails += 1;
@@ -1020,6 +1266,7 @@ struct Gallery {
     instances: u32,
     frames: u32,
     fails: u32,
+    inconclusive: u32,
 }
 
 impl Gallery {
@@ -1142,7 +1389,7 @@ impl Gallery {
         let name = instance_name(style, theme, scenario);
         remove_named(&self.out, &name);
         self.instances += 1;
-        let before = self.fails;
+        let before = (self.fails, self.inconclusive);
         let (c, l, f) = scenario.grid();
         let grid = (
             a.columns.unwrap_or(c),
@@ -1167,8 +1414,10 @@ impl Gallery {
                 self.end(live, &name);
             }
         }
-        if self.fails == before {
+        if (self.fails, self.inconclusive) == before {
             println!("[{name}] done");
+        } else if self.fails == before.0 {
+            println!("[{name}] INCONCLUSIVE");
         } else {
             println!("[{name}] FAILED");
         }
@@ -1201,22 +1450,28 @@ impl Gallery {
             clean: self.clean,
             frames: 0,
             fails: 0,
+            inconclusive: 0,
         };
         if shot.tsv.is_none() {
             shot.note(&format!("cannot write {}", tsv_path.display()));
             shot.fails += 1;
         }
-        shot.keep("status.txt", &inst.ctl(&["trail", "status"]));
+        let status = shot.request(&["trail", "status"], ReplyShape::Counted);
+        shot.keep("status.txt", &status);
         if shot.terminal {
-            shot.keep("dims.txt", &inst.ctl(&["dims"]));
+            let dims = shot.request(&["dims"], ReplyShape::Line);
+            shot.keep("dims.txt", &dims);
         }
         let ran = shot.run(scenario);
         if ran.is_ok() {
-            shot.keep("status-end.txt", &inst.ctl(&["trail", "status"]));
-            shot.keep("admissions.txt", &inst.ctl(&["trail", "40"]));
+            let status = shot.request(&["trail", "status"], ReplyShape::Counted);
+            shot.keep("status-end.txt", &status);
+            let admissions = shot.request(&["trail", "40"], ReplyShape::Counted);
+            shot.keep("admissions.txt", &admissions);
         }
         self.frames += shot.frames;
         self.fails += shot.fails;
+        self.inconclusive += shot.inconclusive;
         ran
     }
 
@@ -1299,6 +1554,7 @@ pub fn cmd_trail_gallery(args: &[String]) -> Res {
         instances: 0,
         frames: 0,
         fails: 0,
+        inconclusive: 0,
     };
     let styles = if a.styles.is_empty() {
         let r = g.roster()?;
@@ -1316,13 +1572,14 @@ pub fn cmd_trail_gallery(args: &[String]) -> Res {
     }
     let alive = g.survivors();
     println!(
-        "trail-gallery: {} instance(s), {} frame(s), {} failure(s), {alive} left running -> {}",
+        "trail-gallery: {} instance(s), {} frame(s), {} failure(s), {} inconclusive return(s), {alive} left running -> {}",
         g.instances,
         g.frames,
         g.fails,
+        g.inconclusive,
         g.out.display()
     );
-    Ok(i32::from(alive > 0 || g.fails > 0))
+    Ok(i32::from(alive > 0 || g.fails > 0 || g.inconclusive > 0))
 }
 
 #[cfg(test)]

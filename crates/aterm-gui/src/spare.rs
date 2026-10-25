@@ -4303,7 +4303,7 @@ impl App {
                 proxy,
                 session.id,
                 window,
-                &session.ctx.witness,
+                &session.ctx,
             );
         }
         session._pty_census = crate::metrics::PtyCensus::counted();

@@ -3,6 +3,7 @@
 
 use super::*;
 use aterm_cli::macos_doctor::ProvisionalSetupWatchTest;
+use aterm_types::macos_setup::Selection;
 
 struct ScratchUpgrade<'a, 'root> {
     setup: &'a mut ProvisionalSetupWatchTest<'root>,
@@ -61,6 +62,103 @@ fn require_owed_after_publish(setup: &ProvisionalSetupWatchTest<'_>) {
         !settle_setup_stop(Duration::ZERO),
         "the published upgrade still owes its exact target's Stop"
     );
+}
+
+fn completed_before_queued_stop(root: &std::path::Path) -> ProvisionalSetupWatchTest<'_> {
+    let setup = ProvisionalSetupWatchTest::new(root).unwrap();
+    let original = setup.snapshot().unwrap().revision;
+    change(|script| script.stop_root = Some(root.to_owned()));
+    register_admitted_run(original, send_admission(), false, None);
+    // The page accepted Stop from the last running frame. The worker finishes
+    // and releases its registration before the host delivers that intent.
+    with_setup_run(original, || {});
+    assert_eq!(setup_run(), None);
+    assert!(setup.snapshot().unwrap().finished);
+    assert!(
+        settle_setup_stop(Duration::ZERO),
+        "a completed registration is evidence, not an outstanding Stop"
+    );
+    assert!(script().stop_attempts.is_empty());
+    let _ = stop_initial_setup();
+    wait_until("the queued Stop finishes saving", stop_worker_idle);
+    setup
+}
+
+#[test]
+fn watch_stop_handoff_a_queued_stop_after_registration_ends_holds_the_idle_watch() {
+    let _globals = globals();
+    for refused_choice in [false, true] {
+        let _io = TestIo::install();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut setup = completed_before_queued_stop(root.path());
+        let original = setup.snapshot().unwrap().revision;
+        if refused_choice {
+            let plan = setup.snapshot().unwrap().plan;
+            let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(false);
+            assert!(restart_initial_setup(plan, false, None, receipt));
+            assert_eq!(answer.recv_timeout(HANG), Ok(false));
+            wait_until("the refused newer choice releases its slot", || {
+                !INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire)
+            });
+            assert_eq!(script().persists, 1);
+            assert_eq!(setup.snapshot().unwrap().revision, original);
+        }
+        let before = setup.snapshot().unwrap().observation;
+        let looked = look_setup_upgrade_with(
+            &mut Widened::default(),
+            &mut ScratchUpgrade {
+                setup: &mut setup,
+                fault: None,
+                after: |_| {},
+                unread: false,
+                lose_publication: None,
+            },
+        );
+        assert_eq!(
+            setup.snapshot().unwrap().observation,
+            before,
+            "a queued Stop must hold the completed predecessor's later idle look"
+        );
+        assert_eq!(looked.unwrap(), None);
+        assert!(script().runs.is_empty());
+        assert!(settle_setup_stop(Duration::ZERO));
+    }
+}
+
+#[test]
+fn watch_stop_handoff_a_new_accepted_resume_rearms_after_the_late_queued_stop() {
+    let _globals = globals();
+    let _io = TestIo::install();
+    let root = aterm_tempfile::tempdir().unwrap();
+    let mut setup = completed_before_queued_stop(root.path());
+    let original = setup.snapshot().unwrap().revision;
+    let sent = send_admission();
+    let resumed = setup.resume().unwrap();
+    assert_eq!(resumed, original + 1);
+    register_admitted_run(resumed, sent, false, None);
+    with_setup_run(resumed, || {});
+    assert!(!setup_stop_requested(resumed));
+    let looked = look_setup_upgrade_with(
+        &mut Widened::default(),
+        &mut ScratchUpgrade {
+            setup: &mut setup,
+            fault: None,
+            after: |_| {},
+            unread: false,
+            lose_publication: None,
+        },
+    );
+    assert_eq!(looked.unwrap(), Some(resumed + 1));
+    let current = setup.snapshot().unwrap();
+    assert_eq!(current.revision, resumed + 1);
+    assert_eq!(current.plan.selection, Selection::all());
+    assert!(!current.finished && current.permissions_allowed);
+    assert!(script().stops.iter().all(|stopped| *stopped < resumed));
+    assert!(
+        script().runs.is_empty(),
+        "the look only admits its real target"
+    );
+    assert!(settle_setup_stop(Duration::ZERO));
 }
 
 #[test]

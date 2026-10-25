@@ -25,7 +25,7 @@ default-members = [
     "crates/aterm-gpu-web", "crates/aterm-grapheme", "crates/aterm-grid",
     "crates/aterm-gui", "crates/aterm-gui-consent", "crates/aterm-gui-documents",
     "crates/aterm-gui-fabric", "crates/aterm-gui-tabs", "crates/aterm-gui-timing",
-    "crates/aterm-hash", "crates/aterm-http", "crates/aterm-jpeg", "crates/aterm-json",
+    "crates/aterm-hash", "crates/aterm-http", "crates/aterm-journal", "crates/aterm-jpeg", "crates/aterm-json",
     "crates/aterm-keeper", "crates/aterm-lexicon", "crates/aterm-libc", "crates/aterm-libm",
     "crates/aterm-link", "crates/aterm-log", "crates/aterm-machines", "crates/aterm-log-shim", "crates/aterm-lz4",
     "crates/aterm-macro-support", "crates/aterm-messages", "crates/aterm-net", "crates/aterm-objc",
@@ -80,7 +80,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.136.0"
+version = "0.137.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -167,6 +167,7 @@ aterm-hash = { path = "crates/aterm-hash" }
 # Deadline-bounded TLS stream verified against the OS trust store
 # (`crates/aterm-http/src/verifier.rs`).
 aterm-http = { path = "crates/aterm-http" }
+aterm-journal = { path = "crates/aterm-journal" }
 # Baseline and progressive Huffman JPEG decoder.
 aterm-jpeg = { path = "crates/aterm-jpeg" }
 # First-party JSON serde Deserializer/Serializer, `Value`, and `json!`.

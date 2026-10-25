@@ -134,6 +134,7 @@ fn point(
         answered: None,
         worked_doubt: Duration::ZERO,
         ran_tools: worked.is_some_and(|w| w >= LONG),
+        tools_unread: false,
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(dirty.then(finding)),

@@ -35,15 +35,18 @@ impl EditorWorkspace {
             .is_some_and(|history| !history.redo.is_empty())
     }
 
-    /// Take the synchronous mutation lane's most recent commit projection.
-    pub fn take_last_commit(&mut self, document: DocumentId) -> Option<(Seq, Vec<EditDelta>)> {
-        let (committed_document, seq, deltas) = self.last_commit.take()?;
-        if committed_document == document {
-            Some((seq, deltas))
-        } else {
-            self.last_commit = Some((committed_document, seq, deltas));
-            None
-        }
+    /// Take every unreported commit of `document` in application order. Each delta list uses its own transaction's coordinates; rebase through the lists separately.
+    pub fn take_commits(&mut self, document: DocumentId) -> Vec<(Seq, Vec<EditDelta>)> {
+        let mut commits = Vec::new();
+        self.pending_commits.retain_mut(|(committed, seq, deltas)| {
+            if *committed == document {
+                commits.push((*seq, std::mem::take(deltas)));
+                false
+            } else {
+                true
+            }
+        });
+        commits
     }
 
     pub(super) fn apply_recorded(
@@ -57,7 +60,8 @@ impl EditorWorkspace {
         let redo = edits.clone();
         let (seq, deltas) = transact(store, view.document, view.anchor_seq, edits)?;
         view.observe_own(seq, &deltas);
-        self.last_commit = Some((view.document, seq, deltas.clone()));
+        self.pending_commits
+            .push((view.document, seq, deltas.clone()));
         self.rebase_marks(view.document, &deltas);
         let history = self.histories.entry(view.document).or_default();
         history.undo.push(HistoryFrame {
@@ -95,7 +99,8 @@ impl EditorWorkspace {
         }
         let (seq, deltas) = transact(store, view.document, current, frame.undo.clone())?;
         view.observe_own(seq, &deltas);
-        self.last_commit = Some((view.document, seq, deltas.clone()));
+        self.pending_commits
+            .push((view.document, seq, deltas.clone()));
         self.rebase_marks(view.document, &deltas);
         let history = self.histories.entry(view.document).or_default();
         if let Some(next) = history.undo.last_mut() {
@@ -135,7 +140,8 @@ impl EditorWorkspace {
         }
         let (seq, deltas) = transact(store, view.document, current, frame.redo.clone())?;
         view.observe_own(seq, &deltas);
-        self.last_commit = Some((view.document, seq, deltas.clone()));
+        self.pending_commits
+            .push((view.document, seq, deltas.clone()));
         self.rebase_marks(view.document, &deltas);
         let history = self.histories.entry(view.document).or_default();
         if let Some(next) = history.redo.last_mut() {
@@ -250,5 +256,70 @@ mod tests {
             .unwrap();
         assert!(workspace.can_undo(document));
         assert!(!workspace.can_redo(document));
+    }
+
+    #[test]
+    fn commit_publication_keeps_document_and_undo_redo_transaction_boundaries() {
+        let (mut store, mut workspace, mut view, document) = editor("abc");
+        let other_document = store.open("mem://other".to_string(), "other".to_string());
+        let mut other = workspace
+            .attach(&mut store, other_document, crate::store::DocumentViewId(92))
+            .unwrap();
+        workspace.insert_text(&mut store, &mut view, "x").unwrap();
+        let inserted = store.snapshot(document).unwrap().seq;
+        workspace.insert_text(&mut store, &mut other, "y").unwrap();
+        let other_seq = store.snapshot(other_document).unwrap().seq;
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::Undo)
+            .unwrap();
+        let undone = store.snapshot(document).unwrap().seq;
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::Redo)
+            .unwrap();
+        let redone = store.snapshot(document).unwrap().seq;
+
+        assert_eq!(
+            workspace.take_commits(document),
+            vec![
+                (
+                    inserted,
+                    vec![EditDelta {
+                        old: 0..0,
+                        inserted_len: 1
+                    }]
+                ),
+                (
+                    undone,
+                    vec![EditDelta {
+                        old: 0..1,
+                        inserted_len: 0
+                    }]
+                ),
+                (
+                    redone,
+                    vec![EditDelta {
+                        old: 0..0,
+                        inserted_len: 1
+                    }]
+                ),
+            ]
+        );
+        assert!(workspace.take_commits(document).is_empty());
+        assert_eq!(
+            workspace.take_commits(other_document),
+            vec![(
+                other_seq,
+                vec![EditDelta {
+                    old: 0..0,
+                    inserted_len: 1
+                }]
+            )]
+        );
+        assert!(workspace.take_commits(other_document).is_empty());
+        assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "xabc");
+        assert_eq!(
+            store.snapshot(other_document).unwrap().text.as_ref(),
+            "yother"
+        );
     }
 }

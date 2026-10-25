@@ -800,6 +800,7 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         worked_doubt: Duration::ZERO,
         // A turn of real work ran a tool.
         ran_tools: worked.is_some_and(|w| w >= REAL_WORK),
+        tools_unread: false,
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,

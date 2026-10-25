@@ -52,6 +52,13 @@ impl Unit {
     pub const fn is_blank(self) -> bool {
         self.ch == ' '
     }
+
+    /// True when two glyph units match in char and wide-cell role.
+    #[inline]
+    #[must_use]
+    pub const fn eq(self, other: Self) -> bool {
+        self.ch == other.ch && self.wide == other.wide && self.cont == other.cont
+    }
 }
 
 /// The glyph unit at `col` of a sampled row.
@@ -87,46 +94,79 @@ pub const fn unit_at(cols: &[char], col: u16) -> Unit {
 
 type ShiftCell = (u16, Option<Unit>, bool);
 
-fn find_shift(cells: &[ShiftCell], cols: &[char], caret: Option<u16>) -> Option<(u16, u16, i16)> {
-    let s = cells.iter().position(|c| c.2)?;
+const fn find_shift(
+    cells: &[ShiftCell],
+    cols: &[char],
+    caret: Option<u16>,
+) -> Option<(u16, u16, i16)> {
+    let mut s_opt = None;
+    let mut idx = 0;
+    while idx < cells.len() {
+        if cells[idx].2 {
+            s_opt = Some(idx);
+            break;
+        }
+        idx += 1;
+    }
+    let Some(s) = s_opt else {
+        return None;
+    };
     let (scol, sunit, _) = cells[s];
-    let sunit = sunit?;
-    let width = u16::try_from(cols.len()).unwrap_or(u16::MAX);
-    let reach = width.min(scol.saturating_add(SHIFT_MAX_COLS));
-    for x in scol.saturating_add(1)..reach {
-        if unit_at(cols, x) != sunit {
+    let Some(sunit) = sunit else {
+        return None;
+    };
+    let width = if cols.len() <= u16::MAX as usize {
+        cols.len() as u16
+    } else {
+        u16::MAX
+    };
+    let max_reach = scol.saturating_add(SHIFT_MAX_COLS);
+    let reach = if width < max_reach { width } else { max_reach };
+    let mut x = scol.saturating_add(1);
+    while x < reach {
+        if !unit_at(cols, x).eq(sunit) {
+            x += 1;
             continue;
         }
-        let Ok(dc) = i16::try_from(x - scol) else {
+        let span = x - scol;
+        if span > i16::MAX as u16 {
             break;
-        };
+        }
+        let dc = span as i16;
         if let Some(v) = shift_block(cells, cols, s, dc, caret) {
             return Some(v);
         }
+        x += 1;
     }
     None
 }
 
-fn shift_block(
+const fn shift_block(
     cells: &[ShiftCell],
     cols: &[char],
     b: usize,
     dc: i16,
     caret: Option<u16>,
 ) -> Option<(u16, u16, i16)> {
-    let at = |col: u16| {
-        col.checked_add_signed(dc)
-            .map_or(Unit::BLANK, |c| unit_at(cols, c))
-    };
+    #[inline]
+    const fn at(cols: &[char], dc: i16, col: u16) -> Unit {
+        match col.checked_add_signed(dc) {
+            Some(c) => unit_at(cols, c),
+            None => Unit::BLANK,
+        }
+    }
+
     let mut found = 0usize;
     let mut tail = false;
     let mut hi = None;
     let mut overwritten = false;
-    for (i, &(col, rec, _)) in cells.iter().enumerate().skip(b) {
-        let there = at(col);
+    let mut i = b;
+    while i < cells.len() {
+        let (col, rec, _) = cells[i];
+        let there = at(cols, dc, col);
         match rec {
             Some(unit) => {
-                if !tail && there == unit {
+                if !tail && there.eq(unit) {
                     found += 1;
                     hi = Some(i);
                     overwritten |= !unit_at(cols, col).is_blank();
@@ -137,9 +177,8 @@ fn shift_block(
                 }
             }
             None => {
-                let on_row = col
-                    .checked_add_signed(dc)
-                    .is_some_and(|c| usize::from(c) < cols.len());
+                let on_row =
+                    matches!(col.checked_add_signed(dc), Some(c) if (c as usize) < cols.len());
                 if !tail && on_row && there.is_blank() {
                     hi = Some(i);
                 } else {
@@ -147,20 +186,23 @@ fn shift_block(
                 }
             }
         }
+        i += 1;
     }
-    let hi = hi?;
+    let Some(hi) = hi else {
+        return None;
+    };
     if found == 0 || !overwritten {
         return None;
     }
     let mut lo = b;
     while lo > 0 {
         let (pcol, prec, _) = cells[lo - 1];
-        if pcol.checked_add(1) != Some(cells[lo].0) {
+        if !matches!(pcol.checked_add(1), Some(next) if next == cells[lo].0) {
             break;
         }
-        let there = at(pcol);
+        let there = at(cols, dc, pcol);
         let explained = match prec {
-            Some(unit) => there == unit,
+            Some(unit) => there.eq(unit),
             None => there.is_blank(),
         };
         if !explained {
@@ -168,17 +210,36 @@ fn shift_block(
         }
         lo -= 1;
     }
-    let keyed = caret.and_then(|c| (lo..=b).find(|&i| cells[i].0 == c));
-    let lo = keyed.unwrap_or(lo);
+    let mut keyed = None;
+    if let Some(c) = caret {
+        let mut k = lo;
+        while k <= b {
+            if cells[k].0 == c {
+                keyed = Some(k);
+                break;
+            }
+            k += 1;
+        }
+    }
+    let lo = match keyed {
+        Some(k) => k,
+        None => lo,
+    };
     if found < 2 {
-        let end = cells[hi]
-            .0
-            .checked_add_signed(dc)
-            .map_or(usize::MAX, usize::from);
-        let text_past = cols
-            .iter()
-            .skip(end.saturating_add(1))
-            .any(|&c| c != ' ' && c != '\0');
+        let end = match cells[hi].0.checked_add_signed(dc) {
+            Some(c) => c as usize,
+            None => usize::MAX,
+        };
+        let mut text_past = false;
+        let mut idx = end.saturating_add(1);
+        while idx < cols.len() {
+            let c = cols[idx];
+            if c != ' ' && c != '\0' {
+                text_past = true;
+                break;
+            }
+            idx += 1;
+        }
         if keyed.is_none() || tail || text_past {
             return None;
         }
@@ -752,8 +813,7 @@ impl Witness {
         let mut i = 0;
         while i < armed.len() {
             let (col, unit, _, arrivals) = armed[i];
-            let here_u = unit_at(there, col);
-            let here = here_u.ch == unit.ch && here_u.wide == unit.wide && here_u.cont == unit.cont;
+            let here = unit_at(there, col).eq(unit);
             let twin = arrivals & bit == 0;
             if here && !twin {
                 v.found += 1;
@@ -821,8 +881,7 @@ impl Witness {
                 let mut j = start;
                 while j < armed.len() {
                     let (col, unit, ..) = armed[j];
-                    let u = unit_at(own, col - shift);
-                    if !(u.ch == unit.ch && u.wide == unit.wide && u.cont == unit.cont) {
+                    if !unit_at(own, col - shift).eq(unit) {
                         all_match = false;
                         break;
                     }
@@ -1767,14 +1826,29 @@ impl Witness {
     }
 
     #[inline]
-    fn standing_glyphs_of(&self, run: (u16, u32)) -> &[(u16, u32, u16)] {
-        let lo = self
-            .standing_glyphs
-            .partition_point(|&(r, c, _)| (r, c) < run);
-        let hi = self
-            .standing_glyphs
-            .partition_point(|&(r, c, _)| (r, c) <= run);
-        &self.standing_glyphs[lo..hi]
+    const fn standing_glyphs_of(&self, run: (u16, u32)) -> &[(u16, u32, u16)] {
+        let slice = self.standing_glyphs.as_slice();
+        let mut lo = 0;
+        let mut hi = slice.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (r, c, _) = slice[mid];
+            if r < run.0 || (r == run.0 && c < run.1) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let mut end = lo;
+        while end < slice.len() {
+            let (r, c, _) = slice[end];
+            if r == run.0 && c == run.1 {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        slice.split_at(end).0.split_at(lo).1
     }
 
     fn find_standing_runs(&mut self, cells: &[Cell], retire: &[(u16, u16, Instant)]) {
@@ -1952,8 +2026,7 @@ impl Witness {
                             all_match = false;
                             break;
                         }
-                        let u = unit_at(s.cols, at as u16);
-                        if !(u.ch == b.unit.ch && u.wide == b.unit.wide && u.cont == b.unit.cont) {
+                        if !unit_at(s.cols, at as u16).eq(b.unit) {
                             all_match = false;
                             break;
                         }

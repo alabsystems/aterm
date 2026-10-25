@@ -42,18 +42,20 @@ fn cuts(lines: &[&str]) -> Vec<usize> {
 }
 
 struct Truncated {
-    cut: usize,
     run: Run,
     home: Vec<String>,
     tmp: Vec<String>,
     calls: String,
 }
 
+/// Runs the first <cut> bytes of <text> as bash's whole input, as a `curl | bash` cut
+/// there would, under a scratch home (`cut/<cut>`) with logging stand-ins on PATH. The
+/// prefix goes as a file, which bash reads in blocks (a pipe it reads a byte at a time),
+/// and is removed after.
 fn truncated(scratch: &Scratch, text: &str, cut: usize, shim: &Path) -> Truncated {
     let home = scratch.home(&format!("cut/{cut}"));
     let log = scratch.join(&format!("cut/{cut}/calls.log"));
-    let prefix: String = text.split_inclusive('\n').take(cut).collect();
-    let file = scratch.write(&format!("cut/{cut}/prefix.sh"), prefix);
+    let file = scratch.write(&format!("cut/{cut}/prefix.sh"), &text.as_bytes()[..cut]);
     let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
     cmd.arg("-c")
         .arg(format!("exec {} <{}", q(s(&bash())), q(s(&file))))
@@ -62,26 +64,73 @@ fn truncated(scratch: &Scratch, text: &str, cut: usize, shim: &Path) -> Truncate
     for (key, value) in hermetic(&home, &[("PATH", &path), ("SHIM_LOG", s(&log))]) {
         cmd.env(key, value);
     }
+    let run = run(&mut cmd);
+    std::fs::remove_file(&file).expect("remove the prefix");
     Truncated {
-        cut,
-        run: run(&mut cmd),
+        run,
         home: tree(&home.home),
         tmp: tree(&home.tmp),
         calls: read(&log),
     }
 }
 
+/// The stand-ins a truncated run finds first on PATH: curl and gh log their calls and fail,
+/// and uname says Linux.
+fn shims(scratch: &Scratch) -> std::path::PathBuf {
+    let shim = scratch.mkdir("shim");
+    scratch.stand_in("shim/curl", LOGGER);
+    scratch.stand_in("shim/gh", LOGGER);
+    scratch.stand_in("shim/uname", LINUX_UNAME);
+    shim
+}
+
+/// What a cut run did that an inert one would not, named by <at>: touched its home or
+/// TMPDIR, called a stand-in, or ended other than silently with 0 or by bash's syntax
+/// error (a 2 alone is also `make`'s, with no Makefile to build).
+fn breach(t: &Truncated, at: &str) -> Option<String> {
+    let all = t.run.all();
+    let inert = match t.run.code() {
+        0 => all.is_empty(),
+        2 => all.contains("syntax error") || all.contains("unexpected EOF"),
+        _ => false,
+    };
+    (!(t.home.is_empty() && t.tmp.is_empty() && t.calls.is_empty() && inert)).then(|| {
+        format!(
+            "cut at {at}: exit {:?}, HOME {:?}, TMPDIR {:?}, calls {:?}, output {:?}",
+            t.run.status,
+            t.home,
+            t.tmp,
+            t.calls,
+            t.run.all().lines().next()
+        )
+    })
+}
+
+/// The line cuts of <text> that <select> keeps, as [`breaches`] runs them.
 fn guard_breaches(
     scratch: &Scratch,
     text: &str,
     select: fn(Vec<usize>) -> Vec<usize>,
 ) -> Vec<String> {
-    let shim = scratch.mkdir("shim");
-    scratch.stand_in("shim/curl", LOGGER);
-    scratch.stand_in("shim/gh", LOGGER);
-    scratch.stand_in("shim/uname", LINUX_UNAME);
     let lines: Vec<&str> = text.lines().collect();
-    let cuts = select(cuts(&lines));
+    let ends: Vec<usize> = text
+        .split_inclusive('\n')
+        .scan(0, |at, line| {
+            *at += line.len();
+            Some(*at)
+        })
+        .collect();
+    let cuts = select(cuts(&lines))
+        .into_iter()
+        .map(|cut| (ends[cut - 1], format!("line {cut} ({:?})", lines[cut - 1])))
+        .collect();
+    breaches(scratch, text, cuts)
+}
+
+/// Runs each (byte offset, name) cut of <source>, eight at a time, and names each one
+/// that was not inert ([`breach`]), in the order given.
+fn breaches(scratch: &Scratch, text: &str, cuts: Vec<(usize, String)>) -> Vec<String> {
+    let shim = shims(scratch);
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(Vec::new());
@@ -90,38 +139,19 @@ fn guard_breaches(
             scope.spawn(|| {
                 loop {
                     let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(cut) = cuts.get(at) else { break };
-                    let t = truncated(scratch, text, *cut, &shim);
-                    results.lock().expect("results").push(t);
+                    let Some((cut, name)) = cuts.get(at) else {
+                        break;
+                    };
+                    let found = breach(&truncated(scratch, text, *cut, &shim), name);
+                    results.lock().expect("results").push((at, found));
                 }
             });
         }
     });
     let mut results = results.into_inner().expect("results");
     assert_eq!(results.len(), cuts.len(), "every cut ran");
-    results.sort_by_key(|t| t.cut);
-    results
-        .into_iter()
-        .filter_map(|t| {
-            let inert = match t.run.code() {
-                0 => t.run.all().is_empty(),
-                code => code == 2,
-            };
-            (!(t.home.is_empty() && t.tmp.is_empty() && t.calls.is_empty() && inert))
-                .then(|| {
-                    format!(
-                        "cut at line {} ({:?}): exit {:?}, HOME {:?}, TMPDIR {:?}, calls {:?}, output {:?}",
-                        t.cut,
-                        lines[t.cut - 1],
-                        t.run.status,
-                        t.home,
-                        t.tmp,
-                        t.calls,
-                        t.run.all().lines().next()
-                    )
-                })
-        })
-        .collect()
+    results.sort_by_key(|(at, _)| *at);
+    results.into_iter().filter_map(|(_, found)| found).collect()
 }
 
 #[test]
@@ -129,6 +159,36 @@ fn a_truncated_pipe_runs_nothing() {
     let scratch = Scratch::new();
     let text = std::fs::read_to_string(install_sh()).expect("install.sh");
     let breaches = guard_breaches(&scratch, &text, |all| all);
+    assert!(breaches.is_empty(), "{}", breaches.join("\n"));
+}
+
+/// A cut inside a word runs nothing either: at every byte of each top-level line's first
+/// word, and of the last line, `main "$@"; }`. The file is one group, which bash runs
+/// only once its closing brace has arrived. With main alone wrapped, bash ran the cut
+/// word's first letters as a command: `make` (from make_download_dir) built the
+/// Makefile where the run was started, `bundle` ran bundle install, and a bare
+/// `main "$@"` cut just after `main` ran a whole install with no arguments.
+#[test]
+fn a_cut_inside_a_word_runs_nothing() {
+    let scratch = Scratch::new();
+    let text = std::fs::read_to_string(install_sh()).expect("install.sh");
+    let body = text.trim_end_matches('\n');
+    let last = body.rfind('\n').expect("install.sh has lines") + 1;
+    let mut cuts = Vec::new();
+    let mut start = 0;
+    for line in text.split_inclusive('\n') {
+        let word = if start == last {
+            body.len() - last - 1
+        } else if line.starts_with(|c: char| c.is_whitespace() || c == '#') {
+            0
+        } else {
+            line.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(line.len())
+        };
+        cuts.extend((start + 1..=start + word).map(|at| (at, format!("{:?}", &text[start..at]))));
+        start += line.len();
+    }
+    let breaches = breaches(&scratch, &text, cuts);
     assert!(breaches.is_empty(), "{}", breaches.join("\n"));
 }
 
@@ -163,22 +223,30 @@ print $? & 127 ? "signal " . ($? & 127) : "exit " . ($? >> 8);
 
 /// A Ctrl-C that cuts a `curl | bash` download short ends bash by the signal,
 /// so a script around it stops too. The prefix is every line before the final
-/// `main "$@"`, so it runs every top-level line, and its last line says bash
-/// ran them all. Before, the run's INT trap was set at the top level: bash only
-/// marked it pending, and the cut script ended with status 0, or mid-function
-/// with a syntax error.
+/// `main "$@"; }`, with one before the whole-file group's `{` that says bash has
+/// read that far; nothing in the group has run. Before, the run's INT trap was
+/// set at the top level as the script arrived: bash only marked it pending, and
+/// the cut script ended with status 0, or mid-function with a syntax error.
 #[test]
 fn a_ctrl_c_while_the_script_arrives_ends_it_by_the_signal() {
     let scratch = Scratch::new();
     let text = std::fs::read_to_string(install_sh()).expect("install.sh");
     let lines: Vec<&str> = text.lines().collect();
+    let open = lines
+        .iter()
+        .position(|l| *l == "{")
+        .expect("install.sh opens its whole-file group");
     let last = lines
         .iter()
-        .rposition(|l| *l == "main \"$@\"")
+        .rposition(|l| *l == "main \"$@\"; }")
         .expect("install.sh ends by calling main");
     let mark = scratch.join("ran");
-    let mut prefix = lines[..last].join("\n");
-    prefix.push_str(&format!("\n: >{}\n", q(s(&mark))));
+    let prefix = format!(
+        "{}\n: >{}\n{}\n",
+        lines[..open].join("\n"),
+        q(s(&mark)),
+        lines[open..last].join("\n")
+    );
     let prefix = scratch.write("prefix.sh", prefix);
     let feed = scratch.write("feed.pl", FEED);
     let mut lib = Lib::new();
@@ -441,6 +509,131 @@ fn a_dry_run_over_a_home_that_cannot_be_read_still_plans() {
         let plan = dry.run.all();
         assert_eq!(dry.run.code(), 0, "HOME={home:?}: {plan}");
         assert!(plan.contains("DRY RUN"), "HOME={home:?}: {plan}");
+    }
+}
+
+/// A dry run over a config it cannot read still plans, and says so: the plan's
+/// awk failed, and its bare assignment ended the dry run under `set -e`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_dry_run_over_a_config_it_cannot_read_still_plans() {
+    let scratch = Scratch::new();
+    let fresh = scratch.home("unread");
+    let cfg = fresh.home.join(".config/aterm/aterm.toml");
+    write(&cfg, "[packages]\nauto_install = true\n");
+    let mode = |m: u32| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(m)).expect("chmod");
+    };
+    mode(0o000);
+    let dry = dry_run(&scratch, &fresh, &["--dry-run", "--no-toolchain"]);
+    mode(0o600);
+    let plan = dry.run.all();
+    assert_eq!(dry.run.code(), 0, "{plan}");
+    assert!(
+        plan.contains(&format!("config:   cannot read {}", s(&cfg))),
+        "{plan}"
+    );
+}
+
+/// A dry run says what the run does with the config: that it creates the file or
+/// adds the key exactly where the run then writes it, and that it cannot write it
+/// exactly where the run says to set the key by hand. Both ask the open the run's
+/// write makes (config_write_opens): a read-write one for the insert under a
+/// [packages] table, an appending one for the append of the table, the folder for
+/// a create. The dry run said it adds the key whatever the file's mode; asked by
+/// -w, it said it cannot write a file an ACL lets it append to (deny write), which
+/// the append wrote, and that it adds the key to one an ACL bars appending to
+/// (deny append) and to a folder at the path, where the run wrote nothing. Each
+/// row is a plan, what stands in the way (a mode, macOS's chmod +a, a folder), and
+/// whether the run writes the key; the dry run must say the same.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_dry_run_says_what_the_run_does_with_the_config() {
+    const INSERT: &str = "[packages]\nkeep = 1\n";
+    const APPEND: &str = "x = 1\n";
+    const DENY_WRITE: &str = "chmod +a \"$(id -un) deny write\" \"$cfg\"";
+    const DENY_APPEND: &str = "chmod +a \"$(id -un) deny append\" \"$cfg\"";
+    let rows: [(&str, Option<&str>, &str, bool); 11] = [
+        ("insert", Some(INSERT), "", true),
+        ("insert-444", Some(INSERT), "chmod 444 \"$cfg\"", false),
+        ("insert-deny-write", Some(INSERT), DENY_WRITE, false),
+        ("insert-deny-append", Some(INSERT), DENY_APPEND, true),
+        ("append", Some(APPEND), "", true),
+        ("append-444", Some(APPEND), "chmod 444 \"$cfg\"", false),
+        ("append-deny-write", Some(APPEND), DENY_WRITE, true),
+        ("append-deny-append", Some(APPEND), DENY_APPEND, false),
+        ("folder", None, "mkdir \"$cfg\"", false),
+        ("create", None, "", true),
+        ("create-shut", None, "chmod 555 \"${cfg%/*}\"", false),
+    ];
+    let scratch = Scratch::new();
+    let homes: Vec<Home> = rows.iter().map(|(row, ..)| scratch.home(row)).collect();
+    let cfgs: Vec<String> = homes
+        .iter()
+        .map(|h| s(&h.home.join(".config/aterm/aterm.toml")).to_string())
+        .collect();
+    let mut setup = Lib::new();
+    for ((_, text, guard, _), cfg) in rows.iter().zip(&cfgs) {
+        let text = text.map_or(String::new(), |t| format!("printf {} >\"$cfg\" && ", q(t)));
+        setup.step(format!(
+            "cfg={}; mkdir -p \"${{cfg%/*}}\" && {text}{}",
+            q(cfg),
+            if guard.is_empty() { ":" } else { guard }
+        ));
+    }
+    setup.run(&scratch);
+    let said: Vec<String> = homes
+        .iter()
+        .map(|home| {
+            let plan = dry_run(&scratch, home, &["--dry-run", "--no-toolchain"])
+                .run
+                .all();
+            plan.lines()
+                .find(|l| l.starts_with("  config:"))
+                .unwrap_or(&plan)
+                .to_string()
+        })
+        .collect();
+    let mut lib = Lib::new();
+    let calls: Vec<usize> = cfgs
+        .iter()
+        .map(|cfg| {
+            lib.call(
+                format!(
+                    "cfg={}; s=0; persist_no_toolchain \"$cfg\" >/dev/null 2>&1 || s=$?; \
+                     chmod 755 \"${{cfg%/*}}\"; [[ -d \"$cfg\" ]] || chmod -N \"$cfg\" 2>/dev/null; \
+                     echo \"$s $([[ -f \"$cfg\" ]] && grep -q '^auto_install = false$' \"$cfg\" && echo key || echo none)\"",
+                    q(cfg)
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for (((row, _, _, writes), said), call) in rows.iter().zip(&said).zip(calls) {
+        let dry = if said.contains("cannot write") {
+            false
+        } else {
+            assert!(
+                said.contains("config:   adds") || said.contains("config:   creates"),
+                "{row}: {said}"
+            );
+            true
+        };
+        let ran = recs[call].out == "0 key";
+        assert!(
+            ran || recs[call].out == "1 none",
+            "{row}: {}: {}",
+            recs[call].out,
+            recs[call].err
+        );
+        assert_eq!(
+            (dry, ran),
+            (*writes, *writes),
+            "{row}: the dry run said {said:?}, the run {}",
+            recs[call].out
+        );
     }
 }
 

@@ -5464,12 +5464,49 @@ pub(super) fn session_files_in(claude_dir: &Path) -> Option<Vec<SessionFile>> {
                 claude_dir: Some(claude_dir.to_path_buf()),
                 ..file
             }),
-            Some(file) if !alive(file_pid) && !alive(file.pid) => {}
-            None if !alive(file_pid) => {}
+            Some(file) if !writer_may_live(file_pid) && !writer_may_live(file.pid) => {}
+            None if !writer_may_live(file_pid) => {}
             _ => return None,
         }
     }
     Some(files)
+}
+
+/// Whether `pid` may be this user's live Claude Code, writing the session file it names
+/// ([`session_files_in`]): a signal reaches it, where [`alive`] also counts `EPERM`, another
+/// user's process (root's included) that took the number and keeps the file from being judged;
+/// and, on macOS, it runs as this effective user and is no zombie, which `kill` answers as
+/// alive and [`aterm_uds::process::read_short_info`] does not find. Claude Code's own sweep
+/// removes a stale file only on `ESRCH`, so a file a crash left half-written stays while such a
+/// process holds its number.
+fn writer_may_live(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(p) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        if p <= 0 {
+            return false;
+        }
+        // SAFETY: signal 0 checks existence and permission; nothing is delivered.
+        if unsafe { libc::kill(p, 0) } != 0 {
+            return false;
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            // SAFETY: `geteuid` is a side-effect-free getter.
+            let me = unsafe { libc::geteuid() };
+            aterm_uds::process::read_short_info(p).is_some_and(|info| info.pbsi_uid == me)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            true
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        alive(pid)
+    }
 }
 
 pub(super) const SESSION_ROSTER_RESCAN: Duration = Duration::from_secs(1);
@@ -8067,6 +8104,30 @@ pub(super) fn codex_alab_snapshot(
     args: &atpkg::caller_shell::ProcArgs,
 ) -> Result<super::relaunch::Snapshot, &'static str> {
     codex_alab_drive::snapshot(opts, tab, pid, start, shell, args, &Live)
+}
+
+pub(super) fn codex_alab_snapshot_with_claim(
+    opts: &Opts,
+    tab: &str,
+    pid: u32,
+    start: String,
+    shell: u32,
+    args: &atpkg::caller_shell::ProcArgs,
+    claim: Option<&super::self_claimed::Copy>,
+) -> Result<super::relaunch::Snapshot, &'static str> {
+    match claim {
+        Some(claim) => codex_alab_drive::snapshot_with_claim(
+            opts,
+            tab,
+            pid,
+            start,
+            shell,
+            args,
+            Some(claim),
+            &Live,
+        ),
+        None => codex_alab_snapshot(opts, tab, pid, start, shell, args),
+    }
 }
 
 /// Relaunch a proven self-claimed codex-alab after exit.

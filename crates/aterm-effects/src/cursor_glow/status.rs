@@ -846,7 +846,7 @@ impl CursorGlow {
 
     /// Colour of a seated caret stop (`v2_stop`).
     #[inline]
-    pub(super) fn v2_caret_stop_rgb(t: f32, cfg: &rk::Config) -> u32 {
+    pub(super) const fn v2_caret_stop_rgb(t: f32, cfg: &rk::Config) -> u32 {
         rk::ribbon::caret_ink(crate::spectrum::spectrum(rk::ribbon::walk_arc(t)), cfg)
     }
 

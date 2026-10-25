@@ -10,10 +10,10 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-use aterm_buffer::{BlobId, EventLog, KeyframeId, Op, Seq, Ticks};
+use aterm_buffer::{BlobId, EventLog, KeyframeId, Op, Seq, Ticks, WitnessId};
 use aterm_control::replay::ReplayEngine;
 use aterm_core::grid::ResizePolicy;
-use aterm_core::terminal::{Terminal, TerminalCheckpoint};
+use aterm_core::terminal::{ClockReading, ShellIntegrationNonce, Terminal, TerminalCheckpoint};
 
 /// Default byte budget for retained payloads: input blobs plus keyframes.
 pub(crate) const DEFAULT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
@@ -22,27 +22,45 @@ pub(crate) const DEFAULT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) enum TemporalMsg {
     RawIn(InputSlice),
     Reply,
-    Resize { rows: u16, cols: u16 },
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
     ResizesLost(u64),
     Keyframe(Arc<TerminalCheckpoint>),
+    /// A live keyframe a diverged witness asked for ([`SpineWatermark::keyframe_wanted`]); it closes no break.
+    LiveKeyframe(Arc<TerminalCheckpoint>),
+    /// The live screen right after the slice queued before it, for a replay to match ([`Fidelity`]).
+    Witness(Arc<TerminalCheckpoint>),
 }
 
-/// The bytes of one `RawIn`.
+/// The bytes of one `RawIn` and the clock reading the live engine parsed them at.
 #[derive(Clone)]
 pub(crate) struct InputSlice {
     batch: Arc<[u8]>,
     range: Range<usize>,
+    clock: ClockReading,
 }
 
 impl InputSlice {
-    /// `batch[range]`, sharing `batch`.
-    pub(crate) fn new(batch: Arc<[u8]>, range: Range<usize>) -> Self {
+    /// `batch[range]`, sharing `batch`, parsed live at `clock`.
+    pub(crate) fn new(batch: Arc<[u8]>, range: Range<usize>, clock: ClockReading) -> Self {
         assert!(
             range.start <= range.end && range.end <= batch.len(),
             "input slice {range:?} outside its {}-byte batch",
             batch.len()
         );
-        Self { batch, range }
+        Self {
+            batch,
+            range,
+            clock,
+        }
+    }
+
+    /// A copy of `bytes`, parsed live at `clock`.
+    pub(crate) fn at(bytes: &[u8], clock: ClockReading) -> Self {
+        let batch = Arc::<[u8]>::from(bytes);
+        Self::new(batch, 0..bytes.len(), clock)
     }
 
     fn bytes(&self) -> &[u8] {
@@ -54,17 +72,15 @@ impl InputSlice {
     }
 }
 
-impl From<Arc<[u8]>> for InputSlice {
-    fn from(batch: Arc<[u8]>) -> Self {
-        let range = 0..batch.len();
-        Self { batch, range }
-    }
-}
-
-impl From<&[u8]> for InputSlice {
-    fn from(bytes: &[u8]) -> Self {
-        Self::from(Arc::<[u8]>::from(bytes))
-    }
+/// A replay keyframe of `term` with each grid's history bounded to `max_history` lines, carrying the shell-integration nonce and revision so a replay verifies shell marks as the live engine does (it stays in memory).
+#[must_use]
+pub(crate) fn keyframe_of(term: &Terminal, max_history: usize) -> Option<TerminalCheckpoint> {
+    let mut checkpoint = term.checkpoint_continuing_bounded(max_history)?;
+    checkpoint.shell_integration_nonce = term
+        .shell_integration_nonce_in_use()
+        .map(ShellIntegrationNonce);
+    checkpoint.shell_integration_rev = term.shell_integration_rev().map(str::to_owned);
+    Some(checkpoint)
 }
 
 /// Open a recording's writer queue, bounded at `cap` messages: the reader's end and the writer thread's.
@@ -147,6 +163,7 @@ pub(crate) struct SpineWatermark {
     dropped_input: AtomicU64,
     closed: AtomicU64,
     dropped_replies: AtomicU64,
+    keyframe_wanted: AtomicBool,
 }
 
 impl SpineWatermark {
@@ -193,6 +210,12 @@ impl SpineWatermark {
     pub(crate) fn break_open(&self) -> bool {
         self.closed.load(Ordering::Acquire) < self.dropped_input()
     }
+
+    /// Whether a diverged witness asked for a live keyframe that no reader has queued yet.
+    #[must_use]
+    pub(crate) fn keyframe_wanted(&self) -> bool {
+        self.keyframe_wanted.load(Ordering::Acquire)
+    }
 }
 
 /// One reader's resize watermark.
@@ -201,6 +224,8 @@ pub(crate) struct SpineMark {
     at: Option<(u64, u64)>,
     shared: Arc<SpineWatermark>,
     broken: bool,
+    since_witness: usize,
+    witnessed_at: Option<aterm_time::Instant>,
 }
 
 /// What one reader hold read before processing its bytes: the engine's resize lifetime, ordinal and geometry.
@@ -258,8 +283,9 @@ impl SpineSink for TemporalSink<'_> {
         self.0.send(TemporalMsg::ResizesLost(n))
     }
 
-    fn bytes(&mut self, bytes: &[u8]) -> bool {
-        self.0.send(TemporalMsg::RawIn(InputSlice::from(bytes)))
+    /// Refused: the writer queue takes bytes only with the clock they were parsed at ([`SpineMark::record`]).
+    fn bytes(&mut self, _bytes: &[u8]) -> bool {
+        false
     }
 }
 
@@ -270,6 +296,8 @@ impl SpineMark {
             at: shared.load(),
             broken: shared.break_open(),
             shared,
+            since_witness: 0,
+            witnessed_at: None,
         }
     }
 
@@ -286,7 +314,7 @@ impl SpineMark {
         }
     }
 
-    /// Record one slice on the spine.
+    /// Record one slice on the spine, then a live witness when one is due ([`WITNESS_BYTES`], [`WITNESS_INTERVAL`]).
     pub(crate) fn record(
         &mut self,
         tx: &TemporalTx,
@@ -295,31 +323,64 @@ impl SpineMark {
         input: InputSlice,
     ) {
         if self.broken {
-            self.resync(tx, term);
-        } else if self.catch_up(&mut TemporalSink(tx), pre, term)
-            && tx.send(TemporalMsg::RawIn(input))
-        {
+            self.resync(tx, term, true);
+            return;
+        }
+        if self.shared.keyframe_wanted() && self.resync(tx, term, false) {
+            return;
+        }
+        let (len, at) = (input.len(), input.clock.monotonic);
+        if self.catch_up(&mut TemporalSink(tx), pre, term) && tx.send(TemporalMsg::RawIn(input)) {
             // Past anything the bytes themselves applied (they replay it).
             self.advance((term.resize_lifetime(), term.resize_ordinal()));
+            self.witness(tx, term, len, at);
         } else {
             self.broken = true;
             self.shared.dropped_input.fetch_add(1, Ordering::Release);
         }
     }
 
-    fn resync(&mut self, tx: &TemporalTx, term: &Terminal) {
-        if !tx.has_room() || term.partial_sequence_swallowed().is_some() {
+    fn witness(&mut self, tx: &TemporalTx, term: &Terminal, len: usize, at: aterm_time::Instant) {
+        let since = *self.witnessed_at.get_or_insert(at);
+        self.since_witness = self.since_witness.saturating_add(len);
+        let due = self.since_witness >= WITNESS_BYTES
+            || at.saturating_duration_since(since) >= WITNESS_INTERVAL;
+        if !due || !term.parser_is_ground() {
             return;
         }
-        let Some(checkpoint) = term.checkpoint_continuing_bounded(REKEY_SCROLLBACK_LINES) else {
+        let Some(live) = term.checkpoint_visible() else {
             return;
+        };
+        if tx.send(TemporalMsg::Witness(Arc::new(live))) {
+            self.since_witness = 0;
+            self.witnessed_at = Some(at);
+        }
+    }
+
+    fn resync(&mut self, tx: &TemporalTx, term: &Terminal, closes_break: bool) -> bool {
+        if !tx.has_room() || term.partial_sequence_swallowed().is_some() {
+            return false;
+        }
+        let Some(checkpoint) = keyframe_of(term, REKEY_SCROLLBACK_LINES) else {
+            return false;
         };
         #[cfg(test)]
         resync_probe::projected();
-        if tx.send(TemporalMsg::Keyframe(Arc::new(checkpoint))) {
-            self.broken = false;
-            self.advance((term.resize_lifetime(), term.resize_ordinal()));
+        let checkpoint = Arc::new(checkpoint);
+        let msg = if closes_break {
+            TemporalMsg::Keyframe(checkpoint)
+        } else {
+            TemporalMsg::LiveKeyframe(checkpoint)
+        };
+        if !tx.send(msg) {
+            return false;
         }
+        self.broken = false;
+        self.shared.keyframe_wanted.store(false, Ordering::Release);
+        self.since_witness = 0;
+        self.witnessed_at = None;
+        self.advance((term.resize_lifetime(), term.resize_ordinal()));
+        true
     }
 
     /// Queue the instant of a reply the engine emitted (`take_response()`).
@@ -421,6 +482,78 @@ pub(crate) struct TemporalRecorder {
     resize_policy: ResizePolicy,
     host_resyncs_alt_screen: bool,
     handoff: Option<crate::session_timeline::HandoffGap>,
+    witnesses: VecDeque<Witnessed>,
+    next_witness: u64,
+    witnessed: u64,
+    diverged: u64,
+    chain_diverged: bool,
+}
+
+/// What the live witnesses say of one replayed instant ([`TemporalRecorder::fidelity_at`]); only `Faithful` may be shown as what was on screen.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the Rewind view (R0b) reads it; until then only `fidelity_at` (itself expected \
+                  dead) does, and an `expect` here is unmet on the Linux cell"
+    )
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fidelity {
+    /// The first witness at or after the instant, and every one before it since the instant's keyframe, matched the replay.
+    Faithful,
+    /// A witness since the instant's keyframe, up to the first at or after the instant, did not match the replay.
+    Diverged,
+    /// No fold has judged every witness that covers the instant yet, or none covers it.
+    Unwitnessed,
+}
+
+/// One live witness on the spine: its snapshot until a fold judges it, then only its verdict.
+struct Witnessed {
+    id: WitnessId,
+    seq: Seq,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the Rewind view (R0b) reads it; until then only `fidelity_at` (itself \
+                      expected dead) does, and an `expect` here is unmet on the Linux cell"
+        )
+    )]
+    ts: Ticks,
+    state: WitnessState,
+}
+
+enum WitnessState {
+    Pending(Arc<TerminalCheckpoint>),
+    Matched,
+    Diverged,
+}
+
+impl Witnessed {
+    fn charge(&self) -> usize {
+        match &self.state {
+            WitnessState::Pending(live) => charge_of(live),
+            WitnessState::Matched | WitnessState::Diverged => 0,
+        }
+    }
+}
+
+/// The verdicts a fold reached on the live witnesses it passed, for [`TemporalRecorder::judge`].
+#[must_use = "a verdict counts once the recorder is handed it (`TemporalRecorder::judge`)"]
+#[derive(Debug, Default)]
+pub(crate) struct Judged(Vec<(WitnessId, bool)>);
+
+/// A fold's replayed engine and its verdicts ([`ReplayPlan::fold`]).
+pub(crate) struct Fold {
+    /// The engine at the plan's instant.
+    pub(crate) term: Terminal,
+    /// What the fold found of each pending witness it passed.
+    pub(crate) judged: Judged,
+}
+
+fn charge_of(checkpoint: &TerminalCheckpoint) -> usize {
+    checkpoint.grid.len() + checkpoint.alt_grid.as_ref().map_or(0, Vec::len)
 }
 
 impl TemporalRecorder {
@@ -451,6 +584,11 @@ impl TemporalRecorder {
             resize_policy: ResizePolicy::Native,
             host_resyncs_alt_screen: false,
             handoff: None,
+            witnesses: VecDeque::new(),
+            next_witness: 0,
+            witnessed: 0,
+            diverged: 0,
+            chain_diverged: false,
         }
     }
 
@@ -494,6 +632,7 @@ impl TemporalRecorder {
                     self.pop_keyframe();
                 }
             }
+            Some((gone, Op::Witness(_))) => self.drop_witnesses_through(gone),
             _ => {}
         }
         seq
@@ -502,11 +641,124 @@ impl TemporalRecorder {
     fn record(&mut self, op: Op) -> Option<Rekey> {
         let ts = self.now();
         self.append(op, ts);
+        self.due()
+    }
+
+    fn due(&mut self) -> Option<Rekey> {
         let due = self.rekey_due();
         if due.is_none() {
             self.enforce_budget();
         }
         due
+    }
+
+    fn witness(&mut self, live: Arc<TerminalCheckpoint>) -> Option<Rekey> {
+        if self.keyframes.is_empty() || self.chain_diverged {
+            return None;
+        }
+        let ts = self.now();
+        let id = WitnessId(self.next_witness);
+        self.next_witness += 1;
+        let seq = self.append(Op::Witness(id), ts);
+        let charge = charge_of(&live);
+        self.used += charge;
+        self.bytes_since_keyframe += charge;
+        self.witnesses.push_back(Witnessed {
+            id,
+            seq,
+            ts,
+            state: WitnessState::Pending(live),
+        });
+        self.due()
+    }
+
+    fn drop_witnesses_through(&mut self, gone: Seq) {
+        while let Some(w) = self.witnesses.front().filter(|w| w.seq <= gone) {
+            self.used = self.used.saturating_sub(w.charge());
+            self.witnesses.pop_front();
+        }
+    }
+
+    fn witness_mut(&mut self, id: WitnessId) -> Option<&mut Witnessed> {
+        let base = self.witnesses.front()?.id.0;
+        let idx = usize::try_from(id.0.checked_sub(base)?).ok()?;
+        self.witnesses.get_mut(idx).filter(|w| w.id == id)
+    }
+
+    /// Record the verdicts a fold reached ([`ReplayPlan::fold`]); a mismatch in the newest keyframe's chain asks the reader for a live keyframe and keeps the chain from minting one.
+    pub(crate) fn judge(&mut self, judged: Judged) {
+        let newest = self.keyframes.back().map(|kf| kf.seq);
+        for (id, matched) in judged.0 {
+            let Some(w) = self.witness_mut(id) else {
+                continue;
+            };
+            let WitnessState::Pending(live) = &w.state else {
+                continue;
+            };
+            let charge = charge_of(live);
+            w.state = if matched {
+                WitnessState::Matched
+            } else {
+                WitnessState::Diverged
+            };
+            let seq = w.seq;
+            self.used = self.used.saturating_sub(charge);
+            self.bytes_since_keyframe = self.bytes_since_keyframe.saturating_sub(charge);
+            self.witnessed += 1;
+            if !matched {
+                self.diverged += 1;
+                if newest.is_some_and(|kf| seq > kf) {
+                    self.chain_diverged = true;
+                    self.spine.keyframe_wanted.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    /// What the live witnesses say of a replay to `at`, from the verdicts folds have reached so far.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the Rewind view (R0b) reads it")
+    )]
+    pub(crate) fn fidelity_at(&self, at: Ticks) -> Fidelity {
+        let Some(base) = self.base_keyframe(at) else {
+            return Fidelity::Unwitnessed;
+        };
+        let end = self
+            .keyframes
+            .iter()
+            .find(|kf| kf.seq > base.seq)
+            .map(|kf| kf.seq);
+        let mut verdict = Fidelity::Faithful;
+        for w in self
+            .witnesses
+            .iter()
+            .skip_while(|w| w.seq <= base.seq)
+            .take_while(|w| end.is_none_or(|end| w.seq < end))
+        {
+            match w.state {
+                WitnessState::Diverged => return Fidelity::Diverged,
+                WitnessState::Pending(_) => verdict = Fidelity::Unwitnessed,
+                WitnessState::Matched => {}
+            }
+            if w.ts >= at {
+                return verdict;
+            }
+        }
+        Fidelity::Unwitnessed
+    }
+
+    /// Witnesses a fold has judged (`temporal status` `witnessed=`).
+    #[must_use]
+    pub(crate) const fn witnessed(&self) -> u64 {
+        self.witnessed
+    }
+
+    /// Judged witnesses the replay did not match (`temporal status` `diverged=`).
+    #[must_use]
+    pub(crate) const fn diverged(&self) -> u64 {
+        self.diverged
     }
 
     /// Record a keyframe (a serialized [`TerminalCheckpoint`]), the seed for replays to instants at or after it.
@@ -527,6 +779,7 @@ impl TemporalRecorder {
         self.used += keyframe.charge();
         self.keyframes.push_back(keyframe);
         self.bytes_since_keyframe = 0;
+        self.chain_diverged = false;
         while self.keyframes.len() > MAX_KEYFRAMES {
             self.pop_keyframe();
         }
@@ -544,7 +797,7 @@ impl TemporalRecorder {
     }
 
     fn rekey_due(&self) -> Option<Rekey> {
-        if self.ends_mid_sequence {
+        if self.ends_mid_sequence || self.chain_diverged {
             return None;
         }
         let newest = self
@@ -571,10 +824,13 @@ impl TemporalRecorder {
         })
     }
 
-    /// Record the keyframe a due re-keyframe minted ([`Rekey::mint`]), then hold the budget.
+    /// Record the verdicts and the keyframe a due re-keyframe minted ([`Rekey::mint`]), unless a witness in its chain diverged, then hold the budget.
     pub(crate) fn rekeyed(&mut self, minted: Minted) {
+        self.judge(minted.judged);
         match minted.checkpoint {
-            Some(checkpoint) if self.log.head() == minted.head => self.record_keyframe(checkpoint),
+            Some(checkpoint) if self.log.head() == minted.head && !self.chain_diverged => {
+                self.record_keyframe(checkpoint);
+            }
             Some(_) => self.enforce_budget(),
             None => {
                 self.ends_mid_sequence = true;
@@ -610,6 +866,8 @@ impl TemporalRecorder {
             return false;
         };
         self.used = self.used.saturating_sub(keyframe.charge());
+        let base = self.keyframes.front().map_or(Seq(u64::MAX), |kf| kf.seq);
+        self.drop_witnesses_through(Seq(base.0.saturating_sub(1)));
         true
     }
 
@@ -697,6 +955,12 @@ impl TemporalRecorder {
                 self.close_break(checkpoint);
                 return None;
             }
+            TemporalMsg::LiveKeyframe(checkpoint) => {
+                self.ends_mid_sequence = false;
+                self.record_keyframe(checkpoint);
+                return None;
+            }
+            TemporalMsg::Witness(live) => return self.witness(live),
         };
         self.record(op)
     }
@@ -713,13 +977,21 @@ impl TemporalRecorder {
     /// Record a raw PTY-input burst (one copy into a shared allocation).
     #[cfg(test)]
     pub(crate) fn record_raw_in(&mut self, bytes: &[u8]) {
-        self.apply_inline(TemporalMsg::RawIn(InputSlice::from(bytes)));
+        self.apply_inline(TemporalMsg::RawIn(InputSlice::at(
+            bytes,
+            ClockReading::now(),
+        )));
     }
 
     /// Record a raw PTY-input burst, retaining the caller's allocation.
     #[cfg(test)]
     pub(crate) fn record_raw_in_shared(&mut self, bytes: Arc<[u8]>) {
-        self.apply_inline(TemporalMsg::RawIn(InputSlice::from(bytes)));
+        let range = 0..bytes.len();
+        self.apply_inline(TemporalMsg::RawIn(InputSlice::new(
+            bytes,
+            range,
+            ClockReading::now(),
+        )));
     }
 
     /// Record a reply's instant.
@@ -785,6 +1057,17 @@ impl TemporalRecorder {
             .collect()
     }
 
+    fn pending_witness(&self, id: WitnessId) -> Option<Arc<TerminalCheckpoint>> {
+        let base = self.witnesses.front()?.id.0;
+        let w = self
+            .witnesses
+            .get(usize::try_from(id.0.checked_sub(base)?).ok()?)?;
+        match &w.state {
+            WitnessState::Pending(live) if w.id == id => Some(live.clone()),
+            _ => None,
+        }
+    }
+
     fn base_keyframe(&self, at: Ticks) -> Option<&RetainedKeyframe> {
         self.keyframes.iter().rev().find(|kf| kf.ts <= at)
     }
@@ -802,6 +1085,11 @@ impl TemporalRecorder {
             match ev.op {
                 Op::RawIn(id) => steps.push(Step::RawIn(self.blob(id)?.clone())),
                 Op::Resize { rows, cols } => steps.push(Step::Resize { rows, cols }),
+                Op::Witness(id) => {
+                    if let Some(live) = self.pending_witness(id) {
+                        steps.push(Step::Witness(id, live));
+                    }
+                }
                 _ => {}
             }
         }
@@ -842,7 +1130,7 @@ struct RetainedKeyframe {
 
 impl RetainedKeyframe {
     fn charge(&self) -> usize {
-        self.checkpoint.grid.len() + self.checkpoint.alt_grid.as_ref().map_or(0, Vec::len)
+        charge_of(&self.checkpoint)
     }
 }
 
@@ -873,23 +1161,41 @@ pub(crate) struct ReplayPlan {
 enum Step {
     RawIn(InputSlice),
     Resize { rows: u16, cols: u16 },
+    Witness(WitnessId, Arc<TerminalCheckpoint>),
 }
 
 impl ReplayPlan {
-    /// Fold the plan from its base keyframe through a fresh [`ReplayEngine`] configured with [`TemporalRecorder::set_resize_policy`] and [`TemporalRecorder::set_host_resyncs_alt_screen`].
+    /// Fold the plan from its base keyframe through a fresh [`ReplayEngine`] configured with [`TemporalRecorder::set_resize_policy`] and [`TemporalRecorder::set_host_resyncs_alt_screen`], each slice at its recorded clock, judging each pending witness it passes by full equality with the replay's `checkpoint_visible()`.
     #[must_use]
-    pub(crate) fn run(self) -> Terminal {
+    pub(crate) fn fold(self) -> Fold {
         #[cfg(test)]
         replay_hook::before_replay();
         let mut replay = ReplayEngine::from_checkpoint(&self.base, self.policy)
             .with_host_resyncs_alt_screen(self.host_resyncs);
+        let mut judged = Vec::new();
         for step in self.steps {
             match step {
-                Step::RawIn(input) => replay.process(input.bytes()),
+                #[cfg(test)]
+                Step::RawIn(input) if replay_clock::live() => replay.process(input.bytes()),
+                Step::RawIn(input) => replay.process_at(input.bytes(), input.clock),
                 Step::Resize { rows, cols } => replay.resize(rows, cols),
+                Step::Witness(id, live) => {
+                    let replayed = replay.terminal().checkpoint_visible();
+                    judged.push((id, replayed.as_ref() == Some(&*live)));
+                }
             }
         }
-        replay.into_terminal()
+        Fold {
+            term: replay.into_terminal(),
+            judged: Judged(judged),
+        }
+    }
+
+    /// [`Self::fold`]'s engine, its verdicts dropped.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn run(self) -> Terminal {
+        self.fold().term
     }
 }
 
@@ -901,17 +1207,18 @@ pub(crate) struct Rekey {
 }
 
 impl Rekey {
-    /// Replay to the spine's end and checkpoint the result, with the recorder unlocked.
+    /// Replay to the spine's end, judging the witnesses on the way, and checkpoint the result, with the recorder unlocked.
     pub(crate) fn mint(self) -> Minted {
-        let live = self.plan.run();
-        let checkpoint = if live.parser_is_ground() {
-            live.checkpoint_continuing_bounded(REKEY_SCROLLBACK_LINES)
+        let Fold { term, judged } = self.plan.fold();
+        let checkpoint = if term.parser_is_ground() {
+            keyframe_of(&term, REKEY_SCROLLBACK_LINES)
         } else {
             None
         };
         Minted {
             head: self.head,
             checkpoint,
+            judged,
         }
     }
 }
@@ -920,9 +1227,10 @@ impl Rekey {
 pub(crate) struct Minted {
     head: Seq,
     checkpoint: Option<TerminalCheckpoint>,
+    judged: Judged,
 }
 
-/// Test-only hook [`ReplayPlan::run`] calls first, so a test can probe the recorder lock from inside the fold.
+/// Test-only hook [`ReplayPlan::fold`] calls first, so a test can probe the recorder lock from inside the fold.
 #[cfg(test)]
 pub(crate) mod replay_hook {
     use std::cell::RefCell;
@@ -957,6 +1265,35 @@ pub(crate) mod replay_hook {
     }
 }
 
+/// Test-only switch [`ReplayPlan::fold`] reads per slice: a replay on the live clock, the negative control of the recorded one.
+#[cfg(test)]
+pub(crate) mod replay_clock {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIVE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Puts replays back on the recorded clock when dropped.
+    pub(crate) struct Live;
+
+    impl Drop for Live {
+        fn drop(&mut self) {
+            LIVE.with(|l| l.set(false));
+        }
+    }
+
+    /// Fold every later replay on this thread with plain `process` (the live clock), until the returned guard drops.
+    pub(crate) fn on_live_clock() -> Live {
+        LIVE.with(|l| l.set(true));
+        Live
+    }
+
+    pub(super) fn live() -> bool {
+        LIVE.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 mod resync_probe {
     use std::cell::Cell;
@@ -987,6 +1324,12 @@ enum RekeyTrigger {
 }
 
 const REKEY_SCROLLBACK_LINES: usize = 2048;
+
+/// Output since the last witness that makes the next slice at parser ground take one.
+const WITNESS_BYTES: usize = 256 * 1024;
+
+/// Time since the last witness after which the next slice at parser ground takes one.
+const WITNESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 const MAX_KEYFRAMES: usize = 4;
 
@@ -1619,13 +1962,35 @@ mod tests {
             TemporalMsg::Resize { rows, cols } => format!("r:{rows}x{cols}"),
             TemporalMsg::ResizesLost(n) => format!("lost:{n}"),
             TemporalMsg::Keyframe(_) => "keyframe".to_string(),
+            TemporalMsg::LiveKeyframe(_) => "live-keyframe".to_string(),
+            TemporalMsg::Witness(_) => "witness".to_string(),
+        }
+    }
+
+    /// A clock `ms` past one epoch every test shares, so a slice's time decides no witness unless a test means it to.
+    fn clock(ms: u64) -> ClockReading {
+        static EPOCH: std::sync::OnceLock<ClockReading> = std::sync::OnceLock::new();
+        let epoch = *EPOCH.get_or_init(ClockReading::now);
+        ClockReading {
+            monotonic: epoch.monotonic + std::time::Duration::from_millis(ms),
+            wall_ms: Some(1_800_000_000_000 + ms),
         }
     }
 
     fn slice(live: &mut Terminal, mark: &mut SpineMark, tx: &TemporalTx, bytes: &[u8]) {
+        slice_at(live, mark, tx, bytes, clock(0));
+    }
+
+    fn slice_at(
+        live: &mut Terminal,
+        mark: &mut SpineMark,
+        tx: &TemporalTx,
+        bytes: &[u8],
+        at: ClockReading,
+    ) {
         let pre = SpinePre::take(live);
-        live.process(bytes);
-        mark.record(tx, pre, live, InputSlice::from(bytes));
+        live.process_at(bytes, at);
+        mark.record(tx, pre, live, InputSlice::at(bytes, at));
     }
 
     fn seeded(live: &Terminal) -> TemporalRecorder {
@@ -1718,12 +2083,12 @@ mod tests {
                 _ => {}
             }
             let pre = SpinePre::take(&live);
-            live.process(&batch[range.clone()]);
+            live.process_at(&batch[range.clone()], clock(0));
             mark.record(
                 &tx,
                 pre,
                 &live,
-                InputSlice::new(batch.clone(), range.clone()),
+                InputSlice::new(batch.clone(), range.clone(), clock(0)),
             );
         }
         assert_eq!(
@@ -2041,7 +2406,7 @@ mod tests {
                 live.checkpoint_continuing_bounded(REKEY_SCROLLBACK_LINES)
                     .expect("carried, as a string to swallow"),
             ),
-            steps: vec![Step::RawIn(InputSlice::from(&tail[..]))],
+            steps: vec![Step::RawIn(InputSlice::at(&tail[..], clock(0)))],
             policy: ResizePolicy::Native,
             host_resyncs: false,
         };
@@ -2081,11 +2446,233 @@ mod tests {
         }
     }
 
+    fn mark_times(t: &Terminal) -> Vec<[Option<u64>; 4]> {
+        t.command_marks()
+            .iter()
+            .map(|m| {
+                [
+                    m.prompt_time_ms,
+                    m.command_input_start_time_ms,
+                    m.command_exec_start_time_ms,
+                    m.command_end_time_ms,
+                ]
+            })
+            .collect()
+    }
+
+    /// A mode-2026 frame left open past its timeout, bells 50 ms apart and OSC 133 marks replay at the recorded clock exactly as the live engine parsed them; on the live clock the frame is still open.
+    #[test]
+    fn a_replay_at_the_recorded_clock_is_the_live_engine() {
+        const TIMEOUT_MS: u64 = 1000;
+        let fixture: [(u64, &[u8]); 8] = [
+            (0, b"\x1b]133;A\x07$ \x1b]133;B\x07"),
+            (10, b"ls\r\n\x1b]133;C\x07"),
+            (20, b"\x1b[?2026hframe"),
+            (50, b"\x07"),
+            (100, b"\x07"),
+            (150, b"\x07"),
+            (200, b"\x07"),
+            (20 + TIMEOUT_MS + 500, b"after\r\n\x1b]133;D;0\x07"),
+        ];
+        let mut live = Terminal::new(6, 30);
+        let mut r = TemporalRecorder::new();
+        r.record_keyframe(live.checkpoint());
+        for (ms, bytes) in fixture {
+            live.process_at(bytes, clock(ms));
+            r.apply_inline(TemporalMsg::RawIn(InputSlice::at(bytes, clock(ms))));
+        }
+        assert!(
+            !live.modes().synchronized_output,
+            "precondition: the timeout ended the frame live"
+        );
+        assert_eq!(
+            live.bell_total(),
+            2,
+            "precondition: the 100 ms bell floor held two"
+        );
+        let marks = mark_times(&live);
+        assert_eq!(
+            marks.last().and_then(|m| m[3]),
+            clock(20 + TIMEOUT_MS + 500).wall_ms,
+            "precondition: the mark took the slice's wall clock"
+        );
+
+        let replayed = r.replay_at(None).expect("replay");
+        assert_eq!(replayed.checkpoint_visible(), live.checkpoint_visible());
+        assert_eq!(replayed.bell_total(), live.bell_total());
+        assert_eq!(mark_times(&replayed), marks);
+
+        let _live = replay_clock::on_live_clock();
+        let plain = r.replay_at(None).expect("replay");
+        assert!(
+            plain.modes().synchronized_output,
+            "on the live clock the frame never timed out"
+        );
+        assert_ne!(plain.checkpoint_visible(), live.checkpoint_visible());
+    }
+
+    /// Two live witnesses of a recorded session match its replay, and the rekey that judged them mints its keyframe; replayed on the live clock both diverge, the rekey mints none, and the next slice queues a live keyframe the replay then matches.
+    #[test]
+    fn live_witnesses_judge_the_replay_and_a_mismatch_takes_a_live_keyframe() {
+        for live_clock in [false, true] {
+            let mut live = Terminal::new(6, 30);
+            let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
+            r.record_keyframe(live.checkpoint());
+            r.spine_watermark().seed(SpinePre::take(&live));
+            let (tx, rx) = queue(64);
+            let mut mark = SpineMark::attach(r.spine_watermark());
+            let _clock = live_clock.then(replay_clock::on_live_clock);
+            let burst = vec![b'.'; MIN_REKEY_BYTES];
+            let mut feed = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8], ms| {
+                tick_past(r, r.latest_tick());
+                slice_at(live, &mut mark, &tx, bytes, clock(ms));
+                drain_named(&rx, r)
+            };
+            assert_eq!(feed(&mut live, &mut r, b"\x1b[?2026hframe", 0), ["in"]);
+            assert_eq!(feed(&mut live, &mut r, b"\r\none", 1500), ["in", "witness"]);
+            assert!(!live.modes().synchronized_output, "precondition");
+            assert_eq!(feed(&mut live, &mut r, b"\r\ntwo", 3000), ["in", "witness"]);
+            assert_eq!(r.witnessed(), 0, "no fold has judged them yet");
+            assert_eq!(
+                feed(&mut live, &mut r, &burst, 3100),
+                ["in"],
+                "the burst is due a rekey"
+            );
+            assert_eq!(
+                (r.witnessed(), r.diverged()),
+                (2, if live_clock { 2 } else { 0 })
+            );
+            assert_eq!(
+                r.keyframe_count(),
+                if live_clock { 1 } else { 2 },
+                "a chain that diverged mints no keyframe"
+            );
+            assert_eq!(r.spine_watermark().keyframe_wanted(), live_clock);
+            let at_witness = r.witnesses[0].ts;
+            assert_eq!(
+                r.fidelity_at(at_witness),
+                if live_clock {
+                    Fidelity::Diverged
+                } else {
+                    Fidelity::Faithful
+                }
+            );
+            assert_eq!(
+                feed(&mut live, &mut r, b"\r\nthree", 3200),
+                [if live_clock { "live-keyframe" } else { "in" }]
+            );
+            assert!(!r.spine_watermark().keyframe_wanted());
+            assert_eq!(r.keyframe_count(), 2);
+            let replayed = r.replay_at(None).expect("replay");
+            assert_eq!(screen_of(&replayed), screen_of(&live));
+        }
+    }
+
+    /// A span is faithful only up to the first matched witness at or after it, diverged from a mismatch on, and unwitnessed past the last judged witness or before any.
+    #[test]
+    fn the_fidelity_of_an_instant_is_the_verdict_of_the_witnesses_that_cover_it() {
+        let mut live = Terminal::new(6, 30);
+        let mut r = seeded(&live);
+        let (tx, rx) = queue(64);
+        let mut mark = SpineMark::attach(r.spine_watermark());
+        let mut feed = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8], ms| {
+            tick_past(r, r.latest_tick());
+            slice_at(live, &mut mark, &tx, bytes, clock(ms));
+            drain(&rx, r)
+        };
+        feed(&mut live, &mut r, b"a", 0);
+        let before = r.latest_tick();
+        feed(&mut live, &mut r, b"b", 1000);
+        feed(&mut live, &mut r, b"c", 2000);
+        assert_eq!(r.witnesses.len(), 2, "REACH: one witness a second");
+        let [first, second] = [r.witnesses[0].ts, r.witnesses[1].ts];
+        assert_eq!(
+            r.fidelity_at(before),
+            Fidelity::Unwitnessed,
+            "nothing judged"
+        );
+
+        let fold = r.replay_plan(Some(first)).expect("replay").fold();
+        r.judge(fold.judged);
+        assert_eq!(
+            (r.witnessed(), r.diverged()),
+            (1, 0),
+            "a fold judges what it passes"
+        );
+        assert_eq!(r.fidelity_at(before), Fidelity::Faithful);
+        assert_eq!(r.fidelity_at(first), Fidelity::Faithful);
+        assert_eq!(
+            r.fidelity_at(Ticks(first.0 + 1)),
+            Fidelity::Unwitnessed,
+            "its next witness is pending"
+        );
+
+        let poisoned = r.witnesses.back_mut().expect("the second witness");
+        let WitnessState::Pending(live_cp) = &poisoned.state else {
+            panic!("pending");
+        };
+        let mut wrong = (**live_cp).clone();
+        wrong.cols += 1;
+        poisoned.state = WitnessState::Pending(Arc::new(wrong));
+        let fold = r.replay_plan(None).expect("replay").fold();
+        r.judge(fold.judged);
+        assert_eq!((r.witnessed(), r.diverged()), (2, 1));
+        assert_eq!(
+            r.fidelity_at(first),
+            Fidelity::Faithful,
+            "before the mismatch"
+        );
+        assert_eq!(r.fidelity_at(second), Fidelity::Diverged);
+        assert_eq!(r.fidelity_at(Ticks(second.0 + 1)), Fidelity::Diverged);
+        assert!(r.spine_watermark().keyframe_wanted());
+    }
+
+    /// A replay keyframe carries the session's shell-integration nonce, so its replay accepts the shell's signed marks as the live engine did; a keyframe without it drops them.
+    #[test]
+    fn a_replay_keyframe_carries_the_nonce_its_shell_signs_marks_with() {
+        let nonce = [0x5Au8; 32];
+        let hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let mut live = Terminal::new(6, 40);
+        live.authorize_shell_integration(nonce);
+        live.set_require_shell_integration_nonce(true);
+        let signed = format!(
+            "\x1b]133;A;id={hex}\x07$ \x1b]133;B;id={hex}\x07ls\r\n\x1b]133;C;id={hex}\x07\
+             out\r\n\x1b]133;D;0;id={hex}\x07"
+        );
+        let carried = keyframe_of(&live, usize::MAX).expect("at ground");
+        assert!(carried.shell_integration_nonce.is_some());
+        let bare = live.checkpoint();
+        live.process_at(signed.as_bytes(), clock(0));
+        assert_eq!(
+            live.command_marks().len(),
+            1,
+            "precondition: the mark was accepted"
+        );
+        for (keyframe, accepted) in [(carried, true), (bare, false)] {
+            let mut r = TemporalRecorder::new();
+            r.record_keyframe(keyframe);
+            r.apply_inline(TemporalMsg::RawIn(InputSlice::at(
+                signed.as_bytes(),
+                clock(0),
+            )));
+            let replayed = r.replay_at(None).expect("replay");
+            assert_eq!(
+                replayed.command_marks().len() == 1,
+                accepted,
+                "nonce carried: {accepted}"
+            );
+            assert_eq!(
+                replayed.checkpoint_visible() == live.checkpoint_visible(),
+                accepted
+            );
+        }
+    }
+
     #[test]
     fn temporal_replay_runs_with_the_recorder_unlocked() {
         use std::cell::Cell;
         use std::rc::Rc;
-        let burst = || TemporalMsg::RawIn(InputSlice::from(&[b'x'; MIN_REKEY_BYTES][..]));
+        let burst = || TemporalMsg::RawIn(InputSlice::at(&[b'x'; MIN_REKEY_BYTES][..], clock(0)));
         let recorder = Arc::new(Mutex::new(TemporalRecorder::with_budget(
             4 * MIN_REKEY_BYTES,
         )));

@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-journal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Private strict astream journal with acknowledged-prefix recovery"
+[dependencies]
+libc.workspace = true
+aterm-codec.workspace = true
+aterm-digest.workspace = true
+aterm-durable.workspace = true
+aterm-uds.workspace = true
+astream-broker = { path = "../../vendor/astream/crates/astream-broker" }
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
+[dev-dependencies]
+aterm-tempfile.workspace = true
+[lints]
+workspace = true

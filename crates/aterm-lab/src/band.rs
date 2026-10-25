@@ -20,22 +20,20 @@ use crate::paths::paths;
 pub enum Band {
     /// A child of this lab, inside the caller's coalition, at the caller's role.
     Agent,
-    /// Its own launchd job: a new coalition, role `UI_FOCAL` (aterm.app's band).
+    /// Its own launchd job: a new coalition, role `UI_FOCAL` (aterm.app's band). A windowed
+    /// instance's keeper is the job's process, and its aterm a child in the job's coalition.
     App,
 }
 
 impl Band {
-    /// `--band` as given, else the default: the app band for a headless instance.
+    /// `--band` as given, else the default: the app band.
     /// # Errors
-    /// An unknown band, or the app band asked of a window.
-    pub fn pick(given: Option<&str>, window: bool) -> Result<Band, Fail> {
-        match (given, window) {
-            (None, true) | (Some("agent"), _) => Ok(Band::Agent),
-            (None | Some("app"), false) => Ok(Band::App),
-            (Some("app"), true) => Err(Fail::usage(
-                "instance: --band app is headless-only (a windowed instance runs under its keeper)",
-            )),
-            (Some(other), _) => Err(Fail::usage(format!(
+    /// An unknown band.
+    pub fn pick(given: Option<&str>) -> Result<Band, Fail> {
+        match given {
+            None | Some("app") => Ok(Band::App),
+            Some("agent") => Ok(Band::Agent),
+            Some(other) => Err(Fail::usage(format!(
                 "instance: --band takes app or agent, not '{other}'"
             ))),
         }
@@ -69,14 +67,15 @@ const LAUNCHCTL: &str = aterm_uds::os_path!("launchctl");
 /// An instance running as its own launchd job.
 pub struct Job {
     pub label: String,
-    /// aterm's pid (the job's process: [`band_main`] execs it).
+    /// The job's process's pid ([`band_main`] execs it): a headless aterm's, or a windowed one's
+    /// keeper's.
     pub pid: i32,
     /// The lifeline's held end; dropping it cuts the lifeline.
     held: Option<OwnedFd>,
 }
 
 impl Job {
-    /// Start `line` (program first: aterm and its flags, `--lifeline-fd 0` among them) as its own launchd job ([`launch`]) with exactly `env`, in `cwd`, its output appended to `log`, and wait for it to report its pid.
+    /// Start `line` (program first: a headless aterm and its flags, `--lifeline-fd 0` among them, or a windowed one's keeper, which takes the lifeline on stdin) as its own launchd job ([`launch`]) with exactly `env`, in `cwd`, its output appended to `log`, and wait for it to report its pid.
     /// # Errors
     /// The world's entries could not be made, `launchctl` refused the job, or the job never reported (its log says why; the job is removed).
     pub fn start(
@@ -136,7 +135,7 @@ impl Job {
         crate::sys::alive(self.pid)
     }
 
-    /// Cut its lifeline: a headless aterm ends at the end of file.
+    /// Cut its lifeline: a headless aterm ends at the end of file, as a keeper ends its aterm.
     pub fn cut(&mut self) {
         self.held = None;
     }
@@ -359,12 +358,21 @@ pub fn band_main(args: &[String]) -> i32 {
     127
 }
 
-/// `aterm-lab band-standin <file>`: the program `tests/band.rs` runs in an app-band job, in aterm's place.
+/// `aterm-lab band-standin <file> [--kept]`: the program `tests/band.rs` runs in an app-band
+/// job, in aterm's place; `--kept`, a keeper's, in a windowed aterm's: it prints `kept <pid>`,
+/// then appends its pid to `<file>`, and runs until a signal ends it.
 #[must_use]
 pub fn standin_main(args: &[String]) -> i32 {
-    let [file] = args else {
-        eprintln!("aterm-lab band-standin: usage: band-standin <file> (an app-band job's program)");
-        return 2;
+    let usage = || {
+        eprintln!(
+            "aterm-lab band-standin: usage: band-standin <file> [--kept] (an app-band job's program, or its keeper's)"
+        );
+        2
+    };
+    let file = match args {
+        [file] => file,
+        [file, kept] if kept == "--kept" => return kept_main(file),
+        _ => return usage(),
     };
     let pid = i32::try_from(std::process::id()).unwrap_or(0);
     let role = crate::sys::darwin_role(pid).map_or_else(|e| format!("({e})"), |r| r.to_string());
@@ -385,6 +393,31 @@ pub fn standin_main(args: &[String]) -> i32 {
     0
 }
 
+/// `band-standin <file> --kept`: this process's pid printed and then appended to `file` (so the
+/// file's line says the printed one was written), then held until a signal ends it (a keeper's
+/// `SIGTERM`, or the test's).
+fn kept_main(file: &str) -> i32 {
+    let pid = std::process::id();
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = writeln!(out, "kept {pid}").and_then(|()| out.flush()) {
+        eprintln!("aterm-lab band-standin: stdout: {e}");
+        return 1;
+    }
+    drop(out);
+    let wrote = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)
+        .and_then(|mut f| f.write_all(format!("{pid}\n").as_bytes()));
+    if let Err(e) = wrote {
+        eprintln!("aterm-lab band-standin: {file}: {e}");
+        return 1;
+    }
+    loop {
+        std::thread::park();
+    }
+}
+
 /// This process's pid into the world's pid file, whole or not at all.
 fn write_pid(dir: &Path) -> std::io::Result<()> {
     let tmp = dir.join(format!("{PID_FILE}.tmp"));
@@ -399,12 +432,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_headless_instance_defaults_to_the_app_band_and_a_window_to_the_agent_band() {
-        assert_eq!(Band::pick(None, false).ok(), Some(Band::App));
-        assert_eq!(Band::pick(None, true).ok(), Some(Band::Agent));
-        assert_eq!(Band::pick(Some("agent"), false).ok(), Some(Band::Agent));
-        assert_eq!(Band::pick(Some("app"), false).ok(), Some(Band::App));
-        assert!(Band::pick(Some("app"), true).is_err());
-        assert!(Band::pick(Some("own"), false).is_err());
+    fn an_instance_defaults_to_the_app_band_and_takes_either_band_by_name() {
+        assert_eq!(Band::pick(None).ok(), Some(Band::App));
+        assert_eq!(Band::pick(Some("agent")).ok(), Some(Band::Agent));
+        assert_eq!(Band::pick(Some("app")).ok(), Some(Band::App));
+        assert!(Band::pick(Some("own")).is_err());
     }
 }

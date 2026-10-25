@@ -53,6 +53,9 @@ pub enum Family {
     FabricState,
     /// Harness occupancy (`harness.occupancy.<subject>.<cause>`).
     Occupancy,
+    /// System State's setup of this Mac (`setup.<cause>`): a fact its page says calmly, such
+    /// as changes it made and could not log.
+    Setup,
 }
 
 impl Family {
@@ -80,6 +83,7 @@ impl Family {
             Self::HugeDir => "vitals.huge-dir",
             Self::FabricState => "fabric.state",
             Self::Occupancy => "harness.occupancy",
+            Self::Setup => "setup",
         }
     }
 
@@ -112,12 +116,13 @@ impl Family {
             | Self::Terminal
             | Self::Removed
             | Self::FabricState
-            | Self::Occupancy => Mode::Event,
+            | Self::Occupancy
+            | Self::Setup => Mode::Event,
         }
     }
 
     /// Every family, in digest order.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::Privacy,
         Self::Update,
         Self::Upgrade,
@@ -137,6 +142,7 @@ impl Family {
         Self::HugeDir,
         Self::FabricState,
         Self::Occupancy,
+        Self::Setup,
     ];
 
     /// The message tag the family's entries carry.
@@ -156,7 +162,7 @@ impl Family {
             | Self::LongHold
             | Self::Occupancy => tags::HARNESS,
             Self::Toolchain => tags::TOOLCHAIN,
-            Self::Disk | Self::FleetUnreadable | Self::HugeDir => tags::SYSTEM,
+            Self::Disk | Self::FleetUnreadable | Self::HugeDir | Self::Setup => tags::SYSTEM,
             Self::Render => tags::RENDER,
             Self::Terminal | Self::Removed => tags::CONFIG,
             Self::FabricState => tags::FABRIC,

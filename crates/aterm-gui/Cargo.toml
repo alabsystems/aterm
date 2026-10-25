@@ -46,16 +46,6 @@ path = "benches/settings_frame_cost.rs"
 harness = false
 required-features = ["bench-support"]
 
-# The top deck's frame per stage (deck_paint, prims_fp, rasterize_tray, fold) and
-# whole, on the merged deck's busy and calm scenes, timed: a measurement, not a gate. Its
-# scenes are debug-gated, so by hand it is
-# `targo --unverified bench --profile opt-test -p aterm-gui --features bench-support --bench deck_frame_cost`.
-[[bench]]
-name = "deck_frame_cost"
-path = "benches/deck_frame_cost.rs"
-harness = false
-required-features = ["bench-support"]
-
 # An open overlay card's redraw (the Overview's and the palette's tray, then its
 # raster) at 1x, 2x and 2x with the width cap in device pixels, timed: a
 # measurement, not a gate; by hand it is

@@ -639,6 +639,14 @@ impl DebuggerRow {
         self.probe_age_ms
             .map(|ms| Duration::from_millis(u64::try_from(ms).unwrap_or(u64::MAX)))
     }
+
+    /// Time since a read that brought no reading ended: `-status` timed out, did not start, or
+    /// answered what the classifier does not claim (`None` for a reading, and for a row
+    /// [`Self::probe_age`] gives no age).
+    pub(crate) fn unread_age(&self) -> Option<Duration> {
+        self.probe_age()
+            .filter(|_| self.probe.mode == consent::DebuggerMode::Unknown)
+    }
 }
 
 fn completed_debugger_age_ms(label: DebuggerProbeLabel, age: Duration) -> Option<u128> {
@@ -1099,8 +1107,7 @@ impl ConsentState {
     }
 
     /// A debugger worker is out.
-    #[cfg(all(test, target_os = "macos"))]
-    pub(crate) fn debugger_in_flight_for_test(&self) -> bool {
+    pub(crate) fn debugger_in_flight(&self) -> bool {
         self.shared.debugger.slot.lock_or_recover().in_flight
     }
 

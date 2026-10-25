@@ -670,6 +670,29 @@ fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
     assert!(!env.accounts_store().dir.join("bin").exists());
 }
 
+/// `--due` runs what a session needs now, never a row the upkeep signs in by itself before any
+/// session needs it: a row with an email and no login, and nothing walled or due, is not due.
+#[test]
+fn due_leaves_a_row_no_session_needs_to_the_upkeep() {
+    let (_tmp, env) = renew_env("renew-due-unneeded");
+    let host = RenewHost::new();
+    let (code, out, err) = acc(
+        AccountsCmd::Add {
+            label: "w3".into(),
+            class: Class::Dedicated,
+            email: Some("w3@example.test".into()),
+            browser: None,
+        },
+        &env,
+        &host,
+    );
+    assert_eq!(code, exit(0), "{out}{err}");
+    let (code, out, err) = acc(renew(&[], true, None), &env, &host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    assert_eq!(out, "nothing is due on this machine\n");
+    assert!(host.flows.borrow().is_empty(), "no sign-in started");
+}
+
 #[test]
 fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     let (_tmp, env) = renew_env("renew-due");
@@ -879,12 +902,20 @@ fn each_line_that_signs_a_row_in_names_its_own_verb() {
     let (code, out, err) = acc(add("w3", Some("w3@example.com")), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let (_, report, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
-    for (label, verb) in [("w3", "renew"), ("plain", "login")] {
-        let reason = format!(
-            "{label}: not-enrolled (no login made yet: run `aterm harness accounts {verb} \
-             {label}`)"
-        );
-        assert!(report.contains(&reason), "{reason}\n{report}");
+    for (label, verb, reason) in [
+        (
+            "w3",
+            "renew",
+            "w3: not-enrolled (no login made yet: aterm signs it in by itself; `aterm harness \
+             accounts renew w3` runs that now)",
+        ),
+        (
+            "plain",
+            "login",
+            "plain: not-enrolled (no login made yet: run `aterm harness accounts login plain`)",
+        ),
+    ] {
+        assert!(report.contains(reason), "{reason}\n{report}");
         let (code, _, err) = acc(
             AccountsCmd::Use {
                 label: label.into(),
@@ -908,6 +939,68 @@ fn each_line_that_signs_a_row_in_names_its_own_verb() {
             "{err}"
         );
     }
+}
+
+#[test]
+fn the_report_shows_a_rows_failed_automatic_sign_in_until_a_login_is_made() {
+    let (_tmp, env) = renew_env("renew-attempt");
+    let host = RenewHost::new();
+    let (code, out, err) = acc(
+        AccountsCmd::Add {
+            label: "w3".into(),
+            class: Class::Dedicated,
+            email: Some("w3@example.com".into()),
+            browser: None,
+        },
+        &env,
+        &host,
+    );
+    assert_eq!(code, exit(0), "{out}{err}");
+    let routes = "profile(none) mailbox(none configured) vault(not a member) \
+                  headless-browser(none installed) hosts(none configured)";
+    let at = host.now() - 60;
+    let store = env.accounts_store();
+    for label in ["w3", "main"] {
+        store
+            .transact_logins(at, &mut None, |_, logins| {
+                Ok(accounts::note_sign_in_attempt(
+                    logins,
+                    label,
+                    accounts::AttemptOutcome::NoRoute,
+                    routes,
+                    at,
+                ))
+            })
+            .expect("recorded");
+    }
+    let (code, report, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
+    assert_eq!(code, exit(0));
+    let line = format!(
+        "  sign-in: error no-route since {}: tried {routes}",
+        rfc3339_utc(at)
+    );
+    assert_eq!(
+        report.matches(&line).count(),
+        1,
+        "only the row still without a login says it: {report}"
+    );
+    let (_, json, _) = acc(AccountsCmd::Report { json: true }, &env, &host);
+    let doc: Value = aterm_json::from_str(&json).expect("json");
+    let attempt_of = |label: &str| {
+        doc["accounts"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .find(|row| row["label"] == Value::from(label))
+            .map(|row| row["sign_in_attempt"].clone())
+            .expect("the row")
+    };
+    let w3 = attempt_of("w3");
+    assert_eq!(w3["outcome"], Value::from("no-route"), "{json}");
+    assert_eq!(w3["routes"], Value::from(routes));
+    assert_eq!(w3["since"], Value::from(at));
+    assert_eq!(attempt_of("work-2"), Value::Null, "never tried");
+    no_address(&env, &[&report, &json]);
 }
 
 #[test]

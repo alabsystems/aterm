@@ -42,6 +42,7 @@ aterm-db-core.workspace = true
 aterm-spec-anchor.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+aterm-journal.workspace = true
 # O_NOFOLLOW / O_NONBLOCK for admitted reads.
 libc = { workspace = true }
 # Exclusive private edit directories; unfinished drafts are explicitly kept.

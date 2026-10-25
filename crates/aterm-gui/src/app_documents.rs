@@ -1070,12 +1070,12 @@ impl App {
                     head: range.end,
                 }];
                 buffer.primary = 0;
-                buffer.minibuffer = crate::native_editor::Minibuffer::Inactive;
+                buffer.clear_minibuffer();
                 buffer.ensure_primary_visible(&snapshot.text, buffer.viewport_lines());
                 state.status = Some(format!("Revealed {requested} in aterm.toml"));
             }
             ConfigEditorRevealDecision::AddAbsent { requested } => {
-                buffer.minibuffer = crate::native_editor::Minibuffer::Inactive;
+                buffer.clear_minibuffer();
                 let Some((edit, added_as)) = absent_key_edit(&snapshot.text, &requested) else {
                     let note = match crate::native_config_language::config_key_record_root(
                         &requested,
@@ -1123,7 +1123,7 @@ impl App {
                         }];
                         buffer.primary = 0;
                     }
-                    buffer.minibuffer = crate::native_editor::Minibuffer::Inactive;
+                    buffer.clear_minibuffer();
                     buffer.ensure_primary_visible(&text, buffer.viewport_lines());
                 }
                 let note = match added_as {
@@ -1563,8 +1563,9 @@ impl App {
         document: DocumentId,
         source_view: crate::tab_model::ViewId,
     ) {
-        if let Some((seq, deltas)) = self.editor_workspace.take_last_commit(document) {
-            self.edit_document_committed(document, source_view, seq);
+        let commits = self.editor_workspace.take_commits(document);
+        if let Some((seq, _)) = commits.last() {
+            self.edit_document_committed(document, source_view, *seq);
             let other_views = self
                 .view_store
                 .iter()
@@ -1585,7 +1586,9 @@ impl App {
                 if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view)
                     && let Some(buffer) = state.buffer.as_mut()
                 {
-                    buffer.observe_external(seq, &deltas);
+                    for (seq, deltas) in &commits {
+                        buffer.observe_external(*seq, deltas);
+                    }
                 }
             }
         }
@@ -4172,7 +4175,7 @@ impl App {
             .ok_or_else(|| "the editor buffer disappeared".to_string())?;
         buffer.selections = vec![crate::native_editor::Selection::caret(offset)];
         buffer.primary = 0;
-        buffer.minibuffer = crate::native_editor::Minibuffer::Inactive;
+        buffer.clear_minibuffer();
         buffer.ensure_primary_visible(&snapshot.text, buffer.viewport_lines());
         state.status = Some(format!("Line {}", reveal.line));
         for (window, instance, view) in self.document_native_views(document) {

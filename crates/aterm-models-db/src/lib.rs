@@ -5,6 +5,92 @@
 #![cfg_attr(trust_verify, register_tool(trust))]
 use aterm_spec::derive::Model;
 
+/// Two authenticated peers repeatedly acquire and release independent inbound
+/// leases. Progress persists without eviction; duplicate leases are refused.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn peer_repair_cache_model() -> Model {
+    aterm_spec::ty_model! {
+        DbPeerRepairCache {
+            const Buggy = 0;
+            var a = 0;
+            var b = 0;
+            var wrote = 0;
+            var duplicate = 0;
+            action Acquire when (a == 0 || a == 2) {
+                a = if Buggy == 3 && a == 2 { 1 } else { a + 1 };
+            }
+            action Duplicate when (a == 1 || a == 3) {
+                duplicate = if Buggy == 1 { 1 } else { 0 };
+            }
+            action Advance when (a == 1) { a = 3; wrote = 1; }
+            action Release when (a == 1 || a == 3) {
+                a = if Buggy == 2 && a == 3 { 0 } else { a - 1 };
+            }
+            action OtherAcquire when (b == 0) {
+                b = 1; a = if Buggy == 4 { 0 } else { a };
+            }
+            action OtherRelease when (b == 1) { b = 0; }
+            invariant ExclusiveLease: duplicate == 0;
+            invariant RetainedProgress: wrote == 0 || a > 1;
+        }
+    }
+}
+
+/// Actual TLS repair and durable-receipt scenarios. The model bounds these
+/// scenarios; it does not prove cryptography, unbounded liveness or disk hardware.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn table_repair_model() -> Model {
+    aterm_spec::ty_model! {
+        DbTableRepair {
+            const Buggy = 0;
+            var scenario = 0;
+            var stored = 0;
+            var acknowledged = 0;
+            var control = 0;
+            action NewMember when (scenario == 0) { scenario = 1; stored = if Buggy == 1 { 0 } else { 1 }; acknowledged = 1; control = 1; }
+            action LostKey when (scenario == 0) { scenario = 2; stored = if Buggy == 2 { 0 } else { 1 }; acknowledged = 1; control = 1; }
+            action Legacy when (scenario == 0) { scenario = 3; stored = if Buggy == 3 { 1 } else { 0 }; control = if Buggy == 9 { 0 } else { 1 }; }
+            action Retired when (scenario == 0) { scenario = 4; stored = if Buggy == 4 { 1 } else { 0 }; control = 1; }
+            action Damaged when (scenario == 0) { scenario = 5; stored = if Buggy == 5 { 1 } else { 0 }; control = 1; }
+            action LostAck when (scenario == 0) { scenario = 6; stored = if Buggy == 6 { 0 } else { 1 }; acknowledged = if Buggy == 8 { 1 } else { 0 }; }
+            action Retry when (scenario == 0) { scenario = 7; stored = if Buggy == 7 { 0 } else { 1 }; acknowledged = 1; }
+            invariant ReceiptsRequireStorage: acknowledged == 0 || stored == 1;
+            invariant WithheldDoesNotWrite: 3 > scenario || scenario > 5 || stored == 0;
+            invariant AvailableRepairPersists: scenario == 0 || (scenario > 2 && scenario <= 5) || stored == 1;
+            invariant ControlSurvivesUpgrade: scenario == 0 || scenario > 5 || control == 1;
+            invariant LostReceiptIsNotAcknowledged: 6 > scenario || scenario > 6 || acknowledged == 0;
+        }
+    }
+}
+
+/// Real strict-journal restart, corruption, lost custody, crash-tail and fork
+/// scenarios. These finite checks do not prove filesystem or crypto primitives.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn table_durability_model() -> Model {
+    aterm_spec::ty_model! {
+        DbTableDurability {
+            const Buggy = 0;
+            var scenario = 0;
+            var usable = 0;
+            action Restart when (scenario == 0) { scenario = 1; usable = if Buggy == 1 { 0 } else { 1 }; }
+            action Truncate when (scenario == 0) { scenario = 2; usable = if Buggy == 2 { 1 } else { 0 }; }
+            action LostLog when (scenario == 0) { scenario = 3; usable = if Buggy == 3 { 1 } else { 0 }; }
+            action LostClaim when (scenario == 0) { scenario = 4; usable = if Buggy == 4 { 1 } else { 0 }; }
+            action ChangedScope when (scenario == 0) { scenario = 5; usable = if Buggy == 5 { 1 } else { 0 }; }
+            action TornSuffix when (scenario == 0) { scenario = 6; usable = if Buggy == 6 { 0 } else { 1 }; }
+            action UncertainAppend when (scenario == 0) { scenario = 7; usable = if Buggy == 7 { 0 } else { 1 }; }
+            action OwnFork when (scenario == 0) { scenario = 8; usable = if Buggy == 8 { 1 } else { 0 }; }
+            action CopiedStore when (scenario == 0) { scenario = 9; usable = if Buggy == 9 { 1 } else { 0 }; }
+            action RestoreBackup when (scenario == 0) { scenario = 10; usable = if Buggy == 10 { 1 } else { 0 }; }
+            invariant DamagedHistoryWithholdsWriter: usable == 0 || scenario == 1 || scenario == 6 || scenario == 7;
+            invariant IntactOrRepairedRemainsUsable: scenario == 0 || (scenario > 1 && 6 > scenario) || scenario == 8 || scenario == 9 || scenario == 10 || usable == 1;
+        }
+    }
+}
+
 /// Bounded envelope admission scenarios executed against real encryption,
 /// signatures and secrets-backed sessions; not a proof of cryptographic security.
 #[must_use]
@@ -25,6 +111,33 @@ pub fn table_envelope_model() -> Model {
             action OldEpoch when (scenario == 0) { scenario = 8; accepted = if Buggy == 8 { 0 } else { 1 }; }
             invariant ExactWriterEvidenceOnly: accepted == 0 || scenario == 1 || scenario == 8;
             invariant ValidHistoryWorks: scenario == 0 || (scenario > 1 && 8 > scenario) || accepted == 1;
+        }
+    }
+}
+
+/// Recipient-bound handoffs release original historical evidence only to a
+/// current member, including through a later peer. Not a cryptographic proof.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn history_handoff_model() -> Model {
+    aterm_spec::ty_model! {
+        DbHistoryHandoff {
+            const Buggy = 0;
+            var scenario = 0;
+            var exposed = 0;
+            action NewMember when (scenario == 0) { scenario = 1; exposed = if Buggy == 1 { 0 } else { 1 }; }
+            action Rotated when (scenario == 0) { scenario = 2; exposed = if Buggy == 2 { 0 } else { 1 }; }
+            action Onward when (scenario == 0) { scenario = 3; exposed = if Buggy == 3 { 0 } else { 1 }; }
+            action WrongRecipient when (scenario == 0) { scenario = 4; exposed = if Buggy == 4 { 1 } else { 0 }; }
+            action WrongEpochKey when (scenario == 0) { scenario = 5; exposed = if Buggy == 5 { 1 } else { 0 }; }
+            action WrongFileKey when (scenario == 0) { scenario = 6; exposed = if Buggy == 6 { 1 } else { 0 }; }
+            action Stale when (scenario == 0) { scenario = 7; exposed = if Buggy == 7 { 1 } else { 0 }; }
+            action RetiredRecipient when (scenario == 0) { scenario = 8; exposed = if Buggy == 8 { 1 } else { 0 }; }
+            action Forked when (scenario == 0) { scenario = 9; exposed = if Buggy == 9 { 1 } else { 0 }; }
+            action DiscardedIssuance when (scenario == 0) { scenario = 10; exposed = if Buggy == 10 { 1 } else { 0 }; }
+            action FutureSource when (scenario == 0) { scenario = 11; exposed = if Buggy == 11 { 1 } else { 0 }; }
+            invariant OnlyCurrentRecipientReads: exposed == 0 || (scenario > 0 && scenario <= 3);
+            invariant HistoricalHandoffWorks: scenario == 0 || scenario > 3 || exposed == 1;
         }
     }
 }
@@ -50,6 +163,144 @@ pub fn historical_access_model() -> Model {
             action Discarded when (scenario == 0) { scenario = 9; exposed = if Buggy == 9 { 1 } else { 0 }; }
             invariant OnlyCurrentSelectedReleases: exposed == 0 || scenario == 1 || scenario == 2 || scenario == 8;
             invariant SelectedHistoryWorks: scenario == 0 || (scenario > 2 && (8 > scenario || scenario > 8)) || exposed == 1;
+        }
+    }
+}
+
+/// Historical publication validity is causal, while current key access checks
+/// every retained publication. Real signed journals exercise these scenarios.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn historical_publication_model() -> Model {
+    aterm_spec::ty_model! {
+        DbHistoricalPublication {
+            const Buggy = 0;
+            var scenario = 0;
+            var historical = 0;
+            var current = 0;
+            action Original when (scenario == 0) { scenario = 1; historical = if Buggy == 1 { 0 } else { 1 }; current = 1; }
+            action FutureDescendant when (scenario == 0) { scenario = 2; historical = if Buggy == 2 { 0 } else { 1 }; current = if Buggy == 3 { 1 } else { 0 }; }
+            action ReusedSource when (scenario == 0) { scenario = 3; historical = if Buggy == 4 { 1 } else { 0 }; current = 0; }
+            action FutureSibling when (scenario == 0) { scenario = 4; historical = if Buggy == 5 { 0 } else { 1 }; current = 0; }
+            action MergedPastCopy when (scenario == 0) { scenario = 5; historical = if Buggy == 6 { 1 } else { 0 }; current = 0; }
+            action DiscardedSource when (scenario == 0) { scenario = 6; historical = if Buggy == 7 { 1 } else { 0 }; current = 0; }
+            invariant OriginalEvidenceSurvives: scenario == 0 || scenario == 3 || scenario == 5 || scenario == 6 || historical == 1;
+            invariant HistoricalReuseRefused: scenario == 0 || scenario == 1 || scenario == 2 || scenario == 4 || historical == 0;
+            invariant CurrentReuseRefused: scenario == 1 || current == 0;
+        }
+    }
+}
+
+/// Only an intact witnessed prefix may retain discarded-source ciphertext.
+/// Current projection, transfer and liability admission stay separate.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn table_quarantine_model() -> Model {
+    aterm_spec::ty_model! {
+        DbTableQuarantine {
+            const Buggy = 0;
+            var scenario = 0; var opened = 0; var quarantined = 0;
+            var writable = 0; var complete = 0; var offered = 0;
+            var retained = 0; var received = 0; var visible = 0;
+            action Intact when (scenario == 0) {
+                scenario = 1; opened = 1; writable = if Buggy == 1 { 0 } else { 1 };
+                complete = 1; offered = 1; retained = 1; visible = 1;
+            }
+            action ForeignDiscarded when (scenario == 0) {
+                scenario = 2; opened = 1; quarantined = 1;
+                writable = if Buggy == 1 { 0 } else { 1 };
+                complete = if Buggy == 2 { 1 } else { 0 };
+                offered = if Buggy == 3 { 1 } else { 0 };
+                retained = if Buggy == 4 { 0 } else { 1 };
+                visible = if Buggy == 11 { 1 } else { 0 };
+            }
+            action OwnDiscarded when (scenario == 0) {
+                scenario = 3; opened = 1; quarantined = 1;
+                writable = if Buggy == 5 { 1 } else { 0 }; retained = 1;
+            }
+            action DiscardedTail when (scenario == 0) {
+                scenario = 4; opened = if Buggy == 6 { 1 } else { 0 };
+            }
+            action ChangedWitness when (scenario == 0) {
+                scenario = 5; opened = if Buggy == 7 { 1 } else { 0 };
+            }
+            action MissingSelectedKey when (scenario == 0) {
+                scenario = 6; opened = if Buggy == 8 { 1 } else { 0 };
+            }
+            action RemoteDiscarded when (scenario == 0) {
+                scenario = 7; opened = 1; complete = 1;
+                received = if Buggy == 9 { 1 } else { 0 };
+            }
+            action SelectedDependent when (scenario == 0) {
+                scenario = 8; opened = 1; quarantined = 1; retained = 2;
+                offered = if Buggy == 12 { 1 } else { 0 };
+                visible = if Buggy == 11 { 1 } else { 0 };
+                writable = if Buggy == 5 { 1 } else { 0 };
+            }
+            action ChangedObservation when (scenario == 0) {
+                scenario = 9; opened = if Buggy == 10 { 1 } else { 0 };
+            }
+            action MissingParent when (scenario == 0) {
+                scenario = 10; opened = 1; retained = 1; offered = 1; writable = 1;
+                complete = if Buggy == 13 { 1 } else { 0 };
+            }
+            action RepairedParent when (scenario == 0) {
+                scenario = 11; opened = 1; retained = 2; offered = 2; visible = 2; writable = 1;
+                complete = if Buggy == 14 { 0 } else { 1 };
+            }
+            invariant HealthyWriterProgress: (scenario > 2 || scenario == 0) || writable == 1;
+            invariant UnknownLiabilityWithholds: quarantined == 0 || complete == 0;
+            invariant NoQuarantineOffers: (scenario == 0 || scenario == 1 || scenario == 4 || scenario == 5 || scenario == 6 || scenario == 7 || scenario == 9 || scenario > 9) || offered == 0;
+            invariant NoQuarantineProjection: (scenario == 0 || scenario == 1 || scenario == 4 || scenario == 5 || scenario == 6 || scenario == 7 || scenario == 9 || scenario > 9) || visible == 0;
+            invariant WitnessedBytesRetained: quarantined == 0 || retained > 0;
+            invariant TaintedChainBlocked: (scenario == 0 || scenario == 1 || scenario == 2 || scenario == 4 || scenario == 5 || scenario == 6 || scenario == 7 || scenario == 9 || scenario > 9) || writable == 0;
+            invariant UnsafeSourcesClosed: (scenario == 0 || scenario == 1 || scenario == 2 || scenario == 3 || scenario == 7 || scenario == 8 || scenario > 9) || opened == 0;
+            invariant MissingParentWithholdsLiability: scenario <= 9 || scenario > 10 || complete == 0;
+            invariant RepairedParentRestoresLiability: scenario <= 10 || complete == 1;
+            invariant NoOpaqueAck: received == 0;
+        }
+    }
+}
+
+/// Selected records cannot launder locally quarantined fork evidence. Cutoff
+/// claims must identify the exact writer dot before liabilities are readable.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn table_quarantine_closure_model() -> Model {
+    aterm_spec::ty_model! {
+        DbTableQuarantineClosure {
+            const Buggy = 0;
+            var scenario = 0; var offered = 0; var visible = 0;
+            var complete = 0; var retained = 0; var forked = 0;
+            action TransitiveFork when (scenario == 0) {
+                scenario = 1; retained = 3; forked = 1;
+                offered = if Buggy == 1 { 1 } else { 0 };
+            }
+            action GappedSuffix when (scenario == 0) {
+                scenario = 2; retained = 2;
+                offered = if Buggy == 2 { 1 } else { 0 };
+            }
+            action ImpliedFork when (scenario == 0) {
+                scenario = 3; retained = 2; offered = 0;
+                forked = if Buggy == 3 { 0 } else { 1 };
+                visible = if Buggy == 3 { 1 } else { 0 };
+            }
+            action ValidFrontier when (scenario == 0) {
+                scenario = 4; retained = 2; offered = 2; visible = 2;
+                complete = if Buggy == 4 { 0 } else { 1 };
+            }
+            action WrongActor when (scenario == 0) {
+                scenario = 5; retained = 2; offered = 2; visible = 1;
+                complete = if Buggy == 5 { 1 } else { 0 };
+            }
+            action WrongSequence when (scenario == 0) {
+                scenario = 6; retained = 2; offered = 2; visible = 1;
+                complete = if Buggy == 6 { 1 } else { 0 };
+            }
+            invariant TaintedHistoryNotOffered: scenario == 0 || scenario > 2 || offered == 0;
+            invariant ImpliedForkRestricts: scenario <= 2 || scenario > 3 || (forked == 1 && visible == 0);
+            invariant ValidFrontierReadable: scenario <= 3 || scenario > 4 || complete == 1;
+            invariant InvalidFrontierWithholds: scenario <= 4 || complete == 0;
         }
     }
 }
@@ -572,6 +823,71 @@ pub fn membership_journal_model() -> Model {
             invariant DescendantHasParent: 4 > visible || visible > 4 || right == 1;
             invariant RecoveryHasAncestry: 5 > visible || visible > 5 || (left == 1 && right == 1 && tail == 1);
             invariant ForkHasNoWinner: left == 0 || right == 0 || recovery == 1 || visible == 0;
+        }
+    }
+}
+
+/// Signed negative evidence survives custody replay without becoming an
+/// operation, a refund, or a fresh writer identity. These are bounded scenarios.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn table_conflict_model() -> Model {
+    aterm_spec::ty_model! {
+        DbTableConflict {
+            const Buggy = 0;
+            var scenario = 0; var usable = 0; var restricted = 0;
+            var acknowledged = 0; var visible = 0; var liability = 0; var writable = 0; var imported = 0;
+            action Receive when (scenario == 0) {
+                scenario = 1; usable = 1; acknowledged = 1;
+                restricted = if Buggy == 1 { 0 } else { 1 };
+                imported = if Buggy == 9 { 1 } else { 0 };
+                liability = if Buggy == 10 { 0 } else { 1 };
+            }
+            action Restart when (scenario == 0) {
+                scenario = 2; usable = 1; acknowledged = 1; liability = 1;
+                restricted = if Buggy == 2 { 0 } else { 1 };
+            }
+            action Tail when (scenario == 0) {
+                scenario = 3; usable = 1; liability = 1;
+                restricted = if Buggy == 3 { 0 } else { 1 };
+            }
+            action Rollback when (scenario == 0) {
+                scenario = 4; acknowledged = 1; usable = if Buggy == 4 { 1 } else { 0 };
+            }
+            action OwnReset when (scenario == 0) {
+                scenario = 5; usable = 1; acknowledged = 1; restricted = 1; liability = 1;
+                writable = if Buggy == 5 { 1 } else { 0 };
+            }
+            action WrongScope when (scenario == 0) {
+                scenario = 6; usable = 1; acknowledged = if Buggy == 6 { 1 } else { 0 };
+            }
+            action Forged when (scenario == 0) {
+                scenario = 7; usable = 1; acknowledged = if Buggy == 7 { 1 } else { 0 };
+            }
+            action Retired when (scenario == 0) {
+                scenario = 8; usable = 1; acknowledged = 1; liability = 1;
+                restricted = if Buggy == 8 { 0 } else { 1 };
+            }
+            action Replicate when (scenario == 0) {
+                scenario = 9; usable = 1; acknowledged = 1;
+                restricted = if Buggy == 11 { 0 } else { 1 };
+                visible = if Buggy == 13 { 1 } else { 0 };
+            }
+            action KnownOperation when (scenario == 0) {
+                scenario = 10; usable = 1; acknowledged = 1; restricted = 1;
+                liability = if Buggy == 12 { 1 } else { 0 };
+            }
+            action Capacity when (scenario == 0) {
+                scenario = 11; usable = 1; acknowledged = 1;
+                restricted = if Buggy == 14 { 0 } else { 1 };
+            }
+            invariant RetainedRestriction: scenario == 0 || scenario == 4 || scenario == 6 || scenario == 7 || restricted == 1;
+            invariant AuthenticateBeforeAck: 6 > scenario || scenario > 7 || acknowledged == 0;
+            invariant LostWitnessRefuses: scenario <= 3 || scenario > 4 || usable == 0;
+            invariant NoWriterReset: writable == 0;
+            invariant NoPayloadAdmission: imported == 0 && visible == 0;
+            invariant NoFalseLiability: (scenario <= 8) || liability == 0;
+            invariant UnrelatedLiabilityAvailable: scenario == 0 || scenario > 1 || liability == 1;
         }
     }
 }

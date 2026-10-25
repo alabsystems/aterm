@@ -64,8 +64,8 @@ enum AuthorizationWrite {
     /// An upgrade's plan and recoverable, unadmitted progress share one rename.
     UpgradePlan(Plan, scope::UpgradeProgress),
     Progress(Progress),
-    /// The first-run decision ([`save_admitted_decision`]): what of a Restore still stands,
-    /// else whether the Mac settings read applied.
+    /// The first-run decision ([`save_admitted_decision`]): what of a Restore still stands, and
+    /// whether the Mac settings read applied ([`admitted_applied`]).
     Workstation(Option<Restored>, bool),
 }
 
@@ -102,7 +102,7 @@ impl AuthorizationWrite {
             }
             Self::Progress(progress) => records.progress = Some(*progress),
             Self::Workstation(restored, applied) => {
-                records.decision = if restored.is_none() && *applied {
+                records.decision = if *applied {
                     Decision::Applied(true)
                 } else {
                     Decision::Pending
@@ -158,11 +158,15 @@ impl AuthorizationCommit {
         without_spent_stop(current) == without_spent_stop(expected)
     }
 
+    /// The writes that admit `plan` over the `baseline` records, with the vault this Mac is in
+    /// (`vault`); `waiting`: a Restore's put-back waits for Full Disk Access
+    /// ([`restore_waits`]).
     fn new(
         baseline: InitialSetupObservation,
         plan: &Plan,
         admission: Admission,
         vault: AdmittedVault,
+        waiting: bool,
     ) -> Result<Self, String> {
         validate_plan(plan)?;
         let previous = baseline.records.plan.as_ref().map(|(plan, _)| plan);
@@ -176,12 +180,17 @@ impl AuthorizationCommit {
         };
         let restored = baseline.records.restored;
         let mut still_restored = None;
-        if restored.is_some() {
-            // After a Restore no startup answer is Set up now: whichever plan it admits (the
-            // one it staged, a group choice made while the offer waited, a Join, or the plan
-            // presented in a vault joined since), it is a choice over the Restore, measured
-            // as System State measures one, so it sets only what the person turned on and
-            // keeps every stage it left as it was.
+        if restored.is_some()
+            || (!same_plan && matches!(admission, Admission::Person | Admission::Join))
+        {
+            // A person's answer, or any answer after a Restore (no startup answer is Set up now
+            // then), is a choice: whichever plan it admits (the one a choice cut short staged,
+            // a group choice made while the offer waited, a Join, or the plan presented in a
+            // vault joined since), it is measured as System State measures one, from the run
+            // the records keep ([`Progress::staged`]), or the one pass an older aterm made of its
+            // plan ([`older_run`]), so it sets only what the person turned on and keeps every
+            // stage it left as it was: no Dock reset and no sign-out again for another group, and
+            // a Join runs only the vault steps again.
             let restart = Restart {
                 chosen: true,
                 joins: admission == Admission::Join,
@@ -189,8 +198,11 @@ impl AuthorizationCommit {
             (next.done, next.only, still_restored) = admitted_keeps(
                 restart,
                 baseline.records.plan.as_ref(),
-                prior,
+                prior.or_else(|| {
+                    older_run(baseline.records.plan.as_ref(), baseline.records.decision)
+                }),
                 restored,
+                waiting,
                 plan,
             );
         } else if admission == Admission::Upgrade
@@ -212,9 +224,14 @@ impl AuthorizationCommit {
         next.completed = plan.selection.is_empty();
         next.admitted = false;
         next.running = None;
+        // An admission is a run of its own: an older run's Stop holds it no more.
+        next.continues = None;
         next.admitted_vault = vault;
         let first = if admission == Admission::Upgrade {
-            AuthorizationWrite::UpgradePlan(plan.clone(), scope::UpgradeProgress::new(prior, next))
+            AuthorizationWrite::UpgradePlan(
+                plan.clone(),
+                scope::UpgradeProgress::new(previous.cloned(), prior, next),
+            )
         } else {
             AuthorizationWrite::Plan(
                 plan.clone(),
@@ -222,11 +239,19 @@ impl AuthorizationCommit {
             )
         };
         let mut writes = vec![first, AuthorizationWrite::Progress(next)];
-        // A Restore's record is always written again: it now measures from this plan.
-        if next.done & Stage::Workstation.bit() == 0 || restored.is_some() {
+        // A Restore's record is always written again: it now measures from this plan. So is a
+        // decision no admitted run reads under, such as an older aterm's applied setup whose
+        // sign-outs it never verified.
+        if next.done & Stage::Workstation.bit() == 0
+            || restored.is_some()
+            || !matches!(
+                baseline.records.decision,
+                Decision::Pending | Decision::Applied(true)
+            )
+        {
             writes.push(AuthorizationWrite::Workstation(
                 still_restored,
-                mac_settings_kept(plan, next.done),
+                admitted_applied(plan, still_restored, next.done),
             ));
         }
         next.admitted = true;
@@ -296,8 +321,7 @@ impl InitialSetupAuthorization {
 
     pub(super) fn capture_at(root: &Path) -> Result<Self, String> {
         let baseline = observation_at(root).map_err(|error| error.to_string())?;
-        let plan = baseline.records.plan.as_ref().map(|(plan, _)| plan);
-        let revision = plan_revision(baseline.records.progress, plan)?;
+        let revision = review_revision(&baseline.records)?;
         Ok(Self {
             revision,
             vault: AdmittedVault::Unknown,
@@ -324,6 +348,10 @@ impl InitialSetupAuthorization {
         let records = observation_at(root)
             .map_err(|error| error.to_string())?
             .records;
+        // A plan an older aterm saved predates the Permissions group, so nobody turned it off:
+        // it is presented with aterm's own permissions, approved by default as on every Mac
+        // (System State design §3.5, §6; [`Records::present`]). Only a person's Cancel or Stop
+        // holds them, and either ends setup before anything is offered.
         let plan = offered_plan(records.presented_plan_record(), Ok(configured.clone()))?;
         self.vault = AdmittedVault::of(Ok(configured));
         Ok(plan)
@@ -351,18 +379,15 @@ impl InitialSetupAuthorization {
     /// doctor records must still be current; the vault this intentional join may
     /// replace is read once as that review starts writing, under the profile lock.
     pub fn persist_join_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {
-        observe_person_mutation(
-            Err("another doctor profile pass is running".into()),
-            |root| {
-                self.persist_join_with(
-                    root,
-                    plan,
-                    live_configured_vault,
-                    AuthorizationWrite::persist,
-                    |root| observation_at(root).map_err(|error| error.to_string()),
-                )
-            },
-        )
+        observe_person_choice(|root| {
+            self.persist_join_with(
+                root,
+                plan,
+                live_configured_vault,
+                AuthorizationWrite::persist,
+                |root| observation_at(root).map_err(|error| error.to_string()),
+            )
+        })
     }
 
     fn persist_join_with(
@@ -384,8 +409,8 @@ impl InitialSetupAuthorization {
     }
 
     /// [`Self::persist_observed`] for the plan aterm chose by itself at first
-    /// launch ([`Self::offer_scoped`]): saved as provisional, so a later
-    /// launch that finds the ALab signal may widen it.
+    /// launch ([`Self::offer_scoped`]): saved as provisional, so the launch
+    /// that finds the ALab signal, this one or a later one, may widen it.
     pub fn persist_automatic_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {
         self.persist_as(plan, Admission::Automatic)
     }
@@ -404,19 +429,26 @@ impl InitialSetupAuthorization {
         }
     }
 
+    /// The answer to the offer waits for the profile lock while another holds it, as a
+    /// choice does ([`observe_person_choice`]); the watch's own upgrade does not wait.
     fn persist_as(
         &mut self,
         plan: &Plan,
         admission: Admission,
     ) -> InitialSetupObserved<Option<u64>> {
-        observe_person_mutation(
-            Err("another doctor profile pass is running".into()),
-            |root| {
-                self.persist_with(root, plan, admission, AuthorizationWrite::persist, |root| {
-                    observation_at(root).map_err(|error| error.to_string())
-                })
-            },
-        )
+        let operation = |root: &Path| {
+            self.persist_with(root, plan, admission, AuthorizationWrite::persist, |root| {
+                observation_at(root).map_err(|error| error.to_string())
+            })
+        };
+        if admission == Admission::Upgrade {
+            observe_person_mutation(
+                Err("another doctor profile pass is running".into()),
+                operation,
+            )
+        } else {
+            observe_person_choice(operation)
+        }
     }
 
     #[cfg(test)]
@@ -615,9 +647,10 @@ impl InitialSetupAuthorization {
                 }
                 let owned = baseline.clone();
                 let vault = read(self.vault)?;
+                let waiting = owned.records.restored.is_some() && restore_waits(root);
                 self.state = AuthorizationState::Ended;
                 self.state = AuthorizationState::Writing(AuthorizationCommit::new(
-                    owned, plan, admission, vault,
+                    owned, plan, admission, vault, waiting,
                 )?);
             }
             AuthorizationState::Writing(commit) => {
@@ -1352,7 +1385,15 @@ mod tests {
         let mut replacement = plan;
         replacement.vault_url = "https://vault.example/v1/other".into();
         save_plan(root.path(), &replacement).unwrap();
-        assert!(InitialSetupAuthorization::capture_at(root.path()).is_err());
+        // A plan ahead of its run, as a choice cut short leaves it, still binds the run's
+        // revision so the next launch can offer it; no pass runs on it meanwhile.
+        assert_eq!(
+            InitialSetupAuthorization::capture_at(root.path())
+                .unwrap()
+                .revision(),
+            revision
+        );
+        assert!(revision_at(root.path()).is_err());
         std::fs::remove_file(root.path().join("automatic-plan.json")).unwrap();
         assert!(InitialSetupAuthorization::capture_at(root.path()).is_err());
     }
@@ -1898,7 +1939,8 @@ mod tests {
                 unrelated.revision += 10;
                 save_progress(root.path(), unrelated).unwrap();
             }
-            assert!(InitialSetupAuthorization::capture_at(root.path()).is_err());
+            assert!(revision_at(root.path()).is_err());
+            assert!(!matches!(admission_at(root.path()), Ok(Some(_))));
             // Independent, physically matching progress remains authoritative
             // even if an old marker is malformed or describes another run.
             let mut newer = Progress::for_plan(&Plan::default());

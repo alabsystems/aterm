@@ -24,6 +24,9 @@ pub(crate) struct SessionChromeInput {
     pub description: Option<String>,
     /// The live activity line — Tab Subject & Status's words (`App::session_status_text`).
     pub activity: Option<String>,
+    /// The active goal of the agent in front, one line
+    /// ([`crate::session_timeline::SessionTimeline::goal`]).
+    pub goal: Option<String>,
     /// The engine's reported cwd (OSC 7 / shell integration), RAW.
     pub cwd: Option<String>,
     /// The `$HOME` to abbreviate against (explicit, like [`crate::app_tabs::home_relative_suffix`], so tests need no env).
@@ -236,6 +239,8 @@ pub(crate) struct CachedChrome {
     pub connections_revision: u64,
     /// The window's `upgrade_host::UpgradeView` revision: the harness host's rows move no other epoch.
     pub upgrade_revision: u64,
+    /// The agent's active goal at compose time (`claude_footer::goal_term`): a goal read moves no other epoch.
+    pub goal: u64,
     /// When the clock may move this composition with no input epoch moving ([`clock_expiry_ms`], from [`crate::turn_ledger::now_ms`] at compose time).
     pub expires_ms: Option<u64>,
     /// The session log's clause at compose time ([`ClauseKey`]), `None` with `[session_log] clause` off or no clause.
@@ -405,6 +410,15 @@ fn header_lines(input: &SessionChromeInput) -> (Vec<String>, usize) {
             identity.push(format!("activity: {}", display_description(&activity)));
         }
     }
+    if let Some(goal) = input.goal.as_deref() {
+        let goal = crate::session_timeline::sanitize_presentation_line(
+            goal,
+            crate::session_timeline::META_DESCRIPTION_MAX,
+        );
+        if !goal.is_empty() {
+            identity.push(format!("{GOAL_PREFIX}{}", display_description(&goal)));
+        }
+    }
     let clause_at = identity.len();
     if let Some(cwd) = input.cwd.as_deref().filter(|c| !c.is_empty()) {
         let cwd = display_cwd(cwd, input.home.as_deref());
@@ -546,6 +560,9 @@ pub(crate) fn compose_tooltip(input: &SessionChromeInput) -> Option<String> {
     lines.extend(connections);
     Some(lines.join("\n"))
 }
+
+/// Prefix of the hover's and the tab menu's line naming the agent's active goal.
+pub(crate) const GOAL_PREFIX: &str = "goal: ";
 
 /// Prefix of the tooltip's attention line; the native hover ([`crate::toolbar`]) reads it.
 pub(crate) const NEEDS_ATTENTION_PREFIX: &str = "Needs attention: ";
@@ -727,6 +744,7 @@ mod tests {
             activity_revision: 0,
             connections_revision: 0,
             upgrade_revision: 0,
+            goal: 0,
             expires_ms: Some(composed_ms + CACHE_MAX_AGE_MS),
             clause: None,
             clause_line: None,
@@ -827,6 +845,7 @@ mod tests {
             icon: Some("🤖".to_string()),
             description: Some("Rebuilds the docs site".to_string()),
             activity: Some("Building documentation".to_string()),
+            goal: None,
             cwd: Some("/Users//foo/src/aterm".to_string()),
             home: Some("/Users//foo".to_string()),
             state: Some("alive".to_string()),
@@ -902,6 +921,52 @@ mod tests {
             ..SessionChromeInput::default()
         };
         assert_eq!(compose_tooltip(&bare), None);
+    }
+
+    #[test]
+    fn the_agents_active_goal_is_a_line_of_the_hover_and_the_tab_menu() {
+        let mut input = full_input();
+        input.goal = Some("implement the aos aterm vision".to_string());
+        let tip = compose_tooltip(&input).expect("composes");
+        assert_eq!(
+            tip,
+            "🤖 build agent\n\
+             description: Rebuilds the docs site\n\
+             activity: Building documentation\n\
+             goal: implement the aos aterm vision\n\
+             cwd: ~/src/aterm"
+        );
+        let menu = compose_tab_menu(&input);
+        assert!(
+            menu.contains(&TabMenuEntry::Header(
+                "goal: implement the aos aterm vision".to_string()
+            )),
+            "{menu:?}"
+        );
+        input.goal = Some(format!("spoof\u{202e}ed {}", "word ".repeat(80)));
+        let tip = compose_tooltip(&input).expect("composes");
+        let line = tip
+            .lines()
+            .find(|l| l.starts_with(GOAL_PREFIX))
+            .expect("goal line");
+        assert!(line.starts_with("goal: spoofed word"), "{line}");
+        assert!(
+            line.ends_with('…'),
+            "a long goal is cut for display: {line}"
+        );
+        assert!(!crate::session_timeline::metadata_has_forbidden_formatting(
+            line
+        ));
+        let bare = SessionChromeInput {
+            label: "claude".to_string(),
+            goal: Some("ship it".to_string()),
+            ..SessionChromeInput::default()
+        };
+        assert_eq!(
+            compose_tooltip(&bare).as_deref(),
+            Some("claude\ngoal: ship it"),
+            "a goal alone is worth a hover"
+        );
     }
 
     #[test]

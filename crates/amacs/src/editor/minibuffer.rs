@@ -140,9 +140,11 @@ impl EditorWorkspace {
                         "No editor command matches `{query}`"
                     ))]);
                 };
+                view.clear_minibuffer();
                 self.execute(store, view, command)
             }
             Minibuffer::Search { query, origin } => {
+                view.clear_minibuffer();
                 let status = if query.is_empty() {
                     "Search cancelled"
                 } else {
@@ -153,17 +155,23 @@ impl EditorWorkspace {
                 Ok(vec![EditorEffect::Status(status.to_string())])
             }
             Minibuffer::Buffer { query } => {
+                view.clear_minibuffer();
                 self.record_answers(EditorCommand::SwitchBuffer, std::slice::from_ref(&query));
                 Ok(vec![EditorEffect::SwitchBuffer { query }])
             }
-            Minibuffer::GotoLine { query, origin } => match self.goto_line(store, view, &query)? {
-                Ok(effects) => {
+            Minibuffer::GotoLine { query, origin } => match self.goto_line(store, view, &query) {
+                Ok(Ok(effects)) => {
+                    view.clear_minibuffer();
                     self.record_answers(EditorCommand::GotoLine, std::slice::from_ref(&query));
                     Ok(effects)
                 }
-                Err(refusal) => {
+                Ok(Err(refusal)) => {
                     view.minibuffer = Minibuffer::GotoLine { query, origin };
                     Ok(vec![EditorEffect::Status(refusal)])
+                }
+                Err(error) => {
+                    view.clear_minibuffer();
+                    Err(error)
                 }
             },
             Minibuffer::Prompt {
@@ -172,12 +180,13 @@ impl EditorWorkspace {
             } => {
                 invocation.args.push(query);
                 if invocation.next_prompt().is_some() {
-                    view.minibuffer = Minibuffer::Prompt {
+                    view.open_minibuffer(Minibuffer::Prompt {
                         invocation,
                         query: String::new(),
-                    };
+                    });
                     return Ok(Vec::new());
                 }
+                view.clear_minibuffer();
                 self.answer_prompt(store, view, invocation)
             }
             Minibuffer::Inactive => Ok(vec![EditorEffect::Bell]),
@@ -305,6 +314,150 @@ mod tests {
     use aterm_models_native::native_editor_command_palette_model;
     use aterm_spec::derive::Model;
     use aterm_spec::interp::{State, admits};
+
+    #[test]
+    fn input_lifetime_survives_query_edits_navigation_and_rebase_but_not_reopening() {
+        let (mut store, mut workspace, mut view, document) = editor("needle then needle");
+        let document_input = view.input_lifetime();
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::IncrementalSearch)
+            .unwrap();
+        let search_input = view.input_lifetime();
+        assert!(!std::sync::Arc::ptr_eq(&document_input, &search_input));
+        workspace
+            .insert_text(&mut store, &mut view, "needle")
+            .unwrap();
+        workspace.minibuffer_backspace(&store, &mut view).unwrap();
+        workspace.insert_text(&mut store, &mut view, "e").unwrap();
+        for command in [EditorCommand::SearchNext, EditorCommand::SearchPrevious] {
+            workspace.execute(&mut store, &mut view, command).unwrap();
+        }
+        assert!(std::sync::Arc::ptr_eq(
+            &search_input,
+            &view.input_lifetime()
+        ));
+
+        let mut writer = workspace
+            .attach(&mut store, document, crate::store::DocumentViewId(92))
+            .unwrap();
+        workspace
+            .insert_text(&mut store, &mut writer, "prefix ")
+            .unwrap();
+        for (seq, deltas) in workspace.take_commits(document) {
+            view.observe_external(seq, &deltas);
+        }
+        assert!(std::sync::Arc::ptr_eq(
+            &search_input,
+            &view.input_lifetime()
+        ));
+
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::Abort)
+            .unwrap();
+        let cancelled = view.input_lifetime();
+        assert!(!std::sync::Arc::ptr_eq(&search_input, &cancelled));
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::IncrementalSearch)
+            .unwrap();
+        let reopened = view.input_lifetime();
+        assert!(!std::sync::Arc::ptr_eq(&cancelled, &reopened));
+        assert!(!std::sync::Arc::ptr_eq(&search_input, &reopened));
+        workspace
+            .insert_text(&mut store, &mut view, "needle")
+            .unwrap();
+        let selections = view.selections.clone();
+        view.clear_minibuffer();
+        assert_eq!(view.selections, selections);
+        assert!(!view.minibuffer_active());
+        assert!(!std::sync::Arc::ptr_eq(&reopened, &view.input_lifetime()));
+    }
+
+    #[test]
+    fn refused_modal_submission_keeps_its_input_lifetime() {
+        for (command, query) in [
+            (EditorCommand::ExecuteCommand, "no-such-editor-command"),
+            (EditorCommand::GotoLine, "0"),
+        ] {
+            let (mut store, mut workspace, mut view, document) = editor("unchanged");
+            let original = store.snapshot(document).unwrap();
+            workspace.execute(&mut store, &mut view, command).unwrap();
+            workspace.insert_text(&mut store, &mut view, query).unwrap();
+            let input = view.input_lifetime();
+            let minibuffer = view.minibuffer.clone();
+            workspace.submit_minibuffer(&mut store, &mut view).unwrap();
+            assert_eq!(view.minibuffer, minibuffer);
+            assert!(std::sync::Arc::ptr_eq(&input, &view.input_lifetime()));
+            let after = store.snapshot(document).unwrap();
+            assert_eq!(after.seq, original.seq);
+            assert_eq!(after.text, original.text);
+        }
+    }
+
+    #[test]
+    fn accepted_prompts_and_same_kind_replacements_get_new_input_lifetimes() {
+        let (mut store, mut workspace, mut view, _) = editor("needle");
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::ExecuteCommand)
+            .unwrap();
+        workspace
+            .insert_text(&mut store, &mut view, "kill-buffer")
+            .unwrap();
+        let command_input = view.input_lifetime();
+        workspace.submit_minibuffer(&mut store, &mut view).unwrap();
+        assert!(matches!(
+            &view.minibuffer,
+            Minibuffer::Prompt { invocation, .. } if invocation.command == EditorCommand::KillBuffer
+        ));
+        let prompt_input = view.input_lifetime();
+        assert!(!std::sync::Arc::ptr_eq(&command_input, &prompt_input));
+        workspace
+            .insert_text(&mut store, &mut view, "other")
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &prompt_input,
+            &view.input_lifetime()
+        ));
+        let effects = workspace.submit_minibuffer(&mut store, &mut view).unwrap();
+        assert_eq!(
+            effects,
+            [EditorEffect::KillBuffer {
+                query: "other".into()
+            }]
+        );
+        assert!(!view.minibuffer_active());
+        assert!(!std::sync::Arc::ptr_eq(
+            &prompt_input,
+            &view.input_lifetime()
+        ));
+
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::ExecuteCommand)
+            .unwrap();
+        workspace
+            .insert_text(&mut store, &mut view, "execute-extended-command")
+            .unwrap();
+        let before_replacement = view.input_lifetime();
+        workspace.submit_minibuffer(&mut store, &mut view).unwrap();
+        assert!(matches!(&view.minibuffer, Minibuffer::Command { query, .. } if query.is_empty()));
+        assert!(!std::sync::Arc::ptr_eq(
+            &before_replacement,
+            &view.input_lifetime()
+        ));
+        view.clear_minibuffer();
+
+        for (command, query) in [
+            (EditorCommand::IncrementalSearch, "needle"),
+            (EditorCommand::GotoLine, "1"),
+            (EditorCommand::SwitchBuffer, "other"),
+        ] {
+            workspace.execute(&mut store, &mut view, command).unwrap();
+            workspace.insert_text(&mut store, &mut view, query).unwrap();
+            let input = view.input_lifetime();
+            workspace.submit_minibuffer(&mut store, &mut view).unwrap();
+            assert!(!view.minibuffer_active());
+            assert!(!std::sync::Arc::ptr_eq(&input, &view.input_lifetime()));
+        }
+    }
 
     fn palette_projection(
         model: &Model,
@@ -507,8 +660,9 @@ mod tests {
                 workspace
                     .insert_text(&mut store, &mut writer, inserted)
                     .unwrap();
-                let (seq, deltas) = workspace.take_last_commit(document).unwrap();
-                view.observe_external(seq, &deltas);
+                for (seq, deltas) in workspace.take_commits(document) {
+                    view.observe_external(seq, &deltas);
+                }
                 let before_cancel = store.snapshot(document).unwrap();
                 assert!(before_cancel.text.is_char_boundary(expected));
 
@@ -526,7 +680,7 @@ mod tests {
                         .is_char_boundary(view.primary_selection().head)
                 );
                 assert!(matches!(view.minibuffer, Minibuffer::Inactive));
-                assert_eq!(view.anchor_seq(), seq);
+                assert_eq!(view.anchor_seq(), before_cancel.seq);
                 let after_cancel = store.snapshot(document).unwrap();
                 assert_eq!(after_cancel.seq, before_cancel.seq);
                 assert_eq!(after_cancel.text, before_cancel.text);

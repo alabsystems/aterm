@@ -1005,6 +1005,7 @@ fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
         pgid: p.pgid,
         sid: p.sid,
         start: p.start,
+        age_ms: p.age_ms,
         uid: p.uid,
         name: p.name.clone(),
         exe: p.exe.clone(),

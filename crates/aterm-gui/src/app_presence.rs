@@ -103,6 +103,17 @@ pub(crate) fn set_need_unix_clock_for_test(now: Option<i64>) {
     NEED_UNIX_CLOCK_FOR_TEST.with(|c| c.set(now));
 }
 
+/// Whether `program` reports its own boxes (OSC 7501 `blocked`), which a program-claim need
+/// reads ([`crate::needs::ProgramClaimFact`]): codex alone. An exhaustive match, so a new agent
+/// is placed here before it compiles.
+const fn reports_its_boxes(program: aterm_phase::Program) -> bool {
+    use aterm_phase::Program as P;
+    match program {
+        P::Codex => true,
+        P::Claude | P::Agy | P::Muse | P::Gemini | P::Grok | P::Kimi | P::Generic => false,
+    }
+}
+
 fn need_unix_now() -> i64 {
     #[cfg(test)]
     if let Some(now) = NEED_UNIX_CLOCK_FOR_TEST.with(std::cell::Cell::get) {
@@ -359,7 +370,7 @@ impl App {
         now_unix: i64,
     ) -> crate::needs::NeedFacts {
         let ctx = &h.ctx;
-        let (attention, supervisor) = {
+        let (attention, supervisor, self_claimed) = {
             let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             let mut attention = meta.attention_owners.kinded();
             if attention.is_empty()
@@ -371,11 +382,15 @@ impl App {
                     kind: Some(aterm_types::needs::AttentionKind::Ask),
                 });
             }
-            (attention, meta.live_supervisor(now_us).map(str::to_string))
+            (
+                attention,
+                meta.live_supervisor(now_us).map(str::to_string),
+                meta.supervisor_proven(now_us),
+            )
         };
         let restarts = relaunching.contains(h.ctx.self_id.as_str())
             && crate::input_stall::host_hand_refusal(ctx, now_us).is_none();
-        let (agent, admit, stall, task, resume, age_ms, told) = {
+        let (agent, program_blocked, admit, stall, task, resume, age_ms, told) = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let a = tl.agent();
             let agent = (a.word != "-").then(|| crate::needs::AgentFact {
@@ -384,6 +399,22 @@ impl App {
                 rev: a.rev,
                 subject: a.subject.clone(),
             });
+            // Codex's own claim, in its own field: only where its reader names no state.
+            let program_blocked = tl
+                .program_shown()
+                .filter(|_| {
+                    a.word == "unknown"
+                        && crate::harness_host::identified_agent(a).is_some_and(reports_its_boxes)
+                })
+                .filter(|shown| {
+                    shown.state.state
+                        == aterm_core::terminal::program_state::ProgramStateWord::Blocked
+                })
+                .map(|shown| crate::needs::ProgramClaimFact {
+                    kind: shown.state.kind,
+                    key: shown.seq,
+                    report: shown.report,
+                });
             let stall = a.input.clone().map(|f| {
                 let after = crate::input_stall::after_restart(&tl, f.act.as_ref());
                 (f, a.program.clone(), after)
@@ -396,7 +427,16 @@ impl App {
             let resume = tl.claude_footer().and_then(|facts| facts.resume.clone());
             let admit = (crate::harness_host::agent_of(a), a.program_pgid);
             let told = tl.harness_needs();
-            (agent, admit, stall, task, resume, a.age_ms(), told)
+            (
+                agent,
+                program_blocked,
+                admit,
+                stall,
+                task,
+                resume,
+                a.age_ms(),
+                told,
+            )
         };
         let host_supervises =
             crate::harness_host::admitted_as(ctx, admit.0, admit.1).is_some_and(hosted);
@@ -442,6 +482,8 @@ impl App {
             task,
             attention,
             agent,
+            program_blocked,
+            self_claimed,
             supervised: host_supervises || other_supervisor,
             other_supervisor,
             claim_live: supervisor.is_some(),

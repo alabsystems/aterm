@@ -748,6 +748,14 @@ impl Terminal {
         Self::restored(c, active_grid, saved_grid)
     }
 
+    /// [`Self::from_checkpoint`] for replaying, in the process that took `c`, the bytes its engine parsed next while no restore of its own was pending: the restore adds no holder lineage (`c`'s seed uncertainty and tainted marks stay, and a later adoption is never untouched).
+    #[must_use]
+    pub fn replay_from_checkpoint(c: &TerminalCheckpoint) -> Terminal {
+        let mut terminal = Self::from_checkpoint(c);
+        terminal.holder_carried_at = None;
+        terminal
+    }
+
     /// A copy of this engine that continues as it does.
     #[must_use]
     pub fn replay_fork(&self) -> Option<Terminal> {
@@ -770,6 +778,7 @@ impl Terminal {
         };
         let scalars = self.project(usize::MAX, usize::MAX, true, false, MarksFrom::Carried);
         let mut fork = Self::restored(&scalars, active, inactive);
+        fork.program_state = self.program_state;
         fork.holder_fence.clone_from(&self.holder_fence);
         let since = |at: u64| t.screen_mutations.wrapping_sub(at);
         fork.holder_carried_at = self
@@ -1941,6 +1950,45 @@ mod tests {
         assert!(!closed.modes().synchronized_output());
     }
 
+    /// A CODEX AT A BOX STAYS AT IT ACROSS A HANDOFF: the program's own report standing (OSC
+    /// 7501) is carried, through the carry's meta too, and the adopting engine holds the same
+    /// report, which begins no turn; codex's re-send of it is the same box (where it began is
+    /// kept). CONTROL: an engine with no report carries none.
+    #[test]
+    fn the_programs_own_report_is_carried() {
+        let mut t = Terminal::new(4, 20);
+        assert_eq!(
+            t.checkpoint_carry(0)
+                .expect("Ground")
+                .output_state
+                .program_state,
+            None,
+            "CONTROL"
+        );
+        t.process(
+            b"\x1b]7501;state=working:app=codex\x1b\\\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\",
+        );
+        let cp = t.checkpoint_carry(0).expect("Ground");
+        #[cfg(feature = "serde")]
+        let cp = CheckpointMeta::from_checkpoint(&cp).into_checkpoint(cp.grid.clone(), None);
+        let mut adopted = Terminal::new(4, 20);
+        adopted.restore_checkpoint(&cp);
+        for (at, mut restored) in [
+            ("from_checkpoint", Terminal::from_checkpoint(&cp)),
+            ("restore", adopted),
+        ] {
+            let report = restored.program_state();
+            assert_eq!(report.state, t.program_state().state, "{at}");
+            assert_eq!(report.turns, 0, "{at}: a carried report begins no turn");
+            restored.process(b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\");
+            assert_eq!(
+                restored.program_state().began,
+                report.began,
+                "{at}: the box re-sent is the same box"
+            );
+        }
+    }
+
     #[test]
     fn output_state_in_flight_names_an_open_link_and_a_pending_vt52_address() {
         let mut t = Terminal::new(4, 20);
@@ -2027,6 +2075,7 @@ mod tests {
                     set: true,
                 },
             ],
+            program_state: Some("state=blocked:app=codex:kind=coffee".into()),
         };
         let mut restored = Terminal::new(4, 20);
         restored.process(b"Y\x1b]8;;https://example.com\x07\x1b[#{\x1b[?25s");
@@ -2051,7 +2100,8 @@ mod tests {
                 }],
                 ..OutputStateRepr::default()
             },
-            "the newest pushes, the mask's own bits, the known mode; none of the engine's own"
+            "the newest pushes, the mask's own bits, the known mode, no report the program \
+             state reader refuses; none of the engine's own"
         );
         restored.process(b"\x1b[3b");
         assert_eq!(
@@ -2066,6 +2116,7 @@ mod tests {
         });
         cp.output_state.sgr_stack = (0..depth).map(|n| pushed(n, 0x21)).collect();
         cp.output_state.saved_modes.truncate(1);
+        cp.output_state.program_state = Some("state=blocked:app=codex:kind=question".into());
         restored.restore_checkpoint(&cp);
         assert_eq!(restored.capture_output_state_repr(), cp.output_state);
     }

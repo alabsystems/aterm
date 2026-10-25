@@ -25,6 +25,8 @@ use std::{
     time::Duration,
 };
 
+mod peers;
+
 /// At most 4.5 MiB of sealed nodes are buffered per direction. The durable
 /// inventory, rather than an acknowledgement cursor, determines missing data.
 pub const RECORDS_PER_ROUND: usize = 16;
@@ -55,20 +57,28 @@ pub struct Report {
 /// Volatile scheduling hint, never a claim of delivery. Keep one per peer.
 /// Advancing past a deferred node prevents it from starving later restrictions;
 /// wraparound retries it even if the caller does not maintain a timer.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Repair {
     peer: Option<(Trust, Actor)>,
     cursor: Option<Digest>,
+    data: crate::replica::Repair,
+    application: Option<crate::replica::Report>,
 }
 impl Repair {
-    /// The channel-authenticated peer after a completed hello exchange.
+    /// The most recently channel-authenticated peer; the round may have failed.
     pub fn actor(&self) -> Option<Actor> {
         self.peer.map(|(_, actor)| actor)
+    }
+    /// Only a fully completed application round has a report. None also covers
+    /// legacy peers and deferred/failed upgrades, never a claim of no data.
+    pub const fn application(&self) -> Option<crate::replica::Report> {
+        self.application
     }
     fn prepare(&mut self, trust: Trust, actor: Actor) {
         if self.peer != Some((trust, actor)) {
             self.cursor = None;
             self.peer = Some((trust, actor));
+            self.data = crate::replica::Repair::default();
         }
     }
 
@@ -114,8 +124,36 @@ pub struct Endpoint {
     actor: Actor,
     identity: NodeIdentity,
     hello: Vec<u8>,
+    application: Option<crate::replica::Replica>,
+    inbound: peers::Cache,
+    /// The absolute deadline of one exchange ([`crate::network::WITHIN`]).
+    within: Duration,
 }
 impl Endpoint {
+    /// This endpoint's exchanges wait `within` before their deadline cuts them: a test that
+    /// needs every round to complete waits it out as a one-minute hang detector.
+    #[cfg(test)]
+    pub(crate) const fn within(mut self, within: Duration) -> Self {
+        self.within = within;
+        self
+    }
+
+    /// Attach an explicit local table set. Discovery/subscription is a higher
+    /// layer; no table path or admission can come from a peer's packet.
+    pub fn with_tables(
+        mut self,
+        paths: aterm_secrets::client::Paths,
+        tables: Vec<(crate::table::Scope, PathBuf)>,
+    ) -> Result<Self> {
+        let application = crate::replica::Replica::new(paths, tables)?;
+        if !application.matches(self.trust, self.actor) {
+            return Err(Error::new(
+                "application repair has another control identity",
+            ));
+        }
+        self.application = Some(application);
+        Ok(self)
+    }
     /// Build the control-only endpoint from encrypted secrets custody. Pending
     /// enrollment has no historical witness and cannot open an endpoint.
     pub fn from_bootstrap(
@@ -190,6 +228,9 @@ impl Endpoint {
             actor: request.binding().actor(),
             identity,
             hello,
+            application: None,
+            inbound: peers::Cache::default(),
+            within: crate::network::WITHIN,
         })
     }
 
@@ -203,9 +244,10 @@ impl Endpoint {
         side: Side,
         repair: &mut Repair,
     ) -> Result<Report> {
+        repair.application = None;
         let (tcp, locality) = connection.into_parts();
         locality.recheck()?;
-        let _deadline = crate::network::Deadline::arm(&tcp)?;
+        let _deadline = crate::network::Deadline::arm_within(&tcp, self.within)?;
         // This PUBLIC discriminator separates networks/protocols. It is not an
         // admission secret. Authority witness + exporter-bound identity below
         // are mandatory before any inventory or control repair is exposed.
@@ -232,7 +274,7 @@ impl Endpoint {
                     side,
                     repair,
                 );
-                locality.recheck()?;
+                locality.finish()?;
                 result
             }
             Side::Responder => {
@@ -252,7 +294,7 @@ impl Endpoint {
                     side,
                     repair,
                 );
-                locality.recheck()?;
+                locality.finish()?;
                 result
             }
         }
@@ -273,11 +315,27 @@ impl Endpoint {
         }
         let hello = receive_frame(stream, MAX_HELLO)?;
         let actor = authenticate(self.trust, self.actor, proof, &hello)?;
-        if side == Side::Responder {
-            send_frame(stream, &self.hello)?;
-        }
         repair.prepare(self.trust, actor);
-        exchange(
+        repair.application = None;
+        if side == Side::Responder {
+            let mut lease = self.inbound.acquire(actor, repair)?;
+            lease.prepare(self.trust, actor);
+            lease.application = None;
+            send_frame(stream, &self.hello)?;
+            self.repair_connected(stream, actor, side, &mut lease)
+        } else {
+            self.repair_connected(stream, actor, side, repair)
+        }
+    }
+
+    fn repair_connected(
+        &self,
+        stream: &mut (impl Read + Write),
+        actor: Actor,
+        side: Side,
+        repair: &mut Repair,
+    ) -> Result<Report> {
+        let report = exchange(
             stream,
             &Disk {
                 dir: &self.dir,
@@ -285,7 +343,13 @@ impl Endpoint {
             },
             side,
             repair,
-        )
+        )?;
+        if let Some(application) = &self.application {
+            repair.application = application
+                .exchange(stream, actor, side, &mut repair.data)
+                .ok();
+        }
+        Ok(report)
     }
 }
 
@@ -584,13 +648,13 @@ fn receive_batch(stream: &mut (impl Read + Write), store: &impl Store) -> Result
     stream.flush()?;
     Ok((retained, n - retained))
 }
-fn send_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
+pub(crate) fn send_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
     stream.write_all(&(bytes.len() as u32).to_le_bytes())?;
     stream.write_all(bytes)?;
     stream.flush()?;
     Ok(())
 }
-fn receive_frame(stream: &mut impl Read, max: usize) -> Result<Vec<u8>> {
+pub(crate) fn receive_frame(stream: &mut impl Read, max: usize) -> Result<Vec<u8>> {
     let n = read_u32(stream)? as usize;
     if n > max {
         return Err(Error::new("Commons frame exceeds its bound"));
@@ -599,7 +663,7 @@ fn receive_frame(stream: &mut impl Read, max: usize) -> Result<Vec<u8>> {
     stream.read_exact(&mut bytes)?;
     Ok(bytes)
 }
-fn read_u32(stream: &mut impl Read) -> Result<u32> {
+pub(crate) fn read_u32(stream: &mut impl Read) -> Result<u32> {
     let mut bytes = [0; 4];
     stream.read_exact(&mut bytes)?;
     Ok(u32::from_le_bytes(bytes))

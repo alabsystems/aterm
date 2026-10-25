@@ -8559,6 +8559,111 @@ fn the_autocompact_offer_is_a_persons_unless_read_whole_and_on() {
     }
 }
 
+const AUTO_MODE_SETUP: [&str; 8] = [
+    phase_fixtures::AUTO_MODE_SETUP,
+    phase_fixtures::AUTO_MODE_SETUP_60COL,
+    phase_fixtures::AUTO_MODE_SETUP_40COL,
+    phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN,
+    phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_60COL,
+    phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_40COL,
+    phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_SHELL,
+    phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_SHELL_MODE,
+];
+
+#[test]
+fn the_auto_mode_setup_offer_is_put_off_with_not_now_at_every_level() {
+    for text in AUTO_MODE_SETUP {
+        let rows = phase_fixtures::screen(text);
+        // The title's first row: a narrow pane wraps the title under it.
+        let title = rows
+            .iter()
+            .find(|r| r.trim().starts_with("Teach auto mode about your"))
+            .expect("the title row");
+        let guard = crate::supervise::policy::row_guard(title);
+        for c in [ctx(), full(), none(full())] {
+            let d = on_screen(&rows, &c);
+            let Decision::Approve {
+                rule_id,
+                choice,
+                guard: g,
+                subject,
+                unproven,
+            } = &d
+            else {
+                panic!("{:?}: {d:?}", c.approve);
+            };
+            assert_eq!(*rule_id, RULE_AUTO_MODE_SETUP, "{:?}", c.approve);
+            assert_eq!(*choice, Choice::Digit(2), "{:?}", c.approve);
+            assert_eq!(*g, guard);
+            assert_eq!(
+                subject,
+                "Teach auto mode about your environment? => Not now"
+            );
+            assert_eq!(*unproven, None);
+            let m = aterm_observe::row_matcher(g).expect("compiles");
+            assert_eq!(rows.iter().filter(|r| m.matches(r)).count(), 1, "{g}");
+        }
+    }
+}
+
+/// The negative control: a look-alike of the offer in other words is never put off by its rule,
+/// and at `safe` and `none` nothing presses it.
+#[test]
+fn a_look_alike_of_the_auto_mode_setup_offer_is_not_pressed_by_its_rule() {
+    let title = "Teach auto mode about your environment?";
+    let body = "Auto mode works better when it knows your environment. Takes about a minute.";
+    for text in [
+        phase_fixtures::AUTO_MODE_SETUP,
+        phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN,
+    ] {
+        let rows = phase_fixtures::screen(text);
+        let alike = |from: &str, to: &str| -> Vec<String> {
+            let out: Vec<String> = rows.iter().map(|r| r.replace(from, to)).collect();
+            assert_ne!(out, rows, "{from:?} is on the screen");
+            out
+        };
+        for (what, screen) in [
+            (
+                "another title",
+                alike(title, "Teach auto mode about your project?"),
+            ),
+            (
+                "the setup wizard's body",
+                alike(
+                    body,
+                    "Claude Code reads this project, your recent Claude sessions, and optionally \
+                     your shell history.",
+                ),
+            ),
+            ("another second answer", alike("2. Not now", "2. Later")),
+        ] {
+            for c in [ctx(), full(), none(full())] {
+                let Some(d) = decide_screen(Some("claude"), &screen, &c) else {
+                    continue;
+                };
+                assert_ne!(
+                    approved(&d),
+                    Some(RULE_AUTO_MODE_SETUP),
+                    "{what} {:?}: {d:?}",
+                    c.approve
+                );
+                if c.approve != Approve::All {
+                    assert_eq!(approved(&d), None, "{what} {:?}: {d:?}", c.approve);
+                }
+            }
+        }
+    }
+    let rows = phase_fixtures::screen(phase_fixtures::AUTO_MODE_SETUP);
+    if let Some(d) = decide_screen(Some("codex"), &rows, &full()) {
+        assert!(approved(&d).is_none(), "{d:?}");
+    }
+    let reading = aterm_phase::Reading {
+        phase_authoritative: false,
+        ..aterm_phase::read(Some("claude"), &rows, None)
+    };
+    assert!(reason(&decide(&reading, &rows, &full())).contains("reader vouches for"));
+}
+
 #[test]
 fn muses_several_questions_multi_select_and_review_are_a_persons() {
     use aterm_phase::muse::fixtures as u;

@@ -3883,31 +3883,48 @@ impl CursorGlow {
     /// The most coverage a dark landing veil in `veil` may add at its centre
     /// and leave the theme's text `fg` [`Self::LIGHT_VEIL_BAR`] over it on
     /// the page `bg` (or the theme's own contrast, if less: no veil).
-    pub(crate) fn dark_veil_cap(veil: u32, fg: u32, bg: u32) -> u8 {
+    pub(crate) const fn dark_veil_cap(veil: u32, fg: u32, bg: u32) -> u8 {
         let table = crate::color_math::relative_luminance_table();
         let (fg, bg) = (fg & 0x00FF_FFFF, bg & 0x00FF_FFFF);
         let lum_fg = crate::color_math::relative_luminance_with(table, fg);
         let lum_bg = crate::color_math::relative_luminance_with(table, bg);
-        let contrast = |l: f32| (lum_fg.max(l) + 0.05) / (lum_fg.min(l) + 0.05);
-        let bar = Self::LIGHT_VEIL_BAR.min(contrast(lum_bg));
-        let (bg_r, bg_g, bg_b) = ((bg >> 16) & 0xff, (bg >> 8) & 0xff, bg & 0xff);
-        let (v_r, v_g, v_b) = ((veil >> 16) & 0xff, (veil >> 8) & 0xff, veil & 0xff);
-        let holds = |a: u32| {
-            let r = (bg_r + (v_r * a + 127) / 255).min(255) as usize;
-            let g = (bg_g + (v_g * a + 127) / 255).min(255) as usize;
-            let b = (bg_b + (v_b * a + 127) / 255).min(255) as usize;
-            contrast(crate::color_math::relative_luminance_rgb(table, r, g, b)) >= bar
-        };
+        #[inline]
+        const fn contrast(lum_fg: f32, l: f32) -> f32 {
+            (lum_fg.max(l) + 0.05) / (lum_fg.min(l) + 0.05)
+        }
+        let bar = Self::LIGHT_VEIL_BAR.min(contrast(lum_fg, lum_bg));
+        let bg_rgb = ((bg >> 16) & 0xff, (bg >> 8) & 0xff, bg & 0xff);
+        let v_rgb = ((veil >> 16) & 0xff, (veil >> 8) & 0xff, veil & 0xff);
+        #[inline]
+        const fn holds(
+            table: &crate::color_math::RelativeLuminanceTable,
+            lum_fg: f32,
+            bar: f32,
+            (bg_r, bg_g, bg_b): (u32, u32, u32),
+            (v_r, v_g, v_b): (u32, u32, u32),
+            a: u32,
+        ) -> bool {
+            let r = bg_r + (v_r * a + 127) / 255;
+            let g = bg_g + (v_g * a + 127) / 255;
+            let b = bg_b + (v_b * a + 127) / 255;
+            let r = if r < 255 { r as usize } else { 255 };
+            let g = if g < 255 { g as usize } else { 255 };
+            let b = if b < 255 { b as usize } else { 255 };
+            contrast(
+                lum_fg,
+                crate::color_math::relative_luminance_rgb(table, r, g, b),
+            ) >= bar
+        }
         let (mut lo, mut hi) = (0u32, 255u32);
-        if holds(hi) {
+        if holds(table, lum_fg, bar, bg_rgb, v_rgb, hi) {
             return 255;
         }
-        if !holds(1) {
+        if !holds(table, lum_fg, bar, bg_rgb, v_rgb, 1) {
             return 0;
         }
         while hi - lo > 1 {
             let mid = (lo + hi) / 2;
-            if holds(mid) {
+            if holds(table, lum_fg, bar, bg_rgb, v_rgb, mid) {
                 lo = mid;
             } else {
                 hi = mid;
@@ -4023,7 +4040,7 @@ impl CursorGlow {
     }
 
     /// Maximum centre opacity for a light landing veil in `veil` over `fg` and `bg`.
-    pub(crate) fn light_veil_cap(veil: u32, fg: u32, bg: u32) -> u8 {
+    pub(crate) const fn light_veil_cap(veil: u32, fg: u32, bg: u32) -> u8 {
         let own = crate::color_math::contrast_ratio(fg & 0x00FF_FFFF, bg & 0x00FF_FFFF);
         let keep = (Self::LIGHT_VEIL_BAR / own.max(1.0)).min(1.0);
         light_alpha_keeping(veil, fg, bg, keep).clamp(0.0, 255.0) as u8
@@ -4702,26 +4719,51 @@ impl CursorGlow {
         false
     }
 
-    fn over_ink_ceiling(lift: [f32; 3]) -> f32 {
+    const fn over_ink_ceiling(lift: [f32; 3]) -> f32 {
         let table = crate::color_math::relative_luminance_table();
-        let unpack = |rgb: u32| [16u32, 8, 0].map(|sh| ((rgb >> sh) & 0xff) as f32);
+        #[inline]
+        const fn unpack(rgb: u32) -> [f32; 3] {
+            [
+                ((rgb >> 16) & 0xff) as f32,
+                ((rgb >> 8) & 0xff) as f32,
+                (rgb & 0xff) as f32,
+            ]
+        }
         let ref_ink = unpack(Self::STREAK_REF_INK);
         let ref_ground = unpack(Self::STREAK_REF_GROUND);
-        let lifted = |base: [f32; 3], cov: f32| {
-            let ch = |c: usize| (base[c] + cov * lift[c]).min(255.0) as usize;
-            crate::color_math::relative_luminance_rgb(table, ch(0), ch(1), ch(2))
-        };
-        let holds = |cov: f32| {
-            let (ink, ground) = (lifted(ref_ink, cov), lifted(ref_ground, cov));
-            ink.max(ground) + 0.05 >= Self::STREAK_INK_FLOOR * (ink.min(ground) + 0.05)
-        };
-        if holds(255.0) {
+        #[inline]
+        const fn lifted(
+            table: &crate::color_math::RelativeLuminanceTable,
+            lift: [f32; 3],
+            base: [f32; 3],
+            cov: f32,
+        ) -> f32 {
+            let r = (base[0] + cov * lift[0]).min(255.0) as usize;
+            let g = (base[1] + cov * lift[1]).min(255.0) as usize;
+            let b = (base[2] + cov * lift[2]).min(255.0) as usize;
+            crate::color_math::relative_luminance_rgb(table, r, g, b)
+        }
+        #[inline]
+        const fn holds(
+            table: &crate::color_math::RelativeLuminanceTable,
+            lift: [f32; 3],
+            ref_ink: [f32; 3],
+            ref_ground: [f32; 3],
+            cov: f32,
+        ) -> bool {
+            let ink = lifted(table, lift, ref_ink, cov);
+            let ground = lifted(table, lift, ref_ground, cov);
+            ink.max(ground) + 0.05 >= CursorGlow::STREAK_INK_FLOOR * (ink.min(ground) + 0.05)
+        }
+        if holds(table, lift, ref_ink, ref_ground, 255.0) {
             return 255.0;
         }
         let (mut lo, mut hi) = (0.0f32, 255.0f32);
-        for _ in 0..10 {
+        let mut step = 0;
+        while step < 10 {
+            step += 1;
             let mid = 0.5 * (lo + hi);
-            if holds(mid) {
+            if holds(table, lift, ref_ink, ref_ground, mid) {
                 lo = mid;
             } else {
                 hi = mid;
@@ -4796,7 +4838,7 @@ impl CursorGlow {
 
 /// Whether a cell's ground `ground` reads as the page `page` rather than a surface of its own.
 #[inline]
-pub(super) fn reads_as_page(ground: u32, page: u32) -> bool {
+pub(super) const fn reads_as_page(ground: u32, page: u32) -> bool {
     let (g, p) = (ground & 0x00FF_FFFF, page & 0x00FF_FFFF);
     if g == p {
         return true;
@@ -4970,35 +5012,72 @@ fn flame_heat<'a>(cells: impl Iterator<Item = &'a (u16, u16, f32)>, u: f32) -> f
         .min(1.0)
 }
 
-fn flame_dark_letter_cap(hot: u32, ink: u32, ground: u32, lift: [f32; 3], bar: f32) -> f32 {
+const fn flame_dark_letter_cap(hot: u32, ink: u32, ground: u32, lift: [f32; 3], bar: f32) -> f32 {
     let table = crate::color_math::relative_luminance_table();
-    let lift = lift.map(|l| l.max(0.0).ceil() as u32);
-    let lifted = |base: u32, cov: u32| -> f32 {
-        let ch = |sh: u32, i: usize| {
-            let b = ((base >> sh) & 0xff) + lift[i];
-            (b + (((hot >> sh) & 0xff) * cov + 127) / 255).min(255) as usize
-        };
-        crate::color_math::relative_luminance_rgb(table, ch(16, 0), ch(8, 1), ch(0, 2))
-    };
-    let ink_l = lifted(ink, 0);
-    let reads = |cov: u32| {
-        let g = lifted(ground, cov);
-        (g < ink_l).then(|| (ink_l + 0.05) / (g + 0.05))
-    };
-    let Some(own) = reads(0) else {
+    #[inline]
+    const fn ceil_u32(x: f32) -> u32 {
+        let t = x.max(0.0);
+        let i = t as u32;
+        if (i as f32) < t { i + 1 } else { i }
+    }
+    let lift = [ceil_u32(lift[0]), ceil_u32(lift[1]), ceil_u32(lift[2])];
+    #[inline]
+    const fn lifted(
+        table: &crate::color_math::RelativeLuminanceTable,
+        hot: u32,
+        lift: [u32; 3],
+        base: u32,
+        cov: u32,
+    ) -> f32 {
+        #[inline]
+        const fn ch(base: u32, hot: u32, cov: u32, lift_c: u32, sh: u32) -> usize {
+            let b = ((base >> sh) & 0xff) + lift_c;
+            let v = b + (((hot >> sh) & 0xff) * cov + 127) / 255;
+            if v < 255 { v as usize } else { 255 }
+        }
+        crate::color_math::relative_luminance_rgb(
+            table,
+            ch(base, hot, cov, lift[0], 16),
+            ch(base, hot, cov, lift[1], 8),
+            ch(base, hot, cov, lift[2], 0),
+        )
+    }
+    let ink_l = lifted(table, hot, lift, ink, 0);
+    #[inline]
+    const fn reads(
+        table: &crate::color_math::RelativeLuminanceTable,
+        hot: u32,
+        lift: [u32; 3],
+        ground: u32,
+        ink_l: f32,
+        cov: u32,
+    ) -> Option<f32> {
+        let g = lifted(table, hot, lift, ground, cov);
+        if g < ink_l {
+            Some((ink_l + 0.05) / (g + 0.05))
+        } else {
+            None
+        }
+    }
+    let Some(own) = reads(table, hot, lift, ground, ink_l, 0) else {
         return 255.0;
     };
     let bar = bar.min(own);
-    if reads(255).is_some_and(|c| c >= bar) {
+    if let Some(c) = reads(table, hot, lift, ground, ink_l, 255)
+        && c >= bar
+    {
         return 255.0;
     }
-    if !reads(1).is_some_and(|c| c >= bar) {
-        return 0.0;
+    match reads(table, hot, lift, ground, ink_l, 1) {
+        Some(c) if c >= bar => {}
+        _ => return 0.0,
     }
     let (mut lo, mut hi) = (0u32, 256u32);
     while hi - lo > 1 {
         let mid = (lo + hi) / 2;
-        if reads(mid).is_some_and(|c| c >= bar) {
+        if let Some(c) = reads(table, hot, lift, ground, ink_l, mid)
+            && c >= bar
+        {
             lo = mid;
         } else {
             hi = mid;

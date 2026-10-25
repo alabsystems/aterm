@@ -207,3 +207,29 @@ fn complete_stdout_reads_a_pipe_held_outside_the_childs_group_until_it_lets_go()
     lets_go(writer, b"two");
     assert_eq!(drain.collect(&grace).unwrap(), b"one two");
 }
+
+/// A pipe held outside the exited child's group is read until it lets go while the kernel
+/// still lists that group with no live member: Darwin answers a signal for a group left
+/// only zombies with `EPERM`, and a loaded test binary saw a reaped `git`'s group answer so
+/// past the grace while its stdout was still held (the repository probe read unread).
+/// Negative control: with `EPERM` read as a live descendant, `collect` refuses at once.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn complete_stdout_reads_a_pipe_held_outside_a_group_left_only_a_zombie_until_it_lets_go() {
+    use crate::deadline::tests::{a_group_left_only_a_zombie, lets_go};
+    use std::io::Write as _;
+    let zombie = a_group_left_only_a_zombie();
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    writer.write_all(b"one ").expect("write");
+    let pipe = pipe_end(&reader);
+    let drain = drain_stdout(pipe, reader).expect("reader");
+    let grace = Grace {
+        by: Instant::now(),
+        until: Instant::now() + HANG,
+        group: Some(zombie.id()),
+    };
+    lets_go(writer, b"two");
+    let read = drain.collect(&grace);
+    drop(zombie);
+    assert_eq!(read.unwrap(), b"one two");
+}

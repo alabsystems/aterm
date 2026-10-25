@@ -4074,7 +4074,7 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
         return format!(
             "OK enabled={enabled} latest_tick={} reachable_from={reachable_from} keyframes={} \
              live_events={} dropped_events={} lost_resizes={} dropped_input={} \
-             dropped_replies={} pending_resizes={}{}\n",
+             dropped_replies={} pending_resizes={} witnessed={} diverged={}{}\n",
             rec.latest_tick().0,
             rec.keyframe_count(),
             rec.live_events(),
@@ -4083,6 +4083,8 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
             rec.dropped_input(),
             rec.dropped_replies(),
             if enabled { pending } else { 0 },
+            rec.witnessed(),
+            rec.diverged(),
             rec.status_tail(),
         );
     }
@@ -4112,7 +4114,11 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
     let Some(plan) = plan else {
         return "ERR temporal unreachable\n".to_string();
     };
-    let term = plan.run();
+    let crate::temporal::Fold { term, judged } = plan.fold();
+    ctx.temporal
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .judge(judged);
     let pending = if at_end && pending > 0 {
         format!(" pending_resizes={pending}")
     } else {
@@ -5071,6 +5077,7 @@ mod tests {
             bells: Default::default(),
             screen_moves: Default::default(),
             job_feed: Default::default(),
+            box_banner: Default::default(),
             update_parked: Default::default(),
             watchers: observed.watchers,
             frame: Default::default(),
@@ -5468,7 +5475,7 @@ mod tests {
                 .timeline
                 .lock()
                 .unwrap()
-                .note_program_state(Some(ProgramState { state, kind }));
+                .note_program_state(Some(ProgramState { state, kind }), 1);
         };
         let sid = w.sid.as_str();
         let parked = std::thread::scope(|s| {
@@ -6515,6 +6522,7 @@ mod tests {
             bells: Default::default(),
             screen_moves: Default::default(),
             job_feed: Default::default(),
+            box_banner: Default::default(),
             update_parked: Default::default(),
             watchers: observed.watchers,
             frame: Default::default(),
@@ -6624,14 +6632,80 @@ mod tests {
         assert_eq!(held.take(), Some(true), "the probe sees a held recorder");
     }
 
+    /// `temporal status` counts the live witnesses a `temporal` fold judged: a recorded session's all match; replayed on the live clock one diverges and the next slice records a live keyframe.
+    #[test]
+    fn temporal_status_counts_the_witnesses_a_replay_judged() {
+        use crate::temporal::{InputSlice, SpineMark, SpinePre};
+        use aterm_core::terminal::ClockReading;
+        let key = |status: &str, key: &str| {
+            status
+                .split_whitespace()
+                .find_map(|kv| kv.strip_prefix(key))
+                .map(str::to_owned)
+        };
+        for live_clock in [false, true] {
+            let ctx = temporal_ctx();
+            let live = Mutex::new(aterm_core::terminal::Terminal::new(6, 30));
+            let watermark = {
+                let t = term_lock(&live);
+                let mut rec = ctx.temporal.lock().unwrap();
+                rec.record_keyframe(t.checkpoint());
+                rec.spine_watermark().seed(SpinePre::take(&t));
+                rec.spine_watermark()
+            };
+            let (tx, rx) = crate::temporal::queue(64);
+            let mut mark = SpineMark::attach(watermark);
+            let t0 = ClockReading::now();
+            let mut hold = |bytes: &[u8], ms: u64| {
+                let at = ClockReading {
+                    monotonic: t0.monotonic + std::time::Duration::from_millis(ms),
+                    wall_ms: t0.wall_ms.map(|w| w + ms),
+                };
+                {
+                    let mut t = term_lock(&live);
+                    let pre = SpinePre::take(&t);
+                    t.process_at(bytes, at);
+                    mark.record(&tx, pre, &t, InputSlice::at(bytes, at));
+                }
+                let mut rec = ctx.temporal.lock().unwrap();
+                while let Some(msg) = rx.try_recv() {
+                    rec.apply_inline(msg);
+                }
+            };
+            hold(b"\x1b[?2026hframe", 0);
+            hold(b"\r\none", 1500);
+            let status = cmd_temporal(&ctx, &live, "status");
+            assert_eq!(key(&status, "witnessed=").as_deref(), Some("0"), "{status}");
+            let _clock = live_clock.then(crate::temporal::replay_clock::on_live_clock);
+            assert!(cmd_temporal(&ctx, &live, "").starts_with("OK "));
+            let status = cmd_temporal(&ctx, &live, "status");
+            assert_eq!(key(&status, "witnessed=").as_deref(), Some("1"), "{status}");
+            assert_eq!(
+                key(&status, "diverged=").as_deref(),
+                Some(if live_clock { "1" } else { "0" }),
+                "{status}"
+            );
+            hold(b"\r\ntwo", 1600);
+            let status = cmd_temporal(&ctx, &live, "status");
+            assert_eq!(
+                key(&status, "keyframes=").as_deref(),
+                Some(if live_clock { "2" } else { "1" }),
+                "a mismatch takes a live keyframe: {status}"
+            );
+        }
+    }
+
     #[test]
     fn temporal_status_discloses_dropped_input_and_an_open_break() {
         use crate::temporal::{SpineMark, SpinePre, TemporalTx};
         fn hold(live: &Mutex<Terminal>, mark: &mut SpineMark, tx: &TemporalTx, bytes: &[u8]) {
+            static CLOCK: std::sync::OnceLock<aterm_core::terminal::ClockReading> =
+                std::sync::OnceLock::new();
+            let clock = *CLOCK.get_or_init(aterm_core::terminal::ClockReading::now);
             let mut t = term_lock(live);
             let pre = SpinePre::take(&t);
-            t.process(bytes);
-            mark.record(tx, pre, &t, bytes.into());
+            t.process_at(bytes, clock);
+            mark.record(tx, pre, &t, crate::temporal::InputSlice::at(bytes, clock));
         }
         let key = |status: &str, key: &str| {
             status
@@ -6721,12 +6795,13 @@ mod tests {
         };
         let (tx, rx) = crate::temporal::queue(64);
         let mut mark = SpineMark::attach(watermark);
+        let clock = aterm_core::terminal::ClockReading::now();
         let mut slice = |bytes: &[u8]| {
             {
                 let mut t = term_lock(&live);
                 let pre = SpinePre::take(&t);
-                t.process(bytes);
-                mark.record(&tx, pre, &t, bytes.into());
+                t.process_at(bytes, clock);
+                mark.record(&tx, pre, &t, crate::temporal::InputSlice::at(bytes, clock));
             }
             let mut rec = ctx.temporal.lock().unwrap();
             while let Some(msg) = rx.try_recv() {
@@ -6753,7 +6828,7 @@ mod tests {
             (head.to_string(), body.to_string())
         };
         assert!(
-            cmd_temporal(&ctx, &live, "status").ends_with(" pending_resizes=0\n"),
+            cmd_temporal(&ctx, &live, "status").contains(" pending_resizes=0 "),
             "nothing pending before the flap"
         );
 
@@ -6763,7 +6838,7 @@ mod tests {
             t.resize(ROWS, COLS);
         }
         let status = cmd_temporal(&ctx, &live, "status");
-        assert!(status.ends_with(" pending_resizes=2\n"), "{status}");
+        assert!(status.contains(" pending_resizes=2 "), "{status}");
         let (head, body) = replayed(&cmd_temporal(&ctx, &live, ""));
         assert!(head.ends_with(" pending_resizes=2"), "{head}");
         assert_ne!(
@@ -6774,7 +6849,7 @@ mod tests {
 
         slice(b"\x1b[1;1HT1\x1b[K\x1b[4;3H");
         let status = cmd_temporal(&ctx, &live, "status");
-        assert!(status.ends_with(" pending_resizes=0\n"), "{status}");
+        assert!(status.contains(" pending_resizes=0 "), "{status}");
         let (head, body) = replayed(&cmd_temporal(&ctx, &live, ""));
         assert!(!head.contains("pending_resizes"), "{head}");
         assert_eq!(body, screen(), "both halves handed over: the live screen");

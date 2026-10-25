@@ -662,6 +662,7 @@ pub const BOX_WORDS: &[&str] = &[
     "model-pick",
     "goal-resume",
     "mcp-server",
+    "auto-mode-setup",
     "other",
 ];
 
@@ -746,6 +747,7 @@ pub const NEED_WORDS: &[&str] = &[
     "approval:model-pick",
     "approval:goal-resume",
     "approval:mcp-server",
+    "approval:auto-mode-setup",
     "approval:other",
     "question",
     "wall:usage-session",

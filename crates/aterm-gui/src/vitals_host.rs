@@ -18,7 +18,6 @@ use aterm_sysprobe::volumes::VolumeKey;
 use aterm_vitals::explain::{
     CoalLane, CoalSample, CoalUsage, IdMap, IdSet, LeadIdentity, TimelineSample,
 };
-use aterm_vitals::glance::needs::{Ask, DeckNeed, DeckWindow};
 use aterm_vitals::history::{FreeHistory, SavedFree, VolumeId};
 use aterm_vitals::model::{
     AccountIx, ClusterSpec, CommitSample, DiskFacts, DiskLevel, GpuSample, Hog, LinkKind,
@@ -650,13 +649,6 @@ pub(crate) struct VitalsHost {
     survey: Arc<Where>,
     board: &'static crate::vitals_jobs::JobsBoard,
     proc_edge: &'static ProcEdge,
-    /// The deck scene read in place of the machine (`ATERM_DEBUG_SCENE`, [`crate::icon_scene`]):
-    /// every reader of [`Self::snapshot`] (the deck, its lens, the tab meters, the jobs board)
-    /// reads the scene's facts ([`crate::icon_scene::deck_reading`]), and the deck's and its
-    /// lens's front tab is the scene window's ([`crate::App::deck_frame`],
-    /// [`crate::App::deck_tab_panes`]).
-    #[cfg(debug_assertions)]
-    pub(crate) deck_scene: Option<aterm_vitals::fixtures::DeckScene>,
 }
 
 impl Default for VitalsHost {
@@ -698,8 +690,6 @@ impl Default for VitalsHost {
             } else {
                 &PROC_EDGE
             },
-            #[cfg(debug_assertions)]
-            deck_scene: crate::icon_scene::deck(),
         }
     }
 }
@@ -728,8 +718,6 @@ impl VitalsHost {
             let over = self.job_events.len() - JOB_EVENTS_CAP;
             self.job_events.drain(..over);
         }
-        #[cfg(debug_assertions)]
-        let fresh = fresh.map(|snap| crate::icon_scene::deck_reading(self.deck_scene, snap));
         match fresh {
             Some(snap) if self.snapshot.as_ref().is_none_or(|s| s.seq != snap.seq) => {
                 let held = self.snapshot.as_ref().and_then(|s| s.jobs.as_ref());
@@ -1159,18 +1147,6 @@ fn platform_thermal() -> Option<Thermal> {
     #[cfg(not(target_os = "macos"))]
     {
         None
-    }
-}
-
-/// Pane `pane`'s published need `word` as the deck's needs read it: in its own word
-/// (`approval`), and a stuck program's (`frozen`, `stopped`: the input gate's stall or an agent's
-/// screen that stopped answering, which the jobs engine reads as `stuck`) marked so.
-pub(crate) fn deck_ask(pane: u64, word: aterm_types::needs::NeedWord) -> Ask {
-    use aterm_types::needs::NeedWord;
-    Ask {
-        pane,
-        word: word.word(),
-        stuck: matches!(word, NeedWord::Frozen | NeedWord::Stopped),
     }
 }
 
@@ -3460,60 +3436,12 @@ impl crate::App {
     /// The sessions of this window's front tab ([`Self::tab_sessions`]): the
     /// tab the deck, its lens and Why now take as "this tab", as `sys why`
     /// takes its caller's (a tab split into panes is one,
-    /// [`aterm_vitals::model::TabRoot::tab`]). Under a debug build's deck scene
-    /// (`VitalsHost::deck_scene`), the scene window's front tab's: the panes its readings name.
+    /// [`aterm_vitals::model::TabRoot::tab`]).
     pub(crate) fn deck_tab_panes(&self, wid: crate::WindowId) -> Vec<u64> {
-        #[cfg(debug_assertions)]
-        if let Some(scene) = self.vitals.deck_scene {
-            return crate::stats_deck::deck_fixtures::DeckContext::of(scene).panes;
-        }
         self.windows
             .get(&wid)
             .and_then(|ws| ws.tab_set.active_index().and_then(|i| ws.tab_set.tab_at(i)))
             .map_or_else(Vec::new, |tab| self.tab_sessions(tab))
-    }
-
-    /// What needs the owner in window `wid`'s tabs, worst first
-    /// ([`aterm_vitals::glance::needs::of`]): the jobs engine's verdicts on the latest snapshot,
-    /// each pane's need as the needs system published it ([`deck_ask`]), and the front tab's
-    /// volume. Under a debug build's deck scene, the scene window's.
-    pub(crate) fn deck_needs(&self, wid: crate::WindowId) -> Vec<DeckNeed> {
-        let snap = self.vitals.snapshot.as_deref();
-        #[cfg(debug_assertions)]
-        if let Some(scene) = self.vitals.deck_scene {
-            return crate::stats_deck::deck_fixtures::DeckContext::of(scene).deck_needs(snap);
-        }
-        let Some(ws) = self.windows.get(&wid) else {
-            return Vec::new();
-        };
-        let tabs: Vec<Vec<u64>> = ws
-            .tab_set
-            .tabs()
-            .iter()
-            .map(|tab| self.tab_sessions(tab))
-            .collect();
-        let asks: Vec<Ask> = tabs
-            .iter()
-            .flatten()
-            .filter_map(|&pane| {
-                let session = self.pool.get(pane)?;
-                let timeline = session
-                    .ctx
-                    .timeline
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                let need = timeline.need().need.as_ref()?;
-                Some(deck_ask(pane, need.word))
-            })
-            .collect();
-        aterm_vitals::glance::needs::of(
-            snap,
-            &DeckWindow {
-                tabs: &tabs,
-                front: ws.tab_set.active_index(),
-                asks: &asks,
-            },
-        )
     }
 
     /// The terminal sessions of `tab`, its focused pane first, then the rest

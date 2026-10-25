@@ -157,6 +157,25 @@ fn desktop() -> impl Iterator<Item = (Setting, DesktopKind)> {
         ])
 }
 
+/// The settings of `selected` with a key in another app's container ([`defaults::contained`]):
+/// the System State rows whose changes a pass without Full Disk Access withholds, and which its
+/// follow-up makes ([`withheld_items`]).
+#[must_use]
+pub fn withheld_settings(selected: Selection) -> Selection {
+    let mut settings = Selection::none();
+    for (setting, kind) in desktop() {
+        if selected.contains(setting)
+            && kind
+                .keys()
+                .iter()
+                .any(|(domain, _, _)| defaults::contained(domain))
+        {
+            settings.set(setting, true);
+        }
+    }
+    settings
+}
+
 /// The follow-up of a pass that left keys in another app's container alone ([`Item::withheld`]),
 /// each item with its setting ([`selected_tagged_items`]).
 /// # Errors

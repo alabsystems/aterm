@@ -221,6 +221,8 @@ struct Held {
     task: Option<String>,
     /// What [`publish_facts`] last published from it.
     shown: Option<crate::survey::CodexSurvey>,
+    /// The thread's active goal in codex-alab's goal store ([`aterm_agent::harness::goal`]).
+    goal: aterm_agent::harness::goal::StoreGoal,
 }
 
 /// The taps by session.
@@ -357,6 +359,7 @@ fn read_on(
                 facts: None,
                 task: (job.image.task)(job.target.pid),
                 shown: None,
+                goal: aterm_agent::harness::goal::StoreGoal::default(),
             })
         }
     };
@@ -414,10 +417,19 @@ fn read_facts(held: &mut Held, target: &RolloutTarget) -> Option<crate::survey::
         Some(GitHeadRead::Found(branch, _)) => Some(branch),
         _ => None,
     };
+    let goal = held
+        .goal
+        .read(
+            aterm_agent::harness::goal::Store::Codex,
+            &target.home.join(aterm_agent::harness::goal::CODEX_GOALS),
+            &target.thread,
+        )
+        .map(str::to_owned);
     let survey = crate::survey::CodexSurvey {
         facts,
         branch,
         task: held.task.clone(),
+        goal,
     };
     (held.shown.as_ref() != Some(&survey)).then_some(survey)
 }

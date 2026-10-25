@@ -2169,6 +2169,14 @@ pub fn probe(url: &str, pin: &[u8; 32], wait: Duration) -> crate::Result<ProbeOu
     })
 }
 
+/// Whether `error`, a failed [`probe`] or fetch, is macOS's Local Network privacy refusing this
+/// app a `.local` name: a definite answer that the person turned aterm off (or answered Don't
+/// Allow), unlike a lookup nobody answered, which proves nothing.
+#[must_use]
+pub fn refused_by_local_network(error: &crate::Error) -> bool {
+    error.0.contains(aterm_http::LOCAL_NETWORK_REFUSED)
+}
+
 /// Probe the default ALab vault URL under the compiled-in signer.
 pub fn probe_default(wait: Duration) -> crate::Result<ProbeOutcome> {
     match decode_key32(crate::ALAB_SIGNER) {

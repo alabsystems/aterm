@@ -4,6 +4,65 @@
 use super::*;
 
 #[test]
+fn completed_exchange_survives_reset_but_never_revives_a_withdrawn_proof() {
+    use std::{
+        io::{Read, Write},
+        os::fd::AsRawFd,
+    };
+    for withdrawn in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let connection = Connection::connect(
+            listener.local_addr().unwrap(),
+            Scope::Loopback,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let (mut stream, proof) = connection.into_parts();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let mut peer = listener.accept().unwrap().0;
+        peer.write_all(b"completed").unwrap();
+        let mut bytes = [0; 9];
+        stream.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"completed");
+        proof.recheck().unwrap();
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: peer owns a live socket, and linger is readable for its exact size.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    peer.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&raw const linger).cast(),
+                    std::mem::size_of_val(&linger) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        drop(peer);
+        match stream.read(&mut [0]) {
+            Ok(0) => {} // Some kernels report the completed read side as EOF.
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("reset peer did not close the stream: {other:?}"),
+        }
+        if withdrawn {
+            proof.withdrawn.store(true, Ordering::Release);
+        }
+        let completed = proof.finish();
+        if withdrawn {
+            assert!(completed.is_err());
+        } else {
+            completed.unwrap();
+        }
+    }
+}
+
+#[test]
 fn bounded_fleet_listener_applies_link_policy_before_tls() {
     use crate::fleet::{self, FleetOp, FleetScope, FleetSecret, Listening};
     use std::{

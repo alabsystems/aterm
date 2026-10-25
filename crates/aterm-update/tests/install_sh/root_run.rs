@@ -3075,13 +3075,12 @@ fn a_root_run_copies_the_app_where_only_root_can_reach_it() {
          }\n\
          chown() { log \"chown $*\"; [ -z \"${CHOWN_FAILS:-}\" ]; }\n\
          mv() { log \"mv $*\"; command mv \"$@\"; }\n\
-         mktemp() {\n\
-         \tlocal d\n\
-         \td=\"$(command mktemp \"$@\")\" || return\n\
-         \t[ -z \"${ENTERED:-}\" ] || mkdir \"$d\"/$'\\n'\n\
-         \t[ -z \"${OPENED:-}\" ] || command chmod 777 \"$d\"\n\
-         \t[ -z \"${LINKED:-}\" ] || { command rmdir \"$d\" && ln -s \"$LINKED\" \"$d\"; } || return\n\
-         \tprintf '%s\\n' \"$d\"\n\
+         mkdir() {\n\
+         \tcommand mkdir \"$@\" || return\n\
+         \t[ \"$1\" = -m ] || return 0\n\
+         \t[ -z \"${ENTERED:-}\" ] || command mkdir \"$3\"/$'\\n'\n\
+         \t[ -z \"${OPENED:-}\" ] || command chmod 777 \"$3\"\n\
+         \t[ -z \"${LINKED:-}\" ] || { command rmdir \"$3\" && ln -s \"$LINKED\" \"$3\"; }\n\
          }\n\
          mkdir -p \"$TMPDIR/ok\" \"$TMPDIR/copy-fails\" \"$TMPDIR/chown-fails\" \"$TMPDIR/entered\" \\\n\
          \t\"$TMPDIR/opened\" \"$TMPDIR/taken\" \"$TMPDIR/linked\" \"$TMPDIR/theirs\"\n\

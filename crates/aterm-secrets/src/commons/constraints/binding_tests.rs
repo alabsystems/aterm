@@ -75,12 +75,14 @@ fn recorded_binding_is_exact_and_repetition_is_inert() {
     let empty = constraints(&[&genesis], genesis.id());
     assert!(empty.check_device_candidate(&original).is_ok());
     assert!(empty.check_recorded_device(&original).is_err());
+    assert!(empty.check_known_actor(&original.actor()).is_err());
     let recorded = node(Some(genesis.id()), &[fact(&original)]);
     assert_eq!(recorded.facts(), &[fact(&original)]);
     assert!(recorded.bytes().starts_with(b"ACN3"));
     let repeated = node(Some(recorded.id()), &[fact(&original)]);
     let current = constraints(&[&repeated, &genesis, &recorded], repeated.id());
     assert!(current.check_recorded_device(&original).is_ok());
+    assert!(current.check_known_actor(&original.actor()).is_ok());
     assert_eq!(
         current
             .facts()
@@ -105,6 +107,7 @@ fn recorded_binding_is_exact_and_repetition_is_inert() {
         let conflict = node(Some(repeated.id()), &[fact(&changed)]);
         let conflicted = constraints(&[&conflict, &repeated, &genesis, &recorded], conflict.id());
         assert!(conflicted.check_recorded_device(&original).is_err());
+        assert!(conflicted.check_known_actor(&original.actor()).is_err());
         assert!(conflicted.check_device_candidate(&fresh_writer).is_err());
     }
 }
@@ -159,6 +162,10 @@ fn unreadable_unselected_retirement_prevents_return_under_new_keys_after_restart
         let reopened = Journal::open(directory.path(), trust).unwrap();
         let current = reopened.constraints().unwrap();
         assert!(current.check_device_candidate(&original).is_err());
+        assert!(
+            current.check_known_actor(&original.actor()).is_ok(),
+            "retirement does not erase identity evidence"
+        );
         assert!(current.check_device_candidate(&newcomer).is_err());
         assert!(
             current

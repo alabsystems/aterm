@@ -406,12 +406,19 @@ impl TitleState {
     }
 }
 
+/// The host's admission for one program notification, asked with the program's own state report
+/// as it stands at the notification's byte ([`super::Terminal::set_notification_admission`]).
+pub(super) type NotificationAdmission =
+    Box<dyn FnMut(&super::program_state::ProgramStateReport) -> bool + Send>;
+
 /// Notification callbacks (OSC 9, OSC 99/777) and the OSC 99 multi-part accumulation map.
 pub(super) struct NotificationState {
     /// Simple desktop notification callback (OSC 9).
     pub(super) callback: Option<NotificationCallback>,
     /// Advanced desktop notification callback (OSC 99 - kitty protocol).
     pub(super) advanced_callback: Option<AdvancedNotificationCallback>,
+    /// The host's admission, asked before either callback; none admits every notification.
+    pub(super) admission: Option<NotificationAdmission>,
     /// In-progress notifications being built from OSC 99 chunks.
     pub(super) pending: PendingNotificationsMap,
 }
@@ -422,8 +429,15 @@ impl NotificationState {
         Self {
             callback: None,
             advanced_callback: None,
+            admission: None,
             pending: PendingNotificationsMap::default(),
         }
+    }
+
+    /// Whether the host admits a notification written while `report` stands.
+    #[inline]
+    pub(super) fn admits(&mut self, report: &super::program_state::ProgramStateReport) -> bool {
+        self.admission.as_mut().is_none_or(|admit| admit(report))
     }
 
     /// Reset pending notifications while preserving callbacks.

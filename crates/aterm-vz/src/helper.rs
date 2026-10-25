@@ -60,6 +60,8 @@ pub struct Ident {
     pub pid: u32,
     /// Its unique id.
     pub uniq: u64,
+    /// Its kernel start time ([`crate::record::Pids::birth_us`]).
+    pub birth_us: u64,
     /// Its executable's content address.
     pub helper_sha256: String,
     /// The live disk it holds.
@@ -1419,6 +1421,7 @@ pub fn take(paths: &Paths, ident: &Ident, pids: &dyn Pids) -> Result<Held, Strin
     let record = Record {
         pid: ident.pid,
         uniq: ident.uniq,
+        birth_us: ident.birth_us,
         helper_sha256: ident.helper_sha256.clone(),
         proto: PROTO,
         live_disk: ident.live_disk.clone(),
@@ -1447,8 +1450,9 @@ pub fn previous_console(console_log: &Path) -> PathBuf {
 /// still `record`'s (a lab that saw its session end reads no record of this helper), and
 /// the key disk whoever's record is there, since this helper wrote it under the lock.
 pub fn release_run_files(paths: &Paths, record: &Record, socket: &Path) {
-    let ours =
-        Record::read(&paths.record()).is_some_and(|r| r.pid == record.pid && r.uniq == record.uniq);
+    let ours = Record::read(&paths.record()).is_some_and(|r| {
+        r.pid == record.pid && r.uniq == record.uniq && r.birth_us == record.birth_us
+    });
     if ours {
         let _ = std::fs::remove_file(paths.record());
         let _ = std::fs::remove_file(socket);
@@ -1463,6 +1467,7 @@ pub fn this_process(helper_sha256: String, live_disk: PathBuf) -> Ident {
     Ident {
         pid,
         uniq: Kernel.uniq(pid).unwrap_or(0),
+        birth_us: Kernel.birth_us(pid).unwrap_or(0),
         helper_sha256,
         live_disk,
     }

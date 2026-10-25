@@ -348,6 +348,19 @@ impl Terminal {
         self.notifications.advanced_callback = Some(Box::new(callback));
     }
 
+    /// Set the host's admission for each program notification `allow_notifications` lets
+    /// through (OSC 9, a complete OSC 99, OSC 777), asked with the program's own state report
+    /// (OSC 7501, [`super::program_state`]) as it stands at the notification's byte: a report
+    /// written after it in the same output is not yet taken. `false` drops the notification
+    /// before either notification callback sees it.
+    #[inline]
+    pub fn set_notification_admission<F>(&mut self, admit: F)
+    where
+        F: FnMut(&super::program_state::ProgramStateReport) -> bool + Send + 'static,
+    {
+        self.notifications.admission = Some(Box::new(admit));
+    }
+
     /// Set the OSC 52 clipboard callback.
     #[inline]
     pub fn set_clipboard_callback<F>(&mut self, callback: F)

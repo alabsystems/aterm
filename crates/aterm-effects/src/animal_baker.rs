@@ -46,7 +46,7 @@ impl AnimalBakeKey {
     /// pinned to 0 (no animal layer reads them).
     #[inline]
     #[must_use]
-    pub fn fills(&self) -> ResolvedFills {
+    pub const fn fills(&self) -> ResolvedFills {
         ResolvedFills::from_context(0, 0, self.colors)
     }
 

@@ -273,16 +273,13 @@ pub fn validate(record: &Record, pid: u32, live: &Live) -> Result<Resume, Refusa
     {
         return Err("launch-path");
     }
-    let at = argv
-        .len()
-        .checked_sub(2)
-        .filter(|at| *at >= 1)
-        .ok_or("no-resume")?;
-    if argv[at] != "resume" || argv[at + 1] != session {
+    if argv.last().map(String::as_str) != Some(session)
+        || !argv.iter().skip(1).any(|arg| arg == "resume")
+    {
         return Err("no-resume");
     }
-    let root = codex_alab::rewrite_argv(&live.argv, None).map_err(|_| "live-argv")?;
-    if argv[1..at] != root[..] {
+    let expected = codex_alab::rewrite_argv(&live.argv, Some(session)).map_err(|_| "live-argv")?;
+    if argv[1..] != expected[..] {
         return Err("foreign-argv");
     }
     let same = |named: &str, running: &Path| {

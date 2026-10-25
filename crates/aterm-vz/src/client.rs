@@ -563,7 +563,7 @@ impl Start for Detached {
     }
 
     fn alive(&self, record: &Record) -> bool {
-        Kernel.uniq(record.pid) == Some(record.uniq)
+        crate::record::is_live(record, &Kernel)
     }
 
     fn kill(&mut self, record: &Record) -> Result<(), String> {

@@ -7,7 +7,8 @@
 //!
 //! Two kinds of same-uid process have root-owned tables (`task_dump_owner` in `fs/proc/base.c`):
 //! zombies holding nothing ([`Table::Exited`]), and non-dumpable live processes such as
-//! `ssh-agent` ([`Table::Sealed`]); any other refusal is [`Table::Unreadable`].
+//! `ssh-agent` ([`Table::Sealed`]); any other refusal is [`Table::Unreadable`], which a scan
+//! counts outside it once the process runs as another user (`read_of`).
 
 use std::io;
 use std::os::unix::fs::MetadataExt as _;
@@ -127,7 +128,30 @@ enum Read {
     Holds,
     Clear,
     Sealed,
+    /// Its process runs as another effective user now, outside a scan of `me`'s processes
+    /// ([`read_of`]).
+    Left,
     Unreadable,
+}
+
+/// Whether `<proc>/<pid>` names another effective user than `me` now: its directory's owner,
+/// which the kernel keeps the process's effective uid ([`uid_pids_in`]). `false` once the
+/// directory is gone.
+pub(super) fn runs_as_another_user_in(proc: &Path, pid: u32, me: u32) -> bool {
+    std::fs::metadata(proc.join(pid.to_string())).is_ok_and(|m| m.uid() != me)
+}
+
+/// What `read` makes of `pid`'s table, an unknown answer read [`Read::Left`] once `pid` runs as
+/// another effective user than `me` ([`runs_as_another_user_in`]). A scan lists only `me`'s
+/// processes, so a process that execs a set-user-ID program (`sudo`, `su`, `passwd`) between
+/// the listing and its read is outside it, as it would be listed a moment later: the exec makes
+/// its directory and its table root's (`task_dump_owner`, the process now non-dumpable), so its
+/// table is refused and would otherwise leave the whole scan unknown.
+fn read_of(proc: &Path, pid: u32, me: u32, read: impl FnOnce(Table) -> Read) -> Read {
+    match read(table(proc, pid)) {
+        Read::Unreadable if runs_as_another_user_in(proc, pid, me) => Read::Left,
+        read => read,
+    }
 }
 
 /// Whether `table` holds the file `key` by device and inode (`NotFound` on a closed entry is
@@ -189,9 +213,9 @@ pub(super) fn scan_file_holders_in(
             continue;
         }
         scan.scanned += 1;
-        match holds(table(proc, pid), key) {
+        match read_of(proc, pid, me, |table| holds(table, key)) {
             Read::Holds => scan.holders.push(pid),
-            Read::Clear => {}
+            Read::Clear | Read::Left => {}
             Read::Sealed => scan.sealed.push(pid),
             Read::Unreadable => scan.unreadable.push(pid),
         }
@@ -263,9 +287,9 @@ pub(super) fn scan_listener_holders_in(
         if inodes.is_empty() {
             continue;
         }
-        match holds_socket(table(proc, pid), &inodes) {
+        match read_of(proc, pid, me, |table| holds_socket(table, &inodes)) {
             Read::Holds => scan.holders.push(pid),
-            Read::Clear => {}
+            Read::Clear | Read::Left => {}
             Read::Sealed => scan.sealed.push(pid),
             Read::Unreadable => scan.unreadable.push(pid),
         }
@@ -351,7 +375,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use super::{Table, open_files_in, scan_file_holders_in, table, uid_pids_in, within};
+    use super::{
+        Read, Table, holds, open_files_in, read_of, runs_as_another_user_in, scan_file_holders_in,
+        table, uid_pids_in, within,
+    };
 
     /// A directory only root may list, which a sealed or zombie table's `fd` stands in for
     /// (the kernel makes those root's): macOS's `/var/root`, Linux's `/root`.
@@ -491,6 +518,48 @@ mod tests {
         assert!(
             uid_pids_in(&proc, me().wrapping_add(1)).unwrap().is_empty(),
             "another uid's"
+        );
+    }
+
+    /// A table refused once its process runs as another effective user than the scan's (a
+    /// set-user-ID exec since the listing, which makes `/proc/<pid>` that user's) reads `Left`,
+    /// outside the scan. Negative control: the same refusal scanned as its directory's owner
+    /// stays unknown. A table read or sealed keeps its answer, and a process gone runs as no one.
+    #[test]
+    fn a_table_refused_once_its_process_runs_as_another_user_is_outside_the_scan() {
+        use std::os::unix::fs::MetadataExt as _;
+        let sealed = roots_own();
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let (proc, held) = (tmp.path().join("proc"), tmp.path().join("held"));
+        std::fs::create_dir_all(&proc).unwrap();
+        std::fs::write(&held, b"").unwrap();
+        let meta = std::fs::metadata(&held).unwrap();
+        let key = (meta.dev(), meta.ino());
+        let held_s = held.to_str().unwrap().to_owned();
+        process(&proc, 401, 'S', 1, Some(&[]), &sealed);
+        std::fs::set_permissions(proc.join("401/fd"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        process(&proc, 402, 'S', 1, Some(&[(3, &held_s)]), &sealed);
+        process(&proc, 403, 'S', 1, None, &sealed);
+        let (me, other) = (me(), me().wrapping_add(1));
+        let read = |pid, scan_as| read_of(&proc, pid, scan_as, |table| holds(table, key));
+        let reads = [
+            read(401, me),
+            read(401, other),
+            read(402, other),
+            read(403, other),
+        ];
+        std::fs::set_permissions(proc.join("401/fd"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert_eq!(
+            reads,
+            [Read::Unreadable, Read::Left, Read::Holds, Read::Sealed]
+        );
+        assert!(!runs_as_another_user_in(&proc, 401, me));
+        assert!(runs_as_another_user_in(&proc, 401, other));
+        assert!(
+            !runs_as_another_user_in(&proc, 499, other),
+            "a process gone"
         );
     }
 
@@ -780,5 +849,62 @@ mod live_tests {
         );
         let ours = super::super::uid_pids().expect("listing");
         assert!(ours.contains(&o) && ours.contains(&s), "{ours:?}");
+    }
+
+    /// A running program this test holds stdin of, killed and reaped when it drops, so a failed
+    /// assertion or a hang detector leaves nothing running.
+    struct Held(crate::spawnfd::Child);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A process of this uid's that execs a set-user-ID program (`su`, left waiting for a
+    /// password on a pipe this test holds) runs as root: the kernel makes its directory and its
+    /// table root's, so the table alone is unknown, not sealed, and [`super::read_of`] counts
+    /// it outside a scan of this uid, whose listing no longer names it. `su` is killed while it
+    /// waits, before it reads a password. COULD NOT RUN without a set-user-ID root
+    /// `/usr/bin/su`. Negative control: [`table`] alone answers `Unreadable`.
+    #[test]
+    fn a_process_that_became_a_set_user_id_program_reads_left_not_unknown() {
+        crate::host::could_not_run_as_root("a set-user-ID program that runs as another user");
+        let su = Path::new("/usr/bin/su");
+        if !std::fs::metadata(su).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o4000 != 0) {
+            crate::host::could_not_run("this host has no set-user-ID root /usr/bin/su");
+        }
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let held = tmp.path().join("held");
+        std::fs::write(&held, b"").unwrap();
+        let meta = std::fs::metadata(&held).unwrap();
+        let key = (meta.dev(), meta.ino());
+        let me = crate::peer::our_uid();
+
+        let su = Held(
+            crate::spawnfd::command(su)
+                .args(["root", "-c", "true"])
+                .stdin(crate::spawnfd::Stdio::piped())
+                .stdout(crate::spawnfd::Stdio::null())
+                .stderr(crate::spawnfd::Stdio::null())
+                .spawn()
+                .expect("spawn su"),
+        );
+        let pid = su.0.id();
+        let dir = format!("{PROC}/{pid}");
+        let started = Instant::now();
+        while std::fs::metadata(&dir).map(|m| m.uid()).ok() != Some(0) {
+            assert!(started.elapsed() < HANG, "su never ran as root");
+            std::thread::yield_now();
+        }
+
+        let read = super::read_of(Path::new(PROC), pid, me, |table| super::holds(table, key));
+        let alone = table(Path::new(PROC), pid);
+        let listed = super::uid_pids_in(Path::new(PROC), me).expect("listing");
+        drop(su);
+        assert_eq!(read, super::Read::Left, "outside this uid's scan");
+        assert!(matches!(alone, Table::Unreadable(_)), "{alone:?}");
+        assert!(!listed.contains(&pid), "no longer listed as this uid's");
     }
 }

@@ -8,7 +8,7 @@ use aterm_machines::init::{Hold, Workstation, WorkstationGroup};
 use aterm_machines::port::{Cmd, System};
 use aterm_machines::{model::PValue, plist};
 use aterm_types::macos_setup::{
-    PassOutcome, PutBack, RestoreOutcome, Selection, Setting, Unfinished,
+    PassOutcome, PutBack, RestoreOutcome, Selection, Setting, Subject, Unfinished,
 };
 
 #[cfg(test)]
@@ -19,17 +19,19 @@ pub use initial::{
     InitialSetupObserved, InitialSetupParkMark, InitialSetupRestart, InitialSetupSnapshot,
     InitialSetupSnapshotError, InitialSetupUpgrade, SetupHooks, SetupNext, SetupUpgrade,
     StageEvent, alab_mac, apply_initial_setup, apply_initial_setup_observed, automatic_plan,
-    check_initial_setup, check_initial_setup_observed, initial_setup_access_revision,
-    initial_setup_admission, initial_setup_finished, initial_setup_observation,
-    initial_setup_park_mark, initial_setup_revision, initial_setup_snapshot, initial_setup_status,
-    observe_initial_setup, provisional_setup_widens, request_initial_setup_stop,
-    restart_initial_setup, restart_initial_setup_observed, run_initial_setup_pass,
-    upgrade_provisional_setup, validate_initial_setup_plan,
+    bring_forward_restored_setup, check_initial_setup, check_initial_setup_observed,
+    initial_setup_access_revision, initial_setup_admission, initial_setup_finished,
+    initial_setup_keeps_vault_sync, initial_setup_observation, initial_setup_park_mark,
+    initial_setup_review_revision, initial_setup_revision, initial_setup_snapshot,
+    initial_setup_status, observe_initial_setup, provisional_setup_widens,
+    put_back_held_initial_setup, request_initial_setup_stop, restart_initial_setup,
+    restart_initial_setup_observed, run_initial_setup_pass, upgrade_provisional_setup,
+    validate_initial_setup_plan, with_initial_setup_vault_sync,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{
     InitialSetupAdmissionFault, InitialSetupAdmissionStopTest, ProvisionalSetupWatchTest,
-    initial_setup_observation_at, initial_setup_snapshot_at,
+    initial_setup_observation_at, initial_setup_snapshot_at, with_initial_setup_vault_sync_at,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -122,6 +124,16 @@ impl PassPage {
 }
 
 impl Report {
+    /// The line naming each change this pass or Restore made and could not log, with why, when
+    /// the change journal refused one ([`journal_refused`]).
+    #[must_use]
+    pub fn journal_refused(&self) -> Option<&str> {
+        self.rows
+            .iter()
+            .find(|row| row.name == JOURNAL_ROW && row.status == "error")
+            .map(|row| row.detail.as_str())
+    }
+
     /// Whether a setting or account remains out of policy, blocked, unverified or failed.
     #[must_use]
     pub fn needs_attention(&self) -> bool {
@@ -915,6 +927,13 @@ pub fn initial_setup_scope_ready_at(home: &Path, account_home: &Path) -> Result<
     scope_of(false, 501, Some(home), || Ok(account_home.to_path_buf())).ready()
 }
 
+/// [`lasting_scope_refusal`] from scratch account paths, without consulting this process's
+/// account.
+#[cfg(any(test, debug_assertions))]
+pub fn lasting_scope_refusal_at(home: &Path, account_home: &Path) -> Option<String> {
+    scope_of(false, 501, Some(home), || Ok(account_home.to_path_buf())).lasting()
+}
+
 fn person_scope() -> PersonScope {
     let uid = aterm_uds::peer::our_uid();
     scope_of(
@@ -1601,7 +1620,7 @@ impl Host for NativeHost {
 }
 
 /// The name of the row that says the change journal refused records ([`journal_refused`]).
-const JOURNAL_ROW: &str = "Change journal";
+pub const JOURNAL_ROW: &str = "Change journal";
 
 fn journal_refused(refused: &[String]) -> Row {
     Row {
@@ -1645,14 +1664,12 @@ fn load_backup(path: &Path) -> Result<Vec<Saved>, String> {
                 key: key.into(),
                 host,
             };
-            let value = if entry["xml"].is_null() {
+            let xml = entry.get("xml").ok_or("backup XML is missing")?;
+            let value = if xml.is_null() {
                 None
             } else {
                 Some(plist::parse(
-                    entry["xml"]
-                        .as_str()
-                        .ok_or("backup XML is invalid")?
-                        .as_bytes(),
+                    xml.as_str().ok_or("backup XML is invalid")?.as_bytes(),
                 )?)
             };
             let granted = match entry.get("granted") {
@@ -1762,9 +1779,16 @@ fn append_workstation(
     apply: bool,
     report: &mut Report,
 ) {
-    if group.selected(host.selection()).is_empty() {
+    let selected = group.selected(host.selection());
+    if selected.is_empty() {
         return;
     }
+    // The page says a step that failed as a whole under its rows (design §3.6): the group's
+    // selected rows, and of a follow-up only those it withholds without Full Disk Access.
+    let covers = match group {
+        WorkstationGroup::Withheld => aterm_machines::init_preferences::withheld_settings(selected),
+        _ => selected,
+    };
     let name = match group {
         WorkstationGroup::Accounts => "Messages and FaceTime sign-out",
         WorkstationGroup::Preferences => "Workstation preferences",
@@ -1773,13 +1797,14 @@ fn append_workstation(
         WorkstationGroup::Withheld => "Settings waiting for Full Disk Access",
     };
     match host.workstation(group, apply) {
-        Ok(rows) if rows.is_empty() => as_is(
+        Ok(rows) if rows.is_empty() => as_step(
             report,
             Row {
                 name: name.into(),
                 status: "unverified".into(),
                 detail: "setup returned no settings to verify".into(),
             },
+            covers,
         ),
         Ok(rows) => {
             for (setting, row) in rows {
@@ -1801,13 +1826,14 @@ fn append_workstation(
                 }
             }
         }
-        Err(detail) => as_is(
+        Err(detail) => as_step(
             report,
             Row {
                 name: name.into(),
                 status: "unverified".into(),
                 detail,
             },
+            covers,
         ),
     }
 }
@@ -1821,6 +1847,39 @@ fn page(report: &mut Report) -> &mut PassPage {
 fn as_is(report: &mut Report, row: Row) {
     page(report).rows.push(row.clone());
     report.rows.push(row);
+}
+
+/// Add `row`, a row about a whole step that `aterm doctor` names in its own words (`Workstation
+/// preferences`, `Settings waiting for Full Disk Access`), to `report`, and to its page under
+/// the page's rows for `settings`, the System State rows the step covers ([`step_page`]).
+fn as_step(report: &mut Report, row: Row, settings: Selection) {
+    page(report).merge(step_page(
+        &row,
+        Setting::ALL
+            .into_iter()
+            .filter(|setting| settings.contains(*setting))
+            .map(Subject::Setting),
+    ));
+    report.rows.push(row);
+}
+
+/// The page's rows for `row`, a row about a whole step that `aterm doctor` names in its own
+/// words: one for each of `subjects`, the System State rows the step covers, named as the page
+/// names it, with `row`'s status and no detail, since the page says a step that failed or could
+/// not be confirmed in its own words (design §3.6) and `aterm doctor` and the log keep the
+/// step's.
+fn step_page(row: &Row, subjects: impl IntoIterator<Item = Subject>) -> PassPage {
+    PassPage {
+        outcome: PassOutcome::default(),
+        rows: subjects
+            .into_iter()
+            .map(|subject| Row {
+                name: subject.name().into(),
+                status: row.status.clone(),
+                detail: String::new(),
+            })
+            .collect(),
+    }
 }
 
 fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, String> {
@@ -2145,13 +2204,14 @@ fn apply_preferences(
         });
     }
     if let Err(detail) = record_withheld(root, &left_alone, &reached, &unverified, turn) {
-        as_is(
+        as_step(
             report,
             Row {
                 name: "Settings waiting for Full Disk Access".into(),
                 status: "error".into(),
                 detail,
             },
+            aterm_machines::init_preferences::withheld_settings(group.selected(host.selection())),
         );
     }
     Ok((unverified, settled))
@@ -2386,12 +2446,12 @@ fn follow_up_setup_at(
 /// Once Full Disk Access is granted, put back what a Restore could not for want of it, and apply
 /// any container preferences withheld from earlier passes.
 pub fn finish_withheld_preferences<S>(
-    reserve: impl FnOnce() -> S,
+    reserve: impl FnMut() -> S,
 ) -> Result<Option<Report>, String> {
     if aterm_types::dirs::runs_under_private_state_root() {
         return Ok(None);
     }
-    follow_up_finished_at(
+    follow_up_finished_waiting(
         &state_root()?,
         reserve,
         || {
@@ -2400,15 +2460,56 @@ pub fn finish_withheld_preferences<S>(
         },
         &aterm_types::version::build_id(),
         std::time::SystemTime::now(),
+        follow_up_lock_wait(),
     )
 }
 
+#[cfg(test)]
 fn follow_up_finished_at<S, H: Host>(
     root: &Path,
-    reserve: impl FnOnce() -> S,
+    reserve: impl FnMut() -> S,
     host: impl FnOnce() -> Result<H, String>,
     build: &str,
     now: std::time::SystemTime,
+) -> Result<Option<Report>, String> {
+    follow_up_finished_waiting(root, reserve, host, build, now, || false)
+}
+
+/// How long the follow-up with Full Disk Access waits for the profile lock another holds: a pass
+/// in another process (`aterm doctor` in a terminal), the launch's bring-forward or the ALab
+/// watch's look. A pass of this process holds System State's busy slot, which the follow-up
+/// waits for first. Past it, what waits is put back at the next launch.
+const FOLLOW_UP_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// How often the follow-up looks at the profile lock while another holds it.
+const FOLLOW_UP_LOCK_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// [`follow_up_finished_waiting`]'s wait in a live process: a [`FOLLOW_UP_LOCK_POLL`] at a
+/// time, `false` once [`FOLLOW_UP_LOCK_WAIT`] has passed.
+fn follow_up_lock_wait() -> impl FnMut() -> bool {
+    let deadline = std::time::Instant::now() + FOLLOW_UP_LOCK_WAIT;
+    move || {
+        let more = std::time::Instant::now() < deadline;
+        if more {
+            std::thread::sleep(FOLLOW_UP_LOCK_POLL);
+        }
+        more
+    }
+}
+
+/// The follow-up with Full Disk Access ([`finish_withheld_preferences`]): with something owed and
+/// the grant, it takes System State's busy slot (`reserve`) and the profile lock and runs. While
+/// another holds the lock it lets the slot go, so the page stays usable, and `wait`s (which says
+/// whether to look again) until the lock is free, then takes both again. So a grant recorded while
+/// a pass elsewhere holds the lock, just after that pass's own follow-up point, is still followed
+/// up in this launch once the pass ends. What the holder followed up meanwhile is owed no more.
+fn follow_up_finished_waiting<S, H: Host>(
+    root: &Path,
+    mut reserve: impl FnMut() -> S,
+    host: impl FnOnce() -> Result<H, String>,
+    build: &str,
+    now: std::time::SystemTime,
+    mut wait: impl FnMut() -> bool,
 ) -> Result<Option<Report>, String> {
     if !follow_up_owed(root)? {
         return Ok(None);
@@ -2417,11 +2518,29 @@ fn follow_up_finished_at<S, H: Host>(
     if host.full_disk_access() != Some(true) {
         return Ok(None);
     }
-    let _slot = reserve();
-    let Some(_lock) = HeldLock::try_take(root)? else {
-        return Ok(None);
-    };
-    follow_up_at(root, &mut host, build, now)
+    loop {
+        let slot = reserve();
+        if let Some(lock) = HeldLock::try_take(root)? {
+            let report = if follow_up_owed(root)? {
+                follow_up_at(root, &mut host, build, now)
+            } else {
+                Ok(None)
+            };
+            // The lock goes before the slot, so the page's next operation finds it free.
+            drop(lock);
+            drop(slot);
+            return report;
+        }
+        drop(slot);
+        loop {
+            if !wait() {
+                return Ok(None);
+            }
+            if !HeldLock::profile_active(root)? {
+                break;
+            }
+        }
+    }
 }
 
 fn follow_up_locked_at(root: &Path) -> Result<Option<Report>, String> {
@@ -2565,13 +2684,25 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
     save_withheld(root, &Withheld::default())?;
     let saved = load_backup(&report.backup)?;
     // What this Restore cannot put back until aterm has Full Disk Access, which a follow-up
-    // then puts back by itself ([`finish_waiting_restore`]); none clears an older Restore's.
+    // then puts back by itself ([`finish_waiting_restore`]).
     let waiting: Vec<Target> = saved
         .iter()
         .filter(|item| unknown_original(item).is_none() && withheld(host, &item.target).is_some())
         .map(|item| item.target.clone())
         .collect();
-    save_restore_waiting(root, &waiting)?;
+    // Keep an earlier Restore's put-back owed until this pass handles it, including when
+    // preflight fails or the process ends before a write. Newly blocked keys must also be
+    // durable before any other key changes.
+    let previous_waiting = restore_waiting(root)?;
+    let mut retained_waiting = previous_waiting.clone();
+    for target in &waiting {
+        if !retained_waiting.contains(target) {
+            retained_waiting.push(target.clone());
+        }
+    }
+    if retained_waiting != previous_waiting {
+        save_restore_waiting(root, &retained_waiting)?;
+    }
     let mut activation = pending_refresh(root)?;
     for saved in &saved {
         if withheld(host, &saved.target).is_some() || unknown_original(saved).is_some() {
@@ -2675,6 +2806,9 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
         }
         report.rows.push(runtime.row);
     }
+    // This pass handled the earlier keys. A reported write failure still needs a manual
+    // Restore retry; only keys left for want of the grant remain automatic obligations.
+    save_restore_waiting(root, &waiting)?;
     // The groups Restore put back are left as is from now on (design §3.4).
     initial::leave_restored_as_is(root)?;
     let mut outcome = RestoreOutcome::of(outcomes);
@@ -4625,6 +4759,83 @@ mod tests {
                 "{stop}"
             );
         }
+    }
+
+    #[test]
+    fn backup_original_value_missing_refuses_restore_without_effects() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let _lock = HeldLock::take(root.path()).unwrap();
+        let (dock, applied) = wanted().remove(0);
+        let original = PValue::Bool(true);
+        let mut selected = Selection::none();
+        selected.set(Setting::Dock, true);
+        let mut host = Fake {
+            selected: Some(selected),
+            values: BTreeMap::from([(dock.clone(), original.clone())]),
+            ..Fake::default()
+        };
+        let report = execute(&mut host, root.path(), Action::Apply).unwrap();
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert_eq!(host.values.get(&dock), Some(&applied));
+
+        let backup = root.path().join("original-preferences.json");
+        let mut record: Value = aterm_json::from_slice(&std::fs::read(&backup).unwrap()).unwrap();
+        let Value::Array(keys) = record.as_object_mut().unwrap().get_mut("keys").unwrap() else {
+            panic!("Apply's backup has keys");
+        };
+        assert_eq!(keys.len(), 1);
+        let fields = keys[0].as_object_mut().unwrap();
+        assert_eq!(
+            fields.remove("xml"),
+            Some(Value::from(plist::document(&original)))
+        );
+        write_json(&backup, &record).unwrap();
+        let damaged = std::fs::read(&backup).unwrap();
+        let (writes, restarts, lines) = (host.writes.len(), host.restarts.len(), host.lines.len());
+
+        let restored = run_mutation(&mut host, root.path(), Action::Restore);
+        assert_eq!(
+            host.values.get(&dock),
+            Some(&applied),
+            "a missing before-image must not be treated as an instruction to delete"
+        );
+        assert_eq!(host.writes.len(), writes);
+        assert_eq!(host.restarts.len(), restarts);
+        assert_eq!(host.lines.len(), lines);
+        assert!(restored.is_err());
+        assert_eq!(std::fs::read(&backup).unwrap(), damaged);
+        assert!(
+            initial::finished_at(root.path()).unwrap(),
+            "Restore still stops setup"
+        );
+    }
+
+    #[test]
+    fn backup_original_value_explicit_null_still_restores_absence() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let _lock = HeldLock::take(root.path()).unwrap();
+        let (dock, applied) = wanted().remove(0);
+        let mut selected = Selection::none();
+        selected.set(Setting::Dock, true);
+        let mut host = Fake {
+            selected: Some(selected),
+            ..Fake::default()
+        };
+        let report = execute(&mut host, root.path(), Action::Apply).unwrap();
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert_eq!(host.values.get(&dock), Some(&applied));
+        let backup = root.path().join("original-preferences.json");
+        let bytes = std::fs::read(&backup).unwrap();
+        let record: Value = aterm_json::from_slice(&bytes).unwrap();
+        let keys = record["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].get("xml"), Some(&Value::Null));
+        let writes = host.writes.len();
+        let restored = run_mutation(&mut host, root.path(), Action::Restore).unwrap();
+        assert!(!restored.needs_attention(), "{}", restored.to_text());
+        assert!(!host.values.contains_key(&dock), "the original was absent");
+        assert_eq!(host.writes.len(), writes + 1);
+        assert_eq!(std::fs::read(&backup).unwrap(), bytes);
     }
 
     #[test]
@@ -7004,12 +7215,7 @@ mod tests {
         }
     }
 
-    /// A Restore that could not put Notification Center's widget list back for want of Full
-    /// Disk Access puts it back by itself once aterm has the grant (design §3.4), with no
-    /// press: nothing before the grant, once after it, its reader relaunched, and a calm
-    /// outcome for the page.
-    #[test]
-    fn a_restore_waiting_for_full_disk_access_puts_back_once_granted() {
+    fn deferred_widgets_restore() -> (aterm_tempfile::TempDir, Fake) {
         let mut widgets = Selection::none();
         widgets.set(Setting::Widgets, true);
         let root = aterm_tempfile::tempdir().unwrap();
@@ -7043,6 +7249,16 @@ mod tests {
         );
         assert_eq!(restore_waiting(root.path()).unwrap(), [nc_widgets()]);
         assert!(shows(&host, &cleared()));
+        (root, host)
+    }
+
+    /// A Restore that could not put Notification Center's widget list back for want of Full
+    /// Disk Access puts it back by itself once aterm has the grant (design §3.4), with no
+    /// press: nothing before the grant, once after it, its reader relaunched, and a calm
+    /// outcome for the page.
+    #[test]
+    fn a_restore_waiting_for_full_disk_access_puts_back_once_granted() {
+        let (root, mut host) = deferred_widgets_restore();
         let now = std::time::SystemTime::now();
         let writes = host.writes.len();
         assert!(owed_with_full_disk_access(root.path(), || Some(false)).is_empty());
@@ -7070,7 +7286,7 @@ mod tests {
             report.restore.unwrap().outcome.rows,
             [(Some(Setting::Widgets), PutBack::Back)]
         );
-        assert!(shows(&host, &populated()));
+        assert!(host.values[&nc_widgets()].same(&populated()));
         assert_eq!(
             host.relaunches("NotificationCenter")
                 + host
@@ -7088,5 +7304,232 @@ mod tests {
                 .is_none()
         );
         assert_eq!(host.writes.len(), writes, "once");
+    }
+
+    fn a_waiting_restore_survives_a_replacement_that_never_wrote(interrupted: bool) {
+        let (root, mut host) = deferred_widgets_restore();
+        let _lock = HeldLock::take(root.path()).unwrap();
+        let waiting = std::fs::read(root.path().join(RESTORE_WAITING)).unwrap();
+        let backup = std::fs::read(root.path().join("original-preferences.json")).unwrap();
+        let effects = (host.writes.len(), host.restarts.len());
+        host.full_disk_access = Some(true);
+        if interrupted {
+            host.dies_in_doctor_writes = true;
+            let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_mutation(&mut host, root.path(), Action::Restore)
+            }));
+            assert!(
+                stopped.is_err(),
+                "the replacement ends before its first write"
+            );
+            host.dies_in_doctor_writes = false;
+        } else {
+            std::fs::write(root.path().join("pending-refresh.json"), b"broken").unwrap();
+            assert!(run_mutation(&mut host, root.path(), Action::Restore).is_err());
+            std::fs::remove_file(root.path().join("pending-refresh.json")).unwrap();
+        }
+        assert_eq!((host.writes.len(), host.restarts.len()), effects);
+        assert!(host.values[&nc_widgets()].same(&cleared()));
+        assert_eq!(
+            std::fs::read(root.path().join("original-preferences.json")).unwrap(),
+            backup
+        );
+        assert_eq!(
+            restore_waiting(root.path()).unwrap(),
+            [nc_widgets()],
+            "a replacement that never wrote must keep the earlier put-back owed"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join(RESTORE_WAITING)).unwrap(),
+            waiting
+        );
+        let now = std::time::SystemTime::now();
+        let report = follow_up_at(root.path(), &mut host, BUILD, now)
+            .unwrap()
+            .expect("the original waiting Restore still follows the grant");
+        assert_eq!(
+            report.restore.unwrap().outcome.rows,
+            [(Some(Setting::Widgets), PutBack::Back)]
+        );
+        assert!(host.values[&nc_widgets()].same(&populated()));
+        assert_eq!(host.writes.len(), effects.0 + 1);
+        assert_eq!(host.restarts.len(), effects.1 + 1);
+        assert!(restore_waiting(root.path()).unwrap().is_empty());
+        assert!(
+            follow_up_at(root.path(), &mut host, BUILD, now)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(host.writes.len(), effects.0 + 1, "the follow-up runs once");
+    }
+
+    #[test]
+    fn restore_waiting_survives_interruption_before_its_first_write() {
+        a_waiting_restore_survives_a_replacement_that_never_wrote(true);
+    }
+
+    #[test]
+    fn restore_waiting_survives_bad_activation_preflight() {
+        a_waiting_restore_survives_a_replacement_that_never_wrote(false);
+    }
+
+    #[test]
+    fn restore_waiting_reported_write_failure_still_needs_manual_retry() {
+        let (root, mut host) = deferred_widgets_restore();
+        let _lock = HeldLock::take(root.path()).unwrap();
+        host.full_disk_access = Some(true);
+        host.refuses.push(nc_widgets());
+        let report = run_mutation(&mut host, root.path(), Action::Restore).unwrap();
+        assert!(
+            report
+                .restore
+                .unwrap()
+                .outcome
+                .rows
+                .contains(&(Some(Setting::Widgets), PutBack::Failed))
+        );
+        assert!(restore_waiting(root.path()).unwrap().is_empty());
+        host.refuses.clear();
+        assert!(
+            follow_up_at(root.path(), &mut host, BUILD, std::time::SystemTime::now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(host.values[&nc_widgets()].same(&cleared()));
+    }
+
+    /// The follow-up the window starts as it records Full Disk Access granted
+    /// (`finish_withheld_preferences`): after a Restore that left nothing waiting it measures
+    /// nothing and takes no slot; after one that left Notification Center's widget list waiting
+    /// for the grant it puts that back once, holding the slot, and the next grant's follow-up
+    /// finds nothing owed.
+    #[test]
+    fn a_grants_follow_up_puts_back_what_waits_once_and_starts_nothing_when_nothing_waits() {
+        let mut widgets = Selection::none();
+        widgets.set(Setting::Widgets, true);
+        let now = std::time::SystemTime::now();
+        let slots = std::cell::Cell::new(0_u8);
+        let reserve = || slots.set(slots.get() + 1);
+        let unbuilt = || -> Result<Fake, String> { panic!("nothing owed measures no grant") };
+        for waits in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let mut host = Fake {
+                selected: Some(widgets),
+                notification_center: true,
+                full_disk_access: Some(true),
+                values: BTreeMap::from([(nc_widgets(), populated())]),
+                ..Fake::default()
+            };
+            let report = execute(&mut host, root.path(), Action::Apply).unwrap();
+            assert!(!report.needs_attention(), "{}", report.to_text());
+            host.full_disk_access = Some(!waits);
+            execute(&mut host, root.path(), Action::Restore).unwrap();
+            assert_eq!(restore_waiting(root.path()).unwrap().is_empty(), !waits);
+            slots.set(0);
+            if waits {
+                host.full_disk_access = Some(true);
+                let report = follow_up_finished_at(
+                    root.path(),
+                    reserve,
+                    || Ok(std::mem::take(&mut host)),
+                    BUILD,
+                    now,
+                )
+                .unwrap()
+                .expect("the waiting put-back runs once granted");
+                assert_eq!(
+                    report.restore.unwrap().outcome.rows,
+                    [(Some(Setting::Widgets), PutBack::Back)]
+                );
+                assert!(restore_waiting(root.path()).unwrap().is_empty());
+            }
+            assert!(
+                follow_up_finished_at(root.path(), reserve, unbuilt, BUILD, now)
+                    .unwrap()
+                    .is_none(),
+                "waits={waits}"
+            );
+            assert_eq!(slots.get(), u8::from(waits), "waits={waits}");
+        }
+    }
+
+    /// The grant's follow-up that finds the profile lock taken (a pass in another process, the
+    /// launch's bring-forward, the ALab watch's look) waits for it, without System State's busy
+    /// slot, and puts back what waits for Full Disk Access in this launch once the holder lets
+    /// it go. A holder that keeps it past the wait leaves it for the next launch, slot untaken.
+    #[test]
+    fn a_grants_follow_up_waits_for_the_profile_lock_and_puts_back_in_this_launch() {
+        use std::cell::{Cell, RefCell};
+        let mut widgets = Selection::none();
+        widgets.set(Setting::Widgets, true);
+        let now = std::time::SystemTime::now();
+        let waiting = |root: &Path| {
+            let mut host = Fake {
+                selected: Some(widgets),
+                notification_center: true,
+                full_disk_access: Some(true),
+                values: BTreeMap::from([(nc_widgets(), populated())]),
+                ..Fake::default()
+            };
+            execute(&mut host, root, Action::Apply).unwrap();
+            host.full_disk_access = Some(false);
+            execute(&mut host, root, Action::Restore).unwrap();
+            assert!(!restore_waiting(root).unwrap().is_empty());
+            host.full_disk_access = Some(true);
+            host
+        };
+        struct Slot<'a>(&'a Cell<bool>);
+        impl Drop for Slot<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        for released in [true, false] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let host = waiting(root.path());
+            let holder = RefCell::new(Some(HeldLock::take(root.path()).unwrap()));
+            let (held, slots, waits) = (Cell::new(false), Cell::new(0_u8), Cell::new(0_u8));
+            let report = follow_up_finished_waiting(
+                root.path(),
+                || {
+                    held.set(true);
+                    slots.set(slots.get() + 1);
+                    Slot(&held)
+                },
+                || Ok(host),
+                BUILD,
+                now,
+                || {
+                    waits.set(waits.get() + 1);
+                    assert!(!held.get(), "no slot while it waits");
+                    if released {
+                        holder.borrow_mut().take();
+                    }
+                    released || waits.get() < 3
+                },
+            )
+            .unwrap();
+            if released {
+                let report = report.expect("put back in this launch");
+                assert_eq!(
+                    report.restore.unwrap().outcome.rows,
+                    [(Some(Setting::Widgets), PutBack::Back)]
+                );
+                assert!(restore_waiting(root.path()).unwrap().is_empty());
+                assert_eq!(
+                    (waits.get(), slots.get()),
+                    (1, 2),
+                    "the slot again once free"
+                );
+            } else {
+                assert!(report.is_none());
+                assert!(
+                    !restore_waiting(root.path()).unwrap().is_empty(),
+                    "kept for later"
+                );
+                assert_eq!((waits.get(), slots.get()), (3, 1));
+            }
+            assert!(!held.get());
+        }
     }
 }

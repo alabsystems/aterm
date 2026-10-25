@@ -929,19 +929,20 @@ impl PetBrain {
     }
 
     /// A LANDING'S STAGE (§11.3 of `docs/DESIGN-harness-autopilot-2026-10-15.md`): ground where the cat can cheer with its ♪/♥ legible — its body, and the air the three of them fill side by side in their lanes on the side it faces ([`PetBrain::cheer_air`]), clear of ink, the caret's ring and anything protected: [`PetWorld::clear`], the law every mote on glass is held to (`finish_console_frame`).
-    pub(super) fn cheer_stage(
+    pub(super) const fn cheer_stage(
         &self,
         sense: PetSense,
         width: f32,
         prefer: Option<(f32, f32)>,
     ) -> Option<CheerStage> {
-        if !self.console.presentable {
-            return None;
-        }
-        let world = self.console.world.as_ref()?;
-        world.stamp()?;
-        let body = self.console_body(sense);
-        let stage_at = |air: CheerAir, (col, row): (f32, f32)| {
+        #[inline]
+        const fn stage_at(
+            brain: &PetBrain,
+            sense: PetSense,
+            width: f32,
+            air: CheerAir,
+            (col, row): (f32, f32),
+        ) -> PetRect {
             let body = still_body_rect(
                 (col, row),
                 Stance::NEUTRAL,
@@ -949,7 +950,7 @@ impl PetBrain {
                 (sense.cols, sense.rows),
             );
             let (left, top, right, bottom) =
-                self.cheer_air((col, row), (sense.cell_w, sense.cell_h), width, air);
+                brain.cheer_air((col, row), (sense.cell_w, sense.cell_h), width, air);
             let (row0, col0) = (top.min(body.row), left.min(body.col));
             PetRect::new(
                 row0,
@@ -957,22 +958,50 @@ impl PetBrain {
                 bottom.max(body.row + body.rows) - row0,
                 right.max(body.col + body.cols) - col0,
             )
-        };
-        let shifted =
-            |r: PetRect, (dc, dr): (f32, f32)| PetRect::new(r.row + dr, r.col + dc, r.rows, r.cols);
-        let from =
-            (world.under_text_clearance_past_caret(body, CLEARANCE) != Some(false)).then_some(body);
-        let reachable = |air: CheerAir, (dc, dr): (f32, f32)| {
-            world.clear(stage_at(air, (self.col + dc, self.row + dr)), CLEARANCE)
-                && from.is_none_or(|from| {
-                    world.under_text_corridor_clear_past_caret(
+        }
+
+        #[inline]
+        const fn reachable(
+            brain: &PetBrain,
+            world: &PetWorld,
+            sense: PetSense,
+            width: f32,
+            from: Option<PetRect>,
+            air: CheerAir,
+            (dc, dr): (f32, f32),
+        ) -> bool {
+            let stage = stage_at(brain, sense, width, air, (brain.col + dc, brain.row + dr));
+            world.clear(stage, CLEARANCE)
+                && match from {
+                    None => true,
+                    Some(from) => world.under_text_corridor_clear_past_caret(
                         from,
-                        shifted(from, (dc, dr)),
+                        PetRect::new(from.row + dr, from.col + dc, from.rows, from.cols),
                         CLEARANCE,
-                    )
-                })
+                    ),
+                }
+        }
+
+        if !self.console.presentable {
+            return None;
+        }
+        let Some(world) = self.console.world.as_ref() else {
+            return None;
         };
-        let half_px = 0.5 / f32::from(sense.cell_w.max(1));
+        if world.stamp().is_none() {
+            return None;
+        }
+        let body = self.console_body(sense);
+        let from = if !matches!(
+            world.under_text_clearance_past_caret(body, CLEARANCE),
+            Some(false)
+        ) {
+            Some(body)
+        } else {
+            None
+        };
+        let cw1 = if sense.cell_w > 1 { sense.cell_w } else { 1 };
+        let half_px = 0.5 / (cw1 as f32);
         let tiers = [
             [
                 Some(CheerAir::Lanes(self.facing_left)),
@@ -980,65 +1009,108 @@ impl PetBrain {
             ],
             [Some(CheerAir::Compact), None],
         ];
-        for tier in tiers {
-            let stages = tier.map(|opt| {
-                opt.map(|air| {
-                    let stage = stage_at(air, (self.col, self.row));
+        let mut ti = 0;
+        while ti < tiers.len() {
+            let tier = tiers[ti];
+            ti += 1;
+            let mut stages = [None; 2];
+            let mut si = 0;
+            while si < 2 {
+                if let Some(air) = tier[si] {
+                    let stage = stage_at(self, sense, width, air, (self.col, self.row));
                     let center = stage.col - CLEARANCE - half_px;
-                    let c_lo =
-                        ((center - CHEER_STAGE_COLS).floor().max(0.0) as u16).min(sense.cols);
-                    let c_hi = (((center + CHEER_STAGE_COLS).ceil().max(0.0) as u16)
-                        .saturating_add(1))
-                    .min(sense.cols);
-                    (air, stage, c_lo, c_hi)
-                })
-            });
-            if let Some(&(air, _, _, _)) = stages
-                .iter()
-                .flatten()
-                .find(|(_, stage, _, _)| world.clear(*stage, CLEARANCE))
-            {
-                return Some(CheerStage { at: None, air });
+                    let c_lo_raw = (center - CHEER_STAGE_COLS).floor().max(0.0) as u16;
+                    let c_lo = if c_lo_raw < sense.cols {
+                        c_lo_raw
+                    } else {
+                        sense.cols
+                    };
+                    let c_hi_raw =
+                        ((center + CHEER_STAGE_COLS).ceil().max(0.0) as u16).saturating_add(1);
+                    let c_hi = if c_hi_raw < sense.cols {
+                        c_hi_raw
+                    } else {
+                        sense.cols
+                    };
+                    stages[si] = Some((air, stage, c_lo, c_hi));
+                }
+                si += 1;
             }
-            if let Some((col, row)) = prefer
-                && let Some(&(air, _, _, _)) = stages
-                    .iter()
-                    .flatten()
-                    .find(|&&(air, _, _, _)| reachable(air, (col - self.col, row - self.row)))
-            {
-                return Some(CheerStage {
-                    at: Some((col, row)),
-                    air,
-                });
+            let mut si = 0;
+            while si < 2 {
+                if let Some((air, stage, _, _)) = stages[si]
+                    && world.clear(stage, CLEARANCE)
+                {
+                    return Some(CheerStage { at: None, air });
+                }
+                si += 1;
+            }
+            if let Some((col, row)) = prefer {
+                let mut si = 0;
+                while si < 2 {
+                    if let Some((air, _, _, _)) = stages[si]
+                        && reachable(
+                            self,
+                            world,
+                            sense,
+                            width,
+                            from,
+                            air,
+                            (col - self.col, row - self.row),
+                        )
+                    {
+                        return Some(CheerStage {
+                            at: Some((col, row)),
+                            air,
+                        });
+                    }
+                    si += 1;
+                }
             }
             let mut best: Option<(f32, (f32, f32), CheerAir)> = None;
-            for dir in [-1.0, 1.0] {
-                for step in 0..=CHEER_STAGE_TENTHS_UP {
+            let dirs = [-1.0f32, 1.0f32];
+            let mut di = 0;
+            while di < 2 {
+                let dir = dirs[di];
+                di += 1;
+                let mut step = 0u8;
+                while step <= CHEER_STAGE_TENTHS_UP {
                     if dir > 0.0 && step == 0 {
+                        step += 1;
                         continue;
                     }
-                    let dr = dir * 0.1 * f32::from(step);
+                    let dr = dir * 0.1 * (step as f32);
                     let row_dist = 2.0 * dr.abs();
-                    if row_dist > CHEER_STAGE_COLS || best.is_some_and(|(d, _, _)| row_dist >= d) {
+                    if row_dist > CHEER_STAGE_COLS
+                        || matches!(best, Some((d, _, _)) if row_dist >= d)
+                    {
                         break;
                     }
-                    for &(air, stage, c_lo, c_hi) in stages.iter().flatten() {
-                        for c in c_lo..c_hi {
-                            let dc = f32::from(c) + CLEARANCE + half_px - stage.col;
-                            let distance = row_dist.max(dc.abs());
-                            if distance > CHEER_STAGE_COLS
-                                || best.is_some_and(|(d, _, _)| distance >= d)
-                            {
-                                if dc > 0.0 {
-                                    break;
+                    let mut si = 0;
+                    while si < 2 {
+                        if let Some((air, stage, c_lo, c_hi)) = stages[si] {
+                            let mut c = c_lo;
+                            while c < c_hi {
+                                let dc = (c as f32) + CLEARANCE + half_px - stage.col;
+                                let distance = row_dist.max(dc.abs());
+                                if distance > CHEER_STAGE_COLS
+                                    || matches!(best, Some((d, _, _)) if distance >= d)
+                                {
+                                    if dc > 0.0 {
+                                        break;
+                                    }
+                                    c += 1;
+                                    continue;
                                 }
-                                continue;
-                            }
-                            if reachable(air, (dc, dr)) {
-                                best = Some((distance, (dc, dr), air));
+                                if reachable(self, world, sense, width, from, air, (dc, dr)) {
+                                    best = Some((distance, (dc, dr), air));
+                                }
+                                c += 1;
                             }
                         }
+                        si += 1;
                     }
+                    step += 1;
                 }
                 if best.is_some() {
                     break;
@@ -1055,13 +1127,20 @@ impl PetBrain {
     }
 
     /// A LANDING SEEN AT FIRST LOOK (§11.3): a cat off glass when its cheer comes due (its home under the host's chrome, where the console law hides it, or not yet faded in) has no flight anyone could watch, and a flight from a refused body is stepped aside on its first frame, the whole arc translated with it, so it lands off its stage.
-    pub(super) fn appear_on_cheer_stage(&mut self, sense: PetSense, width: f32) -> bool {
+    pub(super) const fn appear_on_cheer_stage(&mut self, sense: PetSense, width: f32) -> bool {
         if self.console.on_glass || self.flight.is_some() {
             return false;
         }
         let stage = self.cheer_stage(sense, width, None);
-        self.room_cheer_air = stage.map(|s| s.air);
-        let Some((col, row)) = stage.and_then(|s| s.at) else {
+        self.room_cheer_air = match stage {
+            Some(s) => Some(s.air),
+            None => None,
+        };
+        let Some(CheerStage {
+            at: Some((col, row)),
+            ..
+        }) = stage
+        else {
             self.room_cheer_trips = CHEER_STAGE_TRIPS;
             return false;
         };
@@ -1075,7 +1154,7 @@ impl PetBrain {
         self.home = col;
         self.col_at_tick = col;
         self.alpha = 0.0;
-        self.console.hold = VisibilityHold::default();
+        self.console.hold = VisibilityHold::DEFAULT;
         self.console.trip = None;
         self.console.target = None;
         true
@@ -1141,13 +1220,18 @@ impl PetBrain {
     #[inline]
     pub(super) fn console_obstructed(&self, sense: PetSense) -> bool {
         self.console.presentable
-            && self.console.world.as_ref().is_some_and(|world| {
-                Self::stand_clearance(
-                    world,
-                    self.console_body(sense),
-                    self.console_ground_passing(),
-                ) == Some(false)
-            })
+            && matches!(
+                self.console.world.as_ref(),
+                Some(world)
+                    if matches!(
+                        Self::stand_clearance(
+                            world,
+                            self.console_body(sense),
+                            self.console_ground_passing(),
+                        ),
+                        Some(false)
+                    )
+            )
     }
 
     #[inline]
@@ -1173,7 +1257,7 @@ impl PetBrain {
                 self.row = row;
                 self.alpha = 0.0;
                 self.last_caret = None;
-                self.console.hold = VisibilityHold::default();
+                self.console.hold = VisibilityHold::DEFAULT;
             }
         }
     }
@@ -2608,15 +2692,15 @@ impl PetBrain {
     }
 
     #[inline]
-    fn at_escort_stand(&self, body: PetRect, stand: PetRect) -> bool {
+    const fn at_escort_stand(&self, body: PetRect, stand: PetRect) -> bool {
         if Self::at_console_stand(body, stand) {
             return true;
         }
-        let lead = if !self.wall_side
-            && !self.console.rest_seated.get()
-            && self.console.cursor_home.is_some()
-            && self.held_for == self.console.cursor_home
-        {
+        let same_home = matches!(
+            (self.held_for, self.console.cursor_home),
+            (Some((r0, c0)), Some((r1, c1))) if r0 == r1 && c0 == c1
+        );
+        let lead = if !self.wall_side && !self.console.rest_seated.get() && same_home {
             self.lead()
         } else {
             0.0

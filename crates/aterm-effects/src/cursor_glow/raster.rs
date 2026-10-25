@@ -385,14 +385,14 @@ pub(super) const FRESH_INK_GLYPH_BISECT: usize = 24;
 /// WCAG relative luminance of a `0x00RRGGBB` colour, with the piecewise sRGB transfer (linear toe below 0.03928, 2.4 power above); a plain power law differs enough near black to move a ratio across the AA line.
 #[cfg(test)]
 #[inline]
-pub(super) fn rel_luminance(c: u32) -> f32 {
+pub(super) const fn rel_luminance(c: u32) -> f32 {
     crate::color_math::relative_luminance(c)
 }
 
 /// WCAG contrast ratio between two `0x00RRGGBB` colours.
 #[cfg(test)]
 #[inline]
-pub(super) fn wcag_ratio(a: u32, b: u32) -> f32 {
+pub(super) const fn wcag_ratio(a: u32, b: u32) -> f32 {
     let (x, y) = (rel_luminance(a), rel_luminance(b));
     let (hi, lo) = if x > y { (x, y) } else { (y, x) };
     (hi + 0.05) / (lo + 0.05)
@@ -460,7 +460,7 @@ pub(super) enum GlyphInkSide {
 
 /// The side the theme's ink is on and the luminance every point of the tint path must satisfy, or `None` when this theme gets no tint.
 #[inline]
-pub(super) fn glyph_ink_bound(fg: u32, bg: u32) -> Option<(GlyphInkSide, f32)> {
+pub(super) const fn glyph_ink_bound(fg: u32, bg: u32) -> Option<(GlyphInkSide, f32)> {
     // A sentinel (or any set high byte) is not a colour: masking it would read
     // as pure black and flip the side.
     if fg > 0x00FF_FFFF || bg > 0x00FF_FFFF || fg == bg {
@@ -487,7 +487,12 @@ pub(super) fn glyph_ink_bound(fg: u32, bg: u32) -> Option<(GlyphInkSide, f32)> {
 
 /// One band as glyph ink for this theme: saturated, then bisected along a one-parameter family toward black (dark side) or white (light side) until the box corner against the foreground satisfies the bound.
 #[inline]
-pub(super) fn fresh_ink_glyph_ink(band: u32, fg: u32, side: GlyphInkSide, cap: f32) -> Option<u32> {
+pub(super) const fn fresh_ink_glyph_ink(
+    band: u32,
+    fg: u32,
+    side: GlyphInkSide,
+    cap: f32,
+) -> Option<u32> {
     let (r, g, b) = (
         ((band >> 16) & 0xff) as f32,
         ((band >> 8) & 0xff) as f32,
@@ -621,17 +626,26 @@ pub(super) fn fresh_ink_glyph_ink(band: u32, fg: u32, side: GlyphInkSide, cap: f
 pub(super) type GlyphPaletteMemo = ((u32, u32), Option<[u32; RAINBOW_BANDS.len()]>);
 
 /// The seven band inks for one theme, or `None` when this theme gets no tint.
-pub(super) fn fresh_ink_glyph_palette(fg: u32, bg: u32) -> Option<[u32; RAINBOW_BANDS.len()]> {
-    let (side, cap) = glyph_ink_bound(fg, bg)?;
+pub(super) const fn fresh_ink_glyph_palette(
+    fg: u32,
+    bg: u32,
+) -> Option<[u32; RAINBOW_BANDS.len()]> {
+    let Some((side, cap)) = glyph_ink_bound(fg, bg) else {
+        return None;
+    };
     let mut out = [0u32; RAINBOW_BANDS.len()];
-    for (dst, &band) in out.iter_mut().zip(&RAINBOW_BANDS) {
-        let ink = fresh_ink_glyph_ink(band, fg, side, cap)?;
+    let mut i = 0;
+    while i < RAINBOW_BANDS.len() {
+        let Some(ink) = fresh_ink_glyph_ink(RAINBOW_BANDS[i], fg, side, cap) else {
+            return None;
+        };
         if chan_spread(ink) < FRESH_INK_GLYPH_MIN_SPREAD
             || chan_dist(ink, fg) < FRESH_INK_GLYPH_MIN_DELTA
         {
             return None;
         }
-        *dst = ink;
+        out[i] = ink;
+        i += 1;
     }
     Some(out)
 }
@@ -810,17 +824,42 @@ pub(crate) fn push_soft_veil(
     if rx < 1.0 || ry < 1.0 || cap == 0 {
         return;
     }
-    static LAYER_CAP: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
-    let layer_cap = LAYER_CAP.get_or_init(|| {
-        std::array::from_fn(|cap| {
-            if cap == 0 {
-                return 0;
+    const LAYER_CAP: [u32; 256] = {
+        let mut lut = [0u32; 256];
+        let mut c = 1usize;
+        while c < 256 {
+            if c == 255 {
+                lut[c] = 255;
+            } else {
+                let a = (c as f32 / 255.0) as f64;
+                let x = 1.0 - a;
+                let n = SOFT_VEIL_LAYERS as f64;
+                let mut y = 1.0 - a / n;
+                let mut step = 0;
+                while step < 20 {
+                    let y2 = y * y;
+                    let y4 = y2 * y2;
+                    let y8 = y4 * y4;
+                    let y9 = y8 * y;
+                    y = ((n - 1.0) * y + x / y9) / n;
+                    step += 1;
+                }
+                let layer = 1.0 - y as f32;
+                let v = (layer * 255.0).round() as u32;
+                let cap_u = c as u32;
+                lut[c] = if v < 1 {
+                    1
+                } else if v > cap_u {
+                    cap_u
+                } else {
+                    v
+                };
             }
-            let a = cap as f32 / 255.0;
-            let layer = 1.0 - (1.0 - a).powf(1.0 / SOFT_VEIL_LAYERS as f32);
-            ((layer * 255.0).round() as u32).clamp(1, cap as u32)
-        })
-    })[usize::from(cap)];
+            c += 1;
+        }
+        lut
+    };
+    let layer_cap = LAYER_CAP[usize::from(cap)];
     let color = (ink & 0x00FF_FFFF) | (layer_cap << 24);
     for k in 0..SOFT_VEIL_LAYERS {
         let shrink = 1.0 - k as f32 / SOFT_VEIL_LAYERS as f32;
@@ -1233,11 +1272,12 @@ pub(super) const BOLT_BURN_START: f32 = 0.55;
 
 /// The beam power envelope: full power for the first 40% of a spark's life, then one cosine down to zero.
 #[inline]
-pub(super) fn beam_power(frac: f32) -> f32 {
+pub(super) const fn beam_power(frac: f32) -> f32 {
     if frac < 0.40 {
         1.0
     } else {
-        0.5 * (1.0 + (std::f32::consts::PI * (frac - 0.40) / 0.60).cos())
+        let (_, c) = crate::supernova::sin_cos_f32(std::f32::consts::PI * (frac - 0.40) / 0.60);
+        0.5 * (1.0 + c)
     }
 }
 

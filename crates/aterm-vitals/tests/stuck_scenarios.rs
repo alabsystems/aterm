@@ -2917,6 +2917,214 @@ fn a_nested_shells_jobs_are_rows_of_their_own() {
     );
 }
 
+/// A program that puts a group the prompt's program leads in front does job control, but a root
+/// the shell gave way to: a shell nested in the tab's whose first command is a zsh script (macOS
+/// names it `zsh`) runs it as its block's group in front, the nested shell the block's too (its
+/// own marks closed the block that ran it), also a `make` a `bash` run there runs at once, but
+/// not a process substitution an earlier command left in the tab shell's group; and vim's `:sh` keeps vim's block, running its `make` (also one
+/// typed before a pass saw the `:sh` prompt) and at the person's read with that `make` stopped,
+/// not parked, while a `ninja &` there is the tab's background job, running.
+#[test]
+fn a_program_that_puts_the_prompts_program_in_front_does_job_control() {
+    let wire = |v: &JobsView| v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>();
+    // The nested zsh's own marks close the `zsh` block at its prompt and open the script's; an
+    // earlier command's process substitution logs the session in the shell's own group.
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    let shell_pgid = w.p(shell).pgid;
+    w.mark(1);
+    let at = w.at;
+    w.tab(1).tab.block = Some(Block {
+        id: 2,
+        started_ms: at,
+        open: true,
+        command: "exec > >(tee -a ~/zsh.log)".to_owned(),
+        status: None,
+        stopped: false,
+    });
+    let mut tee = Proc::new(1150, shell, "tee");
+    tee.pgid = shell_pgid;
+    tee.sid = shell;
+    tee.tty = true;
+    w.add(tee);
+    let _ = w.tick(TICK_MS);
+    w.close_block(1, 0);
+    w.mark(1);
+    let _ = w.tick(TICK_MS);
+    w.run_fg(1, 3, "zsh", sleeper(1200, "zsh"));
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    let t = w.tab(1);
+    t.tab.ended = t.tab.block.take().map(|b| Block {
+        open: false,
+        status: Some(0),
+        ..b
+    });
+    w.mark(1);
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    let at = w.at;
+    w.tab(1).tab.block = Some(Block {
+        id: 9,
+        started_ms: at,
+        open: true,
+        command: "./release.zsh".to_owned(),
+        status: None,
+        stopped: false,
+    });
+    for (pid, ppid, name) in [(1210, 1200, "zsh"), (1211, 1210, "swift-build")] {
+        let mut p = Proc::new(pid, ppid, name);
+        p.pgid = 1210;
+        p.sid = shell;
+        p.tty = true;
+        w.add(p);
+    }
+    w.tab(1).tpgid = 1210;
+    let v = run_to(&mut w, 900_000, |w, _| w.line_from(1, &[1211]));
+    assert!(
+        v.row("b9")
+            .is_some_and(|r| r.class == Class::Running && r.members == 4)
+            && v.rows.iter().all(|r| !r.id.starts_with('j')),
+        "{:?}",
+        wire(&v)
+    );
+    // Back at the nested prompt, `bash` with a `make` typed ahead, in front at the first pass.
+    w.exit(1211, false);
+    w.exit(1210, false);
+    w.close_block(1, 0);
+    w.tab(1).tpgid = 1200;
+    w.mark(1);
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    let at = w.at;
+    w.tab(1).tab.block = Some(Block {
+        id: 10,
+        started_ms: at,
+        open: true,
+        command: "bash".to_owned(),
+        status: None,
+        stopped: false,
+    });
+    for (pid, ppid) in [(1220, 1200), (1221, 1220)] {
+        let mut p = Proc::new(pid, ppid, if pid == 1220 { "bash" } else { "make" });
+        p.sid = shell;
+        p.tty = true;
+        w.add(p);
+    }
+    w.tab(1).tpgid = 1221;
+    let v = run_to(&mut w, 600_000, |w, _| w.line_from(1, &[1221]));
+    assert!(
+        v.row("b10")
+            .is_some_and(|r| r.class == Class::Running && r.members == 4)
+            && v.rows.iter().all(|r| !r.id.starts_with('j')),
+        "{:?}",
+        wire(&v)
+    );
+
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    ran_one(&mut w);
+    w.run_fg(1, 7, "vim notes.md", sleeper(1300, "vim"));
+    w.tty_mode(1, false, false);
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    let mut sh = Proc::new(1310, 1300, "zsh");
+    sh.sid = shell;
+    sh.tty = true;
+    w.add(sh);
+    w.tab(1).tpgid = 1310;
+    let v = run_to(&mut w, 600_000, |_, _| {});
+    assert!(
+        v.row("b7").is_some_and(|r| r.verdict == Verdict::Fine)
+            && v.rows.iter().all(|r| !r.id.starts_with('j')),
+        "{:?}",
+        wire(&v)
+    );
+    let mut make = Proc::new(1320, 1310, "make");
+    make.sid = shell;
+    make.tty = true;
+    w.add(make);
+    w.tab(1).tpgid = 1320;
+    w.tty_mode(1, true, true);
+    let v = run_to(&mut w, 600_000, |w, _| w.line_from(1, &[1320]));
+    assert!(
+        v.row("b7").is_some_and(|r| r.class == Class::Running)
+            && v.rows.iter().all(|r| !r.id.starts_with('j')),
+        "{:?}",
+        wire(&v)
+    );
+    w.p(1320).state = ProcState::Stopped;
+    w.tab(1).tpgid = 1310;
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 60_000, |_, _| {});
+    assert_eq!(
+        v.row("b7")
+            .map(|r| (r.verdict, r.wait.as_ref().map(|w| w.name))),
+        Some((Verdict::Fine, Some(WaitName::TtyRaw))),
+        "{:?}",
+        wire(&v)
+    );
+    // `ninja &` there, printing: the tab's only background job.
+    let mut ninja = Proc::new(1330, 1310, "ninja");
+    ninja.sid = shell;
+    ninja.tty = true;
+    w.add(ninja);
+    let v = run_to(&mut w, 600_000, |w, _| w.line_from(1, &[1330]));
+    assert!(
+        v.row("j1330").is_some_and(|r| r.class == Class::Running),
+        "{:?}",
+        wire(&v)
+    );
+
+    // A `make` the person typed at the `:sh` before a pass saw its prompt.
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    ran_one(&mut w);
+    w.run_fg(1, 7, "vim notes.md", sleeper(1300, "vim"));
+    w.tty_mode(1, false, false);
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    for (pid, ppid, name) in [(1310, 1300, "zsh"), (1320, 1310, "make")] {
+        let mut p = Proc::new(pid, ppid, name);
+        p.sid = shell;
+        p.tty = true;
+        w.add(p);
+    }
+    w.tab(1).tpgid = 1320;
+    let v = run_to(&mut w, 600_000, |w, _| w.line_from(1, &[1320]));
+    assert!(
+        v.row("b7")
+            .is_some_and(|r| r.class == Class::Running && r.members == 4)
+            && v.rows.iter().all(|r| !r.id.starts_with('j')),
+        "{:?}",
+        wire(&v)
+    );
+}
+
+/// In a tab without marks, a shell nested in the tab's is one row with the command it puts in
+/// front: a `make` printing there reads running, the shell waiting on it no quiet row beside it.
+#[test]
+fn a_nested_shells_command_is_its_row_in_a_tab_without_marks() {
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    let mut bash = sleeper(1200, "bash");
+    bash.ppid = shell;
+    bash.sid = shell;
+    bash.tty = true;
+    w.add(bash);
+    w.tab(1).tpgid = 1200;
+    w.tty_mode(1, false, false);
+    let _ = run_to(&mut w, 6_000, |_, _| {});
+    let mut make = sleeper(1210, "make");
+    make.ppid = 1200;
+    make.sid = shell;
+    make.tty = true;
+    w.add(make);
+    w.tab(1).tpgid = 1210;
+    w.tty_mode(1, true, true);
+    let v = run_to(&mut w, 1_200_000, |w, _| w.line_from(1, &[1210]));
+    let rows: Vec<String> = v.rows.iter().map(|r| r.wire()).collect();
+    assert!(
+        v.rows.len() == 1 && v.rows.iter().all(|r| r.class == Class::Running),
+        "{rows:?}"
+    );
+}
+
 /// A nested session (sudo's `use_pty` command and monitor, `script`'s shell, an agent's pty call)
 /// is one row beside its opener's, judged by its own processes: it takes the lines it writes, and
 /// one hung on a silent peer reads stuck while the opener's row runs on.
@@ -5498,8 +5706,15 @@ fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
     // | Tee-Object build.log` prints through it, a few calls a line under the idle wakes its
     // runtime made at the start; and a `dotnet build` typed at it after one typed ahead with the
     // `pwsh`, which the pass that first saw that pwsh read open, after a pass that swept the pwsh
-    // before it read the block's `C`, and at a pwsh run in that pwsh.
-    for case in ["dotnet", "ninja", "cmdlet", "tee", "ahead", "lag", "deeper"] {
+    // before it read the block's `C`, at a pwsh run in that pwsh, after a first command its
+    // `C` opened a moment after the pass that first saw the pwsh, after one typed ahead that
+    // opened past that moment, the pwsh swept before its block's `C` was read, at a pwsh
+    // whose own first prompt closed its block before a pass saw it, and at the second of two
+    // `pwsh` typed ahead, its block opened by the first's marks as it started.
+    for case in [
+        "dotnet", "ninja", "cmdlet", "tee", "ahead", "lag", "deeper", "quick", "late", "prompt",
+        "twice",
+    ] {
         let mut w = World::new();
         let shell = w.tab(1).tab.shell_pid;
         let shell_pgid = w.p(shell).pgid;
@@ -5541,10 +5756,64 @@ fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
                 started_ms: at,
                 ..pwsh
             });
+        } else if case == "late" {
+            w.add(nested(1100, shell));
+            let _ = w.tick(TICK_MS);
+            let at = w.at;
+            w.tab(1).tab.ended = Some(Block {
+                started_ms: at,
+                open: false,
+                ..pwsh.clone()
+            });
+            w.tab(1).tab.block = Some(Block {
+                id: 5,
+                started_ms: at + 1_500,
+                command: "Get-Location".to_owned(),
+                ..pwsh
+            });
+        } else if case == "twice" {
+            // `pwsh` typed twice: the first's own marks open the second's block as it starts.
+            w.tab(1).tab.ended = Some(Block {
+                open: false,
+                status: Some(0),
+                ..pwsh.clone()
+            });
+            w.tab(1).tab.block = Some(Block {
+                id: 5,
+                started_ms: at + 400,
+                ..pwsh.clone()
+            });
+            let (mut outer, mut inner) = (nested(1100, shell), nested(1150, 1100));
+            outer.born = Some(at + 50);
+            inner.born = Some(at + 450);
+            w.add(outer);
+            w.add(inner);
+        } else if case == "quick" {
+            w.tab(1).tab.block = Some(pwsh.clone());
+            w.add(nested(1100, shell));
+            let _ = w.tick(TICK_MS);
+            let at = w.at;
+            w.tab(1).tab.ended = Some(Block {
+                open: false,
+                status: Some(0),
+                ..pwsh.clone()
+            });
+            w.tab(1).tab.block = Some(Block {
+                id: 5,
+                started_ms: at,
+                command: "Get-Location".to_owned(),
+                ..pwsh
+            });
+        } else if case == "prompt" {
+            w.tab(1).tab.block = Some(Block {
+                open: false,
+                status: Some(0),
+                ..pwsh
+            });
         } else {
             w.tab(1).tab.block = Some(pwsh);
         }
-        if case != "lag" {
+        if !matches!(case, "lag" | "late" | "quick" | "twice") {
             w.add(nested(1100, shell));
         }
         let _ = run_to(&mut w, 6_000, |_, _| {});
@@ -5571,7 +5840,11 @@ fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
             let _ = run_to(&mut w, 20_000, |_, _| {});
             w.mark(1);
         }
-        let (last, maker) = if deeper { (6, 1150) } else { (5, 1100) };
+        let (last, maker) = match case {
+            "deeper" | "twice" => (6, 1150),
+            "quick" | "late" => (6, 1100),
+            _ => (5, 1100),
+        };
         let at = w.at;
         w.tab(1).tab.block = Some(Block {
             id: last,
@@ -5646,8 +5919,18 @@ fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
     // A pwsh `Start-Process -NoNewWindow` started (`watch.ps1`, a `dotnet build` every 15 s,
     // printing) is no shell: its builds are no later command's, so a `git fetch` hung on a dead
     // remote reads no progress; also where it runs each build in a `pwsh -File build.ps1` it
-    // started while the tab's last command was a `pwsh -c`.
-    for nested in [false, true] {
+    // started while the tab's last command was a `pwsh -c`, where the `pwsh` the person ran
+    // started it from its profile, the fetch typed at that pwsh (also a second after a quick
+    // `pwsh -c`), where the pass that first saw it read the tab before its block's `C`, the
+    // tab's last block the `pwsh` left, where the person ran a `pwsh` a moment after the
+    // pass that first saw it, or after it started and before that pass; nor a `git gc` hung on
+    // a lock in a `zsh` that `pwsh` runs.
+    for case in [
+        "root", "nested", "profile", "lag", "quick", "soon", "between", "zsh",
+    ] {
+        let (nested, lag, zsh) = (case == "nested", case == "lag", case == "zsh");
+        let (profile, quick) = (matches!(case, "profile" | "quick" | "zsh"), case == "quick");
+        let (soon, between) = (case == "soon", case == "between");
         let mut w = World::new();
         let shell = w.tab(1).tab.shell_pid;
         let shell_pgid = w.p(shell).pgid;
@@ -5655,39 +5938,114 @@ fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
         w.mark(1);
         let _ = w.tick(TICK_MS);
         let at = w.at;
-        // The `pwsh` the person ran a minute before and left.
-        w.tab(1).tab.ended = Some(Block {
+        // The `pwsh` the person ran a minute before and left, or a quick `pwsh -c` just now.
+        let left = Block {
             id: 2,
-            started_ms: at - 60_000,
+            started_ms: if quick { at + 100 } else { at - 60_000 },
             open: false,
-            command: "pwsh".to_owned(),
+            command: if quick {
+                "pwsh -NoProfile -c '$PSVersionTable.PSVersion'"
+            } else {
+                "pwsh"
+            }
+            .to_owned(),
             status: Some(0),
             stopped: false,
-        });
-        w.tab(1).tab.block = Some(Block {
+        };
+        if lag {
+            w.tab(1).tab.block = Some(left);
+        } else {
+            w.tab(1).tab.ended = Some(left);
+        }
+        let start = Block {
             id: 3,
-            started_ms: at,
+            started_ms: if quick { at + 1_700 } else { at },
             open: true,
-            command:
+            command: if profile {
+                "pwsh"
+            } else {
                 "Start-Process -NoNewWindow pwsh -ArgumentList '-NoProfile','-File','./watch.ps1'"
-                    .to_owned(),
+            }
+            .to_owned(),
             status: None,
             stopped: false,
-        });
-        let mut watcher = Proc::new(1100, shell, "pwsh");
+        };
+        if !lag {
+            w.tab(1).tab.block = Some(start.clone());
+        }
+        // The `pwsh` the person ran after `Start-Process` returned, its own fork.
+        let typed = |w: &mut World, id: u64, started_ms: u64| {
+            w.tab(1).tab.ended = w.tab(1).tab.block.take().map(|b| Block {
+                open: false,
+                status: Some(0),
+                ..b
+            });
+            w.tab(1).tab.block = Some(Block {
+                id,
+                started_ms,
+                open: true,
+                command: "pwsh".to_owned(),
+                status: None,
+                stopped: false,
+            });
+            let mut pwsh = Proc::new(1140, shell, "pwsh");
+            pwsh.pgid = shell_pgid;
+            pwsh.sid = shell;
+            pwsh.tty = true;
+            pwsh.fds.push(tty_fd(0));
+            pwsh.born = Some(started_ms + 50);
+            w.add(pwsh);
+        };
+        if between {
+            typed(&mut w, 4, at + 1_000);
+        }
+        let fetches = if profile { 1050 } else { shell };
+        if profile {
+            let mut pwsh = Proc::new(1050, shell, "pwsh");
+            pwsh.pgid = shell_pgid;
+            pwsh.sid = shell;
+            pwsh.tty = true;
+            pwsh.fds.push(tty_fd(0));
+            pwsh.born = quick.then_some(at + 1_750);
+            w.add(pwsh);
+        }
+        let mut watcher = Proc::new(1100, fetches, "pwsh");
         watcher.pgid = shell_pgid;
         watcher.sid = shell;
         watcher.tty = true;
         watcher.fds.push(tty_fd(0));
+        watcher.born = match case {
+            "quick" => Some(at + 1_900),
+            "soon" => Some(at + 1_000),
+            "between" => Some(at + 100),
+            _ => None,
+        };
         w.add(watcher);
         let _ = w.tick(TICK_MS);
+        if soon {
+            let at = w.at;
+            typed(&mut w, 4, at + 400);
+            let _ = w.tick(TICK_MS);
+        }
+        if soon || between {
+            w.exit(1140, false);
+        }
+        if lag {
+            w.tab(1).tab.ended = w.tab(1).tab.block.take();
+            w.tab(1).tab.block = Some(Block {
+                started_ms: w.at,
+                ..start
+            });
+            let _ = w.tick(TICK_MS);
+        }
         if let Some(b) = w.tab(1).tab.block.as_mut() {
             b.open = false;
             b.status = Some(0);
         }
         w.mark(1);
         let _ = run_to(&mut w, 6_000, |_, _| {});
-        let maker = if nested {
+        // A `pwsh -c` the person ran since.
+        if !profile {
             let at = w.at;
             w.tab(1).tab.block = Some(Block {
                 id: 8,
@@ -5697,40 +6055,56 @@ fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
                 status: Some(0),
                 stopped: false,
             });
+        }
+        let maker = if nested {
             let mut build = Proc::new(1150, 1100, "pwsh");
             build.pgid = shell_pgid;
             build.sid = shell;
             build.tty = true;
             build.fds.push(tty_fd(0));
             w.add(build);
-            let _ = run_to(&mut w, 6_000, |_, _| {});
             1150
         } else {
             1100
         };
+        let _ = run_to(&mut w, 6_000, |_, _| {});
+        if zsh {
+            let mut z = Proc::new(1060, fetches, "zsh");
+            z.sid = shell;
+            z.tty = true;
+            z.fds.push(tty_fd(0));
+            w.add(z);
+            w.tab(1).tpgid = 1060;
+            let _ = run_to(&mut w, 6_000, |_, _| {});
+        }
         w.mark(1);
         let at = w.at;
         w.tab(1).tab.block = Some(Block {
             id: 9,
             started_ms: at,
             open: true,
-            command: "git fetch".to_owned(),
+            command: if zsh { "git gc" } else { "git fetch" }.to_owned(),
             status: None,
             stopped: false,
         });
+        let git_pgid = if zsh { 1200 } else { shell_pgid };
         let mut git = sleeper(1200, "git");
-        git.ppid = shell;
-        git.pgid = shell_pgid;
+        git.ppid = if zsh { 1060 } else { fetches };
+        git.pgid = git_pgid;
         git.sid = shell;
         git.tty = true;
         w.add(git);
-        let mut ssh = sleeper(1201, "ssh");
-        ssh.ppid = 1200;
-        ssh.pgid = shell_pgid;
-        ssh.sid = shell;
-        ssh.tty = true;
-        ssh.fds.push(tcp_fd(3));
-        w.add(ssh);
+        if zsh {
+            w.tab(1).tpgid = 1200;
+        } else {
+            let mut ssh = sleeper(1201, "ssh");
+            ssh.ppid = 1200;
+            ssh.pgid = git_pgid;
+            ssh.sid = shell;
+            ssh.tty = true;
+            ssh.fds.push(tcp_fd(3));
+            w.add(ssh);
+        }
         let v = run_to(&mut w, 600_000, |w, rel| {
             let cycle = rel % 15_000;
             let pid = 3_000 + u32::try_from(rel / 15_000).unwrap_or(0);
@@ -5750,10 +6124,10 @@ fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
                 w.exit(pid, false);
             }
         });
-        assert_ne!(
-            v.row("b9").map(|r| r.class),
-            Some(Class::Running),
-            "nested {nested}: {:?}",
+        assert!(
+            v.row("b9").is_some_and(|r| r.class != Class::Running
+                && (!zsh || r.verdict == Verdict::Quiet)),
+            "{case}: {:?}",
             v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
         );
     }
@@ -5919,8 +6293,14 @@ fn a_shell_exec_in_place_ends_its_block_at_the_new_ones_prompt() {
     // `read -e x && exec "$x"` reading raw keys in the shell itself; `exec vim notes.md` back from
     // a `:sh` whose zsh took a group of its own in front, then running `:!make test` in its group,
     // also picked in atuin's full-screen search, vim's screen switches back from the `:sh` gone by
-    // between two passes.
-    for (vim, alt) in [(false, false), (true, false), (true, true)] {
+    // between two passes, and a vim that keeps to the main screen (`t_ti= t_te=`, as psql does
+    // back from its `\!`).
+    for (vim, alt, screen) in [
+        (false, false, false),
+        (true, false, true),
+        (true, true, true),
+        (true, false, false),
+    ] {
         let mut w = World::new();
         let shell = w.tab(1).tab.shell_pid;
         let shell_pgid = w.p(shell).pgid;
@@ -5948,7 +6328,7 @@ fn a_shell_exec_in_place_ends_its_block_at_the_new_ones_prompt() {
             let root = w.p(shell);
             root.name = "vim".into();
             root.exec += 1;
-            w.tab(1).tab.alt_screen = true;
+            w.tab(1).tab.alt_screen = screen;
             let _ = run_to(&mut w, 4_000, |_, _| {});
             let mut sh = Proc::new(1300, shell, "zsh");
             sh.sid = shell;
@@ -5959,7 +6339,7 @@ fn a_shell_exec_in_place_ends_its_block_at_the_new_ones_prompt() {
             let _ = run_to(&mut w, 6_000, |_, _| {});
             w.exit(1300, false);
             w.tab(1).tpgid = shell_pgid;
-            w.tab(1).tab.alt_screen = !alt;
+            w.tab(1).tab.alt_screen = screen && !alt;
         }
         let _ = run_to(&mut w, 60_000, |_, _| {});
         if vim {
@@ -5980,7 +6360,7 @@ fn a_shell_exec_in_place_ends_its_block_at_the_new_ones_prompt() {
             v.row("b7").is_some_and(
                 |r| r.verdict != Verdict::Exited && (!vim || r.class == Class::Running)
             ) && v.rows.iter().all(|r| !r.id.starts_with('j')),
-            "vim {vim} alt {alt}: {:?}",
+            "vim {vim} alt {alt} screen {screen}: {:?}",
             v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
         );
         if vim {
@@ -5999,7 +6379,7 @@ fn a_shell_exec_in_place_ends_its_block_at_the_new_ones_prompt() {
             assert!(
                 v.row("b7").is_some_and(|r| r.class == Class::Running)
                     && v.rows.iter().all(|r| !r.id.starts_with('j')),
-                "hit-enter alt {alt}: {:?}",
+                "hit-enter alt {alt} screen {screen}: {:?}",
                 v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
             );
         }
@@ -6369,10 +6749,16 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
         );
     }
 
-    // Beside the `>>>`: a server it started, a survivor of one it killed, multiprocessing's
-    // resource tracker (the terminal at fd 0, the REPL's pipe past it); the REPL `make shell`
-    // runs, make waiting on it in front; one a pwsh tab runs in pwsh's group.
-    for kid in ["server", "survivor", "none", "tracker", "make", "pwsh"] {
+    // Beside the `>>>`: a server it started (on Linux, its input the REPL's pipe, its output the
+    // terminal, in its `epoll_wait`; or one `socketserver` runs, in its `poll`), a survivor of one
+    // it killed, multiprocessing's resource tracker (the terminal at fd 0, the REPL's pipe past
+    // it), a queue's consumer it started in its `poll` there, a flusher it feeds that logs to a
+    // file in its `select`, a `pv` it feeds that writes a file, its meter on the terminal; the
+    // REPL `make shell` runs, make waiting on it in front; one a pwsh tab runs in pwsh's group.
+    for kid in [
+        "server", "survivor", "none", "tracker", "make", "pwsh", "listener", "consumer", "logger",
+        "pv",
+    ] {
         let mut w = World::new();
         let shell = w.tab(1).tab.shell_pid;
         let make = kid == "make";
@@ -6399,7 +6785,9 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
             },
         )];
         match kid {
-            "server" | "tracker" => kids.push((2011, 2000, ProcState::Sleeping)),
+            "server" | "tracker" | "listener" | "consumer" | "logger" | "pv" => {
+                kids.push((2011, 2000, ProcState::Sleeping));
+            }
             "survivor" => kids.push((2011, 2010, ProcState::Sleeping)),
             "make" => kids.push((2011, 2010, ProcState::Zombie)),
             _ => {}
@@ -6415,10 +6803,66 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
                 k.fds.push(tty_fd(0));
                 k.fds.push(pipe_end(3, 0xF2, 0xF1, false, 0x8, 0));
             }
+            if matches!(kid, "server" | "listener") && pid == 2011 {
+                k.fds
+                    .extend([linux_pipe(0, 0xF3, false), tty_fd(1), tty_fd(2)]);
+                k.wchan = Some("ep_poll".into());
+            }
+            if kid == "listener" && pid == 2011 {
+                k.fds.push(listen_fd(4, 8000));
+                k.wchan = Some("do_sys_poll".into());
+            }
+            if kid == "pv" && pid == 2011 {
+                k.name = "pv".into();
+                k.fds.extend([
+                    linux_pipe(0, 0xF6, false),
+                    aterm_vitals::jobs::Fd {
+                        fd: 1,
+                        kind: aterm_vitals::jobs::FdKind::File {
+                            regular: true,
+                            size: 0,
+                            dev: 1,
+                            ino: 78,
+                            lf_tail: None,
+                            fresh_dylib: false,
+                        },
+                    },
+                    tty_fd(2),
+                ]);
+                k.wchan = Some("do_select".into());
+            }
+            if kid == "logger" && pid == 2011 {
+                k.fds.extend([
+                    linux_pipe(0, 0xF5, false),
+                    tty_fd(1),
+                    aterm_vitals::jobs::Fd {
+                        fd: 2,
+                        kind: aterm_vitals::jobs::FdKind::File {
+                            regular: true,
+                            size: 0,
+                            dev: 1,
+                            ino: 77,
+                            lf_tail: None,
+                            fresh_dylib: false,
+                        },
+                    },
+                ]);
+                k.wchan = Some("do_select".into());
+            }
+            if kid == "consumer" && pid == 2011 {
+                k.fds
+                    .extend([tty_fd(0), tty_fd(1), tty_fd(2), linux_pipe(3, 0xF4, false)]);
+                k.wchan = Some("do_sys_poll".into());
+            }
             w.add(k);
         }
-        if kid == "tracker" {
-            w.p(2000).fds.push(pipe_end(5, 0xF1, 0xF2, true, 0, 0));
+        match kid {
+            "tracker" => w.p(2000).fds.push(pipe_end(5, 0xF1, 0xF2, true, 0, 0)),
+            "server" | "listener" => w.p(2000).fds.push(linux_pipe(6, 0xF3, true)),
+            "consumer" => w.p(2000).fds.push(linux_pipe(6, 0xF4, true)),
+            "logger" => w.p(2000).fds.push(linux_pipe(6, 0xF5, true)),
+            "pv" => w.p(2000).fds.push(linux_pipe(6, 0xF6, true)),
+            _ => {}
         }
         if survivor {
             let _ = run_to(&mut w, 6_000, |_, _| {});
@@ -6600,14 +7044,16 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
 
     // The pager is crawl.py's sibling, or report.py's own child; fetch_all.py waits on the
     // pager's full pipe, also through a `grep` (each pipe full), and crawl.py deadlocked
-    // through one, and under util-linux `more` at its `--More--`, reading its keys from fd 2.
-    for (script, full, own, grep, pager) in [
-        ("crawl.py", false, false, false, "less"),
-        ("report.py", false, true, false, "less"),
-        ("fetch_all.py", true, false, false, "less"),
-        ("fetch_all.py", true, false, true, "less"),
-        ("crawl.py", false, false, true, "less"),
-        ("crawl.py", false, false, false, "more"),
+    // through one, and under util-linux `more` at its `--More--`, reading its keys from fd 2
+    // (before 2.35), or polling its input and fd 2 (since).
+    for (script, full, own, grep, pager, polls) in [
+        ("crawl.py", false, false, false, "less", false),
+        ("report.py", false, true, false, "less", false),
+        ("fetch_all.py", true, false, false, "less", false),
+        ("fetch_all.py", true, false, true, "less", false),
+        ("crawl.py", false, false, true, "less", false),
+        ("crawl.py", false, false, false, "more", false),
+        ("crawl.py", false, false, false, "more", true),
     ] {
         let mut w = World::new();
         let shell = w.tab(1).tab.shell_pid;
@@ -6646,7 +7092,10 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
         less.sid = shell;
         less.tty = true;
         less.fds.push(less_reads);
-        if pager == "more" {
+        if polls {
+            less.fds.extend([tty_fd(1), tty_fd(2)]);
+            less.wchan = Some("do_sys_poll".into());
+        } else if pager == "more" {
             less.fds.extend([tty_fd(1), tty_fd(2)]);
             less.wchan = Some("n_tty_read".into());
             less.blocked_fd = Some(2);
@@ -6677,25 +7126,48 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
     }
 
     // `python3 build_all.py | less` reads the stderr of the `make docs` it runs, which writes the
-    // pager's pipe, full while the person reads page one (or not, and the build deadlocked).
-    for full in [true, false] {
+    // pager's pipe, full while the person reads page one (or not, and the build deadlocked);
+    // also through zsh's `page() { less -R; }`, whose subshell holds the pipe beside its less.
+    for (full, page) in [(true, false), (false, false), (true, true)] {
         let mut w = World::new();
         let shell = w.tab(1).tab.shell_pid;
         let mut py = sleeper(2000, "python3");
         py.fds.push(pipe_end(1, 0xC1, 0xC2, true, 0, 0));
         py.fds.push(pipe_end(5, 0xC6, 0xC5, false, 0x8, 0));
-        w.run_fg(1, 9, "python3 build_all.py | less", py);
-        let mut less = sleeper(2001, "less");
+        w.run_fg(
+            1,
+            9,
+            if page {
+                "python3 build_all.py | page"
+            } else {
+                "python3 build_all.py | less"
+            },
+            py,
+        );
+        let reads = || {
+            if full {
+                pipe_end(0, 0xC2, 0xC1, false, 0x10, 65_536)
+            } else {
+                pipe_end(0, 0xC2, 0xC1, false, 0x8, 0)
+            }
+        };
+        let mut less = sleeper(if page { 2008 } else { 2001 }, "less");
         less.ppid = shell;
         less.pgid = 2000;
         less.sid = shell;
         less.tty = true;
-        less.fds.push(if full {
-            pipe_end(0, 0xC2, 0xC1, false, 0x10, 65_536)
-        } else {
-            pipe_end(0, 0xC2, 0xC1, false, 0x8, 0)
-        });
+        less.fds.push(reads());
         less.fds.push(tty_fd(3));
+        if page {
+            let mut sub = sleeper(2001, "zsh");
+            sub.ppid = shell;
+            sub.pgid = 2000;
+            sub.sid = shell;
+            sub.tty = true;
+            sub.fds.push(reads());
+            w.add(sub);
+            less.ppid = 2001;
+        }
         w.add(less);
         let mut make = sleeper(2010, "make");
         make.ppid = 2000;
@@ -6722,7 +7194,7 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
             } else {
                 r.class == Class::Zombie && r.verdict != Verdict::Fine
             }),
-            "full {full}: {}",
+            "full {full} page {page}: {}",
             wire(&v, "b9")
         );
     }
@@ -6841,9 +7313,11 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
 
     // On Linux, `python3 build_all.py 2>&1 | less`, an earlier child unreaped, reads a `make
     // docs` whose sphinx-build sleeps writing its warnings to the pager on page one: a wait on
-    // the person paging. And `fzf -m < hosts | python3 ingest.py`, deadlocked reading a worker's
-    // pipe, its earlier workers unreaped, while fzf waits on the person: the zombie class.
-    for ingest in [false, true] {
+    // the person paging (also before Linux 5.5, where a writer sleeps in `pipe_wait`). And `fzf
+    // -m < hosts | python3 ingest.py`, deadlocked reading a worker's pipe (the worker holds
+    // fzf's pipe too, at the stdin it inherited), its earlier workers unreaped, while fzf waits
+    // on the person: the zombie class.
+    for (ingest, old) in [(false, false), (false, true), (true, false)] {
         let mut w = World::new();
         let shell = w.tab(1).tab.shell_pid;
         let in_job = |pid: u32, ppid: u32, name: &str| {
@@ -6864,7 +7338,9 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
             asleep_on(&mut py, 5, false);
             w.add(py);
             let mut worker = in_job(2010, 2001, "python3");
-            worker.fds.push(linux_pipe(1, 0xD5, true));
+            worker
+                .fds
+                .extend([linux_pipe(0, 0xD1, false), linux_pipe(1, 0xD5, true)]);
             worker.wchan = Some("futex_wait_queue".into());
             w.add(worker);
             let mut z = in_job(2011, 2001, "python3");
@@ -6890,6 +7366,9 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
                 .fds
                 .extend([linux_pipe(1, 0xB1, true), linux_pipe(2, 0xC1, true)]);
             asleep_on(&mut sphinx, 2, true);
+            if old {
+                sphinx.wchan = Some("pipe_wait".into());
+            }
             w.add(sphinx);
             let mut z = in_job(2005, 2000, "git");
             z.state = ProcState::Zombie;
@@ -6903,81 +7382,162 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
             } else {
                 r.class != Class::Zombie && r.verdict == Verdict::Fine
             }),
-            "ingest {ingest}: {}",
+            "ingest {ingest} old {old}: {}",
+            wire(&v, "b9")
+        );
+    }
+
+    // On Linux, `ssh db1 'pg_dump app | zstd' | python3 load.py` while ssh asks for a password,
+    // load.py reading a `zstd -dc` it started on the stdin it inherited, an earlier child
+    // unreaped; also where load.py waits for that zstd to end.
+    for waits in [false, true] {
+        let mut w = World::new();
+        let shell = w.tab(1).tab.shell_pid;
+        let mut ssh = sleeper(2000, "ssh");
+        ssh.fds
+            .extend([linux_pipe(1, 0xA1, true), tcp_fd(3), tty_fd(4)]);
+        w.run_fg(1, 9, "ssh db1 'pg_dump app | zstd' | python3 load.py", ssh);
+        let in_job = |pid: u32, ppid: u32, name: &str| {
+            let mut p = sleeper(pid, name);
+            p.ppid = ppid;
+            p.pgid = 2000;
+            p.sid = shell;
+            p.tty = true;
+            p
+        };
+        let mut py = in_job(2001, shell, "python3");
+        py.fds.push(linux_pipe(0, 0xA1, false));
+        let mut zstd = in_job(2010, 2001, "zstd");
+        zstd.fds.push(linux_pipe(0, 0xA1, false));
+        if waits {
+            py.wchan = Some("do_wait".into());
+        } else {
+            py.fds.push(linux_pipe(3, 0xB1, false));
+            asleep_on(&mut py, 3, false);
+            zstd.fds.push(linux_pipe(1, 0xB1, true));
+        }
+        asleep_on(&mut zstd, 0, false);
+        w.add(py);
+        w.add(zstd);
+        let mut z = in_job(2011, 2001, "notify-send");
+        z.state = ProcState::Zombie;
+        w.add(z);
+        w.tty_mode(1, true, false);
+        let v = run_to(&mut w, 1_200_000, |_, _| {});
+        assert!(
+            v.row("b9")
+                .is_some_and(|r| r.class != Class::Zombie && r.verdict == Verdict::WaitingYou),
+            "waits {waits}: {}",
             wire(&v, "b9")
         );
     }
 
     // `python3 deploy.py 2>&1 | tee /dev/tty | gzip > deploy.log.gz`: deploy.py, an `osascript`
     // it never reaped, waits on a `git push` whose ssh asks for a password; tee only writes the
+    // terminal. Also through a `pv -l` instead, in its `select` on Linux, its progress on the
     // terminal.
-    let mut w = World::new();
-    let shell = w.tab(1).tab.shell_pid;
-    let mut py = sleeper(2000, "python3");
-    py.fds.push(pipe_end(1, 0xE1, 0xE2, true, 0, 0));
-    w.run_fg(
-        1,
-        9,
-        "python3 deploy.py 2>&1 | tee /dev/tty | gzip > deploy.log.gz",
-        py,
-    );
-    for (pid, ppid, name, state) in [
-        (2001, shell, "tee", ProcState::Sleeping),
-        (2002, shell, "gzip", ProcState::Sleeping),
-        (2003, 2000, "osascript", ProcState::Zombie),
-        (2010, 2000, "git", ProcState::Sleeping),
-        (2011, 2010, "ssh", ProcState::Sleeping),
-    ] {
-        let mut p = sleeper(pid, name);
-        p.ppid = ppid;
-        p.pgid = 2000;
-        p.sid = shell;
-        p.tty = true;
-        p.state = state;
-        match name {
-            "tee" => p.fds.extend([
-                pipe_end(0, 0xE2, 0xE1, false, 0x8, 0),
-                aterm_vitals::jobs::Fd {
-                    fd: 3,
-                    kind: aterm_vitals::jobs::FdKind::Device {
-                        tty: true,
-                        read: false,
-                    },
-                },
-                pipe_end(1, 0xE3, 0xE4, true, 0, 0),
-            ]),
-            "gzip" => p.fds.push(pipe_end(0, 0xE4, 0xE3, false, 0x8, 0)),
-            "ssh" => p.fds.push(tty_fd(3)),
-            _ => {}
-        }
-        w.add(p);
-    }
-    w.tty_mode(1, true, false);
-    let v = run_to(&mut w, 1_200_000, |_, _| {});
-    assert!(
-        v.row("b9")
-            .is_some_and(|r| r.class != Class::Zombie && r.verdict == Verdict::WaitingYou),
-        "{}",
-        wire(&v, "b9")
-    );
-
-    // An `ssh` asking for a password under `python3 sync.py 2>&1 | tee sync.log`, also with a
-    // `grep -v DEBUG` between the two.
-    for grep in [false, true] {
+    for filter in ["tee", "pv"] {
         let mut w = World::new();
         let shell = w.tab(1).tab.shell_pid;
+        let mut py = sleeper(2000, "python3");
+        py.fds.push(pipe_end(1, 0xE1, 0xE2, true, 0, 0));
+        let command = if filter == "pv" {
+            "python3 deploy.py 2>&1 | pv -l | gzip > deploy.log.gz"
+        } else {
+            "python3 deploy.py 2>&1 | tee /dev/tty | gzip > deploy.log.gz"
+        };
+        w.run_fg(1, 9, command, py);
+        for (pid, ppid, name, state) in [
+            (2001, shell, filter, ProcState::Sleeping),
+            (2002, shell, "gzip", ProcState::Sleeping),
+            (2003, 2000, "osascript", ProcState::Zombie),
+            (2010, 2000, "git", ProcState::Sleeping),
+            (2011, 2010, "ssh", ProcState::Sleeping),
+        ] {
+            let mut p = sleeper(pid, name);
+            p.ppid = ppid;
+            p.pgid = 2000;
+            p.sid = shell;
+            p.tty = true;
+            p.state = state;
+            match name {
+                "tee" => p.fds.extend([
+                    pipe_end(0, 0xE2, 0xE1, false, 0x8, 0),
+                    aterm_vitals::jobs::Fd {
+                        fd: 3,
+                        kind: aterm_vitals::jobs::FdKind::Device {
+                            tty: true,
+                            read: false,
+                        },
+                    },
+                    pipe_end(1, 0xE3, 0xE4, true, 0, 0),
+                ]),
+                "pv" => {
+                    p.fds.extend([
+                        pipe_end(0, 0xE2, 0xE1, false, 0x8, 0),
+                        pipe_end(1, 0xE3, 0xE4, true, 0, 0),
+                        tty_fd(2),
+                    ]);
+                    p.wchan = Some("do_select".into());
+                }
+                "gzip" => p.fds.push(pipe_end(0, 0xE4, 0xE3, false, 0x8, 0)),
+                "ssh" => p.fds.push(tty_fd(3)),
+                _ => {}
+            }
+            w.add(p);
+        }
+        w.tty_mode(1, true, false);
+        let v = run_to(&mut w, 1_200_000, |_, _| {});
+        assert!(
+            v.row("b9")
+                .is_some_and(|r| r.class != Class::Zombie && r.verdict == Verdict::WaitingYou),
+            "{command}: {}",
+            wire(&v, "b9")
+        );
+    }
+
+    // An `ssh` asking for a password under `python3 sync.py 2>&1 | tee sync.log`, also with a
+    // `grep -v DEBUG` between the two, or a `| while read` loop zsh runs in itself, its line
+    // editor's terminal at fd 10, or bash in a subshell, its own at 255, or zsh's function stage
+    // (`| stamp | tee sync.log`) in one, also a loop a `( … )` subshell forks, or a `node` filter
+    // whose libuv reopened its terminal output at fd 11, or on Linux a filter that polls its input
+    // (`| python3 batch.py`, flushing a batch each second).
+    for reader in [
+        "tee", "grep", "shell", "bash", "sub", "stamp", "node", "batch",
+    ] {
+        let (grep, tee) = (reader == "grep", matches!(reader, "tee" | "grep" | "stamp"));
+        let mut w = World::new();
+        let shell = w.tab(1).tab.shell_pid;
+        let sub = reader == "sub";
+        if reader == "bash" || sub {
+            w.p(shell).name = "bash".into();
+        }
         let mut py = sleeper(2000, "python3");
         py.fds.push(pipe_end(1, 0xE1, 0xE2, true, 0, 0));
         w.run_fg(
             1,
             9,
-            if grep {
-                "python3 sync.py 2>&1 | grep -v DEBUG | tee sync.log"
-            } else {
-                "python3 sync.py 2>&1 | tee sync.log"
+            match reader {
+                "grep" => "python3 sync.py 2>&1 | grep -v DEBUG | tee sync.log",
+                "tee" => "python3 sync.py 2>&1 | tee sync.log",
+                "bash" => "python3 sync.py 2>&1 | while IFS= read -r l; do echo \"$l\"; done",
+                "sub" => "( python3 sync.py 2>&1 | while IFS= read -r l; do echo \"$l\"; done )",
+                "stamp" => "python3 sync.py 2>&1 | stamp | tee sync.log",
+                "node" => "python3 sync.py 2>&1 | node tools/pretty.js",
+                "batch" => "python3 sync.py 2>&1 | python3 batch.py",
+                _ => "python3 sync.py 2>&1 | while IFS= read -r l; do print -r -- $l; done",
             },
             py,
         );
+        let filter = |w: &mut World, name: &str, fds: Vec<aterm_vitals::jobs::Fd>| {
+            let mut f = sleeper(2003, name);
+            f.ppid = shell;
+            f.pgid = 2000;
+            f.sid = shell;
+            f.tty = true;
+            f.fds = fds;
+            w.add(f);
+        };
         let tee_reads = if grep {
             let mut g = sleeper(2002, "grep");
             g.ppid = shell;
@@ -6989,17 +7549,56 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
             g.fds.push(tty_fd(2));
             w.add(g);
             pipe_end(0, 0xE4, 0xE3, false, 0x8, 0)
+        } else if reader == "stamp" {
+            let fds = vec![
+                pipe_end(0, 0xE2, 0xE1, false, 0x8, 0),
+                pipe_end(1, 0xE5, 0xE6, true, 0, 0),
+                tty_fd(2),
+                tty_fd(10),
+            ];
+            filter(&mut w, "zsh", fds);
+            pipe_end(0, 0xE6, 0xE5, false, 0x8, 0)
         } else {
             pipe_end(0, 0xE2, 0xE1, false, 0x8, 0)
         };
-        let mut tee = sleeper(2001, "tee");
-        tee.ppid = shell;
-        tee.pgid = 2000;
-        tee.sid = shell;
-        tee.tty = true;
-        tee.fds.push(tee_reads);
-        tee.fds.push(tty_fd(1));
-        w.add(tee);
+        if reader == "bash" || sub {
+            let fds = vec![tee_reads, tty_fd(1), tty_fd(2), tty_fd(255)];
+            filter(&mut w, "bash", fds);
+            if sub {
+                let mut s = sleeper(2005, "bash");
+                s.ppid = shell;
+                s.pgid = 2000;
+                s.sid = shell;
+                s.tty = true;
+                s.fds = vec![tty_fd(1), tty_fd(2), tty_fd(255)];
+                w.add(s);
+                w.p(2000).ppid = 2005;
+                w.p(2003).ppid = 2005;
+            }
+        } else if reader == "batch" {
+            filter(&mut w, "python3", vec![tee_reads, tty_fd(1), tty_fd(2)]);
+            w.p(2003).wchan = Some("do_select".into());
+        } else if reader == "node" {
+            let fds = vec![
+                tee_reads,
+                tty_fd(1),
+                tty_fd(2),
+                tty_fd(11),
+                read_queue(12, &[0]),
+            ];
+            filter(&mut w, "node", fds);
+        } else if tee {
+            let mut tee = sleeper(2001, "tee");
+            tee.ppid = shell;
+            tee.pgid = 2000;
+            tee.sid = shell;
+            tee.tty = true;
+            tee.fds.push(tee_reads);
+            tee.fds.push(tty_fd(1));
+            w.add(tee);
+        } else {
+            w.p(shell).fds.extend([tee_reads, tty_fd(10)]);
+        }
         for (pid, ppid, name, state) in [
             (2010, 2000, "rsync", ProcState::Zombie),
             (2011, 2000, "rsync", ProcState::Sleeping),
@@ -7022,30 +7621,38 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
         assert!(
             v.row("b9")
                 .is_some_and(|r| r.class != Class::Zombie && r.verdict == Verdict::WaitingYou),
-            "grep {grep}: {}",
+            "{reader}: {}",
             wire(&v, "b9")
         );
     }
 
     // `ssh nas pg_dump app | python3 load.py`: ssh asks for a password before it feeds load.py,
-    // which never reaped an `osascript` it ran at its start; also through a `pv`.
-    for pv in [false, true] {
+    // which never reaped an `osascript` it ran at its start; also through a `pv`, or run by a
+    // `dump.sh` that holds the pipe beside it.
+    for (pv, wrapper) in [(false, false), (true, false), (false, true)] {
         let mut w = World::new();
         let shell = w.tab(1).tab.shell_pid;
-        let mut ssh = sleeper(2000, "ssh");
+        let mut ssh = sleeper(if wrapper { 2004 } else { 2000 }, "ssh");
         ssh.fds.push(pipe_end(1, 0xA1, 0xA2, true, 0, 0));
         ssh.fds.push(tcp_fd(3));
         ssh.fds.push(tty_fd(4));
-        w.run_fg(
-            1,
-            9,
-            if pv {
-                "ssh nas pg_dump app | pv | python3 load.py"
-            } else {
-                "ssh nas pg_dump app | python3 load.py"
-            },
-            ssh,
-        );
+        let command = match (pv, wrapper) {
+            (true, _) => "ssh nas pg_dump app | pv | python3 load.py",
+            (_, true) => "./dump.sh | python3 load.py",
+            _ => "ssh nas pg_dump app | python3 load.py",
+        };
+        if wrapper {
+            let mut sh = sleeper(2000, "bash");
+            sh.fds.push(pipe_end(1, 0xA1, 0xA2, true, 0, 0));
+            w.run_fg(1, 9, command, sh);
+            ssh.ppid = 2000;
+            ssh.pgid = 2000;
+            ssh.sid = shell;
+            ssh.tty = true;
+            w.add(ssh);
+        } else {
+            w.run_fg(1, 9, command, ssh);
+        }
         let in_job = |pid: u32, name: &str| {
             let mut p = sleeper(pid, name);
             p.ppid = shell;
@@ -7075,7 +7682,7 @@ fn a_parent_that_reaps_late_waits_all_the_same() {
         assert!(
             v.row("b9")
                 .is_some_and(|r| r.class != Class::Zombie && r.verdict == Verdict::WaitingYou),
-            "pv {pv}: {}",
+            "{command}: {}",
             wire(&v, "b9")
         );
     }

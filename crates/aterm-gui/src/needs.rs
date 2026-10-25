@@ -58,6 +58,20 @@ pub(crate) struct AgentFact {
     pub(crate) subject: Option<String>,
 }
 
+/// The program's own report that it is blocked (OSC 7501 `blocked`, codex's claim), kept apart
+/// from [`AgentFact`]: a claim never moves the agent verdict ([`program_need`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProgramClaimFact {
+    /// What the report says it is blocked on, where it said.
+    pub(crate) kind: Option<aterm_core::terminal::program_state::ProgramBlockedKind>,
+    /// The shown report's episode ([`crate::session_timeline::ShownProgram::seq`]): one box,
+    /// one key.
+    pub(crate) key: u64,
+    /// The engine's sequence where that report began
+    /// ([`crate::session_timeline::ShownProgram::report`]).
+    pub(crate) report: u64,
+}
+
 /// Everything [`of`] reads about one session.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct NeedFacts {
@@ -69,6 +83,11 @@ pub(crate) struct NeedFacts {
     pub(crate) attention: Vec<AttentionFact>,
     /// The agent verdict, `None` for no identified agent.
     pub(crate) agent: Option<AgentFact>,
+    /// A codex whose reader names no state (`agent=unknown`) reports it is blocked: its own claim.
+    pub(crate) program_blocked: Option<ProgramClaimFact>,
+    /// The live claim on the session is a proven self-claim: the program carries itself
+    /// ([`crate::session_timeline::SessionMeta::supervisor_proven`]).
+    pub(crate) self_claimed: bool,
     /// A harness presses this session's boxes.
     pub(crate) supervised: bool,
     /// Another holder's `meta set supervisor` claim is live.
@@ -227,6 +246,9 @@ pub(crate) struct Need {
     pub(crate) what: String,
     /// The harness's own needs you entry, read without aterm's frame.
     pub(crate) harness: Option<HarnessAsk>,
+    /// The engine's sequence of the program's own `blocked` report this need stands on (a
+    /// program-claim need, [`program_need`]); `None` for every need aterm reads itself.
+    pub(crate) report: Option<u64>,
 }
 
 /// A harness's needs you, in the worker's own words ([`Need::harness`]).
@@ -502,7 +524,7 @@ pub(crate) fn of(facts: &NeedFacts) -> Verdict {
     let (wall_need, wall_wait, recheck_unix) = wall.map_or((None, None, None), |(agent, kind)| {
         wall_outcome(facts, agent, kind, supervisor_waits)
     });
-    let boxed = box_need(facts);
+    let boxed = box_need(facts).or_else(|| program_need(facts));
     let ask = ask.filter(|need| need.harness.is_none() || boxed.is_none());
     let candidates = [
         stall_need(facts),
@@ -545,6 +567,7 @@ fn stall_need(facts: &NeedFacts) -> Option<Need> {
         key: stall.key,
         what,
         harness: None,
+        report: None,
     })
 }
 
@@ -591,6 +614,7 @@ fn task_need(facts: &NeedFacts) -> Option<Need> {
         key: task.entered,
         what: fold_clip(&what, REMEDY_TEXT_MAX),
         harness: None,
+        report: None,
     })
 }
 
@@ -607,6 +631,7 @@ fn wall_outcome(
             key: agent.rev,
             what,
             harness: None,
+            report: None,
         })
     };
     let wait = |word: WaitWord| {
@@ -748,6 +773,7 @@ fn attention_outcome(facts: &NeedFacts) -> (Option<Need>, Option<Waiting>, bool)
                     key: ask_key(text),
                     what,
                     harness,
+                    report: None,
                 };
                 if need.harness.is_some() {
                     reported_ask.get_or_insert(need);
@@ -841,6 +867,7 @@ fn box_need(facts: &NeedFacts) -> Option<Need> {
                 key: agent.rev,
                 what: fold_clip(&what, ROW_WHAT_MAX),
                 harness: None,
+                report: None,
             })
         }
         "question" => Some(Need {
@@ -848,9 +875,73 @@ fn box_need(facts: &NeedFacts) -> Option<Need> {
             key: agent.rev,
             what: "question".to_string(),
             harness: None,
+            report: None,
         }),
         _ => None,
     }
+}
+
+/// The words of a program-claim need: the box codex says it waits on, said as its own report.
+pub(crate) const CODEX_APPROVAL_WORDS: &str = "approval (codex's own report)";
+/// [`CODEX_APPROVAL_WORDS`] for a question.
+pub(crate) const CODEX_QUESTION_WORDS: &str = "question (codex's own report)";
+/// [`CODEX_APPROVAL_WORDS`] for a sign-in.
+pub(crate) const CODEX_SIGN_IN_WORDS: &str = "sign-in (codex's own report)";
+
+/// The words for a need another aterm's survey row publishes as the program's own report
+/// (`needs_by=program`): the program-claim need's words for its need word and the row's
+/// `agent=`, the survey's word for the report (`wall:auth` a sign-in); `None` for a need of
+/// another word.
+pub(crate) fn claim_words_of_row(
+    word: aterm_types::needs::NeedWord,
+    agent: Option<&str>,
+) -> Option<&'static str> {
+    use aterm_types::needs::NeedWord;
+    match word {
+        NeedWord::Question => Some(CODEX_QUESTION_WORDS),
+        NeedWord::Approval if agent == Some("wall:auth") => Some(CODEX_SIGN_IN_WORDS),
+        NeedWord::Approval => Some(CODEX_APPROVAL_WORDS),
+        _ => None,
+    }
+}
+
+/// THE PROGRAM-CLAIM NEED: codex says it is blocked (OSC 7501) where its reader names no state
+/// (`agent=unknown`) and no claim speaks for the tab. It is codex's claim, so it never moves
+/// `agent=` and its words say whose report it is; it stands where a Claude Code box would. None
+/// while the tab carries itself (a proven self-claim, which presses and raises its own points),
+/// while another holder's unproven claim stands unheld (`box_need`'s rule for a harness pressing
+/// boxes), and while codex-alab's own attention entry stands (its startup screens raise one with
+/// no claim). A sign-in stays at the approval's severity: a claim raises no stop tone, and
+/// codex's sign-in box is a user check or an app link, never a logged-out wall.
+fn program_need(facts: &NeedFacts) -> Option<Need> {
+    use aterm_core::terminal::program_state::ProgramBlockedKind as K;
+    facts
+        .agent
+        .as_ref()
+        .filter(|agent| agent.word == "unknown")?;
+    let claim = facts.program_blocked?;
+    if facts.self_claimed || (facts.other_supervisor && facts.hold.is_none()) {
+        return None;
+    }
+    if facts
+        .attention
+        .iter()
+        .any(|entry| entry.owner == crate::task_record::SELF_CLAIM_ATTENTION_OWNER)
+    {
+        return None;
+    }
+    let (word, what) = match claim.kind {
+        Some(K::Question) => (NeedWord::Question, CODEX_QUESTION_WORDS),
+        Some(K::Auth) => (NeedWord::Approval, CODEX_SIGN_IN_WORDS),
+        Some(K::Permission) | None => (NeedWord::Approval, CODEX_APPROVAL_WORDS),
+    };
+    Some(Need {
+        word,
+        key: claim.key,
+        what: what.to_string(),
+        harness: None,
+        report: Some(claim.report),
+    })
 }
 
 /// The memory wall's remedy (`wall:memory`, the host not restarting it).

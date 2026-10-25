@@ -4,9 +4,10 @@
 //! Sparkle-words nova emitters (docs/sparkle-words-v2-design.md §6).
 
 use aterm_render::{DecoBlend, DecoGlyph, GlowQuad, WordDecoration, premul_rgb};
-use aterm_scene::{mix_rgb, smoothstep};
+use aterm_scene::smoothstep;
 
 use crate::color_math::{hsv2rgb, rgb2hsv};
+use crate::effect_util::lerp_rgb as mix_rgb;
 use crate::genome::{NovaFeatures, NovaMagic, mix};
 
 /// §6.1 anticipation-dip window (ms): ink dims ~35 %, no quads.
@@ -233,15 +234,17 @@ pub const fn ring_radius(t_ms: u64, r_max: f32, singularity: bool) -> Option<(f3
 
 /// Ring/debris visibility floor: dark palette fringes (ion `#6c8cff`, emerald `#7cd83c`, …) under-read as additive light on dark glass, so lift the fringe's relative luminance to ≥ 0.42 by stepping toward the palette's own core (never white, keeping the pair's identity).
 #[inline]
-pub fn vivid_fringe(core: u32, fringe: u32) -> u32 {
+pub const fn vivid_fringe(core: u32, fringe: u32) -> u32 {
     const FLOOR: f32 = 0.42;
     let table = crate::color_math::relative_luminance_table();
     let mut c = fringe;
-    for k in 1..=8u32 {
+    let mut k = 1u32;
+    while k <= 8 {
         if crate::color_math::relative_luminance_with(table, c) >= FLOOR {
             return c;
         }
         c = mix_rgb(fringe, core, k as f32 / 8.0);
+        k += 1;
     }
     c
 }
@@ -350,6 +353,38 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
     }
 }
 
+const RAY_DIRS: [[[(f32, f32); 8]; 16]; 4] = {
+    let mut table = [[[(0.0f32, 0.0f32); 8]; 16]; 4];
+    let mut r_idx = 0usize;
+    while r_idx < 4 {
+        let nrays = r_idx + 5;
+        let nrays_f = nrays as f32;
+        let mut rot = 0usize;
+        while rot < 16 {
+            let rot_turn = rot as f32 / 16.0;
+            let mut k = 0usize;
+            while k < nrays {
+                let ang = core::f32::consts::TAU * (rot_turn + k as f32 / nrays_f);
+                table[r_idx][rot][k] = crate::supernova::sin_cos_f32(ang);
+                k += 1;
+            }
+            rot += 1;
+        }
+        r_idx += 1;
+    }
+    table
+};
+
+#[inline]
+const fn ray_dir(nrays: usize, rot: u8, k: usize) -> Option<(f32, f32)> {
+    let rot_idx = rot as usize;
+    if nrays >= 5 && nrays <= 8 && rot_idx < 16 && k < 8 {
+        Some(RAY_DIRS[nrays - 5][rot_idx][k])
+    } else {
+        None
+    }
+}
+
 fn emit_rays(
     sink: &mut QuadSink<'_>,
     env: &NovaEnv,
@@ -379,17 +414,15 @@ fn emit_rays(
     let nrays_f = nrays as f32;
     let mut emitted_samples = 0usize;
     for k in 0..nrays {
-        let ang = if quasar {
+        let (dy, dx) = if quasar {
             // Twin vertical polar jets.
-            if k == 0 {
-                -std::f32::consts::FRAC_PI_2
-            } else {
-                std::f32::consts::FRAC_PI_2
-            }
+            if k == 0 { (-1.0, 0.0) } else { (1.0, 0.0) }
+        } else if let Some(dir) = ray_dir(nrays, env.feats.rot, k) {
+            dir
         } else {
-            std::f32::consts::TAU * (rot_turn + k as f32 / nrays_f)
+            let ang = std::f32::consts::TAU * (rot_turn + k as f32 / nrays_f);
+            ang.sin_cos()
         };
-        let (dy, dx) = ang.sin_cos();
         let major_x = dx.abs() >= dy.abs();
         let maj = dx.abs().max(dy.abs());
         let lm = len * maj;
@@ -659,7 +692,7 @@ pub const fn pulse_env(t_ms: u64, cross_ms: u64) -> Option<f32> {
 }
 
 /// Constant-luminance pairing by construction: take `target`'s hue and saturation, then bisect value (and, where the hue cannot reach a bright anchor at full value, saturation toward white) until the WCAG relative luminance matches `anchor`'s.
-pub fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
+pub const fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let want = crate::color_math::relative_luminance_with(table, anchor);
     let (h, s, _) = rgb2hsv(target);
@@ -667,7 +700,8 @@ pub fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
     if crate::color_math::relative_luminance_with(table, full_v) >= want {
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
         let (mut lo_rgb, mut hi_rgb) = (0x0000_0000, full_v);
-        for i in 0..20 {
+        let mut i = 0;
+        while i < 20 {
             let mid = 0.5 * (lo + hi);
             let mid_rgb = hsv2rgb(h, s, mid);
             if mid_rgb == lo_rgb {
@@ -684,12 +718,14 @@ pub fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
             if i >= 1 && lo_rgb == hi_rgb {
                 return lo_rgb;
             }
+            i += 1;
         }
         return hsv2rgb(h, s, 0.5 * (lo + hi));
     }
     let (mut lo, mut hi) = (0.0f32, s);
     let (mut lo_rgb, mut hi_rgb) = (0x00FF_FFFF, full_v);
-    for i in 0..20 {
+    let mut i = 0;
+    while i < 20 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = hsv2rgb(h, mid, 1.0);
         if mid_rgb == lo_rgb {
@@ -706,13 +742,14 @@ pub fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
         if i >= 1 && lo_rgb == hi_rgb {
             return lo_rgb;
         }
+        i += 1;
     }
     hsv2rgb(h, 0.5 * (lo + hi), 1.0)
 }
 
 /// The applied pulse colour: the anchor's hue/saturation shifted toward `fringe` at amplitude `amp` (≤ [`PULSE_AMP`]), then luminance-matched back to the anchor, so |ΔL| ≤ 5% by construction.
 #[inline]
-pub fn pulse_color(anchor: u32, fringe: u32, amp: f32) -> u32 {
+pub const fn pulse_color(anchor: u32, fringe: u32, amp: f32) -> u32 {
     constant_lum_toward(anchor, mix_rgb(anchor, fringe, amp.clamp(0.0, PULSE_AMP)))
 }
 

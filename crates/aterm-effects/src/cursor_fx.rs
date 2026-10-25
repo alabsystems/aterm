@@ -362,22 +362,34 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
     if ink == aterm_core::render::COLOR_UNSET || ground == aterm_core::render::COLOR_UNSET {
         return 1.0;
     }
-    let rgb = |c: u32| c & 0x00FF_FFFF;
-    let (color, ground, ink) = (rgb(color), rgb(ground), rgb(ink));
+    let color = color & 0x00FF_FFFF;
+    let ground = ground & 0x00FF_FFFF;
+    let ink = ink & 0x00FF_FFFF;
     let table = crate::color_math::relative_luminance_table();
     let lum_ink = crate::color_math::relative_luminance_with(table, ink);
-    let contrast_ink = |bg: u32| {
+    #[inline]
+    const fn contrast_ink(
+        table: &crate::color_math::RelativeLuminanceTable,
+        lum_ink: f32,
+        bg: u32,
+    ) -> f32 {
         let lb = crate::color_math::relative_luminance_with(table, bg);
         (lum_ink.max(lb) + 0.05) / (lum_ink.min(lb) + 0.05)
-    };
-    let target = BED_INK_FLOOR.min(contrast_ink(ground));
-    let holds_bg = |bg: u32| {
+    }
+    let target = BED_INK_FLOOR.min(contrast_ink(table, lum_ink, ground));
+    #[inline]
+    const fn holds_bg(
+        table: &crate::color_math::RelativeLuminanceTable,
+        lum_ink: f32,
+        target: f32,
+        bg: u32,
+    ) -> bool {
         let lb = crate::color_math::relative_luminance_with(table, bg);
         lum_ink.max(lb) + 0.05 >= target * (lum_ink.min(lb) + 0.05)
-    };
+    }
     let peak = crate::cursor_trail::BED_PEAK_ALPHA;
     let peak_bg = aterm_render::blend_rgb(ground, color, peak);
-    if holds_bg(peak_bg) {
+    if holds_bg(table, lum_ink, target, peak_bg) {
         return 1.0;
     }
     let (mut lo, mut hi) = (0u8, peak);
@@ -390,7 +402,7 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
         } else if lo > 0 && mid_bg == lo_bg {
             true
         } else {
-            holds_bg(mid_bg)
+            holds_bg(table, lum_ink, target, mid_bg)
         };
         if ok {
             lo = mid;
@@ -400,28 +412,30 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
             hi_bg = mid_bg;
         }
     }
-    ((f32::from(lo) - 0.5).max(0.0) / f32::from(peak)).clamp(0.0, 1.0)
+    ((lo as f32 - 0.5).max(0.0) / peak as f32).clamp(0.0, 1.0)
 }
 
 /// Floor an effect-owned caret fill against the page `ground` ([`caret_page_floor`]), by lightness
 /// alone ([`crate::color_math::floor_contrast_keeping_hue`]).
 #[inline]
 #[must_use]
-pub fn floor_block_fill(
+pub const fn floor_block_fill(
     candidate: BlockFill,
     ground: u32,
     live_cursor: u32,
     pinned_cursor: Option<u32>,
 ) -> BlockFill {
-    let rgb = |c: u32| c & 0x00FF_FFFF;
-    if pinned_cursor.is_some_and(|pinned| candidate.base.map(rgb) == Some(rgb(pinned))) {
+    if let (Some(pinned), Some(base)) = (pinned_cursor, candidate.base)
+        && (base & 0x00FF_FFFF) == (pinned & 0x00FF_FFFF)
+    {
         return candidate;
     }
-    let ground = rgb(ground);
+    let ground = ground & 0x00FF_FFFF;
     let min = match candidate.owner {
-        BlockFillOwner::Momentum => {
-            CARET_PAGE_MIN_CONTRAST.min(crate::color_math::contrast_ratio(rgb(live_cursor), ground))
-        }
+        BlockFillOwner::Momentum => CARET_PAGE_MIN_CONTRAST.min(crate::color_math::contrast_ratio(
+            live_cursor & 0x00FF_FFFF,
+            ground,
+        )),
         owner => caret_page_floor(owner),
     };
     BlockFill {
@@ -443,7 +457,7 @@ pub const fn caret_page_floor(owner: BlockFillOwner) -> f32 {
 
 #[inline]
 #[must_use]
-fn bolt_body(color: u32, blaze: f32, dark: bool) -> u32 {
+const fn bolt_body(color: u32, blaze: f32, dark: bool) -> u32 {
     const fn mix(color: u32, sh: u32, k: f32) -> u32 {
         let c = ((color >> sh) & 0xff) as f32;
         (c + (255.0 - c) * k).min(255.0) as u32
@@ -472,14 +486,13 @@ pub fn project_block_fill(
     if envelope <= 0.0 {
         return None;
     }
-    candidate.map(|mut owned| {
-        owned.fill = aterm_render::blend_rgb(
-            terminal_cursor_color,
-            owned.fill,
-            (envelope * f32::from(u8::MAX)).round() as u8,
-        );
-        owned
-    })
+    let mut owned = candidate?;
+    owned.fill = aterm_render::blend_rgb(
+        terminal_cursor_color,
+        owned.fill,
+        (envelope * f32::from(u8::MAX)).round() as u8,
+    );
+    Some(owned)
 }
 
 /// What a host resolved from a trail-style spelling.

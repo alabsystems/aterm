@@ -658,7 +658,7 @@ pub struct ChromeIcon {
     pub icon: BandIcon,
 }
 
-/// The band's icon set: one drawn icon for every status glyph a message row can carry, so the glyph cell reads as one family whatever font holds `⚠` or `ℹ`. The glass's marks ([`Self::glass_mark`]) and the top deck's pictograms ([`Self::is_pictogram`]) are drawn in the same family.
+/// The band's icon set: one drawn icon for every status glyph a message row can carry, so the glyph cell reads as one family whatever font holds `⚠` or `ℹ`. The glass's marks ([`Self::glass_mark`]) and the need pictograms ([`Self::is_pictogram`]) are drawn in the same family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BandIcon {
     /// `ℹ` — an `i` cut out of a disc.
@@ -708,11 +708,11 @@ pub enum BandIcon {
     House,
     /// `◆` — a diamond filled to the ring's box: the model a fact menu shows.
     Diamond,
-    /// A padlock, the top deck's pictogram ([`Self::is_pictogram`]) for a tab that waits for you: a password, an approval, an answer.
+    /// A padlock, the need pictogram ([`Self::is_pictogram`]) for a tab that waits for you: a password, an approval, an answer.
     Lock,
-    /// An hourglass, its sand run down, the top deck's pictogram for the front tab's stuck job.
+    /// An hourglass, its sand run down, the need pictogram for a stuck job.
     Hourglass,
-    /// A drive, drawn as a drum, the top deck's pictogram for a volume that fills within the hour.
+    /// A drive, drawn as a drum, the need pictogram for a volume that fills within the hour.
     Drive,
 }
 
@@ -773,7 +773,7 @@ impl BandIcon {
         Self::glass_mark(self.ch()).is_some()
     }
 
-    /// Whether this icon is one of the top deck's pictograms (a need's kind: [`Self::Lock`], [`Self::Hourglass`], [`Self::Drive`]): drawn only where a painter names it (`DrawPrim::BandIcon`, a raster's [`ChromeIcon`]) and never for a character, so neither [`Self::for_char`] nor [`Self::glass_mark`] gives it. Its [`Self::ch`] is the stand-in a text grid keeps under it. Like a band's badge it spills into blank neighbours.
+    /// Whether this icon is one of the need pictograms (a need's kind: [`Self::Lock`], [`Self::Hourglass`], [`Self::Drive`]): drawn only where a painter names it (`DrawPrim::BandIcon`, a raster's [`ChromeIcon`]) and never for a character, so neither [`Self::for_char`] nor [`Self::glass_mark`] gives it. Its [`Self::ch`] is the stand-in a text grid keeps under it. Like a band's badge it spills into blank neighbours.
     #[must_use]
     #[inline]
     pub const fn is_pictogram(self) -> bool {
@@ -4527,7 +4527,7 @@ mod band_icon_tests {
         assert_eq!(BandIcon::from_index(u32::MAX), None);
     }
 
-    /// Each icon is exactly one of a band glyph's ([`BandIcon::for_char`]), a glass mark ([`BandIcon::glass_mark`]) or a deck pictogram, which no character maps to; a pictogram's stand-in takes one cell on a grid, as every other icon's character does.
+    /// Each icon is exactly one of a band glyph's ([`BandIcon::for_char`]), a glass mark ([`BandIcon::glass_mark`]) or a need pictogram, which no character maps to; a pictogram's stand-in takes one cell on a grid, as every other icon's character does.
     #[test]
     fn each_icon_is_a_glyph_a_mark_or_a_pictogram() {
         for icon in BandIcon::ALL {

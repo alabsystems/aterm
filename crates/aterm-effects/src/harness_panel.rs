@@ -130,56 +130,140 @@ pub enum PanelMark {
     Pointer,
 }
 
+#[inline]
+const fn hypot_f32(a: f32, b: f32) -> f32 {
+    let x = (a as f64) * (a as f64) + (b as f64) * (b as f64);
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let mut y = f64::from_bits((x.to_bits() >> 1) + (1023_u64 << 51));
+    let mut i = 0;
+    while i < 6 {
+        y = 0.5 * (y + x / y);
+        i += 1;
+    }
+    y as f32
+}
+
+#[inline]
+const fn atan_unit_f64(t: f64) -> f64 {
+    const TAN_PI_12: f64 = 0.267_949_192_431_122_7;
+    const SQRT_3: f64 = 1.732_050_807_568_877_2;
+    let (u, base) = if t > TAN_PI_12 {
+        (
+            (SQRT_3 * t - 1.0) / (SQRT_3 + t),
+            core::f64::consts::FRAC_PI_6,
+        )
+    } else {
+        (t, 0.0)
+    };
+    let u2 = u * u;
+    let mut term = u;
+    let mut sum = u;
+    let mut k = 1;
+    while k <= 11 {
+        term *= -u2;
+        sum += term / (2 * k + 1) as f64;
+        k += 1;
+    }
+    base + sum
+}
+
+#[inline]
+const fn atan2_f32(y: f32, x: f32) -> f32 {
+    let (yf, xf) = (y as f64, x as f64);
+    let (ay, ax) = (yf.abs(), xf.abs());
+    if ax == 0.0 && ay == 0.0 {
+        return 0.0;
+    }
+    let a = if ax >= ay {
+        atan_unit_f64(ay / ax)
+    } else {
+        core::f64::consts::FRAC_PI_2 - atan_unit_f64(ax / ay)
+    };
+    let rad = if xf < 0.0 {
+        if yf < 0.0 {
+            a - core::f64::consts::PI
+        } else {
+            core::f64::consts::PI - a
+        }
+    } else if yf < 0.0 {
+        -a
+    } else {
+        a
+    };
+    rad as f32
+}
+
+#[inline]
+const fn rem_euclid_360(x: f32) -> f32 {
+    let r = x % 360.0;
+    if r < 0.0 {
+        let s = r + 360.0;
+        if s == 360.0 { 0.0 } else { s }
+    } else {
+        r
+    }
+}
+
 /// OKLCh chroma and hue (degrees, `0..360`) of a `0x00RRGGBB` colour.
 #[must_use]
 #[inline]
-pub fn chroma_hue(rgb: u32) -> (f32, f32) {
+pub const fn chroma_hue(rgb: u32) -> (f32, f32) {
     let [_, a, b] = oklab(rgb);
-    (a.hypot(b), b.atan2(a).to_degrees().rem_euclid(360.0))
+    (
+        hypot_f32(a, b),
+        rem_euclid_360(atan2_f32(b, a).to_degrees()),
+    )
 }
 
 /// The angle between two hues, `0..=180` degrees.
 #[inline]
-fn hue_gap(a: f32, b: f32) -> f32 {
-    let d = (a - b).rem_euclid(360.0);
+const fn hue_gap(a: f32, b: f32) -> f32 {
+    let d = rem_euclid_360(a - b);
     d.min(360.0 - d)
 }
+
+const STATUS_HUES: [[f32; 2]; 2] = [
+    [
+        chroma_hue(CLAUDE_SUCCESS[0]).1,
+        chroma_hue(CLAUDE_ERROR[0]).1,
+    ],
+    [
+        chroma_hue(CLAUDE_SUCCESS[1]).1,
+        chroma_hue(CLAUDE_ERROR[1]).1,
+    ],
+];
 
 /// OKLCh hue distance (degrees) from [`CLAUDE_SUCCESS`] and [`CLAUDE_ERROR`].
 #[must_use]
 #[inline]
-pub fn status_gap(ink: u32, dark: bool) -> Option<f32> {
-    static STATUS_HUES: std::sync::OnceLock<[[f32; 2]; 2]> = std::sync::OnceLock::new();
+pub const fn status_gap(ink: u32, dark: bool) -> Option<f32> {
     let (c, h) = chroma_hue(ink);
     if c < HUE_CHROMA_GATE {
         return None;
     }
-    let [hs, he] = STATUS_HUES.get_or_init(|| {
-        [
-            [
-                chroma_hue(CLAUDE_SUCCESS[0]).1,
-                chroma_hue(CLAUDE_ERROR[0]).1,
-            ],
-            [
-                chroma_hue(CLAUDE_SUCCESS[1]).1,
-                chroma_hue(CLAUDE_ERROR[1]).1,
-            ],
-        ]
-    })[usize::from(!dark)];
+    let [hs, he] = STATUS_HUES[!dark as usize];
     Some(hue_gap(h, hs).min(hue_gap(h, he)))
 }
 
 type DotStripes = ([usize; STRIPES], usize);
 
-fn compute_dot_stripes(palette: CardPalette, dark: bool) -> DotStripes {
+const fn compute_dot_stripes(palette: CardPalette, dark: bool) -> DotStripes {
     let mut out = [0; STRIPES];
     let mut n = 0;
-    for k in 0..STRIPES {
+    let mut k = 0;
+    while k < STRIPES {
         let art = palette.art(palette.stripe_t(k), dark);
-        if status_gap(art, dark).is_none_or(|g| g >= STATUS_HUE_GUARD_DEG + STATUS_HUE_DRIFT_DEG) {
+        let ok = match status_gap(art, dark) {
+            None => true,
+            Some(g) => g >= STATUS_HUE_GUARD_DEG + STATUS_HUE_DRIFT_DEG,
+        };
+        if ok {
             out[n] = k;
             n += 1;
         }
+        k += 1;
     }
     if n == 0 {
         return ([0, 1, 2, 3, 4, 5], STRIPES);
@@ -187,27 +271,37 @@ fn compute_dot_stripes(palette: CardPalette, dark: bool) -> DotStripes {
     (out, n)
 }
 
+const DOT_STRIPES: [[DotStripes; 2]; 3] = [
+    [
+        compute_dot_stripes(CardPalette::Cruise, true),
+        compute_dot_stripes(CardPalette::Cruise, false),
+    ],
+    [
+        compute_dot_stripes(CardPalette::Land, true),
+        compute_dot_stripes(CardPalette::Land, false),
+    ],
+    [
+        compute_dot_stripes(CardPalette::Off, true),
+        compute_dot_stripes(CardPalette::Off, false),
+    ],
+];
+
 /// Palette stripe indices safe for dots on a dark or light ground.
 #[must_use]
 #[inline]
-pub fn dot_stripes(palette: CardPalette, dark: bool) -> DotStripes {
-    static DOT_STRIPES: std::sync::OnceLock<[[DotStripes; 2]; 3]> = std::sync::OnceLock::new();
-    let table = DOT_STRIPES.get_or_init(|| {
-        [CardPalette::Cruise, CardPalette::Land, CardPalette::Off]
-            .map(|p| [true, false].map(|d| compute_dot_stripes(p, d)))
-    });
+pub const fn dot_stripes(palette: CardPalette, dark: bool) -> DotStripes {
     let p_idx = match palette {
         CardPalette::Cruise => 0,
         CardPalette::Land => 1,
         CardPalette::Off => 2,
     };
-    table[p_idx][usize::from(!dark)]
+    DOT_STRIPES[p_idx][!dark as usize]
 }
 
 /// Palette position for panel row `k` on a dark or light ground.
 #[must_use]
 #[inline]
-pub fn row_hue(palette: CardPalette, k: usize, dark: bool) -> f32 {
+pub const fn row_hue(palette: CardPalette, k: usize, dark: bool) -> f32 {
     if k == 0 {
         return palette.stripe_t(0);
     }
@@ -218,7 +312,7 @@ pub fn row_hue(palette: CardPalette, k: usize, dark: bool) -> f32 {
 /// Palette position for letter `j` of a `len`-letter name on a row at `row_t`.
 #[must_use]
 #[inline]
-pub fn name_x(row_t: f32, j: usize, len: usize) -> f32 {
+pub const fn name_x(row_t: f32, j: usize, len: usize) -> f32 {
     let along = if len > 1 {
         j as f32 / (len - 1) as f32
     } else {
@@ -247,20 +341,14 @@ pub fn crest(d_cells: f32, ms: u64) -> f32 {
 
 /// A linear-light channel back to a byte.
 #[inline]
-fn srgb(l: f32) -> u32 {
-    let l = l.clamp(0.0, 1.0);
-    let n = if l <= 0.003_130_8 {
-        12.92 * l
-    } else {
-        1.055 * l.powf(1.0 / 2.4) - 0.055
-    };
-    (n * 255.0).round().clamp(0.0, 255.0) as u32
+const fn srgb(l: f32) -> u32 {
+    crate::color_math::srgb_encode(l) as u32
 }
 
 /// Returns `ink`'s hue at `target`'s WCAG luminance ([`at_luminance`]).
 #[must_use]
 #[inline]
-pub fn match_luminance(ink: u32, target: u32) -> u32 {
+pub const fn match_luminance(ink: u32, target: u32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let lc = crate::color_math::relative_luminance_with(table, ink);
     if lc <= 1e-6 {
@@ -277,14 +365,14 @@ pub fn match_luminance(ink: u32, target: u32) -> u32 {
 /// Returns `ink`'s hue scaled or lifted to WCAG luminance `lt` in linear light.
 #[must_use]
 #[inline]
-pub fn at_luminance(ink: u32, lt: f32) -> u32 {
+pub const fn at_luminance(ink: u32, lt: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let lc = crate::color_math::relative_luminance_with(table, ink);
     at_luminance_with(table, ink, lc, lt)
 }
 
 #[inline]
-fn at_luminance_with(
+const fn at_luminance_with(
     table: &crate::color_math::RelativeLuminanceTable,
     ink: u32,
     lc: f32,
@@ -302,7 +390,7 @@ fn at_luminance_with(
 }
 
 #[inline]
-fn at_luminance_linear(r: f32, g: f32, b: f32, lc: f32, lt: f32) -> u32 {
+const fn at_luminance_linear(r: f32, g: f32, b: f32, lc: f32, lt: f32) -> u32 {
     let lt = lt.clamp(0.0, 1.0);
     if lc <= 1e-6 {
         let g = srgb(lt);
@@ -313,15 +401,17 @@ fn at_luminance_linear(r: f32, g: f32, b: f32, lc: f32, lt: f32) -> u32 {
         (srgb(r * s) << 16) | (srgb(g * s) << 8) | srgb(b * s)
     } else {
         let k = (lt - lc) / (1.0 - lc).max(1e-6);
-        let lift = |c: f32| srgb(c + (1.0 - c) * k);
-        (lift(r) << 16) | (lift(g) << 8) | lift(b)
+        let lr = srgb(r + (1.0 - r) * k);
+        let lg = srgb(g + (1.0 - g) * k);
+        let lb = srgb(b + (1.0 - b) * k);
+        (lr << 16) | (lg << 8) | lb
     }
 }
 
 /// Scales `ink`'s OKLab chroma by `keep` (`0..=1`) while holding lightness and hue.
 #[must_use]
 #[inline]
-pub fn fade_chroma(ink: u32, keep: f32) -> u32 {
+pub const fn fade_chroma(ink: u32, keep: f32) -> u32 {
     let keep = if keep.is_finite() {
         keep.clamp(0.0, 1.0)
     } else {
@@ -337,7 +427,7 @@ pub fn fade_chroma(ink: u32, keep: f32) -> u32 {
 /// Returns `ink` at WCAG luminance `lt` while preserving its OKLab hue.
 #[must_use]
 #[inline]
-pub fn at_luminance_hue(ink: u32, lt: f32) -> u32 {
+pub const fn at_luminance_hue(ink: u32, lt: f32) -> u32 {
     let lt = lt.clamp(0.0, 1.0);
     let table = crate::color_math::relative_luminance_table();
     let lc = crate::color_math::relative_luminance_with(table, ink);
@@ -345,12 +435,13 @@ pub fn at_luminance_hue(ink: u32, lt: f32) -> u32 {
         return at_luminance_with(table, ink, lc, lt);
     }
     let [l0, a0, b0] = oklab(ink);
-    let at = |t: f32| oklab_to_rgb([l0 + (1.0 - l0) * t, a0 * (1.0 - t), b0 * (1.0 - t)]);
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (ink & 0x00FF_FFFF, 0x00FF_FFFF);
-    for _ in 0..12 {
+    let mut step = 0;
+    while step < 12 {
+        step += 1;
         let mid = (lo + hi) * 0.5;
-        let mid_rgb = at(mid);
+        let mid_rgb = oklab_to_rgb([l0 + (1.0 - l0) * mid, a0 * (1.0 - mid), b0 * (1.0 - mid)]);
         if mid_rgb == lo_rgb {
             lo = mid;
             continue;
@@ -380,7 +471,7 @@ pub fn at_luminance_hue(ink: u32, lt: f32) -> u32 {
 /// source-over: the ring lies inside the tint's plateau, never under more of
 /// it).
 #[inline]
-fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
+const fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let g = over_rgb(ground, fresh, veil) & 0x00FF_FFFF;
     let lg = crate::color_math::relative_luminance_with(table, g);
@@ -388,22 +479,30 @@ fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
     let r_lin = table.linear[((fresh >> 16) & 0xff) as usize];
     let g_lin = table.linear[((fresh >> 8) & 0xff) as usize];
     let b_lin = table.linear[(fresh & 0xff) as usize];
-    let ring = |l: f32| at_luminance_linear(r_lin, g_lin, b_lin, lc, l);
-    let holds_rgb = |ring_rgb: u32| {
+    #[inline]
+    const fn holds_rgb(
+        table: &crate::color_math::RelativeLuminanceTable,
+        fresh: u32,
+        veil: u8,
+        lg: f32,
+        ring_rgb: u32,
+    ) -> bool {
         let r = over_rgb(ring_rgb, fresh, veil) & 0x00FF_FFFF;
         let lr = crate::color_math::relative_luminance_with(table, r);
         (lr.max(lg) + 0.05) / (lr.min(lg) + 0.05) >= PRINT_RING_CONTRAST
-    };
+    }
     let top = top.min(lc).max(0.0);
-    let top_rgb = ring(top);
-    if holds_rgb(top_rgb) {
+    let top_rgb = at_luminance_linear(r_lin, g_lin, b_lin, lc, top);
+    if holds_rgb(table, fresh, veil, lg, top_rgb) {
         return top_rgb;
     }
     let (mut lo, mut hi) = (0.0f32, top);
-    let (mut lo_rgb, mut hi_rgb) = (ring(0.0), top_rgb);
-    for _ in 0..12 {
+    let (mut lo_rgb, mut hi_rgb) = (at_luminance_linear(r_lin, g_lin, b_lin, lc, 0.0), top_rgb);
+    let mut step = 0;
+    while step < 12 {
+        step += 1;
         let mid = (lo + hi) * 0.5;
-        let mid_rgb = ring(mid);
+        let mid_rgb = at_luminance_linear(r_lin, g_lin, b_lin, lc, mid);
         if mid_rgb == lo_rgb {
             lo = mid;
             continue;
@@ -412,7 +511,7 @@ fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
             hi = mid;
             continue;
         }
-        if holds_rgb(mid_rgb) {
+        if holds_rgb(table, fresh, veil, lg, mid_rgb) {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -435,7 +534,7 @@ const fn alpha_byte(share: f32) -> u8 {
 /// Computes the ink colour for a panel cell of kind `mark` at palette position `x`.
 #[must_use]
 #[inline]
-pub fn panel_ink(
+pub const fn panel_ink(
     palette: CardPalette,
     mark: PanelMark,
     x: f32,
@@ -518,7 +617,7 @@ pub fn breath(ms: Option<u64>) -> f32 {
 #[must_use]
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn dot_look(
+pub const fn dot_look(
     mood: DotMood,
     level: f32,
     sat: f32,
@@ -560,33 +659,38 @@ pub fn dot_look(
         1.0
     };
     let breath = breath.clamp(BREATH_FLOOR, 1.0);
-    let strength_at = |level: f32| {
+    #[inline]
+    const fn strength_at(dark: bool, level: f32) -> f32 {
         if dark {
             HALO_PEAK_MIN + HALO_PEAK_GAIN * level
         } else {
             TINT_ALPHA_MIN + TINT_ALPHA_GAIN * level
         }
-    };
-    let fill_at = |level: f32| {
+    }
+    #[inline]
+    const fn fill_at(dark: bool, level: f32) -> f32 {
         if dark {
             0.0
         } else {
             FILL_ALPHA_MIN + FILL_ALPHA_GAIN * level
         }
-    };
-    let radius_at = |level: f32| (DOT_RADIUS_MIN + DOT_RADIUS_GAIN * level).min(DOT_RADIUS_MAX);
+    }
+    #[inline]
+    const fn radius_at(level: f32) -> f32 {
+        (DOT_RADIUS_MIN + DOT_RADIUS_GAIN * level).min(DOT_RADIUS_MAX)
+    }
     let hue = palette.art(row_hue(palette, k, dark), dark);
     let (ink, light) = match mood {
         DotMood::Running | DotMood::Quiet | DotMood::Tool => {
-            let quiet = mood == DotMood::Quiet;
-            let tool = mood == DotMood::Tool;
+            let quiet = matches!(mood, DotMood::Quiet);
+            let tool = matches!(mood, DotMood::Tool);
             let fresh = fade_chroma(hue, if quiet { QUIET_KEEP * sat } else { 1.0 });
             let fade = match mood {
                 DotMood::Quiet => sat,
                 DotMood::Tool => TOOL_GLOW,
                 _ => 1.0,
             };
-            let strength = strength_at(level) * fade;
+            let strength = strength_at(dark, level) * fade;
             let radius = if tool { TOOL_RADIUS } else { radius_at(level) };
             let ink = if dark {
                 at_luminance_hue(fresh, DOT_LUMA_MIN + DOT_LUMA_GAIN * level)
@@ -600,7 +704,7 @@ pub fn dot_look(
                     color: fresh,
                     radius,
                     strength,
-                    fill: fill_at(level) * fade,
+                    fill: fill_at(dark, level) * fade,
                 },
             )
         }
@@ -619,7 +723,7 @@ pub fn dot_look(
                 DotLight {
                     color: fresh,
                     radius: STUCK_RADIUS,
-                    strength: strength_at(0.0) * breath,
+                    strength: strength_at(dark, 0.0) * breath,
                     fill: 0.0,
                 },
             )
@@ -628,7 +732,7 @@ pub fn dot_look(
     };
     DotLook {
         ink: Some(ink),
-        light: (!serious).then_some(light),
+        light: if !serious { Some(light) } else { None },
     }
 }
 

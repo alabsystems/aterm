@@ -230,6 +230,7 @@ struct SeenPane {
     leaf_index: usize,
     session: u64,
     lights: LightsRead,
+    switch: Option<crate::autopilot::HarnessSwitch>,
 }
 
 /// Cached harness-lights reading (`None` if the reader panicked, `Some(reading)` otherwise).
@@ -1288,6 +1289,8 @@ struct PaneFooter {
     /// Whether `shown` names a Claude Code build that takes the top-effort key's toggle
     /// ([`Self::key_typed`]).
     typed: Option<(u64, bool)>,
+    /// The active goal the top line shows ([`Self::note_goal`]), and its [`goal_term`].
+    goal: Option<(Box<str>, u64)>,
 }
 
 /// A footer rule as [`PaneFooter::compose`] composed it, and what it was composed from.
@@ -1418,6 +1421,14 @@ impl PaneFooter {
             .then_some(self.fp)
     }
 
+    /// Take in the active goal the timeline holds for the pane's agent
+    /// ([`crate::session_timeline::SessionTimeline::goal`]).
+    fn note_goal(&mut self, goal: Option<&str>) {
+        if self.goal.as_ref().map(|(text, _)| &**text) != goal {
+            self.goal = goal.map(|text| (Box::from(text), goal_term(Some(text))));
+        }
+    }
+
     /// Take in the live upgrade's note the timeline holds for the pane.
     fn note_upgrade(&mut self, note: Option<&footer::UpgradeNote>) {
         if self.note.as_ref() != note {
@@ -1489,13 +1500,16 @@ impl PaneFooter {
 
     /// The composer's top line composed from `key` ([`compose_top`], [`mark_layer`]).
     fn compose_top(&mut self, key: TopKey, marks: &mut MarkContents) -> &ComposedTop {
-        if self.top.key != Some(key) {
+        let goal = self.goal.as_ref().map_or(0, |(_, term)| *term);
+        if self.top.key != Some(key) || self.top.goal != goal {
             let version = (key.title_gen != 0)
                 .then_some(self.shown.version.as_deref())
                 .flatten();
-            compose_top(&key, &mut self.top, version);
+            let text = self.goal.as_ref().map(|(text, _)| &**text);
+            compose_top(&key, &mut self.top, version, text);
             self.top.mark = mark_layer(&key, &self.top, self.session, marks);
             self.top.key = Some(key);
+            self.top.goal = goal;
         }
         &self.top
     }
@@ -3044,6 +3058,7 @@ fn resolve_facts_at_with_cwd(
             }
             let files = u32::try_from(identity.pid).ok().and_then(asks.files);
             let mut resume = None;
+            let mut goal = None;
             if prog == aterm_phase::Program::Muse
                 && let (Some(args), Some(home)) = (args.as_ref(), home.as_deref())
             {
@@ -3069,6 +3084,14 @@ fn resolve_facts_at_with_cwd(
                     &args.env,
                     home,
                     files.as_deref(),
+                );
+                goal = aterm_agent::harness::profile::muse_goal_for(
+                    muse_pid,
+                    &args.argv,
+                    &args.env,
+                    home,
+                    files.as_deref(),
+                    fold.store_goal(),
                 );
             }
             if prog == aterm_phase::Program::Agy
@@ -3122,6 +3145,7 @@ fn resolve_facts_at_with_cwd(
                 subscription: Some(sub),
                 plan: None,
                 context: prev_ctx,
+                goal,
             });
         }
     }
@@ -3629,6 +3653,8 @@ pub(crate) fn fingerprint(
         subscription,
         plan: _,
         context,
+        // The leaf's own goal term carries it, for every program ([`goal_term`]).
+        goal: _,
     } = facts;
     let version = version
         .as_deref()
@@ -4459,6 +4485,7 @@ impl App {
             });
             let gate = timeline.card_gate().map_or(0, |gate| gate.key());
             let drawer = !shows && timeline.card_drawer_current();
+            let goal = goal_term(timeline.goal());
             drop(timeline);
             let agent = crate::harness_host::admitted_as(&entry.ctx, agent, group);
             let harness = if shows {
@@ -4502,7 +4529,8 @@ impl App {
                 ^ note.rotate_left(17)
                 ^ harness.rotate_left(29)
                 ^ key.rotate_left(41)
-                ^ top.rotate_left(31);
+                ^ top.rotate_left(31)
+                ^ goal.rotate_left(19);
         }
         if claude {
             fp ^= u64::from(usage).rotate_left(47);
@@ -4646,17 +4674,25 @@ impl App {
             TopLine::Slab => run.rule,
         };
         let mark_fg = legible_on(mark_fg, ground.bg);
-        let mark_hover = ws.claude_lights.mark_hovered(session);
+        let hide_lockup = bare_while_off(Some(program), switch.map(|s| s.face));
+        let mark_hover = !hide_lockup && ws.claude_lights.mark_hovered(session);
         let footer = texts.footer(leaf_index, session);
-        let typed = program == aterm_phase::Program::Claude && footer.key_typed();
-        let face = self.key_face(
-            ws,
-            session,
-            program_pgid,
-            typed.then(|| footer.shown().top_effort.is_some()),
-            footer.published().and_then(|f| f.model.as_deref()),
-            tag,
-        );
+        if hide_lockup {
+            footer.note_goal(None);
+        }
+        let typed = !hide_lockup && program == aterm_phase::Program::Claude && footer.key_typed();
+        let face = if hide_lockup {
+            KeyFace::default()
+        } else {
+            self.key_face(
+                ws,
+                session,
+                program_pgid,
+                typed.then(|| footer.shown().top_effort.is_some()),
+                footer.published().and_then(|f| f.model.as_deref()),
+                tag,
+            )
+        };
         if face.tag.is_some()
             && self.claude_facts.get(&session).and_then(|f| f.top_seen) != Some(program_pgid)
         {
@@ -4675,7 +4711,6 @@ impl App {
             }
             return;
         }
-        let hide_lockup = bare_while_off(Some(program), switch.map(|s| s.face));
         let key = TopKey {
             frame_row,
             term_row: region.row_off + top,
@@ -4882,7 +4917,7 @@ impl App {
                             self.session_autopilot_for(session, agent, &claims);
                         let agy_switch_off =
                             bare_while_off(Some(prog), crate::autopilot::HarnessSwitch::of(view));
-                        if view.carries() && supervised && !agy_switch_off {
+                        if view.wears_glass(supervised).is_some() && !agy_switch_off {
                             let row_off = leaf.rect.origin.y.round().max(0.0) as usize;
                             let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
                             let pane_rows = leaf.rect.size.height.round().max(1.0) as usize;
@@ -4964,6 +4999,10 @@ impl App {
                             }),
                         );
                     }
+                    ws.claude_footer_texts
+                        .borrow_mut()
+                        .footer(leaf_index, session)
+                        .note_goal(timeline.goal());
                     let held = timeline.claude_footer().is_some_and(|facts| {
                         let mut texts = ws.claude_footer_texts.borrow_mut();
                         texts.note_facts(
@@ -5320,7 +5359,7 @@ impl App {
                 if on_glass.is_some() && rule.is_none() {
                     lists.bare.push(session);
                 }
-                let harness_on = view.carries() && supervised;
+                let harness_on = view.wears_glass(supervised).is_some() && !agy_switch_off;
                 let switch = crate::autopilot::HarnessSwitch::of(view).map(|face| {
                     let (face, hover) = ws.claude_lights.switch_shown(session, face);
                     let version = (agent == Some(aterm_phase::Program::Agy))
@@ -5449,6 +5488,7 @@ impl App {
                     leaf_index,
                     session,
                     lights: readings.lights,
+                    switch: crate::autopilot::HarnessSwitch::of(view),
                 });
                 let Some((frame_row, term_row, run, rule)) = rule.filter(|_| !agy_switch_off)
                 else {
@@ -5482,6 +5522,9 @@ impl App {
             );
         }
         for pane in lists.seen.drain(..) {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.claude_lights.note_switch_face(pane.session, pane.switch);
+            }
             self.observe_claude_lights(wid, pane.session, pane.lights);
         }
         for session in lists.bare.drain(..) {
@@ -5751,6 +5794,13 @@ impl App {
                 }
             }
             for b in lists.border_toggles.drain(..) {
+                if !matches!(
+                    b.face,
+                    crate::autopilot::HarnessSwitch::Turning
+                        | crate::autopilot::HarnessSwitch::TurningOff
+                ) {
+                    claude_lights.note_switch_face(b.session, Some(b.face));
+                }
                 if rows.iter().any(|r| {
                     r.frame_row == b.frame_row
                         && r.col_off <= b.cols.start
@@ -6143,8 +6193,8 @@ enum SwitchInk {
     Turning,
 }
 
-/// The cells a switch face may take.
-const SWITCH_FACE_MAX: usize = 38;
+/// The cells a switch face may take: the widest, ` alab harness v0.1 ○ off ▐ on ▌ `.
+const SWITCH_FACE_MAX: usize = 34;
 
 /// One harness switch face as laid ([`switch_face`]): its cells and where its parts lie in them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6247,31 +6297,16 @@ fn switch_face(paint: SwitchPaint, tier: usize) -> Option<SwitchFace> {
             f.push(" ", SwitchInk::Label);
             f.switch.start = f.len;
             label(&mut f, words);
-            if paint.version.is_some() {
-                if tier < 3 {
-                    f.push("\u{25cb} off", SwitchInk::Unlit);
-                    f.switch.end = f.len;
-                    f.push(" ", SwitchInk::Label);
-                } else {
-                    f.switch.end = f.len;
-                }
-                let at = f.len;
-                f.push("\u{2590}", SwitchInk::Cap);
-                f.push(" \u{25cf} on ", SwitchInk::Button);
-                f.push("\u{258c}", SwitchInk::Cap);
-                f.button = Some(at..f.len);
+            if tier < 3 {
+                f.push("\u{25cb} off", SwitchInk::Unlit);
+                f.switch.end = f.len;
+                f.push(" ", SwitchInk::Label);
             } else {
-                if tier < 3 {
-                    f.push("\u{25cb} off", SwitchInk::Unlit);
-                    f.switch.end = f.len;
-                    f.push(" ", SwitchInk::Label);
-                } else {
-                    f.switch.end = f.len;
-                }
-                let at = f.len;
-                push_on_button(&mut f);
-                f.button = Some(at..f.len);
+                f.switch.end = f.len;
             }
+            let at = f.len;
+            push_on_button(&mut f);
+            f.button = Some(at..f.len);
             f.push(" ", SwitchInk::Label);
         }
         HarnessSwitch::Turning | HarnessSwitch::TurningOff => {
@@ -6677,6 +6712,10 @@ struct ComposedTop {
     lockup: std::ops::Range<usize>,
     icon: Option<usize>,
     mark: Option<aterm_core::render::FxLayer>,
+    /// The [`goal_term`] of the goal it was composed with (0: none).
+    goal: u64,
+    /// Where the active goal was laid ([`lay_goal`]): frame columns.
+    goal_cols: Option<std::ops::Range<usize>>,
 }
 
 /// Where [`compose_top`] laid a harness switch ([`switch_face`]).
@@ -6707,16 +6746,23 @@ const fn rgb_of(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
 
-/// Compose the CLI's top line ([`top_line`]).
-fn compose_top(key: &TopKey, top: &mut ComposedTop, version: Option<&str>) {
-    compose_top_in(key, top, version, TITLE_LEAD);
+/// Compose the CLI's top line ([`top_line`]), the agent's active `goal` laid between the lockup and
+/// the switch where it fits ([`lay_goal`]).
+fn compose_top(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, goal: Option<&str>) {
+    compose_top_in(key, top, version, goal, TITLE_LEAD);
 }
 
 /// The `─` the hover title leaves before the switch.
 const TITLE_LEAD: usize = 2;
 
 /// [`compose_top`] with the hover title leaving `title_lead` `─` before the switch.
-fn compose_top_in(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, title_lead: usize) {
+fn compose_top_in(
+    key: &TopKey,
+    top: &mut ComposedTop,
+    version: Option<&str>,
+    goal: Option<&str>,
+    title_lead: usize,
+) {
     #[cfg(test)]
     crate::work_counts::footer_top_composed();
     top.cells.clear();
@@ -6725,6 +6771,7 @@ fn compose_top_in(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, ti
     top.ghost = None;
     top.lockup = 0..0;
     top.icon = None;
+    top.goal_cols = None;
     let TopKey {
         line,
         program,
@@ -6813,6 +6860,17 @@ fn compose_top_in(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, ti
             button: f.button.as_ref().map(laid),
         });
     }
+    // The goal takes the rule between the lockup and the switch; the hover title, which grows
+    // the lockup's name into that room, wins while the pointer is on the mark.
+    let goal_at = goal.filter(|_| !key.mark_hover).and_then(|text| {
+        let from = lockup_at.as_ref().map_or(rung.lead, |r| r.end).max(label);
+        let to = [switch_at.as_ref().map(|r| r.start), mark_at]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(span_len);
+        lay_goal(text, from, to)
+    });
     let (lo, hi) = if tint.is_some() {
         (0, span_len)
     } else {
@@ -6820,11 +6878,13 @@ fn compose_top_in(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, ti
             lockup_at.as_ref().map(|r| r.start),
             switch_at.as_ref().map(|r| r.start),
             mark_at,
+            goal_at.as_ref().map(|g| g.cols.start),
         ];
         let lasts = [
             lockup_at.as_ref().map(|r| r.end),
             switch_at.as_ref().map(|r| r.end),
             mark_at.map(|m| m + 1),
+            goal_at.as_ref().map(|g| g.cols.end),
         ];
         let lo = firsts.into_iter().flatten().min().unwrap_or(0);
         let hi = match ghost_at {
@@ -6945,11 +7005,45 @@ fn compose_top_in(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, ti
     if let (Some(at), Some(mark)) = (mark_at, mark_cell) {
         cells[at - lo] = mark;
     }
+    if let Some(laid) = &goal_at {
+        let inks = FactInks::of(rule_cell.fg, blank.fg, rule_cell.bg);
+        let pad = RenderCell {
+            ch: ' ',
+            ..rule_cell
+        };
+        for (k, glyph) in laid.glyphs.iter().enumerate() {
+            cells[laid.cols.start + k - lo] = match *glyph {
+                GoalGlyph::Pad => pad,
+                GoalGlyph::Mark => RenderCell {
+                    ch: GOAL_MARK,
+                    fg: mark_fg,
+                    bold: false,
+                    ..rule_cell
+                },
+                GoalGlyph::Text(ch) => RenderCell {
+                    ch,
+                    fg: inks.lit,
+                    bold: false,
+                    ..rule_cell
+                },
+                GoalGlyph::Wide => RenderCell {
+                    ch: ' ',
+                    wide: true,
+                    fg: inks.lit,
+                    bold: false,
+                    ..rule_cell
+                },
+            };
+        }
+        top.goal_cols = Some(run.col + laid.cols.start..run.col + laid.cols.end);
+    }
     if let (Some(_), Some(lit)) = (ghost_at, face.ghost) {
         cells.extend(ghost_cells(lit));
     }
     if tint.is_none() && !top.lockup.is_empty() {
-        let from = (top.lockup.end - run.col).max(label);
+        let from = (top.lockup.end - run.col)
+            .max(label)
+            .max(goal_at.as_ref().map_or(0, |g| g.cols.end));
         let next = [
             switch_at.as_ref().map(|r| r.start),
             mark_at,
@@ -6962,6 +7056,87 @@ fn compose_top_in(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, ti
             top.glass = from - lo..next - lo;
         }
     }
+}
+
+/// The mark before the active goal on a top line ([`lay_goal`]): Claude Code's own `/goal` glyph.
+pub(crate) const GOAL_MARK: char = '\u{25ce}';
+
+/// The rule's own `─` kept on either side of a laid goal ([`lay_goal`]).
+const GOAL_RULE: usize = 2;
+
+/// The fewest of a goal's own cells worth laying ([`lay_goal`]): fewer say nothing readable.
+const GOAL_MIN_TEXT: usize = 8;
+
+/// One cell of a laid goal ([`lay_goal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoalGlyph {
+    /// A space on the line's ground.
+    Pad,
+    /// [`GOAL_MARK`], in the mark's ink.
+    Mark,
+    /// A glyph of the goal's words (`…` where they are cut).
+    Text(char),
+    /// The right half of the wide glyph before it.
+    Wide,
+}
+
+/// An active goal laid on a top line ([`lay_goal`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaidGoal {
+    /// The run's cells it takes.
+    cols: std::ops::Range<usize>,
+    /// One per cell: ` ◎ <goal> `.
+    glyphs: Vec<GoalGlyph>,
+}
+
+/// `goal` laid as ` ◎ <goal> ` in the run's free cells `from..to`, [`GOAL_RULE`] of the rule's
+/// `─` left on either side, its words cut with `…` to fit; `None` where fewer than
+/// [`GOAL_MIN_TEXT`] of its cells would show. A control or zero-width character takes no cell, a
+/// wide one two.
+fn lay_goal(goal: &str, from: usize, to: usize) -> Option<LaidGoal> {
+    let start = from + GOAL_RULE;
+    let room = to.checked_sub(start + GOAL_RULE)?;
+    let words = room.checked_sub(4)?;
+    let mut buf = [0u8; 4];
+    let widths: Vec<(char, usize)> = goal
+        .chars()
+        .map(|ch| (ch, footer::text_width(ch.encode_utf8(&mut buf))))
+        .filter(|&(_, w)| w > 0)
+        .collect();
+    let whole: usize = widths.iter().map(|&(_, w)| w).sum();
+    if whole == 0 || words < GOAL_MIN_TEXT.min(whole) {
+        return None;
+    }
+    let (budget, cut) = if whole <= words {
+        (words, false)
+    } else {
+        (words - 1, true)
+    };
+    let mut glyphs = vec![GoalGlyph::Pad, GoalGlyph::Mark, GoalGlyph::Pad];
+    let mut used = 0usize;
+    for &(ch, w) in &widths {
+        if used + w > budget {
+            break;
+        }
+        glyphs.push(GoalGlyph::Text(ch));
+        if w == 2 {
+            glyphs.push(GoalGlyph::Wide);
+        }
+        used += w;
+    }
+    if cut {
+        glyphs.push(GoalGlyph::Text('\u{2026}'));
+    }
+    glyphs.push(GoalGlyph::Pad);
+    Some(LaidGoal {
+        cols: start..start + glyphs.len(),
+        glyphs,
+    })
+}
+
+/// The cache and repaint term of an active goal (0: none).
+pub(crate) fn goal_term(goal: Option<&str>) -> u64 {
+    goal.map_or(0, |text| aterm_hash::fnv1a_64(text.as_bytes()) | 1)
 }
 
 /// The hover title's words ([`hover_title`]).
@@ -8706,6 +8881,10 @@ mod top_tests;
 mod top_lines_tests;
 
 #[cfg(test)]
+#[path = "claude_footer_goal_tests.rs"]
+mod goal_tests;
+
+#[cfg(test)]
 #[path = "claude_footer_floor_tests.rs"]
 mod floor_tests;
 
@@ -8991,6 +9170,8 @@ mod tests {
         for f in (0..SWITCH_TIERS).filter_map(|t| switch_face(off, t)) {
             let button = f.button.clone().expect("CONTROL: every off form's button");
             assert!(f.switch.end <= button.start, "CONTROL: {:?}", f.text());
+            let drawn: String = f.cells()[button].iter().map(|c| c.0).collect();
+            assert_eq!(drawn, "\u{2590} on \u{258c}");
         }
     }
 
@@ -13915,6 +14096,7 @@ mod tests {
                             aterm_agent::harness::profile::SubscriptionDisplay::default(),
                         ),
                         context: Some("ctx 84% left".into()),
+                        goal: Some("implement vision".into()),
                         ..FooterFacts::default()
                     }),
                 ));
@@ -14053,11 +14235,46 @@ mod tests {
                 "{prog}: Autopilot Off wears the white card: {card_off:?}"
             );
             if prog == "agy" {
+                let md = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
+                assert_eq!(
+                    md.trim_end(),
+                    "\u{25CF} Heading",
+                    "agy: Autopilot Off keeps transcript markdown rendering active while the harness is on"
+                );
+                assert!(
+                    top_off.contains(" \u{25CE} implement vision "),
+                    "agy: active harness shows the goal on the top rule: {top_off:?}"
+                );
+                app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+                    crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+                );
+                frame(&mut app, wid);
+                let top_switch_off =
+                    text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
+                assert!(
+                    top_switch_off
+                        .contains(" alab harness v0.1 \u{25CB} off \u{2590} on \u{258C} ")
+                        && !top_switch_off.starts_with(&expected_lockup)
+                        && !top_switch_off.contains("implement vision"),
+                    "agy: toggled-off harness leaves only the off switch button on the top rule: {top_switch_off:?}"
+                );
                 let raw_md = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
                 assert_eq!(
                     raw_md.trim_end(),
                     "\u{25CF} # Heading",
-                    "agy: Autopilot Off restores raw transcript row"
+                    "agy: toggled-off harness restores raw transcript row"
+                );
+                app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+                    crate::app_config::HarnessPolicy::read("[harness]\n"),
+                );
+                frame(&mut app, wid);
+                let top_switch_on =
+                    text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
+                assert!(
+                    top_switch_on.contains(expected_switch)
+                        && !top_switch_on.contains("turning off")
+                        && top_switch_on.contains(" \u{25CE} implement vision "),
+                    "agy: turning the harness back on immediately shows ● on and restores the goal: {top_switch_on:?}"
                 );
             }
 

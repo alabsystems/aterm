@@ -2756,7 +2756,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.setup.box_call_step = step;
     }
 
-    /// Overrides the settle delay before accepting an autocompact prompt.
+    /// Overrides the settle delay before answering an autocompact or auto-mode setup offer.
     #[cfg(test)]
     pub(crate) fn set_autocompact_settle(&mut self, settle: Duration) {
         self.setup.autocompact_settle = settle;

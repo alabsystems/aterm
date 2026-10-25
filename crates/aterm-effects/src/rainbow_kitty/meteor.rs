@@ -4,7 +4,6 @@
 //! Rainbow kitty streaking meteor, corona, flash, starburst, and sparks.
 
 use std::mem;
-use std::sync::OnceLock;
 
 use aterm_time::Instant;
 use std::time::Duration;
@@ -130,38 +129,70 @@ impl LandingWalk {
 /// The landing's ink at folded arc position `t`.
 #[inline]
 #[must_use]
-pub fn landing_ink(t: f32) -> u32 {
+pub const fn landing_ink(t: f32) -> u32 {
     let lut = super::ribbon::hot_edge_ink_lut();
     let x = clamp01(t) * (BED_INK_LUT_LEN - 1) as f32;
-    let i = (x as usize).min(BED_INK_LUT_LEN - 1);
-    let j = (i + 1).min(BED_INK_LUT_LEN - 1);
+    let idx = x as usize;
+    let i = if idx < BED_INK_LUT_LEN - 1 {
+        idx
+    } else {
+        BED_INK_LUT_LEN - 1
+    };
+    let j = if i + 1 < BED_INK_LUT_LEN - 1 {
+        i + 1
+    } else {
+        BED_INK_LUT_LEN - 1
+    };
     lerp_rgb(lut[i], lut[j], x - i as f32)
 }
 
 #[inline]
 #[must_use]
-fn landing_ink_light(t: f32, bg: u32) -> u32 {
+const fn landing_ink_light(t: f32, bg: u32) -> u32 {
     paper_mark_ink(spectrum(walk_pace(clamp01(t))), bg)
 }
+
+const LANDING_STOP_LUT: [u32; SPECTRUM_STOPS] = {
+    let mut lut = [0u32; SPECTRUM_STOPS];
+    let mut i = 0;
+    while i < SPECTRUM_STOPS {
+        lut[i] = hot_edge_ink(spectrum_stop(i));
+        i += 1;
+    }
+    lut
+};
 
 /// The landing's ink at a named stop.
 #[inline]
 #[must_use]
-pub fn landing_stop_ink(i: usize) -> u32 {
-    static LUT: OnceLock<[u32; SPECTRUM_STOPS]> = OnceLock::new();
-    LUT.get_or_init(|| std::array::from_fn(|i| hot_edge_ink(spectrum_stop(i))))
-        [i.min(SPECTRUM_STOPS - 1)]
+pub const fn landing_stop_ink(i: usize) -> u32 {
+    let idx = if i < SPECTRUM_STOPS - 1 {
+        i
+    } else {
+        SPECTRUM_STOPS - 1
+    };
+    LANDING_STOP_LUT[idx]
 }
+
+const SPARK_CORE_LUT: [u32; SPECTRUM_STOPS] = {
+    let mut lut = [0u32; SPECTRUM_STOPS];
+    let mut i = 0;
+    while i < SPECTRUM_STOPS {
+        lut[i] = lerp_rgb(0x00FF_FFFF, LANDING_STOP_LUT[i], SPARK_CORE_TINT);
+        i += 1;
+    }
+    lut
+};
 
 #[inline]
 #[must_use]
-fn landing_spark_core_ink(i: usize) -> u32 {
-    static SPARK_CORE_LUT: OnceLock<[u32; SPECTRUM_STOPS]> = OnceLock::new();
-    SPARK_CORE_LUT.get_or_init(|| {
-        std::array::from_fn(|i| {
-            lerp_rgb(0x00FF_FFFF, hot_edge_ink(spectrum_stop(i)), SPARK_CORE_TINT)
-        })
-    })[i.min(SPECTRUM_STOPS - 1)]
+const fn landing_spark_core_ink(i: usize) -> u32 {
+    let idx = if i < SPECTRUM_STOPS - 1 {
+        i
+    } else {
+        SPECTRUM_STOPS - 1
+    };
+    SPARK_CORE_LUT[idx]
 }
 
 /// Stations per train layer.
@@ -324,7 +355,7 @@ pub const RING_R_PER_IMPACT_CH: f32 = 1.2;
 /// The impact's life for a landing of `cells`.
 #[inline]
 #[must_use]
-pub fn ring_ms(cells: f32) -> f32 {
+pub const fn ring_ms(cells: f32) -> f32 {
     (RING_MS + RING_MS_PER_IMPACT * (impact(cells) - 1.0)).min(RING_MS_MAX)
 }
 
@@ -348,15 +379,21 @@ const _: () = assert!(
 /// The fan's star count for a big landing of `cells`.
 #[inline]
 #[must_use]
-pub fn fan_count(cells: f32, party: bool) -> usize {
+pub const fn fan_count(cells: f32, party: bool) -> usize {
     let base = (FAN_N_BASE + FAN_N_PER_IMPACT * (impact(cells) - 1.0)).min(FAN_N_CEIL);
-    ((base.round() as usize) + usize::from(party) * FAN_PARTY_ADD).min(super::timing::FAN_MAX_N)
+    let party_add = if party { FAN_PARTY_ADD } else { 0 };
+    let total = (base.round() as usize) + party_add;
+    if total < super::timing::FAN_MAX_N {
+        total
+    } else {
+        super::timing::FAN_MAX_N
+    }
 }
 
 /// The fan's throw reach for a big landing of `cells`, in `ch`.
 #[inline]
 #[must_use]
-pub fn fan_reach_ch(cells: f32, grade: f32) -> f32 {
+pub const fn fan_reach_ch(cells: f32, grade: f32) -> f32 {
     let ceil = FAN_REACH_MAX_CH + FAN_REACH_GRADE_CH * grade;
     (FAN_REACH_BASE_CH + FAN_REACH_PER_IMPACT_CH * (impact(cells) - 1.0))
         .clamp(FAN_REACH_MIN_CH, ceil)
@@ -635,9 +672,16 @@ const fn burst_step(ch: f32, share: f32, floor: usize) -> usize {
 /// The largest spike count for a landing of `cells`.
 #[inline]
 #[must_use]
-pub fn burst_n(cells: f32) -> usize {
+pub const fn burst_n(cells: f32) -> usize {
     let n = (BURST_N_BASE + BURST_N_PER_IMPACT * (impact(cells) - 1.0)).min(BURST_N_CEIL);
-    (n.round() as usize).clamp(1, BURST_N_MAX)
+    let r = n.round() as usize;
+    if r < 1 {
+        1
+    } else if r > BURST_N_MAX {
+        BURST_N_MAX
+    } else {
+        r
+    }
 }
 
 /// Spark count constant term.
@@ -794,9 +838,9 @@ impl Meteor {
     /// Path length `L` in px.
     #[inline]
     #[must_use]
-    pub fn length(&self) -> f32 {
+    pub const fn length(&self) -> f32 {
         let (dx, dy) = self.delta();
-        dx.hypot(dy)
+        crate::color_math::hypot_f32(dx, dy)
     }
 
     /// The train's spectrum position `cells_behind_landing` cells short of the landing.
@@ -904,50 +948,73 @@ pub struct Burst {
     pub jet_dir: [(f32, f32); JET_N_PER_SIDE * 2],
 }
 
+const JET_UNIT_DIR: [(f32, f32); JET_N_PER_SIDE] = {
+    let mut dirs = [(0.0_f32, 0.0_f32); JET_N_PER_SIDE];
+    let mut k = 0;
+    while k < JET_N_PER_SIDE {
+        let (st, ct) = crate::supernova::sin_cos_f32(JET_TILT_RAD[k]);
+        let (rx, ry) = (ct, st * JET_RISE_SQUASH);
+        let inv = 1.0 / crate::color_math::sqrt_f32(rx * rx + ry * ry).max(1e-6);
+        dirs[k] = (rx * inv, ry * inv);
+        k += 1;
+    }
+    dirs
+};
+
 #[must_use]
-fn mint_burst(seed: u32, at: Instant, cells: f32) -> Burst {
+const fn mint_burst(seed: u32, at: Instant, cells: f32) -> Burst {
     let n = burst_n(cells);
     let step = std::f32::consts::TAU / n as f32;
     let phase = unit01(seed, 0x51) * step;
     let mut dir = [(0.0_f32, 0.0_f32); BURST_N_MAX];
     let mut len = [0.0_f32; BURST_N_MAX];
-    for i in 0..n {
+    let mut i = 0;
+    while i < n {
         let salt = (i as u32).wrapping_mul(0x9E37_79B9) ^ 0x00B5;
         let a = phase + (i as f32 + BURST_JITTER * (unit01(seed, salt) - 0.5)) * step;
-        let (sa, ca) = a.sin_cos();
+        let (sa, ca) = crate::supernova::sin_cos_f32(a);
         dir[i] = (ca, sa);
         let raw = BURST_LEN_MIN + (1.0 - BURST_LEN_MIN) * unit01(seed, salt ^ 0x1D);
-        len[i] = if i % BURST_HERO_EVERY == 0 {
+        len[i] = if i.is_multiple_of(BURST_HERO_EVERY) {
             (raw * BURST_HERO_GAIN).min(1.0)
         } else {
             raw
         };
+        i += 1;
     }
     let mut order = [0_u8; BURST_N_MAX];
-    for (i, slot) in order.iter_mut().enumerate() {
-        *slot = i as u8;
+    let mut idx = 0;
+    while idx < BURST_N_MAX {
+        order[idx] = idx as u8;
+        idx += 1;
     }
-    for i in 1..n {
+    let mut i = 1;
+    while i < n {
         let mut j = i;
-        while j > 0 && len[usize::from(order[j - 1])] < len[usize::from(order[j])] {
-            order.swap(j - 1, j);
+        while j > 0 && len[order[j - 1] as usize] < len[order[j] as usize] {
+            let tmp = order[j - 1];
+            order[j - 1] = order[j];
+            order[j] = tmp;
             j -= 1;
         }
+        i += 1;
     }
     let mut jet_dir = [(0.0_f32, 0.0_f32); JET_N_PER_SIDE * 2];
-    for k in 0..JET_N_PER_SIDE {
-        let (st, ct) = JET_TILT_RAD[k].sin_cos();
-        for si in 0..2 {
+    let mut k = 0;
+    while k < JET_N_PER_SIDE {
+        let (ux, uy) = JET_UNIT_DIR[k];
+        let mut si = 0;
+        while si < 2 {
             let side = if si == 0 { -1.0_f32 } else { 1.0 };
             let sign = if unit01(seed, 0x7A ^ si as u32) < 0.5 {
                 -1.0_f32
             } else {
                 1.0
             };
-            let (rx, ry) = (ct * side, st * JET_RISE_SQUASH * sign);
-            let inv = (rx * rx + ry * ry).sqrt().max(1e-6).recip();
-            jet_dir[k * 2 + si] = (rx * inv, ry * inv);
+            jet_dir[k * 2 + si] = (ux * side, uy * sign);
+            si += 1;
         }
+        k += 1;
     }
     Burst {
         at,
@@ -1105,7 +1172,7 @@ impl Landing {
     /// A party landing: the celebration's bar fan at the caret with no meteor behind it.
     #[inline]
     #[must_use]
-    pub fn party(
+    pub const fn party(
         at: Instant,
         at_px: (f32, f32),
         n: u8,
@@ -1114,11 +1181,24 @@ impl Landing {
         ch: f32,
         tint_t: f32,
     ) -> Self {
-        let n = usize::from(n).clamp(1, super::timing::FAN_MAX_N) as u8;
+        let raw_n = n as usize;
+        let clamped_n = if raw_n < 1 {
+            1
+        } else if raw_n > super::timing::FAN_MAX_N {
+            super::timing::FAN_MAX_N
+        } else {
+            raw_n
+        };
+        let n = clamped_n as u8;
+        let burst = if ring {
+            Some(mint_burst(mix32(seed ^ 0xB0B5), at, JUMP_MIN_CELLS as f32))
+        } else {
+            None
+        };
         Self {
             pin: Pin { at, t: tri(tint_t) },
             walk: LandingWalk::free(tint_t),
-            burst: ring.then(|| mint_burst(mix32(seed ^ 0xB0B5), at, f32::from(JUMP_MIN_CELLS))),
+            burst,
             flash: false,
             fan: Fan {
                 at,
@@ -1164,16 +1244,18 @@ impl Landing {
             let max_spark = self.spark[..usize::from(self.sparks)]
                 .iter()
                 .fold(0.0_f32, |acc, s| acc.max(s.life));
-            ms = ms.max(max_spark * spark_cull_u());
+            ms = ms.max(max_spark * SPARK_CULL_U);
         }
         self.pin.at + Duration::from_secs_f32(ms / 1000.0)
     }
 }
 
+const SPARK_CULL_U: f32 = spark_cull_u();
+
 #[inline]
 #[must_use]
-fn spark_cull_u() -> f32 {
-    SPARK_HOLD_U + (1.0 - SPARK_HOLD_U) * (1.0 - CHROMA_CULL_ALPHA.sqrt())
+const fn spark_cull_u() -> f32 {
+    SPARK_HOLD_U + (1.0 - SPARK_HOLD_U) * (1.0 - crate::color_math::sqrt_f32(CHROMA_CULL_ALPHA))
 }
 
 /// What a spawn minted, handed back to `Engine`, which owns the companion impulse.
@@ -2367,17 +2449,19 @@ impl Flight {
     }
 
     #[inline]
-    fn head_travel_share(&self) -> f32 {
+    const fn head_travel_share(&self) -> f32 {
         clamp01(enter_at_speed(self.u))
     }
 
     #[inline]
-    fn width_at(&self, s: f32) -> f32 {
+    const fn width_at(&self, s: f32) -> f32 {
         if s <= 0.0 {
             return self.w;
         }
         self.w
-            * (WIDTH_FLOOR_SHARE + WIDTH_SPAN_SHARE * (-s / (WIDTH_FALLOFF_SHARE * self.l)).exp())
+            * (WIDTH_FLOOR_SHARE
+                + WIDTH_SPAN_SHARE
+                    * crate::color_math::exp_f32(-s / (WIDTH_FALLOFF_SHARE * self.l)))
     }
 }
 
@@ -2774,14 +2858,14 @@ fn draw_head(
 
 #[inline]
 #[must_use]
-fn flash_scale(after_ms: f32) -> f32 {
+const fn flash_scale(after_ms: f32) -> f32 {
     if after_ms <= 0.0 {
         return 1.0;
     }
     let over = FLASH_OVERSHOOT - 1.0;
     if after_ms <= FLASH_MS {
         let u = clamp01(after_ms / FLASH_MS);
-        return 1.0 + over * (1.0 - (1.0 - u).powf(FLIGHT_ENTER_EXP));
+        return 1.0 + over * (1.0 - crate::color_math::powf_pos_f32(1.0 - u, FLIGHT_ENTER_EXP));
     }
     let v = clamp01((after_ms - FLASH_MS) / (FLASH_RELAX_MS - FLASH_MS));
     1.0 + over * (1.0 - smoothstep01(v))
@@ -3194,7 +3278,7 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
 }
 
 #[must_use]
-fn mint_spark(seed: u32, k: usize, ch: f32) -> Spark {
+const fn mint_spark(seed: u32, k: usize, ch: f32) -> Spark {
     let s = mix32(seed ^ (k as u32).wrapping_mul(0x27D4_EB2F) ^ 0x5AA5_5AA5);
     let life = SPARK_LIFE_MIN_MS + (SPARK_LIFE_MAX_MS - SPARK_LIFE_MIN_MS) * unit01(s, 1);
     let a =
@@ -3203,8 +3287,14 @@ fn mint_spark(seed: u32, k: usize, ch: f32) -> Spark {
         * ch
         / 1000.0;
     let sizes = SPARK_ARM_MAX_PX - SPARK_ARM_MIN_PX + 1;
-    let arm = SPARK_ARM_MIN_PX + ((sizes as f32 * unit01(s, 4)) as i32).min(sizes - 1);
-    let (sa, ca) = a.sin_cos();
+    let raw_idx = (sizes as f32 * unit01(s, 4)) as i32;
+    let idx = if raw_idx < sizes - 1 {
+        raw_idx
+    } else {
+        sizes - 1
+    };
+    let arm = SPARK_ARM_MIN_PX + idx;
+    let (sa, ca) = crate::supernova::sin_cos_f32(a);
     Spark {
         vx: v * ca * SPARK_SPREAD,
         vy: -v * sa,
@@ -3460,16 +3550,18 @@ fn head_at(m: &Meteor, now: Instant) -> (f32, f32) {
 }
 
 #[inline]
-fn head_speed(l: f32, t_ms: f32, u: f32) -> f32 {
+const fn head_speed(l: f32, t_ms: f32, u: f32) -> f32 {
     if t_ms <= 0.0 {
         return 0.0;
     }
-    l * (1.0 - FLIGHT_P0) * FLIGHT_ENTER_EXP * (1.0 - clamp01(u)).powf(FLIGHT_ENTER_EXP - 1.0)
+    l * (1.0 - FLIGHT_P0)
+        * FLIGHT_ENTER_EXP
+        * crate::color_math::powf_pos_f32(1.0 - clamp01(u), FLIGHT_ENTER_EXP - 1.0)
         / t_ms
 }
 
 #[inline]
-fn seg_gap(a0: (f32, f32), a1: (f32, f32), b0: (f32, f32), b1: (f32, f32)) -> f32 {
+const fn seg_gap(a0: (f32, f32), a1: (f32, f32), b0: (f32, f32), b1: (f32, f32)) -> f32 {
     if segments_cross(a0, a1, b0, b1) {
         return 0.0;
     }
@@ -3480,7 +3572,7 @@ fn seg_gap(a0: (f32, f32), a1: (f32, f32), b0: (f32, f32), b1: (f32, f32)) -> f3
 }
 
 #[inline]
-fn point_seg(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+const fn point_seg(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     let (vx, vy) = (b.0 - a.0, b.1 - a.1);
     let len2 = vx * vx + vy * vy;
     let t = if len2 <= f32::EPSILON {
@@ -3488,7 +3580,7 @@ fn point_seg(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     } else {
         (((p.0 - a.0) * vx + (p.1 - a.1) * vy) / len2).clamp(0.0, 1.0)
     };
-    (p.0 - (a.0 + vx * t)).hypot(p.1 - (a.1 + vy * t))
+    crate::color_math::hypot_f32(p.0 - (a.0 + vx * t), p.1 - (a.1 + vy * t))
 }
 
 #[inline]

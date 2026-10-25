@@ -1796,6 +1796,7 @@ pub(crate) struct SessionTimeline {
     claude_excerpts: Option<(i32, crate::survey::ClaudeExcerpts)>,
     codex_survey: Option<(i32, crate::survey::CodexSurvey)>,
     program_shown: Option<ShownProgram>,
+    program_episodes: u64,
     claude_side: Option<(i32, std::sync::Arc<crate::claude_footer::FactSide>)>,
     claude_footer_read: Option<(i32, std::time::Instant)>,
     gauges: AgentGauges,
@@ -1962,14 +1963,29 @@ pub(crate) struct AgentPublication {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ShownProgram {
     pub(crate) state: aterm_core::terminal::program_state::ProgramState,
+    /// The episode: every move of the shown report is a new one, counted on this timeline (a
+    /// repeat of the report shown is no move, so it stays one episode; a second box begun anew
+    /// with the same words is one, `ProgramStateGate::observe`). A program-claim need's key
+    /// ([`crate::needs::ProgramClaimFact::key`]).
+    pub(crate) seq: u64,
+    /// The engine's sequence where the report shown began (`ProgramStateReport::began`, a
+    /// re-send of it looked past): where it stands in the program's output, as the engine's
+    /// notification admission judges by it ([`crate::box_banner`]).
+    pub(crate) report: u64,
     since: std::time::Instant,
     since_continuous_ms: Option<u64>,
 }
 
 impl ShownProgram {
-    fn now(state: aterm_core::terminal::program_state::ProgramState) -> Self {
+    fn now(
+        state: aterm_core::terminal::program_state::ProgramState,
+        seq: u64,
+        report: u64,
+    ) -> Self {
         Self {
             state,
+            seq,
+            report,
             since: std::time::Instant::now(),
             since_continuous_ms: aterm_uds::process::continuous_ms(),
         }
@@ -2187,12 +2203,17 @@ impl SessionTimeline {
         self.typed_turn = None;
     }
 
-    /// A move of what the program in front says about itself.
+    /// A move of what the program in front says about itself: `shown` and the engine's sequence
+    /// where that report began (`ProgramStateReport::began`), a new episode
+    /// ([`ShownProgram::seq`]).
     pub(crate) fn note_program_state(
         &mut self,
         shown: Option<aterm_core::terminal::program_state::ProgramState>,
+        report: u64,
     ) {
-        self.program_shown = shown.map(ShownProgram::now);
+        self.program_episodes = self.program_episodes.wrapping_add(1);
+        let seq = self.program_episodes;
+        self.program_shown = shown.map(|state| ShownProgram::now(state, seq, report));
         let at = self.slog.now();
         self.slog.observe_program(shown, at);
         self.record(PROGRAM_STATE);
@@ -3504,6 +3525,16 @@ impl SessionTimeline {
             .as_ref()
             .filter(|(pgid, _, _)| *pgid == self.agent.program_pgid)
             .map(|(_, _, facts)| facts)
+    }
+
+    /// The active goal of the agent in front, one line ([`aterm_agent::harness::goal`]): what
+    /// its own records say (Claude Code's `/goal` and Muse Code's goal store through the footer
+    /// resolver's facts, codex-alab's goal store through the rollout tap's), or `None` while it
+    /// has none or keeps none aterm reads.
+    pub(crate) fn goal(&self) -> Option<&str> {
+        self.claude_footer()
+            .and_then(|facts| facts.goal.as_deref())
+            .or_else(|| self.codex_survey().and_then(|codex| codex.goal.as_deref()))
     }
 
     /// The launch card kept for the process whose facts are in front.

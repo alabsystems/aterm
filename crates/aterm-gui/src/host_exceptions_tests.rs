@@ -1278,6 +1278,7 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
             due: Vec::new(),
             none_soon: false,
             wrong: Vec::new(),
+            no_sign_in: Vec::new(),
         })
     };
     let step = |app: &mut App, note: HostNote| -> Vec<(String, String)> {
@@ -1479,6 +1480,7 @@ fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
             due: Vec::new(),
             none_soon: false,
             wrong: Vec::new(),
+            no_sign_in: Vec::new(),
         })
     };
     let step = |app: &mut App, note: HostNote| -> Vec<(String, String)> {
@@ -1567,6 +1569,57 @@ fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
     }
     assert!(mr::accounts_credits_entry(&[]).is_none());
     assert!(mr::accounts_window_full_entry(&[], false).is_none());
+}
+
+/// A row whose automatic sign-in found no route is one `harness.accounts.no-sign-in` line, a
+/// fact for later that marks nothing on the glass and asks no one to sign in: it names each row
+/// with the routes it tried, and it ends when no row's attempt is failing.
+#[test]
+fn a_sign_in_with_no_route_is_one_fact_naming_each_route_tried_and_ends_with_it() {
+    let mut app = App::headless_for_test();
+    let before = glass(&app);
+    let said = |rows: &[(&str, &str)]| {
+        HostNote::Accounts(AccountsSaid::Listed {
+            signed_out: Vec::new(),
+            credits: Vec::new(),
+            window_full: Vec::new(),
+            due: Vec::new(),
+            none_soon: false,
+            wrong: Vec::new(),
+            no_sign_in: rows
+                .iter()
+                .map(|(l, routes)| (l.to_string(), routes.to_string()))
+                .collect(),
+        })
+    };
+    let routes = "profile(none) mailbox(none configured) vault(seq 51, nothing new) \
+                  headless-browser(none installed) hosts(none configured)";
+    app.note_harness_host(said(&[("m2", routes)]));
+    assert_eq!(glass(&app), before, "nothing on the glass");
+    assert!(app.host_noted.is_empty(), "no claim held");
+    let digest = app.messages.digest();
+    assert_eq!(digest.len(), 1);
+    let e = &digest.entries[0];
+    assert_eq!(e.key, mr::ACCOUNTS_NO_SIGN_IN_KEY);
+    assert!(
+        e.detail
+            .iter()
+            .any(|l| l.contains("m2") && l.contains(routes)),
+        "each row with the routes it tried: {:?}",
+        e.detail
+    );
+    let words = format!("{} {} {:?}", e.title, e.then, e.detail).to_lowercase();
+    assert!(
+        !words.contains("sign in to") && !words.contains("needs you"),
+        "{words}"
+    );
+    app.note_harness_host(said(&[]));
+    assert!(app.messages.digest().is_empty(), "it ended");
+    let entry =
+        mr::accounts_no_sign_in_entry(&[("m2".to_string(), routes.to_string())]).expect("an entry");
+    assert_eq!(entry.family(), Family::Accounts);
+    assert!(entry.message().is_ok(), "{:?}", entry.message().err());
+    assert!(mr::accounts_no_sign_in_entry(&[]).is_none());
 }
 
 /// A `Later` point only a person can answer is one `harness.resume.<kind>` line naming its tabs,
@@ -3616,6 +3669,7 @@ fn a_lost_login_is_its_tabs_ask_and_the_accounts_say_lines() {
             due: due.iter().map(|l| l.to_string()).collect(),
             none_soon,
             wrong: wrong.iter().map(|l| l.to_string()).collect(),
+            no_sign_in: Vec::new(),
         })
     };
     let keys = |app: &App| -> Vec<String> {
@@ -4216,6 +4270,7 @@ fn another_pools_due_line_follows_its_note_and_leaves_claudes_alone() {
         due: vec!["m16".to_string()],
         none_soon: false,
         wrong: Vec::new(),
+        no_sign_in: Vec::new(),
     }));
     assert_eq!(keys(&app), [mr::ACCOUNTS_DUE_KEY.to_string()]);
     let kimi_due = mr::pool_notice_key(Cli::Kimi, "due");

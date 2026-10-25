@@ -184,7 +184,7 @@ impl InkLedger {
     }
 
     /// Record composite bed colour `rgb` under text cell `(row, col)`.
-    pub(super) fn lay_under(&mut self, (row, col): (i32, i32), rgb: u32) {
+    pub(super) const fn lay_under(&mut self, (row, col): (i32, i32), rgb: u32) {
         if !self.on {
             return;
         }

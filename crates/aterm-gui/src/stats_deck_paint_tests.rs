@@ -8,7 +8,6 @@ use crate::stats_paint::HitKind;
 use crate::stats_paint::tests::{job_row, zombies};
 use aterm_vitals::explain::WhyFacts;
 use aterm_vitals::explain::fixtures::{self, spotlight_1032};
-use aterm_vitals::fixtures::DeckScene;
 use aterm_vitals::jobs::{Findings, JobsView, Verdict};
 use aterm_vitals::model::{
     AccountIx, Busiest, CapBasis, ClusterView, CoreView, CpuView, DiskFacts, GpuSample, GpuView,
@@ -41,8 +40,6 @@ pub(crate) enum Scene {
     Worst,
     /// Worst-case scene ([`Scene::Worst`]) restricted to valid CPU and memory overflow slots.
     Costly,
-    /// One of the merged deck's mockup scenes, in its own window ([`super::deck_fixtures`]).
-    Merged(DeckScene),
 }
 
 struct Rng(u64);
@@ -269,9 +266,6 @@ fn jobs(counts: &[(Verdict, usize)], zombie_count: u32) -> JobsView {
 
 /// `sc` as one snapshot at [`AT`].
 pub(crate) fn scene(sc: Scene) -> Snapshot {
-    if let Scene::Merged(m) = sc {
-        return aterm_vitals::fixtures::snapshot(m);
-    }
     let worst = matches!(sc, Scene::Worst | Scene::Costly);
     let trouble = sc == Scene::Trouble || worst;
     let mut st = story(trouble);
@@ -289,8 +283,7 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
                 h[30] = None;
             }
         }
-        // A merged scene is returned whole above.
-        Scene::Calm | Scene::Trouble | Scene::HarnessOff | Scene::Merged(_) => {}
+        Scene::Calm | Scene::Trouble | Scene::HarnessOff => {}
     }
     let tab_label = if worst { LONG_TAB } else { "Tab 2" };
     let mut s = Snapshot {
@@ -451,8 +444,6 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
     };
     match sc {
         Scene::Calm => f.disk = Some(watch),
-        // Returned whole above.
-        Scene::Merged(_) => {}
         Scene::HarnessOff => f.disk = None,
         Scene::FirstRun => {
             f.disk = Some(DiskFacts {
@@ -646,24 +637,11 @@ pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
         contrast: false,
         locale: MAC,
         live: crate::stats_live::DeckLive::STILL,
-        needs: Vec::new(),
-    }
-}
-
-/// `sc`'s input: a merged scene's from its own window, v2's from [`scene_input`].
-fn input_of(sc: Scene, snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
-    match sc {
-        Scene::Merged(m) => super::deck_fixtures::DeckContext::of(m).input(
-            Some(snap),
-            form,
-            super::tests::dark_inks(),
-        ),
-        _ => scene_input(snap, form),
     }
 }
 
 fn deck_pt(form: DeckForm, s: f64) -> f64 {
-    deck_px(StatsBars::Deck, DeckStyle::V2, form, s, (14.0 * s) as usize) as f64 / s
+    deck_px(StatsBars::Deck, form, s, (14.0 * s) as usize) as f64 / s
 }
 
 fn geom(w: f64, s: f64, form: DeckForm) -> DeckGeom {
@@ -678,7 +656,7 @@ fn geom(w: f64, s: f64, form: DeckForm) -> DeckGeom {
 
 fn laid(sc: Scene, w: f64, s: f64, form: DeckForm, m: &FaceMetrics, draw: bool) -> Laid {
     let snap = scene(sc);
-    let input = input_of(sc, &snap, form);
+    let input = scene_input(&snap, form);
     let words = DeckWords::new(&input, m);
     lay(&geom(w, s, form), &input, &words, m, draw)
 }
@@ -718,9 +696,6 @@ fn swept(check: Check) -> Vec<&'static str> {
         Scene::Trouble,
         Scene::FirstRun,
         Scene::HarnessOff,
-        Scene::Merged(DeckScene::Busy),
-        Scene::Merged(DeckScene::Calm),
-        Scene::Merged(DeckScene::Absent),
     ];
     FOUND
         .get_or_init(|| {
@@ -767,7 +742,7 @@ fn sweep(
             .into_iter()
             .map(|(sc, snap, face, m, s, form)| {
                 scope.spawn(move || {
-                    let input = input_of(sc, snap, form);
+                    let input = scene_input(snap, form);
                     let words = DeckWords::new(&input, m);
                     let mut failed: Vec<(Check, String)> = Vec::new();
                     for w in sweep_widths() {
@@ -1563,14 +1538,27 @@ fn strip_col(strip: Strip) -> Col {
 #[test]
 fn hit_map() {
     let m = FaceMetrics::helvetica_neue();
-    let scenes = [
-        Scene::Calm,
-        Scene::Merged(DeckScene::Busy),
-        Scene::Merged(DeckScene::Calm),
-        Scene::Merged(DeckScene::Absent),
-    ];
-    for sc in scenes {
-        hit_map_of(sc, &m);
+    for (w, s) in [(1119.0, 2.0), (900.0, 2.0), (550.0, 2.0), (350.0, 1.0)] {
+        let p = plan::plan_full(w, &m);
+        let at = format!("Full {:?} at {w} pt, {s}×", p.kind);
+        let laid = laid(Scene::Calm, w, s, DeckForm::Full, &m, true);
+        let hits = &laid.hits;
+        let mut cols = vec![p.name, strip_col(p.strip)];
+        cols.extend([p.pct, p.bar, p.amount, p.details].into_iter().flatten());
+        let scopes = p.aterm.zip(p.tab);
+        for (i, &res) in DECK_RESOURCES.iter().enumerate() {
+            check_row(hits, s, res, p.rows, i as u32, &cols, scopes, &at);
+        }
+        let header = hit_at(hits, p.strip.x + 20.0, 6.0, s);
+        assert_eq!(header, Some(HitKind::Header), "{at}");
+        let cores = match p.cores {
+            CoresAt::Block { at, .. } => hit_at(hits, at.x + 2.0, 40.0, s),
+            CoresAt::Row(room) => {
+                let y = p.rows.top(DECK_RESOURCES.len() as u32) + p.rows.cell / 2.0;
+                hit_at(hits, room.x + 2.0, y, s)
+            }
+        };
+        assert_eq!(cores, Some(HitKind::Cores), "{at}");
     }
     let header_names = laid(Scene::Calm, 1119.0, 2.0, DeckForm::Full, &m, true)
         .hits
@@ -1578,6 +1566,42 @@ fn hit_map() {
         .find(|h| h.kind == HitKind::Header)
         .map(|h| h.instrument());
     assert_eq!(header_names, Some(Instrument::HowToRead));
+    for (w, s) in [(1119.0, 2.0), (750.0, 2.0), (450.0, 1.0)] {
+        let p = plan::plan_folded(w, &m);
+        let at = format!("Folded {:?} at {w} pt, {s}×", p.blocks[0].kind);
+        let laid = laid(Scene::Calm, w, s, DeckForm::Folded, &m, true);
+        let hits = &laid.hits;
+        for (bi, b) in p.blocks.iter().enumerate() {
+            let mut cols = vec![b.name, strip_col(b.strip)];
+            cols.extend([b.pct, b.bar, b.amount, b.details].into_iter().flatten());
+            let scopes = b.aterm.zip(b.tab);
+            for (res, r) in DECK_RESOURCES
+                .iter()
+                .copied()
+                .skip(bi * 4)
+                .take(4)
+                .zip(0_u32..)
+            {
+                check_row(hits, s, res, b.rows, r, &cols, scopes, &at);
+            }
+            if bi == 1 {
+                let y = b.rows.top(3) + b.rows.cell / 2.0;
+                assert_eq!(
+                    hit_at(hits, b.name.x + 1.0, y, s),
+                    Some(HitKind::Cores),
+                    "{at}"
+                );
+            }
+        }
+        let y = p.blocks[0].rows.top(1) + 4.0;
+        let gutter = (p.blocks[0].at.end() + p.blocks[1].at.x) / 2.0;
+        assert_eq!(hit_at(hits, gutter, y, s), None, "{at}: the gutter");
+        assert_eq!(
+            hit_at(hits, p.blocks[0].strip.x + 20.0, 5.0, s),
+            Some(HitKind::Header),
+            "{at}"
+        );
+    }
     let w = folded_width(BlockKind::Slim, &m);
     let laid = laid(Scene::Trouble, w, 2.0, DeckForm::Folded, &m, true);
     let head = laid.head.as_ref().expect("a header");
@@ -1607,89 +1631,6 @@ fn hit_map() {
     }
 }
 
-/// Every row's columns, its scope bars, the header and the cores name their instruments in
-/// `sc`, Full and Folded.
-fn hit_map_of(sc: Scene, m: &FaceMetrics) {
-    for (w, s) in [(1119.0, 2.0), (900.0, 2.0), (550.0, 2.0), (350.0, 1.0)] {
-        let p = plan::plan_full(w, m);
-        let at = format!("{sc:?}: Full {:?} at {w} pt, {s}×", p.kind);
-        let laid = laid(sc, w, s, DeckForm::Full, m, true);
-        let hits = &laid.hits;
-        let mut cols = vec![p.name, strip_col(p.strip)];
-        cols.extend([p.pct, p.bar, p.amount, p.details].into_iter().flatten());
-        let scopes = p.aterm.zip(p.tab);
-        for (i, &res) in DECK_RESOURCES.iter().enumerate() {
-            check_row(hits, s, res, p.rows, i as u32, &cols, scopes, &at);
-        }
-        let header = hit_at(hits, p.strip.x + 20.0, 6.0, s);
-        assert_eq!(header, Some(HitKind::Header), "{at}");
-        let cores = match p.cores {
-            CoresAt::Block { at, .. } => hit_at(hits, at.x + 2.0, 40.0, s),
-            CoresAt::Row(room) => {
-                let y = p.rows.top(DECK_RESOURCES.len() as u32) + p.rows.cell / 2.0;
-                hit_at(hits, room.x + 2.0, y, s)
-            }
-        };
-        assert_eq!(cores, Some(HitKind::Cores), "{at}");
-    }
-    for (w, s) in [(1119.0, 2.0), (750.0, 2.0), (450.0, 1.0)] {
-        let p = plan::plan_folded(w, m);
-        let at = format!("{sc:?}: Folded {:?} at {w} pt, {s}×", p.blocks[0].kind);
-        let laid = laid(sc, w, s, DeckForm::Folded, m, true);
-        let hits = &laid.hits;
-        for (bi, b) in p.blocks.iter().enumerate() {
-            let mut cols = vec![b.name, strip_col(b.strip)];
-            cols.extend([b.pct, b.bar, b.amount, b.details].into_iter().flatten());
-            let scopes = b.aterm.zip(b.tab);
-            for (res, r) in DECK_RESOURCES
-                .iter()
-                .copied()
-                .skip(bi * 4)
-                .take(4)
-                .zip(0_u32..)
-            {
-                check_row(hits, s, res, b.rows, r, &cols, scopes, &at);
-            }
-            if bi == 1 {
-                let y = b.rows.top(3) + b.rows.cell / 2.0;
-                assert_eq!(
-                    hit_at(hits, b.name.x + 1.0, y, s),
-                    Some(HitKind::Cores),
-                    "{at}"
-                );
-            }
-        }
-        let y = p.blocks[0].rows.top(1) + 4.0;
-        let gutter = (p.blocks[0].at.end() + p.blocks[1].at.x) / 2.0;
-        assert_eq!(hit_at(hits, gutter, y, s), None, "{at}: the gutter");
-        // The header names How to read, except where a row's state is said over the point
-        // (busy's disk): there it is that row's, as the Trouble check below holds.
-        let x = p.blocks[0].strip.x + 20.0;
-        let header = hit_at(hits, x, 5.0, s);
-        let snap = scene(sc);
-        let stated = laid
-            .head
-            .iter()
-            .flat_map(|h| &h.labels)
-            .filter(|l| l.label == Label::State && l.x <= x)
-            .max_by(|a, b| a.x.total_cmp(&b.x))
-            .map(|l| {
-                let res = DECK_RESOURCES
-                    .iter()
-                    .copied()
-                    .find(|&r| {
-                        words::state(r, &snap, &MAC).is_some_and(|st| l.text.starts_with(&st.label))
-                    })
-                    .expect("the label says a row's state");
-                row_hit(res, Bar::Global)
-            });
-        assert!(
-            header == Some(HitKind::Header) || stated.is_some_and(|row| header == row),
-            "{at}: {header:?}, the state said there {stated:?}"
-        );
-    }
-}
-
 #[test]
 #[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
 fn deck_gallery() {
@@ -1704,9 +1645,6 @@ fn deck_gallery() {
         ("trouble", Scene::Trouble),
         ("firstrun", Scene::FirstRun),
         ("harness_off", Scene::HarnessOff),
-        ("merged_busy", Scene::Merged(DeckScene::Busy)),
-        ("merged_calm", Scene::Merged(DeckScene::Calm)),
-        ("merged_absent", Scene::Merged(DeckScene::Absent)),
     ];
     let mut written = Vec::new();
     for (name, sc) in scenes {
@@ -1721,7 +1659,7 @@ fn deck_gallery() {
             for form in [DeckForm::Full, DeckForm::Folded] {
                 for (ground, inks) in [("dark", super::tests::dark_inks()), ("light", light_inks())]
                 {
-                    let mut input = input_of(sc, &snap, form);
+                    let mut input = scene_input(&snap, form);
                     input.inks = inks;
                     let g = geom(w, s, form);
                     let (prims, _) = deck_paint(&g, &input);
@@ -1747,183 +1685,4 @@ fn deck_gallery() {
         }
     }
     assert_eq!(written.len(), scenes.len() * 5 * 2 * 2);
-}
-
-/// The merged deck's gallery sizes: the mockups' 2238, 1100 and 700 device px at 2×, and the
-/// widest at 1×.
-const MERGED_SIZES: [(f64, f64); 4] = [(1119.0, 2.0), (550.0, 2.0), (350.0, 2.0), (1119.0, 1.0)];
-
-/// The landed mockups' deck band: rows 56..158 of each, under the 56-row titlebar and down to
-/// the terminal, the band's 2-row seam included.
-const MOCKUP_BAND: std::ops::Range<usize> = 56..158;
-
-/// The rule between a mockup's band and the deck's render in a `_vs_mockup` stack, device px.
-const STACK_RULE_PX: usize = 4;
-
-/// Each landed mockup ([`mockup_file`]) by the render it is held against: its scene, width in
-/// device px (2×, as the mockups are drawn) and ground, and the words in its band, counted as the
-/// mockups' generator counts them ([`band_words`]).
-const MOCKUPS: [(DeckScene, u32, &str, usize); 6] = [
-    (DeckScene::Busy, 2238, "dark", 110),
-    (DeckScene::Busy, 2238, "light", 110),
-    (DeckScene::Calm, 2238, "dark", 91),
-    (DeckScene::Calm, 2238, "light", 91),
-    (DeckScene::Busy, 1100, "dark", 61),
-    (DeckScene::Busy, 700, "dark", 45),
-];
-
-/// A landed mockup's file in `docs/design-studies`: the narrower forms name their width.
-fn mockup_file(scene: DeckScene, px: u32, ground: &str) -> String {
-    let at = if px == 2238 {
-        String::new()
-    } else {
-        format!("-{px}")
-    };
-    format!("top-deck-{}-{ground}{at}-2026-10-23.png", scene.name())
-}
-
-/// The full-width mockups' right block edges at 2238 px, printed beside the deck's own and never
-/// asserted: the mockups measured their words in SF, the deck draws Helvetica Neue.
-const MOCKUP_EDGES_2238: [(&str, u32); 7] = [
-    ("rail", 313),
-    ("Processes", 856),
-    ("CPU", 1207),
-    ("Memory", 1572),
-    ("divider", 1801),
-    ("Disk", 2015),
-    ("right edge", 2226),
-];
-
-/// The words `prims` draw: tokens holding a letter or digit, `·` splitting as a space.
-fn band_words(prims: &[DrawPrim]) -> usize {
-    prims
-        .iter()
-        .filter_map(|p| match p {
-            DrawPrim::Text { s, .. } => Some(s.as_str()),
-            _ => None,
-        })
-        .flat_map(|s| s.split(|c: char| c.is_whitespace() || c == '·'))
-        .filter(|w| w.chars().any(char::is_alphanumeric))
-        .count()
-}
-
-/// Each instrument's x-extent over its hit regions in device px, in the order the hits first
-/// name them.
-fn block_edges(hits: &[Hit]) -> String {
-    let mut blocks: Vec<(Instrument, f32, f32)> = Vec::new();
-    for h in hits {
-        let (x, _, w, _) = h.rect;
-        match blocks.iter_mut().find(|b| b.0 == h.instrument()) {
-            Some(b) => {
-                b.1 = b.1.min(x);
-                b.2 = b.2.max(x + w);
-            }
-            None => blocks.push((h.instrument(), x, x + w)),
-        }
-    }
-    blocks
-        .iter()
-        .map(|(i, a, b)| format!("{} {a:.0}–{b:.0}", i.word()))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// The landed mockup `file`'s deck band ([`MOCKUP_BAND`], decoded with `aterm_png`) above `ours`
-/// (`w` px wide, the mockup's own width), a grey rule between: the stack and its height.
-fn under_mockup(file: &str, ours: &[u8], w: usize) -> (Vec<u8>, usize) {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/design-studies")
-        .join(file);
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let (art, aw, ah) = aterm_png::decode_rgba8(&bytes, 4096).expect("the mockup decodes");
-    assert_eq!(aw, w, "{file} is drawn at the render's width");
-    assert!(ah >= MOCKUP_BAND.end, "{file}: {ah} rows");
-    let mut out = art[MOCKUP_BAND.start * w * 4..MOCKUP_BAND.end * w * 4].to_vec();
-    out.extend_from_slice(&[0x80, 0x80, 0x80, 0xFF].repeat(w * STACK_RULE_PX));
-    out.extend_from_slice(ours);
-    let h = out.len() / (w * 4);
-    (out, h)
-}
-
-/// The merged deck's scenes as its painter draws them ([`crate::stats_merged::merged_paint`]) at
-/// the mockups' three 17 pt rows, on each ground at each of [`MERGED_SIZES`], each printed with
-/// its blocks' x-edges and its word count; at a mockup's size, also `<name>_vs_mockup.png`, the
-/// mockup's band above the render.
-#[test]
-#[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
-fn merged_gallery() {
-    let Some(dir) = std::env::var_os("ATERM_DECK_GALLERY") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).expect("the gallery directory");
-    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
-    let (mut renders, mut stacks) = (0, 0);
-    for m in DeckScene::ALL {
-        let sc = Scene::Merged(m);
-        let snap = scene(sc);
-        for (w, s) in MERGED_SIZES {
-            for (ground, inks) in [("dark", super::tests::dark_inks()), ("light", light_inks())] {
-                let mut input = input_of(sc, &snap, DeckForm::Full);
-                input.inks = inks;
-                let g = DeckGeom {
-                    h: deck_px(
-                        StatsBars::Deck,
-                        DeckStyle::Merged,
-                        DeckForm::Full,
-                        s,
-                        (17.0 * s) as usize,
-                    ) as f32,
-                    ..geom(w, s, DeckForm::Full)
-                };
-                let (prims, hits) = crate::stats_merged::merged_paint(&g, &input);
-                let [r, gr, b] = inks.ground;
-                let (rgba, pw, ph) = crate::tray_raster::rasterize_tray(
-                    &prims,
-                    g.w as u32,
-                    g.h as u32,
-                    1.0,
-                    [r, gr, b, 0xFF],
-                );
-                let name = format!("{}_{w}pt_{s}x_{ground}", m.name());
-                let write = |file: String, rgba: &[u8], pw: u32, ph: u32| {
-                    let png = crate::app_introspect::encode_rgba8_png(rgba, pw, ph)
-                        .expect("the frame encodes");
-                    std::fs::write(dir.join(file), png).expect("the PNG writes");
-                };
-                write(format!("{name}.png"), &rgba, pw, ph);
-                renders += 1;
-                println!(
-                    "{name}: {} words; {}",
-                    band_words(&prims),
-                    block_edges(&hits)
-                );
-                let mockup = MOCKUPS
-                    .iter()
-                    .find(|k| k.0 == m && k.1 == pw && k.2 == ground);
-                if let Some(&(_, _, _, words)) = mockup {
-                    let file = mockup_file(m, pw, ground);
-                    let (stack, sh) = under_mockup(&file, &rgba, pw as usize);
-                    write(format!("{name}_vs_mockup.png"), &stack, pw, sh as u32);
-                    stacks += 1;
-                    let edges = if pw == 2238 {
-                        MOCKUP_EDGES_2238
-                            .iter()
-                            .map(|(at, x)| format!("{at} {x}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    } else {
-                        "not measured".to_owned()
-                    };
-                    println!("{name} mockup ({file}): {words} words; right edges {edges}");
-                }
-            }
-        }
-    }
-    assert_eq!(renders, DeckScene::ALL.len() * MERGED_SIZES.len() * 2);
-    assert_eq!(
-        stacks,
-        MOCKUPS.len(),
-        "every mockup is stacked over its render"
-    );
 }

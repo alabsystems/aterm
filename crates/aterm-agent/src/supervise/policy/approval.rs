@@ -78,6 +78,8 @@ pub const RULE_LIMIT_STOP: &str = "limit-stop@v1";
 pub const RULE_LIMIT_RESET: &str = "limit-reset@v1";
 /// Claude Code's autocompact offer ([`autocompact_offer`]).
 pub const RULE_AUTOCOMPACT_OFFER: &str = "autocompact-offer@v1";
+/// Claude Code's auto-mode environment offer ([`auto_mode_setup`]).
+pub const RULE_AUTO_MODE_SETUP: &str = "auto-mode-setup@v1";
 
 /// A question dialog answered under the priority word `long-term` ([`QuestionPriority::LongTerm`]).
 pub const RULE_ANSWER_LONG_TERM: &str = "answer-long-term@v1";
@@ -819,6 +821,19 @@ fn decide_box(
             autocompact_offer(prompt, rows, ctx)
         };
         return decided_at(trace, "autocompact-offer", decision);
+    }
+    if let Some(prompt) = reading.prompt.as_ref()
+        && prompt.kind == PromptKind::AutoModeSetup
+    {
+        let decision = if !draws_claude_boxes(reading.program)
+            || reading.phase != Phase::Prompt
+            || !reading.phase_authoritative
+        {
+            Decision::escalate("no auto-mode setup offer the reader vouches for")
+        } else {
+            auto_mode_setup(prompt, rows)
+        };
+        return decided_at(trace, "auto-mode-setup", decision);
     }
     if let Some(prompt) = reading.prompt.as_ref()
         && draws_claude_boxes(reading.program)
@@ -3566,6 +3581,29 @@ fn autocompact_offer(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> D
         choice,
         guard: row_guard(title_row),
         subject,
+        unproven: None,
+    }
+}
+
+/// Claude Code's `Teach auto mode about your environment?` offer (2.1.310), answered `Not now` at
+/// every level: it puts the offer off a week and changes nothing else. `Don't show again` would
+/// turn the offer off for the person for good, and `Yes` starts a minute-long scan of the project
+/// and the person's sessions that nobody asked for.
+fn auto_mode_setup(prompt: &PromptV2, rows: &[String]) -> Decision {
+    let Some(later) = prompt.auto_mode_later() else {
+        return Decision::escalate("an auto-mode setup offer not read whole");
+    };
+    let (Some(n), Select::Digits) = (later.n, prompt.select) else {
+        return Decision::escalate("an auto-mode setup offer whose `Not now` takes no digit");
+    };
+    let Some(title_row) = aterm_phase::prompt::title_row(prompt, rows) else {
+        return Decision::escalate("the auto-mode setup offer's title is not on the screen");
+    };
+    Decision::Approve {
+        rule_id: RULE_AUTO_MODE_SETUP,
+        choice: Choice::Digit(n),
+        guard: row_guard(title_row),
+        subject: format!("{}{SUBJECT_OPTION}{}", prompt.title, later.label),
         unproven: None,
     }
 }

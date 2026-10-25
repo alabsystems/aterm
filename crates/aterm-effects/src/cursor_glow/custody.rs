@@ -706,7 +706,7 @@ impl PressCredits {
     }
 
     /// Put back what [`Self::split_off_after`] took.
-    pub(super) fn merge(&mut self, later: Self) {
+    pub(super) const fn merge(&mut self, later: Self) {
         if later.occupied == 0 {
             return;
         }

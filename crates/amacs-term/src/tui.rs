@@ -763,17 +763,20 @@ impl Tui {
         if pressed {
             self.status = None;
         }
-        let reduction =
-            match self
-                .workspace
-                .handle_input(&mut buffer.store, &mut buffer.view, input)
-            {
-                Ok(reduction) => reduction,
-                Err(error) => {
-                    self.status = Some(error_text(&error).to_string());
-                    return Ok(None);
-                }
-            };
+        let document = buffer.document;
+        let reduction = self
+            .workspace
+            .handle_input(&mut buffer.store, &mut buffer.view, input);
+        // This face has one view, already advanced by the reducer. Release its
+        // publication batch even when a macro committed before a later error.
+        let _ = self.workspace.take_commits(document);
+        let reduction = match reduction {
+            Ok(reduction) => reduction,
+            Err(error) => {
+                self.status = Some(error_text(&error).to_string());
+                return Ok(None);
+            }
+        };
         let saving = reduction
             .effects
             .iter()
@@ -1154,6 +1157,69 @@ pub fn run_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_releases_commit_projections_even_after_a_partial_macro_error() {
+        use amacs::editor::EditorCommand;
+        use aterm_tty::tty::MemTty;
+
+        // SAFETY: the test is a launcher with no untrusted input; its capability
+        // is used only for this scratch document.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let mut tui = Tui::new(
+            authority.grant(aterm_cap::Tier::Trusted),
+            Options::default(),
+        );
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("publication.txt");
+        std::fs::write(&path, "base").unwrap();
+        let mut buffer = tui.open(&Target { path, line: None }).unwrap();
+        let (mut tty, _peer) = MemTty::pair(Size { cols: 80, rows: 24 });
+        let key = |character, mods| EditorInput::Key {
+            key: Key::Character(character),
+            mods,
+            text: None,
+        };
+        let mut send = |tui: &mut Tui, buffer: &mut Buffer, input| {
+            assert!(tui.input(&mut tty, buffer, input).unwrap().is_none());
+            assert!(tui.workspace.take_commits(buffer.document).is_empty());
+        };
+
+        send(
+            &mut tui,
+            &mut buffer,
+            EditorInput::Text("seed ".to_string()),
+        );
+        assert_eq!(buffer.text().as_ref(), "seed base");
+        tui.workspace
+            .execute(
+                &mut buffer.store,
+                &mut buffer.view,
+                EditorCommand::StartMacro,
+            )
+            .unwrap();
+        send(&mut tui, &mut buffer, EditorInput::Text("x".to_string()));
+        for _ in 0..2 {
+            send(&mut tui, &mut buffer, key('/', Modifiers::CTRL));
+        }
+        tui.workspace
+            .execute(&mut buffer.store, &mut buffer.view, EditorCommand::EndMacro)
+            .unwrap();
+        assert_eq!(buffer.text().as_ref(), "base");
+        let before = buffer.store.snapshot(buffer.document).unwrap();
+
+        send(&mut tui, &mut buffer, key('x', Modifiers::CTRL));
+        send(&mut tui, &mut buffer, key('e', Modifiers::empty()));
+        let after = buffer.store.snapshot(buffer.document).unwrap();
+        assert_eq!(after.text, before.text);
+        assert!(after.seq > before.seq);
+        assert_eq!(
+            tui.status.as_deref(),
+            Some(error_text(&EditorError::NothingToUndo))
+        );
+        assert!(!tui.workspace.can_undo(buffer.document));
+        assert!(tui.workspace.can_redo(buffer.document));
+    }
 
     #[test]
     fn a_position_names_a_line_and_a_character_on_it() {

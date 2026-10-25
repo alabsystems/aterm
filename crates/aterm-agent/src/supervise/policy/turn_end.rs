@@ -9865,6 +9865,8 @@ pub struct TurnEndReading {
     pub worked_doubt: Duration,
     /// The turn ran a tool ([`aterm_phase::reader::ScreenReader::turn_ran_tools`]), read on the whole turn, or the history to its start, where it opens above the screen, or may have, neither read: work, however short ([`TurnEndState::repeats`]).
     pub ran_tools: bool,
+    /// [`Self::ran_tools`] only as may have: the turn opens above the screen and neither its whole nor the history to its start was read.
+    pub tools_unread: bool,
     pub rules: Option<String>,
     /// The `aterm:` fact the act typed here may carry ([`FACT_RIDES`],
     /// [`crate::supervise::facts`]): the session's untold one, filled by the loop only at the
@@ -10180,6 +10182,7 @@ impl TurnEndReading {
                 less(w, asleep.least).saturating_sub(less(w, asleep.most))
             }),
             ran_tools: reading.program.reader().turn_ran_tools(rows),
+            tools_unread: false,
             rules,
             fact: None,
             pending_input: claude
@@ -13567,7 +13570,8 @@ impl TurnEndState {
             None => reading,
         };
         let other_unseen;
-        let reading = if self.unseen_turn(reading) {
+        let books_turn = self.unseen_turn(reading);
+        let reading = if books_turn {
             other_unseen = TurnEndReading {
                 worked: Some(Duration::ZERO),
                 ..reading.clone()
@@ -14061,6 +14065,8 @@ impl TurnEndState {
                 self.replies_at = Some(now);
                 self.replies_reset = answer_reset;
             }
+            // A person's turn only the books show, no tool run seen (its start above an unread screen included), lifts nothing: they drive, and the hold lifts at their next turn a point sees.
+            None if books_turn && typed && (idle || reading.tools_unread) => {}
             None if awaited.is_none() && reading.worked.is_some() => {
                 self.replies = match self.replies.last() {
                     Some(k) if idle && !reading.pending_input && k.mark == reply => {

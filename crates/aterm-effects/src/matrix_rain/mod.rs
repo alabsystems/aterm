@@ -2086,22 +2086,37 @@ const THEME_HUE_MIN_CHROMA: f32 = 0.03;
 
 const THEME_HUE_FALLBACK: u32 = 0x003B_8EEA;
 
-fn theme_hue(cfg: &RainConfig) -> f32 {
-    [cfg.theme_fg, cfg.theme_accent]
-        .into_iter()
-        .map(rgb2hsv)
-        .find(|&(_, s, v)| s * v >= THEME_HUE_MIN_CHROMA)
-        .map_or_else(|| rgb2hsv(THEME_HUE_FALLBACK).0, |(h, _, _)| h)
+const fn theme_hue(cfg: &RainConfig) -> f32 {
+    let (h0, s0, v0) = rgb2hsv(cfg.theme_fg);
+    if s0 * v0 >= THEME_HUE_MIN_CHROMA {
+        return h0;
+    }
+    let (h1, s1, v1) = rgb2hsv(cfg.theme_accent);
+    if s1 * v1 >= THEME_HUE_MIN_CHROMA {
+        return h1;
+    }
+    rgb2hsv(THEME_HUE_FALLBACK).0
 }
 
-fn ramp_hue(cfg: &RainConfig) -> f32 {
+#[inline]
+const fn rem_euclid_360(x: f32) -> f32 {
+    let r = x % 360.0;
+    if r < 0.0 {
+        let s = r + 360.0;
+        if s == 360.0 { 0.0 } else { s }
+    } else {
+        r
+    }
+}
+
+const fn ramp_hue(cfg: &RainConfig) -> f32 {
     let hue = match cfg.hue {
         RainHue::Matrix => MATRIX_HUE_DEG,
         RainHue::Theme => theme_hue(cfg),
         RainHue::Custom(c) => rgb2hsv(c).0,
     };
     let diff = rgb2hsv(DIFF_GREEN).0;
-    let mut d = (hue - diff).rem_euclid(360.0);
+    let mut d = rem_euclid_360(hue - diff);
     if d > 180.0 {
         d -= 360.0;
     }
@@ -2115,34 +2130,40 @@ fn ramp_hue(cfg: &RainConfig) -> f32 {
     }
 }
 
-fn build_ramp(hue: f32, cfg: &RainConfig) -> [u32; 16] {
+const fn build_ramp(hue: f32, cfg: &RainConfig) -> [u32; 16] {
     let light_bg = relative_luminance(cfg.default_bg) > 0.5;
     let mut ramp = [0u32; 16];
-    for (i, slot) in ramp.iter_mut().enumerate() {
+    let mut i = 0;
+    while i < 16 {
         let t = i as f32 / 15.0;
         let (s, v) = if light_bg {
             (0.85 - 0.25 * t, 0.62 - 0.42 * t)
         } else {
             (0.9 - 0.55 * t * t, 0.28 + 0.72 * t)
         };
-        *slot = hsv2rgb(hue, s, v);
+        ramp[i] = hsv2rgb(hue, s, v);
+        i += 1;
     }
     ramp
 }
 
-fn luminance_match(mut ramp: [u32; 16], reference: [u32; 16]) -> [u32; 16] {
+const fn luminance_match(mut ramp: [u32; 16], reference: [u32; 16]) -> [u32; 16] {
     let table = crate::color_math::relative_luminance_table();
-    for (slot, target) in ramp.iter_mut().zip(reference.iter()) {
-        let lt = crate::color_math::relative_luminance_with(table, *target);
-        let (h, s, mut v) = rgb2hsv(*slot);
-        for _ in 0..8 {
-            let l = crate::color_math::relative_luminance_with(table, *slot);
+    let mut i = 0;
+    while i < 16 {
+        let lt = crate::color_math::relative_luminance_with(table, reference[i]);
+        let (h, s, mut v) = rgb2hsv(ramp[i]);
+        let mut step = 0;
+        while step < 8 {
+            step += 1;
+            let l = crate::color_math::relative_luminance_with(table, ramp[i]);
             if (l - lt).abs() < 0.01 {
                 break;
             }
             v = (v * (lt + 0.02) / (l + 0.02)).clamp(0.02, 1.0);
-            *slot = hsv2rgb(h, s, v);
+            ramp[i] = hsv2rgb(h, s, v);
         }
+        i += 1;
     }
     ramp
 }

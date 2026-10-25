@@ -316,6 +316,7 @@ pub fn prompt_kind_words(detail: Option<&str>) -> Option<&str> {
         "model-pick" => "model picker",
         "goal-resume" => "paused goal",
         "mcp-server" => "MCP server",
+        "auto-mode-setup" => "auto-mode setup",
         "trust" => "folder trust",
         "powershell" => "PowerShell",
         other => other,

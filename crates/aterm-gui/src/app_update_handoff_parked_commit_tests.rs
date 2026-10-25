@@ -471,6 +471,7 @@ fn note_settles_and_the_write(parked: &mut Parked) {
                 COMMIT_STEPS.with(|steps| steps.borrow_mut().push("settle"));
             },
             sync_on: || false,
+            fda_granted: || {},
         });
     parked.app.handoff_before_egress_fence = Some(Box::new(|| {
         COMMIT_STEPS.with(|steps| steps.borrow_mut().push("write"));

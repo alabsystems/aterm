@@ -214,12 +214,74 @@ enum Proc {
     Job(Job),
 }
 
+/// How an instance starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Via {
+    /// [`Instance::start`]: a child of this lab, in its coalition (the agent band).
+    Child,
+    /// [`Job::start`]: its own launchd job, a new coalition (the app band).
+    Job,
+}
+
+impl Via {
+    /// How [`Instance::start_in`] starts `l` in `band`: the app band as a job, a windowed
+    /// instance too (its keeper is the job's process), and the agent band as a child.
+    /// # Errors
+    /// A sandboxed `l` in the app band.
+    fn of(l: &Launch, band: Band) -> Result<Via, String> {
+        match band {
+            Band::Agent => Ok(Via::Child),
+            Band::App if l.sandbox.is_some() => {
+                Err("the app band starts an unsandboxed instance only".into())
+            }
+            Band::App => Ok(Via::Job),
+        }
+    }
+}
+
+/// The command line that starts `l` `via` a child or a job on the control socket `sock`, program
+/// first: a windowed instance's keeper (`keeper`, run as `keeper --`, or as `keeper --disclaim
+/// --` when it is a job's process, [`keeper_main`]), then `sandbox-exec` under `l`'s profile,
+/// then aterm, a headless one with its lifeline on stdin, and its flags.
+fn line(l: &Launch, via: Via, keeper: &Path, sock: &Path) -> Vec<String> {
+    let mut line: Vec<String> = Vec::new();
+    if !l.headless {
+        line.extend([keeper.to_string_lossy().into_owned(), "keeper".to_string()]);
+        if via == Via::Job {
+            line.push(DISCLAIM.to_string());
+        }
+        line.push("--".to_string());
+    }
+    if let Some(profile) = &l.sandbox {
+        line.extend(["/usr/bin/sandbox-exec", "-p", profile].map(str::to_string));
+    }
+    line.push(l.aterm.to_string_lossy().into_owned());
+    if l.headless {
+        line.extend([
+            "--headless".to_string(),
+            aterm_uds::lifeline::FLAG.to_string(),
+            aterm_uds::lifeline::STDIN.to_string(),
+        ]);
+    }
+    if !l.reroute {
+        line.push("--no-reroute".to_string());
+    }
+    line.extend([
+        "--control-sock".to_string(),
+        sock.to_string_lossy().into_owned(),
+    ]);
+    line.extend(l.args.iter().cloned());
+    line
+}
+
 /// A running private instance.
 pub struct Instance {
     child: Proc,
     lifeline: Option<aterm_uds::lifeline::Lifeline>,
     /// The instance's pid; a windowed one's keeper's ([`keeper_main`]).
     pub pid: i32,
+    /// It runs under a keeper (windowed): aterm is [`Instance::pid`]'s child.
+    kept: bool,
     pub aterm: PathBuf,
     /// The aterm whose `ctl` reads it (the instance's own by default).
     pub client: PathBuf,
@@ -321,30 +383,7 @@ impl Instance {
             .map_err(|e| format!("cannot share the instance log: {e}"))?;
         let (lifeline, far) = aterm_uds::lifeline::Lifeline::open(&world.dir)
             .map_err(|e| format!("the lifeline: {e}"))?;
-        let mut line: Vec<String> = Vec::new();
-        if !l.headless {
-            let exe = paths().exe.to_string_lossy().into_owned();
-            line.extend([exe, "keeper".to_string(), "--".to_string()]);
-        }
-        if let Some(profile) = &l.sandbox {
-            line.extend(["/usr/bin/sandbox-exec", "-p", profile].map(str::to_string));
-        }
-        line.push(l.aterm.to_string_lossy().into_owned());
-        if l.headless {
-            line.extend([
-                "--headless".to_string(),
-                aterm_uds::lifeline::FLAG.to_string(),
-                aterm_uds::lifeline::STDIN.to_string(),
-            ]);
-        }
-        if !l.reroute {
-            line.push("--no-reroute".to_string());
-        }
-        line.extend([
-            "--control-sock".to_string(),
-            world.sock.to_string_lossy().into_owned(),
-        ]);
-        line.extend(l.args);
+        let line = line(&l, Via::Child, &paths().exe, &world.sock);
         let (program, argv) = line.split_first().ok_or("an empty command line")?;
         let child = aterm_uds::spawnfd::command(program)
             .env_clear()
@@ -362,6 +401,7 @@ impl Instance {
             child: Proc::Child(child),
             lifeline: Some(lifeline),
             pid,
+            kept: !l.headless,
             client: l.aterm.clone(),
             aterm: l.aterm,
             sock: world.sock.clone(),
@@ -370,38 +410,24 @@ impl Instance {
         })
     }
 
-    /// [`Instance::start`] in `band`.
+    /// [`Instance::start`] in `band`. In the app band the job's process is a headless aterm, or
+    /// a windowed one's keeper, whose aterm runs in the job's coalition as its child and its own
+    /// responsible process.
     /// # Errors
-    /// As [`Instance::start`]; a windowed or sandboxed `l` in the app band; the job could not
-    /// start.
+    /// As [`Instance::start`]; a sandboxed `l` in the app band; the job could not start.
     pub fn start_in(world: &World, l: Launch, band: Band) -> Result<Instance, String> {
-        if band == Band::Agent {
+        if Via::of(&l, band)? == Via::Child {
             return Instance::start(world, l);
-        }
-        if !l.headless || l.sandbox.is_some() {
-            return Err("the app band starts a headless, unsandboxed instance only".into());
         }
         let log = world.dir.join("aterm.log");
         std::fs::File::create(&log).map_err(|e| format!("cannot create {}: {e}", log.display()))?;
-        let mut line = vec![
-            l.aterm.to_string_lossy().into_owned(),
-            "--headless".to_string(),
-            aterm_uds::lifeline::FLAG.to_string(),
-            aterm_uds::lifeline::STDIN.to_string(),
-        ];
-        if !l.reroute {
-            line.push("--no-reroute".to_string());
-        }
-        line.extend([
-            "--control-sock".to_string(),
-            world.sock.to_string_lossy().into_owned(),
-        ]);
-        line.extend(l.args);
+        let line = line(&l, Via::Job, &paths().exe, &world.sock);
         let job = Job::start(&world.dir, &line, &l.env, &l.cwd, &log)?;
         Ok(Instance {
             pid: job.pid,
             child: Proc::Job(job),
             lifeline: None,
+            kept: !l.headless,
             client: l.aterm.clone(),
             aterm: l.aterm,
             sock: world.sock.clone(),
@@ -511,6 +537,16 @@ impl Instance {
     /// Whether it still runs.
     pub fn running(&mut self) -> bool {
         self.exited().is_none()
+    }
+
+    /// aterm's own pid: [`Instance::pid`], or a windowed instance's keeper's child (`None`
+    /// while the keeper has none).
+    #[must_use]
+    pub fn aterm_pid(&self) -> Option<i32> {
+        if !self.kept {
+            return Some(self.pid);
+        }
+        aterm_uds::process::child_pids(self.pid)?.into_iter().next()
     }
 
     /// How it ended, once it has.
@@ -629,24 +665,6 @@ pub fn resolve_aterm(given: Option<String>) -> Result<PathBuf, String> {
     paths().need_aterm().map(Path::to_path_buf)
 }
 
-/// The scenes `--scene` passes to aterm as `ATERM_DEBUG_SCENE` (aterm-gui's `icon_scene`):
-/// procedural chrome icons, and a debug build's merged-deck fixture scenes read in place of the
-/// machine.
-const SCENES: [&str; 4] = ["band-icons", "deck-busy", "deck-calm", "deck-absent"];
-
-/// `--scene`'s value when it names one of [`SCENES`].
-/// # Errors
-/// The usage error naming them.
-fn scene_arg(scene: Option<String>) -> Result<Option<String>, Fail> {
-    match scene {
-        Some(s) if !SCENES.contains(&s.as_str()) => Err(Fail::usage(format!(
-            "instance: --scene takes {}, not '{s}'",
-            SCENES.join(", ")
-        ))),
-        scene => Ok(scene),
-    }
-}
-
 /// `instance`: a private aterm, headless unless `--window`, held until this command ends.
 /// # Errors
 /// Usage, or the instance could not start or answer.
@@ -665,7 +683,10 @@ pub fn cmd_instance(args: &[String]) -> Res {
     count("--lines", &lines)?;
     let font_px = take_value(&mut a, "--font-px")?;
     let scale = take_value(&mut a, "--scale")?;
-    let scene = scene_arg(take_value(&mut a, "--scene")?)?;
+    let scene = take_value(&mut a, "--scene")?;
+    if scene.as_deref().is_some_and(|s| s != "band-icons") {
+        return Err(Fail::usage("instance: --scene takes band-icons"));
+    }
     let image = take_value(&mut a, "--image")?.map(|p| from_caller(&p));
     let toml = take_values(&mut a, "--toml")?;
     let toml_after = take_values(&mut a, "--toml-after")?;
@@ -679,7 +700,7 @@ pub fn cmd_instance(args: &[String]) -> Res {
     let post = take_values(&mut a, "--post")?;
     let keep = take_flag(&mut a, "--keep");
     let window = take_flag(&mut a, "--window");
-    let band = Band::pick(take_value(&mut a, "--band")?.as_deref(), window)?;
+    let band = Band::pick(take_value(&mut a, "--band")?.as_deref())?;
     let cold = match take_value(&mut a, "--pages")?.as_deref() {
         None | Some("warm") => false,
         Some("cold") => true,
@@ -808,12 +829,24 @@ pub fn cmd_instance(args: &[String]) -> Res {
         run_verbs(&inst, &post);
         return Ok(0);
     }
-    let coalition = crate::sys::coalition_ids(inst.pid)
-        .map_or_else(|| "?".to_string(), |[resource, _]| resource.to_string());
-    let role =
-        crate::sys::darwin_role(inst.pid).map_or_else(|_| "?".to_string(), |r| r.to_string());
-    let main_pri = crate::sys::main_thread_priority(inst.pid)
-        .map_or_else(|| "?".to_string(), |p| p.to_string());
+    let aterm_pid = inst.aterm_pid();
+    let read = |figure: Option<String>| figure.unwrap_or_else(|| "?".to_string());
+    let coalition = read(
+        aterm_pid
+            .and_then(crate::sys::coalition_ids)
+            .map(|[resource, _]| resource.to_string()),
+    );
+    let role = read(aterm_pid.and_then(|p| crate::sys::darwin_role(p).ok().map(|r| r.to_string())));
+    let main_pri = read(
+        aterm_pid
+            .and_then(crate::sys::main_thread_priority)
+            .map(|p| p.to_string()),
+    );
+    let kept = if window {
+        format!(" aterm_pid={}", read(aterm_pid.map(|p| p.to_string())))
+    } else {
+        String::new()
+    };
     let pages = cold.as_ref().map_or_else(String::new, |c| {
         crate::sys::resident_pages(&c.root).map_or_else(
             |e| format!(" pages=cold resident_at_ready=? ({e})"),
@@ -821,7 +854,7 @@ pub fn cmd_instance(args: &[String]) -> Res {
         )
     });
     println!(
-        "instance pid={} sock={} band={} coalition={coalition} role={role} main_pri={main_pri}{pages}\n  drive it: {} ctl --sock {} <verb>   (image, text, send --stdin, metrics percentiles, …)\n  \
+        "instance pid={} sock={} band={} coalition={coalition} role={role} main_pri={main_pri}{kept}{pages}\n  drive it: {} ctl --sock {} <verb>   (image, text, send --stdin, metrics percentiles, …)\n  \
          world:    {}{}\n  it ends when this command does (Ctrl-C, SIGTERM)",
         inst.pid,
         inst.sock.display(),
@@ -1038,15 +1071,29 @@ enum KeeperEnd {
     Signal(i32),
 }
 
-/// The keeper of a windowed instance (`aterm-lab keeper -- <aterm> ARGS…`).
+/// `keeper`'s flag that starts its program as its own responsible process.
+const DISCLAIM: &str = "--disclaim";
+
+/// The keeper of a windowed instance (`aterm-lab keeper [--disclaim] -- <aterm> ARGS…`).
+/// `--disclaim`, an app-band job's keeper, starts aterm as its own responsible process, as
+/// launchd starts aterm.app, so macOS asks aterm's privacy questions of aterm and not of this
+/// keeper; without it aterm is charged to whatever this keeper is charged to.
 #[must_use]
 pub fn keeper_main(args: &[String]) -> i32 {
-    let Some((prog, rest)) = args
-        .iter()
-        .position(|a| a == "--")
-        .and_then(|at| args[at + 1..].split_first())
-    else {
-        eprintln!("aterm-lab keeper: usage: keeper -- PROGRAM ARGS (the lifeline on stdin)");
+    let split = args.iter().position(|a| a == "--").and_then(|at| {
+        let (flags, rest) = (&args[..at], &args[at + 1..]);
+        let disclaim = match flags {
+            [] => false,
+            [flag] if flag == DISCLAIM => true,
+            _ => return None,
+        };
+        rest.split_first()
+            .map(|(prog, rest)| (disclaim, prog, rest))
+    });
+    let Some((disclaim, prog, rest)) = split else {
+        eprintln!(
+            "aterm-lab keeper: usage: keeper [{DISCLAIM}] -- PROGRAM ARGS (the lifeline on stdin)"
+        );
         return 2;
     };
     let lifeline = match aterm_uds::lifeline::adopt(aterm_uds::lifeline::STDIN) {
@@ -1068,6 +1115,7 @@ pub fn keeper_main(args: &[String]) -> i32 {
     let mut child = match aterm_uds::spawnfd::command(prog)
         .args(rest)
         .stdin(Stdio::null())
+        .disclaim_responsibility(disclaim)
         .spawn()
     {
         Ok(c) => c,
@@ -1331,27 +1379,85 @@ mod terminal_selection_tests {
 }
 
 #[cfg(test)]
-mod scene_tests {
-    use super::{SCENES, scene_arg};
+mod launch_line_tests {
+    use super::{Band, Launch, Via, line};
+    use std::path::{Path, PathBuf};
 
+    fn launch(headless: bool) -> Launch {
+        Launch {
+            aterm: PathBuf::from("/b/aterm"),
+            headless,
+            args: vec!["--columns".into(), "200".into()],
+            env: Vec::new(),
+            cwd: PathBuf::from("/w/home"),
+            sandbox: None,
+            reroute: false,
+        }
+    }
+
+    /// `lab instance` starts a window in the app band as a job, as it does a headless instance,
+    /// and either in the agent band as its child.
     #[test]
-    fn scene_takes_the_icon_and_deck_scenes_and_names_them_otherwise() {
-        assert_eq!(scene_arg(None).ok(), Some(None));
-        for name in ["band-icons", "deck-busy", "deck-calm", "deck-absent"] {
+    fn the_app_band_starts_a_job_windowed_or_headless_and_the_agent_band_a_child() {
+        for headless in [false, true] {
+            let l = launch(headless);
+            assert_eq!(Via::of(&l, Band::App), Ok(Via::Job), "headless={headless}");
             assert_eq!(
-                scene_arg(Some(name.to_string())).ok(),
-                Some(Some(name.to_string()))
+                Via::of(&l, Band::Agent),
+                Ok(Via::Child),
+                "headless={headless}"
             );
+            let sandboxed = Launch {
+                sandbox: Some("(version 1)".into()),
+                ..l
+            };
+            assert!(
+                Via::of(&sandboxed, Band::App).is_err(),
+                "headless={headless}"
+            );
+            assert_eq!(Via::of(&sandboxed, Band::Agent), Ok(Via::Child));
         }
-        for wrong in ["deck", "deck-", "busy", "deck-hot", "Deck-busy"] {
-            let fail = scene_arg(Some(wrong.to_string())).expect_err(wrong);
-            assert_eq!(fail.code, 2, "a usage error");
-            let msg = fail.msg.unwrap_or_default();
-            assert!(msg.contains(&format!("'{wrong}'")), "{msg}");
-            for name in SCENES {
-                assert!(msg.contains(name), "{msg}");
-            }
-        }
+    }
+
+    /// An app-band job's process is its line's program: a windowed instance's keeper, so its
+    /// aterm, the keeper's child, runs in the job's coalition, and as its own responsible
+    /// process (`--disclaim`, `tests/band.rs`); a child keeper's aterm is charged as the lab is.
+    #[test]
+    fn a_windowed_line_starts_its_keeper_and_a_headless_one_aterm_on_its_lifeline() {
+        let (keeper, sock) = (Path::new("/s/aterm-lab"), Path::new("/w/run/a.sock"));
+        let tail = [
+            "--no-reroute",
+            "--control-sock",
+            "/w/run/a.sock",
+            "--columns",
+            "200",
+        ];
+        let windowed = |keeper_flags: &[&str]| -> Vec<String> {
+            ["/s/aterm-lab", "keeper"]
+                .iter()
+                .chain(keeper_flags)
+                .chain(&["--", "/b/aterm"])
+                .chain(&tail)
+                .map(|a| (*a).to_string())
+                .collect()
+        };
+        let lifeline = aterm_uds::lifeline::STDIN.to_string();
+        let headless: Vec<String> = ["/b/aterm", "--headless", aterm_uds::lifeline::FLAG]
+            .into_iter()
+            .chain([lifeline.as_str()])
+            .chain(tail)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            line(&launch(false), Via::Job, keeper, sock),
+            windowed(&["--disclaim"])
+        );
+        assert_eq!(
+            line(&launch(false), Via::Child, keeper, sock),
+            windowed(&[])
+        );
+        assert_eq!(line(&launch(true), Via::Job, keeper, sock), headless);
+        assert_eq!(line(&launch(true), Via::Child, keeper, sock), headless);
     }
 }
 

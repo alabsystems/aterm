@@ -131,7 +131,7 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
     {
         let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let _ = tl.note_harness_act("approve", "codex-alab", aterm_slog::Actor::Ctl);
-        tl.note_program_state(None);
+        tl.note_program_state(None, 1);
     }
     crate::harness_policy_verb::record_policy_move(&ctx.timeline, 2);
     let reply = crate::fabric::cmd_deliver_waking(

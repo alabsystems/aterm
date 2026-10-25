@@ -1811,6 +1811,185 @@ fn typed_in(said: &str, text: &str) -> Vec<String> {
     r
 }
 
+/// `ended(said)` with Claude Code's auto-mode setup offer drawn right on the composer, as the
+/// fullscreen renderer draws it.
+fn offer_over(said: &str) -> Vec<String> {
+    let mut r = ended(said);
+    let top = r
+        .iter()
+        .position(|row| row.starts_with('─'))
+        .expect("the composer");
+    r.splice(top..top, offer_rows());
+    r
+}
+
+/// `ended(said)` with the offer drawn under the composer's footer, as the inline renderer draws
+/// it.
+fn offer_under(said: &str) -> Vec<String> {
+    let mut r = ended(said);
+    r.push(String::new());
+    r.extend(offer_rows());
+    r
+}
+
+fn offer_rows() -> [String; 10] {
+    [
+        "─".repeat(120),
+        "  Teach auto mode about your environment?".to_string(),
+        String::new(),
+        "  Auto mode works better when it knows your environment. Takes about a minute."
+            .to_string(),
+        String::new(),
+        "  ❯ 1. Yes".to_string(),
+        "    2. Not now".to_string(),
+        "    3. Don't show again".to_string(),
+        String::new(),
+        "  Enter to confirm · Esc to cancel".to_string(),
+    ]
+}
+
+#[test]
+fn the_auto_mode_setup_offer_over_a_continuation_is_answered_and_the_continuation_typed_again() {
+    let said = "Fixed the parser; the suite is green.";
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        ended(said),
+        offer_over(said),
+        offer_over(said),
+        ended(said),
+        ended(said),
+        typed_in(said, "keep going"),
+        busy_screen(),
+        ended(STOP),
+    ]);
+    assert_eq!(
+        aterm_phase::parse_prompt_v2(&m.screens[2]).map(|p| p.kind),
+        Some(aterm_phase::PromptKind::AutoModeSetup)
+    );
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.human_seq = Some(3);
+    m.human = vec!["null"];
+    m.help = FENCED_HELP.to_string();
+    m.screen_cols.insert(6, 12);
+    m.vanish_after = Some(2);
+    let (lines, _) = watch_lines_with(&mut m, &hosted(30), |s| {
+        s.set_autocompact_settle(Duration::ZERO);
+    });
+    let writes: Vec<&String> = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("send ") || r.starts_with("key "))
+        .collect();
+    let sent = |at: u64| format!("send if-human=3 if-gen=1.{at} if=^❯\\s*$ -- keep going");
+    let title = crate::supervise::policy::row_guard("  Teach auto mode about your environment?");
+    assert_eq!(
+        writes,
+        [
+            &sent(102),
+            &format!("key if-human=3 if-gen=1.104 if={title} 2"),
+            &sent(106),
+            &"key if-human=3 if-gen=1.107 if=^❯\\x20keep\\x20going\\s*$ enter".to_string(),
+        ],
+        "{lines:#?}\n{:#?}",
+        m.requests
+    );
+    assert!(
+        lines.contains(&format!(
+            "CONTINUED seq=106 rule={RULE_CONTINUE} keep going"
+        )),
+        "{lines:#?}"
+    );
+    assert!(
+        !m.requests
+            .iter()
+            .any(|r| r.starts_with("meta set attention") && r.contains("typed, not submitted")),
+        "the box the harness answers is no person's: {:#?}",
+        m.requests
+    );
+
+    assert_eq!(
+        aterm_phase::parse_prompt_v2(&offer_under(said)).map(|p| p.kind),
+        Some(aterm_phase::PromptKind::AutoModeSetup)
+    );
+    let alike: Vec<String> = offer_under(said)
+        .into_iter()
+        .map(|r| r.replace("about your environment?", "about your project?"))
+        .collect();
+    let mut m = Mock::new(vec![busy_screen(), ended(said), alike]);
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.human_seq = Some(3);
+    m.human = vec!["null"];
+    m.help = FENCED_HELP.to_string();
+    m.vanish_after = Some(2);
+    let _ = watch_lines_with(&mut m, &hosted(30), |s| {
+        s.set_autocompact_settle(Duration::ZERO);
+    });
+    assert!(
+        m.attention
+            .as_deref()
+            .is_some_and(|a| a.contains("(typed, not submitted (")),
+        "a look-alike over the write is a person's: {:?}\n{:#?}",
+        m.attention,
+        m.requests
+    );
+    assert!(
+        !m.requests
+            .iter()
+            .any(|r| r.starts_with("key ") && r.ends_with(" 2")),
+        "{:#?}",
+        m.requests
+    );
+}
+
+/// The offer rising over the accounts probe's `/usage` takes its keys: nothing stands in the
+/// composer, so the person is not told `/usage` was left typed, and the probe is tried again.
+/// Negative controls: `/usage` standing in the composer under the offer, and a look-alike box,
+/// are left typed as before.
+#[test]
+fn the_auto_mode_setup_offer_over_the_probe_leaves_nothing_typed() {
+    let said = "Fixed the parser; the suite is green.";
+    let probe = |tag: &str, over: Vec<String>| {
+        let (dir, ledger) = ledger_at(&format!("probe-offer-{tag}"));
+        let mut m = Mock::new(vec![busy_screen(), ended(said), over]);
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.human_seq = Some(0);
+        m.help = FENCED_HELP.to_string();
+        let mut s = virtual_session(&mut m, None);
+        s.set_approval_ledger(Some(ledger.clone()));
+        let point = s.await_turn(Duration::from_secs(60)).expect("the turn end");
+        let mut heard = Heard::default();
+        let typed = s.probe_type_seen(&point, &mut heard).expect("the probe");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+        let sends = m.requests.iter().filter(|r| r.starts_with("send ")).count();
+        (typed, sends, format!("{:#?}", m.requests))
+    };
+    let (typed, sends, evidence) = probe("took", offer_over(said));
+    assert_eq!(sends, 1, "{evidence}");
+    let (why, left) = typed.expect("not entered");
+    assert!(!left, "{why}: {evidence}");
+    assert!(
+        why.contains("the auto-mode setup offer rose over the write"),
+        "{why}"
+    );
+
+    let mut standing = offer_over(said);
+    let caret = standing.iter().rposition(|r| r == "❯").expect("the caret");
+    standing[caret] = "❯ /usage".to_string();
+    let (typed, _, evidence) = probe("stands", standing);
+    assert!(typed.is_some_and(|(_, left)| left), "{evidence}");
+
+    let alike: Vec<String> = offer_under(said)
+        .into_iter()
+        .map(|r| r.replace("environment?", "project?"))
+        .collect();
+    let (typed, _, evidence) = probe("alike", alike);
+    assert!(typed.is_some_and(|(_, left)| left), "{evidence}");
+}
+
 #[test]
 fn a_fenced_host_writes_the_continuation_only_on_the_judged_screen() {
     for human_seq in [Some(0), Some(3)] {

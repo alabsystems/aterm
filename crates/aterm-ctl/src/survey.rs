@@ -362,7 +362,8 @@ fn shown(text: &str, cap: usize) -> String {
 }
 
 /// A typed-by credit within `room`, and whether the line keeps it whole: a fleet credit keeps
-/// `(node <8 hex>) over the fleet`, its host cut to fit or dropped; any other is cut at 24.
+/// `(node <8 hex>) over the fleet`, its host cut only to the room left, or dropped; any other is
+/// cut at 24.
 fn credit_shown(by: &str, room: usize) -> (String, bool) {
     const FLEET: &str = " over the fleet";
     let node = |word: &str| word.len() == 8 && word.bytes().all(|b| b.is_ascii_hexdigit());
@@ -377,7 +378,7 @@ fn credit_shown(by: &str, room: usize) -> (String, bool) {
         && let Some(short) = short.strip_suffix(')').filter(|short| node(short))
     {
         let tail = format!(" (node {short}){FLEET}");
-        let (host, width) = (shown(host, 24), room.saturating_sub(tail.len()));
+        let (host, width) = (shown(host, LINE_CHARS), room.saturating_sub(tail.len()));
         return match host.chars().count() {
             fits if fits <= width => (format!("{host}{tail}"), true),
             _ if width >= 8 => (format!("{}{tail}", fit(&host, width)), true),
@@ -399,24 +400,67 @@ fn fit(line: &str, cap: usize) -> String {
     out
 }
 
+/// `label` (`<name>[:<port>][ at <address>]`) within `cap`, cut in its name alone: the port
+/// dialled and the address the read reached stay whole.
+fn fit_place(label: &str, cap: usize) -> String {
+    let n = |s: &str| s.chars().count();
+    let front = match label.rsplit_once(" at ") {
+        Some((front, ip)) if ip.parse::<std::net::IpAddr>().is_ok() => front,
+        _ => label,
+    };
+    let name = if front.parse::<std::net::SocketAddr>().is_ok()
+        || front.parse::<std::net::IpAddr>().is_ok()
+    {
+        ""
+    } else {
+        match front.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                name
+            }
+            _ => front,
+        }
+    };
+    let (name, tail) = (
+        shown(name, HEADER_CHARS),
+        shown(&label[name.len()..], HEADER_CHARS),
+    );
+    if name.is_empty() || n(&name) + n(&tail) <= cap {
+        return format!("{name}{tail}");
+    }
+    format!("{}{tail}", fit(&name, cap.saturating_sub(n(&tail)).max(1)))
+}
+
 fn header_line(reply: &HostReply, survey: &Survey) -> String {
     let h = &survey.header;
-    let host = if reply.remote {
-        let label = shown(&reply.label, 48);
-        match h.get("host").map(|host| shown(host, 32)) {
-            Some(said)
-                if !label
-                    .to_ascii_lowercase()
-                    .starts_with(&said.to_ascii_lowercase()) =>
-            {
+    let n = |s: &str| s.chars().count();
+    let said = h.get("host").map(|host| shown(host, 32)).filter(|said| {
+        reply.remote
+            && !reply
+                .label
+                .to_ascii_lowercase()
+                .starts_with(&said.to_ascii_lowercase())
+    });
+    // A peer's `(host …)` gives way first, then its name, never the address its read reached.
+    let host_within = |cap: usize| {
+        if !reply.remote {
+            return fit(
+                &h.get("host")
+                    .map_or_else(|| reply.label.clone(), |h| shown(h, 40)),
+                cap,
+            );
+        }
+        let label = fit_place(&reply.label, HEADER_CHARS);
+        match &said {
+            Some(said) if n("fleet  (host )") + n(&label) + n(said) <= cap => {
                 format!("fleet {label} (host {said})")
             }
-            _ => format!("fleet {label}"),
+            _ => format!(
+                "fleet {}",
+                fit_place(&label, cap.saturating_sub(n("fleet ")))
+            ),
         }
-    } else {
-        h.get("host")
-            .map_or_else(|| reply.label.clone(), |h| shown(h, 40))
     };
+    let host = host_within(usize::MAX);
     let mut counts: Vec<String> = Vec::new();
     for (class, word) in [
         (Class::Asking, "asking"),
@@ -469,7 +513,6 @@ fn header_line(reply: &HostReply, survey: &Survey) -> String {
     let version = shown(h.get("version").unwrap_or("?"), 32);
     let facts = format!("{level} · {rows} sessions{counts}{capped}{siblings}{unproven}");
     let room = HEADER_CHARS - label.chars().count();
-    let n = |s: &str| s.chars().count();
     let full = format!("== {host} pid {pid} {version}{facts}");
     let bare = format!("== {host} pid {pid}{facts}");
     const NAME_KEPT: usize = 12;
@@ -479,12 +522,8 @@ fn header_line(reply: &HostReply, survey: &Survey) -> String {
         bare
     } else {
         let fixed = n("== ") + n(" pid ") + n(&pid) + n(&facts);
-        match room.checked_sub(fixed) {
-            Some(keep) if keep >= NAME_KEPT => {
-                format!("== {} pid {pid}{facts}", fit(&host, keep))
-            }
-            _ => fit(&full, room),
-        }
+        let keep = room.saturating_sub(fixed).max(NAME_KEPT);
+        fit(&format!("== {} pid {pid}{facts}", host_within(keep)), room)
     };
     format!("{head}{label}")
 }
@@ -504,7 +543,7 @@ fn sent_at_facts(survey: &Survey, s: &Fields) -> bool {
 }
 
 fn unanswered_line(label: &str, why: &str) -> String {
-    let (label, why) = (shown(label, 60), shown(why, 200));
+    let (label, why) = (fit_place(label, 60), shown(why, 200));
     let n = |s: &str| s.chars().count();
     let room =
         UNANSWERED_CHARS - UNANSWERED_FRAME.len() - UNANSWERED_JOIN.len() - TRUST_LABEL.len();
@@ -512,11 +551,17 @@ fn unanswered_line(label: &str, why: &str) -> String {
         (label, why)
     } else {
         let keep = room.saturating_sub(n(&why)).max(LABEL_KEPT).min(n(&label));
-        let why = fit(&why, room - keep);
-        (fit(&label, keep), why)
+        // An address longer than `keep` (IPv6) stays whole, and the reason gives way to it.
+        let label = fit_place(&label, keep);
+        let why = fit(&why, room.saturating_sub(n(&label)));
+        (label, why)
     };
     format!("{UNANSWERED_FRAME}{label}{UNANSWERED_JOIN}{why}{TRUST_LABEL}")
 }
+
+/// After the agent word of a row whose need is the program's own report (`needs_by=program`):
+/// the word is the program's claim, which aterm did not read off its screen.
+const OWN_REPORT: &str = " (its own report)";
 
 /// Display word for an agent state (`"prompt"` at [`Class::Asking`] renders as `"asking"`).
 #[must_use]
@@ -561,6 +606,10 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
             line.push_str(&shown(program, 16));
             line.push(' ');
             line.push_str(&shown(agent_word_shown(word, class_of(s) as u8), 24));
+            // A need the program's own report raised is its claim, and says so.
+            if s.get("needs_by") == Some("program") {
+                line.push_str(OWN_REPORT);
+            }
             if let Some(ms) = s.number("agent_ms") {
                 line.push(' ');
                 line.push_str(&age(ms));
@@ -728,7 +777,7 @@ fn tail(text: &str, cap: usize) -> String {
 }
 
 struct Excerpt {
-    /// The label: `attention`, `asked` or `said`.
+    /// The label: `attention`, `goal`, `asked` or `said`.
     word: &'static str,
     /// The record's text, decoded.
     text: String,
@@ -751,15 +800,17 @@ impl Excerpt {
 }
 
 fn excerpts(s: &Fields, facts: bool) -> Vec<Excerpt> {
-    let attention = if facts {
-        None
+    // At `facts` a reply's `attention=` and `goal=` are flags (`1`), not words.
+    let worded: &[(&str, &'static str)] = if facts {
+        &[]
     } else {
-        Some(("attention", "attention"))
+        &[("attention", "attention"), ("goal", "goal")]
     };
     let finished =
         matches!(s.get("task"), Some("done" | "exited")) || s.get("agent") == Some("idle");
-    attention
-        .into_iter()
+    worded
+        .iter()
+        .copied()
         .chain([("prompt", "asked"), ("said", "said")])
         .filter_map(|(key, word)| {
             let text = s.get(key)?;
@@ -803,7 +854,7 @@ struct Shown {
     width: usize,
 }
 
-const EVERY_EXCERPT: u8 = 0b111;
+const EVERY_EXCERPT: u8 = 0b1111;
 
 impl Shown {
     fn all(blocks: &Blocks, upto: Class, width: usize) -> Shown {
@@ -856,7 +907,7 @@ enum Unit {
 fn excerpt_rank(word: &str) -> usize {
     match word {
         "attention" => 0,
-        "said" => 1,
+        "goal" | "said" => 1,
         _ => 2,
     }
 }
@@ -1533,7 +1584,7 @@ pub(crate) fn facts_note(replies: &[HostReply]) -> Option<String> {
     let mut names: Vec<String> = facts
         .iter()
         .take(FACTS_NAMED)
-        .map(|label| shown(label, 32))
+        .map(|label| fit_place(label, 48))
         .collect();
     if n > FACTS_NAMED {
         names.push(format!("{} more", n - FACTS_NAMED));

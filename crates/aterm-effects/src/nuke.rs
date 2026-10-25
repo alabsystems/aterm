@@ -239,7 +239,7 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
                 sy: 0.15 + 0.85 * rise,
                 dy_cells: -0.35 * (t_ms.saturating_sub(CAP_BLOOM_END_MS) as f32 / 1700.0),
                 alpha: (q * 3.0).min(1.0) * fade(SKIRT_END_MS, NUKE_TOTAL_MS - SKIRT_END_MS),
-                tint: aterm_scene::mix_rgb(STEM_HOT, STEM_DUST, c),
+                tint: crate::effect_util::lerp_rgb(STEM_HOT, STEM_DUST, c),
             })
         }
         NukePart::Cap => {
@@ -259,7 +259,7 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
                 sy: (0.50 + 0.62 * bloom) * (1.0 + 0.15 * (spread - 1.0)),
                 dy_cells: -(0.90 + 0.60 * q) - 0.70 * tail,
                 alpha: (q * 4.0).min(1.0) * fade(SKIRT_END_MS, NUKE_TOTAL_MS - SKIRT_END_MS),
-                tint: aterm_scene::mix_rgb(CAP_HOT, CAP_DUST, c),
+                tint: crate::effect_util::lerp_rgb(CAP_HOT, CAP_DUST, c),
             })
         }
         NukePart::Skirt => {
@@ -299,7 +299,7 @@ pub fn nuke_core_draw(t_ms: u64) -> Option<NukeDraw> {
         sy: cap.sy * 0.52,
         dy_cells: cap.dy_cells,
         alpha: (q * 4.0).min(1.0) * die * 0.92,
-        tint: aterm_scene::mix_rgb(CORE_HOT, CAP_HOT, 0.35 + 0.45 * q),
+        tint: crate::effect_util::lerp_rgb(CORE_HOT, CAP_HOT, 0.35 + 0.45 * q),
     })
 }
 

@@ -41,6 +41,10 @@ pub struct SetupStatus {
     pub permissions: Option<InitialSetupPermissionPolicy>,
     pub busy: bool,
     pub finished: bool,
+    /// The plan in force is one aterm chose by itself, which a look that finds the ALab
+    /// signal widens (design §3.5). Filled by the worker. While it is, every group press is
+    /// sent, even one that leaves the plan as it is, so the plan becomes the person's.
+    pub provisional: bool,
     pub rows: Vec<SetupStatusRow>,
     /// The latest read-only reading of each row, keyed by subject (at most one
     /// per subject). Rows with no reading yet are absent.
@@ -65,6 +69,10 @@ pub struct SetupStatus {
     /// line and the tab's attention only once the run stops retrying it
     /// (§3.5, §3.6). Filled by the worker.
     pub retrying: bool,
+    /// The run going now is the one aterm admitted by itself on hearing the ALab vault in this
+    /// launch, which widened the plan it had chosen before (§3.5): the page says so in one calm
+    /// note while it goes. Filled by the worker, from the look that widened the plan.
+    pub widened: bool,
 }
 
 /// A read-only Check again or a Restore the window started: the worker is
@@ -137,20 +145,29 @@ impl SetupStatus {
 
     /// A Check's result belongs to the exact plan it read. The page supplies
     /// its current review; a signal without a page supplies the saved plan.
-    /// No known plan means no Check result, never a guessed default. Keep its
-    /// display words, beside the original subject name which Check prefixes.
-    fn results<'a>(
-        &'a self,
-        plan: Option<&'a Plan>,
-    ) -> impl Iterator<Item = (&'a SetupStatusRow, &'a str)> + 'a {
-        self.rows.iter().map(|row| (row, row.name.as_str())).chain(
-            self.check
-                .as_ref()
-                .filter(move |check| Some(&check.plan) == plan)
-                .into_iter()
-                .flat_map(|check| check.rows.iter())
-                .map(|row| (row, row.name.strip_prefix("Check: ").unwrap_or(&row.name))),
-        )
+    /// No known plan means no Check result, never a guessed default. Each
+    /// comes with the name the page says it under: a Check's own result has
+    /// the subject's name, without the `Check: ` its row's name opens with.
+    fn results<'a>(&'a self, plan: Option<&'a Plan>) -> impl Iterator<Item = Said<'a>> + 'a {
+        self.rows
+            .iter()
+            .map(|row| Said {
+                row,
+                name: row.name.as_str(),
+                check: false,
+            })
+            .chain(
+                self.check
+                    .as_ref()
+                    .filter(move |check| Some(&check.plan) == plan)
+                    .into_iter()
+                    .flat_map(|check| check.rows.iter())
+                    .map(|row| Said {
+                        row,
+                        name: row.name.strip_prefix("Check: ").unwrap_or(&row.name),
+                        check: true,
+                    }),
+            )
     }
 
     /// Failed results applicable to this review, whether or not the worker
@@ -161,15 +178,14 @@ impl SetupStatus {
     fn result_failures<'a>(&'a self, plan: Option<&'a Plan>) -> impl Iterator<Item = Failure> + 'a {
         let selection = plan.map_or_else(Selection::none, |plan| plan.selection);
         self.results(plan)
-            .filter(|(row, _)| matches!(row.status.as_str(), "error" | "failed"))
-            .map(|(_, name)| {
-                let (restore, name) = name
+            .filter(|result| matches!(result.row.status.as_str(), "error" | "failed"))
+            .map(|result| {
+                let (restore, name) = result
+                    .name
                     .strip_prefix(RESTORE_ROW)
-                    .map_or((false, name), |name| (true, name));
+                    .map_or((false, result.name), |name| (true, name));
                 Failure {
-                    row: Subject::all()
-                        .into_iter()
-                        .find(|subject| subject.name() == name),
+                    row: subject_named(name),
                     restore,
                 }
             })
@@ -196,24 +212,54 @@ impl SetupStatus {
         self.result_failures(plan).filter(move |_| signal)
     }
 
-    /// The notes the page shows under its headline: the results an
-    /// observation cannot say and someone should know (an action that did
-    /// not start, a stage that failed, a restore that finished), each in its
-    /// own words, then one calm line naming every setting that is back as
+    /// Whether the note for `row`, a failed result, says aterm tries it again by itself (§3.5):
+    /// the words it carries say so, or it carries none while the run retries ([`Said::words`]).
+    /// Meanwhile Set up now is no remedy the page offers for it.
+    fn retries_by_itself(&self, row: &SetupStatusRow) -> bool {
+        row.detail == RETRIES_NOTE || (row.detail.is_empty() && self.retrying)
+    }
+
+    /// The notes the page shows under its headline, in the page's own words
+    /// (§3.6): first, while a run aterm widened by itself goes, why its groups
+    /// changed ([`WIDENED_NOTE`]); then the results an observation cannot say
+    /// and someone should know (an action that did not start, a step that
+    /// failed or could not be confirmed, a restore that finished), where the
+    /// results said alike (a stage's rows, all failed) are one note naming
+    /// each row; then one calm line naming every setting that is back as
     /// saved but loads only at the next login (`login`). That line is no
     /// failure: [`Self::failed_steps`], the menu line and the tab's attention
     /// leave it out.
     fn notes(&self, plan: &Plan) -> Vec<String> {
         let mut notes = Vec::new();
+        if self.widened && self.running() {
+            notes.push(WIDENED_NOTE.to_owned());
+        }
+        // Each kind of result (whose, how it came out, the words it carries), with the
+        // names it is said for, in the order first seen.
+        let mut alike: Vec<(Said<'_>, Vec<&str>)> = Vec::new();
         let mut at_login: Vec<String> = Vec::new();
-        for (row, _) in self.results(Some(plan)) {
-            match row.status.as_str() {
-                "not started" | "error" | "failed" | "unverified" | "restored" => {
-                    notes.push(row.words());
+        for result in self.results(Some(plan)) {
+            match result.row.status.as_str() {
+                "not started" | "error" | "failed" | "unverified" | "restored" | NOTED => {
+                    match alike.iter_mut().find(|(seen, _)| seen.alike(&result)) {
+                        Some((_, names)) if !names.contains(&result.name) => {
+                            names.push(result.name);
+                        }
+                        Some(_) => {}
+                        None => alike.push((result, vec![result.name])),
+                    }
                 }
-                "login" if !at_login.contains(&row.name) => at_login.push(row.name.clone()),
+                "login" if !at_login.contains(&result.row.name) => {
+                    at_login.push(result.row.name.clone());
+                }
                 _ => {}
             }
+        }
+        for (result, names) in alike {
+            let managed = names
+                .iter()
+                .all(|name| subject_named(name).is_some_and(|row| manages(plan.selection, row)));
+            notes.push(result.words(&names, self.retrying, managed));
         }
         if !at_login.is_empty() {
             let verb = if at_login.len() == 1 { "comes" } else { "come" };
@@ -224,6 +270,27 @@ impl SetupStatus {
         }
         notes
     }
+}
+
+/// The calm note a run aterm widened by itself carries while it goes (§3.5): it heard the ALab
+/// vault, so the groups it had left as is are set up now.
+pub(crate) const WIDENED_NOTE: &str =
+    "aterm found the ALab vault on this network, so it is setting up the rest of this Mac.";
+
+/// The row the page names `name`, if one.
+fn subject_named(name: &str) -> Option<Subject> {
+    Subject::all()
+        .into_iter()
+        .find(|subject| subject.name() == name)
+}
+
+/// One result the page can say ([`SetupStatus::results`]): its row, the name the page says it
+/// under, and whether a Check took it.
+#[derive(Clone, Copy)]
+struct Said<'a> {
+    row: &'a SetupStatusRow,
+    name: &'a str,
+    check: bool,
 }
 
 /// The page's rows for what a Restore did (design §3.4), in System State's own row names,
@@ -269,12 +336,7 @@ pub fn restore_rows(outcome: &RestoreOutcome) -> Vec<SetupStatusRow> {
         });
     }
     if outcome.journal_refused {
-        rows.push(SetupStatusRow {
-            name: "Change journal".to_owned(),
-            status: "error".to_owned(),
-            detail: "It did not record every change Restore made; the changes went ahead."
-                .to_owned(),
-        });
+        rows.push(journal_note());
     }
     rows
 }
@@ -338,13 +400,55 @@ pub fn pass_rows(outcome: &PassOutcome) -> Vec<SetupStatusRow> {
         }
     }
     if rolled.journal_refused {
-        rows.push(SetupStatusRow {
-            name: "Change journal".to_owned(),
-            status: "error".to_owned(),
-            detail: "It did not record every change aterm made; the changes went ahead.".to_owned(),
-        });
+        rows.push(journal_note());
     }
     rows
+}
+
+/// The page's one calm line for a change aterm made and could not log (§3.6): the change went
+/// ahead, and nobody can act on it now, so it is no failure. The fact for later is the exceptions
+/// digest's ([`journal_refused_entry`]), and the log keeps which changes.
+fn journal_note() -> SetupStatusRow {
+    SetupStatusRow {
+        name: JOURNAL_ROW.to_owned(),
+        status: NOTED.to_owned(),
+        detail: JOURNAL_NOTE.to_owned(),
+    }
+}
+
+/// The name of the calm line for changes aterm could not log ([`journal_note`]).
+const JOURNAL_ROW: &str = "Change log";
+
+/// What the page says when aterm made a change it could not log.
+pub(crate) const JOURNAL_NOTE: &str = "Every change went ahead; aterm could not log some of them.";
+
+/// The status of a calm line the page says as it is, which is no failure.
+const NOTED: &str = "noted";
+
+/// The exceptions digest's entry for changes aterm made to this Mac and could not log (§3.6):
+/// a fact for later, never an alert, the menu line or the tab's attention. `detail` is
+/// `aterm doctor`'s line naming each change and why, which the log keeps.
+#[must_use]
+pub fn journal_refused_entry(detail: &str) -> aterm_messages::exceptions::Entry {
+    use aterm_messages::need::{Reason, Then, Why};
+    aterm_messages::exceptions::Entry::new(
+        aterm_messages::exceptions::Family::Setup,
+        "",
+        "journal",
+        "Setup changes went unlogged",
+        Why::Spent {
+            tried: Reason::new("aterm logs each change setup makes to this Mac"),
+            reason: Reason::new("some changes went ahead without their log entry"),
+        },
+        Then::step("Read aterm.log for the changes it names"),
+    )
+    .log_line(format!("System State: {detail}"))
+}
+
+/// Raise [`journal_refused_entry`] in the exceptions digest.
+#[cfg(unix)]
+pub fn note_journal_refused(detail: &str) {
+    crate::message_inbox::queue_exception(journal_refused_entry(detail));
 }
 
 /// The rows of `outcome` that came out `how`, in its order.
@@ -449,32 +553,110 @@ const UNDONE: &str = "Undo";
 /// Widgets`.
 const RESTORE_ROW: &str = "Restore: ";
 
-impl SetupStatusRow {
-    /// The note's words: `Check again did not start. Try again.`. A calm line ([`restore_rows`],
-    /// [`pass_rows`]) and a row Restore could not put back are whole sentences already.
-    fn words(&self) -> String {
-        let whole = match self.status.as_str() {
-            "restored" => true,
-            "error" | "failed" => self.name.starts_with(RESTORE_ROW),
-            _ => false,
-        };
-        if whole && !self.detail.is_empty() {
-            return self.detail.clone();
+impl Said<'_> {
+    /// A calm line ([`restore_rows`], [`pass_rows`]), a row Restore could not put back or a
+    /// setup error that carries its own words ([`STATE_UNREAD_NOTE`]), whose words are whole
+    /// sentences already, said alone: aterm could not read its saved setup, and no setup ran
+    /// to fail.
+    fn whole(&self) -> bool {
+        !self.row.detail.is_empty()
+            && match self.row.status.as_str() {
+                "restored" | NOTED => true,
+                "error" | "failed" => self.name.starts_with(RESTORE_ROW) || self.name == SETUP_ROW,
+                _ => false,
+            }
+    }
+
+    /// Whether `other` goes in the same note as this result, under its own name: they came out
+    /// alike, from a run or both from a Check, with the same words (the rows of a stage that
+    /// failed as a whole). A whole sentence is said alone.
+    fn alike(&self, other: &Self) -> bool {
+        !self.whole()
+            && !other.whole()
+            && self.check == other.check
+            && self.row.status == other.row.status
+            && self.row.detail == other.row.detail
+    }
+
+    /// The note's words for `names`, the rows said alike ([`Self::alike`]), in the page's own
+    /// terms (§3.6): what came out (`Dock failed.`, `Check again could not confirm GitHub
+    /// repositories.`, `Check again did not start.`), then the words the result carries, which
+    /// are the page's too: the worker gives the page no process, path or preference key, and
+    /// `aterm doctor` and the log keep those. A failed step of the page's own rows that carries
+    /// none says what comes next: aterm tries it again by itself while the run retries
+    /// (`retrying`), and Set up now tries it again once it no longer does, where `managed` (the
+    /// page's plan still manages them), as it starts a setup run that could not go
+    /// ([`SETUP_ROW`]) again.
+    fn words(&self, names: &[&str], retrying: bool, managed: bool) -> String {
+        if self.whole() {
+            return self.row.detail.clone();
         }
-        let what = match self.status.as_str() {
-            "not started" => format!("{} did not start.", self.name),
-            "error" | "failed" => format!("{} failed.", self.name),
-            "unverified" => format!("{} could not be confirmed.", self.name),
-            "restored" => format!("{} finished.", self.name),
-            other => format!("{}: {other}.", self.name),
+        let list = crate::toolchain_words::and_list(
+            &names
+                .iter()
+                .map(|name| {
+                    if *name == "Check" {
+                        "Check again"
+                    } else {
+                        name
+                    }
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        );
+        let status = self.row.status.as_str();
+        let what = match status {
+            "unverified" if self.check => format!("Check again could not confirm {list}."),
+            "not started" => format!("{list} did not start."),
+            "error" | "failed" => format!("{list} failed."),
+            "unverified" => format!("{list} could not be confirmed."),
+            "restored" => format!("{list} finished."),
+            other => format!("{list}: {other}."),
         };
-        if self.detail.is_empty() {
-            what
+        let step = managed || names == [SETUP_ROW];
+        let then = if !self.row.detail.is_empty() {
+            Some(self.row.detail.as_str())
+        } else if step && !self.check && matches!(status, "error" | "failed") {
+            Some(if retrying {
+                RETRIES_NOTE
+            } else {
+                SET_UP_NOW_NOTE
+            })
         } else {
-            format!("{what} {}", self.detail)
+            None
+        };
+        match then {
+            Some(then) => format!("{what} {then}"),
+            None => what,
         }
     }
 }
+
+/// The headline while rows are read: a Check going, or readings still to come.
+const CHECKING: &str = "Checking this Mac…";
+
+/// The name of the row for a setup run that could not go as a whole (its worker did not start,
+/// a pass failed before its stages): no System State row, and the note's own words.
+pub const SETUP_ROW: &str = "Setup";
+
+/// What the page says after `Check again failed.`: the button is its own remedy, and the rows
+/// keep their last readings meanwhile. The log keeps why.
+pub const CHECK_FAILED_NOTE: &str = "The rows show what aterm read before.";
+
+/// What the page says after a Restore that failed as a whole (`Restore previous settings
+/// failed.`). The log keeps why.
+pub const RESTORE_FAILED_NOTE: &str = "Press it again to try once more.";
+
+/// What the page says when aterm cannot read what it saved of this Mac's setup (its plan and
+/// last run). The log keeps why.
+pub const STATE_UNREAD_NOTE: &str = "aterm could not read what it saved about this Mac's setup.";
+
+/// What a failed step's note says while the run still tries it again by itself (§3.5).
+pub(crate) const RETRIES_NOTE: &str = "aterm tries again by itself.";
+
+/// What a failed step's note says once the run no longer retries it: the headline's Set up now
+/// runs it again (§3.2).
+pub(crate) const SET_UP_NOW_NOTE: &str = "Set up now tries again.";
 
 /// Empty preedit clears platform composition state without any typed input.
 pub(crate) const fn text_input_interacts(event: &TextInputEvent) -> bool {
@@ -766,6 +948,14 @@ fn row_view_for_source(
             };
             (RowValue::One("—".to_owned()), None, label)
         }
+        // macOS tells aterm nothing of it, and nothing in this launch can read it (Local
+        // Network): `—`, its probe's one calm note, and no check claimed, so it never holds the
+        // headline at a check nothing is making (§3.2).
+        Some(Standing::Untold) => (
+            RowValue::One("—".to_owned()),
+            None,
+            format!("{name}: not told"),
+        ),
         // A row read as wanted shows the value read, never the wanted one in
         // its place: with nothing read it is `—` beside the check.
         Some(Standing::InPlace) => match now {
@@ -953,7 +1143,7 @@ impl Headline {
                 let done = rows.iter().filter(|row| row.settled()).count();
                 format!("Setting up this Mac… {done} of {managed}")
             }
-            Some(SetupOperation::Check) => "Checking this Mac…".to_owned(),
+            Some(SetupOperation::Check) => CHECKING.to_owned(),
             Some(SetupOperation::Restore) => "Restoring previous settings…".to_owned(),
         }))
     }
@@ -971,8 +1161,8 @@ impl Headline {
                         .any(|failure| failure.row.is_none())
                         .then(|| Self::line("Setup needs attention"))
                 })
-                .unwrap_or_else(|| Self::line("Checking this Mac…")),
-            _ => Self::line("Checking this Mac…"),
+                .unwrap_or_else(|| Self::line(CHECKING)),
+            _ => Self::line(CHECKING),
         }
     }
 
@@ -1047,11 +1237,21 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     if let Some(first) = failed.first() {
         let steps = if failed.len() == 1 { "step" } else { "steps" };
         let names: Vec<&str> = failed.iter().map(|subject| subject.name()).collect();
-        // Set up now tries a failed step again, even one held after two tries:
-        // the step's own note names it.
+        // Set up now is offered only where running the plan again can change the outcome: a
+        // step the last run tried and could not finish (a change that did not take, a stage
+        // that failed, a vault try held after two), whose note says Set up now tries it again.
+        // One aterm tries again by itself says so instead, and a reading that failed by itself
+        // names its own remedy in its note (sign in, then Check again), which Set up now cannot
+        // give: Show alone takes the person there.
+        let rerun: Vec<Subject> = status
+            .results(plan)
+            .filter(|result| matches!(result.row.status.as_str(), "error" | "failed"))
+            .filter(|result| !status.retries_by_itself(result.row))
+            .filter_map(|result| subject_named(result.name))
+            .collect();
         return Headline {
             show: Some(*first),
-            start: true,
+            start: failed.iter().any(|subject| rerun.contains(subject)),
             ..Headline::line(format!(
                 "{} {steps} failed: {}",
                 failed.len(),
@@ -1063,10 +1263,22 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
         .result_failures(plan)
         .any(|failure| !failure.restore && failure.row.is_none())
     {
-        return Headline::line("Setup needs attention");
+        // A setup run that could not go (its worker did not start, a pass failed as a whole)
+        // is one Set up now starts again, as its note says, unless the run tries it again by
+        // itself; a saved setup aterm cannot read says so in its own words, and a Check that
+        // failed is pressed again where it is.
+        return Headline {
+            start: status.rows.iter().any(|row| {
+                row.name == SETUP_ROW
+                    && matches!(row.status.as_str(), "error" | "failed")
+                    && row.detail.is_empty()
+                    && !status.retries_by_itself(row)
+            }),
+            ..Headline::line("Setup needs attention")
+        };
     }
     if status.observed.is_empty() {
-        return Headline::line("Checking this Mac…");
+        return Headline::line(CHECKING);
     }
     // Past a person and a failure, a row not yet as wanted differs or waits.
     // Set up now runs the plan again, which changes the rows that differ: the
@@ -1127,11 +1339,13 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     }
     // A source change can leave just its managed rows unread. Known changes
     // and waits above stay useful, but unread rows cannot establish success.
+    // A row macOS tells nothing of (`Untold`) was read: nothing in this launch
+    // reads more of it, so it never holds the page at a check.
     if rows
         .iter()
         .any(|row| row.managed && matches!(row.standing, None | Some(Standing::Unknown)))
     {
-        return Headline::line("Checking this Mac…");
+        return Headline::line(CHECKING);
     }
     let only_permissions = rows
         .iter()
@@ -1672,6 +1886,15 @@ impl SystemStateApp {
         plan
     }
 
+    /// An ordinary reading follows current group choices and the accepted
+    /// vault source. A typed address is read only by an explicit Check or Join.
+    pub(crate) fn observation_plan(&self) -> Plan {
+        Plan {
+            vault_url: self.submitted.vault_url.clone(),
+            ..self.plan.clone()
+        }
+    }
+
     fn reviewed_row(&self, subject: Subject) -> RowView {
         row_view_for_source(
             subject,
@@ -1686,6 +1909,50 @@ impl SystemStateApp {
             .into_iter()
             .map(|subject| self.reviewed_row(subject))
             .collect()
+    }
+
+    /// The plan in force with the vault address its readings were taken for, while a draft no
+    /// reading has read is typed ([`Self::vault_draft`]); else the page's plan as reviewed.
+    fn judged_plan(&self) -> Plan {
+        let mut plan = self.reviewed_plan();
+        if let Some(observed) = self.status.observed_vault_url.as_deref().map(str::trim)
+            && self.vault_draft()
+            && observed != plan.vault_url
+        {
+            observed.clone_into(&mut plan.vault_url);
+        }
+        plan
+    }
+
+    /// The rows `plan` reads ([`Self::judged_plan`]).
+    fn judged_rows(&self, plan: &Plan) -> Vec<RowView> {
+        Subject::all()
+            .into_iter()
+            .map(|subject| {
+                row_view_for_source(subject, &self.status, plan.selection, Some(&plan.vault_url))
+            })
+            .collect()
+    }
+
+    /// The page's headline (§3.2): before the plan is known, only what is going. Nothing reads
+    /// a typed vault address until Join or Check again, so while one leaves rows unread the
+    /// headline says what the readings of the vault in force say, never that a check is going
+    /// when none is; a Check's result still belongs to its exact plan alone.
+    pub(crate) fn headline(&self) -> Headline {
+        if !self.plan_known {
+            return Headline::before_plan(&self.status);
+        }
+        let plan = self.reviewed_plan();
+        let line = headline(&self.status, &self.reviewed_rows(), Some(&plan));
+        let in_force = self.judged_plan();
+        if in_force == plan || self.status.busy || line.text != CHECKING {
+            return line;
+        }
+        let status = SetupStatus {
+            check: None,
+            ..self.status.clone()
+        };
+        headline(&status, &self.judged_rows(&in_force), Some(&in_force))
     }
 
     pub(crate) fn can_open_access(&self, access: Access) -> bool {
@@ -1825,7 +2092,9 @@ impl SystemStateApp {
     }
 
     /// Set every bit of `group` to `on`, and submit the plan when that changes
-    /// what the worker will run. Nothing while a Restore runs.
+    /// what the worker will run, or while the plan aterm chose by itself may still
+    /// widen ([`Self::may_widen`]): a group choice makes the plan the person's, even
+    /// one that returns to aterm's plan (§3.5). Nothing while a Restore runs.
     fn choose(&mut self, group: Group, on: bool) {
         if !self.plan_known || self.restoring() {
             return;
@@ -1833,7 +2102,7 @@ impl SystemStateApp {
         for setting in group.settings() {
             self.plan.selection.set(*setting, on);
         }
-        if self.plan.selection != self.next_plan().selection {
+        if self.plan.selection != self.next_plan().selection || self.may_widen() {
             let changed = self.changed_with(group.settings());
             self.apply(
                 Admission::of_gesture(self.by_person),
@@ -1841,6 +2110,14 @@ impl SystemStateApp {
                 changed,
             );
         }
+    }
+
+    /// Whether the plan in force is aterm's own, which a look that finds the ALab signal
+    /// widens: the worker says so ([`SetupStatus::provisional`]), and the startup's offer
+    /// still waiting for its answer may be. A press then is sent even where it leaves the
+    /// groups as they are, or the widen would set a group the person chose to leave as is.
+    fn may_widen(&self) -> bool {
+        self.status.provisional || self.pending()
     }
 
     /// Whether the vault's fields show: as the person last set the
@@ -1948,13 +2225,7 @@ impl SystemStateApp {
         if let Some(slug) = key.strip_prefix("system-state/headline/open/") {
             if self.plan_known
                 && let Some(access) = Access::ALL.into_iter().find(|access| access.word() == slug)
-                && headline(
-                    &self.status,
-                    &self.reviewed_rows(),
-                    Some(&self.reviewed_plan()),
-                )
-                .open
-                    == Some(access)
+                && self.headline().open == Some(access)
             {
                 self.actions.push_back(SystemStateAction::OpenAccess {
                     access,
@@ -1982,14 +2253,7 @@ impl SystemStateApp {
                 self.actions.push_back(SystemStateAction::Restore);
             }
             "system-state/headline/start"
-                if !self.status.busy
-                    && self.plan_known
-                    && headline(
-                        &self.status,
-                        &self.reviewed_rows(),
-                        Some(&self.reviewed_plan()),
-                    )
-                    .start =>
+                if !self.status.busy && self.plan_known && self.headline().start =>
             {
                 // The plan in force as it stands: nothing of the page's own.
                 self.apply(
@@ -1999,13 +2263,7 @@ impl SystemStateApp {
                 );
             }
             "system-state/headline/show" => {
-                if let Some(subject) = headline(
-                    &self.status,
-                    &self.reviewed_rows(),
-                    self.plan_known.then_some(&self.reviewed_plan()),
-                )
-                .show
-                {
+                if let Some(subject) = self.headline().show {
                     // The vault's fields sit under its row: Join, their last
                     // control, brings all of them into view.
                     let key = if subject == Subject::Setting(Setting::Secrets) && self.vault_shown()
@@ -2343,15 +2601,7 @@ impl<'a, 'b> Page<'a, 'b> {
 
     fn tree(mut self) -> UiTree {
         let (pad_x, pad_y, gap, row_h) = (self.m.pad_x, self.m.pad_y, self.m.gap, self.m.row_h);
-        let headline = if self.app.plan_known {
-            headline(
-                &self.app.status,
-                &self.rows,
-                Some(&self.app.reviewed_plan()),
-            )
-        } else {
-            Headline::before_plan(&self.app.status)
-        };
+        let headline = self.app.headline();
         let (brand, brand_h, brand_walks) = self.brand();
         let mut heading = crate::native_settings::page_heading("System State", &headline.text);
         let subtitle = heading.pop();
@@ -2796,10 +3046,12 @@ impl<'a, 'b> Page<'a, 'b> {
             ));
         }
         if headline.start {
+            // Its label is the action alone: the headline beside it already says what it is
+            // about, and VoiceOver reads them together.
             faces.push((
                 "system-state/headline/start",
-                format!("Set up now: {}", headline.text),
-                Some("Set up now"),
+                "Set up now".to_owned(),
+                None,
                 StyleRef::Accent,
                 true,
             ));
@@ -3025,18 +3277,24 @@ impl<'a, 'b> Page<'a, 'b> {
         let limit = (content - room).max(0.0);
         let mut offset = self.view.scroll.get().clamp(0.0, limit);
         // A room that shrank (as when the brand or the title comes back, or
-        // the window gets shorter) keeps in view the focused control it showed:
-        // whole, or more of it than a sliver the list leaves unpainted.
+        // the window gets shorter), or a list whose rows above it changed
+        // height (a vault row whose note leaves once a draft address is typed),
+        // keeps in view the focused control it showed: whole, or more of it
+        // than a sliver the list leaves unpainted.
         let (was, before) = (self.view.room.get(), self.view.scroll.get());
-        if room + crate::native_ui::CLIP_EDGE_EPSILON < was
-            && let Some(focus) = self.view.common.last_focus.as_ref()
-            && self.view.spans.borrow().iter().any(|span| {
-                let shown = span.bottom.min(before + was) - span.top.max(before);
-                *span.key == *focus.as_str()
-                    && shown + crate::native_ui::CLIP_EDGE_EPSILON
-                        >= crate::native_ui::LIST_PEEK_MIN.min(span.bottom - span.top)
-            })
+        const EDGE: f32 = crate::native_ui::CLIP_EDGE_EPSILON;
+        if let Some(focus) = self.view.common.last_focus.as_ref()
+            && let Some((old_top, old_bottom)) = self
+                .view
+                .spans
+                .borrow()
+                .iter()
+                .find(|span| *span.key == *focus.as_str())
+                .map(|span| (span.top, span.bottom))
             && let Some(span) = self.spans.iter().find(|span| *span.key == *focus.as_str())
+            && (room + EDGE < was || (span.top - old_top).abs() > EDGE)
+            && old_bottom.min(before + was) - old_top.max(before) + EDGE
+                >= crate::native_ui::LIST_PEEK_MIN.min(old_bottom - old_top)
         {
             offset = whole_at(offset, room, span.top, span.bottom).clamp(0.0, limit);
         }
@@ -4172,15 +4430,20 @@ fn rule(key: String) -> UiNode {
 }
 
 /// The page's scenarios for looking at it without a Mac to set up
-/// (`ATERM_DEV_SYSTEM_STATE_FIXTURE`): `checking`, `running`, `debugger`,
-/// `needs-you`, `vault`, `set-up`, `non-alab`, `failed`, `check-failed`, `mixed`,
-/// `named-result-failed`, `restore-at-login`, `restore-blocked`, `vault-source-mismatch`,
-/// `plan-unread` and `fresh`.
+/// (`ATERM_DEV_SYSTEM_STATE_FIXTURE`): `checking`, `running`, `widened`, `debugger`,
+/// `needs-you`, `vault`, `vault-unreached`, `vault-not-syncing`, `vault-not-set-up`,
+/// `sync-off`, `vault-failed`, `set-up`, `non-alab`, `widen-stopped`, `failed`,
+/// `check-failed`, `check-unconfirmed`, `mixed`, `named-result-failed`, `restore-at-login`,
+/// `restore-blocked`, `restore-unlogged`, `vault-source-mismatch`, `plan-unread` and `fresh`.
+/// Each draws only what the worker gives the page: the readings `init_observe` and the
+/// worker's probes make, and the rows a run, a Check or a Restore reports.
 /// Debug and dev-seam builds only: a release build carries none of
 /// their words.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
-    use Standing::{AtLogin, Differs, Failed, InPlace, NeedsYou, NotNeeded, Unknown, Waiting};
+    use Standing::{
+        AtLogin, Differs, Failed, InPlace, NeedsYou, NotNeeded, Unknown, Untold, Waiting,
+    };
     use aterm_types::macos_setup::until_login;
     let read = |subject: Subject, standing: Standing, now: Option<&str>| Observation {
         subject,
@@ -4227,6 +4490,12 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
         }
         all
     };
+    // Local Network as `access::observation` reads it where no LAN look has answered aterm
+    // (no ALab vault on this network, or none asked in this launch): macOS tells apps nothing.
+    let untold_lan = || Observation {
+        note: Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD.to_owned()),
+        ..access(Access::LocalNetwork, Untold, None)
+    };
     // The repositories as `init_observe` reads them before the vault has
     // put a GitHub token on this Mac: no count, and the reason in its note.
     let token_waiting = || Observation {
@@ -4245,9 +4514,9 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.plan = None;
             status.observed_vault_url = None;
             status.rows.push(SetupStatusRow {
-                name: "Setup".into(),
+                name: SETUP_ROW.into(),
                 status: "failed".into(),
-                detail: "The saved setup plan could not be read.".into(),
+                detail: STATE_UNREAD_NOTE.into(),
             });
         }
         "vault-source-mismatch" => {
@@ -4266,21 +4535,27 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             );
         }
         "check-failed" => {
+            // A Check that failed as a whole: the rows keep their last readings.
             status.observed = in_place();
             status.check = Some(SetupCheck {
                 plan: all,
-                rows: vec![
-                    SetupStatusRow {
-                        name: "Check".into(),
-                        status: "failed".into(),
-                        detail: "The saved setup state could not be read. Check again.".into(),
-                    },
-                    SetupStatusRow {
-                        name: "Check: GitHub repositories".into(),
-                        status: "unverified".into(),
-                        detail: "GitHub did not answer.".into(),
-                    },
-                ],
+                rows: vec![SetupStatusRow {
+                    name: "Check".into(),
+                    status: "failed".into(),
+                    detail: CHECK_FAILED_NOTE.into(),
+                }],
+            });
+        }
+        "check-unconfirmed" => {
+            // A Check whose repositories stage gave no answer: the page says it under its row.
+            status.observed = in_place();
+            status.check = Some(SetupCheck {
+                plan: all,
+                rows: vec![SetupStatusRow {
+                    name: "Check: GitHub repositories".into(),
+                    status: "unverified".into(),
+                    detail: String::new(),
+                }],
             });
         }
         "running" => {
@@ -4293,7 +4568,9 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.observed = with(
                 in_place(),
                 vec![
-                    access(Access::LocalNetwork, Differs, None),
+                    // macOS tells an app nothing of its Local Network switch: unread until
+                    // something on this network answers.
+                    access(Access::LocalNetwork, Unknown, None),
                     setting(Setting::Dock, Differs, Some("9 apps")),
                     setting(Setting::Messages, Differs, Some("Signed in")),
                     setting(Setting::FaceTime, Differs, Some("Signed in")),
@@ -4313,46 +4590,89 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                  administrator password in a dialog named SamplingTools."
                     .to_owned(),
             );
-            status.observed = with(
-                in_place(),
-                vec![debugger, access(Access::LocalNetwork, Differs, None)],
-            );
+            status.observed = with(in_place(), vec![debugger]);
         }
         "needs-you" => {
             // Each reason where its probe puts it: a grant's in the
             // description, Developer Tools' and the vault's code in the note.
-            let mut fda = access(Access::FullDiskAccess, NeedsYou, Some("Off"));
-            fda.detail =
-                Some("Switch on aterm in Privacy & Security ▸ Full Disk Access.".to_owned());
+            let mut fda = access(Access::FullDiskAccess, NeedsYou, Some("Not confirmed"));
+            fda.detail = Some(
+                "Full Disk Access keeps macOS from interrupting programs you run here with \
+                 privacy dialogs. Only you can switch it on, in System Settings."
+                    .to_owned(),
+            );
             let mut tools = access(Access::DeveloperTools, Waiting, None);
             tools.note = Some("Readable once Full Disk Access is on".to_owned());
             let mut vault = setting(Setting::Secrets, NeedsYou, Some("Awaiting code"));
             vault.note = Some("Approve on an admin Mac: 7QK2-M9WD-4HTX-PL3B".to_owned());
-            status.observed = with(
-                in_place(),
-                vec![
-                    fda,
-                    tools,
-                    access(Access::LocalNetwork, Differs, None),
-                    vault,
-                ],
-            );
+            status.observed = with(in_place(), vec![fda, tools, vault]);
         }
         "vault" => {
-            // The vault waits for an address or a password: its fields show.
+            // No vault answers on this network: the vault waits for an address, which its
+            // disclosure's fields take, and the repositories for its token.
+            let mut vault = setting(Setting::Secrets, Waiting, Some("Not joined"));
+            vault.note = Some("No vault on this network".to_owned());
+            status.observed = with(in_place(), vec![vault, token_waiting()]);
+        }
+        "vault-unreached" => {
+            // Idle after a run whose vault did not answer: the worker tries again by itself
+            // when this Mac's network changes, so nothing is a failure meanwhile.
+            status.retrying = true;
+            let mut vault = setting(Setting::Secrets, Waiting, Some("Not joined"));
+            vault.note = Some("The ALab vault did not answer on this network".to_owned());
             status.observed = with(
                 in_place(),
                 vec![
-                    setting(Setting::Secrets, NeedsYou, Some("Not joined")),
+                    access(Access::LocalNetwork, Unknown, None),
+                    vault,
                     token_waiting(),
                 ],
             );
         }
-        "set-up" => {
-            // Trackpad scrolling, set in this login session, is in full use from the next.
+        "vault-not-syncing" => {
+            let mut vault = setting(Setting::Secrets, Differs, Some("Not syncing"));
+            vault.note = Some("The sync is not running; Set up now starts it".to_owned());
+            status.observed = with(in_place(), vec![vault]);
+        }
+        "vault-not-set-up" => {
+            let mut vault = setting(Setting::Secrets, Differs, Some("Not set up"));
+            vault.note = Some("Not set up to sync this Mac; Set up now installs it".to_owned());
+            status.observed = with(in_place(), vec![vault]);
+        }
+        "sync-off" => {
+            // The person turned sync off: their choice is the row's wanted value.
+            let mut vault = setting(Setting::Secrets, InPlace, Some("Sync off"));
+            "Sync off".clone_into(&mut vault.wanted);
+            vault.note = Some("You turned sync off on this Mac".to_owned());
+            status.observed = with(in_place(), vec![vault]);
+        }
+        "vault-failed" => {
+            // A join the vault refused, as the worker's page says it while it tries again by
+            // itself: the vault's row, in the page's words.
+            status.retrying = true;
             status.observed = with(
                 in_place(),
-                vec![setting(Setting::TrackpadScrolling, AtLogin, Some("All on"))],
+                vec![
+                    setting(Setting::Secrets, Differs, Some("Not joined")),
+                    token_waiting(),
+                ],
+            );
+            status.rows = vec![SetupStatusRow {
+                name: Setting::Secrets.name().into(),
+                status: "error".into(),
+                detail: RETRIES_NOTE.into(),
+            }];
+        }
+        "set-up" => {
+            // Trackpad scrolling, set in this login session, is in full use from the next.
+            // Local Network reads as `access::observation` reads it where no LAN look has
+            // answered aterm: macOS tells apps nothing of it.
+            status.observed = with(
+                in_place(),
+                vec![
+                    setting(Setting::TrackpadScrolling, AtLogin, Some("All on")),
+                    untold_lan(),
+                ],
             );
         }
         "non-alab" => {
@@ -4363,6 +4683,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 in_place(),
                 vec![
                     access(Access::Accessibility, NotNeeded, None),
+                    untold_lan(),
                     setting(Setting::CapsLock, Differs, Some("Caps Lock")),
                     setting(Setting::NaturalScrolling, Differs, Some("On")),
                     setting(Setting::Desktop, Differs, Some("Icons hidden")),
@@ -4371,6 +4692,42 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                     setting(Setting::Messages, Differs, Some("Signed in")),
                     setting(Setting::FaceTime, Differs, Some("Signed in")),
                     setting(Setting::Spotlight, Differs, Some("Docs indexed")),
+                    setting(Setting::Secrets, Differs, Some("Not joined")),
+                    setting(Setting::Repositories, Unknown, None),
+                ],
+            );
+        }
+        "widened" => {
+            // A run aterm widened by itself on hearing the ALab vault on this network: its
+            // note says why the groups changed while it goes.
+            status.busy = true;
+            status.widened = true;
+            status.running = vec![Setting::CapsLock];
+            status.observed = with(
+                in_place(),
+                vec![
+                    setting(Setting::CapsLock, Differs, Some("Caps Lock")),
+                    setting(Setting::Dock, Differs, Some("14 apps")),
+                    setting(Setting::Messages, Differs, Some("Signed in")),
+                    setting(Setting::FaceTime, Differs, Some("Signed in")),
+                    setting(Setting::Secrets, Differs, Some("Not joined")),
+                    token_waiting(),
+                ],
+            );
+        }
+        "widen-stopped" => {
+            // A Stop pressed as aterm widened the plan: the plan stays as it was, Permissions
+            // alone, and the rest is left as is though the ALab vault answers here.
+            let mut selection = Selection::none();
+            selection.set(Setting::Permissions, true);
+            status.plan = Some(Plan::from(selection));
+            status.observed = with(
+                in_place(),
+                vec![
+                    setting(Setting::CapsLock, Differs, Some("Caps Lock")),
+                    setting(Setting::Dock, Differs, Some("14 apps")),
+                    setting(Setting::Messages, Differs, Some("Signed in")),
+                    setting(Setting::FaceTime, Differs, Some("Signed in")),
                     setting(Setting::Secrets, Differs, Some("Not joined")),
                     setting(Setting::Repositories, Unknown, None),
                 ],
@@ -4387,10 +4744,12 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
         }
         "named-result-failed" => {
             status.observed = in_place();
+            // The repositories stage failed as a whole: the worker's page says it under its row,
+            // with no words of the stage's own.
             status.rows = vec![SetupStatusRow {
                 name: "GitHub repositories".into(),
                 status: "error".into(),
-                detail: "GitHub did not answer. Check again.".into(),
+                detail: String::new(),
             }];
         }
         "restore-at-login" => {
@@ -4437,11 +4796,17 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             let mut accessibility = access(Access::Accessibility, NotNeeded, None);
             accessibility.detail =
                 Some("Only the Messages and FaceTime sign-outs need it.".to_owned());
+            // Permissions are managed, so a grant that is off needs the person.
+            let mut debugger = access(Access::Debugger, NeedsYou, Some("Off"));
+            debugger.detail = Some(
+                "Turning it on lets debuggers attach without a password. macOS asks for an \
+                 administrator password in a dialog named SamplingTools."
+                    .to_owned(),
+            );
             status.observed = with(
                 in_place(),
                 vec![
-                    access(Access::Debugger, Differs, Some("Off")),
-                    access(Access::LocalNetwork, Differs, None),
+                    debugger,
                     accessibility,
                     setting(Setting::NaturalScrolling, Differs, Some("On")),
                     setting(Setting::TrackpadScrolling, Differs, Some("Some off")),
@@ -4488,6 +4853,28 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 ]
                 .map(|(setting, put_back)| (Some(setting), put_back)),
             ));
+        }
+        "restore-unlogged" => {
+            // A Restore that put everything back and whose change log refused a record: one
+            // calm line, no failure.
+            status.plan = Some(restored(Selection::all()));
+            status.finished = true;
+            status.observed = with(
+                in_place(),
+                vec![
+                    setting(Setting::Desktop, Differs, Some("Icons hidden")),
+                    setting(Setting::Dock, Differs, Some("9 apps")),
+                ],
+            );
+            let mut outcome = RestoreOutcome::of(
+                [
+                    (Setting::Desktop, PutBack::Back),
+                    (Setting::Dock, PutBack::Back),
+                ]
+                .map(|(setting, put_back)| (Some(setting), put_back)),
+            );
+            outcome.journal_refused = true;
+            status.rows = restore_rows(&outcome);
         }
         "fresh" => {
             // A fresh Mac as the Plan pass reads it, every group set up: most

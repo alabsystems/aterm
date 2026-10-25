@@ -359,6 +359,7 @@ fn ghost_glyphs(
         },
         &mut top,
         None,
+        None,
     );
     let (first, end) = top.ghost.expect("the ghost is drawn");
     top.cells

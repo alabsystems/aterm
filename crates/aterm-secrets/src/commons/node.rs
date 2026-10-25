@@ -374,6 +374,25 @@ impl Node {
         Ok(plain)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn history_file_key(
+        &self,
+        identity: &Identity,
+    ) -> Result<zeroize::Zeroizing<[u8; 16]>> {
+        age::authenticated_file_key(identity, &self.ciphertext)
+            .map_err(|_| Error::new("historical control file key could not be opened"))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn open_history_key(&self, key: &[u8; 16]) -> Result<SecretBytes> {
+        let plain = age::decrypt_file_key(key, &self.ciphertext)
+            .map_err(|_| Error::new("historical control payload could not be authenticated"))?;
+        if plain.len() > MAX_PAYLOAD {
+            return Err(Error::new("control plaintext exceeds its bound"));
+        }
+        Ok(plain)
+    }
+
     /// Each content-addressed control event occupies one one-record stream.
     /// Control conflicts are competing DAG heads, independent of actor clocks.
     #[cfg(unix)]

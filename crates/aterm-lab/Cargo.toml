@@ -22,6 +22,9 @@ path = "src/main.rs"
 # a client process per read. And the shipped price table and its loader
 # (`harness::spend`), which `prices` sets against a build's own catalog.
 aterm-agent = { workspace = true }
+# The control protocol's reply bound, shared by inline trail image validation.
+# Already in the build graph through aterm-agent.
+aterm-types = { workspace = true }
 # The one spawn seam (`spawnfd::command`: posix_spawn, `setsid` as a spawn
 # attribute) and the lifeline a throwaway instance watches.
 aterm-uds = { workspace = true }

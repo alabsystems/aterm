@@ -240,7 +240,19 @@ pub(crate) fn kept_flags(
     argv: &[String],
     keep: impl Fn(&str, &[String]) -> bool,
 ) -> Result<Vec<String>, ArgvRefusal> {
-    let mut kept: Vec<String> = Vec::new();
+    let (mut root, child) = kept_flag_levels(argv, keep)?;
+    root.extend(child);
+    Ok(root)
+}
+
+/// The same flag read as [`kept_flags`], retaining the root and resume/fork
+/// command levels so the record's relaunch keeps each override in its scope.
+fn kept_flag_levels(
+    argv: &[String],
+    keep: impl Fn(&str, &[String]) -> bool,
+) -> Result<(Vec<String>, Vec<String>), ArgvRefusal> {
+    let mut root = Vec::new();
+    let mut child = Vec::new();
     let mut subcommand: Option<&str> = None;
     let mut i = 1;
     let mut positional_only = false;
@@ -300,20 +312,34 @@ pub(crate) fn kept_flags(
             }
         }
         if fate == Fate::Keep && keep(&name, &argv[start..i]) {
+            let kept = if matches!(subcommand, Some("resume" | "fork")) {
+                &mut child
+            } else {
+                &mut root
+            };
             kept.extend(argv[start..i].iter().cloned());
         }
     }
-    Ok(kept)
+    Ok((root, child))
 }
 
-/// The argv rewrite for Codex.
+/// The argv rewrite for Codex: root flags stay before `resume`, child flags
+/// after it. With no thread, the kept flags alone retain their launch order.
 ///
 /// # Errors
 /// An unknown flag, or a value attached to a flag that takes none
 /// ([`ArgvRefusal::UnknownFlag`]), or a session not resumable in place
 /// ([`ArgvRefusal::NotResumable`]: `exec`, `--remote`, `--worktree`, …).
 pub fn rewrite_argv(argv: &[String], thread: Option<&str>) -> Result<Vec<String>, ArgvRefusal> {
-    Ok(resume_words(kept_flags(argv, |_, _| true)?, thread))
+    let (mut root, child) = kept_flag_levels(argv, |_, _| true)?;
+    if thread.is_some() {
+        root.push("resume".to_string());
+    }
+    root.extend(child);
+    if let Some(thread) = thread {
+        root.push(thread.to_string());
+    }
+    Ok(root)
 }
 
 /// `resume <kept> <thread>`, or the kept flags alone with no thread.

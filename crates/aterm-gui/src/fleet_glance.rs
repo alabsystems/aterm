@@ -37,8 +37,10 @@ pub(crate) struct FleetNeed {
     pub(crate) worker_of: Option<String>,
     /// How long ago the fact it stands on moved, as of the read.
     pub(crate) age_ms: Option<u64>,
-    /// The need's own words where the peer serves content ([`content_what`]): an ask's text, a box's kind, a wall's kind and reset.
+    /// The need's own words where the peer serves content ([`content_what`]): an ask's text, a box's kind, a wall's kind and reset; at any level, the words of a need the row says is the program's own report (`claim`).
     pub(crate) what: Option<String>,
+    /// The need's words where the row says it is the program's own report (`needs_by=program`, [`crate::needs::claim_words_of_row`]): aterm's fixed words, no content of the peer's.
+    pub(crate) claim: Option<&'static str>,
 }
 
 /// One session on a fleet peer that this Mac holds over the fleet.
@@ -402,6 +404,9 @@ fn mac_of(
             NeedWord::Frozen | NeedWord::Stopped if !agent => None,
             _ => Some("agent_ms"),
         };
+        let claim = (field(row, "needs_by") == Some("program"))
+            .then(|| crate::needs::claim_words_of_row(need, field(row, "agent")))
+            .flatten();
         mac.needs.push(FleetNeed {
             sid: sid.to_string(),
             word: need,
@@ -412,7 +417,10 @@ fn mac_of(
             age_ms: age_key
                 .and_then(|key| field(row, key))
                 .and_then(|ms| ms.parse().ok()),
-            what: content.then(|| content_what(need, row)).flatten(),
+            what: claim
+                .map(str::to_string)
+                .or_else(|| content.then(|| content_what(need, row)).flatten()),
+            claim,
         });
     }
     mac
@@ -889,6 +897,7 @@ pub(crate) fn escalation(mac: &FleetMac, need: &FleetNeed) -> crate::status_item
         label: format!("{} \u{b7} {} \u{2014} {what}", mac.name, need.who),
         body: crate::needs::fold_clip(&format!("{} \u{b7} {}: {what}", mac.name, need.who), 120),
         headline: crate::status_item::headline(need.word),
+        report: None,
     }
 }
 

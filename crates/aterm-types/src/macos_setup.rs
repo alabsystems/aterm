@@ -355,13 +355,20 @@ pub enum Standing {
     Unknown,
     /// Does not apply on this Mac.
     NotNeeded,
+    /// macOS tells aterm nothing of it, and nothing in this launch can read it (Local Network,
+    /// whose switch macOS does not report to an app): shown as `—` with its note, and settled,
+    /// since no step aterm or a person takes now gives the page more to say.
+    Untold,
 }
 
 impl Standing {
     /// Whether the row counts as in place for the page's "N of M" count.
     #[must_use]
     pub const fn settled(self) -> bool {
-        matches!(self, Self::InPlace | Self::AtLogin | Self::NotNeeded)
+        matches!(
+            self,
+            Self::InPlace | Self::AtLogin | Self::NotNeeded | Self::Untold
+        )
     }
 
     /// Whether the row needs a person, or failed: the only states that may
@@ -371,6 +378,14 @@ impl Standing {
         matches!(self, Self::NeedsYou | Self::Failed)
     }
 }
+
+/// The Local Network row's note when nothing says whether aterm may use the local network
+/// ([`Standing::Untold`]): macOS does not tell apps (design §3.3).
+pub const LOCAL_NETWORK_UNTOLD: &str = "macOS does not tell apps whether it is on";
+
+/// The Local Network row's note once the window raised macOS's question in this approval and
+/// nothing since says how it was answered ([`Standing::Untold`]).
+pub const LOCAL_NETWORK_ASKED: &str = "macOS asked you, and does not tell apps your answer";
 
 /// One read-only observation of one row. `now` is `None` when nothing could be
 /// read; a guessed value is never shown.
@@ -1403,12 +1418,13 @@ mod tests {
             Standing::Failed,
             Standing::Unknown,
             Standing::NotNeeded,
+            Standing::Untold,
         ] {
             assert_eq!(
                 standing.settled(),
                 matches!(
                     standing,
-                    Standing::InPlace | Standing::AtLogin | Standing::NotNeeded
+                    Standing::InPlace | Standing::AtLogin | Standing::NotNeeded | Standing::Untold
                 )
             );
             assert_eq!(

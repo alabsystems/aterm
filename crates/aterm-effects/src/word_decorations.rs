@@ -14,14 +14,15 @@ use aterm_hash::{FNV64_OFFSET, FxHashMap, KeyedHashMap, fnv_mix_u64, fnv1a_64};
 use aterm_lexicon::{Class, FormId, LangSet, Lexicon, Match, ScanOptions, ScanScratch};
 use aterm_render::sprites::{FreeSprite, FreeZ};
 use aterm_render::{DecoBlend, DecoGlyph, GlowQuad, InkCell, WordDecoration};
+use aterm_scene::smoothstep;
 use aterm_scene::vector::FIXED_ONE;
-use aterm_scene::{mix_rgb, smoothstep};
 
 use crate::animal_baker::{AnimalBakeKey, AnimalBaker};
 use crate::animal_glyphs_gen::{ANIMAL_GLYPHS, AnimalGlyphId, animal_glyph_from_key};
 use crate::cat_baker::{BakeKeyV4, CatBaker, CatColorKey, CatTile, EyesFrame, PATCH_STRIP};
 use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, GlyphDef};
 use crate::color_math::{hsv2rgb, hue_nudge, relative_luminance};
+use crate::effect_util::lerp_rgb as mix_rgb;
 use crate::genome::{
     self, CatAge, Genome, NovaFeatures, NovaMagic, VoteScratch, accessory_variant_v4, cat_age_v4,
     cat_fills_v4, cat_magic, cat_variant_v4, mix, nova_duration_ms, nova_features, nova_magic,
@@ -1027,35 +1028,37 @@ impl DoneMarkLru {
     }
 
     #[inline]
-    fn detach(&mut self, idx: u32) -> u8 {
-        let node = self.nodes[idx as usize];
+    const fn detach(&mut self, idx: u32) -> u8 {
+        let nodes = self.nodes.as_mut_slice();
+        let node = nodes[idx as usize];
         let mut writes = 0u8;
         if node.older == DONE_MARK_NONE {
             self.oldest = node.newer;
         } else {
-            self.nodes[node.older as usize].newer = node.newer;
+            nodes[node.older as usize].newer = node.newer;
             writes += 1;
         }
         if node.newer == DONE_MARK_NONE {
             self.newest = node.older;
         } else {
-            self.nodes[node.newer as usize].older = node.older;
+            nodes[node.newer as usize].older = node.older;
             writes += 1;
         }
-        self.nodes[idx as usize].older = DONE_MARK_NONE;
-        self.nodes[idx as usize].newer = DONE_MARK_NONE;
+        nodes[idx as usize].older = DONE_MARK_NONE;
+        nodes[idx as usize].newer = DONE_MARK_NONE;
         writes + 2
     }
 
     #[inline]
-    fn attach_newest(&mut self, idx: u32) -> u8 {
+    const fn attach_newest(&mut self, idx: u32) -> u8 {
+        let nodes = self.nodes.as_mut_slice();
         let mut writes = 2u8;
-        self.nodes[idx as usize].older = self.newest;
-        self.nodes[idx as usize].newer = DONE_MARK_NONE;
+        nodes[idx as usize].older = self.newest;
+        nodes[idx as usize].newer = DONE_MARK_NONE;
         if self.newest == DONE_MARK_NONE {
             self.oldest = idx;
         } else {
-            self.nodes[self.newest as usize].newer = idx;
+            nodes[self.newest as usize].newer = idx;
             writes += 1;
         }
         self.newest = idx;
@@ -1989,7 +1992,7 @@ impl WordDecorations {
 
     /// The flying cursor kitty's dest rect for `layout`, from the emitter's own sizing and placement math.
     #[must_use]
-    pub fn kitty_cursor_footprint(&self, layout: KittyCursorLayout) -> Option<CatFootprint> {
+    pub const fn kitty_cursor_footprint(&self, layout: KittyCursorLayout) -> Option<CatFootprint> {
         let KittyCursorLayout {
             geom,
             cursor: (crow, ccol),
@@ -2000,37 +2003,65 @@ impl WordDecorations {
         if self.kitty_disabled || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
         }
-        let ch = usize::from(geom.cell_h);
+        let ch = geom.cell_h as usize;
         let slot_w = 4 * ch;
         let slot_h = 2 * ch;
-        let (w, h) = if let Some(cust) = self.kitty_custom.as_ref() {
-            let (nw, nh) = (usize::from(cust.w).max(1), usize::from(cust.h).max(1));
-            let max_h = (ch * 9 / 5).clamp(1, slot_h);
+        let (w, h) = if let Some(cust) = &self.kitty_custom {
+            let nw = if cust.w > 1 { cust.w as usize } else { 1 };
+            let nh = if cust.h > 1 { cust.h as usize } else { 1 };
+            let raw_max_h = ch * 9 / 5;
+            let max_h = if raw_max_h < 1 {
+                1
+            } else if raw_max_h > slot_h {
+                slot_h
+            } else {
+                raw_max_h
+            };
             let s = (slot_w as f32 / nw as f32).min(max_h as f32 / nh as f32);
+            let rw = (nw as f32 * s).round() as usize;
+            let rh = (nh as f32 * s).round() as usize;
             (
-                ((nw as f32 * s).round() as usize).clamp(1, slot_w) as u16,
-                ((nh as f32 * s).round() as usize).clamp(1, slot_h) as u16,
+                (if rw < 1 {
+                    1
+                } else if rw > slot_w {
+                    slot_w
+                } else {
+                    rw
+                }) as u16,
+                (if rh < 1 {
+                    1
+                } else if rh > slot_h {
+                    slot_h
+                } else {
+                    rh
+                }) as u16,
             )
         } else {
             let look = look.normalized();
-            let desired_h = Self::COMPANION_CELL_H * f32::from(geom.cell_h) * look.age.scale();
+            let desired_h = Self::COMPANION_CELL_H * (geom.cell_h as f32) * look.age.scale();
             authored_cat_size(look.variant, desired_h, geom.cell_h)
         };
-        let cw = i32::from(geom.cell_w);
-        let ch_i = i32::from(geom.cell_h);
-        let grid_w = i32::from(geom.cols).saturating_mul(cw);
-        let cursor_right = i32::from(ccol).saturating_add(1).saturating_mul(cw);
+        let cw = geom.cell_w as i32;
+        let ch_i = geom.cell_h as i32;
+        let grid_w = (geom.cols as i32).saturating_mul(cw);
+        let cursor_right = (ccol as i32).saturating_add(1).saturating_mul(cw);
         let lead = Self::kitty_cursor_lead_px(geom.cell_w);
-        let x = cursor_right
-            .saturating_add(lead)
-            .min(grid_w.saturating_sub(i32::from(w)));
+        let x_cand = cursor_right.saturating_add(lead);
+        let x_max = grid_w.saturating_sub(w as i32);
+        let x = if x_cand < x_max { x_cand } else { x_max };
         if x < 0 {
             return None;
         }
-        let rest_top = i32::from(crow) * ch_i + ch_i / 2 - i32::from(h) / 2;
+        let rest_top = (crow as i32) * ch_i + ch_i / 2 - (h as i32) / 2;
         let intrusion = cursor_right - x;
         let rise = if intrusion > 0 {
-            intrusion.min(ch_i / 2).min(rest_top.max(0))
+            let r0 = if intrusion < ch_i / 2 {
+                intrusion
+            } else {
+                ch_i / 2
+            };
+            let r_max = if rest_top > 0 { rest_top } else { 0 };
+            if r0 < r_max { r0 } else { r_max }
         } else {
             0
         };
@@ -2038,8 +2069,14 @@ impl WordDecorations {
         // starts above the grid, where a pane divider cuts it and the window pad or the tab strip
         // hides it: the seat stops at the grid top, less the hover bob's reach.
         let headroom = (crate::kitty_cursor::BOB_AMP * ch_i as f32).ceil() as i32;
-        let seated = (rest_top - rise - (lift * ch_i as f32).round() as i32).max(headroom);
-        let y = (seated + (bob * ch_i as f32).round() as i32).max(0);
+        let seated_raw = rest_top - rise - (lift * ch_i as f32).round() as i32;
+        let seated = if seated_raw > headroom {
+            seated_raw
+        } else {
+            headroom
+        };
+        let y_raw = seated + (bob * ch_i as f32).round() as i32;
+        let y = if y_raw > 0 { y_raw } else { 0 };
         Some(CatFootprint { x, y, w, h })
     }
 
@@ -2158,8 +2195,8 @@ impl WordDecorations {
     }
 
     /// Re-anchor the cursor kitty after the host detects a coordinate-space tear between effect sampling and the presented frame.
-    pub fn rebase_kitty_cursor_placement(&mut self) {
-        self.kitty_cursor_placement = KittyCursorPlacementState::default();
+    pub const fn rebase_kitty_cursor_placement(&mut self) {
+        self.kitty_cursor_placement = KittyCursorPlacementState::EMPTY;
     }
 
     const COMPANION_CELL_H: f32 = 1.70;
@@ -2928,21 +2965,37 @@ impl WordDecorations {
         x ^ (x >> 31)
     }
 
-    #[inline]
-    fn pet_mote_tint(kind: crate::kitty_pet::PetMoteKind, colors: CatColorKey) -> u32 {
-        let accent = Self::PET_MOTE_ACCENTS[usize::from(colors.accent.min(12))];
-        match kind {
-            crate::kitty_pet::PetMoteKind::Dust => mix_rgb(0x00B9_B9C0, accent, 0.22),
-            crate::kitty_pet::PetMoteKind::Zee | crate::kitty_pet::PetMoteKind::ZeePop => {
-                mix_rgb(0x00F0_F0F6, accent, 0.45)
-            }
-            crate::kitty_pet::PetMoteKind::Note => mix_rgb(0x00FF_C24D, accent, 0.15),
-            crate::kitty_pet::PetMoteKind::Heart => mix_rgb(0x00FF_6B9A, accent, 0.15),
+    const PET_MOTE_TINTS: [[u32; 13]; 4] = {
+        let mut out = [[0u32; 13]; 4];
+        let mut i = 0;
+        while i < 13 {
+            let accent = Self::PET_MOTE_ACCENTS[i];
+            out[0][i] = mix_rgb(0x00B9_B9C0, accent, 0.22);
+            out[1][i] = mix_rgb(0x00F0_F0F6, accent, 0.45);
+            out[2][i] = mix_rgb(0x00FF_C24D, accent, 0.15);
+            out[3][i] = mix_rgb(0x00FF_6B9A, accent, 0.15);
+            i += 1;
         }
+        out
+    };
+
+    #[inline]
+    const fn pet_mote_tint(kind: crate::kitty_pet::PetMoteKind, colors: CatColorKey) -> u32 {
+        let accent_idx = if colors.accent < 12 {
+            colors.accent as usize
+        } else {
+            12
+        };
+        let kind_idx = (Self::pet_mote_kind_tag(kind) - 1) as usize;
+        Self::PET_MOTE_TINTS[kind_idx][accent_idx]
     }
 
     #[inline]
-    fn pet_mote_on_page(kind: crate::kitty_pet::PetMoteKind, tint: u32, page: Option<u32>) -> u32 {
+    const fn pet_mote_on_page(
+        kind: crate::kitty_pet::PetMoteKind,
+        tint: u32,
+        page: Option<u32>,
+    ) -> u32 {
         match (kind, page) {
             (
                 crate::kitty_pet::PetMoteKind::Note | crate::kitty_pet::PetMoteKind::Heart,
@@ -2951,6 +3004,17 @@ impl WordDecorations {
             _ => tint,
         }
     }
+
+    const PET_MOTE_ROT_SIN_COS: [(f32, f32); Self::PET_MOTE_ROT_BUCKETS as usize] = {
+        let mut out = [(0.0f32, 1.0f32); Self::PET_MOTE_ROT_BUCKETS as usize];
+        let mut b = 0usize;
+        while b < Self::PET_MOTE_ROT_BUCKETS as usize {
+            let ang = b as f32 / Self::PET_MOTE_ROT_BUCKETS as f32 * core::f32::consts::TAU;
+            out[b] = crate::supernova::sin_cos_f32(ang);
+            b += 1;
+        }
+        out
+    };
 
     fn paint_pet_mote(
         tile: &mut aterm_scene::Tile,
@@ -2962,8 +3026,7 @@ impl WordDecorations {
             return;
         }
         let s = f32::from(side);
-        let ang = bucket as f32 / Self::PET_MOTE_ROT_BUCKETS as f32 * std::f32::consts::TAU;
-        let (sin, cos) = ang.sin_cos();
+        let (sin, cos) = Self::PET_MOTE_ROT_SIN_COS[(bucket % Self::PET_MOTE_ROT_BUCKETS) as usize];
         let rp = move |u: f32, v: f32| -> (f32, f32) {
             let (du, dv) = (u - 0.5, v - 0.5);
             (0.5 + du * cos - dv * sin, 0.5 + du * sin + dv * cos)
@@ -5692,15 +5755,18 @@ const fn span_dist2(occ: &Occurrence, center: (i32, i32), geom: EffectGeom) -> u
     ((dx as i64) * (dx as i64) + (dy as i64) * (dy as i64)) as u64
 }
 
-fn nova_env(occ: &Occurrence, nv: &NovaLive, geom: EffectGeom, cfg: &DecoConfig) -> NovaEnv {
-    let advance = i32::from(geom.cell_w) * if occ.dec_line { 2 } else { 1 };
+const fn nova_env(occ: &Occurrence, nv: &NovaLive, geom: EffectGeom, cfg: &DecoConfig) -> NovaEnv {
+    let advance = (geom.cell_w as i32) * if occ.dec_line { 2 } else { 1 };
     let (core, fringe) = nova::palette(nv.feats.palette);
     let (n0, n1) = genome::ink_pair_nudges(Class::Profanity, occ.genome.gkey);
+    let cell_w = if advance > 1 { advance } else { 1 };
+    let ch = geom.cell_h as i32;
+    let cell_h = if ch > 1 { ch } else { 1 };
     NovaEnv {
-        grid_w: i32::from(geom.cols) * i32::from(geom.cell_w),
-        grid_h: i32::from(geom.rows) * i32::from(geom.cell_h),
-        cell_w: advance.max(1),
-        cell_h: i32::from(geom.cell_h).max(1),
+        grid_w: (geom.cols as i32) * (geom.cell_w as i32),
+        grid_h: (geom.rows as i32) * ch,
+        cell_w,
+        cell_h,
         cx: nv.center_px.0,
         cy: nv.center_px.1,
         r_max: nv.r_max,
@@ -6473,8 +6539,10 @@ const fn ink_pair(class: Class) -> Option<(u32, u32)> {
 }
 
 #[inline]
-fn nudged_ink_pair(class: Class, gkey: u64) -> Option<(u32, u32)> {
-    let (c0, c1) = ink_pair(class)?;
+const fn nudged_ink_pair(class: Class, gkey: u64) -> Option<(u32, u32)> {
+    let Some((c0, c1)) = ink_pair(class) else {
+        return None;
+    };
     let (n0, n1) = genome::ink_pair_nudges(class, gkey);
     Some((hue_nudge(c0, n0), hue_nudge(c1, n1)))
 }
@@ -6492,7 +6560,7 @@ fn feline_glow_env(t_ms: u64, window_ms: u64, amp: f32) -> f32 {
 const PAPER_GLOW_KEEP: f32 = 0.9;
 
 #[inline]
-fn paper_glow_scale_with(
+const fn paper_glow_scale_with(
     table: &crate::color_math::RelativeLuminanceTable,
     fg: u32,
     lit: u32,
@@ -6504,32 +6572,40 @@ fn paper_glow_scale_with(
         return 1.0;
     }
     let floor = PAPER_GLOW_KEEP * (lum_bg + 0.05) / (lum_fg + 0.05);
-    let reads_rgb = |rgb: u32| {
+    #[inline]
+    const fn reads_rgb(
+        table: &crate::color_math::RelativeLuminanceTable,
+        rgb: u32,
+        lum_bg: f32,
+        floor: f32,
+    ) -> bool {
         let lum = crate::color_math::relative_luminance_with(table, rgb).min(lum_bg);
         (lum_bg + 0.05) / (lum + 0.05) >= floor
-    };
+    }
     let mut hi_rgb = mix_rgb(fg, lit, amp);
-    if reads_rgb(hi_rgb) {
+    if reads_rgb(table, hi_rgb, lum_bg, floor) {
         return 1.0;
     }
     let mut lo_rgb = fg & 0x00FF_FFFF;
     let (mut lo, mut hi) = (0.0_f32, amp);
-    for _ in 0..12 {
+    let mut step = 0;
+    while step < 12 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = mix_rgb(fg, lit, mid);
-        if mid_rgb == lo_rgb || (mid_rgb != hi_rgb && reads_rgb(mid_rgb)) {
+        if mid_rgb == lo_rgb || (mid_rgb != hi_rgb && reads_rgb(table, mid_rgb, lum_bg, floor)) {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
             hi = mid;
             hi_rgb = mid_rgb;
         }
+        step += 1;
     }
     lo / amp
 }
 
 #[cfg(test)]
-fn paper_glow_scale(fg: u32, lit: u32, bg: u32, amp: f32) -> f32 {
+const fn paper_glow_scale(fg: u32, lit: u32, bg: u32, amp: f32) -> f32 {
     let table = crate::color_math::relative_luminance_table();
     let lum_bg = crate::color_math::relative_luminance_with(table, bg);
     paper_glow_scale_with(table, fg, lit, lum_bg, amp)
@@ -6736,25 +6812,35 @@ fn emit_ink(
     }
 }
 
-fn legible_strength(
+const fn legible_strength(
     table: &crate::color_math::RelativeLuminanceTable,
     ink_strength: f32,
     fg_first: u32,
     samples: &[u32],
     lum_bg: f32,
 ) -> f32 {
-    let contrast = |c: u32| {
+    #[inline]
+    const fn contrast(
+        table: &crate::color_math::RelativeLuminanceTable,
+        c: u32,
+        lum_bg: f32,
+    ) -> f32 {
         let la = crate::color_math::relative_luminance_with(table, c);
         (la.max(lum_bg) + 0.05) / (la.min(lum_bg) + 0.05)
-    };
+    }
     let step = ink_strength.clamp(0.0, 1.0) / 8.0;
     let mut strength = ink_strength.clamp(0.0, 1.0);
-    while strength > 0.0
-        && samples
-            .iter()
-            .any(|&c| contrast(mix_rgb(fg_first, c, strength)) < MIN_INK_CONTRAST)
-    {
-        strength = (strength - step).max(0.0);
+    'guard: while strength > 0.0 {
+        let mut idx = 0;
+        while idx < samples.len() {
+            if contrast(table, mix_rgb(fg_first, samples[idx], strength), lum_bg) < MIN_INK_CONTRAST
+            {
+                strength = (strength - step).max(0.0);
+                continue 'guard;
+            }
+            idx += 1;
+        }
+        break;
     }
     strength
 }
@@ -7397,11 +7483,12 @@ const fn fold_glow(mut h: u64, q: &GlowQuad) -> u64 {
 }
 
 #[inline]
-fn pick_color(cfg: &DecoConfig, s: u64) -> u32 {
-    if cfg.palette.is_empty() {
+const fn pick_color(cfg: &DecoConfig, s: u64) -> u32 {
+    let palette = cfg.palette.as_slice();
+    if palette.is_empty() {
         hsv2rgb((s % 360) as f32, 0.85, 1.0)
     } else {
-        cfg.palette[(s >> 23) as usize % cfg.palette.len()]
+        palette[(s >> 23) as usize % palette.len()]
     }
 }
 

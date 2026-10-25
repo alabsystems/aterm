@@ -282,6 +282,8 @@ pub struct JobProc {
     pub sid: Option<u32>,
     /// When it started, compared for equality only; `None` where unread.
     pub start: Option<u64>,
+    /// How long it had run when the pass read it, ms; `None` where unread.
+    pub age_ms: Option<u64>,
     /// Its user.
     pub uid: Option<u32>,
     /// Its short name (`p_comm`, `comm`).
@@ -898,6 +900,8 @@ pub struct Wait {
     pub fd: Option<u64>,
     /// For `listen`: the port.
     pub port: Option<u16>,
+    /// For `pipe` and `pipe-full`: the end it sleeps on, by its handle and its peer's.
+    pub pipe: Option<(u64, u64)>,
 }
 
 impl Wait {
@@ -913,6 +917,7 @@ impl Wait {
             tcp: None,
             fd: None,
             port: None,
+            pipe: None,
         }
     }
 }

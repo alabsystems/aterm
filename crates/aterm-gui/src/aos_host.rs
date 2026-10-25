@@ -424,9 +424,6 @@ impl App {
             Ask, Asked, UNEVALUATED, pause_line, repair_line, resume_line, status_line,
             trace_file_line, trace_line,
         };
-        if !cfg!(any(test, debug_assertions)) {
-            return Err(crate::aos_verb::NEEDS_DEBUG.to_string());
-        }
         #[cfg_attr(
             not(debug_assertions),
             expect(
@@ -457,7 +454,7 @@ impl App {
                 .aos_bundle_now()
                 .map(|(id, revision, b)| crate::aos_verb::bundle_line(id.0, revision, b)),
             #[cfg(not(debug_assertions))]
-            Asked::Bundle => return Err(crate::aos_verb::NEEDS_DEBUG.to_string()),
+            Asked::Bundle => return Err(crate::aos_verb::needs_debug("bundle")),
             Asked::Resume => self.aos_resume_now().map(|r| resume_line(&r)),
             Asked::Detach => self.aos_detach_now().map(|(id, s)| status_line(id.0, &s)),
             Asked::Trace => self.aos_trace_now().map(|t| trace_line(&t)),

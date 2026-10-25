@@ -411,7 +411,7 @@ impl Cadence {
 /// Seconds until a `spend` fade (`(1 − u)²`, §2.5) next changes its u8 level.
 #[inline]
 #[must_use]
-pub(crate) fn level_step_spend(peak: f32, u: f32, span_s: f32) -> Option<f32> {
+pub(crate) const fn level_step_spend(peak: f32, u: f32, span_s: f32) -> Option<f32> {
     if !(peak.is_finite() && span_s.is_finite() && u.is_finite()) || peak <= 0.0 || span_s <= 0.0 {
         return None;
     }
@@ -420,7 +420,7 @@ pub(crate) fn level_step_spend(peak: f32, u: f32, span_s: f32) -> Option<f32> {
     if level < 1.0 {
         return None;
     }
-    let u_next = 1.0 - ((level - 0.5) / peak).sqrt();
+    let u_next = 1.0 - crate::color_math::sqrt_f32((level - 0.5) / peak);
     Some(((u_next - u) * span_s).max(0.0))
 }
 
@@ -475,24 +475,35 @@ impl EchoLedger {
         tally: LedgerTally::EMPTY,
     };
     #[inline]
-    fn bank(&mut self, at: Instant, cells: u16) {
+    const fn bank(&mut self, at: Instant, cells: u16) {
         if cells == 0 {
             return;
         }
         #[cfg(test)]
         {
-            self.tally.banked += u32::from(cells);
+            self.tally.banked += cells as u32;
         }
-        if let Some(free) = self.slots.iter().position(Option::is_none) {
-            self.slots[free] = Some((at, cells));
-        } else {
-            #[cfg(test)]
-            {
-                self.tally.forfeited += self.slots[0].map_or(0, |(_, c)| u32::from(c));
+        let mut free = 0;
+        while free < ECHO_LEDGER_DEPTH {
+            if self.slots[free].is_none() {
+                self.slots[free] = Some((at, cells));
+                return;
             }
-            self.slots.copy_within(1.., 0);
-            self.slots[ECHO_LEDGER_DEPTH - 1] = Some((at, cells));
+            free += 1;
         }
+        #[cfg(test)]
+        {
+            self.tally.forfeited += match self.slots[0] {
+                Some((_, c)) => c as u32,
+                None => 0,
+            };
+        }
+        let mut i = 0;
+        while i + 1 < ECHO_LEDGER_DEPTH {
+            self.slots[i] = self.slots[i + 1];
+            i += 1;
+        }
+        self.slots[ECHO_LEDGER_DEPTH - 1] = Some((at, cells));
     }
 
     #[inline]
@@ -4114,6 +4125,160 @@ mod tests {
             0,
             "a key before the first licensed move lays nothing — not on row 4's last cell either"
         );
+    }
+
+    #[test]
+    fn successive_partial_redraws_restore_the_whole_typed_ribbon_before_its_expiry() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let original: Vec<char> = "  abcdefgh".chars().collect();
+        let mut failures = Vec::new();
+        for releases in [4u16, 5] {
+            for return_delay_ms in [1u64, 300] {
+                let mut eng = engaged();
+                eng.on_event(mv((3, 0), (3, 2), Licence::Typed), t0);
+                tick_at(&mut eng, t0);
+                let mut t = t0;
+                for col in 2..10u16 {
+                    t = type_key_at(&mut eng, t + ms(40), col);
+                }
+                assert_eq!(eng.ribbon().cohorts().len(), 1, "one typed run");
+                let cohort = eng.ribbon().cohorts()[0].id;
+                assert_eq!(eng.ribbon().cells().len(), 8);
+                assert!((2..10).all(|col| eng.field_at(3, col).is_some()));
+                let original_cells: Vec<(u16, u16, Instant)> = eng
+                    .ribbon()
+                    .cells()
+                    .iter()
+                    .map(|cell| (cell.row, cell.col, cell.born))
+                    .collect();
+                assert_eq!(
+                    eng.witness_rows(
+                        &[RowSample {
+                            row: 3,
+                            cols: &original
+                        }],
+                        t
+                    ),
+                    0,
+                    "the original glyphs arm the witness"
+                );
+
+                let mut partial = original.clone();
+                for step in 0..releases {
+                    t += ms(20);
+                    partial[usize::from(9 - step)] = ' ';
+                    assert_eq!(
+                        eng.witness_rows(
+                            &[RowSample {
+                                row: 3,
+                                cols: &partial
+                            }],
+                            t
+                        ),
+                        1,
+                        "each sampled redraw releases one more suffix glyph"
+                    );
+                    tick_at(&mut eng, t);
+                    assert_eq!(eng.ribbon().cohorts().len(), 1);
+                    assert_eq!(eng.ribbon().cohorts()[0].id, cohort);
+                    assert_eq!(
+                        eng.ribbon().cells().len(),
+                        8,
+                        "all original cells are resident"
+                    );
+                    let stamps: Vec<Instant> = eng
+                        .ribbon()
+                        .cells()
+                        .iter()
+                        .filter_map(|cell| cell.released_at)
+                        .collect();
+                    assert_eq!(stamps.len(), usize::from(step + 1));
+                    assert_eq!(stamps.iter().filter(|&&stamp| stamp == t).count(), 1);
+                }
+
+                let before_return = t + ms(return_delay_ms);
+                assert!(
+                    !eng.ribbon().cohorts()[0].leaving_at(before_return),
+                    "the original run has not begun its natural exit"
+                );
+                assert_eq!(
+                    eng.witness_rows(
+                        &[RowSample {
+                            row: 3,
+                            cols: &partial
+                        }],
+                        before_return
+                    ),
+                    0,
+                    "a repeated partial frame releases nothing else"
+                );
+                tick_at(&mut eng, before_return);
+                assert!(
+                    eng.field_at(3, 2).is_some(),
+                    "the unchanged prefix still stands"
+                );
+                let resident: Vec<u16> = eng.ribbon().cells().iter().map(|cell| cell.col).collect();
+                if return_delay_ms == 1 {
+                    assert_eq!(
+                        resident.len(),
+                        8,
+                        "return before any release finishes fading"
+                    );
+                }
+
+                let returned = before_return + ms(1);
+                assert_eq!(
+                    eng.witness_rows(
+                        &[RowSample {
+                            row: 3,
+                            cols: &original
+                        }],
+                        returned
+                    ),
+                    0,
+                    "the identical row restores rather than replaces its glyphs"
+                );
+                tick_at(&mut eng, returned);
+                if return_delay_ms == 1 {
+                    assert_eq!(eng.ribbon().cells().len(), original_cells.len());
+                    assert!(
+                        eng.ribbon()
+                            .cells()
+                            .iter()
+                            .all(|cell| original_cells.contains(&(cell.row, cell.col, cell.born))),
+                        "the immediate return still owns every original cell identity"
+                    );
+                }
+                let still_released: Vec<(u16, bool, bool)> = eng
+                    .ribbon()
+                    .cells()
+                    .iter()
+                    .filter(|cell| {
+                        original_cells.contains(&(cell.row, cell.col, cell.born))
+                            && (cell.released_at.is_some() || cell.retract_at.is_some())
+                    })
+                    .map(|cell| {
+                        (
+                            cell.col,
+                            cell.released_at.is_some(),
+                            cell.retract_at.is_some(),
+                        )
+                    })
+                    .collect();
+                let dark: Vec<u16> = (2..10)
+                    .filter(|&col| eng.field_at(3, col).is_none())
+                    .collect();
+                if !dark.is_empty() || !still_released.is_empty() {
+                    failures.push(format!(
+                        "{releases} partial releases, return after {return_delay_ms} ms: \
+                         cells resident before return {resident:?}, original cells still \
+                         (column, released, retracting) {still_released:?}, restored glyphs still dark {dark:?}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

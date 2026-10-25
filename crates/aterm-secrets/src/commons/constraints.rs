@@ -19,7 +19,8 @@ pub const MAX_FACTS: usize = 64;
 #[cfg(unix)]
 const MAX_RETIRED_ACTORS: usize = 4096;
 #[cfg(unix)]
-const MAX_BINDINGS: usize = 4096;
+/// Maximum distinct signed actor bindings retained by a Commons control history.
+pub const MAX_BINDINGS: usize = 4096;
 
 /// Last permitted point on one exact writer's previous-link chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -367,6 +368,21 @@ impl Constraints {
         }
         Ok(())
     }
+    /// Require an unambiguous signed enrollment for negative identity evidence.
+    /// Retired actors remain recognizable; this never grants membership or keys.
+    pub fn check_known_actor(&self, actor: &Actor) -> Result<()> {
+        self.complete()?;
+        if self.binding_legacy || self.ambiguous_binding || self.missing_retired_binding {
+            return Err(Error::new(
+                "device binding history is conflicting or incomplete",
+            ));
+        }
+        if !self.bindings.contains_key(actor) {
+            return Err(Error::new("actor identity has no signed enrollment"));
+        }
+        Ok(())
+    }
+
     /// Additionally require this exact binding in the retained signed ledger.
     /// Current roster inclusion and key-release policy remain separate checks.
     pub fn check_recorded_device(&self, binding: &Binding) -> Result<()> {

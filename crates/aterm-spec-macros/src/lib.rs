@@ -148,7 +148,16 @@ fn expand_refines(attr: TokenStream, item: TokenStream) -> Result<TokenStream, E
         })?;
     let item = FnItem::new(item);
     let fn_ident = item_fn_ident(&item);
-    let const_name = anchor_const("refines", Some(&sanitize_ident(&action)), &fn_ident)?;
+    // Exact machine/action bytes keep stacked anchors distinct, including names
+    // that would collide after punctuation is replaced by underscores.
+    let encoded = |value: &str| {
+        value
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let suffix = format!("{}_{}", encoded(&machine), encoded(&action));
+    let const_name = anchor_const("refines", Some(&suffix), &fn_ident)?;
     let rust_method = fn_ident.to_string();
     let candidate_id = entry_id_for(&machine, &action, &rust_method);
     let (item_out, entry_id) = match inject_entry_probe(&item, &candidate_id) {

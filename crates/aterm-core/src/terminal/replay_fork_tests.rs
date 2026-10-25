@@ -478,3 +478,41 @@ fn a_fork_continues_its_sources_restore_lineage() {
         assert_eq!(fork_end, src_end, "{label}");
     }
 }
+
+/// A replay restore of a keyframe of an engine with no restore pending ends as that engine does after the same output, adopted or not; a plain restore marks its seed untrusted, and an engine whose own restore is pending is not what it continues.
+#[test]
+fn a_replay_restore_continues_an_engine_with_no_restore_pending() {
+    for adopt in [false, true] {
+        let mut live = Terminal::new(6, 30);
+        live.process(b"\x1b[1mbefore\x1b[m the keyframe\r\n");
+        let keyframe = live.checkpoint_continuing().expect("ground");
+        let mut replayed = Terminal::replay_from_checkpoint(&keyframe);
+        let mut restored = Terminal::from_checkpoint(&keyframe);
+        let end = |t: &mut Terminal| {
+            t.process(b"more\r\n");
+            let adoption = adopt.then(|| t.adopt_holder_after_restore(0, false));
+            (adoption, t.checkpoint_continuing().expect("ground"))
+        };
+        let live_end = end(&mut live);
+        assert_eq!(end(&mut replayed), live_end, "adopted: {adopt}");
+        if !adopt {
+            assert!(!live_end.1.holder.seed_untrusted, "premise");
+            assert!(
+                end(&mut restored).1.holder.seed_untrusted,
+                "a plain restore adds lineage of its own"
+            );
+        }
+    }
+    let mut carried = Terminal::new(6, 30);
+    carried.holder_carried_at = Some(carried.transient.screen_mutations);
+    let keyframe = carried.checkpoint_continuing().expect("ground");
+    let mut replayed = Terminal::replay_from_checkpoint(&keyframe);
+    for t in [&mut carried, &mut replayed] {
+        t.process(b"more\r\n");
+    }
+    assert_ne!(
+        replayed.checkpoint_continuing(),
+        carried.checkpoint_continuing(),
+        "a pending restore shows once output comes"
+    );
+}

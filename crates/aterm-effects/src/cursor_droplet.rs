@@ -91,7 +91,12 @@ impl Default for DropletFrame {
 fn ramp_band_on(ground: u32) -> (f32, f32) {
     let table = crate::color_math::relative_luminance_table();
     let lum_g = crate::color_math::relative_luminance_with(table, ground);
-    let meets_rgb = |rgb: u32| {
+    #[inline]
+    const fn meets_rgb(
+        table: &crate::color_math::RelativeLuminanceTable,
+        lum_g: f32,
+        rgb: u32,
+    ) -> bool {
         let lum_w = crate::color_math::relative_luminance_with(table, rgb);
         let (hi, lo) = if lum_w > lum_g {
             (lum_w, lum_g)
@@ -99,28 +104,30 @@ fn ramp_band_on(ground: u32) -> (f32, f32) {
             (lum_g, lum_w)
         };
         (hi + 0.05) / (lo + 0.05) >= CARET_PAGE_MIN_CONTRAST
-    };
+    }
     let dark = aterm_render::theme_is_dark(ground);
     let far = if dark { 1.0 } else { 0.0 };
     let far_rgb = water_ramp(far);
-    if !meets_rgb(far_rgb) {
+    if !meets_rgb(table, lum_g, far_rgb) {
         return (far, far);
     }
     let near = 1.0 - far;
     let near_rgb = water_ramp(near);
-    if meets_rgb(near_rgb) {
+    if meets_rgb(table, lum_g, near_rgb) {
         return (0.0, 1.0);
     }
     let (mut pass, mut fail) = (far, near);
     let (mut pass_rgb, mut fail_rgb) = (far_rgb, near_rgb);
-    for _ in 0..20 {
+    let mut step = 0;
+    while step < 20 {
+        step += 1;
         let mid = 0.5 * (pass + fail);
         let mid_rgb = water_ramp(mid);
         if mid_rgb == pass_rgb {
             pass = mid;
         } else if mid_rgb == fail_rgb {
             fail = mid;
-        } else if meets_rgb(mid_rgb) {
+        } else if meets_rgb(table, lum_g, mid_rgb) {
             pass = mid;
             pass_rgb = mid_rgb;
         } else {

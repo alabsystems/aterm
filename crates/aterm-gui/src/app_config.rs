@@ -1878,7 +1878,6 @@ pub(crate) struct MachineConfig {
 pub(crate) struct SysConfig {
     pub(crate) stats_bars: Option<String>,
     pub(crate) stats_deck_size: Option<String>,
-    pub(crate) stats_deck_style: Option<String>,
     pub(crate) disk_roots: Option<Vec<String>>,
 }
 
@@ -3800,15 +3799,6 @@ impl Config {
             self.sys
                 .as_ref()
                 .and_then(|sys| sys.stats_deck_size.as_deref()),
-        )
-    }
-
-    /// Which painter draws the Deck (`[sys] stats_deck_style`).
-    pub(crate) fn stats_deck_style_or_default(&self) -> crate::stats_deck::DeckStyle {
-        crate::stats_deck::DeckStyle::parse(
-            self.sys
-                .as_ref()
-                .and_then(|sys| sys.stats_deck_style.as_deref()),
         )
     }
 
@@ -6358,22 +6348,17 @@ impl App {
 
     /// The `(rows, cols)` window `wid` gets for raw `size`.
     pub(crate) fn grid_dims_for(&self, wid: WindowId, size: PhysicalSize<u32>) -> (u16, u16) {
-        let (cw, _) = self.win_cell_size(wid);
-        let cols = aterm_render::pad_split(size.width as usize, self.win_pad(wid), cw).cells as u16;
-        let rows = self.grid_rows_under(wid, size.height as usize, self.win_head(wid));
-        (rows, cols)
-    }
-
-    /// The rows window `wid`'s grid gets in a frame `frame_h` px tall under a `head` px head.
-    pub(crate) fn grid_rows_under(&self, wid: WindowId, frame_h: usize, head: usize) -> u16 {
-        let (_, ch) = self.win_cell_size(wid);
+        let (cw, ch) = self.win_cell_size(wid);
+        let pad = self.win_pad(wid);
+        let cols = aterm_render::pad_split(size.width as usize, pad, cw).cells as u16;
         let win_rows = crate::asymmetric_pad_cells(
-            frame_h.saturating_sub(head),
+            (size.height as usize).saturating_sub(self.win_head(wid)),
             self.win_pad_top(wid),
-            self.win_pad(wid),
+            pad,
             ch,
         ) as u16;
-        win_rows.saturating_sub(self.chrome_rows(wid)).max(1)
+        let rows = win_rows.saturating_sub(self.chrome_rows(wid)).max(1);
+        (rows, cols)
     }
 
     /// Minimum inner size that aligns the resize-increment lattice with the whole-cell frame lattice for window `wid`.
@@ -6713,6 +6698,7 @@ impl App {
         let toolbars = &self._toolbars;
         let strip_dark = crate::tab_bar::theme_is_dark(bg);
         let (authored, strip_accent) = self.native_strip_chrome();
+        crate::tray_raster::forget_kept_glyphs();
         for (wid, ws) in self.windows.iter_mut() {
             ws.last_strip_fp = None;
             ws.invalidate_raster_caches();
@@ -6743,6 +6729,9 @@ impl App {
         );
         let mut attached = None;
         if let Some(ws) = self.windows.get_mut(&wid) {
+            if (ws.scale - scale).abs() > f64::EPSILON {
+                crate::tray_raster::forget_kept_glyphs();
+            }
             ws.scale = scale;
             if ws.os_window.is_some() {
                 attached = Some(ws.head_pts);
@@ -7270,7 +7259,6 @@ impl App {
         );
         let old_stats_bars = self.config.stats_bars_or_default();
         let old_deck_size = self.config.stats_deck_size_or_default();
-        let old_deck_style = self.config.stats_deck_style_or_default();
 
         let sparkle_feed_changed = deco_feed_changed(
             &self.config,
@@ -7600,13 +7588,11 @@ impl App {
         );
         let new_stats_bars = config.stats_bars_or_default();
         let new_deck_size = config.stats_deck_size_or_default();
-        let new_deck_style = config.stats_deck_style_or_default();
         let deck_moved = old_stats_bars.takes_room() != new_stats_bars.takes_room()
-            || (new_stats_bars.takes_room()
-                && (old_deck_size != new_deck_size || old_deck_style != new_deck_style));
+            || (new_stats_bars.takes_room() && old_deck_size != new_deck_size);
         crate::menu::set_stats_bars_form(new_stats_bars);
         crate::menu::set_deck_size_pref(new_deck_size);
-        if old_stats_bars != new_stats_bars || old_deck_style != new_deck_style {
+        if old_stats_bars != new_stats_bars {
             for ws in self.windows.values_mut() {
                 ws.stats_lens = crate::stats_lens::LensSlot::default();
                 if let Some(w) = ws.os_window.as_ref() {
@@ -8091,6 +8077,37 @@ mod config_policy_tests {
         let warnings = crate::native_config_language::key_warnings(source);
         assert!(warnings.ignored.is_empty(), "{:?}", warnings.ignored);
         assert_eq!(warnings.retired.len(), 2, "{:?}", warnings.retired);
+        assert!(
+            super::unaccepted_value_notices(source, &[]).is_empty(),
+            "a retired key's value is never a value its reader rejects"
+        );
+    }
+
+    /// 0.135.0 shipped `[sys] stats_deck_style` (hidden, for the rejected merged deck): a file
+    /// that still sets it loads as without it and is told once that the key does nothing.
+    #[test]
+    fn a_config_that_still_sets_the_deck_style_loads_and_is_told_once() {
+        let others = "[sys]\nstats_bars = \"deck\"\nstats_deck_size = \"full\"\n";
+        let source = "[sys]\nstats_bars = \"deck\"\nstats_deck_style = \"merged\"\nstats_deck_size = \"full\"\n";
+        let loaded = Config::parse(source).expect("a retired key never fails the file");
+        let baseline = Config::parse(others).expect("the other settings parse alone");
+        assert!(
+            loaded == baseline,
+            "every other setting loads as without it"
+        );
+        assert_eq!(
+            loaded.stats_deck_size_or_default(),
+            crate::stats_plan::DeckSizePref::Full,
+            "the size setting beside it stands"
+        );
+        let warnings = crate::native_config_language::key_warnings(source);
+        assert!(warnings.ignored.is_empty(), "{:?}", warnings.ignored);
+        assert_eq!(
+            warnings.retired,
+            [
+                "line 3: sys.stats_deck_style does nothing: Merged top deck was removed; safe to delete"
+            ],
+        );
         assert!(
             super::unaccepted_value_notices(source, &[]).is_empty(),
             "a retired key's value is never a value its reader rejects"

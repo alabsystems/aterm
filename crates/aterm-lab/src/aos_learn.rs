@@ -375,8 +375,9 @@ fn lock_file(path: &Path) -> Result<Held, String> {
 }
 
 /// [`lock_file`], re-trying each second for up to `limit` while another holder has it, each
-/// second waited by `pause`, whose error ends the wait.
-fn lock_within(
+/// second waited by `pause`, whose error ends the wait. `autopilot-captures` merges its manifest
+/// under it.
+pub(crate) fn lock_within(
     path: &Path,
     limit: Duration,
     pause: &dyn Fn(Duration) -> Result<(), String>,

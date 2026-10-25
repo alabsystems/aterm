@@ -61,6 +61,19 @@ fn status_of(scenario: &str) -> SetupStatus {
     fixture_status(scenario).expect("a named scenario")
 }
 
+/// The `mixed` scenario once its Debugger access is on: one managed row (Rust in Spotlight)
+/// still differs, which a run changes.
+fn to_change() -> SetupStatus {
+    let mut status = status_of("mixed");
+    let debugger = Subject::Access(Access::Debugger);
+    if let Some(reading) = status.observed.iter_mut().find(|o| o.subject == debugger) {
+        reading.standing = Standing::InPlace;
+        reading.now = Some("On".to_owned());
+        reading.detail = None;
+    }
+    status
+}
+
 /// The headline's words: the page heading's subtitle line.
 const HEADLINE: &str = "settings/page-subtitle/system-state";
 
@@ -744,11 +757,7 @@ fn a_restore_names_its_rows_and_each_setting_it_could_not_put_back() {
     refused.journal_refused = true;
     assert_eq!(
         words(restore_rows(&refused))[1],
-        row(
-            "Change journal",
-            "error",
-            "It did not record every change Restore made; the changes went ahead."
-        )
+        row("Change log", "noted", JOURNAL_NOTE)
     );
 }
 
@@ -816,8 +825,7 @@ fn a_pass_says_each_unfinished_row_and_its_rollback_in_row_names() {
             "Rust in Spotlight could not be confirmed.",
             "aterm put back what it could not finish. The Dock is as it was. Natural scrolling \
              comes back at your next login.",
-            "Change journal failed. It did not record every change aterm made; the changes went \
-             ahead.",
+            JOURNAL_NOTE,
         ]
     );
     let head = headline(&status, &rows(&status, plan.selection), Some(&plan));
@@ -830,7 +838,8 @@ fn a_pass_says_each_unfinished_row_and_its_rollback_in_row_names() {
     );
     assert_eq!(
         crate::system_state_access::menu_line(&status, false).map(|line| line.label),
-        Some("System State: 3 failed".to_owned())
+        Some("System State: 2 failed".to_owned()),
+        "the change log's refusal is no failure"
     );
 }
 
@@ -1135,12 +1144,24 @@ fn headlines_say_the_state_in_the_designs_words() {
     let failed = line(&status_of("failed"));
     assert_eq!(failed.text, "1 step failed: GitHub repositories");
     assert_eq!(failed.show, Some(Subject::Setting(Setting::Repositories)));
-    assert!(failed.start, "its note names Set up now");
+    assert!(
+        !failed.start,
+        "its note names its own remedy, which Set up now cannot give"
+    );
+    let step = line(&status_of("named-result-failed"));
+    assert_eq!(step.text, "1 step failed: GitHub repositories");
+    assert!(
+        step.start,
+        "a step the run could not finish: its note names Set up now"
+    );
     assert_eq!(line(&status_of("set-up")).text, "This Mac is set up");
     assert_eq!(line(&status_of("non-alab")).text, "Permissions are set up");
     let mixed = line(&status_of("mixed"));
-    assert_eq!(mixed.text, "3 changes to make");
-    assert!(mixed.start, "a run would change the rows that differ");
+    assert_eq!(mixed.text, "Needs you: Debugger access");
+    assert_eq!(mixed.open, Some(Access::Debugger));
+    let differs = line(&to_change());
+    assert_eq!(differs.text, "1 change to make");
+    assert!(differs.start, "a run would change the rows that differ");
     assert!(!line(&status_of("set-up")).start);
     // Busy with a Check or a Restore is no run: no count, no meter, no Stop.
     for (operation, words) in [
@@ -1571,8 +1592,14 @@ fn only_a_managed_row_that_needs_a_person_or_failed_lights_the_tab() {
         ("failed", true),
         ("set-up", false),
         ("non-alab", false),
-        ("mixed", false),
+        // Its Debugger access is off, which Permissions manage: a person turns it on.
+        ("mixed", true),
         ("fresh", false),
+        ("widened", false),
+        ("vault-unreached", false),
+        // The run still tries the vault again by itself.
+        ("vault-failed", false),
+        ("restore-unlogged", false),
     ] {
         let mut app = SystemStateApp::new(Plan::default());
         app.publish(status_of(scenario));
@@ -1869,7 +1896,8 @@ fn unknown_plan_join_keeps_its_draft_until_the_saved_plan_is_known() {
 
 #[test]
 fn a_plan_read_failure_headline_survives_reopen_until_recovery() {
-    const WHY: &str = "injected saved plan read failure";
+    // As the worker says a saved plan it cannot read, in the page's words.
+    const WHY: &str = STATE_UNREAD_NOTE;
     let mut app = crate::App::headless_for_test();
     let wid = crate::WindowId(0);
     app.set_system_state_handlers_for_test(
@@ -1884,8 +1912,8 @@ fn a_plan_read_failure_headline_survives_reopen_until_recovery() {
     let loading = label(&compiled(&app), HEADLINE);
     let failure = SetupStatus {
         rows: vec![SetupStatusRow {
-            name: "Setup state".into(),
-            status: "error".into(),
+            name: SETUP_ROW.into(),
+            status: "failed".into(),
             detail: WHY.into(),
         }],
         ..SetupStatus::default()
@@ -2020,9 +2048,9 @@ fn a_cached_success_failure_headline_waits_for_a_successful_plan_read() {
     let settled = label(&compile(&app, &view, 999.0, 740.0), HEADLINE);
     app.publish(SetupStatus {
         rows: vec![SetupStatusRow {
-            name: "Setup state".into(),
-            status: "error".into(),
-            detail: "injected current plan read failure".into(),
+            name: SETUP_ROW.into(),
+            status: "failed".into(),
+            detail: STATE_UNREAD_NOTE.into(),
         }],
         observed: success.observed.clone(),
         observed_vault_url: success.observed_vault_url.clone(),
@@ -2100,16 +2128,18 @@ fn a_generic_check_failure_headline_follows_only_the_exact_reviewed_plan() {
 #[test]
 fn set_up_now_runs_the_plan_again_when_rows_differ() {
     let mut app = SystemStateApp::new(Plan::default());
-    app.publish(status_of("mixed"));
+    app.publish(to_change());
     let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
+    assert_eq!(label(&compiled, HEADLINE), "1 change to make");
+    // The button says its action alone: VoiceOver reads the headline beside it.
     assert_eq!(
         label(&compiled, "system-state/headline/start"),
-        "Set up now: 3 changes to make"
+        "Set up now"
     );
     app.gesture(true);
     act(&mut app, "system-state/headline/start");
     let (plan, admission, _) = submitted(app.take_action());
-    assert_eq!(plan.selection, status_of("mixed").plan.unwrap().selection);
+    assert_eq!(plan.selection, to_change().plan.unwrap().selection);
     assert_eq!(admission, Admission::Person);
     act(&mut app, "system-state/headline/start");
     assert!(app.take_action().is_none(), "not while it runs");
@@ -2229,7 +2259,7 @@ fn only_a_group_choice_or_join_makes_the_plan_the_choosers() {
     assert!(chosen(app.take_action()), "Join chooses the vault");
     // Set up now runs the plan as it stands.
     let mut app = SystemStateApp::new(Plan::default());
-    app.publish(status_of("mixed"));
+    app.publish(to_change());
     act(&mut app, "system-state/headline/start");
     assert!(!chosen(app.take_action()));
     // So does the first-run offer.
@@ -2389,7 +2419,7 @@ fn only_a_join_names_a_typed_vault() {
     act(&mut app, "system-state/group/1/leave");
     assert!(!typed(app.take_action()), "a group choice");
     app.status.busy = false;
-    app.publish(status_of("mixed"));
+    app.publish(to_change());
     act(&mut app, "system-state/headline/start");
     assert!(!typed(app.take_action()), "Set up now");
     app.status.busy = false;
@@ -2585,14 +2615,20 @@ fn the_failure_headlines_show_button_scrolls_to_the_failed_row() {
     assert!(compiled.semantic(&row).is_some_and(|node| !node.offscreen));
 }
 
+/// A vault that waits for an address is shown from the headline: with its fields open, Show
+/// brings Join and the fields into view.
 #[test]
-fn a_vault_that_needs_you_is_shown_from_the_headline() {
+fn a_waiting_vault_is_shown_from_the_headline() {
     let mut app = SystemStateApp::new(Plan::default());
     app.publish(status_of("vault"));
     let mut view = SystemStateViewState::default();
+    app.act(&mut view, "system-state/row/secrets/disclose", None);
     let join = UiKey::new("system-state/vault/join");
     let compiled = compile(&app, &view, 640.0, 480.0);
-    assert_eq!(label(&compiled, HEADLINE), "Needs you: Secrets vault");
+    assert_eq!(
+        label(&compiled, HEADLINE),
+        "2 steps waiting: Secrets vault, GitHub repositories"
+    );
     assert!(
         compiled
             .semantics
@@ -2869,7 +2905,8 @@ fn every_word_and_button_face_is_whole_in_a_narrow_pane_at_every_text_size() {
 /// title, and a taller window never shows less. What shows depends on the window and the text
 /// size, not the page's state, while the headline names at most one row; then a window `least`
 /// tall (200 points at 1x, 320 at 1.5x, 440 at 2x, 320 wide) keeps the controls in view. A
-/// headline naming every setting as failed counts its own height and is held to the order alone.
+/// headline naming several rows (every setting as failed, or the vault and the repositories that
+/// wait on it) counts its own height and is held to the order alone.
 #[test]
 fn a_short_window_keeps_the_headline_and_the_footer_in_view() {
     use crate::native_appearance::{AppearancePreferences, install_preferences};
@@ -2911,7 +2948,8 @@ fn a_short_window_keeps_the_headline_and_the_footer_in_view() {
         .into_iter()
         .chain([("failed-many", failed_many)])
         {
-            let one_name = scenario != "failed-many";
+            // The vault that waits for an address names the repositories that wait on it too.
+            let one_name = !matches!(scenario, "failed-many" | "vault");
             let mut app = SystemStateApp::new(Plan::default());
             app.publish(status);
             for width in [narrowest, 240, 320, 420, 520, 720] {
@@ -3174,6 +3212,8 @@ fn a_focused_vault_field_stays_in_view_as_the_list_shrinks_and_shows_when_typed_
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let mut app = SystemStateApp::new(Plan::default());
     app.publish(status_of("vault"));
+    // The person opened the vault's fields under its row.
+    act(&mut app, "system-state/row/secrets/disclose");
     let (mut runtime, instance, view) = runtime_with_app(app);
     let compile_at = |runtime: &NativeRuntime, height: f32| {
         let (app, state) = page_in(runtime, view);
@@ -3242,7 +3282,8 @@ fn a_focused_vault_field_stays_in_view_as_the_list_shrinks_and_shows_when_typed_
         );
     }
     // A caret move, a selection or a submit leaves the disclosure as it
-    // stood: only an edit pins the vault open.
+    // stood.
+    let stood = page_in(&runtime, view).0.vault_open;
     for event in [
         TextInputEvent::Left { extend: false },
         TextInputEvent::Home { extend: true },
@@ -3256,7 +3297,7 @@ fn a_focused_vault_field_stays_in_view_as_the_list_shrinks_and_shows_when_typed_
         runtime
             .dispatch(instance, view, AppEvent::TextInput(event.clone()))
             .unwrap();
-        assert_eq!(page_in(&runtime, view).0.vault_open, None, "{event:?}");
+        assert_eq!(page_in(&runtime, view).0.vault_open, stood, "{event:?}");
     }
     // A focused field scrolled to a sliver the list leaves unpainted is one
     // the person scrolled away from: a room that shrinks leaves it there.
@@ -4216,7 +4257,7 @@ fn a_choice_names_the_groups_changed_since_the_plan_in_force() {
     assert_eq!(changed, groups(&[Group::Input]));
     app.apply_accepted(input_left);
     // Its run done, with rows that differ from the plan, Set up now runs it as it stands.
-    app.publish(status_of("mixed"));
+    app.publish(to_change());
     act(&mut app, "system-state/headline/start");
     let (_, changed) = sent(app.take_action());
     assert_eq!(
@@ -4224,4 +4265,394 @@ fn a_choice_names_the_groups_changed_since_the_plan_in_force() {
         Some(Selection::none()),
         "Set up now changes no group"
     );
+}
+
+/// macOS never tells an app whether it may use the local network. A row nothing in this launch
+/// can read (`Untold`) shows `—` with its one calm note and lets the page settle; a row still
+/// to be read holds the headline at a check.
+#[test]
+fn local_network_that_macos_never_tells_lets_the_page_settle() {
+    let mut permissions = Selection::none();
+    permissions.set(Setting::Permissions, true);
+    let lan = Subject::Access(Access::LocalNetwork);
+    let with_lan = |reading_of_lan: Observation| {
+        let observed = Subject::all()
+            .into_iter()
+            .map(|subject| {
+                if subject == lan {
+                    reading_of_lan.clone()
+                } else {
+                    reading(subject, Standing::InPlace, Some(subject.wanted()))
+                }
+            })
+            .collect();
+        with_readings(permissions, observed)
+    };
+    let untold = with_lan(Observation {
+        note: Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD.to_owned()),
+        ..reading(lan, Standing::Untold, None)
+    });
+    let shown = rows(&untold, permissions);
+    assert_eq!(
+        headline(&untold, &shown, untold.plan.as_ref()).text,
+        "Permissions are set up"
+    );
+    let row = shown.iter().find(|row| row.subject == lan).unwrap();
+    assert_eq!(
+        (&row.value, row.chip, row.note.as_deref()),
+        (
+            &RowValue::One("—".to_owned()),
+            None,
+            Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD)
+        )
+    );
+    let unread = with_lan(reading(lan, Standing::Unknown, None));
+    assert_eq!(
+        headline(&unread, &rows(&unread, permissions), unread.plan.as_ref()).text,
+        "Checking this Mac…",
+        "a row still to be read is a check under way"
+    );
+}
+
+/// A group pressed on aterm's provisional plan is sent as the person's choice even where the
+/// plan already has it: it makes the plan theirs, so a later widen never sets a group they
+/// left as is (§3.5). On a person's plan the same press sends nothing.
+#[test]
+fn leave_as_is_on_aterms_provisional_plan_is_kept_as_the_persons() {
+    let mut permissions = Selection::none();
+    permissions.set(Setting::Permissions, true);
+    let narrow = Plan::from(permissions);
+    for provisional in [true, false] {
+        let mut app = SystemStateApp::new(narrow.clone());
+        app.publish(SetupStatus {
+            plan: Some(narrow.clone()),
+            provisional,
+            ..SetupStatus::default()
+        });
+        app.gesture(true);
+        act(&mut app, "system-state/group/3/leave");
+        let action = app.take_action();
+        if !provisional {
+            assert!(action.is_none(), "a person's plan already leaves it");
+            continue;
+        }
+        let Some(SystemStateAction::Apply(answer, admission)) = action else {
+            panic!("the press on aterm's plan is sent");
+        };
+        assert!(answer.chosen, "the plan becomes the person's");
+        assert_eq!(admission, Admission::Person);
+        let WorkstationSetupDecision::Begin(plan) = &answer.decision else {
+            panic!("the plan begins");
+        };
+        assert_eq!(
+            plan.selection, permissions,
+            "the groups as the person left them"
+        );
+        // aterm's widen, published while the choice is admitted, does not undo the press.
+        app.publish(SetupStatus {
+            plan: Some(Plan::default()),
+            busy: true,
+            ..SetupStatus::default()
+        });
+        assert_eq!(
+            group_choice(Group::Accounts, app.plan.selection),
+            GroupChoice::LeaveAsIs
+        );
+    }
+}
+
+/// A stage that failed as a whole reaches the page as the worker's page says it, under the
+/// rows it covers with none of the stage's words (design §3.6): the headline names those rows
+/// and offers Set up now, and the note says what comes next, in one sentence for the rows that
+/// failed alike.
+#[test]
+fn a_stage_that_failed_as_a_whole_is_said_under_its_rows() {
+    let step = |setting: Setting| SetupStatusRow {
+        name: setting.name().into(),
+        status: "error".into(),
+        detail: String::new(),
+    };
+    let mut status = status_of("set-up");
+    status.rows = vec![step(Setting::Spotlight)];
+    let plan = status.plan.clone().unwrap();
+    let line = headline(&status, &rows(&status, plan.selection), Some(&plan));
+    assert_eq!(
+        (line.text.as_str(), line.show, line.start),
+        (
+            "1 step failed: Rust in Spotlight",
+            Some(Subject::Setting(Setting::Spotlight)),
+            true
+        )
+    );
+    assert_eq!(
+        status.notes(&plan),
+        ["Rust in Spotlight failed. Set up now tries again."]
+    );
+    status.retrying = true;
+    assert_eq!(
+        status.notes(&plan),
+        ["Rust in Spotlight failed. aterm tries again by itself."]
+    );
+    status.retrying = false;
+    status.rows = vec![step(Setting::CapsLock), step(Setting::Dock)];
+    assert_eq!(
+        status.notes(&plan),
+        [format!(
+            "{} and {} failed. Set up now tries again.",
+            Setting::CapsLock.name(),
+            Setting::Dock.name()
+        )]
+    );
+}
+
+/// While a run aterm widened by itself goes, one calm note says why its groups changed
+/// (design §3.5): no alert, no failure, and no note once it ends or for a run a person asked for.
+#[test]
+fn a_widened_run_says_why_its_groups_changed() {
+    let status = status_of("widened");
+    let plan = status.plan.clone().unwrap();
+    assert_eq!(status.notes(&plan), [WIDENED_NOTE]);
+    let mut app = SystemStateApp::new(plan.clone());
+    app.publish(status.clone());
+    assert!(!app.needs_attention());
+    assert!(
+        headline(&status, &rows(&status, plan.selection), Some(&plan))
+            .text
+            .starts_with("Setting up this Mac…")
+    );
+    let done = SetupStatus {
+        busy: false,
+        running: Vec::new(),
+        ..status.clone()
+    };
+    assert!(done.notes(&plan).is_empty(), "the run ended");
+    let asked = SetupStatus {
+        widened: false,
+        ..status
+    };
+    assert!(asked.notes(&plan).is_empty(), "a person's run");
+}
+
+/// Every scenario's notes are sentences in the page's own words (design §3.6): each opens with
+/// a capital or with aterm, and none names a path, the vault's subscriber or System State itself,
+/// which the page is.
+#[test]
+fn every_scenarios_notes_are_sentences_in_the_pages_words() {
+    for scenario in SCENARIOS {
+        let status = status_of(scenario);
+        let Some(plan) = status.plan.clone() else {
+            continue;
+        };
+        for note in status.notes(&plan) {
+            for sentence in note.split(". ") {
+                assert!(
+                    sentence.starts_with(char::is_uppercase) || sentence.starts_with("aterm"),
+                    "{scenario}: {note:?}"
+                );
+            }
+            for word in [
+                "/",
+                "subscriber",
+                "in System State",
+                "journal",
+                "Init",
+                "stage",
+            ] {
+                assert!(!note.contains(word), "{scenario}: {word:?} in {note:?}");
+            }
+        }
+    }
+    // The vault's failed try, as the worker's page says it.
+    let status = status_of("vault-failed");
+    assert_eq!(
+        status.notes(&status.plan.clone().unwrap()),
+        ["Secrets vault failed. aterm tries again by itself."]
+    );
+}
+
+/// Every scenario the page's fixture seam draws.
+const SCENARIOS: [&str; 25] = [
+    "checking",
+    "running",
+    "widened",
+    "debugger",
+    "needs-you",
+    "vault",
+    "vault-unreached",
+    "vault-not-syncing",
+    "vault-not-set-up",
+    "sync-off",
+    "vault-failed",
+    "set-up",
+    "non-alab",
+    "widen-stopped",
+    "failed",
+    "check-failed",
+    "check-unconfirmed",
+    "mixed",
+    "named-result-failed",
+    "restore-at-login",
+    "restore-blocked",
+    "restore-unlogged",
+    "vault-source-mismatch",
+    "plan-unread",
+    "fresh",
+];
+
+/// Changes aterm made and could not log are a fact for later, never a signal (design §3.6):
+/// one calm note on the page, no menu line, no attention, no failure headline; the exceptions
+/// digest's entry carries it.
+#[test]
+fn a_journal_refusal_is_no_signal() {
+    let mut restored = RestoreOutcome::of([(Some(Setting::Dock), PutBack::Back)]);
+    restored.journal_refused = true;
+    let mut rolled = RestoreOutcome::of([(Some(Setting::Dock), PutBack::Back)]);
+    rolled.journal_refused = true;
+    let pass = PassOutcome {
+        rolled_back: Some(rolled),
+        unfinished: Vec::new(),
+    };
+    for said in [restore_rows(&restored), pass_rows(&pass)] {
+        let mut status = status_of("set-up");
+        status.rows = said;
+        let plan = status.plan.clone().unwrap();
+        let mut app = SystemStateApp::new(plan.clone());
+        app.publish(status.clone());
+        let line = headline(&status, &rows(&status, plan.selection), Some(&plan));
+        assert_eq!(
+            crate::system_state_access::menu_line(&status, false).map(|line| line.label),
+            None
+        );
+        assert!(!app.needs_attention());
+        assert_eq!(line.text, "This Mac is set up");
+        assert!(status.failed_steps(Some(&plan)).next().is_none());
+        let notes = status.notes(&plan);
+        assert_eq!(
+            notes
+                .iter()
+                .filter(|note| note.as_str() == JOURNAL_NOTE)
+                .count(),
+            1,
+            "{notes:?}"
+        );
+    }
+    let entry = journal_refused_entry("doctor.restore.dock: disk full");
+    assert_eq!(entry.family(), aterm_messages::exceptions::Family::Setup);
+    assert!(entry.message().is_ok(), "{:?}", entry.message().err());
+    assert_eq!(
+        entry.log_line_text(),
+        Some("System State: doctor.restore.dock: disk full")
+    );
+}
+
+/// The failed headline offers Set up now only where running the plan again can change the
+/// outcome (design §3.2): a step the run could not finish, or a setup run that could not go,
+/// whose note says Set up now tries it again; a failure aterm tries again by itself says so in
+/// its note, a reading that failed by itself names its own remedy there, and the headline
+/// offers Show alone.
+#[test]
+fn the_failed_headline_offers_the_action_its_note_names() {
+    let line = |status: &SetupStatus| {
+        let plan = status.plan.clone().unwrap();
+        (
+            headline(status, &rows(status, plan.selection), Some(&plan)),
+            status.notes(&plan),
+        )
+    };
+    let (failed, notes) = line(&status_of("failed"));
+    assert!(!failed.start && failed.show.is_some(), "{notes:?}");
+    let (step, notes) = line(&status_of("named-result-failed"));
+    assert!(step.start);
+    assert_eq!(
+        notes,
+        ["GitHub repositories failed. Set up now tries again."]
+    );
+    let mut setup = status_of("set-up");
+    setup.rows = vec![SetupStatusRow {
+        name: SETUP_ROW.into(),
+        status: "failed".into(),
+        detail: String::new(),
+    }];
+    let (could_not_go, notes) = line(&setup);
+    assert_eq!(
+        (could_not_go.text.as_str(), could_not_go.start),
+        ("Setup needs attention", true)
+    );
+    assert_eq!(notes, ["Setup failed. Set up now tries again."]);
+    // A Check that failed is pressed again where it is.
+    let (check, notes) = line(&status_of("check-failed"));
+    assert!(!check.start);
+    assert_eq!(notes, [format!("Check again failed. {CHECK_FAILED_NOTE}")]);
+    let (_, notes) = line(&status_of("check-unconfirmed"));
+    assert_eq!(
+        notes,
+        ["Check again could not confirm GitHub repositories."]
+    );
+    // A failure aterm tries again by itself says so, and the headline offers Show alone
+    // meanwhile: the vault's try as the worker's page says it, a step whose run retries, and
+    // a setup run that could not go while the run retries.
+    let (vault, notes) = line(&status_of("vault-failed"));
+    assert!(!vault.start && vault.show.is_some());
+    assert_eq!(
+        notes,
+        ["Secrets vault failed. aterm tries again by itself."]
+    );
+    let mut retried = status_of("named-result-failed");
+    retried.retrying = true;
+    let (step, notes) = line(&retried);
+    assert!(!step.start && step.show.is_some());
+    assert_eq!(
+        notes,
+        ["GitHub repositories failed. aterm tries again by itself."]
+    );
+    setup.retrying = true;
+    let (could_not_go, notes) = line(&setup);
+    assert!(!could_not_go.start);
+    assert_eq!(notes, ["Setup failed. aterm tries again by itself."]);
+    // A vault try held after two names Set up now, which the headline offers.
+    let mut held = status_of("vault-failed");
+    held.retrying = false;
+    held.rows[0].detail = "aterm tried twice, so it tries again once this Mac's network or \
+                           vault changes, or on Set up now."
+        .into();
+    let (vault, _) = line(&held);
+    assert!(vault.start);
+    // A saved setup aterm cannot read is said in its own words: no setup ran to fail.
+    assert_eq!(
+        status_of("plan-unread").notes(&Plan::default()),
+        [STATE_UNREAD_NOTE]
+    );
+}
+
+/// A vault address typed and not joined is read by nothing until Join or Check again (design
+/// §3.2): the headline never claims a check while none runs. On a set-up Mac it keeps what it
+/// said of the vault in force; elsewhere it says what the rows the draft leaves read say.
+#[test]
+fn a_vault_draft_does_not_claim_a_check() {
+    for scenario in [
+        "set-up",
+        "needs-you",
+        "failed",
+        "vault",
+        "check-failed",
+        "mixed",
+    ] {
+        let mut app = SystemStateApp::new(Plan::default());
+        app.publish(status_of(scenario));
+        let before = app.headline().text;
+        let mut view = SystemStateViewState::default();
+        app.act(
+            &mut view,
+            "system-state/url",
+            Some(SemanticInput::Text(
+                "http://team-vault.local:7484/v1/team".into(),
+            )),
+        );
+        assert!(app.take_action().is_none(), "typing starts nothing");
+        let after = app.headline().text;
+        assert_ne!(after, CHECKING, "{scenario}: {before:?} became {after:?}");
+        if scenario == "set-up" {
+            assert_eq!(after, before, "{scenario}");
+        }
+    }
 }

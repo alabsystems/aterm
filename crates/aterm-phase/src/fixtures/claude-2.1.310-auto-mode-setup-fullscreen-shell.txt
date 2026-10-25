@@ -1,0 +1,41 @@
+# claude-code 2.1.310 · MEASURED 2026-10-24, `aterm ctl text` of a private headless aterm (123x40, aterm 0.136.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the auto-mode environment offer in the fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1) above the composer while a background shell runs (stub mode bg:20:25, a turn of `bgstart`; the same scratch .claude.json and [harness] enabled = false as auto-mode-setup-fullscreen)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ bgstart
+
+  Ran 1 shell command
+
+⏺ Background task started.
+
+✻ Cogitated for 0s · done 8:30 PM · 1 shell still running
+
+
+
+
+
+
+
+
+
+
+
+
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Teach auto mode about your environment?
+
+  Auto mode works better when it knows your environment. Takes about a minute.
+
+  ❯ 1. Yes
+    2. Not now
+    3. Don't show again
+
+  Enter to confirm · Esc to cancel
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · ← for agents · ↓ to manage

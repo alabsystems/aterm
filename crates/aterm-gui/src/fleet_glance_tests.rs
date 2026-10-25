@@ -302,6 +302,36 @@ fn a_content_peer_says_what_its_need_is_and_a_freeze_dates_only_an_agent() {
     let band = crate::presence::prompt_band_word(Some("bash:not-read-only"));
     assert_eq!(need_of("content", "approval", &boxed).what, Some(band));
     assert_eq!(need_of("facts", "approval", &boxed).what, None);
+    // A need the row says is the program's own report says so at every level, in aterm's fixed
+    // words; the banner (`escalation`) reads them too.
+    let claimed = [
+        ("program_kind", "agent"),
+        ("agent", "prompt"),
+        ("needs_by", "program"),
+    ];
+    for level in ["facts", "content"] {
+        let need = need_of(level, "approval", &claimed);
+        assert_eq!(
+            need.claim,
+            Some(crate::needs::CODEX_APPROVAL_WORDS),
+            "{level}"
+        );
+        assert_eq!(
+            need.what.as_deref(),
+            Some(crate::needs::CODEX_APPROVAL_WORDS),
+            "{level}"
+        );
+    }
+    let signing = [
+        ("program_kind", "agent"),
+        ("agent", "wall:auth"),
+        ("needs_by", "program"),
+    ];
+    assert_eq!(
+        need_of("facts", "approval", &signing).claim,
+        Some(crate::needs::CODEX_SIGN_IN_WORDS)
+    );
+    assert_eq!(need_of("facts", "approval", &boxed).claim, None, "CONTROL");
     let walled = [("program_kind", "agent"), ("agent", "wall:spend")];
     assert_eq!(
         need_of("content", "wall", &walled).what,
@@ -803,6 +833,7 @@ fn read_slot(read_at_ms: u64, dark: bool) -> FleetSlot {
         worker_of: None,
         age_ms: Some(1_000),
         what: None,
+        claim: None,
     };
     FleetSlot {
         generation: 1,
@@ -1046,6 +1077,7 @@ fn mac17(read_at_ms: u64, need: bool) -> FleetMac {
                 worker_of: None,
                 age_ms: Some(1_000),
                 what: None,
+                claim: None,
             })
             .into_iter()
             .collect(),

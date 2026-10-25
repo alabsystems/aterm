@@ -10,14 +10,17 @@ use aterm_aos::publish::Head;
 use aterm_effects::aos_momentum::bundle::CandidateBundle;
 #[cfg(debug_assertions)]
 use aterm_effects::aos_momentum::m4::Admitted;
-use aterm_effects::aos_momentum::{MomentumAosStatus, MomentumCode};
+use aterm_effects::aos_momentum::{DEMO_CODE_NAME, MomentumAosStatus, MomentumCode};
 
 #[cfg(debug_assertions)]
 use crate::aos_host::PlanPublished;
 use crate::aos_host::{Repaired, Resumed, TraceSummary};
 
-/// Whether this build hosts ([`cmd`]): a debug or test build only.
-const AOS_ENABLED: bool = cfg!(any(test, debug_assertions));
+/// Whether this build answers the debug-only forms ([`cmd`]): `publish`, `bundle` and the demonstration code.
+const DEBUG_FORMS: bool = cfg!(debug_assertions);
+
+/// The demonstration code's names, which a release build refuses by name.
+const DEMO_NAMES: [&str; 2] = ["demo-stranded-settle", DEMO_CODE_NAME];
 
 /// The usage line every junk form answers with.
 const USAGE: &str = "usage: aos [status|attach [code=<name>]|pause|repair [code=<name>]|\
@@ -32,8 +35,10 @@ const _: () = assert!(PLAN_BYTES == aterm_effects::aos_momentum::plan::PLAN_LEN)
 /// What `publish` answers when its ask reaches the main thread without an evaluated plan.
 pub(crate) const UNEVALUATED: &str = "aos publish: no admitted plan came with the ask";
 
-/// The refusal every form gets where this build does not host.
-pub(crate) const NEEDS_DEBUG: &str = "aos needs a debug build";
+/// The refusal a debug-only form gets in a release build.
+pub(crate) fn needs_debug(form: &str) -> String {
+    format!("aos {form} needs a debug build")
+}
 
 /// What the verb asks of the front window's momentum glow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,19 +65,17 @@ pub(crate) enum Asked {
     TraceHex,
 }
 
-/// The verb's arguments, refused where this build does not host.
-pub(crate) fn parse(rest: &str, enabled: bool) -> Result<Asked, String> {
-    if !enabled {
-        return Err(NEEDS_DEBUG.to_string());
-    }
+/// The verb's arguments, where a build without `debug_forms` refuses `publish`, `bundle` and the demonstration code by name.
+pub(crate) fn parse(rest: &str, debug_forms: bool) -> Result<Asked, String> {
     let words: Vec<&str> = rest.split_whitespace().collect();
     Ok(match words.as_slice() {
         [] | ["status"] => Asked::Status,
         ["attach"] => Asked::Attach(MomentumCode::Shipped),
-        ["attach", code] => Asked::Attach(code_of(code)?),
+        ["attach", code] => Asked::Attach(code_of(code, debug_forms)?),
         ["pause"] => Asked::Pause,
         ["repair"] => Asked::Repair(MomentumCode::Shipped),
-        ["repair", code] => Asked::Repair(code_of(code)?),
+        ["repair", code] => Asked::Repair(code_of(code, debug_forms)?),
+        [form @ ("publish" | "bundle"), ..] if !debug_forms => return Err(needs_debug(form)),
         ["publish", plan] => Asked::Publish(plan_of(plan)?),
         ["bundle"] => Asked::Bundle,
         ["resume"] => Asked::Resume,
@@ -83,10 +86,13 @@ pub(crate) fn parse(rest: &str, enabled: bool) -> Result<Asked, String> {
     })
 }
 
-fn code_of(word: &str) -> Result<MomentumCode, String> {
+fn code_of(word: &str, debug_forms: bool) -> Result<MomentumCode, String> {
     let Some(name) = word.strip_prefix("code=") else {
         return Err(USAGE.to_string());
     };
+    if !debug_forms && DEMO_NAMES.contains(&name) {
+        return Err(needs_debug(word));
+    }
     MomentumCode::from_name(name).ok_or_else(|| {
         let names: Vec<&str> = MomentumCode::ALL.iter().map(|c| c.name()).collect();
         format!(
@@ -406,7 +412,7 @@ pub(crate) fn cmd(
     proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
     rest: &str,
 ) -> String {
-    let asked = match parse(rest, AOS_ENABLED) {
+    let asked = match parse(rest, DEBUG_FORMS) {
         Ok(asked) => asked,
         Err(refusal) => return format!("ERR {refusal}\n"),
     };
@@ -432,7 +438,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_aos_verb_parses_its_forms_and_a_release_build_refuses_all_of_them() {
+    fn the_aos_verb_parses_its_forms_and_a_release_build_refuses_only_the_debug_ones() {
         let demo = MomentumCode::DemoStrandedSettle;
         for (rest, want) in [
             ("", Asked::Status),
@@ -440,28 +446,50 @@ mod tests {
             ("  status ", Asked::Status),
             ("attach", Asked::Attach(MomentumCode::Shipped)),
             ("attach code=shipped", Asked::Attach(MomentumCode::Shipped)),
-            ("attach code=demo-stranded-settle", Asked::Attach(demo)),
             (
-                "attach code=momentum-glow.demo-stranded-settle",
-                Asked::Attach(demo),
+                "attach code=momentum-glow.shipped",
+                Asked::Attach(MomentumCode::Shipped),
             ),
             ("pause", Asked::Pause),
             ("repair", Asked::Repair(MomentumCode::Shipped)),
             ("repair code=shipped", Asked::Repair(MomentumCode::Shipped)),
-            ("repair code=demo-stranded-settle", Asked::Repair(demo)),
             ("resume", Asked::Resume),
             ("detach", Asked::Detach),
             ("trace", Asked::Trace),
             ("trace hex", Asked::TraceHex),
             (" trace  hex ", Asked::TraceHex),
-            ("bundle", Asked::Bundle),
-            (" bundle  ", Asked::Bundle),
         ] {
             assert_eq!(parse(rest, true), Ok(want), "{rest:?}");
             assert_eq!(
                 parse(rest, false),
-                Err(NEEDS_DEBUG.to_string()),
-                "a release build refuses {rest:?}"
+                Ok(want),
+                "a release build answers {rest:?}"
+            );
+        }
+        for (rest, want, form) in [
+            (
+                "attach code=demo-stranded-settle",
+                Asked::Attach(demo),
+                "code=demo-stranded-settle",
+            ),
+            (
+                "attach code=momentum-glow.demo-stranded-settle",
+                Asked::Attach(demo),
+                "code=momentum-glow.demo-stranded-settle",
+            ),
+            (
+                "repair code=demo-stranded-settle",
+                Asked::Repair(demo),
+                "code=demo-stranded-settle",
+            ),
+            ("bundle", Asked::Bundle, "bundle"),
+            (" bundle  ", Asked::Bundle, "bundle"),
+        ] {
+            assert_eq!(parse(rest, true), Ok(want), "{rest:?}");
+            assert_eq!(
+                parse(rest, false),
+                Err(format!("aos {form} needs a debug build")),
+                "a release build refuses {rest:?} by name"
             );
         }
         for junk in [
@@ -481,6 +509,10 @@ mod tests {
         ] {
             let refusal = parse(junk, true).expect_err(junk);
             assert!(refusal.starts_with(USAGE), "{junk:?}: {refusal}");
+        }
+        for junk in ["bogus", "attach code=", "repair code=nope", "trace HEX"] {
+            let refusal = parse(junk, false).expect_err(junk);
+            assert!(refusal.starts_with(USAGE), "release {junk:?}: {refusal}");
         }
         assert_eq!(
             parse("repair code=nope", true),
@@ -504,8 +536,8 @@ mod tests {
             assert_eq!(parse(&rest, true), Ok(Asked::Publish(want)), "{rest:?}");
             assert_eq!(
                 parse(&rest, false),
-                Err(NEEDS_DEBUG.to_string()),
-                "a release build refuses {rest:?}"
+                Err("aos publish needs a debug build".to_string()),
+                "a release build refuses {rest:?} by name"
             );
         }
         assert_eq!(

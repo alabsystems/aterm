@@ -462,6 +462,29 @@ struct Usage(Value);
 struct Metadata<const CONTENT: bool>(Value);
 struct Conversation(Value);
 struct Exchange(Value);
+struct Goal(Value);
+
+/// A row's `/goal` status ([`super::goal::ClaudeGoal`]): its discriminants and the attachment's
+/// verdict and condition, never another attachment's payload.
+const GOAL: Shape = Shape::Object(&[
+    ("type", Shape::Scalar),
+    ("isSidechain", Shape::Scalar),
+    (
+        "attachment",
+        Shape::Object(&[
+            ("type", Shape::Scalar),
+            ("met", Shape::Scalar),
+            ("failed", Shape::Scalar),
+            ("condition", Shape::Scalar),
+        ]),
+    ),
+]);
+
+impl<'de> Deserialize<'de> for Goal {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        GOAL.deserialize(de).map(Self)
+    }
+}
 
 impl<'de> Deserialize<'de> for Exchange {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
@@ -555,6 +578,11 @@ pub(crate) fn flight(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Flight>(line).map(|v| v.0)
 }
 
+/// The goal fold's read of a row ([`super::goal::ClaudeGoal`]): the attachment's type, verdict and condition, never another attachment's payload.
+pub(crate) fn goal(line: &str) -> aterm_json::Result<Value> {
+    aterm_json::from_str::<Goal>(line).map(|v| v.0)
+}
+
 /// The step fold's read of a row that holds a call or a result: ids, times, flags, usage and the content's parts, never any text.
 pub(crate) fn steps(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Steps<true>>(line).map(|v| v.0)
@@ -578,6 +606,7 @@ pub fn claude_reads(line: &str) -> Vec<Option<Value>> {
         calls,
         steps,
         steps_bare,
+        goal,
     ]
     .iter()
     .map(|read| read(line).ok())

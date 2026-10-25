@@ -67,26 +67,215 @@ pub(crate) struct RelativeLuminanceTable {
     blue: [f32; 256],
 }
 
-static RELATIVE_LUMINANCE: std::sync::LazyLock<RelativeLuminanceTable> =
-    std::sync::LazyLock::new(|| {
-        let linear: [f32; 256] = std::array::from_fn(|i| {
-            let n = i as f32 / 255.0;
-            if n <= 0.03928 {
-                n / 12.92
-            } else {
-                ((n + 0.055) / 1.055).powf(2.4)
-            }
-        });
-        RelativeLuminanceTable {
-            red: std::array::from_fn(|i| 0.2126 * linear[i]),
-            green: std::array::from_fn(|i| 0.7152 * linear[i]),
-            blue: std::array::from_fn(|i| 0.0722 * linear[i]),
-            linear,
-        }
-    });
+#[inline]
+pub(crate) const fn exp_f64_to_f32(y: f64) -> f32 {
+    if y.is_nan() {
+        return f32::NAN;
+    }
+    if y <= -104.0 {
+        return 0.0;
+    }
+    if y >= 89.0 {
+        return f32::INFINITY;
+    }
+    let q = y / std::f64::consts::LN_2;
+    let n_int = if q >= 0.0 {
+        (q + 0.5) as i32
+    } else {
+        (q - 0.5) as i32
+    };
+    let r = y - (n_int as f64) * std::f64::consts::LN_2;
+    let mut exp_r = 1.0;
+    let mut r_term = 1.0;
+    let mut step = 1;
+    while step <= 20 {
+        r_term *= r / (step as f64);
+        exp_r += r_term;
+        step += 1;
+    }
+    let scale = f64::from_bits(((1023 + n_int) as u64) << 52);
+    (exp_r * scale) as f32
+}
 
 #[inline]
-pub(crate) fn relative_luminance_table() -> &'static RelativeLuminanceTable {
+pub(crate) const fn exp_f32(x: f32) -> f32 {
+    exp_f64_to_f32(x as f64)
+}
+
+#[inline]
+pub(crate) const fn sqrt_f64_to_f32(s: f64) -> f32 {
+    if s.is_nan() || s < 0.0 {
+        return f32::NAN;
+    }
+    if s == 0.0 || s.is_infinite() {
+        return s as f32;
+    }
+    let mut r = f64::from_bits((s.to_bits() >> 1) + (1023u64 << 51));
+    let mut step = 0;
+    while step < 5 {
+        r = 0.5 * (r + s / r);
+        step += 1;
+    }
+    r as f32
+}
+
+#[inline]
+pub(crate) const fn sqrt_f32(x: f32) -> f32 {
+    if x < 0.0 {
+        return f32::NAN;
+    }
+    if x == 0.0 {
+        return x;
+    }
+    sqrt_f64_to_f32(x as f64)
+}
+
+#[inline]
+pub(crate) const fn hypot_f32(x: f32, y: f32) -> f32 {
+    if x.is_infinite() || y.is_infinite() {
+        return f32::INFINITY;
+    }
+    let (xf, yf) = (x as f64, y as f64);
+    sqrt_f64_to_f32(xf * xf + yf * yf)
+}
+
+#[inline]
+pub(crate) const fn powf_pos_f32(x: f32, exp: f32) -> f32 {
+    if x.is_nan() || exp.is_nan() {
+        return f32::NAN;
+    }
+    if exp == 0.0 || x == 1.0 {
+        return 1.0;
+    }
+    if x <= 0.0 {
+        return if exp > 0.0 { 0.0 } else { f32::INFINITY };
+    }
+    if x.is_infinite() {
+        return if exp > 0.0 { f32::INFINITY } else { 0.0 };
+    }
+    let xf = x as f64;
+    let bits = xf.to_bits();
+    let exp_bits = ((bits >> 52) & 0x7ff) as i32;
+    let mut k = exp_bits - 1023;
+    let mut m = f64::from_bits((bits & 0x000F_FFFF_FFFF_FFFF) | (1023u64 << 52));
+    if m > std::f64::consts::SQRT_2 {
+        m *= 0.5;
+        k += 1;
+    }
+    let u = (m - 1.0) / (m + 1.0);
+    let u2 = u * u;
+    let mut term = u;
+    let mut sum = u;
+    let mut j = 3;
+    while j <= 25 {
+        term *= u2;
+        sum += term / (j as f64);
+        j += 2;
+    }
+    let ln_x = 2.0 * sum + (k as f64) * std::f64::consts::LN_2;
+    exp_f64_to_f32((exp as f64) * ln_x)
+}
+
+#[inline]
+const fn srgb_pow_2_4(x: f32) -> f32 {
+    powf_pos_f32(x, 2.4)
+}
+
+#[inline]
+const fn srgb_encode_ref(c: f32) -> u8 {
+    let c = if c.is_finite() {
+        c.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let n = if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * powf_pos_f32(c, 1.0 / 2.4) - 0.055
+    };
+    (n * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+const SRGB_ENCODE_THRESHOLDS: [f32; 255] = {
+    let mut out = [0.0f32; 255];
+    let mut k = 0;
+    let mut lo_start = 0.0_f32.to_bits();
+    let hi_max = 1.0_f32.to_bits();
+    while k < 255 {
+        let target = (k + 1) as u8;
+        let mut lo = lo_start;
+        let mut hi = hi_max;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if srgb_encode_ref(f32::from_bits(mid)) >= target {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        out[k] = f32::from_bits(lo);
+        lo_start = lo;
+        k += 1;
+    }
+    out
+};
+
+/// Encode a linear-light channel `c` (`0..=1`) to an sRGB byte `0..=255`.
+#[inline]
+#[must_use]
+pub(crate) const fn srgb_encode(c: f32) -> u8 {
+    if c.is_nan() || c <= 0.0 {
+        return 0;
+    }
+    if c >= 1.0 {
+        return 255;
+    }
+    let mut lo = 0usize;
+    let mut hi = 255usize;
+    while lo < hi {
+        let mid = (lo + hi) >> 1;
+        if c >= SRGB_ENCODE_THRESHOLDS[mid] {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo as u8
+}
+
+impl RelativeLuminanceTable {
+    const fn build() -> Self {
+        let mut linear = [0.0f32; 256];
+        let mut red = [0.0f32; 256];
+        let mut green = [0.0f32; 256];
+        let mut blue = [0.0f32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let n = i as f32 / 255.0;
+            let lin = if n <= 0.03928 {
+                n / 12.92
+            } else {
+                srgb_pow_2_4((n + 0.055) / 1.055)
+            };
+            linear[i] = lin;
+            red[i] = 0.2126 * lin;
+            green[i] = 0.7152 * lin;
+            blue[i] = 0.0722 * lin;
+            i += 1;
+        }
+        Self {
+            linear,
+            red,
+            green,
+            blue,
+        }
+    }
+}
+
+static RELATIVE_LUMINANCE: RelativeLuminanceTable = RelativeLuminanceTable::build();
+
+#[inline]
+pub(crate) const fn relative_luminance_table() -> &'static RelativeLuminanceTable {
     &RELATIVE_LUMINANCE
 }
 
@@ -115,14 +304,14 @@ pub(crate) const fn relative_luminance_with(table: &RelativeLuminanceTable, rgb:
 /// WCAG relative luminance of a `0x00RRGGBB` colour.
 #[must_use]
 #[inline]
-pub fn relative_luminance(rgb: u32) -> f32 {
+pub const fn relative_luminance(rgb: u32) -> f32 {
     relative_luminance_with(relative_luminance_table(), rgb)
 }
 
 /// WCAG contrast ratio (`>= 1`) between two `0x00RRGGBB` colours, on [`relative_luminance`].
 #[must_use]
 #[inline]
-pub fn contrast_ratio(a: u32, b: u32) -> f32 {
+pub const fn contrast_ratio(a: u32, b: u32) -> f32 {
     let table = relative_luminance_table();
     let (la, lb) = (
         relative_luminance_with(table, a),
@@ -133,22 +322,76 @@ pub fn contrast_ratio(a: u32, b: u32) -> f32 {
 
 /// Floor `rgb`'s WCAG contrast against `ground` to at least `min` by moving its lightness alone.
 #[must_use]
-pub fn floor_contrast_keeping_hue(rgb: u32, ground: u32, min: f32) -> u32 {
+pub const fn floor_contrast_keeping_hue(rgb: u32, ground: u32, min: f32) -> u32 {
     let rgb = rgb & 0x00FF_FFFF;
-    if min.partial_cmp(&1.0) != Some(std::cmp::Ordering::Greater) {
+    if min.is_nan() || min <= 1.0 {
         return rgb;
     }
     let table = relative_luminance_table();
     let lg = relative_luminance_with(table, ground);
-    let meets = |c: u32| {
+    #[inline]
+    const fn meets(table: &RelativeLuminanceTable, lg: f32, min: f32, c: u32) -> bool {
         let lc = relative_luminance_with(table, c);
         (lc.max(lg) + 0.05) / (lc.min(lg) + 0.05) >= min
-    };
-    if meets(rgb) {
+    }
+    if meets(table, lg, min, rgb) {
         return rgb;
     }
     let darken = (lg + 0.05) * (lg + 0.05) >= 0.05 * 1.05;
-    least_on_hue_path(rgb, darken, meets)
+    let end = if darken { 0x0000_0000 } else { 0x00FF_FFFF };
+    if !meets(table, lg, min, end) {
+        return end;
+    }
+    let (r, g, b) = (
+        ((rgb >> 16) & 0xff) as f32,
+        ((rgb >> 8) & 0xff) as f32,
+        (rgb & 0xff) as f32,
+    );
+    let peak = r.max(g).max(b);
+    let up = if peak > 0.0 { 255.0 / peak } else { 1.0 };
+    let (r_up, g_up, b_up) = (r * up, g * up, b * up);
+    #[inline]
+    const fn round_chan(c: f32) -> u32 {
+        c.round().clamp(0.0, 255.0) as u32
+    }
+    #[inline]
+    const fn pack(r: f32, g: f32, b: f32) -> u32 {
+        (round_chan(r) << 16) | (round_chan(g) << 8) | round_chan(b)
+    }
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    let (mut lo_rgb, mut hi_rgb) = (rgb, end);
+    let mut i = 0;
+    while i < 24 {
+        let mid = 0.5 * (lo + hi);
+        let mid_rgb = if darken {
+            let s = 1.0 - mid;
+            pack(r * s, g * s, b * s)
+        } else if mid <= 0.5 {
+            let s = 1.0 + (up - 1.0) * (mid * 2.0);
+            pack(r * s, g * s, b * s)
+        } else {
+            let u = (mid - 0.5) * 2.0;
+            pack(
+                r_up + (255.0 - r_up) * u,
+                g_up + (255.0 - g_up) * u,
+                b_up + (255.0 - b_up) * u,
+            )
+        };
+        if mid_rgb == lo_rgb {
+            lo = mid;
+        } else if mid_rgb == hi_rgb || meets(table, lg, min, mid_rgb) {
+            hi = mid;
+            hi_rgb = mid_rgb;
+        } else {
+            lo = mid;
+            lo_rgb = mid_rgb;
+        }
+        if i >= 1 && lo_rgb == hi_rgb {
+            break;
+        }
+        i += 1;
+    }
+    hi_rgb
 }
 
 /// Lift `rgb` along its hue (its peak scaled to full, then tinted toward white) to the least
@@ -282,16 +525,31 @@ pub const fn wear_pinned(pinned: u32, styled: u32, charge: f32, settled: f32) ->
     ch(pinned, styled, k, 16) | ch(pinned, styled, k, 8) | ch(pinned, styled, k, 0)
 }
 
+#[inline]
+const fn cbrt_f32(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let xf = x as f64;
+    let mut y = f64::from_bits(0x2AA0_0000_0000_0000 + xf.to_bits() / 3);
+    let mut i = 0;
+    while i < 6 {
+        y = (2.0 * y + xf / (y * y)) / 3.0;
+        i += 1;
+    }
+    y as f32
+}
+
 /// OKLab `[L, a, b]` of a `0x00RRGGBB` colour (Björn Ottosson's matrices), the uniform space.
 #[inline]
-pub(crate) fn oklab(rgb: u32) -> [f32; 3] {
+pub(crate) const fn oklab(rgb: u32) -> [f32; 3] {
     let linear = &relative_luminance_table().linear;
     let r = linear[((rgb >> 16) & 0xff) as usize];
     let g = linear[((rgb >> 8) & 0xff) as usize];
     let b = linear[(rgb & 0xff) as usize];
-    let l = (0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
-    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
-    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+    let l = cbrt_f32(0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_995 * b);
+    let m = cbrt_f32(0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b);
+    let s = cbrt_f32(0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b);
     [
         0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
         1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
@@ -301,23 +559,14 @@ pub(crate) fn oklab(rgb: u32) -> [f32; 3] {
 
 /// [`oklab`]'s inverse.
 #[inline]
-pub(crate) fn oklab_to_rgb([l, a, b]: [f32; 3]) -> u32 {
+pub(crate) const fn oklab_to_rgb([l, a, b]: [f32; 3]) -> u32 {
     let l_ = l + 0.396_337_78 * a + 0.215_803_76 * b;
     let m_ = l - 0.105_561_346 * a - 0.063_854_17 * b;
     let s_ = l - 0.089_484_18 * a - 1.291_485_5 * b;
     let (l3, m3, s3) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
-    let byte = |c: f32| {
-        let c = c.clamp(0.0, 1.0);
-        let n = if c <= 0.003_130_8 {
-            12.92 * c
-        } else {
-            1.055 * c.powf(1.0 / 2.4) - 0.055
-        };
-        (n * 255.0).round().clamp(0.0, 255.0) as u32
-    };
-    let r = byte(4.076_741_7 * l3 - 3.307_711_6 * m3 + 0.230_969_94 * s3);
-    let g = byte(-1.268_438 * l3 + 2.609_757_4 * m3 - 0.341_319_38 * s3);
-    let bl = byte(-0.004_196_086_3 * l3 - 0.703_418_6 * m3 + 1.707_614_7 * s3);
+    let r = srgb_encode(4.076_741_7 * l3 - 3.307_711_6 * m3 + 0.230_969_94 * s3) as u32;
+    let g = srgb_encode(-1.268_438 * l3 + 2.609_757_4 * m3 - 0.341_319_38 * s3) as u32;
+    let bl = srgb_encode(-0.004_196_086_3 * l3 - 0.703_418_6 * m3 + 1.707_614_7 * s3) as u32;
     (r << 16) | (g << 8) | bl
 }
 
@@ -454,5 +703,26 @@ mod tests {
         let grey = light_body_fill(0x0080_8080, 0.5);
         let (_, s, _) = rgb2hsv(grey);
         assert!(s < 0.02, "a grey stays grey, got {grey:06x}");
+    }
+
+    #[test]
+    fn srgb_linear_table_matches_powf_within_one_ulp() {
+        let table = relative_luminance_table();
+        for i in 0..256 {
+            let n = i as f32 / 255.0;
+            let expected = if n <= 0.03928 {
+                n / 12.92
+            } else {
+                ((n + 0.055) / 1.055).powf(2.4)
+            };
+            let ulp = table.linear[i].to_bits().abs_diff(expected.to_bits());
+            assert!(
+                ulp <= 1,
+                "channel byte {i}: got {:08x} ({}), expected {:08x} ({expected}), ulp={ulp}",
+                table.linear[i].to_bits(),
+                table.linear[i],
+                expected.to_bits(),
+            );
+        }
     }
 }

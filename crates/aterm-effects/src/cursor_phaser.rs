@@ -9,7 +9,7 @@ use aterm_render::{GlowQuad, premul_rgb};
 
 use crate::cursor_glow::{Geom, hsv2rgb};
 use crate::effect_util::push_fx_rect as push_rect;
-use crate::effect_util::{lerp, mix_rgb};
+use crate::effect_util::{lerp, lerp_rgb as mix_rgb};
 
 /// The block base the beam hue tints from on a dark theme when the host names
 /// none: white.
@@ -24,7 +24,7 @@ const BASE_DARK_THEME: u32 = 0x00FF_FFFF;
 /// ([`crate::cursor_beam::LIGHT_EMITTER_CONTRAST`]), so it reads as the
 /// emitter rather than a drab near-black.
 #[inline]
-fn light_emitter_fill(hue: f32, e: f32) -> u32 {
+const fn light_emitter_fill(hue: f32, e: f32) -> u32 {
     let clean = hsv2rgb(crate::color_math::light_spectrum_hue(hue), 1.0, 1.0);
     crate::color_math::floor_contrast_keeping_hue(
         crate::color_math::light_body_fill(clean, e),

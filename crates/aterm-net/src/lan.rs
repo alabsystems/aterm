@@ -213,18 +213,38 @@ pub struct Proof {
 }
 impl Proof {
     pub fn recheck(&self) -> io::Result<()> {
+        self.check(false)
+    }
+
+    /// Finish an exchange and consume its proof. A TCP reset may have removed
+    /// the socket's peer tuple after the final authenticated bytes arrived. In
+    /// that case, revalidate the recorded tuple's physical route and attachment;
+    /// this terminal check cannot authorize any further I/O.
+    pub fn finish(self) -> io::Result<()> {
+        self.check(true)
+    }
+
+    fn check(&self, completed: bool) -> io::Result<()> {
         if self.withdrawn.load(Ordering::Acquire) {
             return Err(refuse("LAN observation was withdrawn; reconnect"));
         }
         let checked = (|| {
             native::socket_policy(&self.witness, self.bound, self.scope == Scope::Lan)?;
-            let observed = observe(
-                self.witness.local_addr()?,
-                self.witness.peer_addr()?,
-                self.scope,
-                self.bound,
-                native::deadline(),
-            )?;
+            let (local, peer) = match self.witness.peer_addr() {
+                Ok(peer) => (self.witness.local_addr()?, peer),
+                Err(error)
+                    if completed
+                        && (error.kind() == io::ErrorKind::NotConnected
+                            || (cfg!(target_os = "macos")
+                                && error.raw_os_error() == Some(libc::EINVAL))) =>
+                {
+                    // XNU reports EINVAL for getpeername after a reset; Linux
+                    // reports ENOTCONN. Only the consuming finalizer uses this.
+                    (self.observation.local, self.observation.peer)
+                }
+                Err(error) => return Err(error),
+            };
+            let observed = observe(local, peer, self.scope, self.bound, native::deadline())?;
             if observed != self.observation {
                 return Err(refuse("LAN route or attachment changed; reconnect"));
             }

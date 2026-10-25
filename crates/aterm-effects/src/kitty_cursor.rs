@@ -61,6 +61,16 @@ const MAX_WINCE_CHAIN: u8 = 4;
 const WINCE_TUMBLE: f32 = 0.13;
 const WINCE_TUMBLE_FREQ: f32 = 3.1;
 const WINCE_TUMBLE_DECAY: f32 = 3.4;
+const WINCE_TUMBLE_OMEGA: [f32; MAX_WINCE_CHAIN as usize] = {
+    let mut out = [0.0f32; MAX_WINCE_CHAIN as usize];
+    let mut i = 0;
+    while i < out.len() {
+        out[i] =
+            std::f32::consts::TAU * WINCE_TUMBLE_FREQ * crate::color_math::sqrt_f32((i + 1) as f32);
+        i += 1;
+    }
+    out
+};
 
 const DELIGHT_HOLD: f32 = 0.62;
 const DELIGHT_CHAIN_WINDOW: f32 = 0.9;
@@ -1124,12 +1134,9 @@ impl CursorCat {
                 lead = lead * (1.0 - env.min(1.0)) - WINCE_RECOIL * env;
                 scale_y *= 1.0 - WINCE_SQUASH * env;
                 scale_x *= 1.0 + WINCE_SQUASH * 0.7 * env;
-                let swing = (-WINCE_TUMBLE_DECAY * elapsed).exp()
-                    * (std::f32::consts::TAU
-                        * WINCE_TUMBLE_FREQ
-                        * f32::from(chain).sqrt()
-                        * elapsed)
-                        .sin();
+                let omega =
+                    WINCE_TUMBLE_OMEGA[(chain as usize - 1).min(MAX_WINCE_CHAIN as usize - 1)];
+                let swing = (-WINCE_TUMBLE_DECAY * elapsed).exp() * (omega * elapsed).sin();
                 let swing_env = swing * attack * settle;
                 lead += WINCE_TUMBLE * swing_env;
                 let wobble = 0.05 * swing_env;

@@ -3866,7 +3866,6 @@ impl crate::App {
                 utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
             },
             live: crate::stats_live::DeckLive::STILL,
-            needs: Vec::new(),
         }
     }
 

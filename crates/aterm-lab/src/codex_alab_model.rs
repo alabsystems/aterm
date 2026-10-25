@@ -295,7 +295,7 @@ fn question_call() -> J {
     )
 }
 
-/// The approval leg's call: an escalated `exec_command` under `on-request`.
+/// The approval and box legs' call: an escalated `exec_command` under `on-request`.
 fn approval_call() -> J {
     call_item(
         "exec_command",
@@ -351,11 +351,11 @@ pub fn answer(body: &J) -> Answered {
         ("continue" | "hold" | "off" | "control", Step::Continue) => say(CONTINUED_DONE),
         ("carry", Step::Person) => slow("The long task's first step.", CARRY_FIRST_TURN),
         ("carry", Step::Continue) => say(CARRIED_DONE),
-        ("approval", _) if tool.is_some() => {
+        ("approval" | "box", _) if tool.is_some() => {
             name = "after-output".to_string();
             say("The command ran.")
         }
-        ("approval", Step::Person) => {
+        ("approval" | "box", Step::Person) => {
             name = "call".to_string();
             Answered::items(vec![approval_call()])
         }
@@ -726,6 +726,14 @@ mod tests {
         );
         let ran = answer(&body(&["LEG-approval Run the build."], Some("done")));
         assert_eq!(ran.tag, "approval:after-output");
+        let unanswered = answer(&body(&["LEG-box Run the build."], None));
+        assert_eq!(
+            unanswered.tag, "box:call",
+            "the box leg asks for the same box"
+        );
+        assert!(text_of(&unanswered).contains("require_escalated"));
+        let answered = answer(&body(&["LEG-box Run the build."], Some("done")));
+        assert_eq!(answered.tag, "box:after-output");
     }
 
     #[test]

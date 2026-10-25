@@ -236,6 +236,16 @@ pub(crate) fn copy_of_tab(sid: &str) -> Option<Copy> {
         .cloned()
 }
 
+/// The kept primary copy only while that exact proven claim is currently standing.
+/// Post-release crash copies remain available through [`copy_of_tab`] separately.
+pub(crate) fn live_copy(ctx: &crate::SessionCtx) -> Option<Copy> {
+    let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
+    let proven = meta.live_claim(crate::metrics::now_us())?.proven.as_ref()?;
+    let copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
+    let copy = copies.get(ctx.self_id.as_str())?;
+    (copy.pid == proven.pid && copy.start == proven.start).then(|| copy.clone())
+}
+
 /// Rollout tap target for a proven `codex-alab` session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RolloutTarget {
@@ -484,6 +494,61 @@ pub(crate) mod stand_in {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_snapshot_copy_requires_its_current_proven_claim() {
+        use crate::session_timeline::{claim_supervisor_as, release_supervisor};
+        let handle = crate::session_store::test_handle_on(7593, -1);
+        let ctx = handle.ctx.as_ref();
+        let sid = ctx.self_id.as_str();
+        let now = crate::metrics::now_us();
+        let proven = Proven {
+            pid: 4242,
+            start: "current primary".to_string(),
+        };
+        let own = copy_of(
+            proven.pid,
+            &proven.start,
+            present(Some("0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77")),
+        );
+        set_copy_for_test(sid, Some(own.clone()));
+        assert!(
+            live_copy(ctx).is_none(),
+            "a retained copy alone is no current claim"
+        );
+        claim_supervisor_as(
+            ctx,
+            "codex-alab@4242",
+            Some(1),
+            None,
+            Some(proven.clone()),
+            now,
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the proven claim stands");
+        assert_eq!(live_copy(ctx), Some(own.clone()));
+        for other in [
+            copy_of(4243, &proven.start, own.seen.clone()),
+            copy_of(4242, "old process", own.seen.clone()),
+        ] {
+            set_copy_for_test(sid, Some(other));
+            assert!(
+                live_copy(ctx).is_none(),
+                "a current proof cannot borrow another identity's copy"
+            );
+        }
+        set_copy_for_test(sid, Some(own));
+        assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
+        assert!(
+            copy_of_tab(sid).is_some(),
+            "a post-release crash copy may remain"
+        );
+        assert!(
+            live_copy(ctx).is_none(),
+            "the released claim cannot disambiguate a live root"
+        );
+        forget(sid);
+    }
 
     /// A copy of `pid`'s record, read under `start`, naming `session`.
     fn copy_of(pid: u32, start: &str, seen: self_claimed::Seen) -> Copy {

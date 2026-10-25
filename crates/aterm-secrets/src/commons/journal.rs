@@ -9,18 +9,18 @@
 use super::constraints::Constraints;
 use super::node::{Kind, Node};
 use crate::{Error, Result, SecretBytes, age::Identity};
-use astream_broker::{BrokerLog, Durability, OpenOptions as LogOptions, Prepared};
 use astream_wire::{
     Offset,
     sync::{Digest, Index},
 };
-use aterm_uds::private_file::{self, PrivateFileError};
+use aterm_journal::{Limits, Log};
+#[cfg(test)]
+use aterm_uds::private_file;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 /// Maximum retained control records, including pending and competing branches.
@@ -97,201 +97,6 @@ pub struct Current {
     pub constraints: Constraints,
 }
 
-struct WriterLock(File);
-impl Drop for WriterLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-fn lock(dir: &Path) -> Result<WriterLock> {
-    private_file::create_private_dir(dir)?;
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(dir.join("control.lock"))
-    {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    let (file, _) = private_file::open_private(dir, "control.lock")
-        .map_err(|_| Error::new("control journal lock is not private"))?;
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "WriterLock explicitly unlocks before close, including after descriptor inheritance"
-    )]
-    file.try_lock()
-        .map_err(|_| Error::new("another local control journal writer is active"))?;
-    Ok(WriterLock(file))
-}
-
-/// Digest of the exact acknowledged physical prefix. Kept incrementally in
-/// memory, but reconstructed and checked before astream can repair any tail.
-struct Checkpoint {
-    length: u64,
-    hash: aterm_digest::Sha256,
-}
-impl Checkpoint {
-    fn load(dir: &Path, fresh: bool) -> io::Result<Self> {
-        let mut checkpoint = Self {
-            length: 0,
-            hash: aterm_digest::Sha256::new(),
-        };
-        match private_file::read_private(dir, "control.checkpoint", 40) {
-            Ok(bytes) if bytes.len() == 40 => {
-                let length = u64::from_le_bytes(
-                    bytes[..8]
-                        .try_into()
-                        .map_err(|_| io::Error::other("invalid control checkpoint"))?,
-                );
-                checkpoint.extend(dir, length)?;
-                if checkpoint.hash.clone().finalize() != bytes[8..] {
-                    return Err(io::Error::other(
-                        "acknowledged control history changed; preserve it for authenticated repair",
-                    ));
-                }
-            }
-            Err(PrivateFileError::Missing) if fresh => {
-                let (_, metadata) = private_file::open_private(dir, "control.astream")
-                    .map_err(|_| io::Error::other("control journal is not private"))?;
-                if metadata.len() != 0 {
-                    return Err(io::Error::other(
-                        "nonempty control journal has no acknowledgement checkpoint",
-                    ));
-                }
-            }
-            _ => {
-                return Err(io::Error::other(
-                    "control checkpoint is malformed or not private",
-                ));
-            }
-        }
-        Ok(checkpoint)
-    }
-    fn extend(&mut self, dir: &Path, length: u64) -> io::Result<()> {
-        let (mut file, metadata) = private_file::open_private(dir, "control.astream")
-            .map_err(|_| io::Error::other("control journal is not private"))?;
-        if length < self.length
-            || length > MAX_BYTES as u64
-            || metadata.len() < length
-            || metadata.len() > (MAX_BYTES + super::node::MAX_NODE) as u64
-        {
-            return Err(io::Error::other(
-                "control journal lost acknowledged bytes or exceeded its capacity",
-            ));
-        }
-        file.seek(SeekFrom::Start(self.length))?;
-        let mut remaining = length - self.length;
-        let mut buffer = [0; 8192];
-        while remaining != 0 {
-            let count = usize::try_from(remaining.min(buffer.len() as u64))
-                .map_err(|_| io::Error::other("control checkpoint length overflow"))?;
-            file.read_exact(&mut buffer[..count])?;
-            self.hash.update(&buffer[..count]);
-            remaining -= count as u64;
-        }
-        self.length = length;
-        Ok(())
-    }
-    fn save(&self, dir: &Path) -> io::Result<()> {
-        let mut bytes = self.length.to_le_bytes().to_vec();
-        bytes.extend_from_slice(&self.hash.clone().finalize());
-        private_file::write_private(dir, "control.checkpoint", &bytes)
-    }
-}
-
-/// The checkpoint is the application's commit point. Preserve any bytes after
-/// it for diagnosis, then roll back that unacknowledged suffix. The application
-/// writer and the physical file are both locked while this happens; astream's
-/// prepare callback rechecks the prefix after taking over the physical lock.
-fn recover_uncommitted(dir: &Path, fresh: bool) -> io::Result<()> {
-    let (_, admitted) = private_file::open_private(dir, "control.astream")
-        .map_err(|_| io::Error::other("control journal is not private"))?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(dir.join("control.astream"))?;
-    let opened = file.metadata()?;
-    if opened.dev() != admitted.dev()
-        || opened.ino() != admitted.ino()
-        || opened.mode() != admitted.mode()
-        || opened.uid() != admitted.uid()
-    {
-        return Err(io::Error::other(
-            "control journal changed during private open",
-        ));
-    }
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "WriterLock explicitly unlocks the same physical file before transferring ownership to astream"
-    )]
-    file.try_lock()
-        .map_err(|_| io::Error::other("another control journal writer is active"))?;
-    let mut held = WriterLock(file);
-    let checkpoint = Checkpoint::load(dir, fresh)?;
-    let (_, checked) = private_file::open_private(dir, "control.astream")
-        .map_err(|_| io::Error::other("control journal is not private"))?;
-    if checked.dev() != opened.dev() || checked.ino() != opened.ino() {
-        return Err(io::Error::other(
-            "control journal changed while its prefix was checked",
-        ));
-    }
-    let tail_len = checked
-        .len()
-        .checked_sub(checkpoint.length)
-        .ok_or_else(|| io::Error::other("control journal lost acknowledged bytes"))?;
-    if tail_len == 0 {
-        return Ok(());
-    }
-    let mut tail = vec![
-        0;
-        usize::try_from(tail_len)
-            .map_err(|_| io::Error::other("control suffix too large"))?
-    ];
-    held.0.seek(SeekFrom::Start(checkpoint.length))?;
-    held.0.read_exact(&mut tail)?;
-    let name = format!(
-        "control-uncommitted-{}",
-        aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&tail))
-    );
-    match private_file::read_private(dir, &name, MAX_BYTES + super::node::MAX_NODE) {
-        Ok(old) if old == tail => {}
-        Err(PrivateFileError::Missing) => {
-            let mut bytes = tail.len() as u64;
-            for (count, entry) in std::fs::read_dir(dir)?.enumerate() {
-                if count >= MAX_NODES {
-                    return Err(io::Error::other("control directory exceeds its entry cap"));
-                }
-                let entry = entry?;
-                let file_name = entry.file_name();
-                let file_name = file_name.to_string_lossy();
-                if !file_name.starts_with("control-uncommitted-") {
-                    continue;
-                }
-                let (_, metadata) = private_file::open_private(dir, &file_name)
-                    .map_err(|_| io::Error::other("control suffix archive is not private"))?;
-                bytes = bytes.saturating_add(metadata.len());
-            }
-            if bytes > MAX_BYTES as u64 {
-                return Err(io::Error::other(
-                    "control suffix archive capacity exhausted; preserve history for repair",
-                ));
-            }
-            private_file::write_private(dir, &name, &tail)?;
-        }
-        _ => {
-            return Err(io::Error::other(
-                "control suffix archive is corrupt or not private",
-            ));
-        }
-    }
-    held.0.set_len(checkpoint.length)?;
-    aterm_durable::durable(&held.0)?;
-    Ok(())
-}
-
 /// Bounded strict astream log and its disposable causal index. Open, append and
 /// close locally; do not hold this exclusive writer across peer network IO.
 pub struct Journal {
@@ -299,11 +104,7 @@ pub struct Journal {
     index: Index,
     nodes: BTreeMap<Digest, Node>,
     receipts: BTreeMap<Digest, Receipt>,
-    log: BrokerLog,
-    checkpoint: Checkpoint,
-    dir: PathBuf,
-    poisoned: bool,
-    _lock: WriterLock,
+    log: Log,
 }
 impl Journal {
     /// Immutable network, authority and genesis pinned when this journal opened.
@@ -325,67 +126,27 @@ impl Journal {
     }
 
     fn open_mode(dir: &Path, trust: Trust, established: bool) -> Result<Self> {
-        let lock = lock(dir)?;
-        let missing_anchor = match private_file::read_private(dir, "control.anchor", 84) {
-            Ok(bytes) if bytes == trust.bytes() => false,
-            Ok(_) => return Err(Error::new("control journal trust anchor changed")),
-            Err(PrivateFileError::Missing) if !established => true,
-            Err(PrivateFileError::Missing) => {
-                return Err(Error::new("established control journal anchor is missing"));
-            }
-            Err(_) => {
-                return Err(Error::new(
-                    "control journal anchor is not a private regular file",
-                ));
-            }
-        };
-        match private_file::open_private(dir, "control.astream") {
-            Ok(_) => {}
-            Err(PrivateFileError::Missing) if missing_anchor => {
-                private_file::write_private(dir, "control.astream", &[])?
-            }
-            Err(_) => return Err(Error::new("control journal is not a private regular file")),
-        }
-        recover_uncommitted(dir, missing_anchor)?;
-        let mut checkpoint = None;
-        let log = BrokerLog::open_opts(
-            dir.join("control.astream"),
-            LogOptions::new(Durability::Strict),
-            || {
-                let checked = Checkpoint::load(dir, missing_anchor)?;
-                let (_, metadata) = private_file::open_private(dir, "control.astream")
-                    .map_err(|_| io::Error::other("control journal is not private"))?;
-                if metadata.len() != checked.length {
-                    return Err(io::Error::other(
-                        "control journal changed between its writer locks",
-                    ));
-                }
-                checkpoint = Some(checked);
-                Ok(Prepared::Nothing)
+        let log = Log::open(
+            dir,
+            "control",
+            &trust.bytes(),
+            established,
+            Limits {
+                records: MAX_NODES,
+                bytes: MAX_BYTES,
+                record_bytes: super::node::MAX_NODE + 8,
             },
         )?;
-        let mut checkpoint =
-            checkpoint.ok_or_else(|| Error::new("control journal was not prepared"))?;
-        // The verified prefix, not the broker's generation counter, preserves
-        // authority. Recovery may safely cut an unacknowledged torn suffix.
-        if log.stats().retained_bytes > MAX_BYTES {
-            return Err(Error::new("control journal exceeds its byte capacity"));
-        }
-        checkpoint.extend(dir, log.stats().retained_bytes as u64)?;
         let mut journal = Self {
             trust,
             index: Index::new(MAX_NODES),
             nodes: BTreeMap::new(),
             receipts: BTreeMap::new(),
             log,
-            checkpoint,
-            dir: dir.to_path_buf(),
-            poisoned: false,
-            _lock: lock,
         };
         let mut offset = Offset::ZERO;
         loop {
-            let batch = journal.log.read_range(offset, 256);
+            let batch = journal.log.read_range(offset, 256)?;
             if batch.is_empty() {
                 break;
             }
@@ -419,10 +180,7 @@ impl Journal {
                 );
             }
         }
-        journal.checkpoint.save(dir)?;
-        if missing_anchor {
-            private_file::write_private(dir, "control.anchor", &trust.bytes())?;
-        }
+        journal.log.finish_open()?;
         Ok(journal)
     }
 
@@ -438,7 +196,7 @@ impl Journal {
     /// return their original receipt. A failed flush poisons this handle until
     /// reopen: callers retain the prepared bytes and retry those same bytes.
     pub fn ingest(&mut self, wire: &[u8]) -> Result<Receipt> {
-        if self.poisoned {
+        if self.log.is_poisoned() {
             return Err(Error::new(
                 "uncertain control append: reopen and retry the exact prepared bytes",
             ));
@@ -448,11 +206,7 @@ impl Journal {
         if let Some(receipt) = self.receipts.get(&id) {
             return Ok(*receipt);
         }
-        let next_bytes = self
-            .log
-            .stats()
-            .retained_bytes
-            .saturating_add(wire.len() + 256);
+        let next_bytes = self.log.bytes().saturating_add(wire.len() + 256);
         let (data_nodes, data_bytes) = data_usage(self.nodes.values());
         if node.kind() != Kind::Recovery
             && (data_nodes >= MAX_NODES - RECOVERY_NODES
@@ -479,37 +233,11 @@ impl Journal {
                 "control journal recovery headroom exhausted; preserve history",
             ));
         }
-        let sequence = self
-            .log
-            .stats()
-            .head
-            .0
-            .checked_add(1)
-            .ok_or_else(|| Error::new("control journal sequence exhausted"))?;
         let received_ms = aterm_time::unix_millis()
             .ok_or_else(|| Error::new("system clock cannot represent a receipt timestamp"))?;
         let mut body = received_ms.to_le_bytes().to_vec();
         body.extend_from_slice(wire);
-        let offset = match self.log.publish_checked(1, sequence, SUBJECT.into(), body) {
-            Ok((offset, _)) => offset.0,
-            Err(_) => {
-                self.poisoned = true;
-                return Err(Error::new(
-                    "uncertain strict control append: reopen and retry the exact prepared bytes",
-                ));
-            }
-        };
-        if self
-            .checkpoint
-            .extend(&self.dir, self.log.stats().retained_bytes as u64)
-            .and_then(|()| self.checkpoint.save(&self.dir))
-            .is_err()
-        {
-            self.poisoned = true;
-            return Err(Error::new(
-                "uncertain control checkpoint: reopen and retry the exact prepared bytes",
-            ));
-        }
+        let offset = self.log.append(SUBJECT, body)?.0;
         let receipt = Receipt {
             id,
             received_ms,
@@ -555,7 +283,7 @@ impl Journal {
         )
     )]
     pub fn state(&self) -> State {
-        if self.poisoned {
+        if self.log.is_poisoned() {
             return State::Uncertain;
         }
         if self.nodes.is_empty() {
@@ -628,30 +356,47 @@ impl Journal {
     /// only. A recovery's unselected parents remain evidence, not positive grants.
     /// The roster consumer must separately establish current local membership.
     pub(crate) fn historical(&self, id: Digest, identity: &Identity) -> Result<Current> {
+        let (node, constraints) = self.historical_source(id)?;
+        Ok(Current {
+            head: id,
+            basis: id,
+            payload: node.open(identity)?,
+            constraints,
+        })
+    }
+
+    pub(crate) fn historical_with_key(&self, id: Digest, key: &[u8; 16]) -> Result<Current> {
+        let (node, constraints) = self.historical_source(id)?;
+        Ok(Current {
+            head: id,
+            basis: id,
+            payload: node.open_history_key(key)?,
+            constraints,
+        })
+    }
+
+    fn historical_source(&self, id: Digest) -> Result<(&Node, Constraints)> {
         let State::Ready { head, .. } = self.state() else {
             return Err(Error::new(
                 "historical access requires ready control history",
             ));
         };
-        let mut cursor = head;
-        let mut selected = false;
-        for _ in 0..self.nodes.len() {
-            let node = self
-                .nodes
-                .get(&cursor)
-                .ok_or_else(|| Error::new("missing selected history"))?;
-            if cursor == id && node.kind() != Kind::Recovery {
-                selected = true;
-                break;
-            }
-            let Some(parent) = node.selected().or_else(|| node.parents().first().copied()) else {
-                break;
-            };
-            cursor = parent;
-        }
-        if !selected {
+        if !self.selected_ancestor(id, head) {
             return Err(Error::new("roster is outside the selected control history"));
         }
+        let ancestors = self.ancestors(id)?;
+        Ok((
+            &self.nodes[&id],
+            Constraints::collect(
+                self.trust.network,
+                self.trust.authority,
+                id,
+                ancestors.iter().map(|ancestor| &self.nodes[ancestor]),
+            )?,
+        ))
+    }
+
+    fn ancestors(&self, id: Digest) -> Result<BTreeSet<Digest>> {
         let mut ancestors = BTreeSet::new();
         let mut pending = vec![id];
         while let Some(parent) = pending.pop() {
@@ -663,17 +408,27 @@ impl Journal {
                 pending.extend(node.parents());
             }
         }
-        Ok(Current {
-            head: id,
-            basis: id,
-            payload: self.nodes[&id].open(identity)?,
-            constraints: Constraints::collect(
-                self.trust.network,
-                self.trust.authority,
-                id,
-                ancestors.iter().map(|ancestor| &self.nodes[ancestor]),
-            )?,
-        })
+        Ok(ancestors)
+    }
+
+    /// Whether a data node is on this descendant's selected path, including
+    /// the descendant itself. Recovery's unselected parents never qualify.
+    /// This graph query grants no membership or key access.
+    pub fn selected_ancestor(&self, ancestor: Digest, descendant: Digest) -> bool {
+        let mut cursor = descendant;
+        for _ in 0..self.nodes.len() {
+            let Some(node) = self.nodes.get(&cursor) else {
+                return false;
+            };
+            if cursor == ancestor && node.kind() != Kind::Recovery {
+                return true;
+            }
+            let Some(parent) = node.selected().or_else(|| node.parents().first().copied()) else {
+                return false;
+            };
+            cursor = parent;
+        }
+        false
     }
 
     /// Observe the union of restrictive facts without a decryption key, only
@@ -747,6 +502,30 @@ impl Journal {
         self.nodes
             .values()
             .filter(|node| node.facts().contains(&fact))
+            .take(2)
+            .count()
+            == 1
+    }
+
+    /// Historical authenticity depends on the source's complete causal past,
+    /// including every recovery parent. Later publications cannot rewrite that
+    /// past. This check alone supplies no current access or selected-path grant.
+    pub(crate) fn single_historical_key_publication(
+        &self,
+        source: Digest,
+        generation: u64,
+        commitment: Digest,
+    ) -> bool {
+        let Ok(ancestors) = self.ancestors(source) else {
+            return false;
+        };
+        let fact = super::constraints::Fact::Epoch {
+            generation,
+            commitment,
+        };
+        ancestors
+            .iter()
+            .filter(|id| self.nodes[*id].facts().contains(&fact))
             .take(2)
             .count()
             == 1

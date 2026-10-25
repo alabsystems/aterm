@@ -123,7 +123,7 @@ fn relaunchable(
     match crate::self_claim::copy_of_tab(sid)
         .filter(|copy| copy.pid == snap.pid && copy.start == snap.start)
     {
-        Some(copy) => copy.resume.is_ok(),
+        Some(copy) => aterm_agent::harness::relaunch::same_self_claim(snap, &copy),
         None => {
             lane_relaunches(snap)
                 && home
@@ -189,7 +189,7 @@ fn offered_unless(
         .filter(|copy| copy.pid == snap.pid && copy.start == snap.start)
     {
         Some(copy) => {
-            let ok = copy.resume.is_ok();
+            let ok = aterm_agent::harness::relaunch::same_self_claim(&snap, &copy);
             (ok, ok && snap.shell != 0)
         }
         None => (
@@ -990,6 +990,63 @@ impl crate::App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_changed_primary_cannot_publish_or_offer_an_older_root_restart() {
+        use aterm_agent::harness::{relaunch, self_claimed};
+        let sid = "s-primary-restart-switch";
+        let primary = "00000000-1111-2222-3333-444455556666";
+        let next = "00000001-1111-2222-3333-444455556666";
+        let resume = |thread: &str| self_claimed::Resume {
+            argv: vec![
+                "/opt/codex/bin/codex".to_string(),
+                "resume".to_string(),
+                thread.to_string(),
+            ],
+            session: thread.to_string(),
+            codex_home: None,
+            cwd: Some("/w".to_string()),
+        };
+        let copy = |thread: &str| self_claimed::Copy {
+            pid: 0x3fff_ff69,
+            start: "same process".to_string(),
+            home: std::path::PathBuf::from("/private/tmp/codex"),
+            seen: self_claimed::Seen::Never,
+            resume: Ok(resume(thread)),
+        };
+        let initial = copy(primary);
+        let mut snap =
+            relaunch::snapshot_of_copy(sid, &initial, initial.resume.as_ref().unwrap(), 42, None);
+        crate::self_claim::set_copy_for_test(sid, Some(initial));
+        crate::harness_host::publish_snapshot_for_test(sid, Some(&snap));
+        assert!(
+            offered_for(sid, snap.pid),
+            "the exact current primary is offered"
+        );
+        crate::self_claim::set_copy_for_test(sid, Some(copy(next)));
+        assert!(
+            !offered_for(sid, snap.pid),
+            "a root change is fenced before a later snapshot is published"
+        );
+        crate::harness_host::publish_snapshot_for_test(sid, Some(&snap));
+        assert!(
+            crate::harness_host::published_snapshot(sid)
+                .as_ref()
+                .and_then(relaunch::self_claimed_line)
+                .is_none(),
+            "publication cannot graft the new root line onto the old snapshot"
+        );
+        assert!(!offered_for(sid, snap.pid));
+        snap.session = Some(next.to_string());
+        snap.codex_mut().unwrap().self_claimed = Some(resume(next));
+        crate::harness_host::publish_snapshot_for_test(sid, Some(&snap));
+        assert!(
+            offered_for(sid, snap.pid),
+            "a fresh snapshot bound to the new root is offered"
+        );
+        crate::harness_host::publish_snapshot_for_test(sid, None);
+        crate::self_claim::forget(sid);
+    }
 
     #[test]
     fn the_restart_verb_parses_its_three_arguments() {

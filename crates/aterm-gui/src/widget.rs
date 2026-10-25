@@ -416,8 +416,14 @@ pub(crate) enum DrawPrim {
     /// band starts with a dash at its left or top end. Every length snaps to
     /// whole device pixels, a dash or gap to at least one, and each pixel is
     /// inked once; `on <= 0` draws nothing and `off <= 0` a solid stroke.
-    /// Walls, hollow buckets, the free-space outline, projections, missing
-    /// days.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no painter draws a dashed stroke since the merged top deck went; the prim \
+                      and its raster stay as shared renderer code"
+        )
+    )]
     Dashed {
         x: f32,
         y: f32,

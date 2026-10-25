@@ -767,8 +767,10 @@ impl Gen {
     }
 
     fn facts(&mut self, case: u64) -> NeedFacts {
-        let words: [&'static str; 14] = [
+        use aterm_core::terminal::program_state::ProgramBlockedKind as K;
+        let words: [&'static str; 15] = [
             "busy",
+            "unknown",
             "idle",
             "prompt",
             "question",
@@ -836,6 +838,14 @@ impl Gen {
             ]),
             attention,
             agent,
+            program_blocked: self
+                .pick(&[None, None, Some(None), Some(Some(K::Question))])
+                .map(|kind| ProgramClaimFact {
+                    kind,
+                    key: case,
+                    report: case,
+                }),
+            self_claimed: other_supervisor && self.next().is_multiple_of(2),
             supervised,
             other_supervisor,
             claim_live: other_supervisor || self.next().is_multiple_of(2),
@@ -1862,4 +1872,160 @@ fn a_told_need_in_any_script_reads_whole() {
         body.len() <= NEED_WHAT_MAX + " (+1 more)".len() && body.ends_with("\u{2026} (+1 more)"),
         "{body}"
     );
+}
+
+fn codex_blocked(
+    kind: Option<aterm_core::terminal::program_state::ProgramBlockedKind>,
+) -> NeedFacts {
+    NeedFacts {
+        agent: agent("unknown"),
+        program_blocked: Some(ProgramClaimFact {
+            kind,
+            key: 41,
+            report: 5,
+        }),
+        ..facts()
+    }
+}
+
+/// THE PROGRAM-CLAIM NEED (`program_need`): a codex whose reader names no state reports a box,
+/// and no claim speaks for the tab: an approval, a question or a sign-in, each said as codex's
+/// own report, keyed by the shown report's episode and carrying the engine sequence the herald
+/// judges its banner by. A hold does not hide it (a box is a need under a hold, as Claude
+/// Code's is); a host supervising the tab does not either (no harness presses a codex box).
+/// None while codex-alab's proven self-claim carries the tab (held or not), while another
+/// holder's unproven claim stands unheld, and while codex-alab's own attention entry stands,
+/// which is then the tab's whole word.
+#[test]
+fn a_programs_blocked_report_is_a_need_only_where_no_claim_speaks_for_it() {
+    use aterm_core::terminal::program_state::ProgramBlockedKind as K;
+    let codex = crate::task_record::SELF_CLAIM_ATTENTION_OWNER;
+    let need = |f: NeedFacts| of(&f).need;
+    let plain = need(codex_blocked(Some(K::Permission))).expect("codex's box");
+    assert_eq!(
+        (plain.word, plain.key, plain.what.as_str(), plain.report),
+        (NeedWord::Approval, 41, CODEX_APPROVAL_WORDS, Some(5))
+    );
+    assert_eq!(plain.word.severity(), Severity::Decide);
+    assert!(plain.harness.is_none());
+    for (kind, word, what) in [
+        (None, NeedWord::Approval, CODEX_APPROVAL_WORDS),
+        (Some(K::Question), NeedWord::Question, CODEX_QUESTION_WORDS),
+        (Some(K::Auth), NeedWord::Approval, CODEX_SIGN_IN_WORDS),
+    ] {
+        let got = need(codex_blocked(kind)).expect("codex's box");
+        assert_eq!((got.word, got.what.as_str()), (word, what), "{kind:?}");
+        assert!(got.what.ends_with("(codex's own report)"), "{kind:?}");
+    }
+    let held = need(NeedFacts {
+        hold: Some(HoldWord::Local),
+        ..codex_blocked(None)
+    });
+    assert_eq!(
+        held.map(|n| n.word),
+        Some(NeedWord::Approval),
+        "under a hold"
+    );
+    let hosted = need(NeedFacts {
+        supervised: true,
+        ..codex_blocked(None)
+    });
+    assert_eq!(
+        hosted.map(|n| n.word),
+        Some(NeedWord::Approval),
+        "a host's supervision"
+    );
+    for hold in [None, Some(HoldWord::Bridge)] {
+        let carried = of(&NeedFacts {
+            self_claimed: true,
+            supervised: true,
+            other_supervisor: true,
+            claim_live: true,
+            hold,
+            ..codex_blocked(None)
+        });
+        assert_eq!(
+            carried.need, None,
+            "a proven self-claim carries it ({hold:?})"
+        );
+    }
+    let claimed = |hold| {
+        need(NeedFacts {
+            supervised: true,
+            other_supervisor: true,
+            claim_live: true,
+            hold,
+            ..codex_blocked(None)
+        })
+        .map(|n| n.word)
+    };
+    assert_eq!(claimed(None), None, "another holder's claim, unheld");
+    assert_eq!(
+        claimed(Some(HoldWord::Local)),
+        Some(NeedWord::Approval),
+        "held"
+    );
+    let waits = of(&NeedFacts {
+        attention: vec![entry(
+            codex,
+            "kind=wait limited: resets 7pm",
+            Some(AttentionKind::Wait),
+        )],
+        ..codex_blocked(None)
+    });
+    assert_eq!(waits.need, None, "codex-alab's own wait speaks for it");
+    let asks = need(NeedFacts {
+        attention: vec![entry(codex, "sign in to codex", Some(AttentionKind::Ask))],
+        ..codex_blocked(None)
+    })
+    .expect("codex-alab's own ask");
+    assert_eq!(
+        (asks.word, asks.key, asks.report),
+        (NeedWord::Ask, ask_key("sign in to codex"), None),
+        "its own entry is the tab's whole word"
+    );
+    let other_ask = need(NeedFacts {
+        attention: vec![entry("-", "look at the deploy", Some(AttentionKind::Ask))],
+        ..codex_blocked(None)
+    })
+    .expect("a need");
+    assert_eq!(
+        (other_ask.word, other_ask.report),
+        (NeedWord::Ask, None),
+        "another owner's ask outranks codex's box, as it does a Claude Code box"
+    );
+}
+
+/// NEGATIVE CONTROL: a claim never stands over a word the tab's reader names, and none stands
+/// without a claim: a Claude Code box is `box_need`'s, keyed by its verdict and carrying no
+/// report; `busy`, `idle` and no reader at all with codex's `blocked` beside them, and an
+/// `unknown` with none, are no need.
+#[test]
+fn a_program_claim_never_stands_over_a_word_its_reader_names() {
+    let claim = codex_blocked(None).program_blocked;
+    let read = of(&NeedFacts {
+        agent: boxed("bash:ask", "git push"),
+        program_blocked: claim,
+        ..facts()
+    })
+    .need
+    .expect("the box its reader names");
+    assert_eq!(
+        (read.word, read.key, read.report),
+        (NeedWord::Approval, 9, None)
+    );
+    assert!(!read.what.contains("codex's own report"), "{}", read.what);
+    for word in [Some("busy"), Some("idle"), None] {
+        let v = of(&NeedFacts {
+            agent: word.and_then(agent),
+            program_blocked: claim,
+            ..facts()
+        });
+        assert_eq!(v.need, None, "{word:?}");
+    }
+    let quiet = of(&NeedFacts {
+        agent: agent("unknown"),
+        ..facts()
+    });
+    assert_eq!(quiet.need, None, "unknown and no claim");
 }

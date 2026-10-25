@@ -679,6 +679,27 @@ fn link(root: &Path, rel: &str, target: &str) {
 /// A `/proc` tree with one agent call: `4711` (`cat`) reads a pipe whose
 /// writer is `4712`, holds an output file on fd 1, a TCP socket and an
 /// epoll set; `4713` is a zombie; `4714` belongs to another user (no `io`).
+/// A Linux reading's age is the boot clock (`/proc/uptime`) less its start.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_linux_reading_is_aged_by_the_boot_clock() {
+    let dir = aterm_tempfile::tempdir().expect("scratch root");
+    let r = dir.path();
+    write(r, "4711/stat", STAT);
+    write(r, "uptime", "1300.00 5000.00\n");
+    let f = JobsReader::at_root(r, 100)
+        .read_all_at(
+            &[ReadReq {
+                pid: 4711,
+                fds: false,
+            }],
+            now_us(),
+        )
+        .pop()
+        .expect("the fixture reads");
+    assert_eq!(f.age_ms, Some(1_300_000 - 1_234_560), "{f:?}");
+}
+
 #[cfg(unix)]
 #[test]
 fn the_linux_arm_reads_a_fixture_tree() {
@@ -1445,6 +1466,7 @@ fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
         .pop()
         .expect("the job probe reads it");
     assert_eq!(f.state, RunState::Stopped, "{f:?}");
+    assert!(f.age_ms >= Some(21_000), "read 21 s ahead: {f:?}");
     assert_eq!(
         f.threads
             .as_deref()

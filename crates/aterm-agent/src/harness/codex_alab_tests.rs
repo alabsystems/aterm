@@ -219,7 +219,6 @@ fn the_rewrite_resumes_the_thread_with_every_kept_flag() {
     assert_eq!(
         rewrite_argv(&a, Some(T1)).expect("carried"),
         argv(&[
-            "resume",
             "--no-daemon",
             "-m",
             "gpt-6-astra",
@@ -230,12 +229,21 @@ fn the_rewrite_resumes_the_thread_with_every_kept_flag() {
             "--add-dir",
             "-",
             "--model=gpt-5.4-mini",
+            "resume",
             T1,
         ])
     );
     for a in [
         argv(&["codex", "resume", T2, "--no-daemon"]),
         argv(&["codex", "resume", "--last", "--no-daemon"]),
+    ] {
+        assert_eq!(
+            rewrite_argv(&a, Some(T1)).expect("carried"),
+            argv(&["resume", "--no-daemon", T1]),
+            "{a:?}"
+        );
+    }
+    for a in [
         argv(&["codex", "--no-daemon", "fork", T2, "carry on"]),
         argv(&[
             "codex",
@@ -248,7 +256,7 @@ fn the_rewrite_resumes_the_thread_with_every_kept_flag() {
     ] {
         assert_eq!(
             rewrite_argv(&a, Some(T1)).expect("carried"),
-            argv(&["resume", "--no-daemon", T1]),
+            argv(&["--no-daemon", "resume", T1]),
             "{a:?}"
         );
     }
@@ -259,7 +267,30 @@ fn the_rewrite_resumes_the_thread_with_every_kept_flag() {
     assert_eq!(
         rewrite_argv(&argv(&["codex", "--search", "--", "--no-daemon"]), Some(T1))
             .expect("carried"),
-        argv(&["resume", "--search", T1])
+        argv(&["--search", "resume", T1])
+    );
+}
+
+#[test]
+fn the_resume_rewrite_preserves_each_options_command_level() {
+    let root = argv(&["codex", "-c", "a=1", "--search", "fix the build"]);
+    assert_eq!(
+        rewrite_argv(&root, Some(T1)).unwrap(),
+        argv(&["-c", "a=1", "--search", "resume", T1]),
+        "root flags stay before the resume subcommand"
+    );
+    let child = argv(&[
+        "codex", "-c", "a=1", "fork", "--last", "-c", "a=2", "--search",
+    ]);
+    assert_eq!(
+        rewrite_argv(&child, Some(T1)).unwrap(),
+        argv(&["-c", "a=1", "resume", "-c", "a=2", "--search", T1]),
+        "a fork's selectors go while its child flags keep their scope"
+    );
+    assert_eq!(
+        rewrite_argv(&child, None).unwrap(),
+        argv(&["-c", "a=1", "-c", "a=2", "--search"]),
+        "the flags-only worker API retains its original order"
     );
 }
 

@@ -22,7 +22,7 @@ Config/packages	ok	enabled auto_update auto_install seed_install account exclude
 Config/reroute	ok	announce strict
 Config/privacy	ok	enabled check notice report_attribution warmup warmup_folders warmup_hold_ms probe_interval_ms observer protected_roots auto_accept
 Config/machine	ok	universal_control rosetta
-Config/sys	ok	stats_bars stats_deck_size stats_deck_style disk_roots
+Config/sys	ok	stats_bars stats_deck_size disk_roots
 Config/keeper	ok	enabled
 Config/session_log	ok	journal clause
 RestoreManifest/(root)	ok	schema fold windows

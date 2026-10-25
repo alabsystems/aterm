@@ -25,6 +25,7 @@ fn escalation(session: u64, key: u64) -> Escalation {
         label: key.to_string(),
         body: "attention".to_string(),
         headline: super::headline(aterm_types::needs::NeedWord::Ask),
+        report: None,
     }
 }
 

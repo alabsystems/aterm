@@ -4,9 +4,9 @@
 //! The supernova.
 
 use aterm_render::{DecoBlend, DecoGlyph, GlowQuad, WordDecoration};
-use aterm_scene::mix_rgb;
 
 use crate::color_math::hsv2rgb;
+use crate::effect_util::lerp_rgb as mix_rgb;
 
 /// Roll salt: `mix(gkey ^ birth_seq ^ SUPERNOVA_SALT) % 100 < chance_pct`.
 pub const SUPERNOVA_SALT: u64 = 0xF0CC_AC1A_5EED_B00F;
@@ -294,6 +294,54 @@ const fn ease_out(q: f32) -> f32 {
 const WASH_CORE: u32 = 0x00FF_EED2;
 const VEIL_TONE: u32 = 0x001A_1022;
 
+const WASH_ROW_TABLE: [(u32, f32); MAX_WASH_ROWS + 1] = {
+    let mut table = [(0u32, 0.0f32); MAX_WASH_ROWS + 1];
+    let mut i = 0usize;
+    while i <= MAX_WASH_ROWS {
+        let dr = i as f32;
+        let falloff = 0.55 + 0.45 / (1.0 + dr * 0.08);
+        let t = (1.0 - dr * 0.05).clamp(0.0, 0.6);
+        table[i] = (mix_rgb(WASH_CORE, 0x00FF_FFFF, t), falloff);
+        i += 1;
+    }
+    table
+};
+
+const CROWN_SEG_SPECS: [(f32, f32, u32); 3] = {
+    let mut table = [(0.0f32, 0.0f32, 0u32); 3];
+    let mut seg = 0usize;
+    while seg < 3 {
+        let f0 = 0.15 + 0.28 * seg as f32;
+        let tone = mix_rgb(WASH_CORE, 0x00FF_FFFF, 1.0 - f0);
+        table[seg] = (f0, 1.0 - 0.55 * f0, tone);
+        seg += 1;
+    }
+    table
+};
+
+const VEIL_DEFAULT_WIDTH: usize = MAX_VEIL_CELLS / 7;
+const VEIL_HALF_W: usize = VEIL_DEFAULT_WIDTH / 2;
+
+const VEIL_FALLOFF_28: [[f32; VEIL_HALF_W]; 4] = {
+    let mut table = [[0.0f32; VEIL_HALF_W]; 4];
+    let mut dy = 0usize;
+    while dy < 4 {
+        let ny = dy as f32 / 3.5;
+        let ny2 = ny * ny;
+        let mut dx = 0usize;
+        while dx < VEIL_HALF_W {
+            let nx = dx as f32 / (VEIL_HALF_W as f32);
+            let d2 = nx * nx + ny2;
+            if d2 < 1.0 {
+                table[dy][dx] = crate::color_math::powf_pos_f32(1.0 - d2, 0.8);
+            }
+            dx += 1;
+        }
+        dy += 1;
+    }
+    table
+};
+
 /// Emit one supernova frame's additive quads under `budget`.
 pub fn emit_super(
     t_ms: u64,
@@ -337,10 +385,18 @@ pub fn emit_super(
             let r0 = (center_row - rows / 2).clamp(0, (vrows - rows).max(0));
             let n0 = sink.out.len();
             for r in r0..r0 + rows {
-                let dr = (r - center_row).unsigned_abs() as f32;
-                let falloff = 0.55 + 0.45 / (1.0 + dr * 0.08);
+                let dr_idx = (r - center_row).unsigned_abs() as usize;
+                let (tone, falloff) = if dr_idx < WASH_ROW_TABLE.len() {
+                    WASH_ROW_TABLE[dr_idx]
+                } else {
+                    let dr = dr_idx as f32;
+                    let falloff = 0.55 + 0.45 / (1.0 + dr * 0.08);
+                    (
+                        mix_rgb(WASH_CORE, 0x00FF_FFFF, (1.0 - dr * 0.05).clamp(0.0, 0.6)),
+                        falloff,
+                    )
+                };
                 let cov = 0.9 * env_a * falloff;
-                let tone = mix_rgb(WASH_CORE, 0x00FF_FFFF, (1.0 - dr * 0.05).clamp(0.0, 0.6));
                 sink.push(0, r * env.cell_h, env.grid_w, env.cell_h, premul(tone, cov));
             }
             counts.wash = sink.out.len() - n0;
@@ -513,25 +569,72 @@ fn charge_mote_pos(env: &SuperEnv, k: usize, p: f32) -> (i32, i32) {
 }
 
 #[inline]
-fn crown_dirs() -> &'static [(f32, f32); 8] {
-    static DIRS: std::sync::OnceLock<[(f32, f32); 8]> = std::sync::OnceLock::new();
-    DIRS.get_or_init(|| {
-        std::array::from_fn(|point| {
-            let ang = core::f32::consts::TAU * point as f32 / 8.0;
-            ang.sin_cos()
-        })
-    })
+pub(crate) const fn sin_cos_f32(ang: f32) -> (f32, f32) {
+    if !ang.is_finite() {
+        return (f32::NAN, f32::NAN);
+    }
+    const PI_HI: f64 = core::f64::consts::PI;
+    const PI_LO: f64 = 1.22464679914735320717376402945839660462569212467758e-16;
+    let x = ang as f64;
+    let (u, sign) = if x >= -core::f64::consts::FRAC_PI_2 && x <= core::f64::consts::FRAC_PI_2 {
+        (x, 1.0_f64)
+    } else if x >= 0.0 && x <= 3.0 * core::f64::consts::FRAC_PI_2 {
+        ((x - PI_HI) - PI_LO, -1.0_f64)
+    } else if x >= 0.0 && x <= core::f64::consts::TAU {
+        ((x - 2.0 * PI_HI) - 2.0 * PI_LO, 1.0_f64)
+    } else {
+        let k = (x * core::f64::consts::FRAC_1_PI).round();
+        let ki = k as i64;
+        let sign = if (ki & 1) != 0 { -1.0_f64 } else { 1.0_f64 };
+        ((x - k * PI_HI) - k * PI_LO, sign)
+    };
+    let u2 = u * u;
+    let mut s_term = u;
+    let mut sin_u = u;
+    let mut c_term = 1.0_f64;
+    let mut cos_u = 1.0_f64;
+    let mut n = 1;
+    while n <= 10 {
+        let k = (2 * n) as f64;
+        c_term *= -u2 / ((k - 1.0) * k);
+        cos_u += c_term;
+        s_term *= -u2 / (k * (k + 1.0));
+        sin_u += s_term;
+        n += 1;
+    }
+    ((sign * sin_u) as f32, (sign * cos_u) as f32)
+}
+
+const CROWN_DIRS: [(f32, f32); 8] = {
+    let mut out = [(0.0f32, 0.0f32); 8];
+    let mut point = 0;
+    while point < 8 {
+        let ang = core::f32::consts::TAU * point as f32 / 8.0;
+        out[point] = sin_cos_f32(ang);
+        point += 1;
+    }
+    out
+};
+
+const SHOCK_DIRS: [(f32, f32); 16] = {
+    let mut out = [(0.0f32, 0.0f32); 16];
+    let mut k = 0;
+    while k < 16 {
+        let ang = core::f32::consts::TAU * k as f32 / 16.0;
+        out[k] = sin_cos_f32(ang);
+        k += 1;
+    }
+    out
+};
+
+#[inline]
+const fn crown_dirs() -> &'static [(f32, f32); 8] {
+    &CROWN_DIRS
 }
 
 #[inline]
-fn shock_dirs() -> &'static [(f32, f32); 16] {
-    static DIRS: std::sync::OnceLock<[(f32, f32); 16]> = std::sync::OnceLock::new();
-    DIRS.get_or_init(|| {
-        std::array::from_fn(|k| {
-            let ang = core::f32::consts::TAU * k as f32 / 16.0;
-            ang.sin_cos()
-        })
-    })
+const fn shock_dirs() -> &'static [(f32, f32); 16] {
+    &SHOCK_DIRS
 }
 
 /// The 8-point star crown, additive (dark themes): 4 axes (2 orthogonal + 2
@@ -544,11 +647,10 @@ fn emit_crown_quads(sink: &mut QuadSink<'_>, env: &SuperEnv, env_a: f32) {
     sink.push(env.cx - ch, env.cy - ch / 2, 2 * ch, ch, core);
     sink.push(env.cx - ch / 2, env.cy - ch, ch, 2 * ch, core);
     let segs: [(f32, i32, i32, u32); 3] = std::array::from_fn(|seg| {
-        let f0 = 0.15 + 0.28 * seg as f32;
+        let (f0, cov_scale, tone) = CROWN_SEG_SPECS[seg];
         let d = reach * f0;
         let sz = ((1.0 - f0) * ch as f32 * 0.6).max(2.0) as i32;
-        let tone = mix_rgb(WASH_CORE, 0x00FF_FFFF, 1.0 - f0);
-        (d, sz, sz / 2, premul(tone, env_a * (1.0 - 0.55 * f0)))
+        (d, sz, sz / 2, premul(tone, env_a * cov_scale))
     });
     for &(sin_a, cos_a) in crown_dirs() {
         let (dx, dy) = (cos_a, sin_a * 0.75);
@@ -668,6 +770,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         let base_a = 235.0 * env_a;
         let mut stamped = 0usize;
         if base_a >= 14.0 {
+            let use_table = width == VEIL_DEFAULT_WIDTH;
             for dr in 0..rows_span {
                 if out.len() >= cap || stamped >= MAX_VEIL_CELLS {
                     break;
@@ -677,18 +780,32 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                     continue;
                 }
                 let row_u = r as u16;
+                let dy_abs = (dr - rows_span / 2).unsigned_abs() as usize;
                 let ny = (dr - rows_span / 2) as f32 / half_rows;
                 let ny2 = ny * ny;
                 for dc in 0..width as i32 {
                     if out.len() >= cap || stamped >= MAX_VEIL_CELLS {
                         break;
                     }
-                    let nx = (c0 + dc - word_mid) as f32 / half_w;
-                    let d2 = nx * nx + ny2;
-                    if d2 >= 1.0 {
-                        continue;
-                    }
-                    let a = base_a * (1.0 - d2).powf(0.8);
+                    let falloff = if use_table {
+                        let dx_abs = (c0 + dc - word_mid).unsigned_abs() as usize;
+                        if dx_abs >= VEIL_HALF_W {
+                            continue;
+                        }
+                        let f = VEIL_FALLOFF_28[dy_abs][dx_abs];
+                        if f <= 0.0 {
+                            continue;
+                        }
+                        f
+                    } else {
+                        let nx = (c0 + dc - word_mid) as f32 / half_w;
+                        let d2 = nx * nx + ny2;
+                        if d2 >= 1.0 {
+                            continue;
+                        }
+                        (1.0 - d2).powf(0.8)
+                    };
+                    let a = base_a * falloff;
                     if a < 14.0 {
                         continue;
                     }
@@ -1519,5 +1636,19 @@ mod tests {
         assert!(c.ring == 0 && q.is_empty() && !d.is_empty());
         let (_, q, d) = probe(SUPER_TOTAL_MS);
         assert!(q.is_empty() && d.is_empty(), "afterglow emits nothing here");
+    }
+
+    #[test]
+    fn const_dir_tables_match_sin_cos_within_one_ulp() {
+        for (point, &(s, c)) in crown_dirs().iter().enumerate() {
+            let (es, ec) = (core::f32::consts::TAU * point as f32 / 8.0).sin_cos();
+            assert!(s.to_bits().abs_diff(es.to_bits()) <= 1);
+            assert!(c.to_bits().abs_diff(ec.to_bits()) <= 1);
+        }
+        for (k, &(s, c)) in shock_dirs().iter().enumerate() {
+            let (es, ec) = (core::f32::consts::TAU * k as f32 / 16.0).sin_cos();
+            assert!(s.to_bits().abs_diff(es.to_bits()) <= 1);
+            assert!(c.to_bits().abs_diff(ec.to_bits()) <= 1);
+        }
     }
 }

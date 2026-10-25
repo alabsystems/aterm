@@ -4,16 +4,18 @@
 //! Read-only observations of the displayed setup checklist.
 
 use super::{
-    Action, InitialHost, InitialSetupObserved, LiveInitial, NativeHost, Path, Plan, Report, Row,
-    Selection, Stage, access_revision_at, accounts, ensure_person_scope, execute, item_rows,
-    observe_read_only, preferences, readiness_row, rows_ready, state_root,
+    Action, InitialHost, InitialSetupObserved, LiveInitial, NativeHost, PassPage, Path, Plan,
+    Report, Row, Selection, Stage, access_revision_at, accounts, ensure_person_scope, execute,
+    item_rows, observe_read_only, preferences, readiness_row, rows_ready, state_root, step_page,
 };
 use aterm_secrets::client::{self, Membership, Paths, Status};
 use aterm_secrets::service::{self, Job, State};
 
 trait InitialCheckHost {
-    fn workstation(&mut self, root: &Path, selected: Selection) -> Result<Vec<Row>, String>;
-    fn accounts(&mut self, root: &Path, selected: Selection) -> Result<Vec<Row>, String>;
+    /// The Mac settings' check: its rows, and its page, which says them by System State row.
+    fn workstation(&mut self, root: &Path, selected: Selection) -> Result<Report, String>;
+    /// The sign-outs' check, as [`Self::workstation`].
+    fn accounts(&mut self, root: &Path, selected: Selection) -> Result<Report, String>;
     fn spotlight(&mut self) -> Result<Vec<Row>, String>;
     fn permissions(&mut self, plan: &Plan, revision: u64) -> Result<Vec<Row>, String>;
     fn vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String>;
@@ -22,8 +24,8 @@ trait InitialCheckHost {
 
 #[derive(Default)]
 struct LiveCheck {
-    workstation: Option<Result<Vec<Row>, String>>,
-    accounts: Option<Result<Vec<Row>, String>>,
+    workstation: Option<Result<Report, String>>,
+    accounts: Option<Result<Report, String>>,
     spotlight: Option<Result<Vec<Row>, String>>,
     vault: Option<Result<Vec<Row>, String>>,
 }
@@ -33,10 +35,8 @@ impl LiveCheck {
     /// sign-ins, one pass after the other), Spotlight and the vault. Aterm's permissions are
     /// read from the access record when the check reaches them.
     fn prefetch(root: &Path, plan: &Plan) -> Self {
-        let check = |selected: Selection| {
-            execute(&mut NativeHost::selected(selected), root, Action::Check)
-                .map(|report| report.rows)
-        };
+        let check =
+            |selected: Selection| execute(&mut NativeHost::selected(selected), root, Action::Check);
         let (prefs, signins) = (preferences(plan.selection), accounts(plan.selection));
         let ws_selected = Stage::Workstation.selected(plan);
         let accounts_selected = Stage::Accounts.selected(plan);
@@ -76,18 +76,16 @@ impl LiveCheck {
 }
 
 impl InitialCheckHost for LiveCheck {
-    fn workstation(&mut self, root: &Path, selected: Selection) -> Result<Vec<Row>, String> {
-        self.workstation.take().unwrap_or_else(|| {
-            execute(&mut NativeHost::selected(selected), root, Action::Check)
-                .map(|report| report.rows)
-        })
+    fn workstation(&mut self, root: &Path, selected: Selection) -> Result<Report, String> {
+        self.workstation
+            .take()
+            .unwrap_or_else(|| execute(&mut NativeHost::selected(selected), root, Action::Check))
     }
 
-    fn accounts(&mut self, root: &Path, selected: Selection) -> Result<Vec<Row>, String> {
-        self.accounts.take().unwrap_or_else(|| {
-            execute(&mut NativeHost::selected(selected), root, Action::Check)
-                .map(|report| report.rows)
-        })
+    fn accounts(&mut self, root: &Path, selected: Selection) -> Result<Report, String> {
+        self.accounts
+            .take()
+            .unwrap_or_else(|| execute(&mut NativeHost::selected(selected), root, Action::Check))
     }
 
     fn spotlight(&mut self) -> Result<Vec<Row>, String> {
@@ -230,6 +228,7 @@ fn check_with(host: &mut dyn InitialCheckHost, root: &Path, plan: &Plan) -> Repo
         restore: None,
         page: None,
     };
+    let mut page = PassPage::default();
     let mut vault_ready = !Stage::Secrets.selected(plan);
     for stage in Stage::ALL {
         if !stage.selected(plan) {
@@ -243,31 +242,43 @@ fn check_with(host: &mut dyn InitialCheckHost, root: &Path, plan: &Plan) -> Repo
             ));
             continue;
         }
-        let result = match stage {
-            Stage::Workstation => host.workstation(root, preferences(plan.selection)),
-            Stage::Spotlight => host.spotlight(),
-            Stage::Permissions => host.permissions(plan, access_revision_at(root).unwrap_or(0)),
-            Stage::Secrets => host.vault(plan),
-            Stage::Repositories => host.repositories(plan),
-            Stage::Accounts => host.accounts(root, accounts(plan.selection)),
+        // A pass's own page says the Mac settings and the sign-outs by row (`Report::page`).
+        let paged = |checked: Result<Report, String>| {
+            checked.map_or_else(
+                |why| (Err(why), None),
+                |checked| (Ok(checked.rows), checked.page),
+            )
+        };
+        let (result, own) = match stage {
+            Stage::Workstation => paged(host.workstation(root, preferences(plan.selection))),
+            Stage::Spotlight => (host.spotlight(), None),
+            Stage::Permissions => (
+                host.permissions(plan, access_revision_at(root).unwrap_or(0)),
+                None,
+            ),
+            Stage::Secrets => (host.vault(plan), None),
+            Stage::Repositories => (host.repositories(plan), None),
+            Stage::Accounts => paged(host.accounts(root, accounts(plan.selection))),
         };
         match result {
             Ok(rows) if !rows.is_empty() => {
                 if stage == Stage::Secrets {
                     vault_ready = rows_ready(&rows);
                 }
+                page.merge(own.unwrap_or_else(|| named_rows(&rows)));
                 report.rows.extend(rows);
             }
-            Ok(_) => report.rows.push(Row {
-                name: stage.name().into(),
-                status: "unverified".into(),
-                detail: "the selected check returned no observations".into(),
-            }),
-            Err(detail) => report.rows.push(Row {
-                name: stage.name().into(),
-                status: "unverified".into(),
-                detail,
-            }),
+            result => {
+                let row = Row {
+                    name: stage.name().into(),
+                    status: "unverified".into(),
+                    detail: result
+                        .err()
+                        .unwrap_or_else(|| "the selected check returned no observations".into()),
+                };
+                page.merge(step_page(&row, stage.page_rows(&stage.subjects_in(plan))));
+                report.rows.push(row);
+            }
         }
     }
     if plan.selection.is_empty() {
@@ -277,7 +288,29 @@ fn check_with(host: &mut dyn InitialCheckHost, root: &Path, plan: &Plan) -> Repo
             detail: "no settings selected; no checks ran".into(),
         });
     }
+    report.page = Some(page);
     report
+}
+
+/// The page's rows of a stage's check `rows` (design §3.6): those that already name a System
+/// State row, with no detail, since the page says them in its own words. An item's own line
+/// (a preference key, a repository) is left to its row's reading, which the same Check takes.
+fn named_rows(rows: &[Row]) -> PassPage {
+    PassPage {
+        outcome: aterm_types::macos_setup::PassOutcome::default(),
+        rows: rows
+            .iter()
+            .filter(|row| {
+                aterm_types::macos_setup::Subject::all()
+                    .iter()
+                    .any(|subject| subject.name() == row.name)
+            })
+            .map(|row| Row {
+                detail: String::new(),
+                ..row.clone()
+            })
+            .collect(),
+    }
 }
 
 /// Observes the displayed checklist without mutating vault, repository, or setup state.
@@ -304,27 +337,43 @@ mod tests {
         calls: Vec<Stage>,
         workstation: Option<Selection>,
         pending: Option<Stage>,
+        /// A stage whose check fails as a whole.
+        failing: Option<Stage>,
     }
 
     impl Fake {
         fn observe(&mut self, stage: Stage) -> Result<Vec<Row>, String> {
             self.calls.push(stage);
+            if self.failing == Some(stage) {
+                return Err("injected: /usr/bin/defaults exited 1".into());
+            }
             Ok(vec![readiness_row(
                 stage.name(),
                 self.pending != Some(stage),
                 "injected observation".into(),
             )])
         }
+
+        fn report(&mut self, root: &Path, stage: Stage) -> Result<Report, String> {
+            Ok(Report {
+                action: Action::Check,
+                rows: self.observe(stage)?,
+                manual_steps: Vec::new(),
+                backup: root.join("original-preferences.json"),
+                restore: None,
+                page: None,
+            })
+        }
     }
 
     impl InitialCheckHost for Fake {
-        fn workstation(&mut self, _root: &Path, selected: Selection) -> Result<Vec<Row>, String> {
+        fn workstation(&mut self, root: &Path, selected: Selection) -> Result<Report, String> {
             self.workstation = Some(selected);
-            self.observe(Stage::Workstation)
+            self.report(root, Stage::Workstation)
         }
-        fn accounts(&mut self, _root: &Path, selected: Selection) -> Result<Vec<Row>, String> {
+        fn accounts(&mut self, root: &Path, selected: Selection) -> Result<Report, String> {
             self.workstation = Some(selected);
-            self.observe(Stage::Accounts)
+            self.report(root, Stage::Accounts)
         }
         fn spotlight(&mut self) -> Result<Vec<Row>, String> {
             self.observe(Stage::Spotlight)
@@ -379,6 +428,58 @@ mod tests {
         let report = check_with(&mut host, root.path(), &Plan::from(Selection::none()));
         assert!(host.calls.is_empty());
         assert!(!report.needs_attention());
+    }
+
+    /// A stage whose check fails as a whole is said on the page under the rows it covers, with
+    /// none of its own words (design §3.6): `aterm doctor` keeps the stage's name and why.
+    #[test]
+    fn a_check_that_fails_as_a_whole_is_paged_under_its_rows() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        for (stage, settings, said) in [
+            (
+                Stage::Spotlight,
+                vec![Setting::Spotlight],
+                vec!["Rust in Spotlight"],
+            ),
+            (
+                Stage::Workstation,
+                vec![Setting::CapsLock, Setting::Dock],
+                vec![Setting::CapsLock.name(), Setting::Dock.name()],
+            ),
+            (
+                Stage::Accounts,
+                vec![Setting::Messages],
+                vec![Setting::Messages.name()],
+            ),
+        ] {
+            let mut plan = Plan::from(Selection::none());
+            for setting in settings {
+                plan.selection.set(setting, true);
+            }
+            let mut host = Fake {
+                failing: Some(stage),
+                ..Fake::default()
+            };
+            let report = check_with(&mut host, root.path(), &plan);
+            assert!(
+                report.rows.iter().any(|row| row.name == stage.name()
+                    && row.detail == "injected: /usr/bin/defaults exited 1"),
+                "{stage:?}: `aterm doctor` keeps the stage's own words"
+            );
+            let page: Vec<(&str, &str, &str)> = report
+                .page
+                .as_ref()
+                .expect("a Check has a page")
+                .rows
+                .iter()
+                .map(|row| (row.name.as_str(), row.status.as_str(), row.detail.as_str()))
+                .collect();
+            let want: Vec<(&str, &str, &str)> = said
+                .into_iter()
+                .map(|name| (name, "unverified", ""))
+                .collect();
+            assert_eq!(page, want, "{stage:?}");
+        }
     }
 
     #[test]

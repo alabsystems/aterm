@@ -4413,6 +4413,37 @@ pub(crate) fn accounts_signed_out_first(detail: &[String]) -> Option<&str> {
         .filter(|label| !label.is_empty())
 }
 
+pub(crate) const ACCOUNTS_NO_SIGN_IN_KEY: &str = "harness.accounts.no-sign-in";
+
+/// The exceptions digest entry, a fact for later, for the Claude Code rows whose automatic
+/// sign-in found no route (or ran one that failed) and that still have no login: each row with
+/// the routes it tried. It asks no one to sign in: aterm tries each row again by itself, as soon
+/// as anything a route reads changes and at the latest when its backoff ends.
+pub(crate) fn accounts_no_sign_in_entry(rows: &[(String, String)]) -> Option<Entry> {
+    rows.first()?;
+    let mut entry = Entry::new(
+        Family::Accounts,
+        "",
+        "no-sign-in",
+        "Claude sign-in found no route",
+        Why::Spent {
+            tried: Reason::new("tried every sign-in route this machine has"),
+            reason: Reason::new("none can make the login here, and each one tried is named"),
+        },
+        Then::step("Run aterm harness accounts to read each route tried"),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .restated_at_once();
+    for (label, routes) in rows.iter().take(aterm_messages::exceptions::MORE_LINES) {
+        entry = entry.more(atpkg::progress::sanitize_for_tty(
+            &format!("{label}: {routes}"),
+            aterm_messages::DETAIL_LINE_CAP,
+        ));
+    }
+    Some(entry.log_line(format!("accounts need=no-sign-in-route n={}", rows.len())))
+}
+
 pub(crate) const ACCOUNTS_CREDITS_KEY: &str = "harness.accounts.credits";
 
 pub(crate) const ACCOUNTS_WINDOW_FULL_KEY: &str = "harness.accounts.window-full";
@@ -4488,6 +4519,11 @@ pub(crate) const ACCOUNTS_WRONG_KEY: &str = "harness.accounts.wrong-account";
 
 const ACCOUNTS_RENEW_DUE: &str = "Run aterm harness accounts renew --due";
 
+/// The reason of the Claude Code renewal entries: the upkeep renews each due login by itself
+/// (`accounts_sync`'s sign-in ladder), so a login on the line is one none of its routes renewed.
+const ACCOUNTS_RENEWS_ITSELF: &str =
+    "renews each due login by every sign-in route this machine has";
+
 /// Builds the exceptions digest entry for Claude Code logins due for renewal.
 pub(crate) fn accounts_due_entry(labels: &[String]) -> Option<Entry> {
     labels.first()?;
@@ -4500,9 +4536,10 @@ pub(crate) fn accounts_due_entry(labels: &[String]) -> Option<Entry> {
         "",
         "due",
         &what,
-        Why::OnlyYou(Reason::new(
-            "A login ends on a date Anthropic sets, and only a sign-in in your browser renews it",
-        )),
+        Why::Spent {
+            tried: Reason::new(ACCOUNTS_RENEWS_ITSELF),
+            reason: Reason::new("none of them has renewed these logins"),
+        },
         Then::step(ACCOUNTS_RENEW_DUE),
     )
     .severity(Severity::Info)
@@ -4520,9 +4557,10 @@ pub(crate) fn accounts_none_soon_entry() -> Entry {
         "",
         "none-soon",
         "No Claude login lasts past tomorrow",
-        Why::OnlyYou(Reason::new(
-            "Every Claude login on this machine ends within a day, and only you can renew one",
-        )),
+        Why::Spent {
+            tried: Reason::new(ACCOUNTS_RENEWS_ITSELF),
+            reason: Reason::new("every login on this machine still ends within a day"),
+        },
         Then::step(ACCOUNTS_RENEW_DUE),
     )
     .severity(Severity::Warn)

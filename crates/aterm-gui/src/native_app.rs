@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use aterm_grapheme::GraphemeClusters;
 
@@ -113,6 +114,9 @@ pub(crate) struct CommonViewState {
     pub(crate) review_revision: u64,
     /// THE VIEW'S CONTENT REVISION: the runtime moves it on every access that can change the view's state or what it renders from.
     pub(crate) content_epoch: u64,
+    /// Async input belongs to this field lifetime, independently of edits and paints.
+    input_lifetime: Arc<()>,
+    input_focus: Option<UiKey>,
 }
 
 impl Default for CommonViewState {
@@ -125,6 +129,25 @@ impl Default for CommonViewState {
             presentation_revision: 1,
             review_revision: 0,
             content_epoch: 0,
+            input_lifetime: Arc::new(()),
+            input_focus: None,
+        }
+    }
+}
+
+impl CommonViewState {
+    pub(crate) fn input_lifetime(&self) -> Arc<()> {
+        Arc::clone(&self.input_lifetime)
+    }
+
+    pub(crate) fn retire_input(&mut self) {
+        self.input_lifetime = Arc::new(());
+    }
+
+    fn sync_input_focus(&mut self) {
+        if self.input_focus != self.last_focus {
+            self.retire_input();
+            self.input_focus.clone_from(&self.last_focus);
         }
     }
 }
@@ -161,6 +184,7 @@ impl AppViewState {
     /// Move the view's content revision ([`CommonViewState::content_epoch`]): what it renders from may have changed.
     pub(crate) fn touch(&mut self) {
         let common = self.common_mut();
+        common.sync_input_focus();
         common.content_epoch = common.content_epoch.wrapping_add(1);
     }
 
@@ -3516,6 +3540,7 @@ impl NativeRuntime {
             return false;
         };
         let changed = change(state);
+        state.common_mut().sync_input_focus();
         if changed {
             state.touch();
         }
@@ -3558,7 +3583,9 @@ impl NativeRuntime {
             }
             event => event,
         };
-        let result = app.update(state, event, &mut cx)?;
+        let result = app.update(state, event, &mut cx);
+        state.common_mut().sync_input_focus();
+        let result = result?;
         Ok(DispatchOutcome {
             result,
             effects: cx.effects,
@@ -6080,22 +6107,30 @@ impl NativeAppModel for EditorApp {
         let button_for = |key: &'static str, words: &'static str, width: f32| {
             let (label, action, enabled) = match key {
                 "editor/save-button" => (
-                    "Save buffer (Cmd-S or C-x C-s)",
+                    if cfg!(windows) {
+                        "Save buffer (C-s or C-x C-s)"
+                    } else {
+                        "Save buffer (Cmd-S or C-x C-s)"
+                    },
                     "editor/save",
                     self.can_save(view),
                 ),
                 "editor/undo-button" => (
                     "Undo (Cmd-Z or C-/)",
                     "editor/undo",
-                    buffer_ready && self.can_undo,
+                    buffer_ready && !minibuffer_active && self.can_undo,
                 ),
                 "editor/redo-button" => (
                     "Redo (Cmd-Shift-Z)",
                     "editor/redo",
-                    buffer_ready && self.can_redo,
+                    buffer_ready && !minibuffer_active && self.can_redo,
                 ),
                 "editor/find-button" => (
-                    "Find: incremental search (C-s)",
+                    if cfg!(windows) {
+                        "Find: incremental search (M-s)"
+                    } else {
+                        "Find: incremental search (C-s)"
+                    },
                     "editor/find",
                     view.buffer
                         .as_ref()
@@ -6667,6 +6702,10 @@ impl NativeAppModel for EditorApp {
 
     fn commands(&self, view: &Self::ViewState, out: &mut Vec<Command>) {
         let buffer_ready = view.buffer.is_some();
+        let minibuffer_active = view
+            .buffer
+            .as_ref()
+            .is_some_and(crate::native_editor::EditorBufferView::minibuffer_active);
         out.extend([
             Command {
                 id: ActionId::new("editor/save"),
@@ -6685,13 +6724,13 @@ impl NativeAppModel for EditorApp {
                 id: ActionId::new("editor/undo"),
                 title: "Undo".to_string(),
                 shortcut: Some("Cmd-Z · C-/".to_string()),
-                enabled: buffer_ready && self.can_undo,
+                enabled: buffer_ready && !minibuffer_active && self.can_undo,
             },
             Command {
                 id: ActionId::new("editor/redo"),
                 title: "Redo".to_string(),
                 shortcut: Some("Cmd-Shift-Z".to_string()),
-                enabled: buffer_ready && self.can_redo,
+                enabled: buffer_ready && !minibuffer_active && self.can_redo,
             },
             Command {
                 id: ActionId::new("editor/find"),
@@ -6918,7 +6957,8 @@ fn editor_status_message(
     }) {
         status.to_string()
     } else if app.dirty {
-        format!("Modified · Cmd-S to save · {lines} {line_noun}")
+        let save = if cfg!(windows) { "C-s" } else { "Cmd-S" };
+        format!("Modified · {save} to save · {lines} {line_noun}")
     } else if empty {
         "Empty buffer · Ready".to_string()
     } else {
@@ -8757,6 +8797,136 @@ mod markdown_reader_tests {
             Some("editor/revert")
         );
         assert!(reload.state.is_some_and(|state| state.enabled));
+    }
+
+    #[test]
+    fn editor_history_actions_wait_for_prompts_and_resume_the_same_history() {
+        use crate::native_editor::{EditorCommand, EditorEffect, EditorWorkspace};
+
+        fn assert_history_actions(
+            app: &EditorApp,
+            view: &EditorViewState,
+            snapshot: &crate::document_store::DocumentSnapshot,
+            expected: (bool, bool),
+        ) {
+            let mut commands = Vec::new();
+            app.commands(view, &mut commands);
+            let viewport = LogicalRect::new(0.0, 0.0, 804.0, 582.0);
+            let compiled = app
+                .view(view, &cx(viewport, Some(snapshot)))
+                .compile(viewport)
+                .unwrap();
+            for (id, key, enabled) in [
+                ("editor/undo", "editor/undo-button", expected.0),
+                ("editor/redo", "editor/redo-button", expected.1),
+            ] {
+                assert_eq!(command(&commands, id).enabled, enabled, "{id}");
+                assert_eq!(
+                    compiled
+                        .semantic(&UiKey::new(key))
+                        .unwrap()
+                        .state
+                        .unwrap()
+                        .enabled,
+                    enabled,
+                    "{key}"
+                );
+            }
+            compiled.validate_parity().unwrap();
+        }
+
+        let source = "first needle\nsecond needle\n";
+        let mut store = crate::test_document_store();
+        let document = store.open("file:///history.txt".to_string(), source.to_string());
+        let mut workspace = EditorWorkspace::new();
+        let mut view = EditorViewState {
+            buffer: Some(
+                workspace
+                    .attach(
+                        &mut store,
+                        document,
+                        crate::document_store::DocumentViewId(1),
+                    )
+                    .unwrap(),
+            ),
+            ..EditorViewState::default()
+        };
+        let mut app = EditorApp::new(document, "history.txt".to_string());
+        for text in ["one ", "two "] {
+            workspace
+                .insert_text(&mut store, view.buffer.as_mut().unwrap(), text)
+                .unwrap();
+        }
+        let full_edit = store.snapshot(document).unwrap();
+        workspace
+            .execute(
+                &mut store,
+                view.buffer.as_mut().unwrap(),
+                EditorCommand::Undo,
+            )
+            .unwrap();
+        let draft = store.snapshot(document).unwrap();
+        app.can_undo = workspace.can_undo(document);
+        app.can_redo = workspace.can_redo(document);
+        assert!(app.can_undo && app.can_redo);
+        assert_history_actions(&app, &view, &draft, (true, true));
+
+        for prompt in [
+            EditorCommand::GotoLine,
+            EditorCommand::ExecuteCommand,
+            EditorCommand::SwitchBuffer,
+            EditorCommand::KillBuffer,
+            EditorCommand::IncrementalSearch,
+        ] {
+            workspace
+                .execute(&mut store, view.buffer.as_mut().unwrap(), prompt)
+                .unwrap();
+            workspace
+                .insert_text(&mut store, view.buffer.as_mut().unwrap(), "2")
+                .unwrap();
+            let prompt_state = view.buffer.clone();
+            assert_history_actions(&app, &view, &draft, (false, false));
+            for command in [EditorCommand::Undo, EditorCommand::Redo] {
+                let effects = workspace
+                    .execute(&mut store, view.buffer.as_mut().unwrap(), command)
+                    .unwrap();
+                assert!(matches!(effects.as_slice(), [EditorEffect::Status(_)]));
+                assert_eq!(view.buffer, prompt_state);
+                let after = store.snapshot(document).unwrap();
+                assert_eq!(after.seq, draft.seq);
+                assert_eq!(after.text, draft.text);
+                assert!(workspace.can_undo(document) && workspace.can_redo(document));
+            }
+            if prompt == EditorCommand::GotoLine {
+                workspace
+                    .submit_minibuffer(&mut store, view.buffer.as_mut().unwrap())
+                    .unwrap();
+            } else {
+                workspace
+                    .execute(
+                        &mut store,
+                        view.buffer.as_mut().unwrap(),
+                        EditorCommand::Abort,
+                    )
+                    .unwrap();
+            }
+            assert!(!view.buffer.as_ref().unwrap().minibuffer_active());
+            assert_history_actions(&app, &view, &draft, (true, true));
+        }
+
+        workspace
+            .execute(
+                &mut store,
+                view.buffer.as_mut().unwrap(),
+                EditorCommand::Redo,
+            )
+            .unwrap();
+        let redone = store.snapshot(document).unwrap();
+        assert_eq!(redone.text, full_edit.text);
+        assert!(redone.seq > draft.seq);
+        app.can_undo = workspace.can_undo(document);
+        app.can_redo = workspace.can_redo(document);
+        assert_history_actions(&app, &view, &redone, (true, false));
     }
 
     #[test]

@@ -391,7 +391,7 @@ fn scan(wanted: &[u128], lookup: Lookup, skip: &[u32]) -> io::Result<Vec<HolderS
             scan.scanned += 1;
             match read {
                 TableRead::Holds => scan.holders.push(pid),
-                TableRead::Clear | TableRead::Exited => {}
+                TableRead::Clear | TableRead::Exited | TableRead::Left => {}
                 TableRead::Unreadable => scan.unreadable.push(pid),
             }
         }
@@ -532,7 +532,7 @@ pub fn process_holds_rdev(pid: u32, rdev: u64) -> Option<bool> {
     match read_table(pid, &[u128::from(rdev)], Lookup::BY_RDEV).first() {
         Some(TableRead::Holds) => Some(true),
         Some(TableRead::Clear | TableRead::Exited) => Some(false),
-        Some(TableRead::Unreadable) | None => None,
+        Some(TableRead::Unreadable | TableRead::Left) | None => None,
     }
 }
 
@@ -546,6 +546,9 @@ enum TableRead {
     Clear,
     /// The process has exited.
     Exited,
+    /// The process runs as another effective user now, outside a scan of this user's
+    /// processes ([`left_the_user`]).
+    Left,
     /// Unknown: the table was refused, or a read failed otherwise.
     Unreadable,
 }
@@ -687,10 +690,72 @@ fn refusal_shown(
         .any(|fd| describe(fd).is_ok())
 }
 
-/// What `pid`'s descriptor table says of each key in `wanted`.
+/// What `pid`'s descriptor table says of each key in `wanted`, a key left unknown read
+/// [`TableRead::Left`] once `pid` runs as another effective user ([`left_the_user`]).
 #[cfg(target_vendor = "apple")]
 #[cfg_attr(trust_verify, trust::skip)]
 fn read_table(pid: u32, wanted: &[u128], lookup: Lookup) -> Vec<TableRead> {
+    let reads = read_own_table(pid, wanted, lookup);
+    if !reads.contains(&TableRead::Unreadable) {
+        return reads;
+    }
+    let (now, me) = effective_users(pid);
+    left_the_user(reads, now, me)
+}
+
+/// `pid`'s effective uid now (`None`: unread, or a zombie) and this process's.
+#[cfg(target_vendor = "apple")]
+#[cfg_attr(trust_verify, trust::skip)]
+fn effective_users(pid: u32) -> (Option<u32>, u32) {
+    let now = i32::try_from(pid)
+        .ok()
+        .and_then(crate::process::read_short_info)
+        .map(|info| info.pbsi_uid);
+    // SAFETY: `geteuid` is a side-effect-free getter.
+    (now, unsafe { ffi::geteuid() })
+}
+
+/// Whether `pid` runs as another effective user than this process now: outside a scan of this
+/// user's processes, which lists by effective uid ([`uid_pids`], [`left_the_user`]).
+#[cfg(target_vendor = "apple")]
+fn runs_as_another_user(pid: u32) -> bool {
+    let (now, me) = effective_users(pid);
+    now.is_some_and(|uid| uid != me)
+}
+
+/// See the macOS twin. Linux reads the owner of `/proc/<pid>`, which the kernel keeps the
+/// process's effective uid ([`uid_pids`]).
+#[cfg(target_os = "linux")]
+fn runs_as_another_user(pid: u32) -> bool {
+    // SAFETY: `geteuid` is a side-effect-free getter.
+    let me = unsafe { libc::geteuid() };
+    procfs::runs_as_another_user_in(std::path::Path::new(procfs::PROC), pid, me)
+}
+
+/// `reads` of a process whose effective user is `now` (`None`: unread), scanned as `me`: each
+/// unknown key reads [`TableRead::Left`] when `now` names another user, and a key the table was
+/// shown to hold stays [`TableRead::Holds`]. A scan lists only `me`'s processes ([`uid_pids`]),
+/// so a process that execs a set-user-ID program (`/bin/ps`, `top`) between the listing and its
+/// read is outside it, as it would be listed a moment later; the kernel refuses its table
+/// (`EPERM`), which would otherwise leave the whole scan unknown.
+#[cfg(target_vendor = "apple")]
+fn left_the_user(reads: Vec<TableRead>, now: Option<u32>, me: u32) -> Vec<TableRead> {
+    if now.is_none_or(|uid| uid == me) {
+        return reads;
+    }
+    reads
+        .into_iter()
+        .map(|read| match read {
+            TableRead::Unreadable => TableRead::Left,
+            TableRead::Holds | TableRead::Clear | TableRead::Exited | TableRead::Left => read,
+        })
+        .collect()
+}
+
+/// [`read_table`]'s read of `pid`'s own table.
+#[cfg(target_vendor = "apple")]
+#[cfg_attr(trust_verify, trust::skip)]
+fn read_own_table(pid: u32, wanted: &[u128], lookup: Lookup) -> Vec<TableRead> {
     let every = |read| vec![read; wanted.len()];
     let Ok(pid) = i32::try_from(pid) else {
         return every(TableRead::Unreadable);
@@ -2037,6 +2102,64 @@ mod tests {
             rdev: 0,
         }
         .file_key()
+    }
+
+    #[test]
+    fn a_table_left_unknown_is_outside_the_scan_once_its_process_runs_as_another_user() {
+        use super::TableRead::{Clear, Exited, Holds, Left, Unreadable};
+        let read = vec![Holds, Unreadable, Clear, Exited];
+        assert_eq!(
+            super::left_the_user(read.clone(), Some(0), 501),
+            [Holds, Left, Clear, Exited],
+            "another user's now: unknown keys leave, a key it held stays held"
+        );
+        assert_eq!(
+            super::left_the_user(read.clone(), Some(501), 501),
+            read,
+            "still this user's: unknown stays unknown"
+        );
+        assert_eq!(
+            super::left_the_user(read.clone(), None, 501),
+            read,
+            "its user unread: unknown stays unknown"
+        );
+    }
+
+    /// A process of this user's that becomes a set-user-ID program after a scan lists it
+    /// (`/bin/ps` run from a shell, measured leaving every scan unknown under a `ps` loop) is
+    /// outside the scan, as it is once listed so; `top` is one that stays to be read.
+    /// Negative control: without [`super::left_the_user`] its read is `Unreadable`.
+    #[test]
+    fn a_process_that_became_a_set_user_id_program_reads_left_not_unknown() {
+        use super::{Lookup, TableRead};
+        // SAFETY: `geteuid` is a side-effect-free getter.
+        let me = unsafe { ffi::geteuid() };
+        assert_ne!(me, 0, "a scan as root reads every process");
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let sought = tmp.path().join("sought");
+        std::fs::write(&sought, b"sought").expect("write");
+        let mut top = crate::spawnfd::command("/usr/bin/top")
+            .args(["-l", "0", "-s", "60"])
+            .stdin(crate::spawnfd::Stdio::null())
+            .stdout(crate::spawnfd::Stdio::null())
+            .stderr(crate::spawnfd::Stdio::null())
+            .spawn()
+            .expect("spawn top");
+        let pid = top.id();
+        let started = Instant::now();
+        while crate::process::read_short_info(i32::try_from(pid).expect("a pid"))
+            .is_none_or(|info| info.pbsi_uid == me)
+        {
+            assert!(started.elapsed() < HANG, "top never ran as its owner");
+            std::thread::yield_now();
+        }
+        let key = file_key(&sought);
+        let read = super::read_table(pid, &[key], Lookup::BY_FILE);
+        let asked = super::process_holds_rdev(pid, u64::from(u32::MAX - 1));
+        let _ = top.kill();
+        let _ = top.wait();
+        assert_eq!(read, [TableRead::Left], "outside this user's scan");
+        assert_eq!(asked, None, "asked of that process alone, unknown");
     }
 
     #[test]

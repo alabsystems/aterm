@@ -563,8 +563,166 @@ impl Bootstrap {
                 "historical roster has another local trust binding",
             ));
         }
-        access.historical(journal, &self.device.identity, basis)
+        match access.historical(journal, &self.device.identity, basis) {
+            Ok(past) => Ok(past),
+            Err(error) => match self.cached_handoff(basis)? {
+                Some(handoff) => handoff.open(journal, access, &self.device.identity),
+                None => Err(error),
+            },
+        }
     }
+
+    /// Prepare encrypted historical access for one exact current member. The
+    /// caller transmits only these sealed bytes, after releasing the journal.
+    /// A member that learned history through a handoff can pass it on too.
+    pub fn history_handoff(
+        &self,
+        journal: &Journal,
+        access: &super::roster::Access,
+        basis: [u8; 32],
+        recipient: &super::binding::Binding,
+    ) -> Result<super::history::Handoff> {
+        self.check_history_local(journal, access)?;
+        let issue = |inherited| {
+            self.device.with_seed(|seed| {
+                super::history::Handoff::issue(
+                    journal,
+                    access,
+                    &self.device.identity,
+                    seed,
+                    basis,
+                    recipient,
+                    inherited,
+                )
+            })
+        };
+        match issue(None) {
+            Ok(handoff) => Ok(handoff),
+            Err(error) => match self.cached_handoff(basis)? {
+                Some(inherited) => issue(Some(&inherited)),
+                None => Err(error),
+            },
+        }
+    }
+
+    /// Authenticate a handoff completely before caching its encrypted bytes.
+    /// One entry per source roster bounds storage by the control journal cap.
+    /// A failed durability barrier is uncertain; retrying revalidates the entry.
+    pub fn import_history(
+        &self,
+        journal: &Journal,
+        access: &super::roster::Access,
+        wire: &[u8],
+    ) -> Result<super::history::Handoff> {
+        self.check_history_local(journal, access)?;
+        let handoff = super::history::Handoff::decode(wire)?;
+        handoff.open(journal, access, &self.device.identity)?;
+        // Native custody already retains these keys. Avoid spending a handoff
+        // slot or doing a durable write for redundant transport.
+        if access
+            .historical(journal, &self.device.identity, *handoff.source())
+            .is_ok()
+        {
+            return Ok(handoff);
+        }
+        let dir = self.history_dir();
+        aterm_journal::create_private_dir_durable(&dir)
+            .map_err(|e| Error::new(format!("history cache directory: {e}")))?;
+        let name = history_name(handoff.source());
+        if let Some(saved) = fsx::read_private(&dir.join(&name), super::history::MAX_HANDOFF)?
+            && let Ok(saved) = super::history::Handoff::decode(saved.as_slice())
+            && saved.source() == handoff.source()
+            && saved.open(journal, access, &self.device.identity).is_ok()
+            && journal.selected_ancestor(*saved.issued_under(), *handoff.issued_under())
+        {
+            // Keep the earliest usable issuance: an ancestor survives every
+            // selected-path recovery that preserves its descendant. Finish a
+            // possibly uncertain previous directory barrier before acknowledging.
+            aterm_durable::durable_dir(&dir)
+                .map_err(|e| Error::new(format!("history cache publication: {e}")))?;
+            return Ok(saved);
+        }
+        history_capacity(&dir, &name, super::journal::MAX_NODES)?;
+        aterm_journal::write_private_durable(&dir, &name, wire)
+            .map_err(|e| Error::new(format!("history cache publication: {e}")))?;
+        Ok(handoff)
+    }
+
+    fn check_history_local(&self, journal: &Journal, access: &super::roster::Access) -> Result<()> {
+        if journal.trust() != self.trust()
+            || !access.is_current(journal)
+            || access.local().binding() != self.request()?.binding()
+        {
+            return Err(Error::new(
+                "history handoff has another local trust binding",
+            ));
+        }
+        Ok(())
+    }
+
+    fn history_dir(&self) -> PathBuf {
+        self.journal_dir.parent().unwrap().join("history")
+    }
+
+    fn cached_handoff(&self, basis: [u8; 32]) -> Result<Option<super::history::Handoff>> {
+        let dir = self.history_dir();
+        match aterm_uds::private_file::check_private_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::new(format!("history cache directory: {e}"))),
+        }
+        fsx::read_private(&dir.join(history_name(&basis)), super::history::MAX_HANDOFF)?
+            .map(|wire| {
+                let handoff = super::history::Handoff::decode(wire.as_slice())?;
+                if handoff.source() != &basis {
+                    return Err(Error::new("cached history has another source"));
+                }
+                Ok(handoff)
+            })
+            .transpose()
+    }
+}
+
+// Preserve bounded crash leftovers without charging them as usable key slots.
+// Unknown files get the same small headroom; none are silently deleted.
+fn history_capacity(dir: &Path, target: &str, limit: usize) -> Result<()> {
+    let mut found = false;
+    let mut records = 0;
+    let mut auxiliary = 0;
+    for entry in
+        std::fs::read_dir(dir).map_err(|e| Error::new(format!("history cache inventory: {e}")))?
+    {
+        let entry = entry.map_err(|e| Error::new(format!("history cache entry: {e}")))?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".handoff"))
+            .is_some_and(|stem| {
+                stem.len() == 64
+                    && stem
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        {
+            found |= name == target;
+            records += 1;
+        } else {
+            auxiliary += 1;
+        }
+        if records > limit || auxiliary > 32 {
+            return Err(Error::new(
+                "history cache exceeds its record or auxiliary bound",
+            ));
+        }
+    }
+    if !found && records == limit {
+        return Err(Error::new("history cache is full"));
+    }
+    Ok(())
+}
+
+fn history_name(basis: &[u8; 32]) -> String {
+    format!("{}.handoff", aterm_codec::hex::encode_lower(basis))
 }
 
 fn pin_bytes(trust: Trust) -> Vec<u8> {

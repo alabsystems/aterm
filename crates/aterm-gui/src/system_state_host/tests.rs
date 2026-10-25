@@ -234,6 +234,7 @@ fn handlers() -> InitialSetupHandlers {
             note("sync on".to_owned());
             true
         },
+        fda_granted: || {},
     }
 }
 
@@ -1848,7 +1849,7 @@ mod observation_start {
     }
 
     #[test]
-    fn observation_start_refusal_retries_the_current_review_then_settles_once() {
+    fn observation_start_refusal_retries_without_reading_a_vault_draft() {
         let (mut app, _, _, view, saved) = setup(false);
         let start = Instant::now();
         tick(&mut app, start);
@@ -1874,14 +1875,19 @@ mod observation_start {
         }
         ACCEPT.with(|accepted| accepted.set(true));
         tick(&mut app, start + Duration::from_secs(1));
-        let reviewed = Plan {
-            vault_url: "http://reviewed.invalid:7484/v1/team".into(),
-            ..saved.clone()
-        };
         assert_eq!(
             reads(),
-            [saved, reviewed],
-            "the retry reads the current exact review"
+            [saved.clone(), saved],
+            "an ordinary retry reads the accepted source, never the typed draft"
+        );
+        assert_eq!(
+            app.native_runtime
+                .system_state_mut()
+                .unwrap()
+                .field_projection("system-state/url")
+                .unwrap()
+                .text,
+            "http://reviewed.invalid:7484/v1/team"
         );
         for seconds in 2..=4 {
             tick(&mut app, start + Duration::from_secs(seconds));
@@ -1891,6 +1897,247 @@ mod observation_start {
             2,
             "an accepted read is not repeated while shown"
         );
+    }
+
+    #[test]
+    fn observation_focus_return_reads_the_unoccluded_page_once() {
+        if !crate::test_alone::alone() {
+            return;
+        }
+        let (mut app, wid, instance, view, saved) = setup(true);
+        app.window_focus_event(wid, true);
+        tick(&mut app, Instant::now());
+        assert_eq!(reads().as_slice(), std::slice::from_ref(&saved));
+
+        // System Settings can sit beside this page while the person changes
+        // a preference. Losing focus never hides the page from its shown-view
+        // tracker, even through ordinary ticks.
+        app.window_focus_event(wid, false);
+        assert!(!app.windows[&wid].occluded);
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        assert_eq!(app.system_state_shown_views(instance), [view]);
+        assert_eq!(reads().len(), 1);
+
+        app.window_focus_event(wid, true);
+        // Follow the scheduled deadline, including time spent handling focus.
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        assert_eq!(
+            reads(),
+            [saved.clone(), saved],
+            "returning to the page must read the Mac's current values"
+        );
+        for _ in 0..3 {
+            app.window_focus_event(wid, true);
+            let next = app.system_state_host.next_tick.unwrap();
+            tick(&mut app, next);
+        }
+        assert_eq!(reads().len(), 2, "an unchanged focus is no new reading");
+    }
+
+    #[test]
+    fn ordinary_observations_keep_the_committed_vault_until_an_explicit_check() {
+        use aterm_types::macos_setup::{Observation, Standing, Subject};
+
+        if !crate::test_alone::alone() {
+            return;
+        }
+        let (mut app, wid, _, view, mut saved) = setup(true);
+        calls();
+        saved.selection.set(Setting::Secrets, true);
+        let source_a = saved.vault_url.clone();
+        let source_b = "http://draft.invalid:7484/v1/team";
+        let status = |source: &str, code: &str| SetupStatus {
+            plan: Some(saved.clone()),
+            observed_vault_url: Some(source.into()),
+            observed: vec![Observation {
+                subject: Subject::Setting(Setting::Secrets),
+                standing: Standing::NeedsYou,
+                now: Some("Awaiting code".into()),
+                after_login: None,
+                wanted: Setting::Secrets.wanted().into(),
+                note: Some(code.into()),
+                detail: None,
+            }],
+            ..SetupStatus::default()
+        };
+        fresh(&mut app, status(&source_a, "SOURCE_A_CODE"));
+        app.window_focus_event(wid, true);
+        tick(&mut app, Instant::now());
+        assert_eq!(reads().as_slice(), std::slice::from_ref(&saved));
+
+        for (key, value) in [
+            ("system-state/row/secrets/disclose", None),
+            ("system-state/url", Some(source_b)),
+        ] {
+            app.act_app(ActRequest {
+                view,
+                ui_key: key.into(),
+                action: key.into(),
+                value: value.map(str::to_owned),
+            })
+            .unwrap();
+        }
+        let reviewed = Plan {
+            vault_url: source_b.into(),
+            ..saved.clone()
+        };
+        assert_eq!(
+            app.native_runtime
+                .system_state_mut()
+                .unwrap()
+                .reviewed_plan(),
+            reviewed
+        );
+        app.window_focus_event(wid, false);
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        app.window_focus_event(wid, true);
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        assert_eq!(
+            reads(),
+            [saved.clone(), saved.clone()],
+            "returning focus refreshes the committed source, never an unjoined draft"
+        );
+
+        // The resulting in-force reading keeps its source tag and cannot
+        // reinstall A's approval code under the B draft.
+        fresh(&mut app, status(&source_a, "SOURCE_A_CODE"));
+        assert_eq!(
+            app.native_runtime
+                .system_state_mut()
+                .unwrap()
+                .field_projection("system-state/url")
+                .unwrap()
+                .text,
+            source_b
+        );
+        assert!(
+            app.compiled_native_ui(wid)
+                .unwrap()
+                .semantics
+                .iter()
+                .all(|node| !node.label.contains("SOURCE_A_CODE"))
+        );
+
+        app.switch_tab_in(wid, 0);
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        assert!(app.open_system_state_tab());
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        assert_eq!(reads().last(), Some(&saved), "showing the page reads A too");
+        assert_eq!(reads().len(), 3);
+
+        // Even when the Check handler could not start its own reading, its
+        // explicit observation still reads the exact B review.
+        app.set_system_state_handlers_for_test(InitialSetupHandlers {
+            check: |plan| {
+                note(format!("check {}", plan.vault_url));
+                CheckStarted::default()
+            },
+            observe: |plan| {
+                READS.with(|reads| reads.borrow_mut().push(plan));
+                true
+            },
+            ..InitialSetupHandlers::inert_for_test()
+        });
+        press(&mut app, wid, view, "system-state/check");
+        assert_eq!(calls(), [format!("check {source_b}")]);
+        assert_eq!(reads().last(), Some(&reviewed));
+        assert_eq!(reads().len(), 4);
+        fresh(&mut app, status(source_b, "SOURCE_B_CODE"));
+        assert!(
+            app.compiled_native_ui(wid)
+                .unwrap()
+                .semantics
+                .iter()
+                .any(|node| node.label.contains("SOURCE_B_CODE"))
+        );
+
+        // A previous explicit B reading also grants no implicit permission
+        // to read B on the next focus return.
+        app.window_focus_event(wid, false);
+        app.window_focus_event(wid, true);
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        assert_eq!(reads().last(), Some(&saved));
+        assert_eq!(reads().len(), 5);
+        assert_eq!(
+            app.native_runtime
+                .system_state_mut()
+                .unwrap()
+                .field_projection("system-state/url")
+                .unwrap()
+                .text,
+            source_b
+        );
+    }
+
+    #[test]
+    fn observation_focus_return_leaves_other_and_terminal_pages_alone() {
+        if !crate::test_alone::alone() {
+            return;
+        }
+        let (mut app, wid, instance, _, saved) = setup(true);
+        app.window_focus_event(wid, true);
+        tick(&mut app, Instant::now());
+        assert_eq!(reads(), [saved]);
+
+        let terminal = WindowId(1);
+        app.install_window_state(terminal, crate::stub_session(91), 90, 160);
+        app.window_focus_event(wid, false);
+        app.window_focus_event(terminal, true);
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        assert_eq!(app.system_state_shown_views(instance).len(), 1);
+        assert_eq!(
+            reads().len(),
+            1,
+            "another window's focus is not this page's"
+        );
+
+        app.window_focus_event(terminal, false);
+        app.switch_tab_in(wid, 0);
+        assert!(app.active_native_view(wid).is_none());
+        app.window_focus_event(wid, true);
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        assert!(app.system_state_shown_views(instance).is_empty());
+        assert_eq!(reads().len(), 1, "a hidden page owes no reading");
+    }
+
+    #[test]
+    fn observation_focus_return_preserves_a_refused_starts_retry_deadline() {
+        if !crate::test_alone::alone() {
+            return;
+        }
+        let (mut app, wid, _, _, saved) = setup(false);
+        app.window_focus_event(wid, true);
+        let now = Instant::now();
+        tick(&mut app, now);
+        let retry = app.system_state_host.observe_retry.unwrap();
+        assert_eq!(reads(), [saved]);
+        for _ in 0..3 {
+            app.window_focus_event(wid, false);
+            app.window_focus_event(wid, true);
+            tick(&mut app, now);
+        }
+        assert_eq!(app.system_state_host.observe_retry, Some(retry));
+        assert_eq!(
+            reads().len(),
+            1,
+            "focus cannot bypass a failed start's backoff"
+        );
+
+        ACCEPT.with(|accepted| accepted.set(true));
+        tick(&mut app, retry);
+        assert_eq!(reads().len(), 2);
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        assert_eq!(reads().len(), 2, "the successful retry is accepted once");
     }
 
     #[test]

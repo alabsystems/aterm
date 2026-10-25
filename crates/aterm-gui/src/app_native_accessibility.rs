@@ -1082,6 +1082,19 @@ mod tests {
         status
     }
 
+    fn setup_start_failed_result(retrying: bool) -> crate::SetupStatus {
+        use aterm_types::macos_setup::{Setting, Standing};
+        crate::SetupStatus {
+            retrying,
+            rows: vec![crate::SetupStatusRow {
+                name: Setting::Repositories.name().into(),
+                status: "error".into(),
+                detail: String::new(),
+            }],
+            ..setup_start_reading(Standing::Failed)
+        }
+    }
+
     fn assert_deferred_setup_start(current: crate::SetupStatus, should_start: bool) {
         use aterm_types::macos_setup::{Plan, Standing};
         thread_local! {
@@ -1181,16 +1194,30 @@ mod tests {
     }
 
     #[test]
-    fn deferred_setup_start_runs_once_for_current_changes_and_retrying_failures() {
+    fn deferred_setup_start_runs_once_for_current_changes_and_manual_failures() {
         use aterm_types::macos_setup::Standing;
         assert_deferred_setup_start(setup_start_reading(Standing::Differs), true);
-        assert_deferred_setup_start(
-            crate::SetupStatus {
-                retrying: true,
-                ..setup_start_reading(Standing::Failed)
-            },
-            true,
-        );
+        // Once the worker stops retrying a failed step, Set up now tries it again.
+        assert_deferred_setup_start(setup_start_failed_result(false), true);
+    }
+
+    #[test]
+    fn deferred_setup_start_does_not_repeat_a_failure_retrying_by_itself() {
+        assert_deferred_setup_start(setup_start_failed_result(true), false);
+    }
+
+    #[test]
+    fn deferred_setup_start_does_not_run_for_a_reading_that_failed_by_itself() {
+        // Its note names its own remedy, which Set up now cannot give, retried or not.
+        for retrying in [false, true] {
+            assert_deferred_setup_start(
+                crate::SetupStatus {
+                    retrying,
+                    ..setup_start_reading(aterm_types::macos_setup::Standing::Failed)
+                },
+                false,
+            );
+        }
     }
 
     #[test]

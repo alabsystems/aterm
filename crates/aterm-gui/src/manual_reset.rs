@@ -9,7 +9,7 @@ use std::sync::mpsc::TrySendError;
 use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 use std::time::Duration;
 
-use aterm_core::terminal::Terminal;
+use aterm_core::terminal::{ClockReading, Terminal};
 
 use crate::SessionCtx;
 
@@ -70,9 +70,9 @@ pub(crate) fn manual_payload(source: ResetSource, report: &ResetReport) -> Strin
     )
 }
 
-/// The engine half, under a lock the caller already holds.
-pub(crate) fn apply(t: &mut Terminal) -> (ResetReport, Vec<u8>) {
-    let h = t.manual_handback();
+/// The engine half at the caller's `clock`, under a lock the caller already holds.
+pub(crate) fn apply(t: &mut Terminal, clock: ClockReading) -> (ResetReport, Vec<u8>) {
+    let h = t.manual_handback_at(clock);
     let report = ResetReport {
         reverted: h.reverted,
         bytes: h.bytes.len(),
@@ -117,7 +117,7 @@ pub(crate) fn run_direct(
 ) -> Result<ResetReport, String> {
     let (report, _) = {
         let mut t = crate::term_lock(term);
-        apply(&mut t)
+        apply(&mut t, ClockReading::now())
     };
     let noted = ctx.fabric.note_direct_reset(fence_wait);
     record(sid, &ctx.timeline, source, &report);

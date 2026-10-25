@@ -588,8 +588,7 @@ const STARTER_CONFIG: &str = concat!(
 # --- system awareness: live Global / aterm / Tab stats bars (⌘I: Stats Lens)
 # [sys]
 # stats_bars = \"deck\"              # \"deck\" (default: under titlebar) | \"sill\" (bottom padding) | \"off\"
-# stats_deck_size = \"auto\"         # \"auto\" (default: v2 Folded at any height) | \"full\" | \"folded\"
-# stats_deck_style = \"v2\"          # \"v2\" (default: the table) | \"merged\" (three rows, row A alone under 10; being built)
+# stats_deck_size = \"auto\"         # \"auto\" (default: Folded at any height) | \"full\" | \"folded\"
 # disk_roots = []                  # ~/Library or protected folders the disk walker may size
 
 # --- input policy: map a chord to raw bytes sent to the program (macOS menu chords

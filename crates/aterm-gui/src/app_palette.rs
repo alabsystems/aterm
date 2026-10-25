@@ -327,7 +327,7 @@ impl App {
         let window = wid.and_then(|wid| self.windows.get(&wid));
         let has_selection = wid.is_some_and(|wid| {
             if self.active_native_view(wid).is_some() {
-                self.native_selection_text(wid).is_some()
+                self.native_has_selection(wid)
             } else {
                 self.front_terminal(wid).is_some_and(|terminal| {
                     crate::term_lock(&terminal.term)
@@ -442,11 +442,25 @@ impl App {
     pub(crate) fn publish_menu_live(&self) {
         let last = crate::menu::menu_live();
         let front = self.frontmost_window;
+        let content_window = front.filter(|wid| {
+            self.windows
+                .get(wid)
+                .is_some_and(|window| !window.overlay_open())
+        });
         let terminal = front.and_then(|wid| self.front_terminal(wid));
-        let has_selection = if front.is_some_and(|wid| self.active_native_view(wid).is_some())
-            || self.front_rename_edit().is_some()
-        {
+        let has_selection = if self.front().is_some_and(|window| window.overlay_open()) {
+            false
+        } else if self.front_rename_edit().is_some() {
             true
+        } else if self.front().is_some_and(|window| {
+            window
+                .stats_lens
+                .open
+                .is_some_and(|lens| lens.how != crate::stats_lens::Opened::Hover)
+        }) {
+            self.vitals.snapshot.is_some()
+        } else if let Some(wid) = front.filter(|wid| self.active_native_view(*wid).is_some()) {
+            self.native_has_selection(wid)
         } else if let Some(terminal) = terminal {
             crate::term_try_lock(&terminal.term).map_or(last.has_selection, |term| {
                 term.text_selection().has_selection()
@@ -457,9 +471,9 @@ impl App {
         let promotable = front.map_or(self.launch_kitty, |wid| self.promotable_kitty(wid));
         crate::menu::set_menu_live(crate::menu::MenuLive {
             has_selection,
-            can_save: front.is_some_and(|wid| self.can_save_document(wid)),
-            can_find: front.is_some_and(|wid| self.can_find(wid)),
-            can_find_again: front.is_some_and(|wid| self.can_find_again(wid)),
+            can_save: content_window.is_some_and(|wid| self.can_save_document(wid)),
+            can_find: content_window.is_some_and(|wid| self.can_find(wid)),
+            can_find_again: content_window.is_some_and(|wid| self.can_find_again(wid)),
             multi_tab: self.front().is_some_and(|ws| ws.tab_set.len() >= 2),
             can_reopen_closed_tab: self.can_reopen_closed_tab(),
             can_reopen_closed_view: self.can_reopen_closed_view(),
@@ -550,6 +564,7 @@ impl App {
             opened = true;
         }
         if opened {
+            self.retire_native_input_in(wid);
             self.settle_pointer_drags(wid);
             let _ = self.palette_claims_pointer(wid);
             if let Some((x, y)) = self.windows.get(&wid).map(|window| window.last_cursor_px) {
@@ -598,6 +613,7 @@ impl App {
         if let Some(os_window) = &window.os_window {
             os_window.request_redraw();
         }
+        self.retire_native_input_in(wid);
         self.settle_pointer_drags(wid);
         let _ = self.palette_claims_pointer(wid);
         self.invalidate_native_ui_cache(wid);
@@ -1467,6 +1483,198 @@ mod tests {
         }
     }
 
+    fn dirty_editor_with_accepted_search() -> (
+        aterm_tempfile::TempDir,
+        App,
+        std::path::PathBuf,
+        crate::tab_model::ViewId,
+        crate::document_store::DocumentId,
+    ) {
+        use crate::native_app::{AppEvent, AppKind, TextInputEvent};
+        use amacs::input::EditorInput;
+        use aterm_types::keyboard::{Key, Modifiers, NamedKey};
+
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("overlay.txt");
+        std::fs::write(&path, "needle one\nneedle two\n").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(
+            AppKind::Editor,
+            &crate::native_document_host::path_to_file_uri(&path).unwrap(),
+        )
+        .unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("draft ".into())),
+        )
+        .unwrap();
+        app.find_requested_in(wid);
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("needle".into())),
+        )
+        .unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::EditorInput(EditorInput::Key {
+                key: Key::Named(NamedKey::Enter),
+                mods: Modifiers::empty(),
+                text: None,
+            }),
+        )
+        .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        assert!(app.can_save_document(wid));
+        assert!(app.can_find(wid) && app.can_find_again(wid));
+        (scratch, app, path, view, document)
+    }
+
+    fn editor_buffer(
+        app: &App,
+        view: crate::tab_model::ViewId,
+    ) -> &crate::native_editor::EditorBufferView {
+        let Some(crate::native_app::AppViewState::Editor(state)) =
+            app.native_runtime.view_state(view)
+        else {
+            panic!("editor view");
+        };
+        state.buffer.as_ref().unwrap()
+    }
+
+    #[test]
+    fn document_menu_commands_do_not_reach_the_editor_behind_an_overlay() {
+        use crate::menu::MenuAction;
+
+        for overview in [false, true] {
+            let (_scratch, mut app, path, view, document) = dirty_editor_with_accepted_search();
+            let wid = WindowId(0);
+            let disk = std::fs::read(&path).unwrap();
+            let snapshot = app.document_store.snapshot(document).unwrap();
+            let buffer = editor_buffer(&app, view).clone();
+            if overview {
+                app.open_overview().unwrap();
+            } else {
+                app.palette_enter();
+            }
+            let overlay = app.windows[&wid].overlay.as_ref().unwrap().kind();
+
+            for action in [
+                MenuAction::Save,
+                MenuAction::Find,
+                MenuAction::FindNext,
+                MenuAction::FindPrev,
+            ] {
+                app.pending_action_refusal = None;
+                app.dispatch_document_menu_action(action);
+                assert!(
+                    app.pending_action_refusal.is_some(),
+                    "{overlay:?}: {action:?}"
+                );
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    disk,
+                    "{overlay:?}: {action:?}"
+                );
+                assert_eq!(app.document_store.dirty(document), Some(true));
+                assert_eq!(
+                    editor_buffer(&app, view),
+                    &buffer,
+                    "{overlay:?}: {action:?}"
+                );
+                let after = app.document_store.snapshot(document).unwrap();
+                assert_eq!(
+                    (after.seq, after.text),
+                    (snapshot.seq, snapshot.text.clone())
+                );
+                assert_eq!(app.windows[&wid].overlay.as_ref().unwrap().kind(), overlay);
+            }
+        }
+    }
+
+    #[test]
+    fn document_menu_readiness_yields_to_overlays_and_palette_commands_run_after_close() {
+        use crate::menu::{MenuAction, menu_live, set_menu_live};
+        use crate::native_app::AppEvent;
+        use crate::native_editor::{EditorCommand, Minibuffer};
+        use crate::palette::PaletteTarget;
+
+        let before = menu_live();
+        for overview in [false, true] {
+            let (_scratch, mut app, path, view, document) = dirty_editor_with_accepted_search();
+            let wid = WindowId(0);
+            let snapshot = app.document_store.snapshot(document).unwrap();
+            let first = editor_buffer(&app, view).primary_selection().range();
+            if overview {
+                app.open_overview().unwrap();
+            } else {
+                app.palette_enter();
+            }
+            app.publish_menu_live();
+            let menu = menu_live();
+            assert!(!menu.can_save && !menu.can_find && !menu.can_find_again);
+            let palette = app.palette_live();
+            assert!(palette.can_save && palette.can_find && palette.can_find_again);
+            assert_eq!(
+                app.palette_snapshot(wid).action_by_name("Save"),
+                Ok(MenuAction::Save)
+            );
+            if overview {
+                app.overview_exit(wid);
+            } else {
+                app.palette_exit();
+            }
+            app.publish_menu_live();
+            let menu = menu_live();
+            assert!(menu.can_save && menu.can_find && menu.can_find_again);
+
+            for (name, action) in [
+                ("Find Next", MenuAction::FindNext),
+                ("Find Previous", MenuAction::FindPrev),
+                ("Find", MenuAction::Find),
+            ] {
+                open_palette_in(&mut app, wid, name);
+                assert_eq!(
+                    app.windows[&wid].palette().unwrap().selected_action(),
+                    Some(action)
+                );
+                app.palette_activate_in(wid);
+                assert!(app.windows[&wid].overlay.is_none());
+                match action {
+                    MenuAction::FindNext => {
+                        assert_ne!(editor_buffer(&app, view).primary_selection().range(), first)
+                    }
+                    MenuAction::FindPrev => {
+                        assert_eq!(editor_buffer(&app, view).primary_selection().range(), first)
+                    }
+                    MenuAction::Find => assert!(matches!(
+                        editor_buffer(&app, view).minibuffer,
+                        Minibuffer::Search { .. }
+                    )),
+                    _ => unreachable!(),
+                }
+            }
+            app.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::Abort))
+                .unwrap();
+            open_palette_in(&mut app, wid, "Save");
+            assert!(matches!(
+                app.windows[&wid].palette().unwrap().selected_target(),
+                Some(PaletteTarget::Native(target)) if target.action.as_str() == "editor/save"
+            ));
+            app.palette_activate_in(wid);
+            assert!(app.windows[&wid].overlay.is_none());
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                snapshot.text.as_ref()
+            );
+            assert_eq!(app.document_store.dirty(document), Some(false));
+            let after = app.document_store.snapshot(document).unwrap();
+            assert_eq!((after.seq, after.text), (snapshot.seq, snapshot.text));
+        }
+        set_menu_live(before);
+    }
+
     #[test]
     fn editor_find_availability_preserves_other_prompts_and_restores_after_exit() {
         use crate::native_app::{AppEvent, AppKind, AppViewState};
@@ -2088,8 +2296,11 @@ mod tests {
 
     #[test]
     fn copy_enablement_uses_native_selection_and_never_the_hidden_terminal() {
+        use crate::menu::{menu_live, set_menu_live};
+        use crate::native_app::{AppEvent, TextInputEvent};
         use aterm_core::selection::{SelectionSide, SelectionType};
 
+        let before = menu_live();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let hidden_terminal = app
@@ -2112,23 +2323,154 @@ mod tests {
             !app.palette_live().has_selection,
             "a hidden terminal selection cannot enable native Copy"
         );
-        let (_, view) = app.active_native_view(wid).unwrap();
-        let Some(crate::native_app::AppViewState::Settings(settings)) =
-            app.native_runtime.view_state_mut(view)
-        else {
-            panic!("Settings view state");
-        };
-        settings.search_input.insert("native selection");
-        settings.search_input.select_all();
+        app.publish_menu_live();
+        assert!(!menu_live().has_selection);
+        app.find_requested_in(wid);
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("native selection".into())),
+        )
+        .unwrap();
+        app.dispatch_native_event(wid, AppEvent::TextInput(TextInputEvent::SelectAll))
+            .unwrap();
         assert!(
             app.palette_live().has_selection,
             "the active Settings selection enables Copy"
         );
+        app.publish_menu_live();
+        assert!(menu_live().has_selection);
 
         let palette = app.palette_snapshot(wid);
         assert!(palette.controls_lines().iter().any(|line| {
             line.contains("target=menu action=Copy") && line.contains("enabled=true")
         }));
+        set_menu_live(before);
+    }
+
+    #[test]
+    fn menu_copy_tracks_native_document_selection_and_yields_to_overlays() {
+        use crate::menu::{MenuAction, menu_live, set_menu_live};
+        use crate::native_app::{AppEvent, AppKind, TextInputEvent};
+        use crate::native_editor::EditorCommand;
+
+        let before = menu_live();
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("selection.md");
+        let source = "# Héllo\n\nBody 🦀 and a selection.\n";
+        std::fs::write(&path, source).unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        for kind in [AppKind::Editor, AppKind::Markdown] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.open_document_tab(kind, &uri).unwrap();
+            let (instance, _) = app.active_native_view(wid).unwrap();
+            let document = app.native_runtime.document_id(instance).unwrap();
+            let original = app.document_store.snapshot(document).unwrap();
+            app.publish_menu_live();
+            assert!(!menu_live().has_selection, "{kind:?}: no selection");
+            app.dispatch_native_event(wid, AppEvent::TextInput(TextInputEvent::SelectAll))
+                .unwrap();
+            assert_eq!(app.native_selection_text(wid).as_deref(), Some(source));
+            app.publish_menu_live();
+            assert!(menu_live().has_selection, "{kind:?}: native selection");
+
+            if kind == AppKind::Editor {
+                app.dispatch_native_event(
+                    wid,
+                    AppEvent::EditorCommand(EditorCommand::ExecuteCommand),
+                )
+                .unwrap();
+                app.publish_menu_live();
+                assert!(
+                    !menu_live().has_selection,
+                    "the prompt owns input over the parked document selection"
+                );
+                assert!(!app.palette_live().has_selection);
+                app.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::Abort))
+                    .unwrap();
+                app.publish_menu_live();
+                assert!(
+                    menu_live().has_selection,
+                    "closing M-x restores the selected document"
+                );
+            }
+
+            app.palette_enter();
+            app.publish_menu_live();
+            assert!(
+                !menu_live().has_selection,
+                "the menu cannot copy behind the palette"
+            );
+            assert!(
+                app.palette_live().has_selection,
+                "palette commands retain their underlying target"
+            );
+            assert_eq!(
+                app.windows[&wid].palette().unwrap().action_by_name("Copy"),
+                Ok(MenuAction::Copy)
+            );
+            app.palette_exit();
+            app.publish_menu_live();
+            assert!(menu_live().has_selection);
+
+            app.open_overview().unwrap();
+            app.publish_menu_live();
+            assert!(
+                !menu_live().has_selection,
+                "the menu cannot copy behind Overview"
+            );
+            app.overview_exit(wid);
+            app.publish_menu_live();
+            assert!(menu_live().has_selection);
+            let after = app.document_store.snapshot(document).unwrap();
+            assert_eq!(after.text, original.text);
+            assert_eq!(after.seq, original.seq);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        set_menu_live(before);
+    }
+
+    #[test]
+    fn menu_copy_preserves_a_pinned_stats_sentence_owner_over_native_content() {
+        use crate::menu::{menu_live, set_menu_live};
+        use crate::stats_lens::Opened;
+        use crate::stats_paint::{Bar, Instrument};
+
+        let before = menu_live();
+        let _stats = crate::stats_deck::tests::attach_stats();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.config
+            .sys
+            .get_or_insert_with(Default::default)
+            .stats_bars = Some("sill".into());
+        app.windows.get_mut(&wid).unwrap().metrics.pad = 24;
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        assert!(app.native_selection_text(wid).is_none());
+        app.vitals.snapshot = Some(std::sync::Arc::new(crate::stats_deck::tests::snapshot()));
+        app.open_stats_lens(wid, Instrument::Cpu, Bar::Global, Opened::Pinned);
+        assert!(app.windows[&wid].stats_lens.open.is_some());
+        assert!(app.stats_lens_sentence(wid).is_some());
+        app.publish_menu_live();
+        assert!(menu_live().has_selection);
+        app.vitals.snapshot = None;
+        app.publish_menu_live();
+        assert!(
+            !menu_live().has_selection,
+            "no sentence exists without its snapshot"
+        );
+        app.vitals.snapshot = Some(std::sync::Arc::new(crate::stats_deck::tests::snapshot()));
+        app.palette_enter();
+        app.publish_menu_live();
+        assert!(
+            !menu_live().has_selection,
+            "the palette takes input before the lens"
+        );
+        app.palette_exit();
+        app.close_stats_lens(wid);
+        app.publish_menu_live();
+        assert!(!menu_live().has_selection);
+        set_menu_live(before);
     }
 
     #[test]

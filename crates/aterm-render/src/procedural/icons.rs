@@ -1635,7 +1635,7 @@ mod tests {
         );
     }
 
-    /// The deck's pictograms ([`BandIcon::is_pictogram`]) at the sizes they are drawn: on the grid's faces in a cell of their own and between blanks (the band-icons scene), between blanks on the small faces measured at 1x ([`SMALL_FACES`]), and alone in a chrome surface's square box ([`boxed_icon_metrics`]) of 11 to 13 px at 1x and 22 to 26 at 2x (the deck's need pills), each as `(where, raster width, raster, icon)`.
+    /// The need pictograms ([`BandIcon::is_pictogram`]) at the sizes they are drawn: on the grid's faces in a cell of their own and between blanks (the band-icons scene), between blanks on the small faces measured at 1x ([`SMALL_FACES`]), and alone in a chrome surface's square box ([`boxed_icon_metrics`]) of 11 to 13 px at 1x and 22 to 26 at 2x, each as `(where, raster width, raster, icon)`.
     fn pictogram_rasters() -> Vec<(String, usize, Vec<u8>, BandIcon)> {
         let mut drawn = Vec::new();
         let pictograms = || BandIcon::ALL.into_iter().filter(|i| i.is_pictogram());

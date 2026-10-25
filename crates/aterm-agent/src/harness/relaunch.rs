@@ -3345,6 +3345,18 @@ pub fn snapshot(opts: &Opts) -> Result<Snapshot, &'static str> {
     snapshot_with(opts, &Live)
 }
 
+/// Read the foreground agent with its host-proven live primary copy, when present.
+/// The ordinary job, start-time, tab and terminal checks still precede its admission.
+///
+/// # Errors
+/// Returns the same refusal codes as [`snapshot`].
+pub fn snapshot_with_claim(
+    opts: &Opts,
+    claim: Option<&super::self_claimed::Copy>,
+) -> Result<Snapshot, &'static str> {
+    snapshot_with_claimed(opts, &Live, claim)
+}
+
 /// The lane that reads a tab's foreground agent ([`snapshot_with`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SnapshotLane {
@@ -3479,6 +3491,14 @@ pub fn snapshot_of_copy(
 
 /// [`snapshot`] with the agent's job and terminal read from `k` ([`Kernel`]).
 pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'static str> {
+    snapshot_with_claimed(opts, k, None)
+}
+
+fn snapshot_with_claimed(
+    opts: &Opts,
+    k: &dyn Kernel,
+    claim: Option<&super::self_claimed::Copy>,
+) -> Result<Snapshot, &'static str> {
     let tab = opts.only_sid.as_deref().ok_or("no-tab")?;
     let mut c = connect(opts, tab).map_err(|_| "no-socket")?;
     super::laps::lap("connect");
@@ -3520,7 +3540,9 @@ pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'s
     super::laps::lap("process");
     match snapshot_lane(image.as_deref(), &args.argv) {
         SnapshotLane::CodexAlab => {
-            return super::upgrade_drive::codex_alab_snapshot(opts, tab, pid, start, shell, &args);
+            return super::upgrade_drive::codex_alab_snapshot_with_claim(
+                opts, tab, pid, start, shell, &args, claim,
+            );
         }
         SnapshotLane::Muse => {
             return super::upgrade_drive::muse_snapshot(opts, tab, pid, start, shell, &args);
@@ -3928,6 +3950,17 @@ pub const fn self_claimed_line(snap: &Snapshot) -> Option<&super::self_claimed::
         AgentRun::Codex(run) => run.self_claimed.as_ref(),
         AgentRun::Claude | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => None,
     }
+}
+
+/// Whether the current validated copy still names this exact published root and line.
+#[must_use]
+pub fn same_self_claim(snap: &Snapshot, copy: &super::self_claimed::Copy) -> bool {
+    copy.pid == snap.pid
+        && copy.start == snap.start
+        && copy.resume.as_ref().is_ok_and(|resume| {
+            snap.session.as_deref() == Some(resume.session.as_str())
+                && self_claimed_line(snap) == Some(resume)
+        })
 }
 
 fn after_exit_as(

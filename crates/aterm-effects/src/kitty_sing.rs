@@ -790,17 +790,17 @@ impl MusicNotes {
     #[inline]
     fn resolve(note: &Note, now: Instant, reduced_motion: bool) -> Option<NoteSprite> {
         let age = now.saturating_duration_since(note.born).as_secs_f32();
-        let u = age / NOTE_LIFE;
+        let u = age * (1.0 / NOTE_LIFE);
         if !(0.0..1.0).contains(&u) {
             return None;
         }
-        let fade_in = (u / 0.15).min(1.0);
-        let fade_out = ((1.0 - u) / 0.4).min(1.0);
+        let fade_in = (u * (1.0 / 0.15)).min(1.0);
+        let fade_out = ((1.0 - u) * (1.0 / 0.4)).min(1.0);
         let alpha = (fade_in * fade_out * 255.0) as u8;
         let s = note.seed;
         let tint = NOTE_TINTS[(s % NOTE_TINTS.len() as u32) as usize];
-        let x0 = 0.1 + 0.8 * ((s >> 8) & 0xff) as f32 / 255.0;
-        let phase = ((s >> 16) & 0xff) as f32 / 255.0;
+        let x0 = 0.1 + (0.8 / 255.0) * ((s >> 8) & 0xff) as f32;
+        let phase = ((s >> 16) & 0xff) as f32 * (1.0 / 255.0);
         let (dx, dy) = if reduced_motion {
             (x0, -0.3 - 0.8 * phase)
         } else {

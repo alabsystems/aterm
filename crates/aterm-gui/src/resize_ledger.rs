@@ -46,10 +46,10 @@ pub(crate) enum Cause {
     Pass,
     /// A tab a drag deferred, sized as it is drawn (`redraw_window`).
     Redraw,
-    /// The Deck's head moved: a config reload changed its style, its size setting, or the stats
-    /// bars into or out of it (`App::apply_prepared_config_generation_unfenced`), or a restored
-    /// frame another style, or v2 in the form it no longer takes, sized re-gridded its tabs at
-    /// attach (`App::regrid_to_attach_frame`).
+    /// The Deck's head moved: a config reload changed its size setting, or the stats bars into or
+    /// out of it (`App::apply_prepared_config_generation_unfenced`), or a restored frame the Deck
+    /// sized in the form it no longer takes re-gridded its tabs at attach
+    /// (`App::regrid_to_attach_frame`).
     Deck,
 }
 

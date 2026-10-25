@@ -12,36 +12,9 @@ use crate::linux::{self, Up};
 use crate::linux_guest::{self as guest, Arch, Display, Screen, Seat};
 use crate::linux_proof::{self as proof, Gui};
 
-/// The Deck's style these rows run: aterm-gui's default `[sys] stats_deck_style`.
-pub const STYLE: Style = Style::V2;
-
-/// The Deck's styles (aterm-gui's `stats_deck::DeckStyle`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Style {
-    /// Stats Deck v2: 62 pt in the Folded form a new window opens in.
-    V2,
-    /// The merged deck: three cells, held to 45..=60 pt.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the rows run it once it is aterm-gui's default")
-    )]
-    Merged,
-}
-
-impl Style {
-    /// The Deck's height in device px at `scale` over `cell_h` px cells, as aterm-gui's
-    /// `stats_deck::deck_px` gives it a new window.
-    #[must_use]
-    pub fn deck_px(self, scale: f64, cell_h: usize) -> usize {
-        match self {
-            Self::V2 => (62.0 * scale).round() as usize,
-            Self::Merged => cell_h.saturating_mul(3).clamp(
-                (45.0 * scale).round() as usize,
-                (60.0 * scale).round() as usize,
-            ),
-        }
-    }
-}
+/// The Deck's height in points, Folded as a new window opens it: aterm-gui's
+/// `stats_deck::FOLDED_PT`.
+pub const DECK_PT: f64 = 62.0;
 
 const FIRST_TAB_COL: u16 = 5;
 
@@ -232,7 +205,7 @@ impl Dims {
     }
 
     fn deck_want(&self) -> usize {
-        STYLE.deck_px(self.scale, self.cell_h)
+        (DECK_PT * self.scale).round() as usize
     }
 
     const fn deck_rows(&self) -> Range<usize> {
@@ -297,14 +270,14 @@ fn head(d: &Dims) -> Result<String, String> {
     let want = d.deck_want();
     if d.deck_h != want || d.deck_y != 0 || d.head < d.deck_h {
         return Err(format!(
-            "deck_y={} deck_h={} in head={}, where the {STYLE:?} Deck at scale {:.2} over \
-             {} px cells is {want} px at the head's top",
-            d.deck_y, d.deck_h, d.head, d.scale, d.cell_h
+            "deck_y={} deck_h={} in head={}, where the Deck's {DECK_PT} pt at scale {:.2} \
+             is {want} px at the head's top",
+            d.deck_y, d.deck_h, d.head, d.scale
         ));
     }
     Ok(format!(
-        "deck_y=0 deck_h={want} ({STYLE:?} at scale {:.2} over {} px cells) in head={}",
-        d.scale, d.cell_h, d.head
+        "deck_y=0 deck_h={want} ({DECK_PT} pt at scale {:.2}) in head={}",
+        d.scale, d.head
     ))
 }
 
@@ -560,15 +533,5 @@ mod tests {
         assert_eq!(d.band_foot(), 98);
         assert_eq!(d.deck_rows(), 0..62);
         assert!(Dims::read("OK 24x80 scale=1.00").is_err());
-    }
-
-    #[test]
-    fn the_merged_deck_is_three_cells_held_to_45_to_60_pt() {
-        assert_eq!(Style::Merged.deck_px(1.0, 17), 51);
-        assert_eq!(Style::Merged.deck_px(2.0, 34), 102);
-        assert_eq!(Style::Merged.deck_px(2.0, 28), 90);
-        assert_eq!(Style::Merged.deck_px(1.0, 30), 60);
-        assert_eq!(Style::V2.deck_px(2.0, 28), 124);
-        assert_eq!(STYLE, Style::V2, "aterm-gui's default");
     }
 }

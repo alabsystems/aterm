@@ -323,6 +323,25 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
             .switch_turning
             .is_none()
     );
+    policy(&mut app, "[harness]\n");
+    set_program(&app, session, Some("agy"));
+    frame(&mut app, wid);
+    arm(&mut app, false);
+    policy(&mut app, MASTER_OFF);
+    frame(&mut app, wid);
+    assert!(
+        app.windows[&wid].claude_lights.sessions[&session]
+            .switch_turning
+            .is_none(),
+        "agy's bare off read-back also lets `turning off` go"
+    );
+    policy(&mut app, "[harness]\n");
+    frame(&mut app, wid);
+    assert_eq!(
+        switch(&app, wid).map(|b| b.face),
+        Some(HarnessSwitch::On),
+        "turning back on shows On, never stale TurningOff"
+    );
 }
 
 #[test]

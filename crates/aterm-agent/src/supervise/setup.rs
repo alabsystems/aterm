@@ -94,7 +94,7 @@ pub struct SessionSetup {
     pub(super) reset_waits: reset_loop::ResetWaits,
     /// [`BOX_SETTLE`] (`Session::set_box_settle`).
     pub(super) box_settle: Duration,
-    /// [`AUTOCOMPACT_SETTLE`] (`Session::set_autocompact_settle`): the box settle of Claude Code's autocompact offer, at least [`Self::box_settle`].
+    /// [`AUTOCOMPACT_SETTLE`] (`Session::set_autocompact_settle`): the box settle of Claude Code's autocompact offer and auto-mode setup offer, which drop a key pressed within 500 ms of their mount or of the key before, at least [`Self::box_settle`].
     pub(super) autocompact_settle: Duration,
     /// [`background_settle`] (`Session::set_background_settle`): read from the live upgrade's settle once, here.
     pub(super) background_settle: Duration,

@@ -4306,7 +4306,8 @@ fn a_ledger_row_round_trips_as_one_bounded_line() {
             "wrong-account",
             "reset",
             "epoch",
-            "sign-in"
+            "sign-in",
+            "displaced"
         ]
     );
 
@@ -4333,7 +4334,7 @@ fn a_ledger_row_round_trips_as_one_bounded_line() {
     assert!(!line.contains(['\n', '\r', '\u{2028}']));
     assert!(line.len() < MAX_EVENT_LINE_BYTES, "{}", line.len());
     let back = Event::of_json_line(&line).expect("still a row");
-    assert!(back.account.len() <= LABEL_MAX && back.why.len() <= WHY_MAX);
+    assert!(back.account.len() <= LABEL_MAX && back.why.len() <= LEDGER_WHY_MAX);
     assert!(back.to.is_some_and(|t| t.len() <= LABEL_MAX));
     assert!(back.sid.is_some_and(|s| s.len() <= WORD_MAX));
     assert!(back.why.starts_with("failed: é"), "{}", back.why);
@@ -4425,6 +4426,7 @@ fn a_row_wakes_waiting_tabs_only_when_an_account_is_usable_sooner() {
         Kind::Reset,
         Kind::Epoch,
         Kind::SignIn,
+        Kind::Displaced,
     ];
     for kind in quiet {
         assert!(!wakes(kind, "ok"), "{}", kind.as_str());

@@ -229,7 +229,8 @@ fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
         .insert_text(&mut store, &mut editor, "-clean")
         .unwrap();
     let (seq, _) = workspace
-        .take_last_commit(document)
+        .take_commits(document)
+        .pop()
         .expect("the Editor's own commit");
     text.insert_str(caret, "-clean");
     history.push((seq, text.clone()));

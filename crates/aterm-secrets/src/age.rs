@@ -8,6 +8,8 @@
 use crate::{SecretBytes, b64, bech32, x25519};
 use ring::{aead, hkdf, hmac};
 use zeroize::Zeroize;
+#[cfg(unix)]
+use zeroize::Zeroizing;
 
 /// Why an age operation failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,6 +470,14 @@ fn parse_header(file: &[u8]) -> Result<Header<'_>, AgeError> {
 }
 
 fn decrypt_binary(identities: &[Identity], file: &[u8]) -> Result<SecretBytes, AgeError> {
+    let header = binary_header(file)?;
+    let mut file_key = unwrap_file_key(identities, &header.stanzas)?;
+    let result = open_after_header(&file_key, file, &header);
+    file_key.zeroize();
+    result
+}
+
+fn binary_header(file: &[u8]) -> Result<Header<'_>, AgeError> {
     if file.len() > MAX_FILE {
         return Err(AgeError::Header);
     }
@@ -475,10 +485,30 @@ fn decrypt_binary(identities: &[Identity], file: &[u8]) -> Result<SecretBytes, A
     if header.stanzas.len() > 1 && header.stanzas.iter().any(|s| s.kind == "scrypt") {
         return Err(AgeError::Header);
     }
-    let mut file_key = unwrap_file_key(identities, &header.stanzas)?;
-    let result = open_after_header(&file_key, file, &header);
-    file_key.zeroize();
-    result
+    Ok(header)
+}
+
+/// Only Commons history handoff uses an original file key. Authenticate the
+/// complete binary file before allowing that key to be wrapped to a new member.
+#[cfg(unix)]
+pub(crate) fn authenticated_file_key(
+    identity: &Identity,
+    file: &[u8],
+) -> Result<Zeroizing<[u8; FILE_KEY]>, AgeError> {
+    let header = binary_header(file)?;
+    let key = Zeroizing::new(unwrap_file_key(
+        std::slice::from_ref(identity),
+        &header.stanzas,
+    )?);
+    open_after_header(&key, file, &header)?;
+    Ok(key)
+}
+
+/// Opening with a handoff key still authenticates the original header and every
+/// payload chunk. This is crate-private, not another public decryption mode.
+#[cfg(unix)]
+pub(crate) fn decrypt_file_key(key: &[u8; FILE_KEY], file: &[u8]) -> Result<SecretBytes, AgeError> {
+    open_after_header(key, file, &binary_header(file)?)
 }
 
 fn open_after_header(

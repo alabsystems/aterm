@@ -59,6 +59,23 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
         self.plan.clone()
     }
 
+    /// Admit and complete a scratch vault plan, without running its host stages.
+    pub fn complete_vault_setup(&mut self) -> Result<u64, String> {
+        self.plan.selection.set(Setting::Secrets, true);
+        let revision = self
+            .persist(InitialSetupAdmissionFault::None)?
+            .ok_or("the scratch vault plan was refused")?;
+        let _lock = HeldLock::take(self.root)?;
+        let mut progress = progress(self.root)?.ok_or("the scratch run is missing")?;
+        progress.done = Stage::ALL
+            .into_iter()
+            .filter(|stage| stage.selected(&self.plan))
+            .fold(0, |done, stage| done | stage.bit());
+        progress.completed = true;
+        save_progress(self.root, progress)?;
+        Ok(revision)
+    }
+
     /// Move the real retained restart into the binary's live retry coordinator.
     pub fn into_restart(self) -> InitialSetupRestart {
         match self.owner {

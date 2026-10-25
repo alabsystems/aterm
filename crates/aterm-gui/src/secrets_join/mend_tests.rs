@@ -92,6 +92,11 @@ impl ScratchSubscriber {
 
     fn reach(self: &Arc<Self>, off_after_probe: bool) -> MendReach {
         MendReach {
+            wanted: Box::new(|| true),
+            while_wanted: Box::new(|work| {
+                work();
+                true
+            }),
             configured: Box::new({
                 let this = Arc::clone(self);
                 move || {

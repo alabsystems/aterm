@@ -7390,6 +7390,16 @@ fn tab_walks_the_whole_system_state_list() {
     let (_, view) = app
         .active_native_view(wid)
         .expect("active System State view");
+    // The person opened the vault's fields under its row.
+    app.dispatch_native_view_event(
+        wid,
+        view,
+        crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+            id: crate::native_ui::ActionId::new("system-state/row/secrets/disclose"),
+            value: None,
+        }),
+    )
+    .unwrap();
     let compiled = app.compiled_native_ui(wid).unwrap();
     // Every group's choice, then the vault's disclosure, fields and Join.
     let stops: Vec<&str> = compiled.list_stops.iter().map(UiKey::as_str).collect();

@@ -137,6 +137,9 @@ pub struct FooterFacts {
     pub plan: Option<super::profile::PlanUsage>,
     /// The context left, as read off the agent's own indicator on the glass (`ctx 84% left`).
     pub context: Option<String>,
+    /// The session's active goal, one line ([`super::goal`]): Claude Code's `/goal` condition
+    /// as its transcript leaves it ([`FooterCache::goal`]).
+    pub goal: Option<String>,
 }
 
 /// One of the footer's facts a person can act on in the bottom rule.
@@ -1382,6 +1385,9 @@ pub struct FooterCache {
     /// How many folds this cache has dropped: a new fold's generations start
     /// over, so [`Self::traffic_generation`] names the fold too.
     dropped: u64,
+    /// The goal store read of an agent that keeps its goal in one (Muse Code,
+    /// [`super::goal::StoreGoal`]): no transcript fold holds it.
+    store_goal: super::goal::StoreGoal,
 }
 
 impl Default for FooterCache {
@@ -1395,6 +1401,7 @@ impl Default for FooterCache {
             steps_certain: true,
             dirs: None,
             dropped: 0,
+            store_goal: super::goal::StoreGoal::default(),
         }
     }
 }
@@ -1557,6 +1564,23 @@ impl FooterCache {
     pub fn traffic_generation(&self) -> Option<(u64, u64)> {
         self.caught_up_usage()
             .map(|usage| (self.dropped, usage.traffic_generation()))
+    }
+
+    /// The conversation's active `/goal` ([`super::goal::ClaudeGoal`]), only once the fold has
+    /// caught up: one part way through a long transcript may not yet have folded the row that
+    /// met or cleared it.
+    #[must_use]
+    pub fn goal(&self) -> Option<String> {
+        self.caught_up_usage()?
+            .main()
+            .fold()
+            .goal()
+            .map(str::to_owned)
+    }
+
+    /// The goal store read this session's agent keeps ([`super::goal::StoreGoal`]).
+    pub fn store_goal(&mut self) -> &mut super::goal::StoreGoal {
+        &mut self.store_goal
     }
 
     fn caught_up_usage(&self) -> Option<&super::session_usage::SessionUsage> {
@@ -2429,6 +2453,7 @@ fn facts_for_entry_from(
         subscription: None,
         plan: None,
         context: None,
+        goal: None,
     };
     (
         facts,
@@ -2592,6 +2617,7 @@ pub fn read_pid(
     );
     fold.dirs = Some(dirs);
     facts.usage = fold.usage(transcript, clock.now, clock.offset_at);
+    facts.goal = fold.goal();
     let home = user_home.map_or_else(Vec::new, |user_home| {
         super::resume::home_env(user_home, launch.config.as_deref(), Some(claude_dir))
     });

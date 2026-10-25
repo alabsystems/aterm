@@ -1540,12 +1540,13 @@ impl App {
         let connections_revision = self.connections.revision();
         let upgrade_revision = self.upgrade_view.revision();
         let activity_revision = self.session_status_revision(session);
-        let high_id = ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .view_head()
-            .unwrap_or(0);
+        let (high_id, goal_term) = {
+            let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                timeline.view_head().unwrap_or(0),
+                crate::claude_footer::goal_term(timeline.goal()),
+            )
+        };
         let now = crate::turn_ledger::now_ms();
         let clause = self.chrome_clause_read(retry_window, session, &ctx.timeline, now);
         if let Some(c) = self.session_chrome.get(&session)
@@ -1554,6 +1555,7 @@ impl App {
             && c.activity_revision == activity_revision
             && c.connections_revision == connections_revision
             && c.upgrade_revision == upgrade_revision
+            && c.goal == goal_term
             && c.clause.as_ref() == clause.as_ref().map(|(key, _)| key)
         {
             return c.ext.clone();
@@ -1602,10 +1604,14 @@ impl App {
         let connections = sid.as_ref().map_or_else(Vec::new, |sid| {
             self.connection_facts_in(&snapshot.edges, sid)
         });
-        let timeline: Vec<chrome::TimelineNote> = {
+        let (timeline, goal): (Vec<chrome::TimelineNote>, Option<String>) = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            chrome::timeline_tail(tl.view_newest_first())
+            (
+                chrome::timeline_tail(tl.view_newest_first()),
+                tl.goal().map(str::to_owned),
+            )
         };
+        let goal_term = crate::claude_footer::goal_term(goal.as_deref());
         let can_rename = self.can_rename_session(retry_window);
         let upgrade = sid.as_ref().and_then(|sid| {
             self.upgrade_view
@@ -1618,6 +1624,7 @@ impl App {
             icon: meta.presentation_value("icon"),
             description: meta.presentation_value("description"),
             activity,
+            goal,
             cwd,
             home: cached_home().map(str::to_string),
             state,
@@ -1642,6 +1649,7 @@ impl App {
                 activity_revision,
                 connections_revision,
                 upgrade_revision,
+                goal: goal_term,
                 expires_ms: chrome::clock_expiry_ms(now, &input),
                 clause: clause.as_ref().map(|(key, _)| key.clone()),
                 clause_line: input.clause.clone(),
@@ -2485,7 +2493,53 @@ impl App {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .contains(&session);
-        self.herald_deliver(session, current.as_ref(), looking);
+        let spent = looking.then_some(crate::status_item::Spent::Looking);
+        // One banner per box (`box_banner`): a program-claim need's banner is decided with the
+        // program's own notifications held off, and spent where one of them, or a banner of the
+        // herald's, told the box; a banner for an ask, approval or question beside a shown box
+        // (codex-alab's own ask about it) tells that box too.
+        let banner = handle.as_ref().map(|h| {
+            let shown_box = h
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .program_shown()
+                .filter(|shown| {
+                    shown.state.state
+                        == aterm_core::terminal::program_state::ProgramStateWord::Blocked
+                })
+                .map(|shown| shown.report);
+            (std::sync::Arc::clone(&h.ctx.box_banner), shown_box)
+        });
+        let answered_at_the_box = current.as_ref().is_some_and(|esc| {
+            matches!(
+                esc.word,
+                aterm_types::needs::NeedWord::Ask
+                    | aterm_types::needs::NeedWord::Approval
+                    | aterm_types::needs::NeedWord::Question
+            )
+        });
+        match (current.as_ref().and_then(|esc| esc.report), banner) {
+            (Some(report), Some((banner, _))) => banner.herald(report, |told| {
+                let spent = spent.or(told.then_some(crate::status_item::Spent::Told));
+                (
+                    (),
+                    self.herald_deliver_spent(session, current.as_ref(), spent),
+                )
+            }),
+            (None, Some((banner, Some(report)))) if answered_at_the_box => {
+                banner.herald_beside(report, || {
+                    (
+                        (),
+                        self.herald_deliver_spent(session, current.as_ref(), spent),
+                    )
+                });
+            }
+            _ => {
+                let _ = self.herald_deliver_spent(session, current.as_ref(), spent);
+            }
+        }
     }
 
     fn adopt_status_carry(
@@ -2647,12 +2701,24 @@ impl App {
         current: Option<&crate::status_item::Escalation>,
         looking: bool,
     ) {
+        let spent = looking.then_some(crate::status_item::Spent::Looking);
+        let _ = self.herald_deliver_spent(session, current, spent);
+    }
+
+    /// [`Self::herald_deliver`] where the owner already heard of the need (`spent`): whether a
+    /// notice was queued.
+    fn herald_deliver_spent(
+        &mut self,
+        session: u64,
+        current: Option<&crate::status_item::Escalation>,
+        spent: Option<crate::status_item::Spent>,
+    ) -> bool {
         let now = std::time::Instant::now();
         let alerts = self.config.desktop_alerts_or_default();
         let outcome = self
             .presence
             .herald
-            .note(session, current, looking, alerts, now);
+            .note_spent(session, current, spent, alerts, now);
         let post = match outcome.notice.as_ref() {
             Some(_) if !alerts => crate::status_item::HeraldPost::Suppressed,
             Some(notice) => match self.post_herald_notice(notice) {
@@ -2680,6 +2746,7 @@ impl App {
         if outcome.row_moved {
             self.mark_status_dirty();
         }
+        outcome.notice.is_some() && post == crate::status_item::HeraldPost::Queued
     }
 
     fn post_herald_notice(
@@ -8028,12 +8095,14 @@ mod status_glance_tests {
         app.publish_need(session);
     }
 
-    /// A CODEX TAB AT REST RESTS ON THE GLANCE: where its reader names no state
-    /// (`agent=unknown`), the glance buckets the tab by the survey's word for the program's own
-    /// shown report (`program_state::survey_word`), so an `idle`, `done` or `error` report is
-    /// resting; with a `working` or `blocked` one, or none, it stays working, and a word its
-    /// reader names stands over any report. The herald sees the bucket move, so the menu bar is
-    /// rebuilt.
+    /// A CODEX TAB AT REST RESTS ON THE GLANCE, AND ONE AT A BOX NEEDS YOU: where its reader
+    /// names no state (`agent=unknown`), the glance buckets the tab by the survey's word for the
+    /// program's own shown report (`program_state::survey_word`), so an `idle`, `done` or
+    /// `error` report is resting and a `working` one, or none, working; a `blocked` one is
+    /// published as the tab's need (`needs::program_need`, through `publish_need` as every
+    /// presence refresh does) and counted need-you, except under a proven self-claim, which
+    /// speaks for the tab: there it works. A word its reader names stands over any report. The
+    /// herald sees the bucket move, so the menu bar is rebuilt.
     #[test]
     fn a_codex_tabs_own_report_rests_it_only_where_its_reader_names_no_state() {
         use aterm_core::terminal::program_state::{
@@ -8057,34 +8126,96 @@ mod status_glance_tests {
             );
             assert_eq!(tl.agent().word, word);
         };
+        let reports = std::cell::Cell::new(0_u64);
         let report_kind = |state: Option<W>, kind: Option<K>| {
-            ctx.timeline
-                .lock()
-                .unwrap()
-                .note_program_state(state.map(|state| ProgramState { state, kind }));
+            reports.set(reports.get() + 1);
+            ctx.timeline.lock().unwrap().note_program_state(
+                state.map(|state| ProgramState { state, kind }),
+                reports.get(),
+            );
         };
         let report = |state: Option<W>| report_kind(state, None);
-        let here = |app: &App| {
+        let here = |app: &mut App| {
+            app.publish_need(0);
             let g = app.status_glance();
-            (g.here.resting, g.here.working)
+            (g.here.need_you, g.here.resting, g.here.working)
+        };
+        let claim = |proven: Option<bool>| {
+            ctx.meta.lock().unwrap().supervisor =
+                proven.map(|proven| crate::session_timeline::SupervisorClaim {
+                    holder: "codex-alab@4242".to_string(),
+                    conn: Some(1),
+                    expires_us: None,
+                    proven: proven.then(|| crate::self_claim::Proven {
+                        pid: 4242,
+                        start: "Mon Oct 20 16:37:58 2026".to_string(),
+                    }),
+                });
+        };
+        let proven = |held: bool| claim(held.then_some(true));
+        let need = |app: &mut App| {
+            app.publish_need(0);
+            ctx.timeline.lock().unwrap().need().need.clone()
         };
         publish("unknown", aterm_phase::Program::Codex, "codex");
         report(None);
-        assert_eq!(here(&app), (0, 1), "no report: unknown stays working");
+        assert_eq!(
+            here(&mut app),
+            (0, 0, 1),
+            "no report: unknown stays working"
+        );
         for state in [W::Idle, W::Done, W::Error] {
             report(Some(state));
-            assert_eq!(here(&app), (1, 0), "{state:?}: a codex at rest rests");
+            assert_eq!(
+                here(&mut app),
+                (0, 1, 0),
+                "{state:?}: a codex at rest rests"
+            );
         }
         report(Some(W::Working));
-        assert_eq!(here(&app), (0, 1), "a working report is work");
+        assert_eq!(here(&mut app), (0, 0, 1), "a working report is work");
         for kind in [None, Some(K::Permission), Some(K::Question), Some(K::Auth)] {
             report_kind(Some(W::Blocked), kind);
             assert_eq!(
-                here(&app),
-                (0, 1),
-                "blocked {kind:?}: a blocked codex is no rest"
+                here(&mut app),
+                (1, 0, 0),
+                "blocked {kind:?}: a codex at a box no claim speaks for needs you"
             );
+            proven(true);
+            assert_eq!(
+                here(&mut app),
+                (0, 0, 1),
+                "blocked {kind:?} under a proven self-claim: it carries itself, so it works"
+            );
+            proven(false);
         }
+        // Under a person's hold another holder's claim speaks for the tab only where it is a
+        // proven self-claim: the same holder unproven leaves the box the person's.
+        report_kind(Some(W::Blocked), Some(K::Permission));
+        assert!(crate::fabric::apply_hold_for_test(
+            &ctx,
+            Some(crate::fabric::Hold {
+                reason: "-".into(),
+                origin: "local".into(),
+            })
+        ));
+        claim(Some(true));
+        assert_eq!(need(&mut app), None, "held: a proven self-claim carries it");
+        claim(Some(false));
+        assert_eq!(
+            need(&mut app).map(|need| need.what),
+            Some(crate::needs::CODEX_APPROVAL_WORDS.to_string()),
+            "held: the same holder unproven speaks for nothing"
+        );
+        claim(None);
+        assert!(crate::fabric::apply_hold_for_test(&ctx, None));
+        // The claim is codex's alone: another agent whose reader names no state (a Claude Code
+        // under `node`, which the gate honours for its name) raises nothing from the report.
+        publish("unknown", aterm_phase::Program::Claude, "node");
+        report_kind(Some(W::Blocked), Some(K::Permission));
+        assert_eq!(here(&mut app), (0, 0, 1), "no codex: no claim need");
+        assert_eq!(need(&mut app), None);
+        publish("unknown", aterm_phase::Program::Codex, "codex");
         report(Some(W::Idle));
         let handle = app
             .store
@@ -8093,6 +8224,7 @@ mod status_glance_tests {
             .by_local(0)
             .cloned()
             .expect("registered");
+        assert_eq!(here(&mut app), (0, 1, 0), "the box answered: no need");
         let resting = app.status_session_row(&handle);
         assert_eq!(resting.program, Some("idle"));
         report(Some(W::Working));
@@ -8108,11 +8240,11 @@ mod status_glance_tests {
             "control: no move"
         );
         publish("busy", aterm_phase::Program::Claude, "claude");
-        report(Some(W::Idle));
+        report_kind(Some(W::Blocked), Some(K::Permission));
         assert_eq!(
-            here(&app),
-            (0, 1),
-            "a word its reader names stands over the report"
+            here(&mut app),
+            (0, 0, 1),
+            "a word its reader names stands over the report, a box's included"
         );
         assert_eq!(app.status_session_row(&handle).program, None);
     }

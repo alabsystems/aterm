@@ -120,6 +120,7 @@ pub(crate) fn notes(asked: &Asked, sid: &str) -> Vec<HostNote> {
             due: Vec::new(),
             none_soon: false,
             wrong,
+            no_sign_in: Vec::new(),
         })
     };
     match asked {

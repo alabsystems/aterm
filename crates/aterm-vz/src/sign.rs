@@ -435,6 +435,7 @@ mod tests {
         let record = Record {
             pid: 1,
             uniq: 1,
+            birth_us: 1,
             helper_sha256: "e".repeat(64),
             proto: crate::proto::PROTO,
             live_disk: "/l".into(),

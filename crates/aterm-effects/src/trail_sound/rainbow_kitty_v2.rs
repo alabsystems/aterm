@@ -372,24 +372,27 @@ const SPACE_STEP_MIN_GAP_MS: u32 = 75;
 const SPACE_STEP_HI_HZ: f32 = BASS_BASE_HZ * 4.0;
 
 #[inline]
-fn indent_step_hz(chord: usize, root: f32, n: u32, key: i32) -> f32 {
+const fn indent_step_hz(chord: usize, root: f32, n: u32, key: i32) -> f32 {
     let lit = sky_bed_degrees(chord);
-    let m = lit.len();
-    let hz = |k: usize| penta(BASS_BASE_HZ, 5 * (k / m) as i32 + lit[k % m] + key);
+    #[inline]
+    const fn hz(lit: [i32; 3], k: usize, key: i32) -> f32 {
+        let m = lit.len();
+        penta(BASS_BASE_HZ, 5 * (k / m) as i32 + lit[k % m] + key)
+    }
     let mut k0 = 0usize;
-    for _ in 0..64 {
-        if hz(k0) > root * 1.01 {
+    while k0 < 64 {
+        if hz(lit, k0, key) > root * 1.01 {
             break;
         }
         k0 += 1;
     }
     let mut cycle = 0usize;
-    while cycle < 64 && hz(k0 + cycle) < SPACE_STEP_HI_HZ {
+    while cycle < 64 && hz(lit, k0 + cycle, key) < SPACE_STEP_HI_HZ {
         cycle += 1;
     }
-    let cycle = cycle.max(1);
+    let cycle = if cycle > 1 { cycle } else { 1 };
     let k = k0 + (n.saturating_sub(1) as usize) % cycle;
-    let mut f = hz(k);
+    let mut f = hz(lit, k, key);
     while f.is_finite() && f >= SPACE_STEP_HI_HZ {
         f *= 0.5;
     }
@@ -1751,7 +1754,7 @@ const fn roof_hz(cps: f32, lit: bool, heat: f32, hue: f32, touch: Touch) -> f32 
 }
 
 #[inline]
-fn hue_arc(hue: f32) -> f32 {
+const fn hue_arc(hue: f32) -> f32 {
     tri(2.0 * hue.clamp(0.0, 1.0))
 }
 
@@ -2091,7 +2094,7 @@ const fn head_breath(root: f32) -> Voice {
 }
 
 #[inline]
-fn bloom(deg: i32, roof: f32, tau_v: f32) -> Voice {
+const fn bloom(deg: i32, roof: f32, tau_v: f32) -> Voice {
     let decay = (BLOOM_DECAY_TAU_MUL * tau_v).min(BLOOM_DECAY_S);
     let head = (tau_v / TAU_V_MAX_S).clamp(BLOOM_HEAD_MIN_MUL, 1.0);
     Voice {
@@ -2099,17 +2102,31 @@ fn bloom(deg: i32, roof: f32, tau_v: f32) -> Voice {
         dur: (3.0 * decay + TINE_DUR_TAIL_S).min(BLOOM_DUR_S),
         attack: BLOOM_ATTACK_S * head,
         decay,
-        p: core::array::from_fn(|i| Partial {
-            lvl: BLOOM_LVL[i],
-            f0: penta(TINE_BASE_HZ, deg + BLOOM_DEGREES[i]),
-            decay: BLOOM_TAU[i],
-            ..Partial::default()
-        }),
+        p: [
+            Partial {
+                lvl: BLOOM_LVL[0],
+                f0: penta(TINE_BASE_HZ, deg + BLOOM_DEGREES[0]),
+                decay: BLOOM_TAU[0],
+                ..Partial::DEFAULT
+            },
+            Partial {
+                lvl: BLOOM_LVL[1],
+                f0: penta(TINE_BASE_HZ, deg + BLOOM_DEGREES[1]),
+                decay: BLOOM_TAU[1],
+                ..Partial::DEFAULT
+            },
+            Partial {
+                lvl: BLOOM_LVL[2],
+                f0: penta(TINE_BASE_HZ, deg + BLOOM_DEGREES[2]),
+                decay: BLOOM_TAU[2],
+                ..Partial::DEFAULT
+            },
+        ],
         tw_rate: BLOOM_TW_RATE,
         tw_depth: BLOOM_TW_DEPTH,
         lp_cut: roof + BLOOM_ROOF_ADD_HZ,
         lane: LANE_BLOOM,
-        ..Voice::default()
+        ..Voice::DEFAULT
     }
 }
 
@@ -2809,7 +2826,7 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn v2_lit_roof(&self, ev: &SoundEvent) -> f32 {
+    const fn v2_lit_roof(&self, ev: &SoundEvent) -> f32 {
         let arc = if self.v2.stops.hue {
             hue_arc(ev.hue)
         } else {
@@ -3082,11 +3099,11 @@ impl TrailSynth {
         self.v2_spawn(core, ev.gain * KEY_TINE_TRIM * MET_ARM_CORE_LEVEL, pan);
     }
 
-    fn v2_core_voice(&self, dir: i8, t: f32) -> Voice {
+    const fn v2_core_voice(&self, dir: i8, t: f32) -> Voice {
         let lo = fold_into(
             penta(
                 TINE_BASE_HZ,
-                i32::from(self.v2.text.walk) + i32::from(self.song_key),
+                (self.v2.text.walk as i32) + (self.song_key as i32),
             ),
             MET_CORE_LO_HZ,
             MET_CORE_HI_HZ,
@@ -3109,15 +3126,15 @@ impl TrailSynth {
                     fm_ratio: MET_CORE_FM_RATIO,
                     fm_i0: MET_CORE_FM_INDEX,
                     fm_tau: MET_CORE_FM_TAU_MUL * t,
-                    ..Partial::default()
+                    ..Partial::DEFAULT
                 },
-                Partial::default(),
-                Partial::default(),
+                Partial::DEFAULT,
+                Partial::DEFAULT,
             ],
             lp_cut: MET_CORE_LP_HZ,
             lane: LANE_METEOR,
             pan_glide_s: t,
-            ..Voice::default()
+            ..Voice::DEFAULT
         }
     }
 

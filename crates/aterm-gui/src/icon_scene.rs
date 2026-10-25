@@ -1,86 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Private Lab scenes in the real frame renderer (`ATERM_DEBUG_SCENE`, `lab instance --scene`):
-//! `band-icons` exercises chrome icon dispatch, and in a debug build `deck-busy`, `deck-calm`
-//! and `deck-absent` put one of the merged deck's scenes ([`aterm_vitals::fixtures`]) in place
-//! of the machine.
+//! Private Lab scenes that exercise chrome icon dispatch in the real frame renderer.
 
 use std::sync::{Arc, OnceLock};
 
 use aterm_core::render::{BandIcon, ChromeIcon, ChromeRaster, RenderInput};
 use aterm_core::terminal::RenderCell;
-#[cfg(debug_assertions)]
-use aterm_vitals::{
-    fixtures::{self, DeckScene},
-    model::Snapshot,
-};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Scene {
     BandIcons,
-    /// One of the merged deck's scenes: each reading is the scene's ([`deck_reading`]) and the
-    /// deck's front tab is the scene window's (`stats_deck::deck_fixtures::DeckContext`).
-    #[cfg(debug_assertions)]
-    Deck(DeckScene),
-}
-
-impl Scene {
-    /// The scene `name` selects: `band-icons`, or `deck-` and a deck scene's name.
-    fn named(name: &str) -> Option<Self> {
-        if name == "band-icons" {
-            return Some(Self::BandIcons);
-        }
-        #[cfg(debug_assertions)]
-        if let Some(deck) = name.strip_prefix("deck-") {
-            return DeckScene::ALL
-                .into_iter()
-                .find(|scene| scene.name() == deck)
-                .map(Self::Deck);
-        }
-        None
-    }
 }
 
 /// The shipped app never reads this seam. A private Lab instance selects a scene once.
 fn configured() -> Option<Scene> {
     static SCENE: OnceLock<Option<Scene>> = OnceLock::new();
     *SCENE.get_or_init(|| {
-        let named = aterm_types::dev_seam!("ATERM_DEBUG_SCENE")?;
-        let scene = named.to_str().and_then(Scene::named);
-        if scene.is_none() {
-            aterm_log::warn!(
-                "ATERM_DEBUG_SCENE={} names no scene this build has",
-                named.to_string_lossy()
-            );
-        }
-        scene
+        aterm_types::dev_seam!("ATERM_DEBUG_SCENE")
+            .as_deref()
+            .and_then(|s| s.to_str())
+            .filter(|s| *s == "band-icons")
+            .map(|_| Scene::BandIcons)
     })
-}
-
-/// The deck scene the seam selects, if it selects one.
-#[cfg(debug_assertions)]
-pub(crate) fn deck() -> Option<DeckScene> {
-    match configured()? {
-        Scene::Deck(scene) => Some(scene),
-        Scene::BandIcons => None,
-    }
-}
-
-/// The reading `live` as `scene` has it: the scene's snapshot ([`fixtures::snapshot`]) under
-/// `live`'s sequence number, so each reading is a new one and the deck's repaint path runs at
-/// the readings' cadence. The scene keeps its own clock (`at_unix_ms`, `at_ns`), since its runs,
-/// rings and free history end there and at the machine's clock would read as empty. `live`
-/// itself when no scene is selected.
-#[cfg(debug_assertions)]
-pub(crate) fn deck_reading(scene: Option<DeckScene>, live: Arc<Snapshot>) -> Arc<Snapshot> {
-    match scene {
-        Some(scene) => Arc::new(Snapshot {
-            seq: live.seq,
-            ..fixtures::snapshot(scene)
-        }),
-        None => live,
-    }
 }
 
 pub(crate) fn apply(input: &mut RenderInput) {
@@ -175,29 +117,6 @@ fn paint(scene: Option<Scene>, input: &mut RenderInput) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A seam value selects a scene only by its exact name; any other selects none.
-    #[test]
-    fn a_seam_value_names_a_scene_or_none() {
-        assert_eq!(Scene::named("band-icons"), Some(Scene::BandIcons));
-        for scene in DeckScene::ALL {
-            assert_eq!(
-                Scene::named(&format!("deck-{}", scene.name())),
-                Some(Scene::Deck(scene))
-            );
-        }
-        for other in [
-            "",
-            "deck",
-            "deck-",
-            "deck-hot",
-            "Deck-busy",
-            "busy",
-            "band-icons ",
-        ] {
-            assert_eq!(Scene::named(other), None, "{other:?}");
-        }
-    }
 
     #[test]
     fn only_the_selected_scene_replaces_cells_and_supplies_procedural_marks() {

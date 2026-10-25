@@ -832,7 +832,7 @@ impl App {
         };
         let moved = self.windows.get(&wid).is_some_and(|ws| {
             self.carried_deck_of(wid, ws.head_pts, ws.scale, (rows, cols), carried.height)
-                .is_some_and(|was| was.keeps_frame(self.deck_style(), ws.deck_form))
+                .is_some_and(|was| was.keeps_frame(ws.deck_form))
         });
         let cells = self.win_cell_size(wid);
         if let Some(kept) = kept_carried_frame(exact, carried, cells, (rows, cols), moved, |px| {
@@ -853,9 +853,9 @@ impl App {
     }
 
     /// Re-grid window `wid`'s tabs once to its attach frame `size` where that frame holds
-    /// another grid than the window's: the other deck style sized it, or v2 sized it in the form
-    /// it no longer takes ([`Self::attach_frame_px`] keeps it), so the deck's head moved under
-    /// it. Booked `site=deck`.
+    /// another grid than the window's: the Deck sized it in the form it no longer takes
+    /// ([`Self::attach_frame_px`] keeps it), so the deck's head moved under it. Booked
+    /// `site=deck`.
     pub(crate) fn regrid_to_attach_frame(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
         let Some((rows, cols)) = self.windows.get(&wid).map(|ws| (ws.rows, ws.cols)) else {
             return;
@@ -868,33 +868,16 @@ impl App {
         }
     }
 
-    /// Window `wid`'s head at its attach for a `head_pts` titlebar band at `scale`: the form
-    /// is the one the carried frame was sized in, of either deck style
-    /// ([`crate::stats_deck::carried_deck`]), else the one a window of the live style opens
-    /// in ([`crate::stats_deck::DeckStyle::room_form`]), then decided for the frame.
-    pub(crate) fn attach_deck_head(
-        &mut self,
-        wid: WindowId,
-        head_pts: f64,
-        scale: f64,
-        (rows, cols): (u16, u16),
-        carried: Option<PhysicalSize<u32>>,
-    ) -> usize {
-        let form = carried
-            .and_then(|c| self.carried_deck_of(wid, head_pts, scale, (rows, cols), c.height))
-            .map_or(self.deck_style().room_form(), |was| was.form);
+    /// Window `wid`'s head at its attach for a `head_pts` titlebar band at `scale`, in the form
+    /// the size setting gives ([`crate::stats_plan::deck_form_for`]), whatever form sized a
+    /// carried frame: [`Self::attach_frame_px`] keeps a frame the Deck sized in the other form,
+    /// and [`Self::regrid_to_attach_frame`] re-grids to it.
+    pub(crate) fn attach_deck_head(&mut self, wid: WindowId, head_pts: f64, scale: f64) -> usize {
+        let form = crate::stats_plan::deck_form_for(self.deck_size_pref());
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.deck_form = form;
         }
-        let frame_h = match carried {
-            None => {
-                let head = self.deck_head_px(wid, head_pts, scale, 0);
-                self.backend.set_head(head);
-                self.window_frame_px_for(wid, rows, cols).height
-            }
-            Some(carried) => carried.height,
-        };
-        let head = self.deck_head_px(wid, head_pts, scale, frame_h);
+        let head = self.deck_head_px(wid, head_pts, scale, 0);
         self.backend.set_head(head);
         head
     }
@@ -1079,41 +1062,19 @@ impl App {
                     let height = crate::visible_frame_height(raw_height, pad, pad_top);
                     PhysicalSize::new(width as u32, height as u32)
                 };
-                let (bars, style) = (self.stats_bars_form(), self.deck_style());
-                let start = style.room_form();
-                let head_in = |style, form| {
-                    band + crate::stats_deck::deck_px(bars, style, form, scale, cell_h)
-                };
+                let bars = self.stats_bars_form();
+                let head_in = |form| band + crate::stats_deck::deck_px(bars, form, scale, cell_h);
                 let carried = self.windows.get(&wid).and_then(|ws| ws.carried_inner_px);
-                let carried_h = carried.map(|c| c.height);
-                let was = carried_h.and_then(|h| {
-                    crate::stats_deck::carried_deck(h, cell_h, style, head_in, |head| {
+                let was = carried.and_then(|c| {
+                    crate::stats_deck::carried_deck(c.height, cell_h, head_in, |head| {
                         frame(head).height
                     })
                 });
-                let (prev, frame_h) = match carried_h {
-                    Some(h) => (was.map_or(start, |was| was.form), h),
-                    None => (start, frame(head_in(style, start)).height),
-                };
-                let chrome = self.chrome_rows(wid);
-                let rows_under = |head: usize| {
-                    let rows = crate::asymmetric_pad_cells(
-                        (frame_h as usize).saturating_sub(head),
-                        pad_top,
-                        pad,
-                        cell_h,
-                    );
-                    u16::try_from(rows)
-                        .unwrap_or(u16::MAX)
-                        .saturating_sub(chrome)
-                        .max(1)
-                };
-                let room =
-                    crate::stats_deck::deck_room(style, bars, band, scale, cell_h, rows_under);
-                let deck = crate::stats_plan::deck_form_for(room, prev, self.deck_size_pref());
+                let deck = crate::stats_plan::deck_form_for(self.deck_size_pref());
                 // Sized as `attach_frame_px` sizes it, so the window shown is the one attached.
-                let head = head_in(style, deck);
-                let moved = was.is_some_and(|was| was.keeps_frame(style, deck));
+                let head = head_in(deck);
+                let moved = was.is_some_and(|was| was.keeps_frame(deck));
+                let chrome = self.chrome_rows(wid);
                 let grid_of = |px: PhysicalSize<u32>| {
                     let cols = aterm_render::pad_split(px.width as usize, pad, cell_w).cells;
                     let rows = crate::asymmetric_pad_cells(
@@ -1223,7 +1184,7 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.metrics = crate::MetricsView::applied(self.font_px, pad, pad_top, ws.metrics.head);
         }
-        let head = self.attach_deck_head(wid, head_pts, scale, (rows, cols), carried);
+        let head = self.attach_deck_head(wid, head_pts, scale);
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.metrics = crate::MetricsView::applied(self.font_px, pad, pad_top, head);
         }

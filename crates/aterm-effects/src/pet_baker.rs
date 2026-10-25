@@ -352,7 +352,7 @@ impl PetBakeKey {
     /// Resolve this key's ramp indices and local palette into bake fills (floats appear only past this point).
     #[inline]
     #[must_use]
-    pub fn fills(&self) -> ResolvedFills {
+    pub const fn fills(&self) -> ResolvedFills {
         ResolvedFills::from_context(self.coat, self.iris, self.colors)
     }
 

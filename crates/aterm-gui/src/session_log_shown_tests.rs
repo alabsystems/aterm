@@ -22,6 +22,7 @@ fn need(word: NeedWord) -> Option<Need> {
         key: 1,
         what: String::new(),
         harness: None,
+        report: None,
     })
 }
 

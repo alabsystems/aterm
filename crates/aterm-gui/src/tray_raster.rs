@@ -838,6 +838,8 @@ struct ChromeFonts {
     semantic_ready_epoch: u64,
     semantic_prewarm_ms: Option<u64>,
     measures: MeasureMemo,
+    /// The glyphs rasters drew, kept for the next ([`GlyphMemo`]).
+    glyphs: GlyphMemo,
 }
 
 #[derive(Default)]
@@ -1063,6 +1065,23 @@ fn note_whole_walk() {
     WHOLE_WALKS.with(|walks| walks.set(walks.get() + 1));
 }
 
+#[cfg(test)]
+thread_local! {
+    static GLYPH_RASTERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The glyphs this thread has rasterized so far, not found kept (test-only): a raster's glyph
+/// work is the difference across it.
+#[cfg(test)]
+pub(crate) fn glyph_rasters() -> u64 {
+    GLYPH_RASTERS.with(std::cell::Cell::get)
+}
+
+fn note_glyph_raster() {
+    #[cfg(test)]
+    GLYPH_RASTERS.with(|rasters| rasters.set(rasters.get() + 1));
+}
+
 fn default_chrome_fonts() -> ChromeFonts {
     ChromeFonts {
         primary: None,
@@ -1087,6 +1106,7 @@ fn default_chrome_fonts() -> ChromeFonts {
         semantic_ready_epoch: 0,
         semantic_prewarm_ms: None,
         measures: MeasureMemo::default(),
+        glyphs: GlyphMemo::default(),
     }
 }
 
@@ -1350,6 +1370,29 @@ fn install_chrome_faces_locked(
     fonts.semantic_displaced = None;
     fonts.semantic_ready_epoch = fonts.semantic_ready_epoch.wrapping_add(1);
     fonts.semantic_prewarm_ms = None;
+    fonts.glyphs = GlyphMemo::default();
+}
+
+/// Drop the glyphs rasters keep for the next ([`GlyphMemo`]), as a window's scale change and a
+/// theme change do. Neither could make a kept glyph draw stale, as its key names its size in device
+/// px and its bitmap is coverage alone: the drop frees what the old scale drew, and starts the
+/// memo again with the chrome a new theme redraws.
+pub(crate) fn forget_kept_glyphs() {
+    lock_fonts().glyphs = GlyphMemo::default();
+}
+
+/// How many glyphs rasters keep for the next on this test thread ([`GlyphMemo`]).
+#[cfg(test)]
+pub(crate) fn kept_glyphs() -> usize {
+    lock_fonts().glyphs.len()
+}
+
+/// Test-only: turn every kept glyph's coverage over, the stale glyph a test of the memo must see.
+#[cfg(test)]
+pub(crate) fn spoil_kept_glyphs_for_test() {
+    for kept in lock_fonts().glyphs.glyphs.values_mut() {
+        kept.bitmap = kept.bitmap.iter().map(|coverage| !coverage).collect();
+    }
 }
 
 /// Test-only: install `renderer` as this test thread's settled semantic chrome font.
@@ -3030,8 +3073,104 @@ fn linear_to_srgb_u8(l: f32) -> u8 {
     encoded as u8
 }
 
+/// What a glyph's bitmap is a function of: the address of the face that rasterized it (0 for the
+/// pen's own designs, [`synthesized`]), its size in device px (so the scale factor is in it), the
+/// char, and the pen's quarter-pixel phase ([`pen_phase`]). A face is one family at one weight,
+/// immutable once parsed. The bitmap is coverage alone: ink, ground and the contrast correction
+/// are applied as it is drawn ([`Canvas::blend_glyph_texel`]), so none of them is in the key.
 type GlyphCacheKey = (usize, u32, char, u8);
-type GlyphCacheEntry = (ChromeMetrics, std::sync::Arc<[u8]>);
+
+/// The glyphs [`Canvas::raster_glyph_at`] rasterized, kept from one raster to the next in
+/// [`ChromeFonts::glyphs`] ([`rasterize_tray_on_canvas`]): a reading of the CPU close-up or the
+/// Deck draws the glyphs the reading before it drew. A font install drops them, and so do a
+/// window's scale change and a theme change ([`forget_kept_glyphs`]).
+#[derive(Default)]
+struct GlyphMemo {
+    glyphs: aterm_hash::KeyedHashMap<GlyphCacheKey, KeptGlyph>,
+    /// Every face a key names by its address, held, so no other face is allocated at that address
+    /// while the key stands.
+    faces: Vec<Arc<ChromeFont>>,
+    /// The kept bitmaps' bytes.
+    bytes: usize,
+    /// The raster drawing now ([`Self::begin`]), whose glyphs [`Self::trim`] keeps.
+    raster: u64,
+}
+
+struct KeptGlyph {
+    metrics: ChromeMetrics,
+    bitmap: Arc<[u8]>,
+    /// The last raster that drew it.
+    raster: u64,
+}
+
+/// The most glyphs [`GlyphMemo`] keeps past a raster: a few surfaces' text at two scales.
+const GLYPH_MEMO_ENTRIES: usize = 4096;
+/// The most bitmap bytes [`GlyphMemo`] keeps past a raster.
+const GLYPH_MEMO_BYTES: usize = 4 * 1024 * 1024;
+
+impl GlyphMemo {
+    fn get(&mut self, key: &GlyphCacheKey) -> Option<(ChromeMetrics, Arc<[u8]>)> {
+        let kept = self.glyphs.get_mut(key)?;
+        kept.raster = self.raster;
+        Some((kept.metrics, Arc::clone(&kept.bitmap)))
+    }
+
+    /// Keep `bitmap` under `key`, holding `face`, the face whose address the key names.
+    fn keep(
+        &mut self,
+        face: Option<&Arc<ChromeFont>>,
+        key: GlyphCacheKey,
+        metrics: ChromeMetrics,
+        bitmap: &Arc<[u8]>,
+    ) {
+        if let Some(face) = face
+            && !self.faces.iter().any(|held| Arc::ptr_eq(held, face))
+        {
+            self.faces.push(Arc::clone(face));
+        }
+        self.bytes = self.bytes.saturating_add(bitmap.len());
+        let kept = KeptGlyph {
+            metrics,
+            bitmap: Arc::clone(bitmap),
+            raster: self.raster,
+        };
+        if let Some(was) = self.glyphs.insert(key, kept) {
+            self.bytes = self.bytes.saturating_sub(was.bitmap.len());
+        }
+    }
+
+    const fn begin(&mut self) {
+        self.raster = self.raster.wrapping_add(1);
+    }
+
+    /// Past its bounds, keep only the glyphs the raster that just ended drew, and the faces their
+    /// keys name; a raster that alone draws past them leaves nothing kept.
+    fn trim(&mut self) {
+        if self.glyphs.len() <= GLYPH_MEMO_ENTRIES && self.bytes <= GLYPH_MEMO_BYTES {
+            return;
+        }
+        let raster = self.raster;
+        self.glyphs.retain(|_, kept| kept.raster == raster);
+        self.bytes = self.glyphs.values().map(|kept| kept.bitmap.len()).sum();
+        if self.glyphs.len() > GLYPH_MEMO_ENTRIES || self.bytes > GLYPH_MEMO_BYTES {
+            *self = Self {
+                raster,
+                ..Self::default()
+            };
+            return;
+        }
+        let glyphs = &self.glyphs;
+        self.faces.retain(|face| {
+            let at = Arc::as_ptr(face) as usize;
+            glyphs.keys().any(|&(address, ..)| address == at)
+        });
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.glyphs.len()
+    }
+}
 
 #[derive(Default)]
 struct RimMemo {
@@ -3062,7 +3201,7 @@ struct Canvas {
     w: u32,
     h: u32,
     px: Vec<u8>,
-    glyphs: std::collections::HashMap<GlyphCacheKey, GlyphCacheEntry>,
+    glyphs: GlyphMemo,
     clip: Vec<(i32, i32, i32, i32)>,
     glyph_remap: (u32, u32, [f32; 256]),
     fade: Vec<FadeLayer>,
@@ -3121,7 +3260,7 @@ impl Canvas {
             w,
             h,
             px,
-            glyphs: std::collections::HashMap::new(),
+            glyphs: GlyphMemo::default(),
             clip: Vec::new(),
             glyph_remap: (u32::MAX, u32::MAX, [f32::NAN; 256]),
             fade: Vec::new(),
@@ -3162,37 +3301,32 @@ impl Canvas {
 
     fn raster_glyph(
         &mut self,
-        font: &ChromeFont,
+        font: &Arc<ChromeFont>,
         character: char,
         px: f32,
-    ) -> (ChromeMetrics, std::sync::Arc<[u8]>) {
+    ) -> (ChromeMetrics, Arc<[u8]>) {
         self.raster_glyph_at(font, character, px, 0)
     }
 
     fn raster_glyph_at(
         &mut self,
-        font: &ChromeFont,
+        font: &Arc<ChromeFont>,
         character: char,
         px: f32,
         phase: u8,
-    ) -> (ChromeMetrics, std::sync::Arc<[u8]>) {
-        let key = (
-            font as *const ChromeFont as usize,
-            px.to_bits(),
-            character,
-            phase,
-        );
-        if let Some((metrics, bitmap)) = self.glyphs.get(&key) {
-            return (*metrics, std::sync::Arc::clone(bitmap));
+    ) -> (ChromeMetrics, Arc<[u8]>) {
+        let key = (Arc::as_ptr(font) as usize, px.to_bits(), character, phase);
+        if let Some(kept) = self.glyphs.get(&key) {
+            return kept;
         }
+        note_glyph_raster();
         let (metrics, bitmap) = if phase == 0 {
             font.char_raster(character, px)
         } else {
             font.char_raster_at(character, px, f32::from(phase) / PEN_PHASES)
         };
-        let bitmap: std::sync::Arc<[u8]> = bitmap.into();
-        self.glyphs
-            .insert(key, (metrics, std::sync::Arc::clone(&bitmap)));
+        let bitmap: Arc<[u8]> = bitmap.into();
+        self.glyphs.keep(Some(font), key, metrics, &bitmap);
         (metrics, bitmap)
     }
 
@@ -3200,15 +3334,15 @@ impl Canvas {
         &mut self,
         character: char,
         px: f32,
-    ) -> Option<(ChromeMetrics, std::sync::Arc<[u8]>)> {
+    ) -> Option<(ChromeMetrics, Arc<[u8]>)> {
         let key = (0, px.to_bits(), character, 0);
-        if let Some((metrics, bitmap)) = self.glyphs.get(&key) {
-            return Some((*metrics, std::sync::Arc::clone(bitmap)));
+        if let Some(kept) = self.glyphs.get(&key) {
+            return Some(kept);
         }
+        note_glyph_raster();
         let (metrics, bitmap) = synthesized::rasterize(character, px)?;
-        let bitmap: std::sync::Arc<[u8]> = bitmap.into();
-        self.glyphs
-            .insert(key, (metrics, std::sync::Arc::clone(&bitmap)));
+        let bitmap: Arc<[u8]> = bitmap.into();
+        self.glyphs.keep(None, key, metrics, &bitmap);
         Some((metrics, bitmap))
     }
 
@@ -4111,7 +4245,7 @@ impl Canvas {
         let mut pen = x;
         let mut prev_ui: Option<char> = None;
         for ch in s.chars() {
-            if let Some(font) = ui.as_deref().filter(|font| font.maps(ch)) {
+            if let Some(font) = ui.as_ref().filter(|font| font.maps(ch)) {
                 if let Some(previous) = prev_ui {
                     pen += font.char_kern(previous, ch, px).unwrap_or(0.0);
                 }
@@ -4182,7 +4316,7 @@ impl Canvas {
 
     fn pen_glyph(
         &mut self,
-        font: &ChromeFont,
+        font: &Arc<ChromeFont>,
         ch: char,
         px: f32,
         pen: f32,
@@ -4530,7 +4664,7 @@ pub(crate) fn composite_rgba_surface(
         w: destination_width,
         h: destination_height,
         px: std::mem::take(destination),
-        glyphs: std::collections::HashMap::new(),
+        glyphs: GlyphMemo::default(),
         clip: Vec::new(),
         glyph_remap: (u32::MAX, u32::MAX, [f32::NAN; 256]),
         fade: Vec::new(),
@@ -4595,6 +4729,8 @@ pub(crate) fn rasterize_tray_region(
 
 fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> Vec<u8> {
     let mut fonts = lock_fonts();
+    cv.glyphs = std::mem::take(&mut fonts.glyphs);
+    cv.glyphs.begin();
     let mut frames: Vec<(usize, Rc<aterm_render::Frame>)> = Vec::new();
     match occluding_specimen(prims, scale, &cv, &mut frames) {
         Some((cover, covered)) => {
@@ -4657,6 +4793,8 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
     while !cv.fade.is_empty() {
         cv.pop_fade();
     }
+    fonts.glyphs = std::mem::take(&mut cv.glyphs);
+    fonts.glyphs.trim();
     cv.px
 }
 
@@ -7705,11 +7843,13 @@ mod tests {
 
     #[test]
     fn glyph_rasterization_is_memoized_for_one_retained_surface() {
-        let font = ChromeFont::from_bytes(
-            aterm_render::embedded_font(),
-            aterm_render::font::FontSettings::default(),
-        )
-        .expect("embedded font parses");
+        let font = Arc::new(
+            ChromeFont::from_bytes(
+                aterm_render::embedded_font(),
+                aterm_render::font::FontSettings::default(),
+            )
+            .expect("embedded font parses"),
+        );
         let mut canvas = Canvas::new(1, 1, [0, 0, 0, 0]);
 
         let (first_metrics, first) = canvas.raster_glyph(&font, 'A', 13.0);
@@ -7718,6 +7858,348 @@ mod tests {
         assert_eq!(first_metrics, second_metrics);
         assert!(std::sync::Arc::ptr_eq(&first, &second));
         assert_eq!(canvas.glyphs.len(), 1);
+    }
+
+    /// Text in each face the pen draws (the UI face and its semibold, the mono face and its bold,
+    /// a char only the pen designs), half of it over a panel of the other ground, in `ink` over
+    /// `ground`: each face draws the same words at one size from one pen, so a key that missed
+    /// the face would draw one face's glyph for another's, and the same words again at sizes and
+    /// quarter-pixel pens of their own.
+    fn memo_prims(ink: [u8; 4], ground: [u8; 4], other: [u8; 4]) -> Vec<DrawPrim> {
+        let text = |x: f32, baseline: f32, s: &str, px: f32, weight, face| DrawPrim::Text {
+            x,
+            baseline,
+            s: s.to_string(),
+            px,
+            color: ink,
+            weight,
+            face,
+        };
+        let mut prims = vec![
+            DrawPrim::Panel {
+                x: 0.0,
+                y: 0.0,
+                w: 240.0,
+                h: 72.0,
+                radius: 0.0,
+                fill: ground,
+            },
+            DrawPrim::Panel {
+                x: 120.0,
+                y: 0.0,
+                w: 120.0,
+                h: 72.0,
+                radius: 6.0,
+                fill: other,
+            },
+        ];
+        let faces = [
+            (TextWeight::Regular, TextFace::Ui),
+            (TextWeight::Bold, TextFace::UiBold),
+            (TextWeight::Regular, TextFace::Mono),
+            (TextWeight::Bold, TextFace::Mono),
+        ];
+        for (row, (weight, face)) in faces.into_iter().enumerate() {
+            let (baseline, step) = (14.0 + 16.0 * row as f32, row as f32);
+            prims.push(text(
+                4.25,
+                baseline,
+                "load 11.3 \u{00b7} \u{2235} mds",
+                11.0,
+                weight,
+                face,
+            ));
+            prims.push(text(
+                130.75 - 0.25 * step,
+                baseline,
+                "Why now \u{2139} 0.42 \u{23f8}",
+                12.0 + step,
+                weight,
+                face,
+            ));
+        }
+        prims
+    }
+
+    const DARK_INK: [u8; 4] = [0xE6, 0xE8, 0xEB, 0xFF];
+    const LIGHT_INK: [u8; 4] = [0x24, 0x29, 0x2F, 0xFF];
+    const DARK_GROUND: [u8; 4] = [0x1E, 0x1E, 0x1E, 0xFF];
+    const LIGHT_GROUND: [u8; 4] = [0xF5, 0xF5, 0xF5, 0xFF];
+
+    fn memo_raster(ink: [u8; 4], ground: [u8; 4], other: [u8; 4], scale: f32) -> Vec<u8> {
+        rasterize_tray(
+            &memo_prims(ink, ground, other),
+            240,
+            72,
+            scale,
+            [0, 0, 0, 0],
+        )
+        .0
+    }
+
+    /// What [`memo_raster`] draws with no glyph kept from another prim: each prim drawn over the
+    /// bytes the ones before it drew ([`rasterize_tray_over`]), from no kept glyph.
+    fn fresh_raster(ink: [u8; 4], ground: [u8; 4], other: [u8; 4], scale: f32) -> Vec<u8> {
+        let (w, h) = ((240.0 * scale) as u32, (72.0 * scale) as u32);
+        let mut bytes = vec![0; (w * h * 4) as usize];
+        for prim in memo_prims(ink, ground, other) {
+            forget_kept_glyphs();
+            bytes = rasterize_tray_over(&[prim], scale, bytes, w, h);
+        }
+        forget_kept_glyphs();
+        bytes
+    }
+
+    #[test]
+    fn a_raster_over_kept_glyphs_is_the_raster_a_fresh_canvas_draws() {
+        prepare_ui_fonts_for_direct_view_test();
+        let fresh_dark = fresh_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0);
+        let fresh_light = fresh_raster(LIGHT_INK, LIGHT_GROUND, DARK_GROUND, 2.0);
+        let fresh_small = fresh_raster(LIGHT_INK, LIGHT_GROUND, DARK_GROUND, 1.0);
+        assert!(fresh_dark != fresh_light, "the two inks draw apart");
+
+        assert!(
+            memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0) == fresh_dark,
+            "the glyphs a raster keeps for itself draw as fresh ones"
+        );
+        let kept = kept_glyphs();
+        assert!(kept > 40, "the first raster keeps its glyphs ({kept})");
+        let rasters = glyph_rasters();
+        assert!(
+            memo_raster(LIGHT_INK, LIGHT_GROUND, DARK_GROUND, 2.0) == fresh_light,
+            "the other ink over the other grounds, every glyph a kept one"
+        );
+        assert_eq!(glyph_rasters(), rasters, "no glyph was rasterized again");
+        assert_eq!(kept_glyphs(), kept);
+        assert!(
+            memo_raster(LIGHT_INK, LIGHT_GROUND, DARK_GROUND, 1.0) == fresh_small,
+            "the scale-2 glyphs kept, at scale 1"
+        );
+        assert!(glyph_rasters() > rasters, "scale 1 rasterizes its own");
+        assert!(
+            memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0) == fresh_dark,
+            "both scales kept"
+        );
+
+        // Negative control: a kept glyph is what a raster draws, so a spoiled one shows.
+        spoil_kept_glyphs_for_test();
+        assert!(
+            memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0) != fresh_dark,
+            "a spoiled kept glyph changes the bytes"
+        );
+        forget_kept_glyphs();
+        assert!(memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0) == fresh_dark);
+    }
+
+    #[test]
+    fn a_font_install_drops_the_kept_glyphs() {
+        prepare_ui_fonts_for_direct_view_test();
+        let fresh = fresh_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0);
+        memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0);
+        let kept = kept_glyphs();
+        assert!(kept > 0);
+        // Negative control: another raster, and another ink, keep them.
+        memo_raster(LIGHT_INK, LIGHT_GROUND, DARK_GROUND, 2.0);
+        assert_eq!(kept_glyphs(), kept, "a raster keeps what the last kept");
+
+        set_chrome_fonts(None, None, None);
+        assert_eq!(kept_glyphs(), 0, "a font install drops them");
+        assert!(memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0) == fresh);
+    }
+
+    #[test]
+    fn the_kept_glyphs_hold_their_faces_and_keep_within_their_bounds() {
+        prepare_ui_fonts_for_direct_view_test();
+        forget_kept_glyphs();
+        memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0);
+        let held: Vec<usize> = lock_fonts()
+            .glyphs
+            .faces
+            .iter()
+            .map(|face| Arc::as_ptr(face) as usize)
+            .collect();
+        let named: std::collections::BTreeSet<usize> = lock_fonts()
+            .glyphs
+            .glyphs
+            .keys()
+            .map(|&(address, ..)| address)
+            .filter(|&address| address != 0)
+            .collect();
+        assert!(named.len() >= 3, "the UI, its semibold and a mono face");
+        assert!(
+            named.iter().all(|address| held.contains(address)),
+            "each face a key names is held"
+        );
+
+        // One raster that alone draws past the bounds leaves nothing kept.
+        let letters: String = ('a'..='z').collect();
+        let sizes = |n: u16| -> Vec<DrawPrim> {
+            (0..n)
+                .map(|step| DrawPrim::Text {
+                    x: 0.25 * f32::from(step % 4),
+                    baseline: 30.0,
+                    s: letters.clone(),
+                    px: 8.0 + f32::from(step) / 8.0,
+                    color: DARK_INK,
+                    weight: TextWeight::Regular,
+                    face: TextFace::Ui,
+                })
+                .collect()
+        };
+        rasterize_tray(&sizes(200), 600, 40, 1.0, [0, 0, 0, 255]);
+        assert_eq!(kept_glyphs(), 0, "5200 glyphs in one raster keep none");
+
+        // Past the bounds, only the last raster's glyphs are kept, and only their faces.
+        rasterize_tray(&sizes(157), 600, 40, 1.0, [0, 0, 0, 255]);
+        let alone = kept_glyphs();
+        assert!(alone <= GLYPH_MEMO_ENTRIES && lock_fonts().glyphs.bytes <= GLYPH_MEMO_BYTES);
+        forget_kept_glyphs();
+        memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0);
+        let before = kept_glyphs();
+        assert!(before + alone > GLYPH_MEMO_ENTRIES, "{before} + {alone}");
+        rasterize_tray(&sizes(157), 600, 40, 1.0, [0, 0, 0, 255]);
+        assert_eq!(kept_glyphs(), alone, "the last raster's glyphs alone");
+        assert_eq!(lock_fonts().glyphs.faces.len(), 1, "the UI face alone");
+        // Negative control: within the bounds a raster keeps what the one before it kept.
+        forget_kept_glyphs();
+        memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0);
+        rasterize_tray(&sizes(10), 600, 40, 1.0, [0, 0, 0, 255]);
+        assert_eq!(kept_glyphs(), before + 260);
+    }
+
+    /// The kept glyphs' bitmap bytes by their size in device px and their char, each kept once;
+    /// the memo's byte count is their sum.
+    fn kept_bytes_by_glyph() -> HashMap<(u32, char), usize> {
+        let fonts = lock_fonts();
+        let mut by_glyph = HashMap::new();
+        for (&(_, px, ch, _), kept) in fonts.glyphs.glyphs.iter() {
+            let once = by_glyph.insert((px, ch), kept.bitmap.len()).is_none();
+            assert!(once, "{ch:?} at {} px kept once", f32::from_bits(px));
+        }
+        assert_eq!(
+            fonts.glyphs.bytes,
+            by_glyph.values().sum::<usize>(),
+            "the memo counts its kept bitmaps' bytes"
+        );
+        by_glyph
+    }
+
+    #[test]
+    fn the_kept_glyphs_keep_within_their_byte_bound() {
+        prepare_ui_fonts_for_direct_view_test();
+        // Display text at 2×: two lines of 52 letters, each line's bitmaps under the byte bound and
+        // the two past it, 104 glyphs against the bound's 4096.
+        let letters: Vec<char> = ('A'..='Z').chain('a'..='z').collect();
+        let line = |px: f32, n: usize| DrawPrim::Text {
+            x: 0.0,
+            baseline: px,
+            s: letters[..n].iter().collect(),
+            px,
+            color: DARK_INK,
+            weight: TextWeight::Regular,
+            face: TextFace::Ui,
+        };
+        let raster = |prims: &[DrawPrim]| {
+            rasterize_tray(prims, 64, 64, 2.0, [0, 0, 0, 255]);
+        };
+        let (first, second) = (200.0_f32, 210.0_f32);
+        let second_px = (second * 2.0).to_bits();
+        forget_kept_glyphs();
+        raster(&[line(first, 52)]);
+        let first_bytes: usize = kept_bytes_by_glyph().values().sum();
+        assert_eq!(kept_glyphs(), 52);
+        forget_kept_glyphs();
+        raster(&[line(second, 52)]);
+        let second_kept = kept_bytes_by_glyph();
+        let second_bytes: usize = second_kept.values().sum();
+        assert_eq!(second_kept.len(), 52);
+        forget_kept_glyphs();
+        assert!(
+            first_bytes < GLYPH_MEMO_BYTES
+                && second_bytes < GLYPH_MEMO_BYTES
+                && first_bytes + second_bytes > GLYPH_MEMO_BYTES,
+            "{first_bytes} + {second_bytes}"
+        );
+
+        // One raster that alone draws past the byte bound leaves nothing kept.
+        raster(&[line(first, 52), line(second, 52)]);
+        assert_eq!(
+            kept_glyphs(),
+            0,
+            "104 glyphs past the byte bound in one raster keep none"
+        );
+        assert!(kept_bytes_by_glyph().is_empty() && lock_fonts().glyphs.faces.is_empty());
+
+        // Negative control: just under the bound a raster keeps what the one before it kept. The
+        // second line's longest run of letters that fits beside the first line, then one more.
+        let glyph_bytes = |at: usize| second_kept[&(second_px, letters[at])];
+        let (mut fit, mut under) = (0, first_bytes);
+        while under + glyph_bytes(fit) <= GLYPH_MEMO_BYTES {
+            under += glyph_bytes(fit);
+            fit += 1;
+        }
+        assert!(fit > 0, "{first_bytes} leaves room for a glyph");
+        raster(&[line(first, 52)]);
+        raster(&[line(second, fit)]);
+        assert_eq!(
+            kept_glyphs(),
+            52 + fit,
+            "{under} bytes keep both rasters' glyphs"
+        );
+        assert_eq!(kept_bytes_by_glyph().values().sum::<usize>(), under);
+
+        // One glyph past the bound, only the last raster's glyphs are kept, and only their face.
+        raster(&[line(second, fit + 1)]);
+        let past = kept_bytes_by_glyph();
+        assert_eq!(past.len(), fit + 1, "the last raster's glyphs alone");
+        assert!(
+            (0..=fit).all(|at| past.get(&(second_px, letters[at])) == Some(&glyph_bytes(at))),
+            "every one of them, none of the first raster's"
+        );
+        assert_eq!(lock_fonts().glyphs.faces.len(), 1, "the UI face alone");
+        forget_kept_glyphs();
+    }
+
+    #[test]
+    fn a_scale_change_drops_the_kept_glyphs() {
+        let mut app = crate::App::headless_for_test();
+        let window = crate::WindowId(0);
+        if let Some(ws) = app.windows.get_mut(&window) {
+            ws.scale = 2.0;
+        }
+        memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0);
+        let kept = kept_glyphs();
+        assert!(kept > 0);
+        // Negative control: the scale it had is no change.
+        app.on_scale_factor_changed(window, 2.0);
+        assert_eq!(kept_glyphs(), kept, "the same scale keeps them");
+
+        app.on_scale_factor_changed(window, 1.0);
+        assert_eq!(kept_glyphs(), 0, "a new scale drops them");
+    }
+
+    #[test]
+    fn a_theme_change_drops_the_kept_glyphs() {
+        use crate::app_colorscheme::ThemeChange;
+        let mut app = crate::App::headless_for_test();
+        app.install_resolved_colors(ThemeChange::ConfigReload);
+        memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0);
+        let kept = kept_glyphs();
+        assert!(kept > 0);
+        // Negative control: installing the theme in force again is no change.
+        app.install_resolved_colors(ThemeChange::ConfigReload);
+        assert_eq!(kept_glyphs(), kept, "the theme in force keeps them");
+
+        app.publish_theme_chrome();
+        assert_eq!(kept_glyphs(), 0, "the chrome's new theme drops them");
+        memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0);
+        assert!(kept_glyphs() > 0);
+        app.config = aterm_toml::from_str("theme = \"Nord\"\n").expect("valid toml");
+        assert!(
+            app.install_resolved_colors(ThemeChange::ConfigReload)
+                .theme_changed
+        );
+        assert_eq!(kept_glyphs(), 0, "a new theme drops them");
     }
 
     #[test]
@@ -8765,7 +9247,7 @@ mod tests {
         }
     }
 
-    /// The top deck draws its need pictograms through [`DrawPrim::BandIcon`]: at 1x and 2x, at an origin off the pixel grid, each inks only the prim's square and draws.
+    /// A need pictogram drawn through [`DrawPrim::BandIcon`] at 1x and 2x, at an origin off the pixel grid, inks only the prim's square and draws.
     #[test]
     fn a_pictogram_prim_inks_only_its_square() {
         for scale in [1.0f32, 2.0] {

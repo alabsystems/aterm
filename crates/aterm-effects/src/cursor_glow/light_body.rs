@@ -15,14 +15,14 @@ pub(crate) const BODY_CONTRAST_GUARD: f32 = 0.05;
 /// The darkest a light-ground body may composite, in WCAG relative luminance: the theme's text keeps [`BODY_CONTRAST_BAR`] (plus the guard) over it.
 #[inline]
 #[must_use]
-pub(crate) fn light_body_floor(theme_fg: u32) -> f32 {
+pub(crate) const fn light_body_floor(theme_fg: u32) -> f32 {
     light_floor_at(theme_fg, BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD)
 }
 
 /// The darkest a light-ground mark may composite, in WCAG relative luminance, for `theme_fg` to keep `bar` over it.
 #[inline]
 #[must_use]
-pub(crate) fn light_floor_at(theme_fg: u32, bar: f32) -> f32 {
+pub(crate) const fn light_floor_at(theme_fg: u32, bar: f32) -> f32 {
     bar * (relative_luminance(theme_fg) + 0.05) - 0.05
 }
 
@@ -48,7 +48,7 @@ const fn over_at(bg: u32, ink: u32, a: u8) -> u32 {
 
 /// The opacity `0..=255` at which source-over `ink` on `theme_bg` leaves `theme_fg` `keep` of its contrast on the bare paper, composited as the renderer composites a quad.
 #[must_use]
-pub(crate) fn light_alpha_keeping(ink: u32, theme_fg: u32, theme_bg: u32, keep: f32) -> f32 {
+pub(crate) const fn light_alpha_keeping(ink: u32, theme_fg: u32, theme_bg: u32, keep: f32) -> f32 {
     use crate::color_math::{
         RelativeLuminanceTable, relative_luminance_table, relative_luminance_with,
     };
@@ -78,13 +78,13 @@ pub(crate) fn light_alpha_keeping(ink: u32, theme_fg: u32, theme_bg: u32, keep: 
 
 /// THE LIGHT BODY'S INK: `rgb`'s vivid ink ([`light_ink_bold`], the most chroma one ink weight allows), walked toward white only as far as the body's composite at its strongest opacity `a_max` over `theme_bg` must be lifted for `theme_fg` to keep [`BODY_CONTRAST_BAR`] over it ([`light_body_floor`]).
 #[must_use]
-pub(crate) fn light_body_ink(rgb: u32, theme_fg: u32, theme_bg: u32, a_max: u8) -> u32 {
+pub(crate) const fn light_body_ink(rgb: u32, theme_fg: u32, theme_bg: u32, a_max: u8) -> u32 {
     light_ink_over_floor(rgb, theme_bg, a_max, light_body_floor(theme_fg))
 }
 
 /// [`light_body_ink`]'s solve against any `floor` (a WCAG relative luminance the composite at `a_max` over `theme_bg` keeps): `rgb`'s vivid ink walked toward white only as far as that floor asks, with the same light exception.
 #[must_use]
-pub(crate) fn light_ink_over_floor(rgb: u32, theme_bg: u32, a_max: u8, floor: f32) -> u32 {
+pub(crate) const fn light_ink_over_floor(rgb: u32, theme_bg: u32, a_max: u8, floor: f32) -> u32 {
     ink_over_floor_from(light_ink_bold(rgb & 0x00FF_FFFF), theme_bg, a_max, floor)
 }
 
@@ -97,39 +97,52 @@ pub(crate) fn light_ink_over_floor(rgb: u32, theme_bg: u32, a_max: u8, floor: f3
 /// the floor at their brightest, and greys, take [`light_ink_over_floor`]'s
 /// walk unchanged.
 #[must_use]
-pub(crate) fn light_ink_vivid_over_floor(rgb: u32, theme_bg: u32, a_max: u8, floor: f32) -> u32 {
+pub(crate) const fn light_ink_vivid_over_floor(
+    rgb: u32,
+    theme_bg: u32,
+    a_max: u8,
+    floor: f32,
+) -> u32 {
     use crate::color_math::{relative_luminance_table, relative_luminance_with, rgb2hsv};
     let bold = light_ink_bold(rgb & 0x00FF_FFFF);
-    let peak = ((bold >> 16) & 0xff)
-        .max((bold >> 8) & 0xff)
-        .max(bold & 0xff);
+    let r = (bold >> 16) & 0xff;
+    let g = (bold >> 8) & 0xff;
+    let b = bold & 0xff;
+    let peak = if r > g { r } else { g };
+    let peak = if peak > b { peak } else { b };
     let table = relative_luminance_table();
-    let lum = |c: u32| relative_luminance_with(table, over_at(theme_bg, c, a_max));
-    let scaled = |k: f32| {
-        let ch = |sh: u32| ((((bold >> sh) & 0xff) as f32 * k + 0.5).min(255.0) as u32) << sh;
-        ch(16) | ch(8) | ch(0)
-    };
+    #[inline]
+    const fn scaled(bold: u32, k: f32) -> u32 {
+        #[inline]
+        const fn ch(bold: u32, k: f32, sh: u32) -> u32 {
+            ((((bold >> sh) & 0xff) as f32 * k + 0.5).min(255.0) as u32) << sh
+        }
+        ch(bold, k, 16) | ch(bold, k, 8) | ch(bold, k, 0)
+    }
     let top = if peak == 0 { 1.0 } else { 255.0 / peak as f32 };
-    let top_rgb = scaled(top);
+    let top_rgb = scaled(bold, top);
     if a_max == 0
         || rgb2hsv(bold).1 < VIVID_LIFT_CHROMA_MIN
-        || lum(bold) >= floor
-        || lum(top_rgb) < floor
+        || relative_luminance_with(table, over_at(theme_bg, bold, a_max)) >= floor
+        || relative_luminance_with(table, over_at(theme_bg, top_rgb, a_max)) < floor
     {
         return light_ink_over_floor(rgb, theme_bg, a_max, floor);
     }
     let (mut lo, mut hi) = (1.0f32, top);
     let (mut lo_rgb, mut hi_rgb) = (bold, top_rgb);
-    for _ in 0..FRESH_INK_GLYPH_BISECT {
+    let mut i = 0;
+    while i < FRESH_INK_GLYPH_BISECT {
         let mid = 0.5 * (lo + hi);
-        let mid_rgb = scaled(mid);
-        if mid_rgb == hi_rgb || (mid_rgb != lo_rgb && lum(mid_rgb) >= floor) {
+        let mid_rgb = scaled(bold, mid);
+        let mid_lum = relative_luminance_with(table, over_at(theme_bg, mid_rgb, a_max));
+        if mid_rgb == hi_rgb || (mid_rgb != lo_rgb && mid_lum >= floor) {
             hi = mid;
             hi_rgb = mid_rgb;
         } else {
             lo = mid;
             lo_rgb = mid_rgb;
         }
+        i += 1;
     }
     hi_rgb
 }
@@ -142,21 +155,66 @@ const VIVID_LIFT_CHROMA_MIN: f32 = 0.2;
 /// keeps `floor`, else walked toward white only as far as the floor asks,
 /// with the same light exception.
 #[must_use]
-pub(crate) fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floor: f32) -> u32 {
+pub(crate) const fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floor: f32) -> u32 {
     let ink = ink & 0x00FF_FFFF;
     if a_max == 0 {
         return ink;
     }
     let table = crate::color_math::relative_luminance_table();
-    let lum_of =
-        |c: u32| crate::color_math::relative_luminance_with(table, over_at(theme_bg, c, a_max));
-    if lum_of(ink) >= floor {
+    if crate::color_math::relative_luminance_with(table, over_at(theme_bg, ink, a_max)) >= floor {
         return ink;
     }
-    let bisect = |pass: &dyn Fn(u32) -> bool, want_low: bool, mut hi_known: bool| {
+    let (w_bar, bar_rgb) =
+        if crate::color_math::relative_luminance_with(table, over_at(theme_bg, 0x00FF_FFFF, a_max))
+            >= floor
+        {
+            let (mut lo, mut hi) = (0.0f32, 1.0f32);
+            let (mut lo_rgb, mut hi_rgb) = (ink, 0x00FF_FFFF);
+            let mut i = 0;
+            while i < FRESH_INK_GLYPH_BISECT {
+                let mid = 0.5 * (lo + hi);
+                let mid_rgb = toward_white(ink, mid);
+                let matches = if mid_rgb == lo_rgb {
+                    false
+                } else if mid_rgb == hi_rgb {
+                    true
+                } else {
+                    crate::color_math::relative_luminance_with(
+                        table,
+                        over_at(theme_bg, mid_rgb, a_max),
+                    ) >= floor
+                };
+                if matches {
+                    hi = mid;
+                    hi_rgb = mid_rgb;
+                } else {
+                    lo = mid;
+                    lo_rgb = mid_rgb;
+                }
+                if lo_rgb == hi_rgb {
+                    break;
+                }
+                i += 1;
+            }
+            (hi, hi_rgb)
+        } else {
+            (1.0, 0x00FF_FFFF)
+        };
+    let linear = &table.linear;
+    if !crate::rainbow_kitty::ribbon::seen_with(linear, over_at(theme_bg, ink, a_max), theme_bg) {
+        ink
+    } else if crate::rainbow_kitty::ribbon::seen_with(
+        linear,
+        over_at(theme_bg, bar_rgb, a_max),
+        theme_bg,
+    ) {
+        bar_rgb
+    } else {
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
         let (mut lo_rgb, mut hi_rgb) = (ink, 0x00FF_FFFF);
-        for _ in 0..FRESH_INK_GLYPH_BISECT {
+        let mut hi_known = false;
+        let mut i = 0;
+        while i < FRESH_INK_GLYPH_BISECT {
             let mid = 0.5 * (lo + hi);
             let mid_rgb = toward_white(ink, mid);
             let matches = if mid_rgb == lo_rgb {
@@ -164,7 +222,11 @@ pub(crate) fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floor: f32
             } else if hi_known && mid_rgb == hi_rgb {
                 true
             } else {
-                pass(mid_rgb) == want_low
+                !crate::rainbow_kitty::ribbon::seen_with(
+                    linear,
+                    over_at(theme_bg, mid_rgb, a_max),
+                    theme_bg,
+                )
             };
             if matches {
                 hi = mid;
@@ -177,25 +239,9 @@ pub(crate) fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floor: f32
             if lo_rgb == hi_rgb {
                 break;
             }
+            i += 1;
         }
-        if want_low { (hi, hi_rgb) } else { (lo, lo_rgb) }
-    };
-    let (w_bar, bar_rgb) = if lum_of(0x00FF_FFFF) >= floor {
-        bisect(&|c| lum_of(c) >= floor, true, true)
-    } else {
-        (1.0, 0x00FF_FFFF)
-    };
-    let linear = &table.linear;
-    let seen_of = |c: u32| {
-        crate::rainbow_kitty::ribbon::seen_with(linear, over_at(theme_bg, c, a_max), theme_bg)
-    };
-    if !seen_of(ink) {
-        ink
-    } else if seen_of(bar_rgb) {
-        bar_rgb
-    } else {
-        let (w_seen, seen_rgb) = bisect(&seen_of, false, false);
-        if w_bar <= w_seen { bar_rgb } else { seen_rgb }
+        if w_bar <= lo { bar_rgb } else { lo_rgb }
     }
 }
 
@@ -354,14 +400,29 @@ fn soft_ellipse(
         return;
     }
     const STEPS: usize = 24;
-    static U_ROUND: std::sync::OnceLock<[(f32, f32); STEPS + 1]> = std::sync::OnceLock::new();
-    let u_round = U_ROUND.get_or_init(|| {
-        std::array::from_fn(|i| {
+    const U_ROUND: [(f32, f32); STEPS + 1] = {
+        let mut table = [(0.0f32, 0.0f32); STEPS + 1];
+        let mut i = 0;
+        while i <= STEPS {
             let u = i as f32 / STEPS as f32 * 2.0 - 1.0;
-            let round = (1.0 - u * u).max(0.0).sqrt();
-            (u, round)
-        })
-    });
+            let s = (1.0 - u * u).max(0.0) as f64;
+            let round = if s <= 0.0 {
+                0.0
+            } else {
+                let mut r = s;
+                let mut step = 0;
+                while step < 16 {
+                    r = 0.5 * (r + s / r);
+                    step += 1;
+                }
+                r as f32
+            };
+            table[i] = (u, round);
+            i += 1;
+        }
+        table
+    };
+    let u_round = &U_ROUND;
     let mut verts = [RibbonVertex {
         x: 0.0,
         spine: cy,
@@ -442,7 +503,7 @@ impl LightGround {
     /// [`light_body_ink`] on this ground at the body ceiling ([`LIGHT_BODY_ALPHA_CAP`], opaque): the bodies under the letters stack (a crown over a tail over the typing glow), and a stack of one ink composites toward the ink itself, so the ink alone keeps the bar.
     #[inline]
     #[must_use]
-    pub(crate) fn body_ink(self, rgb: u32) -> u32 {
+    pub(crate) const fn body_ink(self, rgb: u32) -> u32 {
         #[cfg(test)]
         if self.unsolved {
             return light_ink_bold(rgb & 0x00FF_FFFF);
@@ -456,7 +517,7 @@ impl LightGround {
     /// asks ([`ink_over_floor_from`]).
     #[inline]
     #[must_use]
-    pub(crate) fn vivid_body_ink(self, rgb: u32) -> u32 {
+    pub(crate) const fn vivid_body_ink(self, rgb: u32) -> u32 {
         ink_over_floor_from(
             rgb,
             self.bg,

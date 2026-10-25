@@ -34,6 +34,8 @@ pub struct Proc {
     pub tty: bool,
     pub uid: u32,
     pub start: u64,
+    /// When it was born on the world's clock, where the reader gives its age.
+    pub born: Option<u64>,
     /// CPU, ns a second.
     pub cpu_per_s: u64,
     /// Reaped children's CPU, ns a second.
@@ -84,6 +86,7 @@ impl Proc {
             tty: false,
             uid: UID,
             start: u64::from(pid) * 1000 + 7,
+            born: None,
             cpu_per_s: 0,
             child_cpu_per_s: 0,
             syscalls_per_s: 0,
@@ -564,6 +567,7 @@ impl World {
             pgid: p.pgid,
             sid: (!zombie).then_some(p.sid),
             start: Some(p.start),
+            age_ms: p.born.map(|b| self.at.saturating_sub(b)),
             uid: Some(p.uid),
             name: p.name.clone(),
             exe: p.exe.clone().filter(|_| !zombie),

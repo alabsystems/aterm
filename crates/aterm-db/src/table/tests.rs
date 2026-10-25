@@ -16,13 +16,16 @@ use std::{path::PathBuf, time::Duration};
 
 const NETWORK: [u8; 16] = [9; 16];
 
-struct Lab {
-    _home: aterm_tempfile::TempDir,
-    paths: Vec<Paths>,
+pub(crate) struct Lab {
+    pub(crate) _home: aterm_tempfile::TempDir,
+    pub(crate) paths: Vec<Paths>,
     source: PathBuf,
 }
 impl Lab {
-    fn new(roles: &[Role]) -> Self {
+    pub(crate) fn new(roles: &[Role]) -> Self {
+        Self::with_enrolled(roles, roles.len())
+    }
+    pub(crate) fn with_enrolled(roles: &[Role], enrolled: usize) -> Self {
         let home = aterm_tempfile::tempdir().unwrap();
         let source = home.path().join("test.vault");
         let paths: Vec<_> = (0..roles.len())
@@ -47,6 +50,7 @@ impl Lab {
             .iter()
             .zip(roles)
             .enumerate()
+            .take(enrolled)
             .map(|(n, (path, role))| {
                 let device = Device::open(path).unwrap().unwrap();
                 let request = device
@@ -96,10 +100,42 @@ impl Lab {
             source,
         }
     }
-    fn bootstrap(&self, n: usize) -> Bootstrap {
+    pub(crate) fn bootstrap(&self, n: usize) -> Bootstrap {
         Bootstrap::cached(&self.paths[n]).unwrap().unwrap()
     }
-    fn rotate(&self, roles: &[Role]) {
+    pub(crate) fn admit(&self, roles: &[Role]) {
+        let admin = client::admin_open(&self.paths[0]).unwrap();
+        let bootstraps: Vec<_> = (0..self.paths.len()).map(|n| self.bootstrap(n)).collect();
+        let mut journal =
+            Journal::open_existing(bootstraps[0].journal_dir(), bootstraps[0].trust()).unwrap();
+        let grants = roles
+            .iter()
+            .enumerate()
+            .map(|(n, role)| {
+                let device = Device::open(&self.paths[n]).unwrap().unwrap();
+                let request = bootstraps[n].request().unwrap();
+                let (mut pending, challenge) =
+                    Pending::issue(&request, NETWORK, *request.binding().authority()).unwrap();
+                let possession = pending
+                    .verify(&device.answer(&request, &challenge).unwrap())
+                    .unwrap();
+                let certificate = admin
+                    .approve_commons_member(&journal, &format!("m{}", n + 1), possession)
+                    .unwrap();
+                Grant::certified(format!("m{}", n + 1), certificate, *role)
+            })
+            .collect();
+        let node = admin.prepare_commons_rotation(&journal, grants).unwrap();
+        journal.ingest(node.bytes()).unwrap();
+        drop(journal);
+        for b in bootstraps.iter().skip(1) {
+            Journal::open_existing(b.journal_dir(), b.trust())
+                .unwrap()
+                .ingest(node.bytes())
+                .unwrap();
+        }
+    }
+    pub(crate) fn rotate(&self, roles: &[Role]) {
         let admin = client::admin_open(&self.paths[0]).unwrap();
         let bootstraps: Vec<_> = (0..self.paths.len()).map(|n| self.bootstrap(n)).collect();
         let mut journal =
@@ -207,7 +243,7 @@ fn readers_can_authenticate_but_cannot_write_even_with_a_copied_header() {
     );
 }
 
-fn resign(bootstrap: &Bootstrap, wire: &mut [u8]) {
+pub(crate) fn resign(bootstrap: &Bootstrap, wire: &mut [u8]) {
     let end = wire.len() - 64;
     let signature = bootstrap
         .device()
@@ -413,4 +449,138 @@ fn signed_envelope_conforms_and_reader_forgery_mutant_is_detected() {
     forged.insert("accepted", 1);
     assert!(!model.successors("ForgedReader", &initial).contains(&forged));
     assert!(!model.check_invariant("ExactWriterEvidenceOnly", &forged));
+}
+
+mod storage;
+
+#[test]
+fn newly_admitted_machines_replay_durable_tables_and_relay_historical_access_offline() {
+    let lab = Lab::with_enrolled(&[Role::Writer, Role::Reader, Role::Reader], 1);
+    let a = lab.bootstrap(0);
+    let session = Session::open(&a).unwrap();
+    let dir = lab._home.path().join("table-a");
+    let mut original = store::Store::create(&session, &dir).unwrap();
+    let scope = original.scope();
+    let receipt = original
+        .commit_catalog(&session, b"old-account-metadata")
+        .unwrap();
+    let wire = original
+        .wire(&session, &receipt.id)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    let source = *session.authenticate(scope, &wire).unwrap().roster();
+    drop(original);
+    drop(session);
+    lab.admit(&[Role::Writer, Role::Reader]);
+    let b = lab.bootstrap(1);
+    assert!(
+        Session::open(&b)
+            .unwrap()
+            .authenticate(scope, &wire)
+            .is_err()
+    );
+    let journal = Journal::open_existing(a.journal_dir(), a.trust()).unwrap();
+    let access = a.access_in(&journal).unwrap().unwrap();
+    let handoff = a
+        .history_handoff(&journal, &access, source, b.request().unwrap().binding())
+        .unwrap();
+    drop(journal);
+    let journal = Journal::open_existing(b.journal_dir(), b.trust()).unwrap();
+    let access = b.access_in(&journal).unwrap().unwrap();
+    b.import_history(&journal, &access, handoff.bytes())
+        .unwrap();
+    let key = b
+        .historical(&journal, &access, source)
+        .unwrap()
+        .with_key(&journal, |key| *key)
+        .unwrap();
+    b.import_history(&journal, &access, handoff.bytes())
+        .unwrap();
+    drop(journal);
+    let history_dir = b.journal_dir().parent().unwrap().join("history");
+    let entries: Vec<_> = std::fs::read_dir(&history_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let cached = std::fs::read(&entries[0]).unwrap();
+    assert_eq!(cached, handoff.bytes());
+    assert!(!cached.windows(32).any(|w| w == key));
+    let restarted = lab.bootstrap(1);
+    let session = Session::open(&restarted).unwrap();
+    let replica_dir = lab._home.path().join("table-b");
+    let mut replica = store::Store::join(&session, &replica_dir, scope).unwrap();
+    replica.ingest(&session, &wire).unwrap();
+    assert_eq!(
+        replica.catalog(&session).unwrap()[0].payload(),
+        b"old-account-metadata"
+    );
+    drop(replica);
+    drop(session);
+    lab.admit(&[Role::Writer, Role::Reader, Role::Reader]);
+    let c = lab.bootstrap(2);
+    let journal = Journal::open_existing(a.journal_dir(), a.trust()).unwrap();
+    let access = a.access_in(&journal).unwrap().unwrap();
+    let newer = a
+        .history_handoff(&journal, &access, source, b.request().unwrap().binding())
+        .unwrap();
+    let to_self = a
+        .history_handoff(&journal, &access, source, a.request().unwrap().binding())
+        .unwrap();
+    a.import_history(&journal, &access, to_self.bytes())
+        .unwrap();
+    assert!(!a.journal_dir().parent().unwrap().join("history").exists());
+    drop(journal);
+    let journal = Journal::open_existing(b.journal_dir(), b.trust()).unwrap();
+    let access = b.access_in(&journal).unwrap().unwrap();
+    let retained = b.import_history(&journal, &access, newer.bytes()).unwrap();
+    assert_eq!(
+        retained.id(),
+        handoff.id(),
+        "retain earlier usable issuance"
+    );
+    let onward = b
+        .history_handoff(&journal, &access, source, c.request().unwrap().binding())
+        .unwrap();
+    drop(journal);
+    let journal = Journal::open_existing(c.journal_dir(), c.trust()).unwrap();
+    let access = c.access_in(&journal).unwrap().unwrap();
+    c.import_history(&journal, &access, onward.bytes()).unwrap();
+    drop(journal);
+    assert_eq!(
+        Session::open(&c)
+            .unwrap()
+            .authenticate(scope, &wire)
+            .unwrap()
+            .payload(),
+        b"old-account-metadata"
+    );
+    let session = Session::open(&b).unwrap();
+    assert_eq!(
+        store::Store::open(&session, &replica_dir, scope)
+            .unwrap()
+            .catalog(&session)
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(session);
+    // Cache loss/corruption cannot silently infer old roles or obtain an old key.
+    let mut corrupt = cached.clone();
+    *corrupt.last_mut().unwrap() ^= 1;
+    std::fs::write(&entries[0], &corrupt).unwrap();
+    assert!(
+        Session::open(&b)
+            .unwrap()
+            .authenticate(scope, &wire)
+            .is_err()
+    );
+    std::fs::remove_file(&entries[0]).unwrap();
+    assert!(
+        Session::open(&b)
+            .unwrap()
+            .authenticate(scope, &wire)
+            .is_err()
+    );
 }

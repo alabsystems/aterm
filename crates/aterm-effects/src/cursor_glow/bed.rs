@@ -19,7 +19,7 @@ const DARK_BED_LUMA_MAX: f32 = 0.150;
 /// The bed's luminance budget for the theme's ink `ink`.
 #[inline]
 #[must_use]
-pub(crate) fn dark_bed_budget(ink: u32) -> f32 {
+pub(crate) const fn dark_bed_budget(ink: u32) -> f32 {
     let bar =
         (crate::color_math::relative_luminance(ink & 0x00FF_FFFF) + 0.05) / DARK_BED_BAR - 0.05;
     bar.clamp(DARK_BED_LUMA_MIN, DARK_BED_LUMA_MAX)
@@ -27,50 +27,87 @@ pub(crate) fn dark_bed_budget(ink: u32) -> f32 {
 
 /// The bed's ink for the stop `rgb` over the page `bg` under `budget`.
 #[must_use]
-pub(crate) fn dark_bed_ink(rgb: u32, bg: u32, budget: f32, sat: f32) -> u32 {
+pub(crate) const fn dark_bed_ink(rgb: u32, bg: u32, budget: f32, sat: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let rgb = crate::spectrum::spectrum_with_min_saturation(rgb & 0x00FF_FFFF, sat);
-    let ch = |c: u32, sh: u32| (c >> sh) & 0xff;
-    let mx = ch(rgb, 16).max(ch(rgb, 8)).max(ch(rgb, 0));
+    #[inline]
+    const fn ch(c: u32, sh: u32) -> u32 {
+        (c >> sh) & 0xff
+    }
+    let r = ch(rgb, 16);
+    let g = ch(rgb, 8);
+    let b = ch(rgb, 0);
+    let rg = if r > g { r } else { g };
+    let mx = if rg > b { rg } else { b };
     let full = if mx == 0 {
         [0.0; 3]
     } else {
         let k = 255.0 / mx as f32;
-        [16u32, 8, 0].map(|sh| ((ch(rgb, sh) as f32 * k).round() as u32).min(255) as f32)
+        #[inline]
+        const fn scale_ch(c: u32, k: f32) -> f32 {
+            let v = (c as f32 * k + 0.5) as u32;
+            (if v < 255 { v } else { 255 }) as f32
+        }
+        [scale_ch(r, k), scale_ch(g, k), scale_ch(b, k)]
     };
-    let bg_rgb = [16u32, 8, 0].map(|sh| ch(bg, sh) as usize);
-    let pick_rgb = |t: f32| -> [usize; 3] {
-        full.map(|c| {
+    let bg_rgb = [ch(bg, 16) as usize, ch(bg, 8) as usize, ch(bg, 0) as usize];
+    #[inline]
+    const fn pick_rgb(full: [f32; 3], t: f32) -> [usize; 3] {
+        #[inline]
+        const fn pick_c(c: f32, t: f32) -> usize {
             let v = if t <= 0.5 {
                 c * 2.0 * t
             } else {
                 c + (255.0 - c) * (2.0 * t - 1.0)
             };
-            (v as usize).min(255)
-        })
-    };
-    let seen = |ink: [usize; 3]| {
-        crate::color_math::relative_luminance_rgb(
-            table,
-            ink[0].max(bg_rgb[0]),
-            ink[1].max(bg_rgb[1]),
-            ink[2].max(bg_rgb[2]),
-        )
-    };
+            let u = v as usize;
+            if u < 255 { u } else { 255 }
+        }
+        [pick_c(full[0], t), pick_c(full[1], t), pick_c(full[2], t)]
+    }
+    #[inline]
+    const fn seen(
+        table: &crate::color_math::RelativeLuminanceTable,
+        bg_rgb: [usize; 3],
+        ink: [usize; 3],
+    ) -> f32 {
+        let r = if ink[0] > bg_rgb[0] {
+            ink[0]
+        } else {
+            bg_rgb[0]
+        };
+        let g = if ink[1] > bg_rgb[1] {
+            ink[1]
+        } else {
+            bg_rgb[1]
+        };
+        let b = if ink[2] > bg_rgb[2] {
+            ink[2]
+        } else {
+            bg_rgb[2]
+        };
+        crate::color_math::relative_luminance_rgb(table, r, g, b)
+    }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
-    let (mut lo_rgb, mut hi_rgb) = (pick_rgb(0.0), pick_rgb(1.0));
+    let (mut lo_rgb, mut hi_rgb) = (pick_rgb(full, 0.0), pick_rgb(full, 1.0));
     let (mut lo_ok, mut hi_ok) = (false, false);
-    for _ in 0..20 {
-        if lo_rgb == hi_rgb {
+    let mut step = 0;
+    while step < 20 {
+        step += 1;
+        if lo_rgb[0] == hi_rgb[0] && lo_rgb[1] == hi_rgb[1] && lo_rgb[2] == hi_rgb[2] {
             break;
         }
         let mid = 0.5 * (lo + hi);
-        let mid_rgb = pick_rgb(mid);
-        if lo_ok && mid_rgb == lo_rgb {
+        let mid_rgb = pick_rgb(full, mid);
+        if lo_ok && mid_rgb[0] == lo_rgb[0] && mid_rgb[1] == lo_rgb[1] && mid_rgb[2] == lo_rgb[2] {
             lo = mid;
-        } else if hi_ok && mid_rgb == hi_rgb {
+        } else if hi_ok
+            && mid_rgb[0] == hi_rgb[0]
+            && mid_rgb[1] == hi_rgb[1]
+            && mid_rgb[2] == hi_rgb[2]
+        {
             hi = mid;
-        } else if seen(mid_rgb) <= budget {
+        } else if seen(table, bg_rgb, mid_rgb) <= budget {
             lo = mid;
             lo_rgb = mid_rgb;
             lo_ok = true;
@@ -269,7 +306,7 @@ pub(crate) const fn night_rgb(rgb: u32) -> u32 {
 /// `budget` ([`dark_bed_budget`]) dimmed to `dim` of its rise over `page`.
 #[inline]
 #[must_use]
-pub(crate) fn dim_budget(budget: f32, page: u32, dim: f32) -> f32 {
+pub(crate) const fn dim_budget(budget: f32, page: u32, dim: f32) -> f32 {
     let floor = crate::color_math::relative_luminance(page & 0x00FF_FFFF);
     floor + (budget - floor).max(0.0) * dim.clamp(0.0, 1.0)
 }
@@ -581,15 +618,32 @@ pub(crate) fn lay_dark_bed(
                         color: if k < 0.5 { a.color } else { b.color },
                         cov,
                     };
-                    static LAYER_COV: std::sync::OnceLock<[u8; 256]> = std::sync::OnceLock::new();
-                    let lut = LAYER_COV.get_or_init(|| {
-                        std::array::from_fn(|a| {
-                            let a = a as f32 / 255.0;
-                            let layer = 1.0 - (1.0 - a).powf(1.0 / LEAP_LAYERS as f32);
-                            (layer * 255.0).round().clamp(0.0, 255.0) as u8
-                        })
-                    });
-                    let (ca, cb) = (lut[usize::from(a.cov)], lut[usize::from(b.cov)]);
+                    const LAYER_COV: [u8; 256] = {
+                        let mut lut = [0u8; 256];
+                        let mut a_idx = 0usize;
+                        while a_idx < 256 {
+                            let a = a_idx as f32 / 255.0;
+                            let rem = (1.0 - a) as f64;
+                            let root = if rem <= 0.0 {
+                                0.0
+                            } else {
+                                let mut r = 1.0f64;
+                                let mut step = 0;
+                                while step < 20 {
+                                    let r2 = r * r;
+                                    let r5 = r2 * r2 * r;
+                                    r = (5.0 * r + rem / r5) / (LEAP_LAYERS as f64);
+                                    step += 1;
+                                }
+                                r as f32
+                            };
+                            let layer = 1.0 - root;
+                            lut[a_idx] = (layer * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                            a_idx += 1;
+                        }
+                        lut
+                    };
+                    let (ca, cb) = (LAYER_COV[usize::from(a.cov)], LAYER_COV[usize::from(b.cov)]);
                     tube.clear();
                     tube.extend([at(0.0, 0), at(f, ca), at(1.0 - f, cb), at(1.0, 0)]);
                     for k in 0..LEAP_LAYERS {
@@ -948,15 +1002,21 @@ impl CursorGlow {
     }
 
     /// [`dark_bed_ink`] ([`Self::bed_unsolved`]).
-    fn bed_ink(&self, rgb: u32, page: u32, budget: f32, sat: f32) -> u32 {
+    const fn bed_ink(&self, rgb: u32, page: u32, budget: f32, sat: f32) -> u32 {
         if self.bed_unsolved() {
             let rgb = crate::spectrum::spectrum_with_min_saturation(rgb & 0x00FF_FFFF, sat);
-            let mx = ((rgb >> 16) & 0xff)
-                .max((rgb >> 8) & 0xff)
-                .max(rgb & 0xff)
-                .max(1);
-            let up = |sh: u32| ((((rgb >> sh) & 0xff) * 255) / mx).min(255);
-            (up(16) << 16) | (up(8) << 8) | up(0)
+            let r = (rgb >> 16) & 0xff;
+            let g = (rgb >> 8) & 0xff;
+            let b = rgb & 0xff;
+            let rg = if r > g { r } else { g };
+            let rgb_max = if rg > b { rg } else { b };
+            let mx = if rgb_max > 1 { rgb_max } else { 1 };
+            #[inline]
+            const fn up(rgb: u32, mx: u32, sh: u32) -> u32 {
+                let v = (((rgb >> sh) & 0xff) * 255) / mx;
+                if v < 255 { v } else { 255 }
+            }
+            (up(rgb, mx, 16) << 16) | (up(rgb, mx, 8) << 8) | up(rgb, mx, 0)
         } else {
             dark_bed_ink(rgb, page, budget, sat)
         }

@@ -7,10 +7,11 @@ use std::sync::Arc;
 
 use aterm_core::render::{FxArt, FxTexels};
 use aterm_scene::vector::{FIXED_ONE, PathSeg};
-use aterm_scene::{PathTransform, Tile, fill_path_fixed, mix_rgb};
+use aterm_scene::{PathTransform, Tile, fill_path_fixed};
 
 use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, GlyphRole, Layer, Recolor};
 use crate::color_math::{hsv2rgb, relative_luminance, rgb2hsv};
+use crate::effect_util::lerp_rgb as mix_rgb;
 
 /// Structural entry ceiling (§5.5): the LRU never holds more than 32 tiles.
 pub const MAX_SLOTS: usize = 32;
@@ -530,7 +531,7 @@ impl CatColorKey {
     /// Resolve matched-word, neighboring-text, and local-background colors on the cold rescan path.
     #[inline]
     #[must_use]
-    pub fn from_rgb(background: u32, foreground: u32, surrounding: u32) -> Self {
+    pub const fn from_rgb(background: u32, foreground: u32, surrounding: u32) -> Self {
         let harmonized = mix_rgb(foreground, surrounding, 0.35);
         let (h, s, _) = rgb2hsv(harmonized);
         let accent = if s < 0.12 {
@@ -545,7 +546,7 @@ impl CatColorKey {
     /// Like [`Self::from_rgb`], plus one bit of footprint structure that RGB averaging loses.
     #[inline]
     #[must_use]
-    pub fn from_rgb_span(
+    pub const fn from_rgb_span(
         background: u32,
         foreground: u32,
         surrounding: u32,
@@ -553,10 +554,17 @@ impl CatColorKey {
         max_background_band: u8,
     ) -> Self {
         let mut key = Self::from_rgb(background, foreground, surrounding);
-        if (key.background >= 1 || max_background_band.min(3) >= 3)
-            && min_background_band.min(3) <= 1
-            && max_background_band.min(3) >= 2
-        {
+        let min_b = if min_background_band < 3 {
+            min_background_band
+        } else {
+            3
+        };
+        let max_b = if max_background_band < 3 {
+            max_background_band
+        } else {
+            3
+        };
+        if (key.background >= 1 || max_b >= 3) && min_b <= 1 && max_b >= 2 {
             key.background = 4;
         }
         key
@@ -564,7 +572,7 @@ impl CatColorKey {
 
     #[inline]
     #[must_use]
-    pub fn background_band(background: u32) -> u8 {
+    pub const fn background_band(background: u32) -> u8 {
         background_band(background)
     }
 
@@ -576,7 +584,7 @@ impl CatColorKey {
 }
 
 #[inline]
-fn background_band(background: u32) -> u8 {
+const fn background_band(background: u32) -> u8 {
     let l = relative_luminance(background);
     if l < BG_BAND_DARKEST_MAX {
         0
@@ -641,30 +649,58 @@ struct FillsLut {
     coat_eye: [[[CoatEyePair; 2]; CONTEXT_ACCENTS.len()]; COAT_RAMP.len()],
 }
 
-fn fills_lut() -> &'static FillsLut {
-    static LUT: std::sync::OnceLock<FillsLut> = std::sync::OnceLock::new();
-    LUT.get_or_init(|| FillsLut {
-        iris: std::array::from_fn(|iris_idx| {
-            let iris = EYE_RAMP[iris_idx];
-            std::array::from_fn(|accent_idx| rgb(mix_rgb(iris, CONTEXT_ACCENTS[accent_idx], 0.28)))
-        }),
-        outline: std::array::from_fn(|bg_idx| {
+impl FillsLut {
+    const fn build() -> Self {
+        let zero = (0.0f32, 0.0f32, 0.0f32);
+        let mut iris = [[zero; CONTEXT_ACCENTS.len()]; EYE_RAMP.len()];
+        let mut iris_idx = 0;
+        while iris_idx < EYE_RAMP.len() {
+            let iris_stop = EYE_RAMP[iris_idx];
+            let mut accent_idx = 0;
+            while accent_idx < CONTEXT_ACCENTS.len() {
+                iris[iris_idx][accent_idx] =
+                    rgb(mix_rgb(iris_stop, CONTEXT_ACCENTS[accent_idx], 0.28));
+                accent_idx += 1;
+            }
+            iris_idx += 1;
+        }
+
+        let mut outline = [[zero; CONTEXT_ACCENTS.len()]; OUTLINE_BASES.len()];
+        let mut bg_idx = 0;
+        while bg_idx < OUTLINE_BASES.len() {
             let outline_base = OUTLINE_BASES[bg_idx];
-            std::array::from_fn(|accent_idx| {
-                rgb(mix_rgb(outline_base, CONTEXT_ACCENTS[accent_idx], 0.10))
-            })
-        }),
-        underlay: std::array::from_fn(|accent_idx| {
-            rgb(mix_rgb(EYE_INK_PALE, CONTEXT_ACCENTS[accent_idx], 0.10))
-        }),
-        coat_eye: std::array::from_fn(|coat_idx| {
+            let mut accent_idx = 0;
+            while accent_idx < CONTEXT_ACCENTS.len() {
+                outline[bg_idx][accent_idx] =
+                    rgb(mix_rgb(outline_base, CONTEXT_ACCENTS[accent_idx], 0.10));
+                accent_idx += 1;
+            }
+            bg_idx += 1;
+        }
+
+        let mut underlay = [zero; CONTEXT_ACCENTS.len()];
+        let mut accent_idx = 0;
+        while accent_idx < CONTEXT_ACCENTS.len() {
+            underlay[accent_idx] = rgb(mix_rgb(EYE_INK_PALE, CONTEXT_ACCENTS[accent_idx], 0.10));
+            accent_idx += 1;
+        }
+
+        let zero_pair = CoatEyePair {
+            coat: zero,
+            eye_ink: zero,
+        };
+        let mut coat_eye = [[[zero_pair; 2]; CONTEXT_ACCENTS.len()]; COAT_RAMP.len()];
+        let mut coat_idx = 0;
+        while coat_idx < COAT_RAMP.len() {
             let coat_stop = COAT_RAMP[coat_idx];
-            std::array::from_fn(|accent_idx| {
+            let mut accent_idx = 0;
+            while accent_idx < CONTEXT_ACCENTS.len() {
                 let accent = CONTEXT_ACCENTS[accent_idx];
                 let base_coat = rgb(mix_rgb(coat_stop, accent, 0.12));
                 let dark_eye = rgb(mix_rgb(EYE_INK_DARK, accent, 0.06));
                 let pale_eye = rgb(mix_rgb(EYE_INK_PALE, accent, 0.06));
-                std::array::from_fn(|lift| {
+                let mut lift = 0;
+                while lift < 2 {
                     let coat = if lift != 0 {
                         lift_coat_luminance(base_coat, COAT_MIN_LUM_DARK_BG)
                     } else {
@@ -676,18 +712,35 @@ fn fills_lut() -> &'static FillsLut {
                     } else {
                         dark_eye
                     };
-                    CoatEyePair { coat, eye_ink }
-                })
-            })
-        }),
-    })
+                    coat_eye[coat_idx][accent_idx][lift] = CoatEyePair { coat, eye_ink };
+                    lift += 1;
+                }
+                accent_idx += 1;
+            }
+            coat_idx += 1;
+        }
+
+        Self {
+            iris,
+            outline,
+            underlay,
+            coat_eye,
+        }
+    }
+}
+
+static FILLS_LUT: FillsLut = FillsLut::build();
+
+#[inline]
+const fn fills_lut() -> &'static FillsLut {
+    &FILLS_LUT
 }
 
 impl ResolvedFills {
     /// Resolve genome ramp indices into concrete colours (the cache key → fills step).
     #[inline]
     #[must_use]
-    pub fn from_indices(coat: u8, iris: u8, dark_bg: bool) -> Self {
+    pub const fn from_indices(coat: u8, iris: u8, dark_bg: bool) -> Self {
         let colors = CatColorKey {
             accent: 12,
             background: if dark_bg { 0 } else { 3 },
@@ -698,10 +751,22 @@ impl ResolvedFills {
     /// Resolve genome fills through the local palette.
     #[inline]
     #[must_use]
-    pub fn from_context(coat: u8, iris: u8, colors: CatColorKey) -> Self {
-        let accent_idx = usize::from(colors.accent.min(12));
-        let coat_idx = usize::from(coat).min(COAT_RAMP.len() - 1);
-        let iris_idx = usize::from(iris).min(EYE_RAMP.len() - 1);
+    pub const fn from_context(coat: u8, iris: u8, colors: CatColorKey) -> Self {
+        let accent_idx = if colors.accent < 12 {
+            colors.accent as usize
+        } else {
+            12
+        };
+        let coat_idx = if (coat as usize) < COAT_RAMP.len() - 1 {
+            coat as usize
+        } else {
+            COAT_RAMP.len() - 1
+        };
+        let iris_idx = if (iris as usize) < EYE_RAMP.len() - 1 {
+            iris as usize
+        } else {
+            EYE_RAMP.len() - 1
+        };
         let outline_idx = match colors.background {
             1 => 1,
             2 => 2,
@@ -709,7 +774,7 @@ impl ResolvedFills {
             4 => 4,
             _ => 0,
         };
-        let lift = usize::from(matches!(colors.background, 0 | 4));
+        let lift = matches!(colors.background, 0 | 4) as usize;
         let lut = fills_lut();
         let CoatEyePair { coat, eye_ink } = lut.coat_eye[coat_idx][accent_idx][lift];
         Self {
@@ -717,7 +782,11 @@ impl ResolvedFills {
             iris: lut.iris[iris_idx][accent_idx],
             eye_ink,
             outline: lut.outline[outline_idx][accent_idx],
-            outline_underlay: (colors.background == 4).then_some(lut.underlay[accent_idx]),
+            outline_underlay: if colors.background == 4 {
+                Some(lut.underlay[accent_idx])
+            } else {
+                None
+            },
         }
     }
 }
@@ -743,30 +812,34 @@ const fn mix3(a: (f32, f32, f32), b: (f32, f32, f32), t: f32) -> (f32, f32, f32)
     )
 }
 
-fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f32) {
+const fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f32) {
     let table = crate::color_math::relative_luminance_table();
-    let lum_rgb = |rgb: u32| crate::color_math::relative_luminance_with(table, rgb);
     let mut lo_rgb = packed_rgb(coat);
-    if lum_rgb(lo_rgb) >= floor {
+    if crate::color_math::relative_luminance_with(table, lo_rgb) >= floor {
         return coat;
     }
     let (h, s, _v) = rgb2hsv(lo_rgb);
     let pale = rgb(hsv2rgb(h, s * 0.55, 0.78));
     let mut hi_rgb = packed_rgb(pale);
-    if lum_rgb(hi_rgb) <= floor {
+    if crate::color_math::relative_luminance_with(table, hi_rgb) <= floor {
         return pale;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
-    for _ in 0..6 {
+    let mut step = 0;
+    while step < 6 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = packed_rgb(mix3(coat, pale, mid));
-        if mid_rgb == lo_rgb || (mid_rgb != hi_rgb && lum_rgb(mid_rgb) < floor) {
+        if mid_rgb == lo_rgb
+            || (mid_rgb != hi_rgb
+                && crate::color_math::relative_luminance_with(table, mid_rgb) < floor)
+        {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
             hi = mid;
             hi_rgb = mid_rgb;
         }
+        step += 1;
     }
     mix3(coat, pale, hi)
 }
@@ -774,13 +847,19 @@ fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f32) {
 /// `COAT_RAMP[coat]` lifted to [`COAT_MIN_LUM_DARK_BG`] as on the dark background classes, without
 /// the accent nudge (which cancels out of a two-coat comparison).
 #[cfg(test)]
-pub(crate) fn dark_bg_coat_stop(coat: u8) -> (f32, f32, f32) {
-    let stop = rgb(COAT_RAMP[usize::from(coat).min(COAT_RAMP.len() - 1)]);
+pub(crate) const fn dark_bg_coat_stop(coat: u8) -> (f32, f32, f32) {
+    let idx = coat as usize;
+    let stop_idx = if idx < COAT_RAMP.len() - 1 {
+        idx
+    } else {
+        COAT_RAMP.len() - 1
+    };
+    let stop = rgb(COAT_RAMP[stop_idx]);
     lift_coat_luminance(stop, COAT_MIN_LUM_DARK_BG)
 }
 
 #[inline]
-fn contrast_ratio(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+const fn contrast_ratio(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
     let table = crate::color_math::relative_luminance_table();
     let a = crate::color_math::relative_luminance_with(table, packed_rgb(a));
     let b = crate::color_math::relative_luminance_with(table, packed_rgb(b));
@@ -806,13 +885,13 @@ pub const fn resolve_layer(layer: &Layer, fills: &ResolvedFills) -> ((f32, f32, 
 }
 
 #[inline]
-fn resolve_glyph_layer(
+const fn resolve_glyph_layer(
     layer: &Layer,
     fills: &ResolvedFills,
     coat_lum: Option<(&crate::color_math::RelativeLuminanceTable, f32)>,
 ) -> ((f32, f32, f32), f32) {
-    if layer.role == GlyphRole::Eye
-        && layer.recolor == Recolor::Fixed
+    if matches!(layer.role, GlyphRole::Eye)
+        && matches!(layer.recolor, Recolor::Fixed)
         && let Some((table, coat_lum)) = coat_lum
     {
         let eye_lum = crate::color_math::relative_luminance_with(table, layer.fill);
@@ -1401,7 +1480,7 @@ impl BakeKeyV4 {
     /// Resolve this key's ramp indices + local palette into bake fills.
     #[inline]
     #[must_use]
-    pub fn fills(&self) -> ResolvedFills {
+    pub const fn fills(&self) -> ResolvedFills {
         ResolvedFills::from_context(self.coat, self.iris, self.colors)
     }
 

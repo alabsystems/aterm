@@ -1459,7 +1459,7 @@ pub(crate) fn seed_temporal_keyframe(
 ) -> bool {
     let (checkpoint, at) = {
         let engine = term_lock(term);
-        match engine.checkpoint_continuing() {
+        match crate::temporal::keyframe_of(&engine, usize::MAX) {
             Some(checkpoint) => (checkpoint, crate::temporal::SpinePre::take(&engine)),
             None => {
                 aterm_log::warn!(
@@ -1844,6 +1844,7 @@ pub(crate) fn spawn_session(
         bells: Default::default(),
         screen_moves: Default::default(),
         job_feed: Default::default(),
+        box_banner: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),
@@ -1952,10 +1953,6 @@ pub(crate) fn spawn_session(
         );
     }
 
-    if factory.temporal_recording {
-        seed_temporal_keyframe(&term, &temporal, id);
-    }
-
     if let Some(nonce) = shell_nonce {
         let mut t = term_lock(&term);
         if !lost_nonce {
@@ -1967,7 +1964,7 @@ pub(crate) fn spawn_session(
     let reach = session_host_reach();
     match spare {
         Some(s) => crate::spare::wire_spare_taint(&term, &s.link),
-        None => arm_host_reach(&term, reach, factory, proxy, id, window, &ctx.witness),
+        None => arm_host_reach(&term, reach, factory, proxy, id, window, &ctx),
     }
 
     term_lock(&term).apply_policy_engine(aterm_policy::engine::PolicyEngine::new(
@@ -1975,6 +1972,10 @@ pub(crate) fn spawn_session(
     ));
 
     configure_palette_refusal(&term);
+
+    if factory.temporal_recording {
+        seed_temporal_keyframe(&term, &temporal, id);
+    }
 
     match crate::keeper_link::journal_refusal() {
         #[cfg(unix)]
@@ -4717,8 +4718,9 @@ pub(crate) fn arm_host_reach(
     proxy: &dyn WakeTarget,
     id: u64,
     window: WindowId,
-    witness: &Arc<crate::spare::Witness>,
+    ctx: &crate::SessionCtx,
 ) {
+    let witness = &ctx.witness;
     configure_clipboard(term, reach, witness);
     if reach == HostReach::Platform
         && factory
@@ -4728,7 +4730,14 @@ pub(crate) fn arm_host_reach(
     {
         term_lock(term).authorize_clipboard_access(ClipboardAccess::Query);
     }
-    configure_notifications(term, reach, &factory.notify_tx, id, witness);
+    configure_notifications(
+        term,
+        reach,
+        &factory.notify_tx,
+        id,
+        witness,
+        &ctx.box_banner,
+    );
     if factory.allow_kitty_file_transfer {
         configure_kitty_file_transfer(term, reach);
     }
@@ -4814,11 +4823,14 @@ fn configure_notifications(
     notify_tx: &std::sync::mpsc::SyncSender<notify::NotifyMsg>,
     id: u64,
     witness: &Arc<crate::spare::Witness>,
+    banner: &Arc<crate::box_banner::BoxBanner>,
 ) {
     if reach == HostReach::Refused {
         return;
     }
     let mut t = term_lock(term);
+    // One banner per box: codex's own notification for a box the herald told is dropped.
+    t.set_notification_admission(banner.admission());
     let tx = notify_tx.clone();
     let w = Arc::clone(witness);
     t.set_notification_callback(move |body| {
@@ -6975,13 +6987,14 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             .map(|_| crate::temporal::SpinePre::take(&t));
                         #[cfg(unix)]
                         let mut journal_pre = journal.as_ref().map(|j| j.pre(&t));
-                        let (report, reset_bytes) = crate::manual_reset::apply(&mut t);
+                        let clock = aterm_core::terminal::ClockReading::now();
+                        let (report, reset_bytes) = crate::manual_reset::apply(&mut t, clock);
                         emitted += reset_bytes.len();
                         fg_owners.observe(holder, t.program_evidence(), t.take_evidence_asserted());
                         if !reset_bytes.is_empty()
                             && let (Some(tx), Some(pre)) = (&temporal_tx, spine_pre)
                         {
-                            let input = crate::temporal::InputSlice::from(&reset_bytes[..]);
+                            let input = crate::temporal::InputSlice::at(&reset_bytes[..], clock);
                             spine_mark.record(tx, pre, &t, input);
                         }
                         #[cfg(unix)]
@@ -7119,6 +7132,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             let waited = term_busy(&term).then(Instant::now);
                             let mut t = term_lock(&term);
                             crate::metrics::note_parse_hold(parse_hold_wait(waited));
+                            let clock = aterm_core::terminal::ClockReading::now();
                             let card_from = card_rows_wanted.then(|| t.screen_mutations());
                             t.holder_rings();
                             cuts.observe(emitted, &t, &cast_watermark);
@@ -7138,7 +7152,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 );
                                 let orphaned = fg_owners.orphaned_by(e.to, |p| v.gone(p)).is_some();
                                 let run = if orphaned || v.gone(e.from) {
-                                    t.foreground_handback_scoped(orphaned)
+                                    t.foreground_handback_scoped_at(orphaned, clock)
                                 } else {
                                     None
                                 };
@@ -7151,7 +7165,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 if let Some(h) = run {
                                     emitted += h.bytes.len();
                                     if let (Some(tx), Some(pre)) = (&temporal_tx, spine_pre) {
-                                        let input = crate::temporal::InputSlice::from(&h.bytes[..]);
+                                        let input =
+                                            crate::temporal::InputSlice::at(&h.bytes[..], clock);
                                         spine_mark.record(tx, pre, &t, input);
                                     }
                                     #[cfg(unix)]
@@ -7214,7 +7229,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 },
                             );
                             let started_before = t.started_command_seq();
-                            if let Some(unread) = launch.process(&mut t, &bytes[off..end], &person)
+                            if let Some(unread) =
+                                launch.process(&mut t, &bytes[off..end], clock, &person)
                             {
                                 launch_unread = Some(unread);
                             }
@@ -7254,7 +7270,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 && end > off
                             {
                                 let input =
-                                    crate::temporal::InputSlice::new(copy.clone(), off..end);
+                                    crate::temporal::InputSlice::new(copy.clone(), off..end, clock);
                                 spine_mark.record(tx, pre, &t, input);
                             }
                             #[cfg(unix)]
@@ -9386,7 +9402,14 @@ mod host_reach_tests {
                 None,
             )));
             let (tx, notices) = sync_channel(8);
-            configure_notifications(&term, host_reach(mode), &tx, 1, &Arc::default());
+            configure_notifications(
+                &term,
+                host_reach(mode),
+                &tx,
+                1,
+                &Arc::default(),
+                &Arc::default(),
+            );
             term_lock(&term).apply_policy_engine(aterm_policy::engine::PolicyEngine::new(
                 aterm_policy::profiles::standard(),
             ));
@@ -9406,6 +9429,47 @@ mod host_reach_tests {
                 assert_eq!(posted(&term, &notices), NOTICES.len(), "{mode}");
             }
         }
+    }
+
+    /// ONE BANNER PER BOX, WIRED: the session's notification path asks its `BoxBanner`, so a
+    /// program notification written while the `blocked` report the herald told stands posts
+    /// nothing, OSC 9, OSC 99 and OSC 777 alike, and every one passes again once the report
+    /// moves. NEGATIVE CONTROL: the same notifications before the herald told the box post.
+    #[test]
+    fn a_box_the_herald_told_posts_no_program_notification() {
+        const BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\";
+        const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
+        let term = Arc::new(Mutex::new(new_live_terminal(
+            24,
+            80,
+            Some(&notifications_allowed()),
+            None,
+        )));
+        let (tx, notices) = sync_channel(8);
+        let banner = Arc::new(crate::box_banner::BoxBanner::default());
+        configure_notifications(
+            &term,
+            host_reach(Cm::User),
+            &tx,
+            1,
+            &Arc::default(),
+            &banner,
+        );
+        term_lock(&term).process(BLOCKED);
+        assert_eq!(
+            posted(&term, &notices),
+            NOTICES.len(),
+            "CONTROL: nobody told it"
+        );
+        let report = term_lock(&term).program_state().began;
+        banner.herald(report, |_| ((), true));
+        assert_eq!(posted(&term, &notices), 0, "the box the herald told");
+        term_lock(&term).process(WORKING);
+        assert_eq!(
+            posted(&term, &notices),
+            NOTICES.len(),
+            "the box was answered"
+        );
     }
 }
 

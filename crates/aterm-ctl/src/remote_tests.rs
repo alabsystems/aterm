@@ -193,6 +193,37 @@ fn what_never_crosses_the_fleet_is_refused_here() {
 }
 
 #[test]
+fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
+    fn left(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        Err(DriveRefused {
+            left: Some("496e9154e57ae1d4bb20b01cf5d624cf".to_owned()),
+            ..DriveRefused::once("this machine is in no fleet".to_owned())
+        })
+    }
+    let local = LocalVerbs {
+        fleet_drive: Some(left),
+        ..LocalVerbs::NONE
+    };
+    let off = run("lab-mini", &words("hold s-a1 off"), None, &local)
+        .expect_err("no fleet")
+        .to_string();
+    assert_eq!(
+        off,
+        "this machine is in no fleet now, so it reaches lab-mini no more to hand s-a1 back: a \
+         hold it took there before it left stands until that Mac's person takes the tab (Take \
+         Over) or runs `aterm fleet peers rm 496e9154` there; if this machine left a fleet it \
+         joined, `aterm ctl --host lab-mini hold s-a1 off` hands it back once it joins that \
+         fleet again (a fleet it issued went with its leave)"
+    );
+    for other in ["hold s-a1 on", "@s-a1 status"] {
+        let said = run("lab-mini", &words(other), None, &local)
+            .expect_err(other)
+            .to_string();
+        assert_eq!(said, "this machine is in no fleet", "{other}");
+    }
+}
+
+#[test]
 fn an_exchange_is_framed_as_on_one_mac() {
     static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
     fn answer(sent: &str) -> String {

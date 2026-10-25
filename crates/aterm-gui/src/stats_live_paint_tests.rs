@@ -13,7 +13,7 @@ use crate::stats_live::{BEAT_REACH, DOT_R, DOT_RISE, LINE_DX};
 const OPEN: i64 = AT - 7_000;
 
 fn geom_at(w: f64, s: f64, form: DeckForm) -> DeckGeom {
-    let h = deck_px(StatsBars::Deck, DeckStyle::V2, form, s, (14.0 * s) as usize) as f64;
+    let h = deck_px(StatsBars::Deck, form, s, (14.0 * s) as usize) as f64;
     DeckGeom {
         w: (w * s) as f32,
         h: h as f32,

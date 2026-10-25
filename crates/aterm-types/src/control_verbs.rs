@@ -1539,24 +1539,25 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "aos [status|attach|pause|repair|publish|bundle|resume|detach|trace]: glow host \
-         (debug builds)",
-        "— hosts the front window's typing-momentum glow as an Aos task. `aos [status]` answers \
-         `OK window=<id> attached=<bool> code=<name> …` (revision, pause queue, trace cursor, \
-         hot/active/settling flags, `cold_at=`, last wake and boundary counters). `aos attach \
-         [code=<shipped|demo-stranded-settle>]` checkpoints the glow and records keys, resets, \
-         frame ticks and scheduler queries; `aos pause` holds at the step boundary; `aos repair \
-         [code=<name>]` shadow-replays live and candidate code over the trace and swaps the \
-         candidate in only when live matches the paused head and the candidate keeps \
-         `momentum-glow.no-stranded-light` (on a refusal a glow the repair paused resumes on the \
-         old code, and one `aos pause` held stays paused, as for `aos publish`); `aos publish \
-         plan=<24 hex>` judges a 12-byte schedule plan under the pinned acceptance policy and \
-         publishes it at the step boundary (pausing first) only if it is admitted and, over the \
-         shipped code, useful (`useful=`, `gain_ppm=`, `bundle=`); `aos bundle` exports the live \
-         plan's candidate bundle (`bundle=<digest> rev= bytes= hex=`); `aos resume` drops a \
-         pending update; `aos detach` stops hosting; `aos trace` reports the log length, the \
-         trace and checkpoint digests and the broken flag, and `aos trace hex` adds the exported \
-         trace file's bytes.",
+        "aos [status|attach|pause|repair|resume|detach|trace|publish|bundle]: the glow as an Aos task",
+        "— hosts the front window's typing-momentum glow as an Aos task, in every build. `aos \
+         [status]` answers `OK window=<id> attached=<bool> code=<name> …` (revision, pause queue, \
+         trace cursor, hot/active/settling flags, `cold_at=`, last wake and boundary counters). \
+         `aos attach [code=<name>]` checkpoints the glow and records keys, resets, frame ticks and \
+         scheduler queries; `aos pause` holds at the step boundary; `aos repair [code=<name>]` \
+         shadow-replays live and candidate code over the trace from the attach checkpoint and \
+         swaps the candidate in only when live reproduces the paused head and the candidate keeps \
+         `momentum-glow.no-stranded-light`, then delivers the queue (with `code=shipped`, the only \
+         code a release build carries, it verifies and resumes; on a refusal a glow the repair \
+         paused resumes on the old code, and one `aos pause` held stays paused); `aos resume` \
+         drops a pending update; `aos detach` stops hosting; `aos trace` reports the log length, \
+         the trace and checkpoint digests and the broken flag, and `aos trace hex` adds the \
+         exported trace file's bytes. Debug builds only, each answering `ERR aos <form> needs a \
+         debug build` in a release build: `code=demo-stranded-settle`; `aos publish \
+         plan=<24 hex>`, which judges a 12-byte schedule plan under the pinned acceptance policy \
+         and publishes it at the step boundary (pausing first) only if it is admitted and, over \
+         the shipped code, useful (`useful=`, `gain_ppm=`, `bundle=`); and `aos bundle`, which \
+         exports the live plan's candidate bundle (`bundle=<digest> rev= bytes= hex=`).",
     )
     .forms(&[form(AnyOf(&["status", "trace"])).op(Read)])
     .input(Input::NONE),
@@ -1717,11 +1718,15 @@ pub const VERBS: &[VerbSpec] = &[
         "temporal [status|<tick>] [trim]: the screen reconstructed at a past instant",
         "— `<tick>` is µs since the session started (default: the latest recorded instant); a \
          replay needs `temporal_recording = true` (`ERR temporal: this session is not \
-         recording; …`). `temporal status` answers `enabled= latest_tick= \
-         reachable_from=<tick|-> keyframes= live_events= dropped_events= lost_resizes= \
-         dropped_input= dropped_replies= pending_resizes=` (`reachable_from=-`: nothing \
-         replays); a replay at the spine's end adds `pending_resizes=` to its header. `trim` \
-         drops trailing blank rows (`OK <nbytes> trimmed=<k>`).",
+         recording; …`). Each slice replays at the clock reading it was parsed at live. \
+         `temporal status` answers `enabled= latest_tick= reachable_from=<tick|-> keyframes= \
+         live_events= dropped_events= lost_resizes= dropped_input= dropped_replies= \
+         pending_resizes= witnessed= diverged=` (`reachable_from=-`: nothing replays; \
+         `witnessed=`: snapshots of the live screen, taken every 256 KiB of output or 1 s, that \
+         a replay has been checked against, and `diverged=` those it did not equal, after each \
+         of which the recording takes a live keyframe); a replay at the spine's end adds \
+         `pending_resizes=` to its header. `trim` drops trailing blank rows (`OK <nbytes> \
+         trimmed=<k>`).",
     )
     .forms(&[form(Word("status")).framing(Status)]),
     v(
@@ -1859,10 +1864,13 @@ pub const VERBS: &[VerbSpec] = &[
          copy=<managed|foreign|-> upgrade= history_lost= journal=<live|off> (then its \
          `journal_*` fields, and `restore=…` after a crash restore) integration_rev= \
          born=<cold|spare-<tier>> render=<ok|displaced|desync-risk|unverified|unjudged> \
-         resizes= flaps= land_at= task=<open|landed|theirs|-> pause= land_held= land_nudges= land_since= task_state= \
+         resizes= flaps= land_at= task=<open|landed|theirs|-> pause= land_held= land_nudges= land_since= \
+         goal=<pct|-> task_state= \
          task_rev= log_seq= log_ep= run= turn= step= need= need_since_ms= \
          rollout=<ok|missing|stalled|-> rollout_asks= editing= bells= bells_sounded= \
-         last_bell=`, then `gen=<epoch>.<seq> seq= hash=`. `seq=` and `hash=` are `-` on a \
+         last_bell=` (`goal=` is the active goal the agent in front keeps for itself, one line: \
+         Claude Code's `/goal` condition from its transcript; `-` while it has none or keeps \
+         none aterm reads), then `gen=<epoch>.<seq> seq= hash=`. `seq=` and `hash=` are `-` on a \
          contended lock or an unfinished DEC 2026 frame, which `status` never waits for; `gen=` \
          stands. `if-gen=`, `if-human=` and `if-fp=` fence on `gen=`, `human_seq=` and `hash=`.",
     ),
@@ -2448,7 +2456,11 @@ pub const VERBS: &[VerbSpec] = &[
          unavailable: \
          <not-the-hosts-agent|not-relaunchable|not-supervised|driver-lease|driver-turn|halted|start-unread|no-state>` \
          (or `ERR not-stalled`, `ERR bad restart argument: <word>`, `ERR restart failed: <what>`). \
-         Works even when `[harness] relaunch = false`.",
+         Works even when `[harness] relaunch = false`. Restart requires a matching host snapshot \
+         and a validated relaunch route. Codex's `supervisor_proven=1` confirms a direct foreground \
+         claim. `not-the-hosts-agent` means the host lacks a snapshot for this PID and kernel start. \
+         Snapshot-read or resume-line validation failures are recorded in `aterm.log` \
+         (`aterm help update`, LOG).",
     )
     .input(Input::PTY.with(Input::FENCES)),
     v(
@@ -2578,7 +2590,11 @@ pub const VERBS: &[VerbSpec] = &[
          `CloseTab` or `Quit` over a running job (and a multi-tab `Quit` on Windows) parks an \
          in-window confirmation, replying `OK confirm pending \
          kind=<quit|close-window|close-tab|close-pane> window=<n>; …`; `confirm yes|no` answers \
-         it.",
+         it. On macOS a windowed instance's `Quit`, and a close over a running job, raise the \
+         native alert, which only the person at the Mac answers (`confirm` cannot): the call \
+         waits on it (`ERR main-thread reply did not arrive within 30s`) and later calls that \
+         need the main thread reply `ERR aterm is showing a dialog; answer it, then retry`. A \
+         `--headless` instance asks nothing.",
     )
     .input(Input::PTY.with(Input::APP_UNREAD)),
     v(
@@ -3257,18 +3273,21 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         OwnerOnly,
-        "survey [facts|content]: each session's program, state, task, prompt, last words and tool",
-        "— Owner-only and fleet-readable (`[fleet] allow`). Replies `OK <n>`, an `instance pid= \
+        "survey [--json]: each session's program, state, task and latest activity",
+        "— Owner-only and fleet-readable (`[fleet] allow`). The raw control request is \
+         `survey [facts|content]`. It replies `OK <n>`, an `instance pid= \
          host=<pct> version= sessions=<n> level=<facts|content> cut=<n> at_ms=<unix ms> node=<32 \
          hex|-> instances=<n>[ drive=1]` header (`drive=1`: a fleet reader this machine lets \
          drive it), and one `session` row per session: `local= sid= state= \
          program=<pct|-> program_kind=<agent|shell|program|-> agent=<word|-> agent_detail=<pct|-> \
          agent_ms=<ms> human_ms=<ms|-> bg=<n|-> task=<state|-> task_rev=<n> task_from=<pct|-> \
          task_ms=<ms|-> model=<pct|-> effort=<pct|-> ctx_left_pct=<n|-> detail=<pct|-> \
-         doing=<pct|-> role=<pct|-> supervisor=<pct|-> attention=<1|pct|-> needs=<word|-> \
-         hold_by=<word|-> held_from=<32 hex|-> typed_by=<pct|-> typed_ms=<ms|-> bells=<n> \
-         bells_sounded=<n> last_bell=<ms>/<sound>/<program|->[,…]|->`, plus under `content` (the \
-         local default; `attention=` is the excerpt, `needs=ask` selects the ask excerpt and \
+         doing=<pct|-> role=<pct|-> supervisor=<pct|-> attention=<1|pct|-> goal=<1|pct|-> needs=<word|-> \
+         needs_by=<program|-> hold_by=<word|-> held_from=<32 hex|-> typed_by=<pct|-> \
+         typed_ms=<ms|-> bells=<n> bells_sounded=<n> last_bell=<ms>/<sound>/<program|->[,…]|->`, \
+         plus under `content` (the local default; `attention=` and `goal=` are the excerpts \
+         (`goal=` the agent's active goal, as `status` reads it), `needs=ask` selects the ask \
+         excerpt and \
          `by=harness` turns are skipped in `prompt=`): `user_title= title= cwd= branch= prompt= \
          said= cmd= rows=` (<= 400 B per excerpt, credentials/fleet codes redacted, fleet \
          replies capped at 256 KiB; `rows=-` on an unfinished DEC 2026 frame, never waited for). \
@@ -3276,7 +3295,9 @@ pub const VERBS: &[VerbSpec] = &[
          itself in OSC 7501 (`working` is `busy`; `blocked` is `prompt`, `question` or \
          `wall:auth`; at rest, `idle`; nothing said, `unknown`) and, while its proven claim stands \
          (`supervisor=codex-alab@<pid>`), `model= effort= ctx_left_pct= doing= cwd= branch= \
-         prompt= said=` from its rollout. \
+         prompt= said=` from its rollout. `needs_by=program` marks a need raised by the \
+         program's own report (a codex that says it is `blocked` where no claim speaks for the \
+         tab): a claim, never read off its screen. \
          `aterm ctl survey [--fleet] [--budget <chars>]`, `survey [--json] [--sid <s>] [--fleet \
          | --host <h>]` (`--timeout <s>` with `--fleet` or `--host`) and `survey --brief \
          [--budget <chars>]` (`log n` + `brief all`) format multi-instance and fleet digests and \

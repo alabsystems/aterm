@@ -108,6 +108,7 @@ impl Rig {
         let ident = Ident {
             pid: 4242,
             uniq: 77,
+            birth_us: 1_792_000_000_000_000,
             helper_sha256: HELPER.into(),
             live_disk: "/vz/live/aterm-linux.img".into(),
         };
@@ -115,6 +116,7 @@ impl Rig {
             let r = Record {
                 pid: ident.pid,
                 uniq: ident.uniq,
+                birth_us: ident.birth_us,
                 helper_sha256: HELPER.into(),
                 proto: PROTO,
                 live_disk: ident.live_disk.clone(),
@@ -1169,6 +1171,7 @@ fn a_helpers_exit_removes_the_key_disk_and_only_its_own_record_and_socket() {
     let ours = Record {
         pid: 4242,
         uniq: 77,
+        birth_us: 1_792_000_000_000_000,
         helper_sha256: HELPER.into(),
         proto: PROTO,
         live_disk: paths.live_disk(),

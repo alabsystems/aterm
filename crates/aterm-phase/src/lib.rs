@@ -6,6 +6,7 @@
 pub mod agents_panel;
 pub mod agy;
 pub mod anchors;
+pub mod auto_mode;
 pub mod autocompact;
 pub mod codex;
 pub mod credits;

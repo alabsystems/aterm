@@ -1060,3 +1060,156 @@ fn a_renewal_made_under_a_wall_is_followed_at_once() {
         );
     }
 }
+
+#[test]
+fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_failure() {
+    let r = roster();
+    let routes = "profile(none) mailbox(none configured) vault(not a member) \
+                  headless-browser(none installed) hosts(none configured)";
+    let mut logins = Logins::default();
+    let events = note_sign_in_attempt(&mut logins, "work-2", AttemptOutcome::NoRoute, routes, NOW);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        (events[0].kind, events[0].account.as_str()),
+        (Kind::SignIn, "work-2")
+    );
+    assert_eq!(events[0].why, format!("{AUTO_SIGN_IN} no-route: {routes}"));
+    assert!(
+        note_sign_in_attempt(
+            &mut logins,
+            "work-2",
+            AttemptOutcome::NoRoute,
+            routes,
+            NOW + HOUR
+        )
+        .is_empty(),
+        "the same finding is not written again"
+    );
+    assert_eq!(
+        logins.get("work-2").and_then(|b| b.sign_in_attempt.clone()),
+        Some(SignInAttempt {
+            outcome: AttemptOutcome::NoRoute,
+            routes: routes.to_owned(),
+            since: NOW,
+        }),
+        "since when it has been so"
+    );
+    let long = "mailbox(none configured) ".repeat(20);
+    assert_eq!(
+        note_sign_in_attempt(&mut logins, "main", AttemptOutcome::Failed, &long, NOW).len(),
+        1
+    );
+    let bounded = &logins
+        .get("main")
+        .and_then(|b| b.sign_in_attempt.clone())
+        .unwrap();
+    assert!(bounded.routes.len() <= ROUTES_MAX);
+
+    let text = logins.to_json();
+    assert!(text.contains("\"sign_in_attempt\":"), "{text}");
+    assert_eq!(Logins::from_json(&text, NOW), Ok(logins.clone()));
+    let unread = Logins::from_json(
+        &text.replace("\"outcome\":\"no-route\"", "\"outcome\":\"someday\""),
+        NOW,
+    )
+    .expect("an attempt it cannot read is dropped, never the whole file");
+    assert_eq!(unread.get("work-2").unwrap().sign_in_attempt, None);
+    assert_eq!(
+        unread.get("work-2").unwrap().dir,
+        logins.get("work-2").unwrap().dir
+    );
+
+    let mut signed_out = state();
+    note_auth(&mut signed_out, "main", Auth::SignedOut, NOW - HOUR);
+    assert_eq!(
+        failing_sign_ins(&r, &signed_out, &logins, NOW)
+            .into_iter()
+            .map(|(label, attempt)| (label, attempt.outcome))
+            .collect::<Vec<_>>(),
+        [
+            ("main".to_owned(), AttemptOutcome::Failed),
+            ("work-2".to_owned(), AttemptOutcome::NoRoute)
+        ],
+        "a signed-out row and a row never enrolled, in roster order"
+    );
+    assert_eq!(
+        failing_sign_ins(&r, &state(), &logins, NOW)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>(),
+        ["work-2"],
+        "a row whose login works says nothing of an old failure"
+    );
+
+    let mut state = signed_out;
+    note_renewed(
+        &mut state,
+        &mut logins,
+        "main",
+        None,
+        &abs("/s/main.1"),
+        None,
+        NOW + HOUR,
+    );
+    assert_eq!(logins.get("main").unwrap().sign_in_attempt, None);
+    assert_eq!(
+        note_sign_in_attempt(
+            &mut logins,
+            "main",
+            AttemptOutcome::SignedIn,
+            "mailbox",
+            NOW + HOUR
+        )
+        .len(),
+        1
+    );
+    note_renewed(
+        &mut state,
+        &mut logins,
+        "main",
+        None,
+        &abs("/s/main.2"),
+        None,
+        NOW + 2 * HOUR,
+    );
+    assert_eq!(
+        logins
+            .get("main")
+            .and_then(|b| b.sign_in_attempt.as_ref())
+            .map(|a| a.outcome),
+        Some(AttemptOutcome::SignedIn),
+        "the route that made the login stays named"
+    );
+    assert_eq!(
+        failing_sign_ins(&r, &state, &logins, NOW + 2 * HOUR)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>(),
+        ["work-2"]
+    );
+}
+
+#[test]
+fn claude_codes_own_warning_is_read_at_any_percent_until_its_window_ends() {
+    let mut account = Account::default();
+    assert!(!account.warned(NOW));
+    account.warned_week = Some(WindowSaid {
+        pct: Some(80),
+        reset: Some(NOW + DAY),
+        at: NOW - HOUR,
+    });
+    assert!(account.warned(NOW), "a weekly warning at 80%");
+    assert!(!account.low(NOW), "well before the account is low");
+    assert!(!account.warned(NOW + DAY), "its window ended");
+    account.warned_week = None;
+    account.warned_session = Some(WindowSaid {
+        pct: Some(90),
+        reset: None,
+        at: NOW - HOUR,
+    });
+    assert!(account.warned(NOW), "a five-hour warning");
+    assert!(
+        !account.warned(NOW + 4 * HOUR),
+        "five hours after it was read"
+    );
+}

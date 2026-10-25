@@ -68,7 +68,6 @@ pub(super) fn pace(reads: &dyn Reads) -> Pace {
 
 fn marks(reads: &dyn Reads) -> String {
     use aterm_secrets::client::Membership;
-    use aterm_secrets::service::State;
     let mut marks = reads.routes();
     match reads.vault() {
         None => marks.push_str("; no single console account"),
@@ -82,15 +81,20 @@ fn marks(reads: &dyn Reads) -> String {
                 }
                 Err(error) => marks.push_str(&format!("; status: {error}")),
             }
-            let running = vault
-                .subscriber()
-                .map(|state| matches!(state, State::Installed { pid: Some(_), .. }));
+            let running = vault.subscriber().map(subscriber_running);
             marks.push_str(&format!("; subscriber running: {running:?}"));
             marks.push_str(&format!("; runs from: {:?}", vault.fleeting()));
         }
     }
     let digest = aterm_digest::Sha256::digest(marks.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub(super) fn subscriber_running(state: aterm_secrets::service::State) -> bool {
+    matches!(
+        state,
+        aterm_secrets::service::State::Installed { pid: Some(_), .. }
+    )
 }
 
 /// This Mac, now.
@@ -335,6 +339,44 @@ pub(super) fn record(
     }
     .save(root)
 }
+
+/// The page's rows for the Secrets stage's `rows` (design §3.6): the vault's one row, named as the
+/// page names it, in the page's words. A step that failed says what aterm does next, as
+/// [`record`] last left the pause ([`PAGE_RETRIES`], or [`PAGE_HELD`] once two tries failed); one
+/// that could not be confirmed says no more; the rest carry no detail, which the page never shows
+/// for them. The process, the paths and the vault's own words stay in `rows`, for `aterm doctor`
+/// and the log.
+pub(super) fn page(root: &Path, rows: &[Row]) -> super::PassPage {
+    let held = Attempt::load(root).is_some_and(|last| last.held());
+    let mut page = super::PassPage::default();
+    for row in rows {
+        let detail = match row.status.as_str() {
+            "error" if held => PAGE_HELD,
+            "error" => PAGE_RETRIES,
+            _ => "",
+        };
+        let row = Row {
+            name: aterm_types::macos_setup::SECRETS_VAULT_ROW.into(),
+            status: row.status.clone(),
+            detail: detail.into(),
+        };
+        let said = page
+            .rows
+            .iter()
+            .any(|seen| seen.status == row.status && seen.detail == row.detail);
+        if !said {
+            page.rows.push(row);
+        }
+    }
+    page
+}
+
+/// What the page says after a failed Secrets try that aterm tries again on its pause.
+pub(super) const PAGE_RETRIES: &str = "aterm tries again by itself.";
+
+/// What the page says once two tries in a row failed: only a change, or a person, asks again.
+pub(super) const PAGE_HELD: &str = "aterm tried twice, so it tries again once this Mac's network \
+                                    or vault changes, or on Set up now.";
 
 const HELD: &str = "aterm tried this twice by itself and it did not take, so it tries again only when this Mac's network or vault changes, after an update of aterm, or on Set up now or Join in System State";
 

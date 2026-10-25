@@ -9,20 +9,18 @@ use crate::stats_paint::Bar;
 /// Stats deck layout form.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum DeckForm {
-    /// v2: two blocks of four rows in 62 pt. Merged: row A alone.
+    /// Two blocks of four rows in 62 pt.
     #[default]
     Folded,
-    /// v2: header line and seven rows in full height, only where `stats_deck_size` is full.
-    /// Merged: its three rows.
+    /// Header line and seven rows in full height, only where `stats_deck_size` is full.
     Full,
 }
 
 /// Configured `[sys] stats_deck_size` preference.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum DeckSizePref {
-    /// v2: `Folded` whatever the window's height (the owner, 2026-10-24: the Full form had too
-    /// many details). Merged: row A alone under 10 grid rows, its three rows from 11, and at
-    /// 10 the form it had.
+    /// `Folded` whatever the window's height (the owner, 2026-10-24: the Full form had too
+    /// many details).
     #[default]
     Auto,
     /// Always use `Full`.
@@ -67,40 +65,11 @@ impl DeckSizePref {
     }
 }
 
-/// The merged deck keeps row A alone while the grid would hold fewer rows than this under its
-/// three rows (spec §3, "under about 10 terminal rows"), and takes the three rows back at
-/// [`THREE_ROWS_FROM`] or more, so a resize back and forth across one row never flips it.
-const ROW_A_UNDER: u16 = 10;
-const THREE_ROWS_FROM: u16 = 11;
-
-/// What a window has room for, as its deck's style reads it ([`deck_form_for`]).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum DeckRoom {
-    /// v2: nothing; its form never follows the window.
-    Unread,
-    /// Merged: the rows the grid would hold under the three-row deck, whatever the form now,
-    /// so the fold cannot feed back into the decision.
-    Rows(u16),
-}
-
-/// Chooses the [`DeckForm`] for `room` under `pref`; the merged deck's fold keeps `prev` at 10
-/// rows, so it has hysteresis.
-pub(crate) fn deck_form_for(room: DeckRoom, prev: DeckForm, pref: DeckSizePref) -> DeckForm {
+/// The [`DeckForm`] `pref` gives: Full only where chosen, whatever the window's height.
+pub(crate) const fn deck_form_for(pref: DeckSizePref) -> DeckForm {
     match pref {
         DeckSizePref::Full => DeckForm::Full,
-        DeckSizePref::Folded => DeckForm::Folded,
-        DeckSizePref::Auto => {
-            let full = match (room, prev) {
-                (DeckRoom::Unread, _) => false,
-                (DeckRoom::Rows(rows), DeckForm::Folded) => rows >= THREE_ROWS_FROM,
-                (DeckRoom::Rows(rows), DeckForm::Full) => rows >= ROW_A_UNDER,
-            };
-            if full {
-                DeckForm::Full
-            } else {
-                DeckForm::Folded
-            }
-        }
+        DeckSizePref::Auto | DeckSizePref::Folded => DeckForm::Folded,
     }
 }
 
@@ -1920,85 +1889,32 @@ mod tests {
 
     #[test]
     fn deck_height_is_a_function_of_the_window() {
-        use crate::stats_deck::{DeckStyle, StatsBars, deck_px};
+        use crate::stats_deck::{StatsBars, deck_px};
         use DeckForm::{Folded, Full};
-        let _: fn(DeckRoom, DeckForm, DeckSizePref) -> DeckForm = deck_form_for;
-        let _: fn(StatsBars, DeckStyle, DeckForm, f64, usize) -> usize = deck_px;
+        let _: fn(DeckSizePref) -> DeckForm = deck_form_for;
+        let _: fn(StatsBars, DeckForm, f64, usize) -> usize = deck_px;
 
-        // v2 is Folded unless chosen Full, a window Full before included; merged follows rows.
-        for prev in [Folded, Full] {
-            assert_eq!(
-                deck_form_for(DeckRoom::Unread, prev, DeckSizePref::Auto),
-                Folded
-            );
-            for room in [DeckRoom::Unread]
-                .into_iter()
-                .chain([0, 9, 10, 11, 400].map(DeckRoom::Rows))
-            {
-                assert_eq!(deck_form_for(room, prev, DeckSizePref::Full), Full);
-                assert_eq!(deck_form_for(room, prev, DeckSizePref::Folded), Folded);
-            }
-        }
-        assert_eq!(
-            deck_form_for(DeckRoom::Rows(400), Folded, DeckSizePref::Auto),
-            Full,
-            "CONTROL: merged's Automatic still takes its three rows"
-        );
+        // Folded unless chosen Full: the form reads nothing of the window.
+        assert_eq!(deck_form_for(DeckSizePref::Auto), Folded);
+        assert_eq!(deck_form_for(DeckSizePref::Full), Full);
+        assert_eq!(deck_form_for(DeckSizePref::Folded), Folded);
 
         assert_eq!(full_delta_px(2.0, 28), 84);
-        assert_eq!(deck_px(StatsBars::Deck, DeckStyle::V2, Full, 2.0, 28), 208);
+        assert_eq!(deck_px(StatsBars::Deck, Full, 2.0, 28), 208);
         for s in [1.0, 2.0] {
             let folded = (FOLDED_PT * s).round() as usize;
             let table = (FULL_TABLE_PT * s).round() as usize;
             for cell in 10..=40 {
                 let at = format!("{cell} px cells at {s}×");
-                assert_eq!(
-                    deck_px(StatsBars::Deck, DeckStyle::V2, Folded, s, cell),
-                    folded,
-                    "{at}"
-                );
-                let full = deck_px(StatsBars::Deck, DeckStyle::V2, Full, s, cell);
+                assert_eq!(deck_px(StatsBars::Deck, Folded, s, cell), folded, "{at}");
+                let full = deck_px(StatsBars::Deck, Full, s, cell);
                 assert_eq!((full - folded) % cell, 0, "{at}");
                 assert_eq!(full - folded, full_delta_px(s, cell), "{at}");
                 assert!((table..table + cell).contains(&full), "{at}");
                 for bars in [StatsBars::Sill, StatsBars::Off] {
                     for deck in [Folded, Full] {
-                        assert_eq!(
-                            deck_px(bars, DeckStyle::V2, deck, s, cell),
-                            0,
-                            "{bars:?} {at}"
-                        );
+                        assert_eq!(deck_px(bars, deck, s, cell), 0, "{bars:?} {at}");
                     }
-                }
-            }
-        }
-    }
-
-    /// The merged deck folds to row A below 10 grid rows under its three rows and unfolds at
-    /// 11, keeping its form at exactly 10: a resize back and forth across one row never flips it.
-    #[test]
-    fn the_merged_deck_folds_under_ten_rows_and_unfolds_at_eleven() {
-        use DeckForm::{Folded, Full};
-        let rows = [0, 1, 8, 9, 10, 11, 12, 400].map(DeckRoom::Rows);
-        let auto = DeckSizePref::Auto;
-        assert_eq!(
-            rows.map(|r| deck_form_for(r, Full, auto)),
-            [Folded, Folded, Folded, Folded, Full, Full, Full, Full]
-        );
-        assert_eq!(
-            rows.map(|r| deck_form_for(r, Folded, auto)),
-            [Folded, Folded, Folded, Folded, Folded, Full, Full, Full]
-        );
-        for prev in [Folded, Full] {
-            for r in 1..30u16 {
-                for there in [r - 1, r + 1] {
-                    let at = deck_form_for(DeckRoom::Rows(r), prev, auto);
-                    let went = deck_form_for(DeckRoom::Rows(there), at, auto);
-                    let back = deck_form_for(DeckRoom::Rows(r), went, auto);
-                    assert_eq!(
-                        back, went,
-                        "{prev:?} at {r} rows, to {there} and back: a flap"
-                    );
                 }
             }
         }

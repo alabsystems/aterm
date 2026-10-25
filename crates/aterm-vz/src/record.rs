@@ -12,8 +12,12 @@
 //! | `run/key.img` | the boot's key disk (0600), attached read-only; removed when the helper exits |
 //! | `live/aterm-linux.img.lock` | the live disk's `flock`, held for the helper's whole life |
 //!
-//! A record names its helper by pid *and* unique id (`p_uniqueid`, never reused within a
-//! boot), so a reused pid is never taken for the helper and never signalled ([`Holder`]).
+//! A record names its helper by pid, unique id (`p_uniqueid`, never reused within a boot) *and*
+//! kernel start time, so a reused pid is never taken for the helper and never signalled
+//! ([`Holder`], [`is_live`]). The start time carries the name across boots: a record outlives a
+//! restart that killed its helper, and every process a boot makes before its first pid wrap
+//! has a unique id equal to its pid (measured), so pid and unique id alone match whichever
+//! process holds that early pid in the next boot.
 
 use std::path::{Path, PathBuf};
 
@@ -114,6 +118,9 @@ pub struct Record {
     pub pid: u32,
     /// Its unique id, which the kernel never reuses within a boot.
     pub uniq: u64,
+    /// Its kernel start time in microseconds since the Unix epoch ([`Pids::birth_us`]), which
+    /// names it across boots.
+    pub birth_us: u64,
     /// Its executable's content address (`host/<sha256>/`).
     pub helper_sha256: String,
     /// [`crate::proto::PROTO`].
@@ -135,6 +142,7 @@ impl Record {
         let value = aterm_json::json!({
             "pid": self.pid,
             "uniq": self.uniq,
+            "birth_us": self.birth_us,
             "helper_sha256": self.helper_sha256,
             "proto": self.proto,
             "live_disk": self.live_disk.to_string_lossy().into_owned(),
@@ -148,7 +156,8 @@ impl Record {
     }
 
     /// A whole record, or `None`. A record naming pid 0 or 1 is none: no helper has either
-    /// ([`helper_pid`]).
+    /// ([`helper_pid`]). So is one without a start time, which an earlier build wrote: its
+    /// helper is never taken for live or signalled.
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         let v = aterm_json::from_str::<aterm_json::Value>(text).ok()?;
@@ -159,6 +168,7 @@ impl Record {
                 .ok()
                 .filter(|pid| helper_pid(*pid))?,
             uniq: v.get("uniq")?.as_u64()?,
+            birth_us: v.get("birth_us")?.as_u64()?,
             helper_sha256: opt("helper_sha256")?,
             proto: u32::try_from(v.get("proto")?.as_u64()?).ok()?,
             live_disk: PathBuf::from(text_of("live_disk")?),
@@ -191,11 +201,14 @@ pub const fn helper_pid(pid: u32) -> bool {
     pid > 1
 }
 
-/// What a pid's unique id is now, for [`holder`]: the kernel's in the helper's arm, a
-/// script in the tests'.
+/// What a pid's unique id and start time are now, for [`holder`]: the kernel's in the
+/// helper's arm, a script in the tests'.
 pub trait Pids {
     /// `pid`'s unique id, or `None` when no process has it.
     fn uniq(&self, pid: u32) -> Option<u64>;
+    /// `pid`'s kernel start time in microseconds since the Unix epoch, or `None` when no
+    /// process has it or it cannot be read.
+    fn birth_us(&self, pid: u32) -> Option<u64>;
 }
 
 /// This machine's processes (`proc_pidinfo`'s `PROC_PIDUNIQIDENTIFIERINFO`).
@@ -215,6 +228,23 @@ impl Pids for Kernel {
             None
         }
     }
+
+    fn birth_us(&self, pid: u32) -> Option<u64> {
+        let birth = aterm_uds::process::read_process_birth(i32::try_from(pid).ok()?)?;
+        birth
+            .seconds
+            .checked_mul(1_000_000)?
+            .checked_add(birth.microseconds)
+    }
+}
+
+/// Whether `record` names a live helper: its pid ([`helper_pid`]) holds the record's unique id
+/// and start time now, by `pids`.
+#[must_use]
+pub fn is_live(record: &Record, pids: &dyn Pids) -> bool {
+    helper_pid(record.pid)
+        && pids.uniq(record.pid) == Some(record.uniq)
+        && pids.birth_us(record.pid) == Some(record.birth_us)
 }
 
 /// Who a record names.
@@ -222,9 +252,10 @@ impl Pids for Kernel {
 pub enum Holder {
     /// No record.
     None,
-    /// A live helper: its pid's unique id is the record's.
+    /// A live helper: its pid's unique id and start time are the record's ([`is_live`]).
     Live(Record),
-    /// A dead helper: its pid is gone, or now names another process (its unique id differs).
+    /// A dead helper: its pid is gone, or now names another process (its unique id or start
+    /// time differs).
     Dead(Record),
 }
 
@@ -233,7 +264,7 @@ pub enum Holder {
 pub fn holder(paths: &Paths, pids: &dyn Pids) -> Holder {
     match Record::read(&paths.record()) {
         None => Holder::None,
-        Some(r) if pids.uniq(r.pid) == Some(r.uniq) => Holder::Live(r),
+        Some(r) if is_live(&r, pids) => Holder::Live(r),
         Some(r) => Holder::Dead(r),
     }
 }
@@ -250,13 +281,13 @@ pub fn remove_leftovers(paths: &Paths, dead: &Record) {
     }
 }
 
-/// `SIGKILL` the helper `record` names, only after its pid's unique id is read again and is
-/// the record's (§5.1): a reused pid is never signalled. Its XPC VM exits by itself within
-/// half a second (fact 44).
+/// `SIGKILL` the helper `record` names, only after its pid's unique id and start time are read
+/// again and are the record's (§5.1): a reused pid is never signalled, in this boot or a later
+/// one. Its XPC VM exits by itself within half a second (fact 44).
 ///
 /// # Errors
-/// The pid is 0 or 1 ([`helper_pid`]), the unique id differs or the pid is gone (nothing was
-/// sent), or the kernel refused the signal.
+/// The pid is 0 or 1 ([`helper_pid`]), the unique id or start time differs, the start time
+/// cannot be read, or the pid is gone (nothing was sent), or the kernel refused the signal.
 pub fn kill_helper(record: &Record, pids: &dyn Pids) -> Result<(), String> {
     if !helper_pid(record.pid) {
         return Err(format!(
@@ -274,9 +305,25 @@ pub fn kill_helper(record: &Record, pids: &dyn Pids) -> Result<(), String> {
         }
         None => return Err(format!("pid {} is gone: not signalled", record.pid)),
     }
+    match pids.birth_us(record.pid) {
+        Some(birth) if birth == record.birth_us => {}
+        Some(birth) => {
+            return Err(format!(
+                "pid {} is now another process (started {birth} us, the record's {}): not \
+                 signalled",
+                record.pid, record.birth_us
+            ));
+        }
+        None => {
+            return Err(format!(
+                "pid {}'s start cannot be read: not signalled",
+                record.pid
+            ));
+        }
+    }
     let pid = i32::try_from(record.pid).map_err(|_| format!("pid {} past i32", record.pid))?;
     // SAFETY: two integers; one pid, never a group (`helper_pid` held it above 1, and its
-    // unique id was just read again).
+    // unique id and start time were just read again).
     if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
         Ok(())
     } else {
@@ -334,11 +381,31 @@ mod tests {
 
     use super::*;
 
-    struct Script(RefCell<HashMap<u32, u64>>);
+    /// Each scripted pid's unique id; its start time is [`BIRTH`] unless `births` says.
+    struct Script(
+        RefCell<HashMap<u32, u64>>,
+        RefCell<HashMap<u32, Option<u64>>>,
+    );
+
+    const BIRTH: u64 = 1_792_000_000_000_000;
+
+    impl Script {
+        fn of(pids: impl IntoIterator<Item = (u32, u64)>) -> Self {
+            Self(
+                RefCell::new(pids.into_iter().collect()),
+                RefCell::new(HashMap::new()),
+            )
+        }
+    }
 
     impl Pids for Script {
         fn uniq(&self, pid: u32) -> Option<u64> {
             self.0.borrow().get(&pid).copied()
+        }
+
+        fn birth_us(&self, pid: u32) -> Option<u64> {
+            self.uniq(pid)?;
+            self.1.borrow().get(&pid).copied().unwrap_or(Some(BIRTH))
         }
     }
 
@@ -346,6 +413,7 @@ mod tests {
         Record {
             pid,
             uniq,
+            birth_us: BIRTH,
             helper_sha256: "ab".repeat(32),
             proto: crate::proto::PROTO,
             live_disk: "/vz/live/aterm-linux.img".into(),
@@ -371,7 +439,7 @@ mod tests {
         let dir = aterm_tempfile::tempdir().unwrap();
         let paths = Paths::at(dir.path());
         std::fs::create_dir_all(paths.run_dir()).unwrap();
-        let pids = Script(RefCell::new(HashMap::from([(4242, 77)])));
+        let pids = Script::of([(4242, 77)]);
         assert_eq!(holder(&paths, &pids), Holder::None);
         let r = record(4242, 77);
         r.write(&paths.record()).unwrap();
@@ -409,7 +477,7 @@ mod tests {
         // The pid is this test's own: a signal would end the test, so reaching the end shows
         // none was sent.
         let me = std::process::id();
-        let pids = Script(RefCell::new(HashMap::from([(me, 2)])));
+        let pids = Script::of([(me, 2)]);
         let why = kill_helper(&record(me, 1), &pids).expect_err("refused");
         assert!(
             why.contains("another process") && why.contains("not signalled"),
@@ -418,6 +486,68 @@ mod tests {
         pids.0.borrow_mut().clear();
         let why = kill_helper(&record(me, 1), &pids).expect_err("gone");
         assert!(why.contains("gone"), "{why}");
+    }
+
+    /// A record from an earlier boot: its pid and unique id match a process of this boot (every
+    /// process a boot makes before its first pid wrap has a unique id equal to its pid), and
+    /// only the start time tells them apart. That process is no helper and is never signalled.
+    /// Negative control: judged by unique id alone, it reads live.
+    #[test]
+    fn a_record_from_an_earlier_boot_names_no_live_helper_and_nothing_is_signalled() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path());
+        std::fs::create_dir_all(paths.run_dir()).unwrap();
+        // The pid is this test's own: a signal would end the test.
+        let me = std::process::id();
+        let earlier = record(me, u64::from(me));
+        earlier.write(&paths.record()).unwrap();
+        let pids = Script::of([(me, u64::from(me))]);
+        assert_eq!(
+            holder(&paths, &pids),
+            Holder::Live(earlier.clone()),
+            "the same start"
+        );
+        pids.1
+            .borrow_mut()
+            .insert(me, Some(BIRTH + 4 * 86_400_000_000));
+        assert_eq!(
+            holder(&paths, &pids),
+            Holder::Dead(earlier.clone()),
+            "a later start"
+        );
+        assert!(!is_live(&earlier, &pids));
+        let why = kill_helper(&earlier, &pids).expect_err("another process");
+        assert!(
+            why.contains("another process") && why.contains("not signalled"),
+            "{why}"
+        );
+        pids.1.borrow_mut().insert(me, None);
+        assert_eq!(
+            holder(&paths, &pids),
+            Holder::Dead(earlier.clone()),
+            "start unread"
+        );
+        let why = kill_helper(&earlier, &pids).expect_err("unread");
+        assert!(
+            why.contains("cannot be read") && why.contains("not signalled"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_record_without_a_start_time_is_no_record() {
+        let mut v = aterm_json::from_str::<aterm_json::Value>(&record(4242, 77).json()).unwrap();
+        v.as_object_mut().unwrap().remove("birth_us");
+        assert_eq!(Record::parse(&aterm_json::to_string(&v).unwrap()), None);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_kernel_reads_this_process_s_start_time() {
+        let me = std::process::id();
+        let birth = Kernel.birth_us(me).expect("this process's start");
+        assert!(birth > 1_700_000_000_000_000, "{birth}");
+        assert_eq!(Kernel.birth_us(me), Some(birth), "stable");
     }
 
     #[test]
@@ -434,7 +564,7 @@ mod tests {
         assert_eq!(Record::parse(&record(2, 2).json()), Some(record(2, 2)));
         // A record built in code naming pid 1 with its unique id is refused before any kill
         // (were it sent, launchd would refuse it: EPERM, other words).
-        let pids = Script(RefCell::new(HashMap::from([(1, 1)])));
+        let pids = Script::of([(1, 1)]);
         let why = kill_helper(&record(1, 1), &pids).expect_err("refused");
         assert_eq!(why, "pid 1 is never a helper's: not signalled");
     }

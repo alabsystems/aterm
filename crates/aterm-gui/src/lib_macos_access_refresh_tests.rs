@@ -1980,10 +1980,7 @@ fn the_debugger_step_waits_for_a_fresh_reading_of_the_rule() {
     let gate = app.config.privacy_probe_gate();
     app.look_for_debugger_moment(later(&mut t), page_away);
     assert_eq!(workers(), 0);
-    assert!(
-        !app.consent.debugger_in_flight_for_test(),
-        "a wait starts no probe"
-    );
+    assert!(!app.consent.debugger_in_flight(), "a wait starts no probe");
     assert!(
         app.consent
             .debugger_cached(gate)
@@ -2009,7 +2006,7 @@ fn the_debugger_step_waits_for_a_fresh_reading_of_the_rule() {
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
         "the debugger probe the look dispatched ends",
-        || (!app.consent.debugger_in_flight_for_test()).then_some(()),
+        || (!app.consent.debugger_in_flight()).then_some(()),
     );
     debugger_reads_off(&mut app);
     two_looks(&mut app, &mut t);
@@ -2479,7 +2476,7 @@ fn read_again_lands(app: &mut App) -> Instant {
     use crate::debugger_access::ASK_PROBE_FRESH;
     let gate = app.config.privacy_probe_gate();
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the rule read again", || {
-        if app.consent.debugger_in_flight_for_test() {
+        if app.consent.debugger_in_flight() {
             return None;
         }
         let landed = app.consent.debugger_cached(gate).is_some_and(|row| {
@@ -3025,6 +3022,241 @@ fn a_persons_turn_on_starts_the_change_with_no_alert() {
         "no plan admitted"
     );
     assert_eq!(workers(), 1);
+}
+
+/// System State's page, its Debugger row standing as `standing` in the setup worker's reading.
+fn page_reads_debugger(app: &mut App, standing: aterm_types::macos_setup::Standing) {
+    use aterm_types::macos_setup::{Access, Observation, Plan, Selection, Subject};
+    let subject = Subject::Access(Access::Debugger);
+    app.publish_system_state(crate::SetupStatus {
+        observed_vault_url: Some(Plan::default().vault_url),
+        plan: Some(Plan::from(Selection::all())),
+        observed: vec![Observation {
+            subject,
+            standing,
+            now: None,
+            after_login: None,
+            wanted: subject.wanted().to_string(),
+            note: None,
+            detail: None,
+        }],
+        ..crate::SetupStatus::default()
+    });
+}
+
+/// Whether System State offers the Debugger row's `Turn On…`.
+fn turn_on_offered(app: &App) -> bool {
+    use crate::native_app::{AppKind, NativeApp};
+    app.native_runtime
+        .instance_by_kind(AppKind::SystemState)
+        .is_some_and(|instance| {
+            matches!(app.native_runtime.app(instance),
+                Some(NativeApp::SystemState(page))
+                    if page.can_open_access(aterm_types::macos_setup::Access::Debugger))
+        })
+}
+
+/// A launch whose debugger step is over (this Mac was asked before Full Disk Access's Quit &
+/// Reopen) with System State up and the window's plan admitted; the rule reads off and the build
+/// hardened when the window reads them, and nothing is read yet.
+fn relaunched_with_system_state_up(dir: &std::path::Path) -> App {
+    use aterm_containment::consent::SelfHardening;
+    crate::debugger_access::note_asked(&dir.join("aterm.toml"), "READY-MAC", 1)
+        .expect("this Mac recorded");
+    let mut app = new_mac();
+    queue_debugger_step(&mut app, dir, || Some("READY-MAC"));
+    window_admits(&mut app, REVISION);
+    app.debugger_launch.end();
+    app.consent.probes_for_test().debugger = rule_reads_off;
+    app.consent.probes_for_test().hardening = || SelfHardening::Hardened;
+    assert!(app.open_system_state_tab(), "PRECONDITION: System State up");
+    app
+}
+
+/// While System State offers `Turn On…`, the window takes its own reading of debugger access
+/// through the real tick, so the first press after a launch starts the change rather than finding
+/// this aterm's hardening unread; with nothing offered it reads nothing.
+#[test]
+fn an_offered_turn_on_has_the_windows_reading_in_hand_for_the_first_press() {
+    use crate::workstation_setup::PagePress;
+    use aterm_containment::consent::{DebuggerMode, SelfHardening};
+    use aterm_types::macos_setup::{Access, Standing};
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut app = relaunched_with_system_state_up(root.path());
+    page_reads_debugger(&mut app, Standing::InPlace);
+    assert!(!turn_on_offered(&app), "PRECONDITION: on already");
+    app.tick_consent_lanes(Instant::now());
+    assert!(
+        app.consent.debugger_slot_idle_for_test(),
+        "nothing offered, nothing read"
+    );
+
+    page_reads_debugger(&mut app, Standing::NeedsYou);
+    assert!(turn_on_offered(&app), "PRECONDITION: Turn On… offered");
+    app.tick_consent_lanes(Instant::now());
+    let gate = app.config.privacy_probe_gate();
+    let row = aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the window's own reading of debugger access",
+        || {
+            app.consent
+                .debugger_cached(gate)
+                .filter(|row| !row.pending())
+        },
+    );
+    assert_eq!(row.probe().mode, DebuggerMode::Disabled);
+    assert_eq!(row.self_hardened(), SelfHardening::Hardened);
+
+    app.note_system_state_touch();
+    let by_person = app.take_system_state_press() == PagePress::Person;
+    assert!(by_person, "a person's touch");
+    assert!(
+        app.open_access_from_system_state(Access::Debugger, by_person),
+        "the first press starts the change"
+    );
+    assert_eq!(workers(), 1);
+
+    // The control: the same press with no reading in hand starts nothing.
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut cold = relaunched_with_system_state_up(root.path());
+    page_reads_debugger(&mut cold, Standing::NeedsYou);
+    cold.note_system_state_touch();
+    let by_person = cold.take_system_state_press() == PagePress::Person;
+    assert!(by_person, "a person's touch");
+    assert!(
+        !cold.open_access_from_system_state(Access::Debugger, by_person),
+        "a press before any reading starts nothing"
+    );
+    assert_eq!(workers(), 1);
+}
+
+/// What the window keeps while `Turn On…` is offered: a reading, however old, is kept (a press reads
+/// the rule again past the slot's minute); a read that brought no reading is read again once it is
+/// `RECHECK_EVERY` old and not before, never while a read is out, and never while the launch step,
+/// which retired one, reads the rule again at that pace itself. The cases that must see no read
+/// come before the first read this test dispatches, so the slot's retry floor (half a second after
+/// each dispatch) cannot be what holds one back.
+#[test]
+fn an_offered_turn_on_reads_again_only_a_read_that_brought_no_reading() {
+    use crate::debugger_access::StepWait;
+    use crate::devtools_helper::RECHECK_EVERY;
+    use aterm_containment::consent::{DebuggerMode, DebuggerProbeLabel, SelfHardening};
+    use aterm_types::macos_setup::Standing;
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut app = relaunched_with_system_state_up(root.path());
+    page_reads_debugger(&mut app, Standing::NeedsYou);
+    assert!(turn_on_offered(&app), "PRECONDITION: Turn On… offered");
+    let gate = app.config.privacy_probe_gate();
+    let unread = rule_read_fails(DebuggerProbeLabel::TimedOut);
+    let past_the_minute = Duration::from_secs(120);
+    // Unchanged and none out: had one been dispatched it would still be out, or its reading (the
+    // rule off, aged nothing) would have replaced `held`, published `aged` ago.
+    let kept = |app: &App, held, aged| {
+        !app.consent.debugger_in_flight()
+            && app
+                .consent
+                .debugger_cached(gate)
+                .is_some_and(|row| row.probe() == held && row.probe_age() >= Some(aged))
+    };
+
+    let old = rule_reads(DebuggerMode::Disabled);
+    app.consent
+        .publish_debugger_aged_for_test(old, SelfHardening::Hardened, past_the_minute);
+    app.tick_consent_lanes(Instant::now());
+    assert!(
+        kept(&app, old, past_the_minute),
+        "a reading in hand is kept, an old one too"
+    );
+
+    app.consent
+        .publish_debugger_aged_for_test(unread, SelfHardening::Hardened, Duration::ZERO);
+    app.tick_consent_lanes(Instant::now());
+    assert!(
+        kept(&app, unread, Duration::ZERO),
+        "a read that just failed is not read again at once"
+    );
+
+    // The step's own ProbeUnread: it retires the failed row and looks again at RECHECK_EVERY.
+    queue_debugger_step(&mut app, root.path(), || Some("READY-MAC"));
+    app.consent.invalidate_debugger();
+    app.debugger_launch
+        .wait(StepWait::ProbeUnread, Instant::now() + RECHECK_EVERY);
+    assert!(
+        !app.debugger_launch.due(Instant::now()),
+        "PRECONDITION: no look due"
+    );
+    app.tick_consent_lanes(Instant::now());
+    assert!(
+        !app.consent.debugger_in_flight() && app.consent.debugger_cached(gate).is_none(),
+        "the step reads it again itself"
+    );
+
+    app.debugger_launch.end();
+    app.consent.publish_debugger_aged_for_test(
+        unread,
+        SelfHardening::Hardened,
+        RECHECK_EVERY + Duration::from_secs(1),
+    );
+    app.tick_consent_lanes(Instant::now());
+    let row = aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the failed read read again",
+        || {
+            app.consent
+                .debugger_cached(gate)
+                .filter(|row| !row.pending() && row.probe() != unread)
+        },
+    );
+    assert_eq!(row.probe().mode, DebuggerMode::Disabled);
+
+    // A read out is never retired, which would void it: the failed row it refreshes stands until
+    // it lands. Past the slot's minute a read refreshes the row it still serves; the loop waits
+    // out the retry floor the read above set.
+    let held = READ_HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    app.consent.probes_for_test().debugger = rule_read_held;
+    app.consent
+        .publish_debugger_aged_for_test(unread, SelfHardening::Hardened, past_the_minute);
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "a read out", || {
+        let _ = app.consent.debugger(gate);
+        app.consent.debugger_in_flight().then_some(())
+    });
+    app.tick_consent_lanes(Instant::now());
+    assert!(
+        app.consent.debugger_in_flight()
+            && app
+                .consent
+                .debugger_cached(gate)
+                .is_some_and(|row| row.probe() == unread),
+        "a read out is not retired"
+    );
+    drop(held);
+    let row = aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the read out landed",
+        || {
+            app.consent
+                .debugger_cached(gate)
+                .filter(|row| !row.pending() && row.probe() != unread)
+        },
+    );
+    assert_eq!(row.probe().mode, DebuggerMode::Disabled);
+}
+
+/// Held by a test while [`rule_read_held`]'s read is to stay out.
+static READ_HELD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A read of the rule that stays out while [`READ_HELD`] is held, then reads it off.
+fn rule_read_held(
+    gate: aterm_containment::consent::ProbeGate,
+) -> aterm_containment::consent::DebuggerProbe {
+    drop(
+        READ_HELD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    rule_reads_off(gate)
 }
 
 /// A person's `Turn On…` answers the once-per-Mac question: their press writes this Mac into

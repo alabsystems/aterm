@@ -6621,6 +6621,7 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
         bells: Default::default(),
         screen_moves: Default::default(),
         job_feed: Default::default(),
+        box_banner: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),
@@ -18690,14 +18691,13 @@ fn await_log_kind_program_answers_on_the_programs_move() {
     std::thread::spawn(move || {
         let _ = tx.send(await_log(&h2, &store2, &parked));
     });
-    h.ctx
-        .timeline
-        .lock()
-        .unwrap()
-        .note_program_state(Some(ProgramState {
+    h.ctx.timeline.lock().unwrap().note_program_state(
+        Some(ProgramState {
             state: ProgramStateWord::Working,
             kind: None,
-        }));
+        }),
+        1,
+    );
     let reply = rx
         .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
         .expect("the program's move answers the wait");

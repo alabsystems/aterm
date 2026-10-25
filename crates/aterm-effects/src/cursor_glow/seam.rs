@@ -411,32 +411,52 @@ impl CursorGlow {
 
     /// This row's remembered print endpoint and brand, with its slot ([`Self::anchor_rows`]: a linear scan of [`ANCHOR_ROWS`] rows).
     #[inline]
-    pub(super) fn anchor_row(&self, row: u16) -> Option<(usize, AnchorRow)> {
-        self.anchor_rows
-            .iter()
-            .enumerate()
-            .find_map(|(i, entry)| entry.filter(|mem| mem.row == row).map(|mem| (i, mem)))
+    pub(super) const fn anchor_row(&self, row: u16) -> Option<(usize, AnchorRow)> {
+        let mut i = 0;
+        while i < self.anchor_rows.len() {
+            if let Some(mem) = self.anchor_rows[i]
+                && mem.row == row
+            {
+                return Some((i, mem));
+            }
+            i += 1;
+        }
+        None
     }
 
     /// Write a row's print endpoint and brand back, stamped with the touch clock.
-    pub(super) fn remember_anchor_row(&mut self, slot: Option<usize>, mem: AnchorRow) {
+    pub(super) const fn remember_anchor_row(&mut self, slot: Option<usize>, mem: AnchorRow) {
         self.anchor_rows_clock = self.anchor_rows_clock.wrapping_add(1);
         let mem = AnchorRow {
             touched: self.anchor_rows_clock,
             ..mem
         };
-        let i = slot.unwrap_or_else(|| {
-            self.anchor_rows
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, entry)| entry.map(|m| m.touched))
-                .map_or(0, |(i, _)| i)
-        });
+        let i = match slot {
+            Some(i) => i,
+            None => {
+                let mut best_i = 0;
+                let mut idx = 0;
+                while idx < self.anchor_rows.len() {
+                    let cur_key = self.anchor_rows[idx];
+                    let best_key = self.anchor_rows[best_i];
+                    let less = match (cur_key, best_key) {
+                        (None, Some(_)) => true,
+                        (Some(a), Some(b)) => a.touched < b.touched,
+                        _ => false,
+                    };
+                    if less {
+                        best_i = idx;
+                    }
+                    idx += 1;
+                }
+                best_i
+            }
+        };
         self.anchor_rows[i] = Some(mem);
     }
 
     /// Move the hide-bridge source to where the caret will be shown after a licensed anchored echo under a hidden caret (Rainbow Kitty only).
-    pub(super) fn relocate_hide_bridge_to_anchor(
+    pub(super) const fn relocate_hide_bridge_to_anchor(
         &mut self,
         ar: u16,
         pc: u16,
@@ -444,14 +464,24 @@ impl CursorGlow {
         pane_col1: usize,
         now: Instant,
     ) {
-        let estimate = self.last_visible.map(|(cell, _)| cell);
+        let estimate = match self.last_visible {
+            Some((cell, _)) => Some(cell),
+            None => None,
+        };
         let col = match estimate {
             Some((row, col)) if row == ar && col < pc => col.saturating_add(ac - pc),
             _ => ac,
         };
-        let on_grid = u16::try_from(pane_col1.saturating_sub(1)).unwrap_or(u16::MAX);
-        self.hide_bridge_shown = self.hide_bridge_shown.or(estimate);
-        self.last_visible = Some(((ar, col.min(on_grid)), now));
+        let max_col = pane_col1.saturating_sub(1);
+        let on_grid = if max_col <= u16::MAX as usize {
+            max_col as u16
+        } else {
+            u16::MAX
+        };
+        if self.hide_bridge_shown.is_none() {
+            self.hide_bridge_shown = estimate;
+        }
+        self.last_visible = Some(((ar, if col < on_grid { col } else { on_grid }), now));
     }
 
     /// The glyph at the last cell of the print run ending at `(row, end)`, as this frame's host sampled it.
@@ -1608,13 +1638,19 @@ impl CursorGlow {
 
     /// Whether a glyph sits left of `col` on `row` in this frame's row probe ([`HeldPark::landing_glyph`]).
     #[inline]
-    pub(super) fn landing_glyph_at(&self, row: u16, col: u16) -> bool {
-        self.row_cur_meta.is_none_or(|m| {
-            m.row != row
-                || col
-                    .checked_sub(1)
-                    .is_some_and(|left| !rk::witness::unit_at(&self.row_cur, left).is_blank())
-        })
+    pub(super) const fn landing_glyph_at(&self, row: u16, col: u16) -> bool {
+        match self.row_cur_meta {
+            None => true,
+            Some(m) => {
+                m.row != row
+                    || match col.checked_sub(1) {
+                        Some(left) => {
+                            !rk::witness::unit_at(self.row_cur.as_slice(), left).is_blank()
+                        }
+                        None => false,
+                    }
+            }
+        }
     }
 
     /// Whether presses banked at or before the park pay for the return's cells `origin..cc` ([`HeldPark`]).

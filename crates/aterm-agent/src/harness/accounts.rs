@@ -61,8 +61,16 @@ pub const MAX_ROTATIONS: usize = 128;
 /// The longest session id, machine id, window name and `held` word kept.
 pub const WORD_MAX: usize = 64;
 
-/// The longest reason a ledger row carries, in bytes.
+/// The longest reason a ledger row is given ([`Event::because`]), in bytes.
 pub const WHY_MAX: usize = 200;
+
+/// The longest record of the routes an automatic sign-in tried ([`SignInAttempt::routes`]), in
+/// bytes: room for every route's words at their longest, so none is cut off.
+pub const ROUTES_MAX: usize = 400;
+
+/// The longest reason a ledger row carries, in bytes: a [`Kind::SignIn`] row's `auto <outcome>:`
+/// and its [`ROUTES_MAX`] of routes ([`note_sign_in_attempt`]), every other row's [`WHY_MAX`].
+pub const LEDGER_WHY_MAX: usize = ROUTES_MAX + 32;
 
 /// The longest ledger line that is parsed.
 pub const MAX_EVENT_LINE_BYTES: usize = 4096;
@@ -1537,6 +1545,56 @@ pub struct Binding {
     pub proved_by: Option<Proof>,
     /// The remaining human step of a renewal, cleared by a successful sign-in.
     pub sign_in_task: Option<SignInTask>,
+    /// How the row's last automatic sign-in ended and the routes it tried
+    /// ([`note_sign_in_attempt`]); a failed one is cleared by a renewal ([`note_renewed`]).
+    pub sign_in_attempt: Option<SignInAttempt>,
+}
+
+/// How an automatic sign-in of a row ended ([`SignInAttempt::outcome`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AttemptOutcome {
+    /// No route could sign the row in on this machine: every one tried is named.
+    NoRoute,
+    /// A route ran and did not bind a login.
+    Failed,
+    /// A route signed the row in and its login was bound.
+    SignedIn,
+}
+
+impl AttemptOutcome {
+    /// The stored and shown word.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRoute => "no-route",
+            Self::Failed => "failed",
+            Self::SignedIn => "signed-in",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        [Self::NoRoute, Self::Failed, Self::SignedIn]
+            .into_iter()
+            .find(|outcome| outcome.as_str() == word)
+    }
+
+    /// Whether the row is still without a login it can be run on.
+    #[must_use]
+    pub const fn failing(self) -> bool {
+        matches!(self, Self::NoRoute | Self::Failed)
+    }
+}
+
+/// A row's last automatic sign-in: how it ended, the routes its ladder tried (one bounded line
+/// that never holds a URL, code, password or email), and since when that has been so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignInAttempt {
+    /// How it ended.
+    pub outcome: AttemptOutcome,
+    /// The routes tried and what each found, at most [`ROUTES_MAX`] bytes.
+    pub routes: String,
+    /// When this outcome over these routes was first recorded (Unix seconds).
+    pub since: i64,
 }
 
 /// The human step a vendor renewal could not finish, without its page or error text.
@@ -1635,6 +1693,7 @@ impl Default for Binding {
             was: Vec::new(),
             proved_by: None,
             sign_in_task: None,
+            sign_in_attempt: None,
         }
     }
 }
@@ -1716,6 +1775,13 @@ impl Logins {
                     pending.insert("at".into(), Value::from(task.at));
                     m.insert("sign_in_task".into(), Value::Object(pending));
                 }
+                if let Some(attempt) = &b.sign_in_attempt {
+                    let mut tried = Map::new();
+                    tried.insert("outcome".into(), Value::from(attempt.outcome.as_str()));
+                    tried.insert("routes".into(), Value::from(attempt.routes.clone()));
+                    tried.insert("since".into(), Value::from(attempt.since));
+                    m.insert("sign_in_attempt".into(), Value::Object(tried));
+                }
                 (label.clone(), Value::Object(m))
             })
             .collect();
@@ -1796,6 +1862,18 @@ impl Logins {
                     Some(SignInTask { action, at })
                 }
             };
+            // An attempt this build cannot read is dropped, not refused: it is a record of the
+            // ladder's last pass, which the next pass writes again.
+            let sign_in_attempt = v.get("sign_in_attempt").and_then(|tried| {
+                Some(SignInAttempt {
+                    outcome: tried
+                        .get("outcome")
+                        .and_then(Value::as_str)
+                        .and_then(AttemptOutcome::parse)?,
+                    routes: one_line(tried.get("routes")?.as_str()?, ROUTES_MAX),
+                    since: stamp(tried.get("since"), now)?,
+                })
+            });
             let binding = Binding {
                 dir,
                 renewed_at: stamp(v.get("renewed_at"), now),
@@ -1813,6 +1891,7 @@ impl Logins {
                     .and_then(Value::as_str)
                     .and_then(Proof::parse),
                 sign_in_task,
+                sign_in_attempt,
             };
             labels.insert(label.clone(), binding);
         }
@@ -1988,6 +2067,74 @@ pub fn note_sign_in_task(logins: &mut Logins, label: &str, action: SignInAction,
     }
 }
 
+/// The `why` prefix of the [`Kind::SignIn`] event an automatic sign-in writes
+/// ([`note_sign_in_attempt`]).
+pub const AUTO_SIGN_IN: &str = "auto";
+
+/// Records how `label`'s automatic sign-in ended at `at` and the `routes` its ladder tried,
+/// without changing its login binding: one [`Kind::SignIn`] event (`auto <outcome>: <routes>`)
+/// when the outcome or the routes differ from the row's last attempt, and nothing at all when
+/// they are the same, so an unchanged failure is written once however often it is tried again.
+pub fn note_sign_in_attempt(
+    logins: &mut Logins,
+    label: &str,
+    outcome: AttemptOutcome,
+    routes: &str,
+    at: i64,
+) -> Vec<Event> {
+    let routes = one_line(routes, ROUTES_MAX);
+    let Some(binding) = logins.entry(label) else {
+        return Vec::new();
+    };
+    if binding
+        .sign_in_attempt
+        .as_ref()
+        .is_some_and(|last| last.outcome == outcome && last.routes == routes)
+    {
+        return Vec::new();
+    }
+    let mut event = Event::new(at, Kind::SignIn, label);
+    event.why = one_line(
+        &format!("{AUTO_SIGN_IN} {}: {routes}", outcome.as_str()),
+        LEDGER_WHY_MAX,
+    );
+    binding.sign_in_attempt = Some(SignInAttempt {
+        outcome,
+        routes,
+        since: at,
+    });
+    vec![event]
+}
+
+/// The rows of `roster` whose last automatic sign-in failed and which are still without a login
+/// they can be run on here (not enrolled, or signed out), in roster order, with that attempt.
+#[must_use]
+pub fn failing_sign_ins(
+    roster: &Roster,
+    state: &State,
+    logins: &Logins,
+    now: i64,
+) -> Vec<(String, SignInAttempt)> {
+    let enrolled = enrolled(roster);
+    roster
+        .rows
+        .iter()
+        .filter(|row| {
+            matches!(
+                condition(row, state, is_enrolled(row, &enrolled), now),
+                Condition::NotEnrolled | Condition::SignedOut
+            )
+        })
+        .filter_map(|row| {
+            let attempt = logins.get(&row.label)?.sign_in_attempt.clone()?;
+            attempt
+                .outcome
+                .failing()
+                .then(|| (row.label.clone(), attempt))
+        })
+        .collect()
+}
+
 /// Records a login wall hit at `at` on `label`'s bound login and updates learned lifetime.
 pub fn note_login_end(state: &mut State, logins: &mut Logins, label: &str, at: i64) -> Vec<Event> {
     let mut out = if state.account(label).auth == Auth::SignedOut {
@@ -2093,6 +2240,13 @@ pub fn note_renewed(
     binding.wrong_at = None;
     binding.proved_by = None;
     binding.sign_in_task = None;
+    if binding
+        .sign_in_attempt
+        .as_ref()
+        .is_some_and(|attempt| attempt.outcome.failing())
+    {
+        binding.sign_in_attempt = None;
+    }
     binding.subscription = subscription
         .map(|s| one_line(s, SUBSCRIPTION_MAX))
         .filter(|s| !s.is_empty());
@@ -2118,6 +2272,73 @@ pub fn note_wrong_account(logins: &mut Logins, label: &str, at: i64) -> Vec<Even
             vec![Event::new(at, Kind::WrongAccount, label)]
         }
         None => Vec::new(),
+    }
+}
+
+/// Records at `at` that the vendor's own sign-in on the default login replaced `label`'s account
+/// there with `now_default`'s, so `label` has no login on this machine: its auth word is signed
+/// out, a pin on it ends ([`Kind::Unpin`]), its binding's `served_at` (turns served under a login
+/// it no longer holds) is cleared, and one [`Kind::Displaced`] event says so. A later auth word
+/// already on record is kept.
+pub fn note_displaced(
+    state: &mut State,
+    logins: &mut Logins,
+    label: &str,
+    now_default: &str,
+    at: i64,
+) -> Vec<Event> {
+    let Some(record) = account_mut(state, label) else {
+        return Vec::new();
+    };
+    if record.auth_at.is_none_or(|held| held <= at) {
+        record.auth = Auth::SignedOut;
+        record.auth_at = Some(at);
+    }
+    let mut out = vec![
+        Event::new(at, Kind::Displaced, label)
+            .with_to(now_default)
+            .because(&format!("default login now {now_default}")),
+    ];
+    end_pin(state, label, "displaced", at, &mut out);
+    if let Some(binding) = logins.labels.get_mut(label) {
+        binding.served_at = None;
+    }
+    out
+}
+
+/// Moves what is on record of the account the row `from` held to `to`, the label the roster
+/// gives that account now, where a fleet gave `from` to another account and the account is the
+/// default login's under both labels: its observations (walls, samples, auth word) and its
+/// binding, where `to` has none of its own, and every session, the active account and the
+/// previous one that named it by `from`. `from` is left with nothing on record, so the account
+/// the fleet gave it to starts with no walls, no auth word and no turns served.
+pub fn move_account(state: &mut State, logins: &mut Logins, from: &str, to: &str) {
+    if let Some(record) = state.accounts.remove(from) {
+        state.accounts.entry(to.to_owned()).or_insert(record);
+    }
+    if let Some(binding) = logins.labels.remove(from) {
+        logins.labels.entry(to.to_owned()).or_insert(binding);
+    }
+    for named in state
+        .sessions
+        .values_mut()
+        .map(|session| &mut session.account)
+        .chain(state.active.as_mut())
+        .chain(state.previous.as_mut())
+    {
+        if named == from {
+            to.clone_into(named);
+        }
+    }
+}
+
+/// Drops what is on record of the account the row `label` held, where a fleet gave the label to
+/// another account: its observations (walls, samples, auth word) and its binding's turns served.
+/// The login directory the label is bound to is kept: what it holds is checked where it is run.
+pub fn forget_account(state: &mut State, logins: &mut Logins, label: &str) {
+    state.accounts.remove(label);
+    if let Some(binding) = logins.labels.get_mut(label) {
+        binding.served_at = None;
     }
 }
 
@@ -2633,6 +2854,22 @@ impl Account {
     #[must_use]
     pub fn low(&self, now: i64) -> bool {
         self.low_until(now).is_some()
+    }
+
+    /// Returns whether Claude Code's own warning that its five-hour or weekly window is filling
+    /// ([`Self::warned_session`], [`Self::warned_week`]) still stands at `now`, at any percent:
+    /// the first sign a session on it will need another account, well before it is [`Self::low`].
+    #[must_use]
+    pub fn warned(&self, now: i64) -> bool {
+        self.warned_session
+            .as_ref()
+            .and_then(|w| w.figure(SESSION_WINDOW_S, now))
+            .is_some()
+            || self
+                .warned_week
+                .as_ref()
+                .and_then(|w| w.figure(WEEK_WINDOW_S, now))
+                .is_some()
     }
 
     /// Returns whether a session on this account should proactively rotate off before hitting a
@@ -4444,11 +4681,15 @@ pub enum Kind {
     /// page's host, the flow (`device`, `browser`, `window`) and how it ended, never a URL, code
     /// or email.
     SignIn,
+    /// The vendor's own sign-in on the default login (Claude Code's `/login`) replaced the
+    /// account the row held there, which leaves the row no login on this machine
+    /// ([`note_displaced`]); `to` names the row the default login holds now.
+    Displaced,
 }
 
 impl Kind {
     /// Every kind.
-    pub const ALL: [Kind; 22] = [
+    pub const ALL: [Kind; 23] = [
         Kind::Wall,
         Kind::Sample,
         Kind::Rotate,
@@ -4471,6 +4712,7 @@ impl Kind {
         Kind::Reset,
         Kind::Epoch,
         Kind::SignIn,
+        Kind::Displaced,
     ];
 
     /// Canonical string for this event kind in `ledger.jsonl`.
@@ -4499,6 +4741,7 @@ impl Kind {
             Kind::Reset => "reset",
             Kind::Epoch => "epoch",
             Kind::SignIn => "sign-in",
+            Kind::Displaced => "displaced",
         }
     }
 
@@ -4586,7 +4829,8 @@ impl Event {
             | Kind::WrongAccount
             | Kind::Reset
             | Kind::Epoch
-            | Kind::SignIn => false,
+            | Kind::SignIn
+            | Kind::Displaced => false,
         }
     }
 
@@ -4608,7 +4852,10 @@ impl Event {
             "sid".to_owned(),
             Value::from(self.sid.as_deref().map(|s| one_line(s, WORD_MAX))),
         );
-        o.insert("why".to_owned(), Value::from(one_line(&self.why, WHY_MAX)));
+        o.insert(
+            "why".to_owned(),
+            Value::from(one_line(&self.why, LEDGER_WHY_MAX)),
+        );
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
     }
 
@@ -4625,7 +4872,7 @@ impl Event {
             account: word(doc.get("account"), LABEL_MAX)?,
             to: word(doc.get("to"), LABEL_MAX),
             sid: word(doc.get("sid"), WORD_MAX),
-            why: word(doc.get("why"), WHY_MAX).unwrap_or_default(),
+            why: word(doc.get("why"), LEDGER_WHY_MAX).unwrap_or_default(),
         })
     }
 }

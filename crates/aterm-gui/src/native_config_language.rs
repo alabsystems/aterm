@@ -222,6 +222,13 @@ const RETIRED_CONFIG_KEYS: &[RetiredConfigKeyMetadata] = &[
         feature: "Explain heavy load",
         effect_label: "No effect",
     },
+    // THE MERGED TOP DECK WAS REJECTED (2026-10-24): 0.135.0's hidden `[sys] stats_deck_style`
+    // chose its painter. A file that still sets it loads and is told the key does nothing.
+    RetiredConfigKeyMetadata {
+        key: "sys.stats_deck_style",
+        feature: "Merged top deck",
+        effect_label: "No effect",
+    },
 ];
 
 pub(crate) fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKeyMetadata> {
@@ -272,10 +279,6 @@ const STATS_DECK_SIZES: &[&str] = &[
     crate::stats_plan::DeckSizePref::Auto.word(),
     crate::stats_plan::DeckSizePref::Full.word(),
     crate::stats_plan::DeckSizePref::Folded.word(),
-];
-const STATS_DECK_STYLES: &[&str] = &[
-    crate::stats_deck::DeckStyle::V2.word(),
-    crate::stats_deck::DeckStyle::Merged.word(),
 ];
 const WINDOWING_BEHAVIOR_ALIASES: &[&str] = &[
     "new-window",
@@ -1020,22 +1023,13 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "sys.stats_deck_size",
-        "Stats deck size: automatic (v2 folded), full or folded",
+        "Stats deck size: automatic (folded), full or folded",
         ConfigSchemaKind::Scalar(EditKind::Enum {
             options: STATS_DECK_SIZES,
         }),
         &[
             "system", "stats", "deck", "size", "full", "folded", "height", "rows",
         ],
-        true,
-    ),
-    manual(
-        "sys.stats_deck_style",
-        "Stats deck style: v2's table, or the merged deck being built",
-        ConfigSchemaKind::Scalar(EditKind::Enum {
-            options: STATS_DECK_STYLES,
-        }),
-        &["system", "stats", "deck", "style", "merged", "v2"],
         true,
     ),
     manual(
@@ -2230,11 +2224,6 @@ fn manual_default_shown(key: &str) -> Option<String> {
             key,
             config.stats_deck_size_or_default(),
             crate::stats_plan::DeckSizePref::from_word,
-        )?,
-        "sys.stats_deck_style" => word(
-            key,
-            config.stats_deck_style_or_default(),
-            crate::stats_deck::DeckStyle::from_word,
         )?,
         "agents_auto_prime" => config.agents_auto_prime_or_default().to_string(),
         "claude_footer.usage" => config.claude_footer_usage().to_string(),
@@ -5663,10 +5652,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · default deck: a table under the titlebar with one row per resource, CPU, GPU, memory, disk, network, tokens and processes, plus the cores: each row's last 10 minutes as a heat strip (cold to hot, 0 to 100% of that resource's max, a hollow cell where nothing was read), its % now, a Global ⊇ aterm ⊇ Tab bar on its capacity and the amount with its unit; Folded, or Full where `stats_deck_size` says so · sill: thin lanes in the window's bottom padding, which takes no terminal row (needs 8 pt of padding) · off: no bars, and the terminal gets the Deck's rows back · rest the pointer on a row, or press ⌘I, for the close-up · View ▸ Stats Bars picks one · read live"
         }
         "sys.stats_deck_size" => {
-            " · default auto: v2's Deck stays Folded, two blocks of four rows in 62 pt, however tall the window; the merged deck folds to its row A once the grid would hold under 10 rows (`stats_deck_style`) · full: always Full, for v2 a header line and a row per resource in about 100 pt, which takes whole terminal rows · folded: always Folded · decided when a window opens, resizes, changes display or the font changes, never by what the deck shows · View ▸ Deck Size picks one · read live"
-        }
-        "sys.stats_deck_style" => {
-            " · default v2: the table Stats Deck v2 draws · merged: the merged deck (DESIGN-top-deck-merged-2026-10-21.md), still being built, three terminal rows tall (held to 45–60 pt), folded to its first row (row A) once the grid would hold under 10 rows under the three and unfolded at 11, which gives the grid two rows back; `stats_deck_size` full keeps the three rows and folded keeps row A · a change re-grids each tab once (`resizes` books it site=deck) · no menu item · read live"
+            " · default auto: the Deck stays Folded, two blocks of four rows in 62 pt, however tall the window · full: always Full, a header line and a row per resource in about 100 pt, which takes whole terminal rows · folded: always Folded · decided when a window opens, resizes, changes display or the font changes, never by what the deck shows · View ▸ Deck Size picks one · read live"
         }
         "session_log.clause" => {
             " · on (the default): one more line after `activity:`, `now:` and what the session's log says the tab is doing (`now: running shell`, `now: approval · bash`, `now: limit · resets 14:05`; what needs you first), in the menu with how long it has held; the harness's own moments for 30 s with their author (`now: restarting · by the harness`); never a label another client wrote; the tab's name is unchanged · off: a tab's tooltip and context menu are as they were · read live"

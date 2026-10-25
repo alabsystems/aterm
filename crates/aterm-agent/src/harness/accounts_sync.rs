@@ -48,6 +48,10 @@ pub enum OptIn {
     Named,
     /// The sync read `[fleet] accounts_source`.
     Key,
+    /// No source was named or configured: the accounts are the ones this machine's own logins,
+    /// profiles and transcripts show (local discovery), and discovery adds the ones it finds later
+    /// ([`fleet_takes_discovered`]). A fleet file that says so opts in as [`Self::Named`] does.
+    Discovered,
 }
 
 impl OptIn {
@@ -57,7 +61,21 @@ impl OptIn {
         match self {
             Self::Named => "named",
             Self::Key => "key",
+            Self::Discovered => "discovered",
         }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        [Self::Named, Self::Key, Self::Discovered]
+            .into_iter()
+            .find(|opt_in| opt_in.as_str() == word)
+    }
+
+    /// Whether a fleet file beside the roster that records it opts this machine in
+    /// ([`configured_source`]): [`Self::Named`] or [`Self::Discovered`].
+    #[must_use]
+    pub const fn opts_in_by_file(self) -> bool {
+        matches!(self, Self::Named | Self::Discovered)
     }
 }
 
@@ -126,18 +144,25 @@ impl FleetRoster {
         self.to_toml_for(None)
     }
 
-    /// [`Self::to_toml`], with this machine's [`OPT_IN_KEY`] where `opt_in` names one.
+    /// [`Self::to_toml`], with this machine's [`OPT_IN_KEY`] where `opt_in` names one. A fleet
+    /// discovery made ([`OptIn::Discovered`]) says it was found on this Mac, not handed to a sync.
     #[must_use]
     pub fn to_toml_for(&self, opt_in: Option<OptIn>) -> String {
-        let mut out = String::from(
+        let mut out = String::from(if opt_in == Some(OptIn::Discovered) {
+            "# Found on this Mac by aterm: the accounts its own logins, profiles and transcripts\n\
+             # show. No person named a source for them, and aterm adds each account it finds\n\
+             # later. `aterm harness accounts sync <path-or-url>` replaces it with a fleet you name.\n\n"
+        } else {
             "# Managed by `aterm harness accounts sync` — shared LAN fleet account roster.\n\
              # Run `aterm harness accounts sync <path-or-url>` on any machine to materialize\n\
-             # its local `accounts.toml`.\n\n",
-        );
+             # its local `accounts.toml`.\n\n"
+        });
         if let Some(opt_in) = opt_in {
             out.push_str(&format!(
                 "# Why this machine keeps its fleet accounts: `named`, a sync handed its source\n\
-                 # (delete this file to stop); `key`, `[fleet] accounts_source` in aterm.toml.\n\
+                 # (delete this file to stop); `key`, `[fleet] accounts_source` in aterm.toml;\n\
+                 # `discovered`, the accounts this machine's own logins and transcripts show,\n\
+                 # which it adds to as it finds more (delete this file to stop).\n\
                  {OPT_IN_KEY} = {}\n\n",
                 toml_quote(opt_in.as_str())
             ));
@@ -922,26 +947,14 @@ pub fn find_default_home_standing_wall(
 }
 
 fn match_session_context_label(line: &str, roster: &Roster) -> Option<Option<String>> {
-    if !line.contains("\"session_context\"") || !line.contains("\"userEmail\"") {
-        return None;
-    }
-    let v: Value = aterm_json::from_str(line).ok()?;
-    let attachment = v.get("attachment")?;
-    if attachment.get("type").and_then(Value::as_str) != Some("session_context") {
-        return None;
-    }
-    let user_email = attachment.get("context")?.get("userEmail")?.as_str()?;
-    let tok = user_email
-        .split([' ', '\t', '\n', '\r', '<', '>', '"', '\''])
-        .map(|s| s.trim_end_matches(['.', ',', ';', ':']))
-        .find(|s| s.contains('@'))?;
+    let tok = session_context_email(line)?;
     let matched = roster
         .rows
         .iter()
         .find(|r| {
             r.email
                 .as_deref()
-                .is_some_and(|re| accounts::email_matches(re, tok))
+                .is_some_and(|re| accounts::email_matches(re, &tok))
         })
         .map(|r| r.label.clone());
     Some(matched)
@@ -1051,7 +1064,53 @@ fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
     }
 }
 
-/// Build the machine's [`Roster`] from `fleet` for `machine`.
+/// The label discovery gives an account of `machines` in `slot` (`m8`, `m8-2`, `m106-m38`).
+fn discovered_label(machines: &[String], slot: Option<u32>) -> String {
+    match (machines, slot) {
+        ([only], None | Some(1)) => only.clone(),
+        ([only], Some(n)) => format!("{only}-{n}"),
+        (many, None | Some(1)) => many.join("-"),
+        (many, Some(n)) => format!("{}-{n}", many.join("-")),
+    }
+}
+
+/// `email` as one more account of `machine` alone, labelled as discovery labels it
+/// ([`discovered_label`], its slot where the email's own machine hint is `machine`) and made
+/// unique against `used` by `-2`, `-3`, …; `None` for an email or a label the roster refuses.
+fn local_account(email: &str, machine: &str, used: &BTreeSet<String>) -> Option<FleetAccount> {
+    let email = email.trim();
+    if accounts::email_refusal(email).is_some() {
+        return None;
+    }
+    let machines = vec![machine.to_owned()];
+    let (hinted, slot) = email_machines_and_slot(email);
+    let slot = slot.filter(|_| hinted.is_empty() || hinted == machines);
+    let base = discovered_label(&machines, slot);
+    let mut label = base.clone();
+    let mut suffix = 2u32;
+    while used.contains(&label) {
+        label = format!("{base}-{suffix}");
+        suffix = suffix.checked_add(1)?;
+    }
+    accounts::label_refusal(&label)
+        .is_none()
+        .then(|| FleetAccount {
+            label,
+            machines,
+            class: Class::Dedicated,
+            email: email.to_owned(),
+            browser: None,
+            vendor: accounts::Vendor::default(),
+        })
+}
+
+/// Build the machine's [`Roster`] from `fleet` for `machine`. The row whose email is
+/// `default_email` is the default login's (no `dir`); where none of `machine`'s rows has that
+/// email, the default login holds an account they do not list, and the roster lists it too, as
+/// the default login's row: the fleet's own row for it where another machine's lists it, else
+/// the label `existing` already gives that account where the fleet gives it to no account, else
+/// a new one ([`local_account`], unique among the fleet's labels and `existing`'s), so no label
+/// is kept on an account it is not and an account keeps its label while it can.
 #[must_use]
 pub fn build_machine_roster(
     fleet: &FleetRoster,
@@ -1060,9 +1119,55 @@ pub fn build_machine_roster(
     existing: Option<&Roster>,
     default_email: Option<&str>,
 ) -> Roster {
-    let fleet_rows = fleet.accounts_for_machine(machine);
+    let mut fleet_rows = fleet.accounts_for_machine(machine);
     if fleet_rows.is_empty() {
         return existing.cloned().unwrap_or_default();
+    }
+    let default_email = default_email.map(str::trim).filter(|de| !de.is_empty());
+    let unlisted = default_email
+        .filter(|de| {
+            !fleet_rows
+                .iter()
+                .any(|r| accounts::email_matches(&r.email, de))
+                && fleet_rows.len() < accounts::MAX_ACCOUNTS
+        })
+        .and_then(|de| {
+            fleet
+                .accounts
+                .iter()
+                .find(|a| accounts::email_matches(&a.email, de))
+                .cloned()
+                .or_else(|| {
+                    let mut used: BTreeSet<String> =
+                        fleet.accounts.iter().map(|a| a.label.clone()).collect();
+                    let kept = existing
+                        .and_then(|ex| {
+                            ex.rows.iter().find(|r| {
+                                r.email
+                                    .as_deref()
+                                    .is_some_and(|re| accounts::email_matches(re, de))
+                            })
+                        })
+                        .map(|r| r.label.clone())
+                        .filter(|label| !used.contains(label));
+                    if let Some(kept) = kept {
+                        return local_account(de, machine, &BTreeSet::new()).map(|acct| {
+                            FleetAccount {
+                                label: kept,
+                                ..acct
+                            }
+                        });
+                    }
+                    used.extend(
+                        existing
+                            .iter()
+                            .flat_map(|ex| ex.rows.iter().map(|r| r.label.clone())),
+                    );
+                    local_account(de, machine, &used)
+                })
+        });
+    if let Some(acct) = &unlisted {
+        fleet_rows.push(acct);
     }
 
     let default_label: String = default_email
@@ -1215,18 +1320,153 @@ impl FleetSource {
 pub fn configured_source(config: Option<&Path>, roster: Option<&Path>) -> Option<FleetSource> {
     if let Some(fleet) = roster
         .and_then(fleet_file_beside)
-        .filter(|fleet| fleet_file_opt_in(fleet) == Some(OptIn::Named))
+        .filter(|fleet| fleet_file_opt_in(fleet).is_some_and(OptIn::opts_in_by_file))
     {
         return Some(FleetSource::File(fleet));
     }
     config.and_then(source_key).map(FleetSource::Key)
 }
 
+/// Where this machine's Claude Code roster rows come from, in the order a sync from init reads
+/// its sources ([`sync_accounts_for_init`]): what `aterm harness accounts` says of its list, and
+/// where `accounts add` lists a row so that the next sync keeps it ([`fleet_origin`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FleetOrigin {
+    /// No fleet file and no source: `accounts.toml` is the list, as it was written.
+    Roster,
+    /// Fleet files on this machine that a sync reads and writes back as they hold: the one
+    /// beside the roster, and a copy in `~/.secrets` that a sync from init reads first and that
+    /// holds this machine's rows alone ([`fleet_of_this_machine`]). `opt_in` is the word they
+    /// record (the beside file's where it opts in, else the copy's): [`OptIn::Discovered`]
+    /// where the list was found on this Mac, from its own logins, profiles and transcripts;
+    /// [`OptIn::Named`] where a sync was handed a source (and where discovery wrote it before it
+    /// recorded `discovered`); none for a file that opts nothing in, which a sync from init
+    /// still reads.
+    Local {
+        /// The files, the one beside the roster first.
+        files: Vec<PathBuf>,
+        /// The word they record.
+        opt_in: Option<OptIn>,
+    },
+    /// `[fleet] accounts_source`, which this machine reads and does not write.
+    Key(String),
+    /// The vault's sheet or fleet in `~/.secrets` (other machines' rows among them), which this
+    /// machine reads and does not write: the vault's subscriber writes it.
+    Vault(PathBuf),
+}
+
+impl FleetOrigin {
+    /// One word for it: `roster`, `discovered`, `named`, `fleet-file`, `key` or `vault`.
+    #[must_use]
+    pub const fn word(&self) -> &'static str {
+        match self {
+            Self::Roster => "roster",
+            Self::Local {
+                opt_in: Some(OptIn::Discovered),
+                ..
+            } => "discovered",
+            Self::Local {
+                opt_in: Some(OptIn::Named),
+                ..
+            } => "named",
+            Self::Local { .. } => "fleet-file",
+            Self::Key(_) => "key",
+            Self::Vault(_) => "vault",
+        }
+    }
+
+    /// The file or source it names; none for [`Self::Roster`].
+    #[must_use]
+    pub fn source(&self) -> Option<String> {
+        match self {
+            Self::Roster => None,
+            Self::Local { files, .. } => files.first().map(|f| f.display().to_string()),
+            Self::Key(source) => Some(source.clone()),
+            Self::Vault(path) => Some(path.display().to_string()),
+        }
+    }
+
+    /// What `aterm harness accounts` says of the list.
+    #[must_use]
+    pub fn words(&self) -> String {
+        let source = self.source().unwrap_or_default();
+        match self {
+            Self::Roster => "as written here (no fleet source names these accounts)".to_owned(),
+            Self::Local {
+                opt_in: Some(OptIn::Discovered),
+                ..
+            } => format!(
+                "found on this Mac, in its own logins, profiles and transcripts ({source} says \
+                 `discovered`); aterm adds each account it finds later"
+            ),
+            Self::Local {
+                opt_in: Some(OptIn::Named),
+                ..
+            } => format!("{source}, kept from a source a sync was handed (`named`)"),
+            Self::Local { .. } => {
+                format!("{source}, which opts nothing in; a sync from `aterm init` reads it")
+            }
+            Self::Key(_) => format!("`[fleet] accounts_source` ({source})"),
+            Self::Vault(_) => format!("the vault's {source}"),
+        }
+    }
+}
+
+/// [`FleetOrigin`] of the roster at `roster`, for `home` and the config file `config`.
+#[must_use]
+pub fn fleet_origin(home: Option<&Path>, config: Option<&Path>, roster: &Path) -> FleetOrigin {
+    let beside = fleet_file_beside(roster).filter(|fleet| fleet.is_file());
+    let beside_opt_in = beside.as_deref().and_then(fleet_file_opt_in);
+    let beside_opts_in = beside_opt_in.is_some_and(OptIn::opts_in_by_file);
+    if !beside_opts_in && let Some(source) = config.and_then(source_key) {
+        return FleetOrigin::Key(source);
+    }
+    let secrets = home.map(|home| home.join(".secrets"));
+    if let Some(vault) = secrets
+        .as_ref()
+        .map(|secrets| secrets.join(FLEET_ROSTER_FILE))
+        .filter(|vault| vault.is_file())
+    {
+        let read = read_local_source_text(&vault).ok().and_then(|text| {
+            let fleet = FleetRoster::from_toml(&text, &vault.display().to_string()).ok()?;
+            Some((opt_in_of(&text), fleet))
+        });
+        return match read {
+            Some((opt_in, fleet)) if fleet_of_this_machine(opt_in, &fleet) => {
+                let files: Vec<PathBuf> = beside.into_iter().chain([vault]).collect();
+                FleetOrigin::Local {
+                    opt_in: if beside_opts_in {
+                        beside_opt_in
+                    } else {
+                        opt_in
+                    },
+                    files,
+                }
+            }
+            _ => FleetOrigin::Vault(vault),
+        };
+    }
+    if let Some(sheet) = secrets
+        .map(|secrets| secrets.join(ACCOUNTS_CSV_FILE))
+        .filter(|sheet| sheet.is_file())
+    {
+        return FleetOrigin::Vault(sheet);
+    }
+    match beside {
+        Some(fleet) => FleetOrigin::Local {
+            files: vec![fleet],
+            opt_in: beside_opt_in,
+        },
+        None => FleetOrigin::Roster,
+    }
+}
+
 /// Whether a fleet roster file stands beside `roster` without opting in ([`configured_source`]).
 #[must_use]
 pub fn fleet_file_ignored(roster: &Path) -> bool {
-    fleet_file_beside(roster)
-        .is_some_and(|fleet| fleet.is_file() && fleet_file_opt_in(&fleet) != Some(OptIn::Named))
+    fleet_file_beside(roster).is_some_and(|fleet| {
+        fleet.is_file() && !fleet_file_opt_in(&fleet).is_some_and(OptIn::opts_in_by_file)
+    })
 }
 
 fn fleet_file_beside(roster: &Path) -> Option<PathBuf> {
@@ -1234,12 +1474,42 @@ fn fleet_file_beside(roster: &Path) -> Option<PathBuf> {
 }
 
 fn fleet_file_opt_in(fleet: &Path) -> Option<OptIn> {
-    let text = read_local_source_text(fleet).ok()?;
-    let table: aterm_toml::Table = aterm_toml::from_str(&text).ok()?;
-    match table.get(OPT_IN_KEY)?.as_str()? {
-        "named" => Some(OptIn::Named),
-        "key" => Some(OptIn::Key),
-        _ => None,
+    opt_in_of(&read_local_source_text(fleet).ok()?)
+}
+
+/// The [`OPT_IN_KEY`] a fleet roster's `text` records, where it is TOML that names one.
+fn opt_in_of(text: &str) -> Option<OptIn> {
+    let table: aterm_toml::Table = aterm_toml::from_str(text).ok()?;
+    OptIn::parse(table.get(OPT_IN_KEY)?.as_str()?)
+}
+
+/// Whether `fleet`, whose file records `opt_in`, is this machine's own list, which this machine
+/// writes (`accounts add` lists a row there): a fleet discovery made ([`OptIn::Discovered`]), or
+/// a `named` one whose every row names one and the same machine alone. A fleet from a vault, a
+/// sheet or a URL lists the fleet's machines and stays as its source wrote it.
+fn fleet_of_this_machine(opt_in: Option<OptIn>, fleet: &FleetRoster) -> bool {
+    match opt_in {
+        Some(OptIn::Discovered) => true,
+        Some(OptIn::Named) => fleet.machines().len() == 1,
+        Some(OptIn::Key) | None => false,
+    }
+}
+
+/// Whether local discovery may add this machine's accounts to `fleet`, whose file records
+/// `opt_in`: a fleet discovery made ([`OptIn::Discovered`]); or a `named` one of this machine
+/// alone ([`fleet_of_this_machine`]) every account of which this machine's own files show
+/// (`shown`, [`Shown::shows_all`]), as discovery wrote its fleets before it recorded
+/// `discovered`. A list a person handed `accounts sync` that names an account this machine shows
+/// nothing of is theirs and is never added to; `shown` is read only for a `named` one.
+fn fleet_takes_discovered(
+    opt_in: Option<OptIn>,
+    fleet: &FleetRoster,
+    shown: impl FnOnce() -> Shown,
+) -> bool {
+    match opt_in {
+        Some(OptIn::Discovered) => true,
+        Some(OptIn::Named) => fleet_of_this_machine(opt_in, fleet) && shown().shows_all(fleet),
+        Some(OptIn::Key) | None => false,
     }
 }
 
@@ -1256,7 +1526,7 @@ fn source_key(config: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
-type Fetch = dyn Fn(&Env, &str) -> Result<String, String> + Sync;
+type Fetch<'f> = dyn Fn(&Env, &str) -> Result<String, String> + Sync + 'f;
 
 /// Load a [`FleetRoster`] from `source`, or from [`configured_source`] when `source` is `None`.
 /// # Errors
@@ -1268,7 +1538,7 @@ pub fn load_fleet_source(env: &Env, source: Option<&str>) -> Result<FleetRoster,
 fn load_fleet_source_with(
     env: &Env,
     source: Option<&str>,
-    fetch: &Fetch,
+    fetch: &Fetch<'_>,
 ) -> Result<(FleetRoster, OptIn), String> {
     let (chosen, opt_in) = match source.map(str::trim).filter(|s| !s.is_empty()) {
         Some(named) => (named.to_owned(), OptIn::Named),
@@ -1283,14 +1553,24 @@ fn load_fleet_source_with(
             .ok_or_else(|| NO_SOURCE.to_owned())?,
     };
     let raw = fetch(env, &chosen)?;
-    let fleet = if chosen.ends_with(".toml")
+    let toml = chosen.ends_with(".toml")
         || raw.trim_start().starts_with('#')
-        || raw.contains("[[account]]")
-    {
+        || raw.contains("[[account]]");
+    let fleet = if toml {
         FleetRoster::from_toml(&raw, &chosen)
     } else {
         parse_accounting_csv(&raw, &chosen)
     }?;
+    // A discovered fleet stays discovery's through every sync of the local file that holds it.
+    let opt_in = if opt_in == OptIn::Named
+        && toml
+        && matches!(fetch_plan(env, &chosen), Ok(FetchPlan::File(_)))
+        && opt_in_of(&raw) == Some(OptIn::Discovered)
+    {
+        OptIn::Discovered
+    } else {
+        opt_in
+    };
     Ok((fleet, opt_in))
 }
 
@@ -1300,15 +1580,74 @@ fn discover_local_fleet(env: &Env) -> Option<FleetRoster> {
 }
 
 fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<FleetRoster> {
-    let mut emails = BTreeSet::new();
-    let mut record_email = |candidate: &str| {
+    discovered_fleet(env, &local_shows(env), min_accounts)
+}
+
+/// What this machine's own files show of the accounts on it, each address by what shows it
+/// ([`local_shows`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Shown {
+    /// Claude Code's own: the default login's profile and its copies (`~/.claude.json*`), the
+    /// login directories' profiles and renewal checkpoints, Claude Code's backups and its
+    /// transcripts' `session_context`.
+    claude: BTreeSet<String>,
+    /// Sign-in credentials, which name an address and say nothing of a Claude Code account
+    /// there: the mailbox configuration's user and the addresses its passwords and TOTP secrets
+    /// are kept for (one file every pool's sign-in reads), and Muse Code's providers.
+    credentials: BTreeSet<String>,
+    /// The rows of this machine's roster.
+    roster: BTreeSet<String>,
+}
+
+impl Shown {
+    /// Every address shown, whatever shows it: what discovery lists.
+    fn all(&self) -> BTreeSet<String> {
+        self.claude
+            .iter()
+            .chain(&self.credentials)
+            .chain(&self.roster)
+            .cloned()
+            .collect()
+    }
+
+    /// The addresses only a credential shows, none of Claude Code's own files.
+    fn credentials_only(&self) -> BTreeSet<String> {
+        self.credentials
+            .iter()
+            .filter(|cred| {
+                !self
+                    .claude
+                    .iter()
+                    .any(|em| accounts::email_matches(em, cred))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Whether every account `fleet` lists is one this machine's own files show (Claude Code's
+    /// or a credential's, never the roster that mirrors the fleet), as each of a fleet discovery
+    /// wrote is.
+    fn shows_all(&self, fleet: &FleetRoster) -> bool {
+        fleet.accounts.iter().all(|acct| {
+            self.claude
+                .iter()
+                .chain(&self.credentials)
+                .any(|em| accounts::email_matches(em, &acct.email))
+        })
+    }
+}
+
+/// Reads [`Shown`] from `env`'s home, state and config.
+fn local_shows(env: &Env) -> Shown {
+    let mut shown = Shown::default();
+    let record = |into: &mut BTreeSet<String>, candidate: &str| {
         let trimmed = candidate.trim();
         if !trimmed.is_empty() && accounts::email_refusal(trimmed).is_none() {
-            emails.insert(trimmed.to_owned());
+            into.insert(trimmed.to_owned());
         }
     };
     if let Some(de) = read_default_profile_email(env) {
-        record_email(&de);
+        record(&mut shown.claude, &de);
     }
     if let Some(home) = &env.home {
         if let Ok(entries) = fs::read_dir(home) {
@@ -1326,7 +1665,7 @@ fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<Fleet
                         .and_then(|o| o.get("emailAddress"))
                         .and_then(Value::as_str)
                 {
-                    record_email(em);
+                    record(&mut shown.claude, em);
                 }
             }
         }
@@ -1337,7 +1676,7 @@ fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<Fleet
         {
             for prov in providers.values() {
                 if let Some(em) = prov.get("user_email").and_then(Value::as_str) {
-                    record_email(em);
+                    record(&mut shown.credentials, em);
                 }
             }
         }
@@ -1347,7 +1686,7 @@ fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<Fleet
     {
         for row in &roster.rows {
             if let Some(em) = row.email.as_deref() {
-                record_email(em);
+                record(&mut shown.roster, em);
             }
         }
     }
@@ -1357,7 +1696,7 @@ fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<Fleet
         env.config.as_deref(),
     ) {
         if let Some(u) = mb.user.as_deref().filter(|u| u.contains('@')) {
-            record_email(u);
+            record(&mut shown.credentials, u);
         }
         for key in mb
             .passwords
@@ -1365,7 +1704,7 @@ fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<Fleet
             .chain(mb.mailbox_passwords.keys())
             .chain(mb.totp_secrets.keys())
         {
-            record_email(key);
+            record(&mut shown.credentials, key);
         }
     }
     if let Ok(entries) = fs::read_dir(accounts::Store::at(&env.state).logins_dir()) {
@@ -1381,14 +1720,14 @@ fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<Fleet
                     .and_then(|o| o.get("emailAddress"))
                     .and_then(Value::as_str)
             {
-                record_email(em);
+                record(&mut shown.claude, em);
             }
             if let Ok(text) =
                 read_local_source_text(&dir_path.join(accounts::RENEWAL_CHECKPOINT_FILE))
                 && let Ok(v) = aterm_json::from_str::<Value>(&text)
                 && let Some(em) = v.get("email").and_then(Value::as_str)
             {
-                record_email(em);
+                record(&mut shown.claude, em);
             }
         }
     }
@@ -1403,7 +1742,7 @@ fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<Fleet
                         .and_then(|o| o.get("emailAddress"))
                         .and_then(Value::as_str)
                 {
-                    record_email(em);
+                    record(&mut shown.claude, em);
                 }
             }
         }
@@ -1429,34 +1768,20 @@ fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<Fleet
                 }
             }
             files_with_mtime.sort_by_key(|a| std::cmp::Reverse(a.0));
-            files_with_mtime.truncate(32);
-            for (_, path) in files_with_mtime {
-                let Ok(text) = read_local_source_text(&path) else {
-                    continue;
-                };
-                for line in text.lines() {
-                    if line.contains("\"session_context\"")
-                        && line.contains("\"userEmail\"")
-                        && let Ok(v) = aterm_json::from_str::<Value>(line)
-                        && let Some(user_email) = v
-                            .get("attachment")
-                            .filter(|a| {
-                                a.get("type").and_then(Value::as_str) == Some("session_context")
-                            })
-                            .and_then(|a| a.get("context"))
-                            .and_then(|c| c.get("userEmail"))
-                            .and_then(Value::as_str)
-                        && let Some(tok) = user_email
-                            .split([' ', '\t', '\n', '\r', '<', '>', '"', '\''])
-                            .map(|s| s.trim_end_matches(['.', ',', ';', ':']))
-                            .find(|s| s.contains('@'))
-                    {
-                        record_email(tok);
-                    }
-                }
+            files_with_mtime.truncate(TRANSCRIPT_FILES);
+            let paths: Vec<PathBuf> = files_with_mtime.into_iter().map(|(_, p)| p).collect();
+            for email in transcript_emails(&paths, &TRANSCRIPT_SCANS, TRANSCRIPT_SCAN_BYTES) {
+                record(&mut shown.claude, &email);
             }
         }
     }
+    shown
+}
+
+/// The fleet discovery makes of what `shown` holds ([`Shown::all`]) for `env`'s machine, where
+/// it lists at least `min_accounts`.
+fn discovered_fleet(env: &Env, shown: &Shown, min_accounts: usize) -> Option<FleetRoster> {
+    let emails = shown.all();
     if emails.is_empty() {
         return None;
     }
@@ -1495,12 +1820,7 @@ fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<Fleet
     let mut used_labels = BTreeSet::new();
     let mut accounts = Vec::new();
     for (slot, machines, email) in rows_with_slot {
-        let base_label = match (&machines[..], slot) {
-            ([only], None | Some(1)) => only.clone(),
-            ([only], Some(n)) => format!("{only}-{n}"),
-            (many, None | Some(1)) => many.join("-"),
-            (many, Some(n)) => format!("{}-{n}", many.join("-")),
-        };
+        let base_label = discovered_label(&machines, slot);
         let mut label = base_label.clone();
         let mut suffix = 2u32;
         while used_labels.contains(&label) {
@@ -1529,6 +1849,178 @@ fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<Fleet
         source: "local-claude-transcripts".to_owned(),
         accounts,
     })
+}
+
+/// How many transcripts discovery reads, the newest first.
+const TRANSCRIPT_FILES: usize = 32;
+
+/// The most transcript bytes one discovery reads that no earlier one in this process read
+/// ([`transcript_emails`]): a transcript is read from where the last read stopped, so a long one
+/// is finished over several discoveries.
+const TRANSCRIPT_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The longest transcript line discovery reads: a longer one (a tool's output, a file it read)
+/// is passed over unkept, since a `session_context` line is a few KiB.
+const TRANSCRIPT_LINE_MAX: usize = 256 * 1024;
+
+/// How many transcripts [`TRANSCRIPT_SCANS`] remembers before it keeps only the last read's.
+const TRANSCRIPT_SCANS_MAX: usize = 4 * TRANSCRIPT_FILES;
+
+/// What discovery has read of one transcript in this process ([`transcript_emails`]).
+struct TranscriptScan {
+    /// The file it read (device and inode where the platform names them).
+    id: Option<(u64, u64)>,
+    /// The file's length when it was read.
+    len: u64,
+    /// The file's modification time when it was read.
+    modified: Option<std::time::SystemTime>,
+    /// Where the next read starts: just past the last line read whole.
+    offset: u64,
+    /// The `session_context` emails read so far.
+    emails: BTreeSet<String>,
+}
+
+/// Discovery's reads of transcripts, by path, in this process only (never written anywhere).
+type TranscriptScans = std::sync::Mutex<BTreeMap<PathBuf, TranscriptScan>>;
+
+static TRANSCRIPT_SCANS: TranscriptScans = std::sync::Mutex::new(BTreeMap::new());
+
+/// The email of a transcript `line` that is Claude Code's `session_context` attachment
+/// (`attachment.context.userEmail`), its first word holding an `@`.
+fn session_context_email(line: &str) -> Option<String> {
+    if !line.contains("\"session_context\"") || !line.contains("\"userEmail\"") {
+        return None;
+    }
+    let v: Value = aterm_json::from_str(line).ok()?;
+    let attachment = v.get("attachment")?;
+    if attachment.get("type").and_then(Value::as_str) != Some("session_context") {
+        return None;
+    }
+    let user_email = attachment.get("context")?.get("userEmail")?.as_str()?;
+    user_email
+        .split([' ', '\t', '\n', '\r', '<', '>', '"', '\''])
+        .map(|s| s.trim_end_matches(['.', ',', ';', ':']))
+        .find(|s| s.contains('@'))
+        .map(str::to_owned)
+}
+
+/// Calls `each` with every line of `reader` no longer than `line_max` bytes (without its
+/// newline), passing longer ones over without keeping more than `line_max` bytes of any; a last
+/// line with no newline is handed over too. Returns how many bytes were read up to and through
+/// the last newline.
+fn each_bounded_line(
+    reader: &mut impl BufRead,
+    line_max: usize,
+    mut each: impl FnMut(&[u8]),
+) -> io::Result<u64> {
+    let mut line = Vec::new();
+    let mut overlong = false;
+    let mut read = 0u64;
+    let mut through_newline = 0u64;
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            break;
+        }
+        let (take, ends) = match buf.iter().position(|&b| b == b'\n') {
+            Some(at) => (at, true),
+            None => (buf.len(), false),
+        };
+        if !overlong {
+            if line.len() + take <= line_max {
+                line.extend_from_slice(&buf[..take]);
+            } else {
+                overlong = true;
+                line.clear();
+            }
+        }
+        let used = take + usize::from(ends);
+        reader.consume(used);
+        read += used as u64;
+        if ends {
+            if !overlong {
+                each(&line);
+            }
+            line.clear();
+            overlong = false;
+            through_newline = read;
+        }
+    }
+    if !overlong && !line.is_empty() {
+        each(&line);
+    }
+    Ok(through_newline)
+}
+
+/// The `session_context` emails ([`session_context_email`]) of the transcripts at `paths`, each
+/// read line by line ([`TRANSCRIPT_LINE_MAX`]) whatever its size, from where `scans` says the
+/// last read of it stopped: a file that only grew is read from there, and one that shrank or
+/// changed in place or was replaced is read again from its start. At most `budget` bytes are read
+/// in all; a file the budget cut short is read on from there next time. A link or a file that is
+/// not a regular one is not read.
+fn transcript_emails(paths: &[PathBuf], scans: &TranscriptScans, budget: u64) -> BTreeSet<String> {
+    let mut scans = scans
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut left = budget;
+    let mut emails = BTreeSet::new();
+    for path in paths {
+        let Ok(file) = astream_sys::open_nonblocking(path, astream_sys::Links::Refuse) else {
+            continue;
+        };
+        let Ok(meta) = file.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        let id = {
+            use std::os::unix::fs::MetadataExt as _;
+            Some((meta.dev(), meta.ino()))
+        };
+        #[cfg(not(unix))]
+        let id = None;
+        let (len, modified) = (meta.len(), meta.modified().ok());
+        let mut scan = match scans.remove(path) {
+            Some(held) if held.id == id && held.len == len && held.modified == modified => held,
+            Some(held) if held.id == id && len > held.len => held,
+            _ => TranscriptScan {
+                id,
+                len,
+                modified,
+                offset: 0,
+                emails: BTreeSet::new(),
+            },
+        };
+        let want = len.saturating_sub(scan.offset).min(left);
+        if want > 0 {
+            let mut file = file;
+            if file.seek(SeekFrom::Start(scan.offset)).is_ok() {
+                let mut reader = io::BufReader::with_capacity(64 * 1024, file.take(want));
+                let found = &mut scan.emails;
+                if let Ok(through) = each_bounded_line(&mut reader, TRANSCRIPT_LINE_MAX, |line| {
+                    if let Some(email) = std::str::from_utf8(line)
+                        .ok()
+                        .and_then(session_context_email)
+                    {
+                        found.insert(email);
+                    }
+                }) {
+                    scan.offset = scan.offset.saturating_add(through);
+                }
+                left -= want;
+            }
+        }
+        scan.len = len;
+        scan.modified = modified;
+        emails.extend(scan.emails.iter().cloned());
+        scans.insert(path.clone(), scan);
+    }
+    if scans.len() > TRANSCRIPT_SCANS_MAX {
+        scans.retain(|path, _| paths.contains(path));
+    }
+    emails
 }
 
 const SOURCE_TEXT_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -1653,6 +2145,9 @@ struct SyncedAccounts {
     fleet_path: PathBuf,
     state: accounts::State,
     note: Option<String>,
+    /// Whether the sync changed anything: a file whose bytes differ from what it held (each is
+    /// written only then), account state or logins, or a ledger row.
+    changed: bool,
 }
 
 struct FleetSnapshot {
@@ -1731,6 +2226,46 @@ fn persist_accounts_sync(
     let (fleet_write_to, fleet_mode) = super::cli::roster_target(&fleet_path)?;
     let fleet_toml = fleet.to_toml_for(Some(opt_in));
     let default_row_label = roster.row_for_login(None).map(|r| r.label.clone());
+    // The labels the fleet gave another account than the one the roster gave them: what is on
+    // record under each is the account it held before, never the one it holds now.
+    let relabelled: Vec<String> = roster
+        .rows
+        .iter()
+        .filter(|row| {
+            existing
+                .row(&row.label)
+                .and_then(|was| was.email.as_deref())
+                .zip(row.email.as_deref())
+                .is_some_and(|(was, now)| !accounts::email_matches(was, now))
+        })
+        .map(|row| row.label.clone())
+        .collect();
+    // The default login's account under a new label because the fleet gave its old one to
+    // another account: its record moves with it, and nothing was written over.
+    let default_moved = existing.row_for_login(None).and_then(|was| {
+        let now_row = roster.row_for_login(None)?;
+        (relabelled.contains(&was.label)
+            && now_row.label != was.label
+            && existing.row(&now_row.label).is_none()
+            && was
+                .email
+                .as_deref()
+                .zip(now_row.email.as_deref())
+                .is_some_and(|(was, now)| accounts::email_matches(was, now)))
+        .then(|| (was.label.clone(), now_row.label.clone()))
+    });
+    // The row the default login held before: where the profile now names another row's account,
+    // the vendor's own sign-in wrote over the one login that row had here. A label the fleet gave
+    // another account was written over by no sign-in.
+    let displaced = existing
+        .row_for_login(None)
+        .map(|r| r.label.clone())
+        .filter(|was| {
+            default_email.is_some()
+                && default_row_label.as_deref().is_some_and(|now| now != was)
+                && roster.row(was).is_some_and(|r| r.dir.is_some())
+                && !relabelled.contains(was)
+        });
     let default_matched = default_email.is_some_and(|de| {
         roster
             .row_for_login(None)
@@ -1739,9 +2274,32 @@ fn persist_accounts_sync(
     });
     let mut note = None;
     let mut publishing = false;
-    store
+    // A sync that finds what is already there writes nothing: each file is replaced only where
+    // its bytes differ, so a periodic caller rewrites no file and wakes no watcher.
+    let mut changed = false;
+    let mut publish_if_changed = |path: &Path, held: Option<&[u8]>, text: &str, mode| {
+        if held == Some(text.as_bytes()) {
+            return Ok(());
+        }
+        changed = true;
+        super::upgrade_models::write_atomic_mode(path, text, mode)
+            .map_err(|why| format!("could not write {}: {why}", path.display()))
+    };
+    let roster_held = fs::read(&write_to).ok();
+    let fleet_held = fs::read(&fleet_write_to).ok();
+    let mut state_changed = false;
+    let events = store
         .transact_logins_held(&held, now, &mut note, |state, logins| {
             publishing = true;
+            let before = (state.clone(), logins.clone());
+            for label in &relabelled {
+                match &default_moved {
+                    Some((from, to)) if from == label => {
+                        accounts::move_account(state, logins, from, to);
+                    }
+                    _ => accounts::forget_account(state, logins, label),
+                }
+            }
             for row in &roster.rows {
                 if let Some(dir) = &row.dir {
                     aterm_types::fs_restricted::ensure_private_dir(&store.logins_dir())
@@ -1751,13 +2309,20 @@ fn persist_accounts_sync(
                         .map_err(|why| format!("could not create {dir}: {why}"))?;
                 }
             }
-            super::upgrade_models::write_atomic_mode(&write_to, &roster_toml, keep_mode)
-                .map_err(|why| format!("could not write {}: {why}", write_to.display()))?;
-            super::upgrade_models::write_atomic_mode(&fleet_write_to, &fleet_toml, fleet_mode)
-                .map_err(|why| format!("could not write {}: {why}", fleet_write_to.display()))?;
+            publish_if_changed(&write_to, roster_held.as_deref(), &roster_toml, keep_mode)?;
+            publish_if_changed(
+                &fleet_write_to,
+                fleet_held.as_deref(),
+                &fleet_toml,
+                fleet_mode,
+            )?;
             for expected in fleet_snapshots.iter().filter(|snapshot| snapshot.publish) {
-                super::upgrade_models::write_atomic_mode(&expected.path, &fleet_toml, Some(0o600))
-                    .map_err(|why| format!("could not write {}: {why}", expected.path.display()))?;
+                publish_if_changed(
+                    &expected.path,
+                    expected.bytes.as_deref(),
+                    &fleet_toml,
+                    Some(0o600),
+                )?;
             }
             let mut events = Vec::new();
             if let Some(label) = &default_row_label {
@@ -1780,6 +2345,33 @@ fn persist_accounts_sync(
                         ));
                     }
                 }
+                // A row bound to a login of its own kept it: only the default login was replaced.
+                if let Some(was) = &displaced
+                    && logins.get(was).is_none_or(|b| b.dir.is_none())
+                {
+                    events.extend(accounts::note_displaced(state, logins, was, label, now));
+                }
+            }
+            // No row whose login directory holds no login is on record as a working login (a
+            // default login written over before its row was told, a directory emptied by hand).
+            for row in &roster.rows {
+                let dir = logins
+                    .get(&row.label)
+                    .and_then(|b| b.dir.clone())
+                    .or_else(|| row.dir.clone());
+                if dir.is_some_and(|dir| !accounts::login_made(Path::new(&dir)))
+                    && state
+                        .accounts
+                        .get(&row.label)
+                        .is_some_and(|a| a.auth == accounts::Auth::Ok)
+                {
+                    events.extend(accounts::note_auth(
+                        state,
+                        &row.label,
+                        accounts::Auth::SignedOut,
+                        now,
+                    ));
+                }
             }
             for (wall_label, wall) in standing_walls {
                 if roster.row(wall_label).is_none() {
@@ -1794,6 +2386,7 @@ fn persist_accounts_sync(
                 let at = i64::try_from(wall.at).unwrap_or(now).min(now);
                 events.extend(accounts::note_wall(state, wall_label, win, until, at, now));
             }
+            state_changed = (&*state, &*logins) != (&before.0, &before.1);
             Ok(events)
         })
         .map_err(|why| {
@@ -1806,12 +2399,15 @@ fn persist_accounts_sync(
                 format!("sync refused before roster publication: {why}")
             }
         })?;
-    store.touch_wake().map_err(|why| {
-        format!(
-            "sync files were published but the wake marker could not be written: {why}; \
-             the published files are kept"
-        )
-    })?;
+    let changed = changed || state_changed || !events.is_empty();
+    if changed {
+        store.touch_wake().map_err(|why| {
+            format!(
+                "sync files were published but the wake marker could not be written: {why}; \
+                 the published files are kept"
+            )
+        })?;
+    }
     let (state, read) = store.load(now).map_err(|why| {
         format!(
             "sync files were published but their state could not be read: {why}; \
@@ -1826,6 +2422,7 @@ fn persist_accounts_sync(
         fleet_path,
         state,
         note,
+        changed,
     })
 }
 
@@ -1847,7 +2444,7 @@ pub fn run_accounts_sync(
 }
 
 struct SyncHow<'a> {
-    fetch: &'a Fetch,
+    fetch: &'a Fetch<'a>,
     ladder: &'a [Duration],
     fleet_snapshots: &'a [FleetSnapshot],
 }
@@ -1873,24 +2470,8 @@ fn run_accounts_sync_with(
         }
     };
     let default_email = read_default_profile_email(env);
-    let email_machine = || {
-        default_email.as_deref().and_then(|de| {
-            fleet
-                .accounts
-                .iter()
-                .find(|a| accounts::email_matches(&a.email, de))
-                .and_then(|a| a.machines.first().cloned())
-        })
-    };
-    let explicit_machine = machine_override
-        .and_then(normalize_machine_id)
-        .or_else(|| config_machine_id(env.config.as_deref()));
-    let machine = explicit_machine.or_else(|| {
-        detect_machine_id(None, None)
-            .filter(|m| !fleet.accounts_for_machine(m).is_empty() || email_machine().is_none())
-            .or_else(email_machine)
-    });
-    let Some(machine) = machine else {
+    let Some(machine) = sync_machine(env, &fleet, default_email.as_deref(), machine_override)
+    else {
         let _ = writeln!(
             err,
             "aterm harness accounts sync: could not determine machine id (`m<N>`); pass `--machine m8`"
@@ -1910,6 +2491,7 @@ fn run_accounts_sync_with(
         fleet_path,
         state,
         note,
+        changed,
     } = match persist_accounts_sync(
         &store,
         &roster_path,
@@ -1973,6 +2555,7 @@ fn run_accounts_sync_with(
             "fleet_accounts".to_owned(),
             Value::from(u64::try_from(fleet.accounts.len()).unwrap_or(0)),
         );
+        o.insert("changed".to_owned(), Value::from(changed));
         o.insert(
             "machine_accounts".to_owned(),
             Value::Array(
@@ -2008,9 +2591,14 @@ fn run_accounts_sync_with(
     } else {
         let _ = writeln!(
             out,
-            "synced machine `{machine}` ({} accounts on this machine, {} across fleet)",
+            "synced machine `{machine}` ({} accounts on this machine, {} across fleet){}",
             roster.rows.len(),
-            fleet.accounts.len()
+            fleet.accounts.len(),
+            if changed {
+                ""
+            } else {
+                "; nothing changed, so no file was written"
+            }
         );
         let _ = writeln!(out, "roster: {}", roster_path.display());
         let _ = writeln!(out, "fleet:  {}", fleet_path.display());
@@ -2052,7 +2640,9 @@ fn run_accounts_sync_with(
         if !needs_renew.is_empty() {
             let _ = writeln!(
                 out,
-                "next step to sign in remaining accounts: aterm harness accounts renew {}",
+                "not signed in yet: {}; aterm signs them in by itself (`aterm harness accounts` \
+                 shows each one's last attempt, `aterm harness accounts renew {}` runs it now)",
+                needs_renew.join(", "),
                 needs_renew.join(" ")
             );
         }
@@ -2060,7 +2650,195 @@ fn run_accounts_sync_with(
     ExitCode::SUCCESS
 }
 
+/// The machine a sync takes `fleet`'s rows for: `machine_override`, else `[fleet] machine`, else
+/// this host's id where the fleet lists it (or the default login, `default_email`, holds no fleet
+/// row), else the first machine of the fleet row the default login holds.
+fn sync_machine(
+    env: &Env,
+    fleet: &FleetRoster,
+    default_email: Option<&str>,
+    machine_override: Option<&str>,
+) -> Option<String> {
+    let email_machine = || {
+        default_email.and_then(|de| {
+            fleet
+                .accounts
+                .iter()
+                .find(|a| accounts::email_matches(&a.email, de))
+                .and_then(|a| a.machines.first().cloned())
+        })
+    };
+    machine_override
+        .and_then(normalize_machine_id)
+        .or_else(|| config_machine_id(env.config.as_deref()))
+        .or_else(|| {
+            detect_machine_id(None, None)
+                .filter(|m| !fleet.accounts_for_machine(m).is_empty() || email_machine().is_none())
+                .or_else(email_machine)
+        })
+}
+
+/// The text each fleet file of `files` ([`FleetOrigin::Local`]) holds with `row` listed as one
+/// more account of this machine ([`sync_machine`]), which the next sync then keeps; a file that
+/// lists it already is left out. Nothing is written here: `accounts add` writes them, under the
+/// accounts lock, before the roster.
+/// # Errors
+/// `row` has no email (a fleet lists each account by its email), a file cannot be read or is
+/// refused, it lists `row`'s label as another account or `row`'s account under another label,
+/// or this machine's id is unknown.
+pub(super) fn list_in_local_fleet(
+    env: &Env,
+    files: &[PathBuf],
+    row: &Row,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    let email = row.email.as_deref().ok_or_else(|| {
+        format!(
+            "{} lists each account by its email, and a sync keeps only the accounts it lists: \
+             pass `--email <address>`; nothing was written",
+            files
+                .first()
+                .map_or_else(|| FLEET_ROSTER_FILE.to_owned(), |f| f.display().to_string())
+        )
+    })?;
+    let default_email = read_default_profile_email(env);
+    let mut texts = Vec::new();
+    for file in files {
+        let text = read_local_source_text(file)
+            .map_err(|why| format!("{}: {why}; nothing was written", file.display()))?;
+        let mut fleet = FleetRoster::from_toml(&text, &file.display().to_string())
+            .map_err(|why| format!("{why}; nothing was written"))?;
+        let machine =
+            sync_machine(env, &fleet, default_email.as_deref(), None).ok_or_else(|| {
+                "could not determine this machine's id (`m<N>`) for the fleet row: set `[fleet] \
+             machine` in aterm.toml; nothing was written"
+                    .to_owned()
+            })?;
+        let same_email = |acct: &FleetAccount| accounts::email_matches(&acct.email, email);
+        if let Some(listed) = fleet.accounts.iter().find(|a| a.label == row.label) {
+            if same_email(listed) && listed.machines.contains(&machine) {
+                continue;
+            }
+            return Err(format!(
+                "{} lists `{}` already as another account, so a sync would give the label that \
+                 one: pick another label; nothing was written",
+                file.display(),
+                row.label
+            ));
+        }
+        if let Some(listed) = fleet.accounts.iter().find(|a| same_email(a)) {
+            return Err(format!(
+                "{} lists that account already, as `{}` (machines {}): a sync keeps one row per \
+                 account; nothing was written",
+                file.display(),
+                listed.label,
+                listed.machines.join(", ")
+            ));
+        }
+        fleet.accounts.push(FleetAccount {
+            label: row.label.clone(),
+            machines: vec![machine],
+            class: row.class,
+            email: email.to_owned(),
+            browser: row.browser.clone(),
+            vendor: accounts::Vendor::default(),
+        });
+        texts.push((file.clone(), fleet.to_toml_for(opt_in_of(&text))));
+    }
+    Ok(texts)
+}
+
 static AUTO_SYNC_COOLDOWN: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// How often a window's upkeep reads this machine's logins and transcripts again for accounts a
+/// fleet discovery made does not list yet ([`init_sync_needed`]).
+const REDISCOVER_EVERY: Duration = Duration::from_secs(15 * 60);
+
+/// How long a window's upkeep waits before it syncs again for the same default login the roster
+/// still does not give its default row ([`default_login_unlisted`]).
+const UNLISTED_RETRY: Duration = Duration::from_secs(10 * 60);
+
+/// What a window's upkeep or the setup pass's resync last did to keep the roster up with this
+/// machine's own logins and sources ([`sync_called_for`]), in this process only.
+#[derive(Debug, Default)]
+struct Rediscovery {
+    /// When it last read this machine's logins and transcripts for new accounts.
+    read_at: Option<Instant>,
+    /// The default login's email it last synced for because the roster's default row was another
+    /// account, and when.
+    synced_for: Option<(String, Instant)>,
+    /// The local file `[fleet] accounts_source` names and its modification time, as last synced
+    /// from ([`key_file_changed`]).
+    key_seen: Option<(PathBuf, std::time::SystemTime)>,
+    /// The addresses a fleet discovery made lists only for a credential, and when they were
+    /// read ([`unclaimed_emails`]).
+    unclaimed: Option<(Instant, BTreeSet<String>)>,
+}
+
+static REDISCOVERY: std::sync::Mutex<Rediscovery> = std::sync::Mutex::new(Rediscovery {
+    read_at: None,
+    synced_for: None,
+    key_seen: None,
+    unclaimed: None,
+});
+
+/// Whether [`REDISCOVER_EVERY`] has passed since the upkeep last read this machine's logins and
+/// transcripts for new accounts; when it has, that read is counted from now.
+fn rediscover_due(rediscovery: &std::sync::Mutex<Rediscovery>) -> bool {
+    let mut held = rediscovery
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held
+        .read_at
+        .is_some_and(|at| at.elapsed() < REDISCOVER_EVERY)
+    {
+        return false;
+    }
+    held.read_at = Some(Instant::now());
+    true
+}
+
+/// Whether a sync is due because the default login holds an account the roster at `roster_path`
+/// does not give its default row (one no row lists, or another row's: the vendor's own sign-in
+/// on the default login changed it): at once for an email the upkeep has not synced for, else
+/// once per [`UNLISTED_RETRY`]. Only a roster a configured source writes is synced
+/// ([`configured_source`]); one written by hand stays as written.
+fn default_login_unlisted(
+    home: &Path,
+    state_dir: &Path,
+    (roster_path, config): (&Path, &Path),
+    now: i64,
+    rediscovery: &std::sync::Mutex<Rediscovery>,
+) -> bool {
+    if configured_source(Some(config), Some(roster_path)).is_none() {
+        return false;
+    }
+    let Ok(roster) = Roster::load(roster_path) else {
+        return false;
+    };
+    if roster.rows.is_empty() {
+        return false;
+    }
+    let Some(email) = read_default_profile_email(&quiet_env(home, state_dir, config, now)) else {
+        return false;
+    };
+    if roster
+        .row_for_login(None)
+        .and_then(|row| row.email.as_deref())
+        .is_some_and(|held| accounts::email_matches(held, &email))
+    {
+        return false;
+    }
+    let mut held = rediscovery
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.synced_for.as_ref().is_some_and(|(was, at)| {
+        accounts::email_matches(was, &email) && at.elapsed() < UNLISTED_RETRY
+    }) {
+        return false;
+    }
+    held.synced_for = Some((email, Instant::now()));
+    true
+}
 
 /// Which of the upkeep's two works one call makes ([`upkeep_live`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2086,11 +2864,15 @@ impl UpkeepStep {
 /// What one upkeep of the window's fleet accounts did ([`upkeep_live`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Upkept {
-    /// No automatic source is configured ([`configured_source`]); a saved explicit selection
-    /// may still progress.
+    /// No automatic source is configured ([`configured_source`]), so nothing is fetched; a saved
+    /// explicit selection may still progress, and the rows of a roster that stands are still
+    /// signed in by the automatic ladder ([`auto_renew_next_account`]) unless the config turns
+    /// sign-ins off ([`sign_ins_on`]).
     Unconfigured {
         /// [`fleet_file_ignored`].
         fleet_file_ignored: bool,
+        /// A renewal or saved selection progressed.
+        renewal: bool,
     },
     /// A source is configured (`kind`, [`FleetSource::kind`]).
     Configured {
@@ -2104,19 +2886,166 @@ pub enum Upkept {
 }
 
 struct UpkeepEffects<'a> {
-    fetch: &'a Fetch,
+    fetch: &'a Fetch<'a>,
     spawn_renewal: &'a SpawnRenewal,
     sync_cooldown: &'a std::sync::Mutex<Option<Instant>>,
+    /// When the upkeep last caught its roster up with this machine's own logins
+    /// ([`rediscover_due`], [`default_login_unlisted`]).
+    rediscovery: &'a std::sync::Mutex<Rediscovery>,
     renew_guard: &'a std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    /// Whether a headless-capable browser is installed for `home` ([`browser_installed`]).
+    find_browser: &'a (dyn Fn(&Path) -> bool + Sync),
+    /// One bounded `aterm secrets sync` for `home` ([`run_vault_sync`]).
+    vault_sync: fn(&Path) -> super::sign_in_ladder::Vault,
+    /// Where that sync runs, off the caller's thread ([`spawn_vault_thread`]).
+    spawn_vault: &'a SpawnRenewal,
+    /// What the configured mailbox offers a row's sign-in ([`ladder_mailbox_live`]).
+    mailbox: &'a LadderMailbox,
+    /// Where each automatic sign-in's one line goes ([`log_sign_in`]).
+    log: SignInLog,
+    /// One run of `claude auth login` for a route, where it is not the live one
+    /// ([`spawn_row_renewal`]).
+    run_attempt: Option<RunAttempt>,
 }
 
 type SpawnRenewal = dyn Fn(Box<dyn FnOnce() + Send>) -> io::Result<()> + Sync;
+
+/// [`UpkeepEffects::mailbox`]: what the configured mailbox offers `row` for `home` and `store`.
+type LadderMailbox =
+    dyn Fn(&Path, &accounts::Store, &accounts::Row) -> super::sign_in_ladder::Mailbox + Sync;
+
+/// [`UpkeepEffects::log`].
+type SignInLog = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// [`UpkeepEffects::run_attempt`]: one run with the browser it is handed, headless where the
+/// flag says so, and how it ended.
+type RunAttempt =
+    std::sync::Arc<dyn Fn(&super::cli::RenewBrowser, bool) -> super::cli::Renewal + Send + Sync>;
 
 fn spawn_renewal_thread(work: Box<dyn FnOnce() + Send>) -> io::Result<()> {
     std::thread::Builder::new()
         .name("aterm-auto-renew".to_owned())
         .spawn(work)
         .map(|_| ())
+}
+
+fn spawn_vault_thread(work: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("aterm-vault-sync".to_owned())
+        .spawn(work)
+        .map(|_| ())
+}
+
+/// The live [`UpkeepEffects::find_browser`]: [`super::headless_oauth::find_headless_browser`].
+fn browser_installed(home: &Path) -> bool {
+    super::headless_oauth::find_headless_browser(Some(home)).is_some()
+}
+
+/// How long one `aterm secrets sync` of the ladder may take before it is ended.
+const VAULT_SYNC_BUDGET: Duration = Duration::from_secs(45);
+
+/// The live [`UpkeepEffects::vault_sync`]: this program's own `secrets sync`, with no terminal,
+/// its stdin empty, at most [`VAULT_SYNC_BUDGET`] (the LAN vault's fetch, its verification and
+/// the files it delivers, `~/.secrets/ai-mailbox.toml` among them).
+fn run_vault_sync(home: &Path) -> super::sign_in_ladder::Vault {
+    use super::sign_in_ladder::Vault;
+    // Only the shipped executable (or a build of it) takes `secrets sync`: a test binary or
+    // another host of this library would read the words as its own arguments.
+    let Some(exe) = std::env::current_exe().ok().filter(|exe| {
+        exe.file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "aterm")
+    }) else {
+        return Vault::Failed("this program is not aterm".to_owned());
+    };
+    let mut cmd = aterm_uds::spawnfd::command(&exe);
+    cmd.args(["secrets", "sync"]).env("HOME", home);
+    match super::align::capture_bounded(cmd, VAULT_SYNC_BUDGET, 16 * 1024) {
+        Ok(ran) => Vault::of_sync(&String::from_utf8_lossy(&ran.stdout), ran.code),
+        Err(why) => Vault::of_run_error(&why, VAULT_SYNC_BUDGET),
+    }
+}
+
+/// The live [`UpkeepEffects::mailbox`]: the mailbox `row`'s sign-in reads, from the process's
+/// environment ([`super::open_url::MAILBOX_ENV`] and its kin) and the mailbox files.
+fn ladder_mailbox_live(
+    home: &Path,
+    store: &accounts::Store,
+    row: &accounts::Row,
+) -> super::sign_in_ladder::Mailbox {
+    mailbox_offer(
+        resolve_mailbox_dir(Some(home), store).is_some(),
+        super::headless_oauth::discover_mailbox_config(Some(home), Some(&store.dir)),
+        row,
+    )
+}
+
+/// [`ladder_mailbox_live`] read from the mailbox files under `home` and `store` alone, never the
+/// process's environment: a test's mailbox is its scratch home's.
+#[cfg(test)]
+fn ladder_mailbox_files(
+    home: &Path,
+    store: &accounts::Store,
+    row: &accounts::Row,
+) -> super::sign_in_ladder::Mailbox {
+    let dir_found = [
+        store.dir.join(super::open_url::DEFAULT_MAILBOX_DIR),
+        home.join(".config/aterm")
+            .join(super::open_url::DEFAULT_MAILBOX_DIR),
+    ]
+    .iter()
+    .any(|dir| dir.is_dir());
+    mailbox_offer(
+        dir_found,
+        super::headless_oauth::discover_mailbox_config_files(Some(home), Some(&store.dir), None),
+        row,
+    )
+}
+
+/// What a mailbox read offers `row`: a mailbox folder (`dir_found`) or a configuration that
+/// reads its inbox over a folder, HTTP or IMAP is ready; one that names only a webmail inbox
+/// needs a headless browser; none for the row is none.
+fn mailbox_offer(
+    dir_found: bool,
+    cfg: Option<super::headless_oauth::MailboxConfig>,
+    row: &accounts::Row,
+) -> super::sign_in_ladder::Mailbox {
+    use super::sign_in_ladder::Mailbox;
+    if dir_found {
+        return Mailbox::Ready;
+    }
+    let email = row.email.as_deref();
+    match cfg {
+        Some(mut cfg) => {
+            cfg.alias_label_to_email(Some(&row.label), email);
+            if !cfg.is_configured_for(email) {
+                Mailbox::None
+            } else if cfg.dir.is_some()
+                || cfg.http_url.is_some()
+                || cfg.effective_imap_url(email).is_some()
+            {
+                Mailbox::Ready
+            } else {
+                Mailbox::WebmailOnly
+            }
+        }
+        None => Mailbox::None,
+    }
+}
+
+/// Where an automatic sign-in's `aterm.log` line goes ([`log_sign_ins_to`]); unset, nowhere.
+static SIGN_IN_LOG: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Sends each automatic sign-in's one line (its routes and how it ended) to `log`: the window's
+/// `aterm.log`. The first call wins.
+pub fn log_sign_ins_to(log: fn(&str)) {
+    let _ = SIGN_IN_LOG.set(log);
+}
+
+fn log_sign_in(line: &str) {
+    if let Some(log) = SIGN_IN_LOG.get() {
+        log(line);
+    }
 }
 
 /// THE WINDOW'S FLEET ACCOUNTS' UPKEEP, the one way a window reaches this module.
@@ -2127,17 +3056,24 @@ pub fn upkeep_live(
     now: i64,
     step: UpkeepStep,
 ) -> Upkept {
-    upkeep(
-        home,
-        state_dir,
-        (roster_path, now, step),
-        &UpkeepEffects {
-            fetch: &fetch_source_text,
-            spawn_renewal: &spawn_renewal_thread,
-            sync_cooldown: &AUTO_SYNC_COOLDOWN,
-            renew_guard: &AUTO_RENEW_GUARD,
-        },
-    )
+    upkeep(home, state_dir, (roster_path, now, step), &live_effects())
+}
+
+/// The effects the live upkeep makes.
+fn live_effects() -> UpkeepEffects<'static> {
+    UpkeepEffects {
+        fetch: &fetch_source_text,
+        spawn_renewal: &spawn_renewal_thread,
+        sync_cooldown: &AUTO_SYNC_COOLDOWN,
+        rediscovery: &REDISCOVERY,
+        renew_guard: &AUTO_RENEW_GUARD,
+        find_browser: &browser_installed,
+        vault_sync: run_vault_sync,
+        spawn_vault: &spawn_vault_thread,
+        mailbox: &ladder_mailbox_live,
+        log: std::sync::Arc::new(log_sign_in),
+        run_attempt: None,
+    }
 }
 
 /// Claude Code's pool's upkeep ([`upkeep_claude`]), then the other CLIs' ([`upkeep_pools`]),
@@ -2160,38 +3096,32 @@ fn upkeep_claude(
     fx: &UpkeepEffects<'_>,
 ) -> Upkept {
     let config = config_beside(roster_path);
-    if step.syncs() {
-        let secrets = home.join(".secrets");
-        let unconfigured_with_secrets = configured_source(Some(&config), Some(roster_path))
-            .is_none()
-            && ([
-                FLEET_ROSTER_FILE,
-                "ai-accounts.csv",
-                super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
-                super::headless_oauth::MAILBOX_TOML_FILE,
-            ]
-            .into_iter()
-            .any(|name| secrets.join(name).is_file())
-                || (secrets.is_dir()
-                    && super::headless_oauth::discover_mailbox_config_files(
-                        Some(home),
-                        None,
-                        Some(&config),
-                    )
-                    .is_some()));
-        if unconfigured_with_secrets || needs_init_accounts_sync(home, state_dir, roster_path, now)
-        {
-            let _ = sync_accounts_for_init(home, state_dir, roster_path, now);
-        }
+    if step.syncs() && sync_called_for(home, state_dir, (roster_path, &config), now, fx.rediscovery)
+    {
+        let _ = sync_accounts_for_init_with(home, state_dir, roster_path, now, || {}, fx.fetch);
     }
     // A saved explicit choice is independent of automatic fleet-source admission.
     let pending = step
         .renews()
         .then(|| resume_pending_pin(home, state_dir, roster_path, now, fx))
         .flatten();
+    // The ladder signs rows in by default; a person's own `[harness] logins = "off"` or
+    // `enabled = false` turns it off (a saved explicit choice above still completes).
+    let signs_in = step.renews() && sign_ins_on(&config);
     let Some(source) = configured_source(Some(&config), Some(roster_path)) else {
+        // A roster written by hand or kept from before is signed in like a fetched one: the
+        // ladder needs only its rows, never a source.
+        let renewal = pending.map_or_else(
+            || {
+                signs_in
+                    && roster_path.is_file()
+                    && auto_renew_next_account(home, state_dir, roster_path, now, fx)
+            },
+            RenewalDispatch::progressed,
+        );
         return Upkept::Unconfigured {
             fleet_file_ignored: fleet_file_ignored(roster_path),
+            renewal,
         };
     };
     let roster = if step.syncs() {
@@ -2200,7 +3130,7 @@ fn upkeep_claude(
         roster_path.exists()
     };
     let renewal = pending.map_or_else(
-        || step.renews() && auto_renew_next_account(home, state_dir, roster_path, now, fx),
+        || signs_in && auto_renew_next_account(home, state_dir, roster_path, now, fx),
         RenewalDispatch::progressed,
     );
     Upkept::Configured {
@@ -2208,6 +3138,97 @@ fn upkeep_claude(
         roster,
         renewal,
     }
+}
+
+/// Whether the config at `config` lets the harness sign rows in by itself: the harness on
+/// (`[harness] enabled`) and its login lifecycle on (`[harness] logins`), as both are unless a
+/// person turned one off.
+fn sign_ins_on(config: &Path) -> bool {
+    let (cfg, _) = crate::supervise::config::SupervisorConfig::from_path(Some(config));
+    cfg.enabled && cfg.logins
+}
+
+/// THE ONE RULE OF WHEN A PERIODIC CALLER SYNCS a roster that stands (a window's upkeep, the
+/// setup pass's [`resync_for_setup`]): when something it is made from changed. That is
+/// `~/.secrets` holding a fleet, a sheet or a mailbox where no source is configured yet; a vault
+/// fleet or sheet the fleet file does not match, or accounts this machine's own logins show that
+/// a fleet discovery made does not list ([`init_sync_needed`], read every [`REDISCOVER_EVERY`]);
+/// the default login holding an account the roster's default row is not
+/// ([`default_login_unlisted`]); or a `[fleet] accounts_source` that is a local file this process
+/// has not synced from as it stands ([`key_file_changed`]). A sync that runs and finds nothing new
+/// writes nothing ([`persist_accounts_sync`]).
+fn sync_called_for(
+    home: &Path,
+    state_dir: &Path,
+    (roster_path, config): (&Path, &Path),
+    now: i64,
+    rediscovery: &std::sync::Mutex<Rediscovery>,
+) -> bool {
+    let secrets = home.join(".secrets");
+    let configured = configured_source(Some(config), Some(roster_path));
+    let unconfigured_with_secrets = configured.is_none()
+        && ([
+            FLEET_ROSTER_FILE,
+            ACCOUNTS_CSV_FILE,
+            super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+            super::headless_oauth::MAILBOX_TOML_FILE,
+        ]
+        .into_iter()
+        .any(|name| secrets.join(name).is_file())
+            || (secrets.is_dir()
+                && super::headless_oauth::discover_mailbox_config_files(
+                    Some(home),
+                    None,
+                    Some(config),
+                )
+                .is_some()));
+    // A roster stays up with this machine's own logins: a default login the vendor's sign-in
+    // moved to another account is synced for at this upkeep (its displaced row is then signed in
+    // like any other), and a fleet discovery made takes the accounts discovery finds, read again
+    // every REDISCOVER_EVERY.
+    unconfigured_with_secrets
+        || init_sync_needed(
+            home,
+            state_dir,
+            roster_path,
+            now,
+            rediscover_due(rediscovery),
+        )
+        || default_login_unlisted(home, state_dir, (roster_path, config), now, rediscovery)
+        || matches!(configured, Some(FleetSource::Key(_)))
+            && key_file_changed(home, state_dir, config, now, rediscovery)
+}
+
+/// Whether `[fleet] accounts_source` names a local file this process has not synced from as it
+/// stands now (its modification time is not the one last seen): at the first read of a file that
+/// is there, then each time it changes. A URL is read only when the roster is missing or a person
+/// syncs.
+fn key_file_changed(
+    home: &Path,
+    state_dir: &Path,
+    config: &Path,
+    now: i64,
+    rediscovery: &std::sync::Mutex<Rediscovery>,
+) -> bool {
+    let Some(source) = source_key(config) else {
+        return false;
+    };
+    let Ok(FetchPlan::File(path)) = fetch_plan(&quiet_env(home, state_dir, config, now), &source)
+    else {
+        return false;
+    };
+    let Ok(modified) = fs::metadata(&path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let seen = (path, modified);
+    let mut held = rediscovery
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.key_seen.as_ref() == Some(&seen) {
+        return false;
+    }
+    held.key_seen = Some(seen);
+    true
 }
 
 fn config_beside(roster: &Path) -> PathBuf {
@@ -2344,7 +3365,9 @@ pub fn has_init_accounts_source(
     discover_local_fleet_with_min(&env, min_accounts).is_some()
 }
 
-/// Whether `~/.secrets/` holds updated fleet or mailbox accounts not yet converged into `roster_path`.
+/// Whether `~/.secrets/` holds an updated fleet or accounting sheet not yet converged into
+/// `roster_path`, or, for a fleet discovery made ([`fleet_takes_discovered`]), local discovery
+/// (a mailbox file's accounts among what it reads) finds an account the fleet does not list yet.
 #[must_use]
 pub fn needs_init_accounts_sync(
     home: &Path,
@@ -2352,11 +3375,23 @@ pub fn needs_init_accounts_sync(
     roster_path: &Path,
     now: i64,
 ) -> bool {
+    init_sync_needed(home, state_dir, roster_path, now, true)
+}
+
+/// [`needs_init_accounts_sync`]; `discover` false reads this machine's logins and transcripts
+/// only where a mailbox file names accounts (a window's upkeep between [`REDISCOVER_EVERY`]s).
+fn init_sync_needed(
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+    discover: bool,
+) -> bool {
     let secrets = home.join(".secrets");
     let Some(fb) = fleet_file_beside(roster_path) else {
         return false;
     };
-    if fleet_file_opt_in(&fb) != Some(OptIn::Named) {
+    if !fleet_file_opt_in(&fb).is_some_and(OptIn::opts_in_by_file) {
         return false;
     }
     let secrets_fleet = secrets.join(FLEET_ROSTER_FILE);
@@ -2369,6 +3404,7 @@ pub fn needs_init_accounts_sync(
     let Ok(existing_fleet) = FleetRoster::from_toml(&existing_text, "fleet-accounts.toml") else {
         return false;
     };
+    let opt_in = opt_in_of(&existing_text);
     let secrets_csv = secrets.join("ai-accounts.csv");
     if !secrets_fleet.is_file()
         && secrets_csv.is_file()
@@ -2383,13 +3419,19 @@ pub fn needs_init_accounts_sync(
     {
         return true;
     }
+    // Discovery's accounts are added only to a fleet discovery made: a fleet from a vault, a
+    // sheet or a URL stays as its source wrote it, and a person's list as they wrote it.
+    if !fleet_of_this_machine(opt_in, &existing_fleet) {
+        return false;
+    }
     let config_path = config_beside(roster_path);
-    if ![
-        super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
-        super::headless_oauth::MAILBOX_TOML_FILE,
-    ]
-    .into_iter()
-    .any(|name| secrets.join(name).is_file())
+    if !discover
+        && ![
+            super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+            super::headless_oauth::MAILBOX_TOML_FILE,
+        ]
+        .into_iter()
+        .any(|name| secrets.join(name).is_file())
         && !(secrets.is_dir()
             && super::headless_oauth::discover_mailbox_config_files(
                 Some(home),
@@ -2425,16 +3467,21 @@ pub fn needs_init_accounts_sync(
         claude_tmp: None,
         claude_running: None,
     };
-    discover_local_fleet_with_min(&env, 1).is_some_and(|local| {
-        local.accounts.iter().any(|acct| {
-            !existing_fleet
-                .accounts
-                .iter()
-                .any(|a| accounts::email_matches(&a.email, &acct.email))
+    let shown = local_shows(&env);
+    fleet_takes_discovered(opt_in, &existing_fleet, || shown.clone())
+        && discovered_fleet(&env, &shown, 1).is_some_and(|local| {
+            local.accounts.iter().any(|acct| {
+                !existing_fleet
+                    .accounts
+                    .iter()
+                    .any(|a| accounts::email_matches(&a.email, &acct.email))
+            })
         })
-    })
 }
 
+/// Adds to `existing_fleet` each account of `local` whose email it does not list, labelled from
+/// its own machines and slot ([`discovered_label`], as [`local_account`] labels a default login
+/// no row lists, so the two name one account alike) and made unique by `-2`, `-3`, ….
 fn merge_discovered_accounts(
     existing_fleet: &mut FleetRoster,
     local: FleetRoster,
@@ -2451,7 +3498,9 @@ fn merge_discovered_accounts(
             .iter()
             .any(|a| accounts::email_matches(&a.email, &acct.email))
         {
-            let base_label = acct.label.clone();
+            let base_label =
+                discovered_label(&acct.machines, email_machines_and_slot(&acct.email).1);
+            acct.label = base_label.clone();
             let mut suffix = 2u32;
             loop {
                 if let Some(why) = accounts::label_refusal(&acct.label) {
@@ -2472,6 +3521,10 @@ fn merge_discovered_accounts(
     Ok(added)
 }
 
+/// The fleet file at `path` as a sync from init reads it, with `merge`, the accounts local
+/// discovery finds that it does not list added where discovery may add to it
+/// ([`fleet_takes_discovered`]; it keeps the `opt_in` it records); and the snapshot that sync
+/// checks it against, which publishes the merged text back to `path` where `publish` asks.
 fn capture_init_fleet(
     env: &Env,
     path: &Path,
@@ -2483,10 +3536,16 @@ fn capture_init_fleet(
     let mut added = false;
     if merge {
         let mut fleet = FleetRoster::from_toml(&text, &path.display().to_string())?;
-        if let Some(local) = discover_local_fleet_with_min(env, 1) {
+        let opt_in = opt_in_of(&text);
+        let mut shown = None;
+        if fleet_takes_discovered(opt_in, &fleet, || {
+            shown.get_or_insert_with(|| local_shows(env)).clone()
+        }) && let Some(local) =
+            discovered_fleet(env, shown.get_or_insert_with(|| local_shows(env)), 1)
+        {
             added = merge_discovered_accounts(&mut fleet, local)?;
             if added {
-                answer = fleet.to_toml_for(Some(OptIn::Named));
+                answer = fleet.to_toml_for(opt_in);
             }
         }
     }
@@ -2500,23 +3559,45 @@ fn capture_init_fleet(
     ))
 }
 
-/// Synchronize the machine and fleet account rosters during `aterm init` or `aterm secrets`.
+/// Synchronize the machine and fleet account rosters during `aterm init` or `aterm secrets`:
+/// the machine, its rows, those enrolled and not signed out, and the fleet's rows.
+/// # Errors
+/// No source was found or the sync refused, as [`run_accounts_sync`] says.
 pub fn sync_accounts_for_init(
     home: &Path,
     state_dir: &Path,
     roster_path: &Path,
     now: i64,
 ) -> Result<(String, usize, usize, usize), String> {
-    sync_accounts_for_init_with(home, state_dir, roster_path, now, || {})
+    sync_accounts_for_init_with(home, state_dir, roster_path, now, || {}, &fetch_source_text)
+        .map(|synced| (synced.machine, synced.rows, synced.enrolled, synced.fleet))
 }
 
+/// What a sync from init made of this machine's roster ([`sync_accounts_for_init_with`]).
+#[derive(Debug)]
+struct InitSynced {
+    machine: String,
+    rows: usize,
+    /// Rows enrolled here and not signed out.
+    enrolled: usize,
+    fleet: usize,
+    /// Whether the sync changed anything ([`SyncedAccounts::changed`]).
+    changed: bool,
+    /// The rows it left with no login made here (its `needs_renew`), which the automatic
+    /// sign-in ladder signs in ([`resync_with`]).
+    to_sign_in: Vec<String>,
+}
+
+/// [`sync_accounts_for_init`], running `before_sync` once its sources are captured and reading
+/// any source it did not capture (a `[fleet] accounts_source`) with `fetch`.
 fn sync_accounts_for_init_with(
     home: &Path,
     state_dir: &Path,
     roster_path: &Path,
     now: i64,
     before_sync: impl FnOnce(),
-) -> Result<(String, usize, usize, usize), String> {
+    fetch_uncaptured: &Fetch<'_>,
+) -> Result<InitSynced, String> {
     let config_path = roster_path
         .parent()
         .map(|p| p.join("aterm.toml"))
@@ -2550,7 +3631,7 @@ fn sync_accounts_for_init_with(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(FLEET_ROSTER_FILE);
-    let has_named_fleet = fleet_file_opt_in(&fleet_path) == Some(OptIn::Named);
+    let has_named_fleet = fleet_file_opt_in(&fleet_path).is_some_and(OptIn::opts_in_by_file);
     let has_key = env.config.as_deref().and_then(source_key).is_some();
     let secrets_source = {
         let secrets = home.join(".secrets");
@@ -2608,7 +3689,7 @@ fn sync_accounts_for_init_with(
         };
         discover_local_fleet_with_min(&env, min_accounts).map(|local| {
             let source = fleet_path.to_string_lossy().into_owned();
-            captured_fleet = Some((source.clone(), local.to_toml_for(Some(OptIn::Named))));
+            captured_fleet = Some((source.clone(), local.to_toml_for(Some(OptIn::Discovered))));
             fleet_snapshots.push(FleetSnapshot {
                 path: fleet_path.clone(),
                 bytes: None,
@@ -2633,7 +3714,7 @@ fn sync_accounts_for_init_with(
         {
             Ok(text.clone())
         } else {
-            fetch_source_text(env, source)
+            fetch_uncaptured(env, source)
         }
     };
     let mut out = Vec::new();
@@ -2656,6 +3737,25 @@ fn sync_accounts_for_init_with(
             msg
         });
     }
+    // The sync's own word of what it changed and which rows are still to sign in.
+    let said = aterm_json::from_str::<Value>(String::from_utf8_lossy(&out).trim()).ok();
+    let changed = said
+        .as_ref()
+        .and_then(|said| said.get("changed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let to_sign_in: Vec<String> = said
+        .as_ref()
+        .and_then(|said| said.get("needs_renew"))
+        .and_then(Value::as_array)
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
     let store = accounts::Store::at(state_dir);
     let raw = Roster::load(roster_path)?;
     let bound = store.bound(&raw, now).unwrap_or(raw);
@@ -2693,8 +3793,99 @@ fn sync_accounts_for_init_with(
         })
         .or_else(|| detect_machine_id(None, None))
         .unwrap_or_else(|| "local".to_owned());
-    let _ = store.touch_wake();
-    Ok((machine, bound.rows.len(), enrolled_count, fleet_count))
+    if changed {
+        let _ = store.touch_wake();
+    }
+    Ok(InitSynced {
+        machine,
+        rows: bound.rows.len(),
+        enrolled: enrolled_count,
+        fleet: fleet_count,
+        changed,
+        to_sign_in,
+    })
+}
+
+/// What one periodic resync of this machine's accounts did ([`resync_for_setup`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Resync {
+    /// Claude Code's sync ran: the roster was missing (at most once per 10 minutes) or something
+    /// it is made from changed ([`sync_called_for`]).
+    pub synced: bool,
+    /// Why that sync failed, where it did (no source found, a refusal); nothing was written.
+    pub failed: Option<String>,
+    /// It changed a file, the account state or the ledger. A sync that finds what is already
+    /// there writes nothing.
+    pub changed: bool,
+    /// The rows it left with no login made here, for the automatic sign-in ladder.
+    pub to_sign_in: Vec<String>,
+    /// The ladder started a sign-in, or a saved account choice progressed.
+    pub renewal: bool,
+    /// Each other CLI whose sync failed, with why.
+    pub cli_failed: Vec<(Cli, String)>,
+}
+
+/// THE SETUP PASS'S RESYNC (`aterm`'s first-run setup runs it every pass it retries): Claude
+/// Code's sync only where the roster is missing or something it is made from changed
+/// ([`sync_called_for`], the rule a window's upkeep keeps), each other CLI's (which writes only
+/// the rows it adds), and, where the sync leaves rows with no login made here, `sign_in` allows
+/// (an instance that keeps this account's own fleet accounts) and the config does not turn
+/// sign-ins off ([`sign_ins_on`]), the automatic sign-in ladder at once
+/// ([`auto_renew_next_account`]): each attempt, and what it found where no route could sign a
+/// row in, is on record as a window's are, and no person is asked.
+#[must_use]
+pub fn resync_for_setup(
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+    sign_in: bool,
+) -> Resync {
+    resync_with(
+        home,
+        state_dir,
+        (roster_path, now, sign_in),
+        &live_effects(),
+    )
+}
+
+fn resync_with(
+    home: &Path,
+    state_dir: &Path,
+    (roster_path, now, sign_in): (&Path, i64, bool),
+    fx: &UpkeepEffects<'_>,
+) -> Resync {
+    let config = config_beside(roster_path);
+    let missing = !roster_path.exists() && {
+        let mut last = fx
+            .sync_cooldown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let due = last.is_none_or(|at| at.elapsed() >= Duration::from_secs(600));
+        if due {
+            *last = Some(Instant::now());
+        }
+        due
+    };
+    let mut done = Resync::default();
+    if missing || sync_called_for(home, state_dir, (roster_path, &config), now, fx.rediscovery) {
+        done.synced = true;
+        match sync_accounts_for_init_with(home, state_dir, roster_path, now, || {}, fx.fetch) {
+            Ok(synced) => {
+                done.changed = synced.changed;
+                done.to_sign_in = synced.to_sign_in;
+            }
+            Err(why) => done.failed = Some(why),
+        }
+    }
+    done.cli_failed = sync_cli_accounts_with(home, state_dir, roster_path, now, fx.fetch)
+        .into_iter()
+        .filter_map(|(cli, synced)| synced.err().map(|why| (cli, why)))
+        .collect();
+    if sign_in && sign_ins_on(&config) && !done.to_sign_in.is_empty() {
+        done.renewal = auto_renew_next_account(home, state_dir, roster_path, now, fx);
+    }
+    done
 }
 
 /// The accounting sheet's name in `~/.secrets` (`DESIGN-secrets-2026-10-20.md` §11).
@@ -2788,7 +3979,7 @@ fn load_cli_fleet(
     env: &Env,
     home: &Path,
     source: Option<&str>,
-    fetch: &Fetch,
+    fetch: &Fetch<'_>,
 ) -> Result<Option<CliFleet>, String> {
     let (chosen, raw) = match source.map(str::trim).filter(|s| !s.is_empty()) {
         Some(named) => (named.to_owned(), fetch(env, named)?),
@@ -2840,7 +4031,7 @@ fn sync_cli_with(
     (home, state_dir, config): (&Path, &Path, &Path),
     (source, machine_override): (Option<&str>, Option<&str>),
     now: i64,
-    (fetch, ladder): (&Fetch, &[Duration]),
+    (fetch, ladder): (&Fetch<'_>, &[Duration]),
 ) -> Result<CliSync, String> {
     let product = cli.connector().product;
     let roster_path = accounts::roster_beside_for(config, cli)
@@ -2955,11 +4146,13 @@ fn sync_cli_with(
             .map_err(|why| format!("could not write {}: {why}", write_to.display()))?;
     }
     drop(lock);
-    if let Ok(roster) = Roster::load_for(cli, &write_to) {
-        let _ =
-            recover_interrupted_staging_renewals_for(cli, &store, &roster, &AUTO_RENEW_GUARD, now);
+    let recovered = Roster::load_for(cli, &write_to).is_ok_and(|roster| {
+        recover_interrupted_staging_renewals_for(cli, &store, &roster, &AUTO_RENEW_GUARD, now)
+    });
+    // A sync that added nothing wrote nothing, and wakes no watcher.
+    if !added.is_empty() || recovered {
+        let _ = store.touch_wake();
     }
-    let _ = store.touch_wake();
     Ok(CliSync::Synced(CliSynced {
         cli,
         machine,
@@ -2996,7 +4189,7 @@ fn run_cli_accounts_sync_with(
     env: &Env,
     (source, machine_override, json): (Option<&str>, Option<&str>, bool),
     (out, err): (&mut dyn Write, &mut dyn Write),
-    fetch: &Fetch,
+    fetch: &Fetch<'_>,
 ) -> ExitCode {
     let flag = format!("--cli {}", cli.id());
     let product = cli.connector().product;
@@ -3122,7 +4315,19 @@ pub fn sync_cli_accounts_for_init(
     roster_path: &Path,
     now: i64,
 ) -> Vec<(Cli, Result<CliSync, String>)> {
+    sync_cli_accounts_with(home, state_dir, roster_path, now, &fetch_source_text)
+}
+
+/// [`sync_cli_accounts_for_init`], reading a named source with `fetch`.
+fn sync_cli_accounts_with(
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+    fetch: &Fetch<'_>,
+) -> Vec<(Cli, Result<CliSync, String>)> {
     let config = config_beside(roster_path);
+    let ladder = sync_lock_ladder();
     OTHER_CLIS
         .into_iter()
         .map(|cli| {
@@ -3131,7 +4336,7 @@ pub fn sync_cli_accounts_for_init(
                 (home, state_dir, &config),
                 (None, None),
                 now,
-                (&fetch_source_text, &sync_lock_ladder()),
+                (fetch, &ladder),
             );
             (cli, synced)
         })
@@ -3245,7 +4450,7 @@ fn upkeep_pools(
     }
 }
 
-/// Start one of `cli`'s due or wall-recovery logins' renewal ([`auto_renew_candidates_for`],
+/// Start one of `cli`'s due or wall-recovery logins' renewal ([`needed_renew_candidates_for`],
 /// [`spawn_row_renewal`]); whether one started.
 fn renew_pool_due(
     cli: Cli,
@@ -3270,7 +4475,7 @@ fn renew_pool_due(
     let (Ok((state, _)), Ok((logins, _))) = (store.load(now), store.load_logins(now)) else {
         return recovered;
     };
-    for row in auto_renew_candidates_for(cli, Some(&store), &file_roster, &state, &logins, now) {
+    for row in needed_renew_candidates_for(cli, Some(&store), &file_roster, &state, &logins, now) {
         if spawn_row_renewal(
             cli,
             home,
@@ -3282,6 +4487,7 @@ fn renew_pool_due(
             now,
             fx.renew_guard,
             fx.spawn_renewal,
+            None,
         )
         .progressed()
         {
@@ -3303,6 +4509,8 @@ struct AutoRenewGuard {
     /// The newest `(at, same_second_count)` signed-in `accounts browser` window event already used
     /// to lift a row's background hold once.
     browser_unparked: BTreeMap<String, (i64, usize)>,
+    /// The automatic sign-in ladder's backoffs and vault clock ([`super::sign_in_ladder::Ladder`]).
+    ladder: super::sign_in_ladder::Ladder,
 }
 
 /// How long a row whose background renewal stopped for a person is left alone by the
@@ -3607,6 +4815,12 @@ pub(super) fn has_configured_mailbox_for_row(
         )
 }
 
+/// The newest modification time among the files a sign-in reads (each file in `~/.secrets`,
+/// the configuration and roster files, the mailbox configurations, the mail folders and their
+/// unread mail): a change
+/// here ends an automatic sign-in's cooldown. Neither the `~/.secrets` folder's own time nor
+/// the vault's `state.toml`, which its subscriber rewrites about once a minute only to say when
+/// it last heard the vault, is among them.
 fn latest_mailbox_mtime(
     home: Option<&Path>,
     store: &accounts::Store,
@@ -3621,8 +4835,6 @@ fn latest_mailbox_mtime(
                 }
             }
         }
-        paths.push(secrets_dir);
-        paths.push(h.join(".config/aterm/secrets/state.toml"));
         paths.push(h.join(".config/aterm/aterm.toml"));
         paths.push(h.join(".config/aterm/accounts.toml"));
         paths.push(h.join(".config/aterm").join(FLEET_ROSTER_FILE));
@@ -3671,16 +4883,40 @@ fn latest_mailbox_mtime(
         .max()
 }
 
+/// Claude Code's [`auto_renew_candidates_tiered`] rows, in its order.
+#[cfg(test)]
 pub(super) fn auto_renew_candidates(
     file_roster: &Roster,
     state: &accounts::State,
     logins: &accounts::Logins,
     now: i64,
 ) -> Vec<accounts::Row> {
-    auto_renew_candidates_for(Cli::Claude, None, file_roster, state, logins, now)
+    auto_renew_candidates_tiered(Cli::Claude, None, file_roster, state, logins, now)
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect()
 }
 
-pub(super) fn auto_renew_candidates_for(
+/// The first tier no session needs yet ([`auto_renew_candidates_tiered`]' tiers 2 and 3): the
+/// rows Claude Code's upkeep signs in by itself, and a person's `accounts renew --due`, the
+/// fact menu's rotation or a pooled CLI's upkeep never does ([`needed_renew_candidates_for`]).
+const UNNEEDED_TIER: u8 = 2;
+
+/// Claude Code's [`needed_renew_candidates_for`], ordered without a store.
+pub(super) fn needed_renew_candidates(
+    file_roster: &Roster,
+    state: &accounts::State,
+    logins: &accounts::Logins,
+    now: i64,
+) -> Vec<accounts::Row> {
+    needed_renew_candidates_for(Cli::Claude, None, file_roster, state, logins, now)
+}
+
+/// The rows of `cli`'s pool a session needs signed in now, best first:
+/// [`auto_renew_candidates_tiered`]' tiers 0 and 1 (the successors of a walled, low, signed-out
+/// or warned session where none is ready, and the logins due for renewal), what a person's
+/// `accounts renew --due`, the fact menu's rotation and a pooled CLI's upkeep start.
+pub(super) fn needed_renew_candidates_for(
     cli: Cli,
     store: Option<&accounts::Store>,
     file_roster: &Roster,
@@ -3688,12 +4924,55 @@ pub(super) fn auto_renew_candidates_for(
     logins: &accounts::Logins,
     now: i64,
 ) -> Vec<accounts::Row> {
+    auto_renew_candidates_tiered(cli, store, file_roster, state, logins, now)
+        .into_iter()
+        .filter(|(tier, _)| *tier < UNNEEDED_TIER)
+        .map(|(_, row)| row)
+        .collect()
+}
+
+/// THE ROWS AN UPKEEP SIGNS IN for `cli`'s pool, best first, each with its tier, every pass and
+/// by default: every row with an email that has no login it can be run on here (not enrolled,
+/// or signed out) is one, whether or not any session needs it yet. Tier 0, the rows that would
+/// carry a session whose account is walled, low, signed out or already warned that a window is
+/// filling (Claude Code's first warning, well before the account is low), where no other row is
+/// ready to take it; tier 1, the enrolled logins due for renewal or ended; tier 2, every other
+/// row to sign in; tier 3, the rows to sign in that are themselves walled, ready once their wall
+/// ends. Within a tier, roster order (dedicated rows first in tiers 0, 2 and 3), a row with an
+/// unaddressed sign-in task after every row without one and the older task first (read through
+/// `store` where one is given, else from `logins` alone), a row whose last renewal answered
+/// another account last.
+fn auto_renew_candidates_tiered(
+    cli: Cli,
+    store: Option<&accounts::Store>,
+    file_roster: &Roster,
+    state: &accounts::State,
+    logins: &accounts::Logins,
+    now: i64,
+) -> Vec<(u8, accounts::Row)> {
     let roster = accounts::bound(file_roster, logins);
     let enrolled = accounts::enrolled_for(cli, &roster);
     let is_walled_or_low = |label: &str| {
         state.accounts.get(label).is_some_and(|a| {
-            a.limited_until(now).is_some() || a.low(now) || a.auth == accounts::Auth::SignedOut
+            a.limited_until(now).is_some()
+                || a.low(now)
+                || a.warned(now)
+                || a.auth == accounts::Auth::SignedOut
         })
+    };
+    let is_limited = |label: &str| {
+        state
+            .accounts
+            .get(label)
+            .is_some_and(|a| a.limited_until(now).is_some())
+    };
+    let wants_sign_in = |row: &accounts::Row| {
+        let is_enr = row.dir.is_none() || enrolled.contains(&row.label);
+        row.email.is_some()
+            && matches!(
+                accounts::condition(row, state, is_enr, now),
+                accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
+            )
     };
     let me = state
         .active
@@ -3730,17 +5009,8 @@ pub(super) fn auto_renew_candidates_for(
                 .iter()
                 .filter(|r| r.class == Class::Dedicated)
                 .chain(roster.rows.iter().filter(|r| r.class == Class::Shared))
-                .filter(|row| me != Some(row.label.as_str()) && row.email.is_some())
-                .filter(|row| {
-                    let is_enr = row.dir.is_none() || enrolled.contains(&row.label);
-                    matches!(
-                        accounts::condition(row, state, is_enr, now),
-                        accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
-                    ) && !state
-                        .accounts
-                        .get(&row.label)
-                        .is_some_and(|a| a.limited_until(now).is_some())
-                })
+                .filter(|row| me != Some(row.label.as_str()))
+                .filter(|row| wants_sign_in(row) && !is_limited(&row.label))
             {
                 if seen.insert(next_row.label.clone()) {
                     tiered.push((0, next_row.clone()));
@@ -3759,11 +5029,7 @@ pub(super) fn auto_renew_candidates_for(
         }
     }
     for label in accounts::renew_due(&roster, logins, state, &enrolled, now) {
-        if state
-            .accounts
-            .get(&label)
-            .is_some_and(|a| a.limited_until(now).is_some())
-        {
+        if is_limited(&label) {
             continue;
         }
         if let Some(row) = roster.row(&label)
@@ -3771,6 +5037,22 @@ pub(super) fn auto_renew_candidates_for(
             && seen.insert(row.label.clone())
         {
             tiered.push((1, row.clone()));
+        }
+    }
+    for next_row in roster
+        .rows
+        .iter()
+        .filter(|r| r.class == Class::Dedicated)
+        .chain(roster.rows.iter().filter(|r| r.class == Class::Shared))
+        .filter(|row| wants_sign_in(row))
+    {
+        let tier = if is_limited(&next_row.label) {
+            UNNEEDED_TIER + 1
+        } else {
+            UNNEEDED_TIER
+        };
+        if seen.insert(next_row.label.clone()) {
+            tiered.push((tier, next_row.clone()));
         }
     }
     tiered.sort_by_key(|(tier, row)| {
@@ -3786,7 +5068,7 @@ pub(super) fn auto_renew_candidates_for(
             logins.get(&row.label).and_then(|b| b.wrong_at),
         )
     });
-    tiered.into_iter().map(|(_, row)| row).collect()
+    tiered
 }
 
 #[cfg(test)]
@@ -4177,14 +5459,32 @@ fn auto_renew_next_account(
     let Ok((logins, _)) = store.load_logins(now) else {
         return recovered;
     };
-    for next_row in auto_renew_candidates_for(
+    let ladder = LadderCtx::of(fx, roster_path);
+    let tiered = auto_renew_candidates_tiered(
         Cli::Claude,
         Some(&store),
         &file_roster,
         &state,
         &logins,
         now,
-    ) {
+    );
+    // A row no session needs yet is signed in only where it is a Claude Code account by some
+    // word: a source's or a person's row, or one Claude Code's own files show, never an address
+    // discovery listed only because a credential names it.
+    let unclaimed = if tiered.iter().any(|(tier, _)| *tier >= UNNEEDED_TIER) {
+        unclaimed_emails(home, state_dir, roster_path, now, fx.rediscovery)
+    } else {
+        BTreeSet::new()
+    };
+    for (tier, next_row) in tiered {
+        if tier >= UNNEEDED_TIER
+            && next_row
+                .email
+                .as_deref()
+                .is_some_and(|em| unclaimed.iter().any(|u| accounts::email_matches(u, em)))
+        {
+            continue;
+        }
         if spawn_row_renewal(
             accounts::Cli::Claude,
             home,
@@ -4196,6 +5496,7 @@ fn auto_renew_next_account(
             now,
             fx.renew_guard,
             fx.spawn_renewal,
+            Some(&ladder),
         )
         .progressed()
         {
@@ -4203,6 +5504,49 @@ fn auto_renew_next_account(
         }
     }
     recovered
+}
+
+/// The addresses of the roster at `roster_path` that only a credential shows
+/// ([`Shown::credentials_only`]), where its fleet is one discovery adds to
+/// ([`fleet_takes_discovered`]): another pool's sign-in, a mailbox's own user, an address no
+/// Claude Code login, transcript or profile here names. None where a source or a person wrote
+/// the roster, since a row they list is a Claude Code account by their word. Read again at most
+/// every [`REDISCOVER_EVERY`].
+fn unclaimed_emails(
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+    rediscovery: &std::sync::Mutex<Rediscovery>,
+) -> BTreeSet<String> {
+    let lock = || {
+        rediscovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let Some((at, emails)) = &lock().unclaimed
+        && at.elapsed() < REDISCOVER_EVERY
+    {
+        return emails.clone();
+    }
+    let env = quiet_env(home, state_dir, &config_beside(roster_path), now);
+    let emails = fleet_file_beside(roster_path)
+        .and_then(|fleet_path| {
+            let text = read_local_source_text(&fleet_path).ok()?;
+            let fleet = FleetRoster::from_toml(&text, &fleet_path.display().to_string()).ok()?;
+            let mut shown = None;
+            fleet_takes_discovered(opt_in_of(&text), &fleet, || {
+                shown.get_or_insert_with(|| local_shows(&env)).clone()
+            })
+            .then(|| {
+                shown
+                    .get_or_insert_with(|| local_shows(&env))
+                    .credentials_only()
+            })
+        })
+        .unwrap_or_default();
+    lock().unclaimed = Some((Instant::now(), emails.clone()));
+    emails
 }
 
 pub(super) fn recover_staging_renewals_for(
@@ -4240,12 +5584,7 @@ pub fn auto_renew_next_account_interactive_for(
     roster_path: &Path,
     now: i64,
 ) -> bool {
-    let fx = UpkeepEffects {
-        fetch: &fetch_source_text,
-        spawn_renewal: &spawn_renewal_thread,
-        sync_cooldown: &AUTO_SYNC_COOLDOWN,
-        renew_guard: &AUTO_RENEW_GUARD,
-    };
+    let fx = live_effects();
     if let Some(pending) = resume_pending_pin_for(cli, home, state_dir, roster_path, now, &fx) {
         return pending.progressed();
     }
@@ -4264,7 +5603,10 @@ pub fn auto_renew_next_account_interactive_for(
     let Ok((logins, _)) = store.load_logins(now) else {
         return recovered;
     };
-    for next_row in auto_renew_candidates_for(cli, Some(&store), &file_roster, &state, &logins, now)
+    // A person's click starts only what a session needs now: a row no session needs is the
+    // upkeep's to sign in, headless, never in a browser opened for a click.
+    for next_row in
+        needed_renew_candidates_for(cli, Some(&store), &file_roster, &state, &logins, now)
     {
         if spawn_row_renewal(
             cli,
@@ -4277,6 +5619,7 @@ pub fn auto_renew_next_account_interactive_for(
             now,
             &AUTO_RENEW_GUARD,
             &spawn_renewal_thread,
+            None,
         )
         .progressed()
         {
@@ -4466,12 +5809,261 @@ fn renew_requested_pin_for(
         now,
         renew_guard,
         spawn_renewal,
+        None,
     )
+}
+
+/// What the automatic ladder of [`spawn_row_renewal`] reaches with ([`UpkeepEffects`]' seams).
+struct LadderCtx<'a> {
+    find_browser: &'a (dyn Fn(&Path) -> bool + Sync),
+    vault_sync: fn(&Path) -> super::sign_in_ladder::Vault,
+    spawn_vault: &'a SpawnRenewal,
+    mailbox: &'a LadderMailbox,
+    log: SignInLog,
+    run_attempt: Option<RunAttempt>,
+    /// How many `[harness] hosts` the config beside the roster names.
+    hosts: usize,
+}
+
+impl<'a> LadderCtx<'a> {
+    fn of(fx: &UpkeepEffects<'a>, roster_path: &Path) -> Self {
+        let config = config_beside(roster_path);
+        Self {
+            find_browser: fx.find_browser,
+            vault_sync: fx.vault_sync,
+            spawn_vault: fx.spawn_vault,
+            mailbox: fx.mailbox,
+            log: std::sync::Arc::clone(&fx.log),
+            run_attempt: fx.run_attempt.clone(),
+            hosts: crate::supervise::SupervisorConfig::from_path(Some(&config))
+                .0
+                .hosts
+                .len(),
+        }
+    }
+}
+
+/// Where the ladder of one row stands this upkeep ([`ladder_route`]).
+enum LadderStep {
+    /// A route is ready: run it.
+    Go {
+        route: super::sign_in_ladder::Route,
+        read: super::sign_in_ladder::Read,
+        /// What the ladder read, for the backoff a failed run sets.
+        inputs: String,
+    },
+    /// Not now, and nothing to record: the row waits out its backoff, or the vault is refreshing.
+    Held,
+    /// No route: recorded, logged, and the row's backoff set.
+    NoRoute,
+}
+
+/// What the files a route reads hold now, as one line a row's backoff is kept by
+/// ([`super::sign_in_ladder::Ladder::held`]): each file in `~/.secrets` (its name, size and
+/// modification time); the vault's membership and the version it applied (`membership`, `seq`
+/// and `digest` in `~/.config/aterm/secrets/state.toml`, never that file's own time, which the
+/// vault's subscriber rewrites about once a minute only to say when it last heard the vault);
+/// the vault's `source.toml`; the mailbox configurations; and the store's browser profiles.
+/// Mail arriving in a mailbox folder is not among them, since a route's own run brings one, and
+/// neither are the roster's own files, which a sync rewrites.
+fn ladder_inputs(home: &Path, store: &accounts::Store) -> String {
+    let stamp = |path: &Path| {
+        fs::symlink_metadata(path)
+            .ok()
+            .map(|meta| (meta.len(), meta.modified().ok()))
+    };
+    let mut line = String::new();
+    let secrets = home.join(".secrets");
+    let mut held: Vec<(std::ffi::OsString, PathBuf)> = fs::read_dir(&secrets)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| (entry.file_name(), entry.path()))
+                .collect()
+        })
+        .unwrap_or_default();
+    held.sort();
+    for (name, path) in held {
+        line.push_str(&format!("{}={:?};", name.to_string_lossy(), stamp(&path)));
+    }
+    let vault = home.join(".config/aterm/secrets");
+    if let Ok(text) = read_local_source_text(&vault.join("state.toml")) {
+        for kept in text.lines().map(str::trim).filter(|kept| {
+            kept.split_once('=').is_some_and(|(key, _)| {
+                matches!(
+                    key.trim(),
+                    "membership" | "seq" | "digest" | "source_identity"
+                )
+            })
+        }) {
+            line.push_str(kept);
+            line.push(';');
+        }
+    }
+    for path in [
+        vault.join("source.toml"),
+        home.join(".config/aterm")
+            .join(super::headless_oauth::MAILBOX_TOML_FILE),
+        store.dir.join(super::headless_oauth::MAILBOX_TOML_FILE),
+        store.dir.join(super::headless_oauth::BROWSER_PROFILES_DIR),
+    ] {
+        line.push_str(&format!("{:?};", stamp(&path)));
+    }
+    line
+}
+
+/// What the ladder reads of the machine for `row` before the vault is tried.
+fn ladder_read(
+    home: &Path,
+    store: &accounts::Store,
+    logins: &accounts::Logins,
+    row: &accounts::Row,
+    ctx: &LadderCtx<'_>,
+) -> super::sign_in_ladder::Read {
+    use super::sign_in_ladder::{Profile, Read};
+    let email = row.email.as_deref();
+    let profile = if !super::headless_oauth::has_browser_profile(&store.dir, &row.label, email) {
+        Profile::None
+    } else if logins.get(&row.label).and_then(|b| b.wrong_at).is_some() {
+        Profile::WrongAccount
+    } else {
+        Profile::Ready
+    };
+    Read {
+        profile,
+        mailbox: (ctx.mailbox)(home, store, row),
+        vault: None,
+        browser: (ctx.find_browser)(home),
+        row_browser: row.browser.is_some(),
+        hosts: ctx.hosts,
+    }
+}
+
+/// THE LADDER OF ONE ROW: read every route; while none is ready, refresh the LAN vault (a
+/// member's bounded `aterm secrets sync`, on its own clock and off this thread) and read again;
+/// then either the route to run, or a recorded error naming every route tried
+/// ([`accounts::note_sign_in_attempt`], written once per distinct finding), one `aterm.log` line,
+/// and the row's backoff. A row inside its backoff whose inputs have not changed is not read past
+/// its cheap probes.
+fn ladder_route(
+    home: &Path,
+    store: &accounts::Store,
+    logins: &accounts::Logins,
+    row: &accounts::Row,
+    now: i64,
+    renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    ctx: &LadderCtx<'_>,
+) -> LadderStep {
+    use super::sign_in_ladder::{Vault, VaultTurn};
+    fn lock(
+        guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    ) -> std::sync::MutexGuard<'_, AutoRenewGuard> {
+        guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    let mut read = ladder_read(home, store, logins, row, ctx);
+    let inputs = format!("{}|{}", read.words(), ladder_inputs(home, store));
+    let at = Instant::now();
+    if lock(renew_guard).ladder.held(&row.label, &inputs, at) {
+        return LadderStep::Held;
+    }
+    if read.route().is_none() {
+        let member = home.join(".config/aterm/secrets/source.toml").is_file();
+        let vault = if member {
+            let turn = lock(renew_guard).ladder.vault_turn(at);
+            match turn {
+                VaultTurn::Seen(seen) => seen,
+                VaultTurn::Running => return LadderStep::Held,
+                VaultTurn::Due => {
+                    let guard = std::sync::Arc::clone(renew_guard);
+                    let (sync, home_owned) = (ctx.vault_sync, home.to_path_buf());
+                    let started = (ctx.spawn_vault)(Box::new(move || {
+                        let seen = sync(&home_owned);
+                        guard
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .ladder
+                            .vault_done(seen);
+                    }));
+                    if started.is_err() {
+                        lock(renew_guard)
+                            .ladder
+                            .vault_done(Vault::Failed("it could not be started".to_owned()));
+                    }
+                    match lock(renew_guard).ladder.vault_turn(at) {
+                        VaultTurn::Seen(seen) => seen,
+                        VaultTurn::Running | VaultTurn::Due => return LadderStep::Held,
+                    }
+                }
+            }
+        } else {
+            Vault::NotMember
+        };
+        if matches!(vault, Vault::Applied(_)) {
+            read = ladder_read(home, store, logins, row, ctx);
+        }
+        read.vault = Some(vault);
+    }
+    if let Some(route) = read.route() {
+        return LadderStep::Go {
+            route,
+            read,
+            inputs,
+        };
+    }
+    let words = read.words();
+    note_attempt(
+        store,
+        logins,
+        &row.label,
+        accounts::AttemptOutcome::NoRoute,
+        &words,
+        now,
+    );
+    let wait = lock(renew_guard).ladder.failed(&row.label, &inputs, at);
+    (ctx.log)(&format!(
+        "{} (tried again in {} or when one of them changes)",
+        super::sign_in_ladder::log_line(
+            &row.label,
+            accounts::AttemptOutcome::NoRoute.as_str(),
+            &words
+        ),
+        super::upgrade::span(wait.as_secs())
+    ));
+    LadderStep::NoRoute
+}
+
+/// Records `label`'s attempt ([`accounts::note_sign_in_attempt`]) unless `logins` (as read
+/// before) already holds the same one; a store that cannot be written now records it on the
+/// next attempt.
+fn note_attempt(
+    store: &accounts::Store,
+    logins: &accounts::Logins,
+    label: &str,
+    outcome: accounts::AttemptOutcome,
+    routes: &str,
+    now: i64,
+) {
+    let same = logins
+        .get(label)
+        .and_then(|b| b.sign_in_attempt.as_ref())
+        .is_some_and(|last| {
+            last.outcome == outcome && last.routes == super::one_line(routes, accounts::ROUTES_MAX)
+        });
+    if same {
+        return;
+    }
+    let _ = store.transact_logins_within(&accounts::LOCK_LADDER, now, &mut None, |_, logins| {
+        Ok(accounts::note_sign_in_attempt(
+            logins, label, outcome, routes, now,
+        ))
+    });
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "row renewal binds paths, roster, logins, target row, pin/browser flags, clock, admission guard, and spawn seam"
+    reason = "row renewal binds paths, roster, logins, target row, pin/browser flags, clock, admission guard, spawn seam and the automatic ladder"
 )]
 fn spawn_row_renewal(
     cli: accounts::Cli,
@@ -4484,6 +6076,7 @@ fn spawn_row_renewal(
     now: i64,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     spawn_renewal: &SpawnRenewal,
+    ladder: Option<&LadderCtx<'_>>,
 ) -> RenewalDispatch {
     if cli != accounts::Cli::Claude {
         return spawn_vendor_renewal_with(
@@ -4500,28 +6093,54 @@ fn spawn_row_renewal(
         );
     }
     let store = accounts::Store::at(state_dir);
-    let mailbox_dir = resolve_mailbox_dir(Some(home), &store);
-    let has_mailbox = mailbox_dir.is_some()
-        || has_configured_mailbox_for_row(
-            Some(home),
-            &store,
-            Some(&next_row.label),
-            next_row.email.as_deref(),
-        );
-    let has_headless_profile = logins
-        .get(&next_row.label)
-        .and_then(|b| b.wrong_at)
-        .is_none()
-        && super::headless_oauth::has_browser_profile(
-            &store.dir,
-            &next_row.label,
-            next_row.email.as_deref(),
-        )
-        && super::headless_oauth::find_headless_browser(Some(home)).is_some();
-    if !allow_default_browser && next_row.browser.is_none() && !has_mailbox && !has_headless_profile
-    {
+    if next_row.email.is_none() {
         return RenewalDispatch::Failed;
     }
+    let mailbox_dir = resolve_mailbox_dir(Some(home), &store);
+    // The automatic ladder ([`ladder_route`]) decides an upkeep's renewal and records how it
+    // ends; a person's own choice (a pin request, a click) takes the routes it always took.
+    let (has_mailbox, has_headless_profile, unattended) = match ladder {
+        Some(ctx) => match ladder_route(home, &store, logins, &next_row, now, renew_guard, ctx) {
+            LadderStep::Go {
+                route,
+                read,
+                inputs,
+            } => (
+                route == super::sign_in_ladder::Route::Mailbox,
+                route == super::sign_in_ladder::Route::Profile,
+                Some((route, read, inputs, std::sync::Arc::clone(&ctx.log))),
+            ),
+            LadderStep::Held => return RenewalDispatch::Held,
+            LadderStep::NoRoute => return RenewalDispatch::Failed,
+        },
+        None => {
+            let has_mailbox = mailbox_dir.is_some()
+                || has_configured_mailbox_for_row(
+                    Some(home),
+                    &store,
+                    Some(&next_row.label),
+                    next_row.email.as_deref(),
+                );
+            let has_headless_profile = logins
+                .get(&next_row.label)
+                .and_then(|b| b.wrong_at)
+                .is_none()
+                && super::headless_oauth::has_browser_profile(
+                    &store.dir,
+                    &next_row.label,
+                    next_row.email.as_deref(),
+                )
+                && super::headless_oauth::find_headless_browser(Some(home)).is_some();
+            if !allow_default_browser
+                && next_row.browser.is_none()
+                && !has_mailbox
+                && !has_headless_profile
+            {
+                return RenewalDispatch::Failed;
+            }
+            (has_mailbox, has_headless_profile, None)
+        }
+    };
     let next_label = next_row.label.clone();
     let Some(next_email) = next_row.email.clone() else {
         return RenewalDispatch::Failed;
@@ -4565,14 +6184,26 @@ fn spawn_row_renewal(
     permit.wake_pending = Some(state_dir.to_path_buf());
     let home_owned = home.to_path_buf();
     let state_owned = state_dir.to_path_buf();
-    start_auto_renew(
+    let ladder_guard = std::sync::Arc::clone(renew_guard);
+    let started_by = unattended.as_ref().map(|(route, _, _, log)| {
+        (
+            route.as_str(),
+            next_label.clone(),
+            std::sync::Arc::clone(log),
+        )
+    });
+    let run_seam = ladder.and_then(|ctx| ctx.run_attempt.clone());
+    let started = start_auto_renew(
         permit,
         move || {
             use super::cli::Renewal;
 
             let store = accounts::Store::at(&state_owned);
-            let run_attempt = |browser: &super::cli::RenewBrowser,
-                               force_headless: bool|
+            // How the last run's `claude auth login` exited, for the words of one that made no
+            // login (`sign_in_ladder::how_it_ended`).
+            let exited: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
+            let live_attempt = |browser: &super::cli::RenewBrowser,
+                                force_headless: bool|
              -> Renewal {
                 let Ok(staging) = store.claim_staging_dir(&next_label) else {
                     return Renewal::Failed;
@@ -4641,6 +6272,7 @@ fn spawn_row_renewal(
                 };
                 if ran.code != Some(0) || !accounts::login_made(&staging) {
                     let _ = fs::remove_dir_all(&staging);
+                    exited.set(ran.code);
                     return Renewal::authentication_failed(ran.code);
                 }
                 let Ok(status_got) = super::cli::status_in_home_within(
@@ -4663,37 +6295,90 @@ fn spawn_row_renewal(
                     now_done,
                 )
             };
+            let run_attempt = |browser: &super::cli::RenewBrowser, force_headless: bool| {
+                exited.set(None);
+                match &run_seam {
+                    Some(run) => run(browser, force_headless),
+                    None => live_attempt(browser, force_headless),
+                }
+            };
+            let how = |renewal: Renewal| super::sign_in_ladder::how_it_ended(renewal, exited.get());
             let _signin = signin;
-            let renewed = (|| {
+            let ran = (|| -> Result<(), String> {
                 let opener = resolve_opener_link(&home_owned, &store);
-                let non_headless_fallback = select_auto_renew_browser(
-                    next_row.browser.as_deref(),
-                    mailbox_dir.as_deref(),
-                    opener.clone(),
-                )
-                .or_else(|| allow_default_browser.then_some(super::cli::RenewBrowser::Default));
+                // Unattended, nothing that opens a window is ever a fallback: neither the row's
+                // desk browser profile nor the system's default browser.
+                let non_headless_fallback = if unattended.is_some() {
+                    None
+                } else {
+                    select_auto_renew_browser(
+                        next_row.browser.as_deref(),
+                        mailbox_dir.as_deref(),
+                        opener.clone(),
+                    )
+                    .or_else(|| allow_default_browser.then_some(super::cli::RenewBrowser::Default))
+                };
                 let browser = if (has_mailbox || has_headless_profile) && opener.is_some() {
                     super::cli::RenewBrowser::Remote { opener }
                 } else {
                     let Some(b) = non_headless_fallback.clone() else {
-                        return false;
+                        return Err("no opener link could be made".to_owned());
                     };
                     b
                 };
                 let result = run_attempt(&browser, !has_mailbox && has_headless_profile);
                 if result == Renewal::Renewed {
-                    return true;
+                    return Ok(());
                 }
                 if result.can_retry_authentication()
                     && !has_mailbox
                     && has_headless_profile
                     && let Some(fallback) = non_headless_fallback
                 {
-                    return run_attempt(&fallback, false) == Renewal::Renewed;
+                    let again = run_attempt(&fallback, false);
+                    return if again == Renewal::Renewed {
+                        Ok(())
+                    } else {
+                        Err(how(again))
+                    };
                 }
-                false
+                Err(how(result))
             })();
+            let renewed = ran.is_ok();
             let now_done = crate::supervise::limit::unix_now().max(now);
+            if let Some((route, read, inputs, log)) = &unattended {
+                let (outcome, routes) = match &ran {
+                    Ok(()) => (
+                        accounts::AttemptOutcome::SignedIn,
+                        route.as_str().to_owned(),
+                    ),
+                    Err(how) => (
+                        accounts::AttemptOutcome::Failed,
+                        super::sign_in_ladder::failed_words(*route, how, read),
+                    ),
+                };
+                let logins_now = store
+                    .load_logins(now_done)
+                    .map(|(logins, _)| logins)
+                    .unwrap_or_default();
+                note_attempt(&store, &logins_now, &next_label, outcome, &routes, now_done);
+                let mut guard = ladder_guard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let line = super::sign_in_ladder::log_line(&next_label, outcome.as_str(), &routes);
+                if renewed {
+                    guard.ladder.signed_in(&next_label);
+                    drop(guard);
+                    log(&line);
+                } else {
+                    let wait = guard.ladder.failed(&next_label, inputs, Instant::now());
+                    drop(guard);
+                    log(&format!(
+                        "{line} (tried again in {} or when its inputs change)",
+                        super::upgrade::span(wait.as_secs())
+                    ));
+                }
+            }
             if let Some(request) = &pin_request {
                 if !renewed {
                     let _ = store.cancel_pin_request(request, now_done);
@@ -4717,8 +6402,15 @@ fn spawn_row_renewal(
             }
         },
         spawn_renewal,
-    )
-    .map_or(RenewalDispatch::Failed, |()| RenewalDispatch::Started)
+    );
+    if started.is_ok()
+        && let Some((route, label, log)) = started_by
+    {
+        log(&format!(
+            "account {label}: automatic sign-in started by its {route} route"
+        ));
+    }
+    started.map_or(RenewalDispatch::Failed, |()| RenewalDispatch::Started)
 }
 
 #[cfg(test)]
@@ -6030,6 +7722,16 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             claude_tmp: None,
             claude_running: None,
         };
+        // A sync that finds what is already there writes nothing, the wake marker included.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            run_accounts_sync(&env, source.to_str(), Some("m8"), false, &mut out, &mut err),
+            ExitCode::SUCCESS,
+            "{}",
+            String::from_utf8_lossy(&err)
+        );
+        // One that writes a file and cannot write the marker says so.
+        fs::remove_file(&saved.fleet_path).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
         assert_eq!(
@@ -6663,10 +8365,25 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
     struct Witness {
         fetched: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         spawned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        fetch: Box<Fetch>,
+        fetch: Box<Fetch<'static>>,
         spawn: Box<SpawnRenewal>,
         cooldown: std::sync::Mutex<Option<Instant>>,
+        rediscovery: std::sync::Mutex<Rediscovery>,
         guard: std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+        /// Whether a headless browser is installed: none unless a test says so.
+        browser: Box<dyn Fn(&Path) -> bool + Sync>,
+        /// The vault's sync: this machine is in none unless a test says so.
+        vault_sync: fn(&Path) -> super::super::sign_in_ladder::Vault,
+        /// The automatic sign-ins' lines, as the window's `aterm.log` would have them.
+        logged: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// One run of a route: none unless a test scripts one.
+        run_attempt: Option<RunAttempt>,
+    }
+
+    /// A spawn seam that runs its work at once, on the caller's thread.
+    fn run_inline(work: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+        work();
+        Ok(())
     }
 
     impl Witness {
@@ -6687,17 +8404,36 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 fetched,
                 spawned,
                 cooldown: std::sync::Mutex::new(None),
+                rediscovery: std::sync::Mutex::new(Rediscovery::default()),
                 guard: std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default())),
+                browser: Box::new(|_: &Path| false),
+                vault_sync: |_: &Path| super::super::sign_in_ladder::Vault::NotMember,
+                logged: std::sync::Arc::default(),
+                run_attempt: None,
             }
         }
 
         fn fx(&self) -> UpkeepEffects<'_> {
+            let logged = std::sync::Arc::clone(&self.logged);
             UpkeepEffects {
                 fetch: &*self.fetch,
                 spawn_renewal: &*self.spawn,
                 sync_cooldown: &self.cooldown,
+                rediscovery: &self.rediscovery,
                 renew_guard: &self.guard,
+                find_browser: &*self.browser,
+                vault_sync: self.vault_sync,
+                spawn_vault: &run_inline,
+                mailbox: &ladder_mailbox_files,
+                log: std::sync::Arc::new(move |line: &str| {
+                    logged.lock().unwrap().push(line.to_owned());
+                }),
+                run_attempt: self.run_attempt.clone(),
             }
+        }
+
+        fn logged(&self) -> Vec<String> {
+            self.logged.lock().unwrap().clone()
         }
 
         fn fetched(&self) -> Vec<String> {
@@ -6714,6 +8450,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
     const UPKEEP_NOW: i64 = 1_792_660_000;
     const UNCONFIGURED: Upkept = Upkept::Unconfigured {
         fleet_file_ignored: false,
+        renewal: false,
     };
 
     #[test]
@@ -6908,7 +8645,8 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             assert_eq!(
                 upkept(),
                 Upkept::Unconfigured {
-                    fleet_file_ignored: true
+                    fleet_file_ignored: true,
+                    renewal: false,
                 },
                 "{text}"
             );
@@ -6924,7 +8662,8 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(
             upkept(),
             Upkept::Unconfigured {
-                fleet_file_ignored: true
+                fleet_file_ignored: true,
+                renewal: false,
             }
         );
         assert_eq!(wit.fetched(), Vec::<String>::new(), "nothing fetched");
@@ -6960,7 +8699,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
     }
 
     #[test]
-    fn a_walled_login_is_renewed_only_where_a_source_is_configured() {
+    fn a_walled_login_is_renewed_by_default_and_a_machine_without_a_route_says_so() {
         let w = World::new();
         w.write_config("[fleet]\nmachine = \"m15\"\n");
         fs::write(
@@ -7032,14 +8771,88 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             0,
             "without a mailbox or browser profile, upkeep starts no background sign-in"
         );
+        // The incident of 2026-10-24: a walled session, its successors never signed in, and no
+        // route on the machine. Each successor's attempt is an error on record naming every
+        // route it tried, never a silent failure, and written once however often it is tried.
+        let (logins, _) = store.load_logins(now).unwrap();
+        let tried: Vec<(String, accounts::SignInAttempt)> =
+            accounts::failing_sign_ins(&file_roster, &store.load(now).unwrap().0, &logins, now);
+        assert!(!tried.is_empty(), "the successors' attempts are on record");
+        for (label, attempt) in &tried {
+            assert_eq!(
+                attempt.outcome,
+                accounts::AttemptOutcome::NoRoute,
+                "{label}"
+            );
+            for route in [
+                "profile(none)",
+                "mailbox(none configured)",
+                "vault(not a member)",
+                "headless-browser(none installed)",
+                "hosts(none configured)",
+            ] {
+                assert!(
+                    attempt.routes.contains(route),
+                    "{label}: {}",
+                    attempt.routes
+                );
+            }
+        }
+        let sign_ins = || {
+            store
+                .tail(100)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == accounts::Kind::SignIn)
+                .count()
+        };
+        assert_eq!(sign_ins(), tried.len(), "one ledger event per row");
+        let no_route_lines = || {
+            wit.logged()
+                .into_iter()
+                .filter(|line| line.contains("no-route"))
+                .collect::<Vec<_>>()
+        };
+        let lines = no_route_lines();
+        assert_eq!(lines.len(), tried.len(), "one log line per try: {lines:?}");
+        for (label, _) in &tried {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains(&format!("account {label}:")) && l.contains("mailbox(")),
+                "{label}: {lines:?}"
+            );
+        }
+        let upkept = |step| upkeep(&w.home, &w.state, (&w.roster(), now, step), &wit.fx());
+        upkept(UpkeepStep::Renew);
+        assert_eq!(
+            sign_ins(),
+            tried.len(),
+            "an unchanged failure is not written again"
+        );
+        assert_eq!(
+            no_route_lines(),
+            lines,
+            "nothing logged while each row is held"
+        );
 
         fs::create_dir_all(&mailbox_dir).unwrap();
         let fleet_aside = w.config.join("fleet-accounts.aside");
         fs::rename(w.fleet_file(), &fleet_aside).unwrap();
 
-        let upkept = |step| upkeep(&w.home, &w.state, (&w.roster(), now, step), &wit.fx());
-        assert_eq!(upkept(UpkeepStep::Both), UNCONFIGURED);
-        assert_eq!(wit.spawned(), 0, "no renewal without a configured source");
+        assert_eq!(
+            upkept(UpkeepStep::Both),
+            Upkept::Unconfigured {
+                fleet_file_ignored: false,
+                renewal: true,
+            },
+            "a roster that stands is signed in with no source configured, by default"
+        );
+        assert_eq!(
+            wit.spawned(),
+            1,
+            "the mailbox that appeared ends the backoff at once"
+        );
 
         fs::rename(&fleet_aside, w.fleet_file()).unwrap();
         assert_eq!(
@@ -7051,16 +8864,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             },
             "the sync step alone starts no sign-in"
         );
-        assert_eq!(wit.spawned(), 0);
-        assert_eq!(
-            upkept(UpkeepStep::Renew),
-            Upkept::Configured {
-                kind: "fleet-file",
-                roster: true,
-                renewal: true
-            }
-        );
-        assert_eq!(wit.spawned(), 1, "the successor's sign-in started");
+        assert_eq!(wit.spawned(), 1);
     }
 
     #[test]
@@ -7368,7 +9172,9 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             let mut initial =
                 FleetRoster::from_toml(std::str::from_utf8(&captured).unwrap(), "initial").unwrap();
             initial.accounts.truncate(2);
-            fs::write(&source, initial.to_toml_for(Some(OptIn::Named))).unwrap();
+            // The list discovery wrote: a named list takes only accounts this Mac shows
+            // all of, and here only the first is still shown.
+            fs::write(&source, initial.to_toml_for(Some(OptIn::Discovered))).unwrap();
             fs::write(
                 race.home.join(".claude.json"),
                 format!(
@@ -7446,6 +9252,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     );
                     newer = Some(snapshot());
                 },
+                &fetch_source_text,
             );
             assert!(result.unwrap_err().contains("changed after init discovery"));
             assert_eq!(snapshot(), newer.unwrap());
@@ -8206,7 +10013,14 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             fetch: &fetch,
             spawn_renewal: &spawn,
             sync_cooldown: &cooldown,
+            rediscovery: &Mutex::new(Rediscovery::default()),
             renew_guard: &guard,
+            find_browser: &|_: &Path| false,
+            vault_sync: |_: &Path| super::super::sign_in_ladder::Vault::NotMember,
+            spawn_vault: &|_work| Ok(()),
+            mailbox: &ladder_mailbox_files,
+            log: std::sync::Arc::new(|_: &str| {}),
+            run_attempt: None,
         };
         let select = |label| match store.select_account(&roster, label, UPKEEP_NOW).unwrap() {
             accounts::PinSelection::Renew(request) => request,
@@ -8257,8 +10071,10 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 &fx
             ),
             Upkept::Unconfigured {
-                fleet_file_ignored: false
-            }
+                fleet_file_ignored: false,
+                renewal: true,
+            },
+            "the saved selection progressed with no source configured"
         );
         assert_eq!(queued.lock().unwrap().len(), 1);
         {
@@ -8287,7 +10103,8 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 (None, true),
                 UPKEEP_NOW,
                 &guard,
-                &spawn
+                &spawn,
+                None,
             ),
             RenewalDispatch::Held,
             "ordinary interactive rotation still observes the per-label cooldown"
@@ -9023,7 +10840,44 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             "clean successor m27-3 must be ordered ahead of m27-2 after m27-2 recorded wrong_at"
         );
 
+        // m27-3's desk browser profile opens a window on the owner's screen, so an upkeep never
+        // drives it: with nothing else on the machine, no sign-in starts, and each row's
+        // attempt names the routes it tried.
         let wit = Witness::answering("");
+        assert!(
+            !auto_renew_next_account(&w.home, &w.state, &w.roster(), UPKEEP_NOW + 10, &wit.fx()),
+            "a desk browser is never driven unattended"
+        );
+        assert_eq!(wit.spawned(), 0);
+        let (logins_tried, _) = store.load_logins(UPKEEP_NOW + 10).unwrap();
+        let attempt = |logins: &accounts::Logins, label: &str| {
+            logins
+                .get(label)
+                .and_then(|b| b.sign_in_attempt.clone())
+                .unwrap_or_else(|| panic!("{label}'s attempt is on record"))
+        };
+        let m27_3_tried = attempt(&logins_tried, "m27-3");
+        assert_eq!(m27_3_tried.outcome, accounts::AttemptOutcome::NoRoute);
+        assert!(
+            m27_3_tried
+                .routes
+                .contains("desk-browser(opens a window: not used unattended)"),
+            "{}",
+            m27_3_tried.routes
+        );
+        assert_eq!(
+            attempt(&logins_tried, "m27-2").outcome,
+            accounts::AttemptOutcome::NoRoute
+        );
+
+        // A headless browser and a stored profile for m27-3 are a route: it is the one signed in.
+        let m27_3_profile =
+            super::super::headless_oauth::browser_profile_dir(&store.dir, Some("m27-3"));
+        fs::create_dir_all(&m27_3_profile).unwrap();
+        let wit = Witness {
+            browser: Box::new(|_: &Path| true),
+            ..Witness::answering("")
+        };
         assert!(
             auto_renew_next_account(&w.home, &w.state, &w.roster(), UPKEEP_NOW + 10, &wit.fx()),
             "auto_renew_next_account must spawn renewal for m27-3"
@@ -9033,19 +10887,35 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             wit.guard.lock().unwrap().last_attempt.contains_key("m27-3"),
             "m27-3 must be the account claimed by AutoRenewPermit"
         );
+        fs::remove_dir_all(&m27_3_profile).unwrap();
 
         // Even with a fresh AutoRenewGuard (as after a process restart or CLI run),
-        // if m27-2 has a browser profile and m27-3 does not, background auto_renew_next_account
+        // if m27-2 has a route and m27-3 has none, background auto_renew_next_account
         // must respect m27-2's persisted 15-minute wrong_at cooldown before retrying it.
-        let mut roster_m27_2_browser = roster.clone();
-        roster_m27_2_browser.rows[1].browser = Some("Claude m27-2".to_owned());
-        roster_m27_2_browser.rows[2].browser = None;
+        let mut roster_m27_2_mailbox = roster.clone();
+        roster_m27_2_mailbox.rows[2].browser = None;
         let mut roster_m27_2_toml = String::new();
-        for r in &roster_m27_2_browser.rows {
+        for r in &roster_m27_2_mailbox.rows {
             roster_m27_2_toml.push_str(&accounts::row_text(r).unwrap());
             roster_m27_2_toml.push('\n');
         }
         fs::write(w.roster(), &roster_m27_2_toml).unwrap();
+        let m27_2_mailbox = store
+            .dir
+            .join(super::super::headless_oauth::MAILBOX_TOML_FILE);
+        fs::write(
+            &m27_2_mailbox,
+            "imap_url = \"imaps://127.0.0.1:9/INBOX\"\n[passwords]\n\"sun.m27.2@example.test\" = \"pw\"\n",
+        )
+        .unwrap();
+        let before_wrong =
+            std::time::UNIX_EPOCH + Duration::from_secs(u64::try_from(UPKEEP_NOW - 100).unwrap());
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&m27_2_mailbox)
+            .unwrap()
+            .set_modified(before_wrong)
+            .unwrap();
         let wit_cooldown = Witness::answering("");
         assert!(
             !auto_renew_next_account(
@@ -9079,6 +10949,15 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+        assert!(
+            wit_cooldown
+                .guard
+                .lock()
+                .unwrap()
+                .last_attempt
+                .contains_key("m27-2")
+        );
+        fs::remove_file(&m27_2_mailbox).unwrap();
 
         // Configure a mailbox password for m27-3 only (and remove its browser profile so only
         // its mailbox credential makes it headless-capable).
@@ -9566,17 +11445,239 @@ totp = "JBSWY3DPEHPK3PXP"
             "wall-recovery rows (clean m27-3 first, then m27-2 with old wrong_at) stay ahead of background due row m27"
         );
 
-        // Negative: when m27 is healthy (not low or walled), only due row m27 is returned.
+        // When m27 is healthy (not low or walled), its due renewal comes first, and the rows
+        // still to sign in follow it at once: a sign-in is never left for a wall to ask for.
         let mut healthy = state.clone();
         healthy.accounts.clear();
-        let due_only: Vec<String> = auto_renew_candidates(&roster, &healthy, &logins, now)
+        let due_first: Vec<String> = auto_renew_candidates(&roster, &healthy, &logins, now)
             .into_iter()
             .map(|r| r.label)
             .collect();
-        assert_eq!(due_only, vec!["m27".to_owned()]);
+        assert_eq!(
+            due_first,
+            vec!["m27".to_owned(), "m27-3".to_owned(), "m27-2".to_owned()]
+        );
+
+        // Claude Code's own warning that m27's week is filling is pressure enough, at any
+        // percent and long before m27 is low: the rows that would take its sessions go first.
+        let mut warned = healthy.clone();
+        warned
+            .accounts
+            .entry("m27".to_owned())
+            .or_default()
+            .warned_week = Some(accounts::WindowSaid {
+            pct: Some(80),
+            reset: Some(now + 3 * 86_400),
+            at: now - 30,
+        });
+        assert!(!warned.accounts["m27"].low(now));
+        let warned_first: Vec<String> = auto_renew_candidates(&roster, &warned, &logins, now)
+            .into_iter()
+            .map(|r| r.label)
+            .collect();
+        assert_eq!(
+            warned_first,
+            vec!["m27-3".to_owned(), "m27-2".to_owned(), "m27".to_owned()]
+        );
+    }
+
+    /// A row to sign in on a machine with no route, as m2 was on 2026-10-24, whose session on
+    /// m2-2 waits at its wall: the vault is refreshed once per wait, the failure is on record,
+    /// the mailbox a refresh brings signs the row in, and the session at the wall moves to it.
+    #[test]
+    fn a_vault_refresh_that_brings_a_mailbox_signs_in_the_row_a_walled_session_moves_to() {
+        use super::super::sign_in_ladder::Vault;
+        static SYNCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn vault_brings_nothing(_: &Path) -> Vault {
+            SYNCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Vault::Unchanged(51)
+        }
+        fn vault_brings_a_mailbox(home: &Path) -> Vault {
+            let secrets = home.join(".secrets");
+            fs::create_dir_all(&secrets).unwrap();
+            fs::write(
+                secrets.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
+                "http_url = \"http://127.0.0.1:9/inbox\"\n",
+            )
+            .unwrap();
+            Vault::Applied(52)
+        }
+
+        let w = World::new();
+        let store = accounts::Store::at(&w.state);
+        let m2_2_dir = store.logins_dir().join("m2-2");
+        fs::create_dir_all(&m2_2_dir).unwrap();
+        fs::write(
+            m2_2_dir.join(".claude.json"),
+            "{\"oauthAccount\":{\"emailAddress\":\"m2-2@example.test\"}}\n",
+        )
+        .unwrap();
+        let mut roster_toml = String::new();
+        for label in ["m2", "m2-2"] {
+            let row = Row {
+                label: label.to_owned(),
+                class: Class::Dedicated,
+                dir: Some(
+                    store
+                        .logins_dir()
+                        .join(label)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                email: Some(format!("{label}@example.test")),
+                ..Row::default()
+            };
+            roster_toml.push_str(&accounts::row_text(&row).unwrap());
+            roster_toml.push('\n');
+        }
+        fs::create_dir_all(&w.config).unwrap();
+        fs::write(w.roster(), &roster_toml).unwrap();
+        let wall_at = UPKEEP_NOW - 60;
+        store
+            .transact(UPKEEP_NOW, &mut None, |st| {
+                st.active = Some("m2-2".to_owned());
+                Ok(accounts::note_wall(
+                    st,
+                    "m2-2",
+                    "seven_day",
+                    Some(UPKEEP_NOW + 86_400),
+                    wall_at,
+                    UPKEEP_NOW,
+                ))
+            })
+            .unwrap();
+        let secrets_config = w.home.join(".config/aterm/secrets");
+        fs::create_dir_all(&secrets_config).unwrap();
+        fs::write(secrets_config.join("source.toml"), "# a vault member\n").unwrap();
+
+        let wit = Witness {
+            vault_sync: vault_brings_nothing,
+            ..Witness::answering("")
+        };
+        let pass = |wit: &Witness| {
+            auto_renew_next_account(&w.home, &w.state, &w.roster(), UPKEEP_NOW, &wit.fx())
+        };
+        assert!(!pass(&wit), "no route: nothing started");
+        assert_eq!(
+            (
+                wit.spawned(),
+                SYNCS.load(std::sync::atomic::Ordering::SeqCst)
+            ),
+            (0, 1)
+        );
+        let tried = store
+            .load_logins(UPKEEP_NOW)
+            .unwrap()
+            .0
+            .get("m2")
+            .and_then(|b| b.sign_in_attempt.clone())
+            .expect("the attempt is on record");
+        assert_eq!(tried.outcome, accounts::AttemptOutcome::NoRoute);
+        assert!(
+            tried.routes.contains("vault(seq 51, nothing new)"),
+            "{}",
+            tried.routes
+        );
+        assert!(!pass(&wit));
+        assert_eq!(
+            SYNCS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "inside its backoff the row is not read again, and the vault not refreshed again"
+        );
+
+        let wit = Witness {
+            vault_sync: vault_brings_a_mailbox,
+            ..Witness::answering("")
+        };
+        assert!(pass(&wit), "the mailbox the vault brought is a route");
+        assert_eq!(wit.spawned(), 1);
+        assert!(wit.guard.lock().unwrap().last_attempt.contains_key("m2"));
+
+        // The sign-in that started ends with m2's login made. A session at m2-2's wall, which
+        // had nowhere to go, now moves to m2; the wake file a renewal touches is what makes
+        // each waiting session's supervisor re-advise at once (`account_news`, turn_end_loop).
+        let file_roster = Roster::load(&w.roster()).unwrap();
+        let m2_2_text = m2_2_dir.to_string_lossy().into_owned();
+        let advise_at = |at: i64| {
+            let (state, _) = store.load(at).unwrap();
+            let (logins, _) = store.load_logins(at).unwrap();
+            let bound = accounts::bound(&file_roster, &logins);
+            let enrolled = accounts::enrolled(&bound);
+            let who = accounts::ProcessLogin {
+                login: Some(m2_2_text.clone()),
+                default_home: true,
+                stored_login: true,
+            };
+            accounts::advise(
+                &bound,
+                &state,
+                &enrolled,
+                &who.me(&bound),
+                &accounts::Point::Wall {
+                    window: "seven_day".to_owned(),
+                    at: Some(wall_at),
+                },
+                accounts::Mode::Wall,
+                at,
+            )
+        };
+        assert!(
+            !matches!(advise_at(UPKEEP_NOW), accounts::Advice::Move { .. }),
+            "{:?}",
+            advise_at(UPKEEP_NOW)
+        );
+        let _ = fs::remove_file(store.wake_path());
+        let staging = store.claim_staging_dir("m2").unwrap();
+        let staging_text = staging.to_str().unwrap().to_owned();
+        fs::write(
+            staging.join(".claude.json"),
+            "{\"oauthAccount\":{\"emailAddress\":\"m2@example.test\",\"subscriptionType\":\"max\"}}\n",
+        )
+        .unwrap();
+        let status = super::super::align::Captured {
+            stdout: b"{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"email\":\"m2@example.test\",\"subscriptionType\":\"max\"}\n".to_vec(),
+            code: Some(0),
+        };
+        assert!(complete_staging_renewal(
+            &store,
+            &file_roster,
+            "m2",
+            &staging,
+            &staging_text,
+            &status,
+            UPKEEP_NOW + 5,
+        ));
+        assert!(store.wake_path().exists(), "the waiting sessions are woken");
+        assert_eq!(
+            advise_at(UPKEEP_NOW + 5),
+            accounts::Advice::Move {
+                to: "m2".to_owned(),
+                ahead: false,
+                rotates: true,
+                takes_canary: false,
+            }
+        );
+        let (logins, _) = store.load_logins(UPKEEP_NOW + 5).unwrap();
+        assert_eq!(
+            logins.get("m2").and_then(|b| b.sign_in_attempt.clone()),
+            None,
+            "the login made ends the failure on record"
+        );
     }
 }
 
 #[cfg(test)]
 #[path = "accounts_sync_cli_tests.rs"]
 mod cli_pool_tests;
+
+#[cfg(test)]
+#[path = "accounts_sync_login_tests.rs"]
+mod login_tests;
+
+#[cfg(test)]
+#[path = "accounts_sync_resync_tests.rs"]
+mod resync_tests;
+
+#[cfg(test)]
+#[path = "accounts_sync_ladder_tests.rs"]
+mod ladder_tests;

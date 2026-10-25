@@ -48,7 +48,7 @@ impl DogBakeKey {
     /// only past this point).
     #[inline]
     #[must_use]
-    pub fn fills(&self) -> ResolvedFills {
+    pub const fn fills(&self) -> ResolvedFills {
         ResolvedFills::from_context(self.coat, DOG_IRIS_STOP, self.colors)
     }
 

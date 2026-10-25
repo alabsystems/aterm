@@ -31,7 +31,8 @@ use std::{
 
 /// Bounded repair work per connection; subsequent rounds resume from durable inventory.
 pub const RECORDS_PER_ROUND: usize = 256;
-const WITHIN: Duration = Duration::from_secs(30);
+/// One exchange's absolute deadline.
+pub(crate) const WITHIN: Duration = Duration::from_secs(30);
 
 /// Durably exchanged operation counts for this peer and round. Zero counts do
 /// not prove global convergence or the absence of another peer's unseen history.
@@ -81,13 +82,18 @@ pub(crate) struct Deadline {
 }
 impl Deadline {
     pub(crate) fn arm(tcp: &TcpStream) -> Result<Self> {
+        Self::arm_within(tcp, WITHIN)
+    }
+
+    /// [`Self::arm`] with its own deadline.
+    pub(crate) fn arm_within(tcp: &TcpStream, within: Duration) -> Result<Self> {
         let socket = tcp.try_clone()?;
         aterm_uds::keep_out_of_children(&socket)?;
         let (done, wait) = mpsc::channel();
         let join = thread::Builder::new()
             .name("db-exchange-deadline".into())
             .spawn(move || {
-                if wait.recv_timeout(WITHIN).is_err() {
+                if wait.recv_timeout(within).is_err() {
                     let _ = socket.shutdown(Shutdown::Both);
                 }
             })?;

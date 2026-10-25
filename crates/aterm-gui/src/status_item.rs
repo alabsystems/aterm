@@ -277,6 +277,9 @@ pub(crate) struct SiblingNeed {
     pub label: String,
     /// How long ago the fact the need stands on moved, when the row says.
     pub age_ms: Option<u64>,
+    /// The need's words where the row says it is the program's own report (`needs_by=program`,
+    /// [`crate::needs::claim_words_of_row`]).
+    pub claim: Option<&'static str>,
 }
 
 /// The stall half of a session's need facts — `input_stall::menu_row`'s words.
@@ -353,7 +356,7 @@ pub(crate) struct Escalation {
     pub session: u64,
     /// What it is about.
     pub kind: EscalationKind,
-    /// The need it is: what a seamless update's carry is matched by ([`Herald::note`]) — a kind holds several words (a login, a memory wall and any other wall are all [`EscalationKind::Wall`]), and each is its own need.
+    /// The need it is: what a seamless update's carry is matched by ([`Herald::note_spent`]) — a kind holds several words (a login, a memory wall and any other wall are all [`EscalationKind::Wall`]), and each is its own need.
     pub word: NeedWord,
     /// The transition's identity within `(session, kind)` ([`crate::needs::Need::key`]): the same need re-read is the same key; a new one is a new key.
     pub key: u64,
@@ -363,6 +366,9 @@ pub(crate) struct Escalation {
     pub body: String,
     /// The notification title ([`headline`]).
     pub headline: &'static str,
+    /// The engine's sequence of the program's own `blocked` report a program-claim need stands
+    /// on ([`crate::needs::Need::report`]): the box [`crate::box_banner`] keeps to one banner.
+    pub report: Option<u64>,
 }
 
 const ROW_TITLE_MAX: usize = 32;
@@ -399,6 +405,7 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
         label,
         body,
         headline: headline(need.word),
+        report: need.report,
     })
 }
 
@@ -423,7 +430,7 @@ pub(crate) struct HeraldNotice {
     decided: (),
 }
 
-/// What one [`Herald::note`] decided.
+/// What one [`Herald::note_spent`] decided.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct HeraldOutcome {
     /// The session's menu row appeared, changed or went away — re-render.
@@ -438,6 +445,16 @@ pub(crate) struct HeraldOutcome {
     pub first_quiet: bool,
 }
 
+/// How the owner already heard of a session's need, so its transition owes no notice
+/// ([`Herald::note_spent`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Spent {
+    /// The human is looking at the tab in the active app.
+    Looking,
+    /// The program's own notification told this box ([`crate::box_banner`]).
+    Told,
+}
+
 /// Why a transition into an escalation posted nothing (test-visible).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeraldQuiet {
@@ -445,6 +462,8 @@ pub(crate) enum HeraldQuiet {
     Same,
     /// The human is looking at the tab in the active app.
     Looking,
+    /// The program's own notification told this box ([`crate::box_banner`]).
+    Told,
     /// Desktop alerts are off.
     Disabled,
     /// [`NOTIFY_SESSION_FLOOR`] or [`NOTIFY_BURST`] held it back, or the notifier's queue refused this session's notice less than [`NOTIFY_RETRY`] ago (another session's refusal holds nothing here): it is owed, and posted (coalesced) when the limit allows ([`Herald::due`]).
@@ -635,7 +654,7 @@ impl Herald {
         moved
     }
 
-    /// A seamless update adopted `session` with what its outgoing process knew of it (`carry`, `SessionRecord::status_seen`), at `now_unix` / `now`: for [`ADOPT_SETTLE`], its first need published here takes the carried age when it is the carried word ([`Self::observe`]), and is no transition when it is the need the herald had told ([`Self::note`]) — an update is no new need, and the owner was told once.
+    /// A seamless update adopted `session` with what its outgoing process knew of it (`carry`, `SessionRecord::status_seen`), at `now_unix` / `now`: for [`ADOPT_SETTLE`], its first need published here takes the carried age when it is the carried word ([`Self::observe`]), and is no transition when it is the need the herald had told ([`Self::note_spent`]) — an update is no new need, and the owner was told once.
     pub(crate) fn adopt(
         &mut self,
         session: u64,
@@ -693,6 +712,21 @@ impl Herald {
     }
 
     /// Fold `session`'s current escalation.
+    #[cfg(test)]
+    pub(crate) fn note(
+        &mut self,
+        session: u64,
+        current: Option<&Escalation>,
+        looking: bool,
+        desktop_alerts: bool,
+        now: std::time::Instant,
+    ) -> HeraldOutcome {
+        let spent = looking.then_some(Spent::Looking);
+        self.note_spent(session, current, spent, desktop_alerts, now)
+    }
+
+    /// Fold the current escalation, accounting for how the owner already heard
+    /// of the need (`spent`). A spent transition owes no desktop notice.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -725,11 +759,11 @@ impl Herald {
             project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
         )
     )]
-    pub(crate) fn note(
+    pub(crate) fn note_spent(
         &mut self,
         session: u64,
         current: Option<&Escalation>,
-        looking: bool,
+        spent: Option<Spent>,
         desktop_alerts: bool,
         now: std::time::Instant,
     ) -> HeraldOutcome {
@@ -781,10 +815,14 @@ impl Herald {
             // The same box re-read, and nothing owed for it.
             return quiet(self, HeraldQuiet::Same, false);
         }
-        if looking {
+        if let Some(spent) = spent {
             slot.owed = 0;
             let first_quiet = slot.first_quiet(now);
-            return quiet(self, HeraldQuiet::Looking, first_quiet);
+            let why = match spent {
+                Spent::Looking => HeraldQuiet::Looking,
+                Spent::Told => HeraldQuiet::Told,
+            };
+            return quiet(self, why, first_quiet);
         }
         if !desktop_alerts {
             slot.suppress_desktop_notice();
@@ -826,7 +864,7 @@ impl Herald {
         }
     }
 
-    /// `notify.rs`'s queue refused the notice [`Self::note`] just posted for `session`, which paid `owed` transitions ([`HeraldOutcome::owed`]): it was full — it is shared with program notifications — or its thread was gone (`App::post_herald_notice`).
+    /// `notify.rs`'s queue refused the notice [`Self::note_spent`] just posted for `session`, which paid `owed` transitions ([`HeraldOutcome::owed`]): it was full — it is shared with program notifications — or its thread was gone (`App::post_herald_notice`).
     pub(crate) fn refused(&mut self, session: u64, owed: u32, now: std::time::Instant) {
         let Some(slot) = self.slots.get_mut(&session) else {
             return;
@@ -878,7 +916,7 @@ impl Herald {
         floor.max(burst).max(retry).max(now)
     }
 
-    /// The sessions whose owed notice the limit now allows — the App's timer re-heralds each ([`Self::note`] with its current escalation), and the earliest instant any other owed notice becomes allowed (its next wake).
+    /// The sessions whose owed notice the limit now allows — the App's timer re-heralds each ([`Self::note_spent`] with its current escalation), and the earliest instant any other owed notice becomes allowed (its next wake).
     pub fn due(&self, now: std::time::Instant) -> (Vec<u64>, Option<std::time::Instant>) {
         let mut ready = Vec::new();
         let mut next: Option<std::time::Instant> = None;
@@ -895,7 +933,7 @@ impl Herald {
         (ready, next)
     }
 
-    /// Why the last [`Self::note`] posted nothing, when it had a transition or a re-read to judge; `None` after a post or a cleared escalation.
+    /// Why the last [`Self::note_spent`] posted nothing, when it had a transition or a re-read to judge; `None` after a post or a cleared escalation.
     pub(crate) const fn last_quiet(&self) -> Option<HeraldQuiet> {
         self.last_quiet
     }
@@ -915,7 +953,7 @@ impl Herald {
     }
 }
 
-/// What became of a [`Herald::note`]'s notice ([`herald_log_line`]'s `post`), decided before its line is written.
+/// What became of a [`Herald::note_spent`]'s notice ([`herald_log_line`]'s `post`), decided before its line is written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeraldPost {
     /// `notify.rs`'s queue took it — or the note owed no notice at all.
@@ -926,7 +964,7 @@ pub(crate) enum HeraldPost {
     Suppressed,
 }
 
-/// The one `aterm.log` line a [`Herald::note`] earns, as `(level, text)`, or `None` when it decided nothing (nothing escalates, or the escalation cleared).
+/// The one `aterm.log` line a [`Herald::note_spent`] earns, as `(level, text)`, or `None` when it decided nothing (nothing escalates, or the escalation cleared).
 pub(crate) fn herald_log_line(
     session: u64,
     current: Option<&Escalation>,
@@ -962,6 +1000,10 @@ pub(crate) fn herald_log_line(
         };
         match quiet? {
             HeraldQuiet::Looking => (first, "not queued: looking".to_string()),
+            HeraldQuiet::Told => (
+                first,
+                "not queued: the program's own notification told it".to_string(),
+            ),
             HeraldQuiet::Disabled => (
                 first,
                 "not queued: suppressed by desktop_alerts = false".to_string(),
@@ -981,12 +1023,15 @@ pub(crate) fn herald_log_line(
         format!(
             "escalation notification for session {session} ({} {}): {decision}",
             esc.kind.log_word(),
-            herald_key_words(esc.kind, esc.key)
+            herald_key_words(esc.kind, esc.key, esc.report)
         ),
     ))
 }
 
-fn herald_key_words(kind: EscalationKind, key: u64) -> String {
+fn herald_key_words(kind: EscalationKind, key: u64, report: Option<u64>) -> String {
+    if report.is_some() {
+        return format!("report_episode={key}");
+    }
     match kind {
         EscalationKind::Prompt | EscalationKind::Question | EscalationKind::Wall => {
             format!("agent_rev={key}")
@@ -1434,7 +1479,10 @@ impl Glance {
                     origin: Origin::Sibling(sibling.pid),
                     label: need.label.clone(),
                     worker_of: None,
-                    what: need_words(need.word).to_string(),
+                    what: need
+                        .claim
+                        .unwrap_or_else(|| need_words(need.word))
+                        .to_string(),
                     harness: None,
                     since_unix: need.age_ms.map(|ms| {
                         scanned.saturating_sub(i64::try_from(ms / 1000).unwrap_or(i64::MAX))
@@ -2764,7 +2812,7 @@ fn mac_row(
                 "{} {} \u{2014} {}{}",
                 need_mark(need.word),
                 need.who,
-                need_words(need.word),
+                need.claim.unwrap_or_else(|| need_words(need.word)),
                 age_suffix(since, now_unix)
             ),
             LINE_MAX,
@@ -4957,6 +5005,7 @@ mod tests {
                 word: NeedWord::Frozen,
                 label: "claude".to_string(),
                 age_ms: Some(60_000),
+                claim: None,
             }],
             scanned_ms: unix_ms(990),
         };
@@ -4996,6 +5045,7 @@ mod tests {
                 word: NeedWord::Stalled,
                 label: "claude".to_string(),
                 age_ms: Some(60_000),
+                claim: None,
             }],
             scanned_ms,
         };
@@ -5744,6 +5794,7 @@ mod tests {
                 key,
                 what: "look".to_string(),
                 harness: None,
+                report: None,
             }),
             held: hold,
             ..SessionRow::default()
@@ -6092,6 +6143,7 @@ mod tests {
                     worker_of: Some("s-1e91".to_string()),
                     age_ms: Some(60_000),
                     what: None,
+                    claim: None,
                 })
                 .collect(),
             ..crate::fleet_glance::FleetMac::default()

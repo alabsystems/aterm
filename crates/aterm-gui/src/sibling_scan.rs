@@ -216,6 +216,9 @@ fn parse_session_row(line: &str) -> Option<(Option<SiblingNeed>, bool)> {
         .or_else(|| field("program"))
         .unwrap_or_else(|| crate::presence::short_sid(&sid));
     let agent = field("program_kind").as_deref() == Some("agent");
+    let claim = (field("needs_by").as_deref() == Some("program"))
+        .then(|| crate::needs::claim_words_of_row(word, field("agent").as_deref()))
+        .flatten();
     let age_ms = match word {
         NeedWord::Stalled => field("task_ms"),
         NeedWord::Ask => None,
@@ -229,6 +232,7 @@ fn parse_session_row(line: &str) -> Option<(Option<SiblingNeed>, bool)> {
             word,
             label: crate::needs::fold_clip(&label, 40),
             age_ms,
+            claim,
         }),
         true,
     ))
@@ -377,6 +381,37 @@ mod tests {
             Some((None, true)),
             "a newer word is never guessed"
         );
+    }
+
+    /// A need the row says is the program's own report (`needs_by=program`) keeps the words
+    /// that say so: an approval, a sign-in (the survey's `agent=wall:auth`) and a question each
+    /// in their own; CONTROL: the same need with no `needs_by=` (a box a reader saw, or an older
+    /// aterm's row) has none.
+    #[test]
+    fn a_row_the_programs_own_report_raised_says_so() {
+        use crate::needs::{CODEX_APPROVAL_WORDS, CODEX_QUESTION_WORDS, CODEX_SIGN_IN_WORDS};
+        let claim = |needs: &str, agent: &str, by: &str| {
+            parse_session_row(&format!(
+                "session local=3 sid=s-abc state=alive program=codex program_kind=agent \
+                 agent={agent} agent_ms=4000 needs={needs} needs_by={by} hold_by=-"
+            ))
+            .and_then(|(need, _)| need)
+            .expect("its need")
+            .claim
+        };
+        assert_eq!(
+            claim("approval", "prompt", "program"),
+            Some(CODEX_APPROVAL_WORDS)
+        );
+        assert_eq!(
+            claim("approval", "wall:auth", "program"),
+            Some(CODEX_SIGN_IN_WORDS)
+        );
+        assert_eq!(
+            claim("question", "question", "program"),
+            Some(CODEX_QUESTION_WORDS)
+        );
+        assert_eq!(claim("approval", "prompt", "-"), None, "CONTROL");
     }
 
     /// A scripted sibling over a real Unix socket serving AUTH and `survey

@@ -247,9 +247,7 @@ fn refused_local(
     }
     io::Error::new(
         io::ErrorKind::HostUnreachable,
-        format!(
-            "dns: {host}: macOS does not let this app use the local network (Local Network privacy)"
-        ),
+        format!("dns: {host}: {}", crate::local_network::REFUSED),
     )
 }
 

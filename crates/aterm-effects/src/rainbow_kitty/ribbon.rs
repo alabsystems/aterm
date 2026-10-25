@@ -500,7 +500,6 @@ pub struct Cohort {
     pub flow: Option<Instant>,
     pub flow_drift: f32,
     release_clock: Option<ReleaseClock>,
-    release_parts: [Option<ReleasePart>; RELEASE_PARTS],
     parts_revoked_at: Option<Instant>,
     line_killed: bool,
     printed: Option<Instant>,
@@ -515,11 +514,9 @@ struct ReleaseClock {
     cells: usize,
 }
 
-/// Partial releases one cohort holds in custody at once (`Cohort::release_parts`).
-pub const RELEASE_PARTS: usize = 4;
-
 #[derive(Clone, Copy, Debug)]
 struct ReleasePart {
+    cohort: u32,
     stamp: Instant,
     cells: usize,
 }
@@ -532,42 +529,12 @@ impl Cohort {
     }
 
     #[inline]
-    fn hold_part(&mut self, part: ReleasePart) {
-        let mut oldest: Option<(usize, Instant)> = None;
-        for (i, slot) in self.release_parts.iter_mut().enumerate() {
-            match slot {
-                None => {
-                    *slot = Some(part);
-                    return;
-                }
-                Some(p) => {
-                    if oldest.is_none_or(|(_, t)| p.stamp < t) {
-                        oldest = Some((i, p.stamp));
-                    }
-                }
-            }
-        }
-        if let Some((i, _)) = oldest {
-            self.release_parts[i] = Some(part);
-        }
-    }
-
-    #[inline]
-    fn part_mut(&mut self, stamp: Instant) -> Option<&mut ReleasePart> {
-        self.release_parts
-            .iter_mut()
-            .flatten()
-            .find(|p| p.stamp == stamp)
-    }
-
-    #[inline]
-    fn holds_partial(&self, cell: &Cell) -> bool {
+    fn holds_partial(&self, cell: &Cell, parts: &[ReleasePart]) -> bool {
         !self.abandoned
             && cell.released_at.is_some_and(|stamp| {
-                self.release_parts
-                    .iter()
-                    .flatten()
-                    .any(|part| part.stamp == stamp)
+                parts
+                    .binary_search_by_key(&(self.id, stamp), |part| (part.cohort, part.stamp))
+                    .is_ok()
             })
     }
 
@@ -1007,7 +974,7 @@ impl FieldIndex {
 /// The bed's one ceiling, in relative luminance.
 #[inline]
 #[must_use]
-pub fn bed_luma_budget(theme_fg: u32) -> f32 {
+pub const fn bed_luma_budget(theme_fg: u32) -> f32 {
     let bar =
         (relative_luminance(theme_fg) + 0.05) / (BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD) - 0.05;
     bar.clamp(BED_LUMA_MIN, BED_LUMA_MAX)
@@ -1033,48 +1000,62 @@ const fn toward_white(rgb: u32, w: f32) -> u32 {
 }
 
 #[inline]
-fn solve_for_luma(family: impl Fn(f32) -> u32, target: f32) -> u32 {
+const fn solve_for_luma(base_rgb: u32, k_full: f32, walk_white: bool, target: f32) -> u32 {
+    #[inline]
+    const fn eval_family(base_rgb: u32, k_full: f32, walk_white: bool, u: f32) -> u32 {
+        if walk_white {
+            toward_white(base_rgb, u)
+        } else {
+            scale_rgb(base_rgb, u * k_full)
+        }
+    }
     let table = crate::color_math::relative_luminance_table();
-    let hi0 = family(1.0);
+    let hi0 = eval_family(base_rgb, k_full, walk_white, 1.0);
     if crate::color_math::relative_luminance_with(table, hi0) < target {
         return hi0;
     }
-    let lo0 = family(0.0);
+    let lo0 = eval_family(base_rgb, k_full, walk_white, 0.0);
     if crate::color_math::relative_luminance_with(table, lo0) >= target {
         return lo0;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
-    let (mut lo_rgb, mut hi_rgb) = (Some(lo0), Some(hi0));
-    for _ in 0..24 {
+    let (mut lo_rgb, mut hi_rgb) = (lo0, hi0);
+    let mut i = 0;
+    while i < 24 {
         let mid = 0.5 * (lo + hi);
-        let mid_rgb = family(mid);
-        if lo_rgb == Some(mid_rgb) {
+        let mid_rgb = eval_family(base_rgb, k_full, walk_white, mid);
+        if mid_rgb == lo_rgb {
             lo = mid;
-        } else if hi_rgb == Some(mid_rgb) {
+        } else if mid_rgb == hi_rgb {
             hi = mid;
         } else if crate::color_math::relative_luminance_with(table, mid_rgb) < target {
             lo = mid;
-            lo_rgb = Some(mid_rgb);
+            lo_rgb = mid_rgb;
         } else {
             hi = mid;
-            hi_rgb = Some(mid_rgb);
+            hi_rgb = mid_rgb;
         }
+        i += 1;
     }
-    lo_rgb.unwrap_or(lo0)
+    lo_rgb
 }
 
 #[inline]
-fn onto_luma(rgb: u32, target: f32) -> u32 {
-    let mx = ((rgb >> 16) & 0xff).max((rgb >> 8) & 0xff).max(rgb & 0xff);
+const fn onto_luma(rgb: u32, target: f32) -> u32 {
+    let r = (rgb >> 16) & 0xff;
+    let g = (rgb >> 8) & 0xff;
+    let b = rgb & 0xff;
+    let mx = if r > g { r } else { g };
+    let mx = if mx > b { mx } else { b };
     if mx == 0 {
-        return solve_for_luma(|w| toward_white(rgb, w), target);
+        return solve_for_luma(rgb, 1.0, true, target);
     }
     let k_full = 255.0 / mx as f32;
     let full = scale_rgb(rgb, k_full);
     if relative_luminance(full) >= target {
-        solve_for_luma(|k| scale_rgb(rgb, k * k_full), target)
+        solve_for_luma(rgb, k_full, false, target)
     } else {
-        solve_for_luma(|w| toward_white(full, w), target)
+        solve_for_luma(full, 1.0, true, target)
     }
 }
 
@@ -1082,7 +1063,17 @@ fn onto_luma(rgb: u32, target: f32) -> u32 {
 /// and the page `page` keeps a letter's edge at the bar ([`DIM_EDGE_GUARD`]);
 /// `bed` unchanged on a theme whose text `fg` reads past [`DIM_THEME_BARE`].
 #[must_use]
-pub fn dim_edge_held(bed: u32, fg: u32, page: u32) -> u32 {
+pub const fn dim_edge_held(bed: u32, fg: u32, page: u32) -> u32 {
+    #[inline]
+    const fn chmax(c: u32, page: u32) -> u32 {
+        #[inline]
+        const fn ch(c: u32, page: u32, sh: u32) -> u32 {
+            let a = (c >> sh) & 0xff;
+            let b = (page >> sh) & 0xff;
+            (if a > b { a } else { b }) << sh
+        }
+        ch(c, page, 16) | ch(c, page, 8) | ch(c, page, 0)
+    }
     let (fg, page) = (fg & 0x00FF_FFFF, page & 0x00FF_FFFF);
     let table = crate::color_math::relative_luminance_table();
     let (lf, lp) = (
@@ -1094,39 +1085,48 @@ pub fn dim_edge_held(bed: u32, fg: u32, page: u32) -> u32 {
         return bed;
     }
     let edge = (lp + 0.05) * DIM_EDGE_SOLID / (PAPER_BAR_THEME_SHARE + DIM_EDGE_GUARD) - 0.05;
-    let chmax = |c: u32| {
-        let ch = |sh: u32| ((c >> sh) & 0xff).max((page >> sh) & 0xff) << sh;
-        ch(16) | ch(8) | ch(0)
-    };
     let hi0 = bed & 0x00FF_FFFF;
-    if crate::color_math::relative_luminance_with(table, chmax(hi0)) <= edge {
+    if crate::color_math::relative_luminance_with(table, chmax(hi0, page)) <= edge {
         return bed;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (None, Some(hi0));
-    for _ in 0..24 {
+    let mut i = 0;
+    while i < 24 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = scale_rgb(bed, mid);
-        if lo_rgb == Some(mid_rgb) {
+        let same_lo = match lo_rgb {
+            Some(prev) => prev == mid_rgb,
+            None => false,
+        };
+        let same_hi = match hi_rgb {
+            Some(prev) => prev == mid_rgb,
+            None => false,
+        };
+        if same_lo {
             lo = mid;
-        } else if hi_rgb == Some(mid_rgb) {
+        } else if same_hi {
             hi = mid;
-        } else if crate::color_math::relative_luminance_with(table, chmax(mid_rgb)) <= edge {
+        } else if crate::color_math::relative_luminance_with(table, chmax(mid_rgb, page)) <= edge {
             lo = mid;
             lo_rgb = Some(mid_rgb);
         } else {
             hi = mid;
             hi_rgb = Some(mid_rgb);
         }
+        i += 1;
     }
-    lo_rgb.unwrap_or_else(|| scale_rgb(bed, lo))
+    match lo_rgb {
+        Some(rgb) => rgb,
+        None => scale_rgb(bed, lo),
+    }
 }
 
 /// The bed's on-glass ink: the stop, its hue bent off the dark bed's mud
 /// ([`DARK_HUE_BEND`]), held to the letters' luminance budget.
 #[inline]
 #[must_use]
-pub fn bed_ink(rgb: u32, budget: f32) -> u32 {
+pub const fn bed_ink(rgb: u32, budget: f32) -> u32 {
     onto_luma(
         dark_hue_bent(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR)),
         budget,
@@ -1135,7 +1135,7 @@ pub fn bed_ink(rgb: u32, budget: f32) -> u32 {
 
 /// [`bed_ink`] without the dark hue bend (a test's control).
 #[cfg(test)]
-pub(crate) fn bed_ink_unbent(rgb: u32, budget: f32) -> u32 {
+pub(crate) const fn bed_ink_unbent(rgb: u32, budget: f32) -> u32 {
     onto_luma(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR), budget)
 }
 
@@ -1171,9 +1171,36 @@ const fn dark_hue_bent(rgb: u32) -> u32 {
 
 /// The bed's light twin, its ink on paper.
 #[must_use]
-pub(crate) fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 {
+pub(crate) const fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 {
+    #[inline]
+    const fn ratio(y: f32, y_fg: f32) -> f32 {
+        (y.max(y_fg) + 0.05) / (y.min(y_fg) + 0.05)
+    }
+    #[inline]
+    const fn worst_lum(
+        table: &crate::color_math::RelativeLuminanceTable,
+        ink: u32,
+        bg: u32,
+        cap: f32,
+    ) -> f32 {
+        #[inline]
+        const fn ch(ink: u32, bg: u32, cap: f32, sh: u32) -> usize {
+            let (i, b) = (((ink >> sh) & 0xff) as f32, ((bg >> sh) & 0xff) as f32);
+            (b + (i - b) * cap - 1.0).max(0.0) as usize
+        }
+        crate::color_math::relative_luminance_rgb(
+            table,
+            ch(ink, bg, cap, 16),
+            ch(ink, bg, cap, 8),
+            ch(ink, bg, cap, 0),
+        )
+    }
     let rgb = spectrum_with_min_saturation(rgb, BED_SAT_FLOOR);
-    let mx = ((rgb >> 16) & 0xff).max((rgb >> 8) & 0xff).max(rgb & 0xff);
+    let r = (rgb >> 16) & 0xff;
+    let g = (rgb >> 8) & 0xff;
+    let b = rgb & 0xff;
+    let mx = if r > g { r } else { g };
+    let mx = if mx > b { mx } else { b };
     if mx == 0 {
         return bg;
     }
@@ -1182,66 +1209,86 @@ pub(crate) fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 {
     let cap = (role.alpha_cap() / 255.0).clamp(0.0, 1.0);
     let table = crate::color_math::relative_luminance_table();
     let y_fg = crate::color_math::relative_luminance_with(table, fg);
-    let ratio = |y: f32| (y.max(y_fg) + 0.05) / (y.min(y_fg) + 0.05);
     let (weight, bar) = match role {
         InkRole::OverText => (
             PAPER_WEIGHT,
             Some((BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD).min(
                 PAPER_BAR_THEME_SHARE
-                    * ratio(crate::color_math::relative_luminance_with(table, bg)),
+                    * ratio(crate::color_math::relative_luminance_with(table, bg), y_fg),
             )),
         ),
         InkRole::Leading => (PAPER_WEIGHT_LEADING, None),
     };
-    let worst_lum = |ink: u32| {
-        let ch = |sh: u32| {
-            let (i, b) = (((ink >> sh) & 0xff) as f32, ((bg >> sh) & 0xff) as f32);
-            (b + (i - b) * cap - 1.0).max(0.0) as usize
-        };
-        crate::color_math::relative_luminance_rgb(table, ch(16), ch(8), ch(0))
-    };
     let bg_lab = oklab(bg);
-    let eval = |(on_glass, ink): (u32, u32)| {
-        let lab = oklab(on_glass);
-        let (dl, da, db) = (lab[0] - bg_lab[0], lab[1] - bg_lab[1], lab[2] - bg_lab[2]);
-        (dl * dl + da * da + db * db).sqrt() <= weight
-            && bar.is_none_or(|bar| ratio(worst_lum(ink)) >= bar)
-    };
     let hi0 = (lerp_rgb(bg, full, cap), lerp_rgb(bg, full, 1.0));
-    if eval(hi0) {
+    let lab0 = oklab(hi0.0);
+    let (dl0, da0, db0) = (
+        lab0[0] - bg_lab[0],
+        lab0[1] - bg_lab[1],
+        lab0[2] - bg_lab[2],
+    );
+    let hi0_ok = crate::color_math::sqrt_f32(dl0 * dl0 + da0 * da0 + db0 * db0) <= weight
+        && match bar {
+            Some(bar) => ratio(worst_lum(table, hi0.1, bg, cap), y_fg) >= bar,
+            None => true,
+        };
+    if hi0_ok {
         return hi0.1;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
-    let (mut lo_pair, mut hi_pair) = (None, Some(hi0));
-    for _ in 0..24 {
+    let mut lo_pair: Option<(u32, u32)> = None;
+    let mut hi_pair = Some(hi0);
+    let mut step = 0;
+    while step < 24 {
         let mid = 0.5 * (lo + hi);
         let pair = (lerp_rgb(bg, full, mid * cap), lerp_rgb(bg, full, mid));
-        if lo_pair == Some(pair) {
+        let same_lo = match lo_pair {
+            Some(prev) => prev.0 == pair.0 && prev.1 == pair.1,
+            None => false,
+        };
+        let same_hi = match hi_pair {
+            Some(prev) => prev.0 == pair.0 && prev.1 == pair.1,
+            None => false,
+        };
+        if same_lo {
             lo = mid;
-        } else if hi_pair == Some(pair) {
+        } else if same_hi {
             hi = mid;
-        } else if eval(pair) {
-            lo = mid;
-            lo_pair = Some(pair);
         } else {
-            hi = mid;
-            hi_pair = Some(pair);
+            let lab = oklab(pair.0);
+            let (dl, da, db) = (lab[0] - bg_lab[0], lab[1] - bg_lab[1], lab[2] - bg_lab[2]);
+            let ok = crate::color_math::sqrt_f32(dl * dl + da * da + db * db) <= weight
+                && match bar {
+                    Some(bar) => ratio(worst_lum(table, pair.1, bg, cap), y_fg) >= bar,
+                    None => true,
+                };
+            if ok {
+                lo = mid;
+                lo_pair = Some(pair);
+            } else {
+                hi = mid;
+                hi_pair = Some(pair);
+            }
         }
+        step += 1;
     }
-    lo_pair.map_or_else(|| lerp_rgb(bg, full, lo), |(_, ink)| ink)
+    match lo_pair {
+        Some((_, ink)) => ink,
+        None => lerp_rgb(bg, full, lo),
+    }
 }
 
 /// The caret's ink on paper.
 #[inline]
 #[must_use]
-pub fn paper_caret_ink(rgb: u32, bg: u32) -> u32 {
+pub const fn paper_caret_ink(rgb: u32, bg: u32) -> u32 {
     paper_vivid_ink(rgb, bg, PAPER_CARET_CONTRAST)
 }
 
 /// The caret's colour for the walk's stop `arc`.
 #[inline]
 #[must_use]
-pub(crate) fn caret_ink(arc: u32, cfg: &Config) -> u32 {
+pub(crate) const fn caret_ink(arc: u32, cfg: &Config) -> u32 {
     if cfg.dark_theme {
         arc
     } else {
@@ -1252,51 +1299,72 @@ pub(crate) fn caret_ink(arc: u32, cfg: &Config) -> u32 {
 /// A point mark's ink on paper.
 #[inline]
 #[must_use]
-pub fn paper_mark_ink(rgb: u32, bg: u32) -> u32 {
+pub const fn paper_mark_ink(rgb: u32, bg: u32) -> u32 {
     paper_vivid_ink(rgb, bg, PAPER_MARK_CONTRAST)
 }
 
-fn paper_vivid_ink(rgb: u32, bg: u32, bar: f32) -> u32 {
+const fn paper_vivid_ink(rgb: u32, bg: u32, bar: f32) -> u32 {
     let (h, s, v) = rgb2hsv(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR));
     if v <= 0.0 {
         return 0;
     }
-    let h = if (30.0..110.0).contains(&h) {
-        PAPER_HUE_BEND
-            .windows(2)
-            .find(|k| (k[0].0..k[1].0).contains(&h))
-            .map_or(h, |k| {
-                k[0].1 + (k[1].1 - k[0].1) * (h - k[0].0) / (k[1].0 - k[0].0)
-            })
+    let h = if h >= 30.0 && h < 110.0 {
+        let mut bent = h;
+        let mut i = 0;
+        while i + 1 < PAPER_HUE_BEND.len() {
+            let (x0, y0) = PAPER_HUE_BEND[i];
+            let (x1, y1) = PAPER_HUE_BEND[i + 1];
+            if h >= x0 && h < x1 {
+                bent = y0 + (y1 - y0) * (h - x0) / (x1 - x0);
+                break;
+            }
+            i += 1;
+        }
+        bent
     } else {
         h
     };
     let full = hsv2rgb(h, s, 1.0);
     let table = crate::color_math::relative_luminance_table();
     let y_bg = crate::color_math::relative_luminance_with(table, bg & 0x00FF_FFFF);
-    let holds = |cand: u32| {
+    #[inline]
+    const fn holds(
+        table: &crate::color_math::RelativeLuminanceTable,
+        y_bg: f32,
+        bar: f32,
+        cand: u32,
+    ) -> bool {
         let y = crate::color_math::relative_luminance_with(table, cand);
         (y.max(y_bg) + 0.05) / (y.min(y_bg) + 0.05) >= bar
-    };
-    if holds(full) {
+    }
+    if holds(table, y_bg, bar, full) {
         return full;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (None, full);
-    for _ in 0..24 {
+    let mut i = 0;
+    while i < 24 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = scale_rgb(full, mid);
+        let same_lo = match lo_rgb {
+            Some(prev) => prev == mid_rgb,
+            None => false,
+        };
         if mid_rgb == hi_rgb {
             hi = mid;
-        } else if lo_rgb == Some(mid_rgb) || holds(mid_rgb) {
+        } else if same_lo || holds(table, y_bg, bar, mid_rgb) {
             lo = mid;
             lo_rgb = Some(mid_rgb);
         } else {
             hi = mid;
             hi_rgb = mid_rgb;
         }
+        i += 1;
     }
-    lo_rgb.unwrap_or(0)
+    match lo_rgb {
+        Some(rgb) => rgb,
+        None => 0,
+    }
 }
 
 #[inline]
@@ -1310,7 +1378,7 @@ const fn channel_contrast(linear: &[f32; 256], a: u8, b: u8) -> f32 {
 #[cfg(test)]
 #[inline]
 #[must_use]
-pub(crate) fn seen(rgb: u32, bg: u32) -> bool {
+pub(crate) const fn seen(rgb: u32, bg: u32) -> bool {
     seen_with(
         &crate::color_math::relative_luminance_table().linear,
         rgb,
@@ -1342,13 +1410,17 @@ pub(crate) const fn seen_with(linear: &[f32; 256], rgb: u32, bg: u32) -> bool {
 
 #[inline]
 #[must_use]
-fn seen_floor(ink: u32, bg: u32) -> f32 {
+const fn seen_floor(ink: u32, bg: u32) -> f32 {
     let linear = &crate::color_math::relative_luminance_table().linear;
-    (1..=255u16)
-        .rev()
-        .map(|a| u8::try_from(a).unwrap_or(255))
-        .find(|&a| !seen_with(linear, over_premul(bg, premul_rgb(ink, a), a), bg))
-        .map_or(1.0, |a| f32::from(a) + 1.0)
+    let mut a = 255u16;
+    while a >= 1 {
+        let alpha = a as u8;
+        if !seen_with(linear, over_premul(bg, premul_rgb(ink, alpha), alpha), bg) {
+            return (alpha as f32) + 1.0;
+        }
+        a -= 1;
+    }
+    1.0
 }
 
 /// The crisp edge's reach, priced at birth.
@@ -1362,7 +1434,7 @@ pub const fn edge_cells(surge: f32, heat: f32) -> f32 {
 /// The hot edge's ink.
 #[inline]
 #[must_use]
-pub fn hot_edge_ink(rgb: u32) -> u32 {
+pub const fn hot_edge_ink(rgb: u32) -> u32 {
     let rgb = spectrum_with_min_saturation(rgb, BED_SAT_FLOOR);
     if relative_luminance(rgb) >= HOT_EDGE_LUMA_FLOOR {
         rgb
@@ -1374,9 +1446,13 @@ pub fn hot_edge_ink(rgb: u32) -> u32 {
 /// The vivid rail's ink.
 #[inline]
 #[must_use]
-pub fn rail_ink(rgb: u32) -> u32 {
+pub const fn rail_ink(rgb: u32) -> u32 {
     let rgb = spectrum_with_min_saturation(rgb, BED_SAT_FLOOR);
-    let mx = ((rgb >> 16) & 0xff).max((rgb >> 8) & 0xff).max(rgb & 0xff);
+    let r = (rgb >> 16) & 0xff;
+    let g = (rgb >> 8) & 0xff;
+    let b = rgb & 0xff;
+    let mx = if r > g { r } else { g };
+    let mx = if mx > b { mx } else { b };
     if mx == 0 {
         return onto_luma(rgb, RAIL_LUMA_FLOOR);
     }
@@ -1417,51 +1493,88 @@ const fn walk_arc_at(i: usize) -> u32 {
     spectrum(walk_pace(i as f32 / (BED_INK_LUT_LEN - 1) as f32))
 }
 
+static HOT_EDGE_INK_LUT: [u32; BED_INK_LUT_LEN] = {
+    let mut table = [0u32; BED_INK_LUT_LEN];
+    let mut i = 0;
+    while i < BED_INK_LUT_LEN {
+        table[i] = hot_edge_ink(walk_arc_at(i));
+        i += 1;
+    }
+    table
+};
+
 /// Shared 129-stop hot-edge ink LUT across the ribbon and meteor landing marks.
 #[inline]
 #[must_use]
-pub(crate) fn hot_edge_ink_lut() -> &'static [u32; BED_INK_LUT_LEN] {
-    static HOT_EDGE_INK_LUT: std::sync::OnceLock<[u32; BED_INK_LUT_LEN]> =
-        std::sync::OnceLock::new();
-    HOT_EDGE_INK_LUT.get_or_init(|| std::array::from_fn(|i| hot_edge_ink(walk_arc_at(i))))
+pub(crate) const fn hot_edge_ink_lut() -> &'static [u32; BED_INK_LUT_LEN] {
+    &HOT_EDGE_INK_LUT
 }
 
-#[inline]
-fn rail_ink_lut() -> &'static [u32; BED_INK_LUT_LEN] {
-    static RAIL_INK_LUT: std::sync::OnceLock<[u32; BED_INK_LUT_LEN]> = std::sync::OnceLock::new();
-    RAIL_INK_LUT.get_or_init(|| std::array::from_fn(|i| rail_ink(walk_arc_at(i))))
-}
-
-#[inline]
-fn dark_bed_max_lut() -> &'static [u32; BED_INK_LUT_LEN] {
-    static DARK_BED_MAX_LUT: std::sync::OnceLock<[u32; BED_INK_LUT_LEN]> =
-        std::sync::OnceLock::new();
-    DARK_BED_MAX_LUT.get_or_init(|| std::array::from_fn(|i| bed_ink(walk_arc_at(i), BED_LUMA_MAX)))
-}
-
-#[inline]
-fn dark_seen_common_lut(bg: u32) -> Option<&'static [f32; BED_INK_LUT_LEN]> {
-    static DARK_SEEN_COMMON_LUT: std::sync::OnceLock<[(u32, [f32; BED_INK_LUT_LEN]); 5]> =
-        std::sync::OnceLock::new();
-    let bg = bg & 0x00FF_FFFF;
-    if !matches!(
-        bg,
-        0x0000_0000 | 0x0010_1016 | 0x0011_1318 | 0x0016_161C | 0x001A_1B26
-    ) {
-        return None;
+static RAIL_INK_LUT: [u32; BED_INK_LUT_LEN] = {
+    let mut table = [0u32; BED_INK_LUT_LEN];
+    let mut i = 0;
+    while i < BED_INK_LUT_LEN {
+        table[i] = rail_ink(walk_arc_at(i));
+        i += 1;
     }
-    let table = DARK_SEEN_COMMON_LUT.get_or_init(|| {
-        let beds = dark_bed_max_lut();
-        [
-            0x0000_0000,
-            0x0010_1016,
-            0x0011_1318,
-            0x0016_161C,
-            0x001A_1B26,
-        ]
-        .map(|g| (g, std::array::from_fn(|i| seen_floor(beds[i], g))))
-    });
-    table.iter().find(|&&(g, _)| g == bg).map(|(_, lut)| lut)
+    table
+};
+
+#[inline]
+const fn rail_ink_lut() -> &'static [u32; BED_INK_LUT_LEN] {
+    &RAIL_INK_LUT
+}
+
+static DARK_BED_MAX_LUT: [u32; BED_INK_LUT_LEN] = {
+    let mut table = [0u32; BED_INK_LUT_LEN];
+    let mut i = 0;
+    while i < BED_INK_LUT_LEN {
+        table[i] = bed_ink(walk_arc_at(i), BED_LUMA_MAX);
+        i += 1;
+    }
+    table
+};
+
+#[inline]
+const fn dark_bed_max_lut() -> &'static [u32; BED_INK_LUT_LEN] {
+    &DARK_BED_MAX_LUT
+}
+
+static DARK_SEEN_COMMON_LUT: [(u32, [f32; BED_INK_LUT_LEN]); 5] = {
+    let grounds = [
+        0x0000_0000,
+        0x0010_1016,
+        0x0011_1318,
+        0x0016_161C,
+        0x001A_1B26,
+    ];
+    let mut out = [(0u32, [0.0f32; BED_INK_LUT_LEN]); 5];
+    let mut g_idx = 0;
+    while g_idx < 5 {
+        let g = grounds[g_idx];
+        let mut seen = [0.0f32; BED_INK_LUT_LEN];
+        let mut i = 0;
+        while i < BED_INK_LUT_LEN {
+            seen[i] = seen_floor(DARK_BED_MAX_LUT[i], g);
+            i += 1;
+        }
+        out[g_idx] = (g, seen);
+        g_idx += 1;
+    }
+    out
+};
+
+#[inline]
+const fn dark_seen_common_lut(bg: u32) -> Option<&'static [f32; BED_INK_LUT_LEN]> {
+    let bg = bg & 0x00FF_FFFF;
+    let mut i = 0;
+    while i < DARK_SEEN_COMMON_LUT.len() {
+        if DARK_SEEN_COMMON_LUT[i].0 == bg {
+            return Some(&DARK_SEEN_COMMON_LUT[i].1);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The bed's ink table for one theme, rebuilt only when the theme or spelling changes.
@@ -1487,15 +1600,23 @@ impl BedInkLut {
         seen: [0.0; BED_INK_LUT_LEN],
     };
 
-    fn sync(&mut self, cfg: &Config) {
+    const fn sync(&mut self, cfg: &Config) {
         let key = (cfg.theme_fg, cfg.theme_bg, cfg.dark_theme, cfg.ribbon_tall);
-        if self.key == Some(key) {
+        if let Some((fg, bg, dark, tall)) = self.key
+            && fg == key.0
+            && bg == key.1
+            && dark == key.2
+            && tall == key.3
+        {
             return;
         }
         let budget = bed_luma_budget(cfg.theme_fg);
         let role = light_role(cfg);
-        let dark_max =
-            (cfg.dark_theme && (budget - BED_LUMA_MAX).abs() == 0.0).then(dark_bed_max_lut);
+        let dark_max = if cfg.dark_theme && (budget - BED_LUMA_MAX).abs() == 0.0 {
+            Some(dark_bed_max_lut())
+        } else {
+            None
+        };
         if let Some(max_lut) = dark_max
             && let Some(seen_lut) = dark_seen_common_lut(cfg.theme_bg)
         {
@@ -1506,7 +1627,8 @@ impl BedInkLut {
         }
         let light_a = (cov_cap(cfg) + 16.0).min(255.0) as u8;
         let linear = &crate::color_math::relative_luminance_table().linear;
-        for i in 0..BED_INK_LUT_LEN {
+        let mut i = 0;
+        while i < BED_INK_LUT_LEN {
             let bed = if let Some(max_lut) = dark_max {
                 max_lut[i]
             } else {
@@ -1530,6 +1652,7 @@ impl BedInkLut {
             };
             self.lut[i] = bed;
             self.seen[i] = seen_floor(bed, cfg.theme_bg);
+            i += 1;
         }
         self.key = Some(key);
     }
@@ -1547,7 +1670,7 @@ impl BedInkLut {
     /// The hot edge's ink at walk position `t`.
     #[inline]
     #[must_use]
-    pub fn hot_at(&self, t: f32) -> u32 {
+    pub const fn hot_at(&self, t: f32) -> u32 {
         if self.key.is_none() {
             return 0;
         }
@@ -1557,7 +1680,7 @@ impl BedInkLut {
     /// The vivid rail's ink at walk position `t`.
     #[inline]
     #[must_use]
-    pub fn rail_at(&self, t: f32) -> u32 {
+    pub const fn rail_at(&self, t: f32) -> u32 {
         if self.key.is_none() {
             return 0;
         }
@@ -1666,7 +1789,7 @@ pub const fn walk_t(d: f32) -> f32 {
 /// A cell's terminal approach to zero, read on its own clock.
 #[inline]
 #[must_use]
-pub fn expiry_melt(u: f32) -> f32 {
+pub const fn expiry_melt(u: f32) -> f32 {
     let rem = 1.0 - clamp01(u);
     if rem >= EXPIRY_MELT_SHARE {
         return 1.0;
@@ -1677,7 +1800,7 @@ pub fn expiry_melt(u: f32) -> f32 {
     } else if taper >= 1.0 {
         1.0
     } else {
-        taper.powf(EXPIRY_MELT_GAMMA)
+        crate::color_math::powf_pos_f32(taper, EXPIRY_MELT_GAMMA)
     }
 }
 
@@ -1975,6 +2098,9 @@ pub struct Ribbon {
     sorted: Vec<(u16, u16, u32)>,
     verts: Vec<RibbonVertex>,
     released_cohorts: Vec<u32>,
+    /// Partial-release counts, sorted by `(cohort, stamp)`. Every key has
+    /// resident stamped cells; an exact return must still match its saved count.
+    release_parts: Vec<ReleasePart>,
     ink: BedInkLut,
     ground: u32,
     ink_quads: usize,
@@ -2209,6 +2335,7 @@ impl Ribbon {
             sorted: Vec::new(),
             verts: Vec::new(),
             released_cohorts: Vec::new(),
+            release_parts: Vec::new(),
             ink: BedInkLut::EMPTY,
             ground: 0,
             ink_quads: 0,
@@ -3005,29 +3132,34 @@ impl Ribbon {
 
     #[inline]
     #[must_use]
-    fn insert_landing(&self, landing: (u16, u16), cells: u16) -> (u16, u16) {
+    const fn insert_landing(&self, landing: (u16, u16), cells: u16) -> (u16, u16) {
         if cells == 0 {
             return landing;
         }
         let (row, end) = landing;
         let first = end.saturating_sub(cells);
-        for &(r, lo, hi, dc) in &self.shifted_now {
-            let Ok(dc) = u16::try_from(dc) else {
+        let shifted = self.shifted_now.as_slice();
+        let mut i = 0;
+        while i < shifted.len() {
+            let (r, lo, hi, dc) = shifted[i];
+            i += 1;
+            if dc < 0 {
                 continue;
-            };
+            }
+            let dc = dc as u16;
             if r != row || cells > dc {
                 continue;
             }
             let (moved0, moved1) = (lo.saturating_add(dc), hi.saturating_add(dc));
             if first >= moved0 && end.saturating_sub(1) <= moved1 {
-                return (row, lo.saturating_add(dc));
+                return (row, moved0);
             }
         }
         landing
     }
 
     #[must_use]
-    fn typed_landing(&self, caret: (u16, u16), cells: u16, cols: u16) -> (u16, u16) {
+    const fn typed_landing(&self, caret: (u16, u16), cells: u16, cols: u16) -> (u16, u16) {
         let Some(pen) = self.pen else {
             return caret;
         };
@@ -3036,16 +3168,27 @@ impl Ribbon {
         }
         if caret.0 >= pen.0 {
             let top = self.fold_top_row(caret, cells, cols);
-            if top == i32::from(caret.0) || top == i32::from(pen.0) {
+            if top == caret.0 as i32 || top == pen.0 as i32 {
                 return caret;
             }
         } else if Self::hand_changed_row(pen, caret) {
             return caret;
         }
-        if !self.cells.iter().any(|c| c.row == pen.0) {
+        let cell_slice = self.cells.as_slice();
+        let mut has_pen_row = false;
+        let mut i = 0;
+        while i < cell_slice.len() {
+            if cell_slice[i].row == pen.0 {
+                has_pen_row = true;
+                break;
+            }
+            i += 1;
+        }
+        if !has_pen_row {
             return caret;
         }
-        (pen.0, pen.1.saturating_add(cells.max(1)))
+        let step = if cells > 1 { cells } else { 1 };
+        (pen.0, pen.1.saturating_add(step))
     }
 
     #[inline]
@@ -3181,28 +3324,55 @@ impl Ribbon {
 
     #[inline]
     #[must_use]
-    fn relay_origin(&self, from: (u16, u16), w: u16) -> Option<WalkPos> {
+    const fn relay_origin(&self, from: (u16, u16), w: u16) -> Option<WalkPos> {
         if w == 0 {
             return None;
         }
-        let last = from.1.checked_sub(1)?;
-        let first = from.1.checked_sub(w)?;
-        if let Some(owner) = self
-            .cells
-            .iter()
-            .rev()
-            .find(|c| c.row == from.0 && c.col == last)
-        {
-            let coh = self.cohorts.iter().find(|c| c.id == owner.cohort)?;
-            return Some(coh.walk_at(first));
+        let Some(last) = from.1.checked_sub(1) else {
+            return None;
+        };
+        let Some(first) = from.1.checked_sub(w) else {
+            return None;
+        };
+        let cells = self.cells.as_slice();
+        let cohorts = self.cohorts.as_slice();
+        let mut i = cells.len();
+        while i > 0 {
+            i -= 1;
+            let c = &cells[i];
+            if c.row == from.0 && c.col == last {
+                let mut k = 0;
+                while k < cohorts.len() {
+                    if cohorts[k].id == c.cohort {
+                        return Some(cohorts[k].walk_at(first));
+                    }
+                    k += 1;
+                }
+                return None;
+            }
         }
-        let split = self.split_off?;
-        if !(split.col0..split.col1).contains(&last) {
+        let Some(split) = self.split_off else {
+            return None;
+        };
+        if last < split.col0 || last >= split.col1 {
             return None;
         }
-        let copy = self.cohorts.iter().find(|c| c.id == split.copy)?;
-        (copy.row.checked_add_signed(split.dr.checked_neg()?) == Some(from.0))
-            .then(|| copy.walk_at(first))
+        let mut k = 0;
+        while k < cohorts.len() {
+            let copy = &cohorts[k];
+            if copy.id == split.copy {
+                let Some(neg_dr) = split.dr.checked_neg() else {
+                    return None;
+                };
+                return if matches!(copy.row.checked_add_signed(neg_dr), Some(r) if r == from.0) {
+                    Some(copy.walk_at(first))
+                } else {
+                    None
+                };
+            }
+            k += 1;
+        }
+        None
     }
 
     fn re_anchor(&mut self, from: (u16, u16), to: (u16, u16), at: Instant) {
@@ -3810,6 +3980,7 @@ impl Ribbon {
             coh.phase = Phase::Laying;
             coh.retract_col = None;
         }
+        self.prune_release_parts();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4084,7 +4255,6 @@ impl Ribbon {
             flow: None,
             flow_drift: 0.0,
             release_clock: None,
-            release_parts: [None; RELEASE_PARTS],
             parts_revoked_at: None,
             line_killed: false,
             printed: None,
@@ -4159,17 +4329,28 @@ impl Ribbon {
     }
 
     #[inline]
-    fn mark_line_killed(&mut self, row: u16) {
-        for k in 0..self.cohorts.len() {
-            let coh = self.cohorts[k];
-            if coh.row == row
-                && !self
-                    .cells
-                    .iter()
-                    .any(|c| c.cohort == coh.id && c.row == row && !c.leaving())
-            {
-                self.cohorts[k].line_killed = true;
+    const fn mark_line_killed(&mut self, row: u16) {
+        let cohorts = self.cohorts.as_mut_slice();
+        let cells = self.cells.as_slice();
+        let mut k = 0;
+        while k < cohorts.len() {
+            let coh = cohorts[k];
+            if coh.row == row {
+                let mut has_live = false;
+                let mut i = 0;
+                while i < cells.len() {
+                    let c = &cells[i];
+                    if c.cohort == coh.id && c.row == row && !c.leaving() {
+                        has_live = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !has_live {
+                    cohorts[k].line_killed = true;
+                }
             }
+            k += 1;
         }
     }
 
@@ -4249,6 +4430,7 @@ impl Ribbon {
             self.cohorts[b].col1 = band.col1.max(wake.col1);
             self.cohorts.remove(w);
         }
+        self.prune_release_parts();
         self.cohorts
             .iter()
             .position(|c| c.id == band_id)
@@ -4378,6 +4560,7 @@ impl Ribbon {
             }
             n += 1;
         }
+        self.prune_release_parts();
         n
     }
 
@@ -4427,10 +4610,9 @@ impl Ribbon {
                         stamped += 1;
                     }
                 }
-                if let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == id)
-                    && stamped > 0
-                {
-                    coh.hold_part(ReleasePart {
+                if stamped > 0 && self.cohorts.iter().any(|coh| coh.id == id) {
+                    self.hold_part(ReleasePart {
+                        cohort: id,
                         stamp: at,
                         cells: stamped,
                     });
@@ -4460,6 +4642,7 @@ impl Ribbon {
             }
         }
         self.released_cohorts = touched;
+        self.prune_release_parts();
         n
     }
 
@@ -4491,9 +4674,13 @@ impl Ribbon {
                 accepted.push(id);
                 continue;
             };
-            let Some(part) = self.cohorts[k].part_mut(stamp).copied() else {
+            let Ok(part_at) = self
+                .release_parts
+                .binary_search_by_key(&(id, stamp), |part| (part.cohort, part.stamp))
+            else {
                 continue;
             };
+            let part = self.release_parts[part_at];
             let resident = self
                 .cells
                 .iter()
@@ -4508,11 +4695,7 @@ impl Ribbon {
                     cell.released_at = None;
                 }
             }
-            for slot in &mut self.cohorts[k].release_parts {
-                if slot.is_some_and(|p| p.stamp == stamp) {
-                    *slot = None;
-                }
-            }
+            self.release_parts.remove(part_at);
             accepted.push(id);
         }
         accepted.sort_unstable();
@@ -4527,30 +4710,115 @@ impl Ribbon {
         if n == 0 {
             return;
         }
-        if let Some(part) = self.cohorts.get_mut(idx).and_then(|c| c.part_mut(stamp)) {
-            part.cells = part.cells.saturating_sub(n);
+        if let Some(cohort) = self.cohorts.get(idx)
+            && let Ok(part_at) = self
+                .release_parts
+                .binary_search_by_key(&(cohort.id, stamp), |part| (part.cohort, part.stamp))
+        {
+            self.release_parts[part_at].cells = self.release_parts[part_at].cells.saturating_sub(n);
         }
+    }
+
+    /// Keep the first saved count for a key, as the cohort's original
+    /// first-match lookup did when a merge brought the same stamp back.
+    fn hold_part(&mut self, part: ReleasePart) {
+        if let Err(at) = self
+            .release_parts
+            .binary_search_by_key(&(part.cohort, part.stamp), |held| (held.cohort, held.stamp))
+        {
+            self.release_parts.insert(at, part);
+        }
+    }
+
+    /// Drop only orphaned keys. A surviving fragment keeps its saved count,
+    /// including zero, so a split or a missing identity cannot weaken the guard.
+    fn prune_release_parts(&mut self) {
+        if self.release_parts.is_empty() {
+            return;
+        }
+        let (cells, cohorts) = (&self.cells, &self.cohorts);
+        let mut cached_cohort: Option<(u32, bool)> = None;
+        self.release_parts.retain(|part| {
+            let cohort_live = match cached_cohort {
+                Some((id, live)) if id == part.cohort => live,
+                _ => {
+                    let live = cohorts.iter().any(|cohort| cohort.id == part.cohort);
+                    cached_cohort = Some((part.cohort, live));
+                    live
+                }
+            };
+            cohort_live
+                && cells
+                    .iter()
+                    .any(|cell| cell.cohort == part.cohort && cell.released_at == Some(part.stamp))
+        });
     }
 
     #[inline]
     fn carry_release(&mut self, from: u32, into: u32) {
-        let Some((parts, revoked)) = self
+        if from == into {
+            return;
+        }
+        if !self.cohorts.iter().any(|cohort| cohort.id == into) {
+            return;
+        }
+        let Some(revoked) = self
             .cohorts
             .iter()
             .find(|c| c.id == from)
-            .map(|c| (c.release_parts, c.parts_revoked_at))
+            .map(|c| c.parts_revoked_at)
         else {
             return;
         };
+        while let Some(at) = self
+            .release_parts
+            .iter()
+            .position(|part| part.cohort == from)
+        {
+            let part = self.release_parts.remove(at);
+            self.hold_part(ReleasePart {
+                cohort: into,
+                ..part
+            });
+        }
         let Some(target) = self.cohorts.iter_mut().find(|c| c.id == into) else {
             return;
         };
-        for part in parts.into_iter().flatten() {
-            target.hold_part(part);
-        }
         if let Some(t) = revoked {
             target.parts_revoked_at = Some(target.parts_revoked_at.map_or(t, |u| u.max(t)));
         }
+    }
+
+    /// A split carries only the keys whose cells reached its new identity.
+    /// Each fragment keeps the original expected count until it reunites.
+    fn split_release(&mut self, from: u32, into: u32) {
+        let mut after = None;
+        loop {
+            let at = self.release_parts.partition_point(|part| {
+                part.cohort < from
+                    || (part.cohort == from && after.is_some_and(|stamp| part.stamp <= stamp))
+            });
+            let Some(part) = self
+                .release_parts
+                .get(at)
+                .copied()
+                .filter(|part| part.cohort == from)
+            else {
+                break;
+            };
+            after = Some(part.stamp);
+            if self
+                .cells
+                .iter()
+                .any(|cell| cell.cohort == into && cell.released_at == Some(part.stamp))
+            {
+                self.hold_part(ReleasePart {
+                    cohort: into,
+                    ..part
+                });
+            }
+        }
+        self.prune_release_parts();
     }
 
     /// Let go of the partial releases revoked since the last tick.
@@ -4560,12 +4828,10 @@ impl Ribbon {
             let Some(t) = coh.parts_revoked_at.take() else {
                 continue;
             };
-            for slot in &mut coh.release_parts {
-                if slot.is_some_and(|p| p.stamp < t) {
-                    *slot = None;
-                }
-            }
+            self.release_parts
+                .retain(|part| part.cohort != coh.id || part.stamp >= t);
         }
+        self.prune_release_parts();
     }
 
     fn heal_seams(&mut self) {
@@ -4632,6 +4898,7 @@ impl Ribbon {
             self.cohorts.remove(from);
             i = 0;
         }
+        self.prune_release_parts();
     }
 
     /// Build this frame's [`Ribbon::plan`] and [`FieldIndex`].
@@ -4795,11 +5062,13 @@ impl Ribbon {
         if ember_done || curtain_done {
             self.cells.clear();
             self.cohorts.clear();
+            self.release_parts.clear();
             self.ember_at = None;
             self.curtain = None;
             return;
         }
         let cohorts = &self.cohorts;
+        let release_parts = &self.release_parts;
         let mut cached_coh: Option<(&Cohort, bool)> = None;
         self.cells.retain(|cell| {
             let (coh, phase_live) = match cached_coh {
@@ -4824,7 +5093,7 @@ impl Ribbon {
             if let Some(at) = cell.retract_at
                 && now.saturating_duration_since(at).as_secs_f32() >= RETRACT_FADE_S
             {
-                let held = coh.holds_partial(cell);
+                let held = coh.holds_partial(cell, release_parts);
                 if !held {
                     return false;
                 }
@@ -4881,6 +5150,7 @@ impl Ribbon {
                 alive_at: gone.alive_at,
             });
         }
+        self.prune_release_parts();
     }
 
     fn build(&mut self, ctx: &Ctx<'_>, below: Option<&GlyphProbe>) {
@@ -6711,6 +6981,7 @@ impl Ribbon {
             }
         }
         let walk = self.cohorts[ci];
+        let release_parts = &self.release_parts;
         let mut n = 0usize;
         let (mut c0, mut c1) = (u16::MAX, 0u16);
         for c in &mut self.cells {
@@ -6718,7 +6989,7 @@ impl Ribbon {
                 continue;
             }
             if ((!c.leaving() && (lo..=hi).contains(&c.col))
-                || (carry_partial && c.col >= lo && walk.holds_partial(c)))
+                || (carry_partial && c.col >= lo && walk.holds_partial(c, release_parts)))
                 && let Some(col) = c.col.checked_add_signed(dc)
             {
                 moved.push((c.row, c.col, c.born));
@@ -6747,19 +7018,32 @@ impl Ribbon {
         self.index.reset();
         self.plan.clear();
         self.runs.clear();
+        self.prune_release_parts();
         n
     }
 
-    fn partial_custody_follows(&self, ci: usize, lo: u16, hi: u16, suffix: bool) -> bool {
-        let Some(cohort) = self.cohorts.get(ci) else {
+    const fn partial_custody_follows(&self, ci: usize, lo: u16, hi: u16, suffix: bool) -> bool {
+        let cohorts = self.cohorts.as_slice();
+        if ci >= cohorts.len() {
             return false;
-        };
-        !cohort.abandoned
-            && self
-                .cells
-                .iter()
-                .filter(|cell| cell.cohort == cohort.id && !cell.leaving())
-                .all(|cell| (suffix && cell.col < lo) || (lo..=hi).contains(&cell.col))
+        }
+        let cohort = &cohorts[ci];
+        if cohort.abandoned {
+            return false;
+        }
+        let cells = self.cells.as_slice();
+        let mut i = 0;
+        while i < cells.len() {
+            let cell = &cells[i];
+            if cell.cohort == cohort.id
+                && !cell.leaving()
+                && !((suffix && cell.col < lo) || (cell.col >= lo && cell.col <= hi))
+            {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
     /// The band follows its text across rows.
@@ -6792,8 +7076,10 @@ impl Ribbon {
         }
         let source = self.cohorts[ci];
         let carry_partial = self.partial_custody_follows(ci, lo, hi, false);
+        let release_parts = &self.release_parts;
         let carried = |cell: &Cell| {
-            (lo..=hi).contains(&cell.col) || (carry_partial && source.holds_partial(cell))
+            (lo..=hi).contains(&cell.col)
+                || (carry_partial && source.holds_partial(cell, release_parts))
         };
         let mut n = 0usize;
         let mut all = 0usize;
@@ -6857,6 +7143,9 @@ impl Ribbon {
                 self.followed_now.push((new_row, c.col, c.born));
             }
         }
+        if id != cohort {
+            self.split_release(cohort, id);
+        }
         if let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == id) {
             if away {
                 Self::flow_cohort(coh, at);
@@ -6914,6 +7203,7 @@ impl Ribbon {
                 keep
             }
         });
+        self.prune_release_parts();
         self.caret = self.caret.map(|(row, col)| (row.saturating_sub(rows), col));
         self.pen = self
             .pen
@@ -7010,6 +7300,7 @@ impl Ribbon {
                 keep
             }
         });
+        self.prune_release_parts();
         self.caret = self
             .caret
             .map(|(row, col)| (band_pos(row, top, bottom, delta), col));
@@ -7071,34 +7362,50 @@ impl Ribbon {
     }
 
     /// [`super::Engine::lift_hand`]'s ribbon half.
-    pub(super) fn lift_hand(&mut self, row: u16, to: u16) {
-        let map = |r: u16| if r == row { to } else { r };
-        self.caret = self.caret.map(|(r, c)| (map(r), c));
-        self.pen = self.pen.map(|(r, c)| (map(r), c));
-        self.arrived = self.arrived.map(|(r, c)| (map(r), c));
-        self.hand_floor = self.hand_floor.map(|(r, c)| (map(r), c));
-        self.last_space = self.last_space.map(|(r, c)| (map(r), c));
-        self.prev_space = self.prev_space.map(|(r, c)| (map(r), c));
-        self.attach = self.attach.map(|(r, c)| (map(r), c));
+    pub(super) const fn lift_hand(&mut self, row: u16, to: u16) {
+        #[inline]
+        const fn map(r: u16, row: u16, to: u16) -> u16 {
+            if r == row { to } else { r }
+        }
+        #[inline]
+        const fn map_pt(pt: Option<(u16, u16)>, row: u16, to: u16) -> Option<(u16, u16)> {
+            match pt {
+                Some((r, c)) => Some((map(r, row, to), c)),
+                None => None,
+            }
+        }
+        self.caret = map_pt(self.caret, row, to);
+        self.pen = map_pt(self.pen, row, to);
+        self.arrived = map_pt(self.arrived, row, to);
+        self.hand_floor = map_pt(self.hand_floor, row, to);
+        self.last_space = map_pt(self.last_space, row, to);
+        self.prev_space = map_pt(self.prev_space, row, to);
+        self.attach = map_pt(self.attach, row, to);
         self.attach_floor = None;
-        self.relocate = self.relocate.map(|r| Relocate {
-            row: map(r.row),
-            ..r
-        });
+        self.relocate = match self.relocate {
+            Some(r) => Some(Relocate {
+                row: map(r.row, row, to),
+                ..r
+            }),
+            None => None,
+        };
         if let Some((sw, _)) = &mut self.carry {
-            sw.origin.0 = map(sw.origin.0);
-            sw.landing.0 = map(sw.landing.0);
+            sw.origin.0 = map(sw.origin.0, row, to);
+            sw.landing.0 = map(sw.landing.0, row, to);
         }
         if let Some(proof) = &mut self.short_reanchor {
-            proof.from.0 = map(proof.from.0);
-            proof.to.0 = map(proof.to.0);
+            proof.from.0 = map(proof.from.0, row, to);
+            proof.to.0 = map(proof.to.0, row, to);
         }
         if let Some(proof) = &mut self.rewrap_start {
-            proof.from.0 = map(proof.from.0);
-            proof.to.0 = map(proof.to.0);
+            proof.from.0 = map(proof.from.0, row, to);
+            proof.to.0 = map(proof.to.0, row, to);
         }
         if let Some(gate) = &mut self.fresh_line {
-            gate.left_row = gate.left_row.map(map);
+            gate.left_row = match gate.left_row {
+                Some(r) => Some(map(r, row, to)),
+                None => None,
+            };
         }
     }
 
@@ -7126,6 +7433,7 @@ impl Ribbon {
     pub fn reset(&mut self) {
         self.cells.clear();
         self.cohorts.clear();
+        self.release_parts.clear();
         self.holds.clear();
         self.holds_next.clear();
         self.carried_holds.clear();
@@ -10059,6 +10367,314 @@ mod tests {
             "the released run is out of the pool the retract's own span later, \
              not {RETIRE_MELT_S} s later"
         );
+    }
+
+    #[test]
+    fn partial_release_counts_follow_splits_and_reunions_without_weakening() {
+        use super::super::witness::FollowRun;
+
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        for hi in [12u16, 13] {
+            let mut rib = Ribbon::new();
+            type_run(&mut rib, t0, 10, 6, &c, 0.9);
+            assert_eq!(rib.cohorts.len(), 1);
+            let original = rib.cohorts[0];
+            let named: Vec<_> = rib
+                .cells
+                .iter()
+                .filter(|cell| (12..=13).contains(&cell.col))
+                .map(|cell| (cell.row, cell.col, cell.born))
+                .collect();
+            let stamp = at(t0, 360);
+            assert_eq!(rib.release_cells(&named, stamp), 2);
+            let mut moved = Vec::new();
+            assert_eq!(
+                rib.translate_run(
+                    FollowRun {
+                        row: 2,
+                        cohort: original.id,
+                        lo: 10,
+                        hi,
+                        dr: 1,
+                    },
+                    at(stamp, 10),
+                    false,
+                    &mut moved
+                ),
+                usize::from(hi - 9)
+            );
+            let split = rib
+                .cohorts
+                .iter()
+                .find(|cohort| cohort.row == 3)
+                .expect("split")
+                .id;
+            assert_eq!(rib.cohorts.len(), 2);
+            assert!(
+                rib.cohorts
+                    .iter()
+                    .all(|cohort| cohort.alive_at == original.alive_at)
+            );
+            assert!(
+                rib.release_parts
+                    .iter()
+                    .all(|part| part.cells == 2 && part.stamp == stamp)
+            );
+            let mut accepted = Vec::new();
+            if hi == 13 {
+                assert_eq!(
+                    rib.release_parts.len(),
+                    1,
+                    "only the new identity has stamped cells"
+                );
+                assert_eq!(rib.release_parts[0].cohort, split);
+                rib.restore_releases(&[(split, Some(stamp))], &mut accepted);
+                assert_eq!(
+                    accepted,
+                    vec![split],
+                    "a whole release part carries its saved count"
+                );
+            } else {
+                assert_eq!(rib.release_parts.len(), 2);
+                rib.prune_release_parts();
+                rib.restore_releases(
+                    &[(original.id, Some(stamp)), (split, Some(stamp))],
+                    &mut accepted,
+                );
+                assert!(
+                    accepted.is_empty(),
+                    "neither one-cell fragment satisfies its saved count of two"
+                );
+                assert_eq!(
+                    rib.release_parts.len(),
+                    2,
+                    "resident fragments retain their custody"
+                );
+                assert_eq!(
+                    rib.translate_run(
+                        FollowRun {
+                            row: 3,
+                            cohort: split,
+                            lo: 10,
+                            hi,
+                            dr: -1,
+                        },
+                        at(stamp, 20),
+                        false,
+                        &mut moved
+                    ),
+                    3
+                );
+                rib.heal_seams();
+                assert_eq!(
+                    rib.cohorts.len(),
+                    1,
+                    "the original adjacent fragments reunite"
+                );
+                assert_eq!(rib.release_parts.len(), 1);
+                assert_eq!(
+                    rib.release_parts[0].cells, 2,
+                    "reunion never sums cloned counts"
+                );
+                let reunited = rib.cohorts[0].id;
+                rib.restore_releases(&[(reunited, Some(stamp))], &mut accepted);
+                assert_eq!(accepted, vec![reunited]);
+            }
+            assert!(rib.release_parts.is_empty());
+            for &(_, col, born) in &named {
+                let restored = rib
+                    .cells
+                    .iter()
+                    .find(|cell| cell.col == col)
+                    .expect("restored cell");
+                assert_eq!(restored.born, born);
+                assert!(restored.released_at.is_none() && restored.retract_at.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn independent_same_stamp_releases_keep_the_first_count_guard_when_merged() {
+        use super::super::witness::FollowRun;
+
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 10, 6, &c, 0.9);
+        let original = rib.cohorts[0].id;
+        let stamp = at(t0, 360);
+        let mut moved = Vec::new();
+        rib.translate_run(
+            FollowRun {
+                row: 2,
+                cohort: original,
+                lo: 10,
+                hi: 12,
+                dr: 1,
+            },
+            stamp,
+            false,
+            &mut moved,
+        );
+        let split = rib
+            .cohorts
+            .iter()
+            .find(|cohort| cohort.row == 3)
+            .expect("split")
+            .id;
+        let named: Vec<_> = rib
+            .cells
+            .iter()
+            .filter(|cell| cell.col == 12 || cell.col == 15)
+            .map(|cell| (cell.row, cell.col, cell.born))
+            .collect();
+        assert_eq!(rib.release_cells(&named, stamp), 2);
+        assert_eq!(rib.release_parts.len(), 2);
+        assert!(rib.release_parts.iter().all(|part| part.cells == 1));
+        rib.translate_run(
+            FollowRun {
+                row: 3,
+                cohort: split,
+                lo: 10,
+                hi: 12,
+                dr: -1,
+            },
+            at(stamp, 10),
+            false,
+            &mut moved,
+        );
+        let mut revoked = rib.clone();
+        revoked
+            .cohorts
+            .iter_mut()
+            .find(|cohort| cohort.id == original)
+            .expect("merge source")
+            .revoke_releases(at(stamp, 1));
+        revoked.heal_seams();
+        assert_eq!(revoked.cohorts.len(), 1);
+        revoked.settle_revoked_parts();
+        assert!(
+            revoked.release_parts.is_empty(),
+            "a merged source's pending cutoff follows its custody"
+        );
+        rib.heal_seams();
+        assert_eq!(rib.cohorts.len(), 1);
+        assert_eq!(rib.release_parts.len(), 1);
+        assert_eq!(
+            rib.release_parts[0].cells, 1,
+            "the first saved count is not widened by a collision"
+        );
+        assert_eq!(
+            rib.cells
+                .iter()
+                .filter(|cell| cell.released_at == Some(stamp))
+                .count(),
+            2
+        );
+        let mut accepted = Vec::new();
+        rib.restore_releases(&[(rib.cohorts[0].id, Some(stamp))], &mut accepted);
+        assert!(
+            accepted.is_empty(),
+            "independent batches with the same stamp still fail the saved-count guard"
+        );
+        let mut replacement = *rib
+            .cells
+            .iter()
+            .find(|cell| cell.col == 12)
+            .expect("released cell");
+        replacement.born = at(stamp, 20);
+        replacement.attack_at = replacement.born;
+        replacement.released_at = None;
+        replacement.retract_at = None;
+        rib.place(0, replacement, replacement.born, 2);
+        assert_eq!(rib.release_parts.len(), 1);
+        assert_eq!(
+            rib.release_parts[0].cells, 0,
+            "the first count can reach zero while another fragment remains"
+        );
+        rib.restore_releases(&[(rib.cohorts[0].id, Some(stamp))], &mut accepted);
+        assert!(
+            accepted.is_empty(),
+            "zero is retained as a refusal guard, never recomputed from residents"
+        );
+    }
+
+    #[test]
+    fn partial_release_pool_keeps_counts_and_cleans_up_with_its_cells() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 10, 6, &c, 0.9);
+        let cohort = rib.cohorts[0].id;
+        let stamp = at(t0, 360);
+        let named: Vec<_> = rib
+            .cells
+            .iter()
+            .filter(|cell| cell.col >= 14)
+            .map(|cell| (cell.row, cell.col, cell.born))
+            .collect();
+        assert_eq!(rib.release_cells(&named, stamp), 2);
+        rib.plan(&ctx(at(stamp, 300), &c, (2, 16), 0.9));
+        assert_eq!(
+            rib.release_parts.len(),
+            1,
+            "dark custody outlives its visual retract"
+        );
+        assert_eq!(rib.release_parts[0].cells, 2);
+        assert!(rib.field_at(2, 14).is_none() && rib.field_at(2, 15).is_none());
+
+        let mut replaced = rib.clone();
+        let mut replacement = *replaced
+            .cells
+            .iter()
+            .find(|cell| cell.col == 14)
+            .expect("old cell");
+        replacement.born = at(stamp, 310);
+        replacement.attack_at = replacement.born;
+        replacement.released_at = None;
+        replacement.retract_at = None;
+        replaced.place(0, replacement, replacement.born, 2);
+        assert_eq!(
+            replaced.release_parts[0].cells, 1,
+            "an explicit replacement decrements the saved count"
+        );
+        let mut accepted = Vec::new();
+        replaced.restore_releases(&[(cohort, Some(stamp))], &mut accepted);
+        assert_eq!(accepted, vec![cohort]);
+        assert!(replaced.release_parts.is_empty());
+
+        let mut revoked = rib.clone();
+        revoked.cohorts[0].revoke_releases(stamp);
+        revoked.settle_revoked_parts();
+        assert_eq!(
+            revoked.release_parts.len(),
+            1,
+            "the revocation cutoff is strictly earlier stamps"
+        );
+        revoked.cohorts[0].revoke_releases(at(stamp, 1));
+        revoked.settle_revoked_parts();
+        revoked.restore_releases(&[(cohort, Some(stamp))], &mut accepted);
+        assert!(accepted.is_empty() && revoked.release_parts.is_empty());
+
+        let mut expired = rib.clone();
+        expired.plan(&ctx(at(stamp, 30_000), &c, (2, 16), 0.0));
+        assert!(expired.cells.is_empty() && expired.release_parts.is_empty());
+        let mut reset = rib.clone();
+        reset.reset();
+        assert!(reset.release_parts.is_empty());
+        let mut scrolled = rib.clone();
+        scrolled.translate_scroll(1);
+        assert_eq!(
+            scrolled.release_parts.len(),
+            1,
+            "a surviving row keeps its count"
+        );
+        scrolled.translate_scroll(2);
+        assert!(scrolled.cells.is_empty() && scrolled.release_parts.is_empty());
+        let mut band = rib;
+        band.translate_band(2, 2, -1);
+        assert!(band.cells.is_empty() && band.release_parts.is_empty());
     }
 
     #[test]

@@ -224,7 +224,8 @@ pub fn reads_line(scene: &Scene<'_>, consumer: Option<u32>, pid: u32, name: &str
 /// Whether `pid`'s sleeping event queues may hold its terminal: one lists a read of a terminal
 /// it holds, or one lists no entries (macOS without lane L6), or none sleeps on one (Linux's
 /// `select`, by its wait channel).
-fn reads_terminal(scene: &Scene<'_>, pid: u32) -> bool {
+#[must_use]
+pub fn reads_terminal(scene: &Scene<'_>, pid: u32) -> bool {
     let Some(p) = scene.procs.get(&pid) else {
         return false;
     };
@@ -298,6 +299,7 @@ fn leaf_wait(
         }
         let mut w = mk(WaitName::Pipe);
         w.peer = writer;
+        w.pipe = Some((*handle, *peer));
         w.standing = peer_standing(scene, consumer, writer, depth);
         return Some(w);
     }
@@ -305,7 +307,10 @@ fn leaf_wait(
         return Some(mk(WaitName::Pipe));
     }
 
-    let linux_writing = wchan.starts_with("pipe_write") || wchan == "pipe_wait_writable";
+    // Before Linux 5.5 a writer sleeps in `pipe_wait` too: one the read loop did not take, by the
+    // descriptor its sleep names or by holding no read end.
+    let linux_writing =
+        wchan.starts_with("pipe_write") || wchan == "pipe_wait_writable" || wchan == "pipe_wait";
     for f in fds {
         let FdKind::Pipe {
             handle,
@@ -326,6 +331,7 @@ fn leaf_wait(
         }
         let mut w = mk(WaitName::PipeFull);
         w.peer = reader;
+        w.pipe = Some((*handle, *peer));
         w.standing = peer_standing(scene, consumer, reader, depth);
         return Some(w);
     }
@@ -406,31 +412,41 @@ fn leaf_wait(
     None
 }
 
+/// The processes holding the far end of the pipe a `pipe` or `pipe-full` wait sleeps on: its
+/// writers or its readers, every one (a wrapper and the `ssh` it runs both write the pipe a
+/// loader reads; a zsh function's subshell and the `less` it runs both read a full one).
+#[must_use]
+pub fn peers(scene: &Scene<'_>, w: &Wait) -> Vec<u32> {
+    w.pipe.map_or_else(Vec::new, |(this, peer)| {
+        holders(scene, peer, this, w.name == WaitName::Pipe, w.leaf)
+    })
+}
+
 fn holder(scene: &Scene<'_>, peer: u64, this: u64, want_write: bool, not: u32) -> Option<u32> {
-    let mut found: Option<u32> = None;
-    for (pid, p) in scene.procs {
-        for f in p.fds.as_deref().unwrap_or(&[]) {
-            let FdKind::Pipe {
-                handle, write_end, ..
-            } = &f.kind
-            else {
-                continue;
-            };
-            if *handle != peer {
-                continue;
-            }
-            let shared = peer == this;
-            if shared && *write_end != Some(want_write) {
-                continue;
-            }
-            if *pid == not && shared {
-                continue;
-            }
-            if found.is_none_or(|f| *pid < f) {
-                found = Some(*pid);
-            }
-        }
-    }
+    holders(scene, peer, this, want_write, not).first().copied()
+}
+
+/// The pids holding the end `peer` of the pipe whose other end is `this`, lowest first: on
+/// Linux, where both ends are one inode, those holding it for writing when `want_write`, else for
+/// reading, `not` aside.
+fn holders(scene: &Scene<'_>, peer: u64, this: u64, want_write: bool, not: u32) -> Vec<u32> {
+    let shared = peer == this;
+    let mut found: Vec<u32> = scene
+        .procs
+        .iter()
+        .filter(|(pid, p)| {
+            p.fds.as_deref().unwrap_or(&[]).iter().any(|f| {
+                matches!(
+                    &f.kind,
+                    FdKind::Pipe { handle, write_end, .. }
+                        if *handle == peer
+                            && (!shared || (*write_end == Some(want_write) && **pid != not))
+                )
+            })
+        })
+        .map(|(pid, _)| *pid)
+        .collect();
+    found.sort_unstable();
     found
 }
 
@@ -527,14 +543,15 @@ pub fn is_sleep_wchan(w: &str) -> bool {
 /// A Linux `wchan` that is an event wait (`epoll_wait`, `poll`, `select`).
 #[must_use]
 pub fn is_event_wchan(w: &str) -> bool {
+    is_poll_wchan(w) || w == "do_epoll_wait" || w.starts_with("ep_poll")
+}
+
+/// A Linux `wchan` that is a `poll` or a `select` (util-linux `more` at its `--More--`), not an
+/// `epoll_wait` (a server's event loop).
+#[must_use]
+pub fn is_poll_wchan(w: &str) -> bool {
     matches!(
         w,
-        "ep_poll"
-            | "do_epoll_wait"
-            | "do_select"
-            | "do_sys_poll"
-            | "poll_schedule_timeout"
-            | "core_sys_select"
-            | "do_poll"
-    ) || w.starts_with("ep_poll")
+        "do_select" | "do_sys_poll" | "poll_schedule_timeout" | "core_sys_select" | "do_poll"
+    )
 }

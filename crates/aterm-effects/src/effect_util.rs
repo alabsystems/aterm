@@ -483,8 +483,9 @@ const _: () = assert!(
 
 /// Brightness multiplier of a twinkling star at `age_s` seconds and `phase` radians.
 #[inline]
-pub(crate) fn twinkle_env(age_s: f32, phase: f32) -> f32 {
-    TWINKLE_FLOOR + TWINKLE_DEPTH * (age_s * TWINKLE_OMEGA + phase).sin().abs()
+pub(crate) const fn twinkle_env(age_s: f32, phase: f32) -> f32 {
+    let (s, _) = crate::supernova::sin_cos_f32(age_s * TWINKLE_OMEGA + phase);
+    TWINKLE_FLOOR + TWINKLE_DEPTH * s.abs()
 }
 
 /// Whether a twinkle envelope multiplier `env` is within the peak glint gate.

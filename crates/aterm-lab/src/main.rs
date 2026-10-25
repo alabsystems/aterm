@@ -24,6 +24,8 @@ mod aos_workers;
 #[cfg(target_os = "macos")]
 mod aos_workers_bench;
 #[cfg(target_os = "macos")]
+mod autopilot_captures;
+#[cfg(target_os = "macos")]
 mod autopilot_scenes;
 #[cfg(target_os = "macos")]
 mod band;
@@ -291,6 +293,12 @@ usage: targo --unverified lab <command> [tag] [args]
                                  launch Muse Code in tab 1 against the stub's Meta routes with a scratch HOME
   muse-selftest [tag] [--keep]   end-to-end Muse Code isolation and stub proof (~30 s)
   muse-captures [--only <regex>] capture every Muse Code fixture screen (~10 min; --only narrows)
+  autopilot-captures --harness all|claude|agy|muse|gemini|codex-alab [--scale 1|2] [--look day|night|both]
+                                 Autopilot's scenes on every harness, one headless instance each per look, launched in it
+                                 (the forever lab's chains; codex-alab-proof's legs): an image per scene, the chip's whole
+                                 hovered title at 400 columns, chrome and status beside each png, manifest.tsv; a paired
+                                 Gemini CLI typing take (--baseline ATERM, alone without --harness) (~40 min a look and
+                                 scale; runs side by side share one folder)
   turn|send|enter|key [tag] ...  type prompt+Enter | text | Enter | named key (0, escape, ctrl+c, ...); turn exits 1
                                  unless the composer accepted the prompt
   mode [tag] [name ['<spec>']]   show or set the stub mode: ok long numbered overloaded too-long compact-fails slow
@@ -400,18 +408,17 @@ usage: targo --unverified lab <command> [tag] [args]
                                  (--keep-dumps: its scratch dumps too)
 
 Outside any lab (no jail, no stub):
-  instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--scene SCENE]
+  instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--scene band-icons]
            [--env NAME=VALUE]... [--toml LINE]... [--toml-after LINE]... [--harness-key LINE]... [--home DIR] [--harness]
            [--reroute-prefix DIR] [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--keep] [-- PROGRAM ARGS]
                                  run a private aterm in a scratch HOME/XDG world, print its socket and hold it until
-                                 Ctrl-C (--window: a real window; --image PNG: capture one settled frame, run --post, and
-                                 end; --pages cold: run a copy whose pages are evicted, to measure cold page-ins;
+                                 Ctrl-C (--window: a real window; --band: app (the default) runs it as its own launchd
+                                 job, in a coalition of its own as aterm.app is, a window under its keeper there, and agent
+                                 as this command's child, in its coalition; --image PNG: capture one settled frame, run
+                                 --post, and end; --pages cold: run a copy whose pages are evicted, to measure cold page-ins;
                                  --reroute-prefix DIR: DIR, new, is the HOME, its atpkg prefix holding a clone of the
                                  managed Claude Code's store build with its twin and reroute stub, and the instance reroutes)
-                                 --scene band-icons draws procedural chrome icons beside H (debug/dev-seams build);
-                                 --scene deck-busy|deck-calm|deck-absent reads the merged deck's fixture scene in place
-                                 of the machine, its front tab the scene's (debug build; headless, the Deck shows with
-                                 --env ATERM_DEV_STATS_DECK_HEADLESS=1 --env ATERM_DEV_HEADROOM_PX=<its height in px>)
+                                 --scene band-icons draws procedural chrome icons beside H (debug/dev-seams build)
   abrew-admission [--json] [--indexes DIR] [--this-machine | --arch A --macos V --xcode V|none --no-clt]
                                  evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from
                                  formulae.brew.sh unless --indexes DIR holds them) on the newest Mac, that Mac with the
@@ -605,6 +612,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "agy-captures" => gemini_captures::cmd_agy_captures(args),
         "muse" => muse::cmd_muse(args),
         "muse-captures" => muse_captures::cmd_muse_captures(args),
+        "autopilot-captures" => autopilot_captures::cmd_autopilot_captures(args),
         "muse-selftest" => muse_proof::cmd_muse_selftest(args),
         "muse-relaunch" => relaunch_muse::cmd_muse_relaunch(args),
         "muse-upgrade" => upgrade_muse::cmd_muse_upgrade(args),

@@ -718,10 +718,10 @@ impl OutputStreak {
     /// Per-theme character: the theme's cursor colour, snapped to its nearest named spectrum stop,
     /// decides where the comet's head enters the arc; the genome jitters within that stop.
     #[inline]
-    fn hue_for(&self, pending: Pending, cfg: &StreakConfig) -> f32 {
+    const fn hue_for(&self, pending: Pending, cfg: &StreakConfig) -> f32 {
         let named = nearest_spectrum_stop_by_hue(cfg.theme_cursor);
         let anchor = spectrum_stop_position(named);
-        let key = genome::mix(self.seed ^ u64::from(pending.row));
+        let key = genome::mix(self.seed ^ (pending.row as u64));
         let jitter = (genome::field(key, 0, 8) as f32 / 255.0 * 2.0 - 1.0)
             * spectrum_stop_jitter_radius(named);
         (anchor + jitter).clamp(0.0, 1.0)
