@@ -120,12 +120,16 @@
 # `ship site` publishes it); piped, it installs from alabsystems/aterm. The
 # same file at the public main's tip:
 #   curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh | bash
+# The whole-file guard (WHOLE-FILE EXECUTION GUARD, at main): this group runs
+# to the file's last line, and bash runs none of it until all of it arrived.
+{
 # `sh install.sh` runs bash in POSIX mode (macOS's /bin/sh is bash 3.2), where
 # a command substitution keeps set -e: a check run in one ends at its first
 # failing command, before it prints what failed, and its caller reads the
 # empty answer as "nothing failed". This script is written for bash's own
 # mode, so it leaves POSIX mode before anything runs (bash 4.4 and later keep
-# inherit_errexit on after that). dash stops at `set -o pipefail` below.
+# inherit_errexit on after that). dash stops before any of it runs: it
+# cannot parse the whole-file group.
 if [ -n "${BASH_VERSION:-}" ]; then
 	set +o posix
 	shopt -u inherit_errexit 2>/dev/null || :
@@ -918,17 +922,18 @@ die_of() { # <signal> <status>
 # elsewhere the run ended with the child's status, not by the Ctrl-C. bash runs
 # this trap once the child returns, whatever its status. A subshell starts with
 # it reset, as with any caught signal. main sets it first, and the test seam
-# before it returns, so a suite's functions run under it as a run's do. Never
-# at the top level: under `curl | bash` that line runs while the rest of the
-# script is still arriving, and a Ctrl-C that cut the download short would end
-# it with a syntax error or status 0, not by the signal. A Ctrl-\ (QUIT) in the
-# run is the same: bash 5 ignores it, so the run read a child's death of it as
-# an answer, and bash 3.2 died of it without running its EXIT trap. One while
-# the script still arrives under bash 5 ends it as that Ctrl-C would, with a
-# syntax error or status 0 and nothing run: bash 5 ignores it, curl dies of
-# it, and no trap can be set before the script has arrived (a top-level one
-# stays pending at the cut's end of file, measured), so that one exception
-# stands.
+# before it returns, so a suite's functions run under it as a run's do. While
+# `curl | bash` still delivers the script none of it has run (the whole-file
+# group), so a Ctrl-C that cuts the download short ends bash by the signal,
+# no trap set yet; a trap set at the top level once ran as the script arrived,
+# and such a Ctrl-C ended it with a syntax error or status 0. A Ctrl-\ (QUIT)
+# in the run needs the trap too: bash 5 ignores it, so the run read a child's
+# death of it as an answer, and bash 3.2 died of it without running its EXIT
+# trap. One while the script still arrives under bash 5 ends it as a cut
+# download does, with a syntax error and nothing run (status 0 when the cut
+# falls in the comments above the group), not by the signal as a Ctrl-C there
+# does: bash 5 ignores it and curl dies of it, and no trap can be set before
+# the script has arrived, so that one exception stands.
 end_on_ctrl_c() {
 	trap 'run_cut INT 130' INT
 	trap 'run_cut QUIT 131' QUIT
@@ -948,24 +953,63 @@ run_cut() { # <signal> <status>
 	die_of "$1" "$2"
 }
 
-# Set <var> to a new private file in TMPDIR, named in the caller's
-# BOUNDED_TEMPS (a local array it declares first) before the file exists, so
-# run_cut removes it whenever the signal lands. Made by mktemp and named after,
-# one a Ctrl-C caught in between stayed (about one interrupt of a check in
-# twelve). mktemp -u draws the name, with the signals ignored: macOS's makes
-# the file and removes it again (mkstemp, then unlink), and one cut in between
-# left a file nothing named. A noclobber redirection then makes the file, with
-# mode 0600 as mktemp would: bash refuses a regular file at the name (or a
-# link to one), and opens a name where it finds nothing with O_EXCL, which
-# fails on a dangling link or on anything made there in between. It opens
-# anything else already there (a device, a FIFO, or a link to either), which
-# only a guess at that random name could have put there.
-probe_temp() { # <var> <prefix>
+# <dir>/<prefix>.<16 hex digits>, eight bytes of /dev/urandom (od reads
+# exactly its count, so pipefail sees no SIGPIPE), or status 1: a name nothing
+# has made, for a file or folder its caller names before making it. Drawing
+# it makes nothing and touches no folder. macOS's mktemp -u makes the file and
+# removes it again (mkstemp, then unlink), so a signal between the two left a
+# file nothing named, and run with the signals ignored to close that, a
+# mktemp held up on its folder held a Ctrl-C until it returned.
+temp_path() { # <dir> <prefix>
+	local s
+	s="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" && [[ "$s" =~ ^[0-9a-f]{16}$ ]] || return 1
+	printf '%s/%s.%s\n' "$1" "$2" "$s"
+}
+
+# Set <var> to a new private file in <dir> (TMPDIR when none is given), named
+# in the caller's BOUNDED_TEMPS (a local array it declares first) before the
+# file exists, so run_cut removes it whenever the signal lands. Made by mktemp
+# and named after, one a Ctrl-C caught in between stayed (about one interrupt
+# of a check in twelve). temp_path draws the name, and a noclobber redirection
+# makes the file, with mode 0600 as mktemp would: bash refuses a regular file
+# at the name (or a link to one), and opens a name where it finds nothing with
+# O_EXCL, which fails on a dangling link or on anything made there in between.
+# It opens anything else already there (a device, a FIFO, or a link to
+# either), which only a guess at that random name could have put there.
+probe_temp() { # <var> <prefix> [<dir>]
 	local name
-	name="$(trap '' INT QUIT HUP TERM && exec mktemp -u "${TMPDIR:-/tmp}/$2.XXXXXX")" || return 1
+	name="$(temp_path "${3:-${TMPDIR:-/tmp}}" "$2")" || return 1
 	BOUNDED_TEMPS+=("$name")
 	(umask 077 && set -C && : >"$name") 2>/dev/null || return 1
 	printf -v "$1" '%s' "$name"
+}
+
+# Set <var> to a new private folder (mode 0700) in <dir>, named before it is
+# made, as probe_temp names a file, so the cleanup that removes <var>'s folder
+# finds one a signal left. Made by mktemp -d and named after, one a Ctrl-C
+# caught in between stayed. Status 1, <var> empty, when mkdir fails: it makes
+# none where anything is already at the name, which is then never this run's.
+temp_dir() { # <var> <dir> <prefix>
+	local name
+	name="$(temp_path "$2" "$3")" || return 1
+	printf -v "$1" '%s' "$name"
+	mkdir -m 700 "$name" || {
+		printf -v "$1" '%s' ""
+		return 1
+	}
+}
+
+# Set TMP to the run's private download folder in TMPDIR, with <cleanup> as
+# the EXIT trap that removes it. The trap is set before the folder is made,
+# and the folder named before it exists (temp_dir): made by mktemp -d first,
+# with the trap set after, one a Ctrl-C caught in between stayed.
+make_download_dir() { # <cleanup>
+	TMP=""
+	trap "$1" EXIT
+	temp_dir TMP "${TMPDIR:-/tmp}" aterm-install || {
+		echo "install.sh: cannot create a private folder under ${TMPDIR:-/tmp}" >&2
+		exit 1
+	}
 }
 
 # The gate may only vouch for a bundle the fresh install would have accepted:
@@ -2620,7 +2664,7 @@ install_linux_app_cleanup() {
 	set +e
 	trap '' INT HUP TERM QUIT
 	linux_verifier_cleanup
-	rm -rf "$TMP"
+	[[ -z "$TMP" ]] || rm -rf "$TMP"
 }
 
 # Make <arch>'s verifier ready. Under the test seam that is ATERM_INSTALL_VERIFIER,
@@ -2673,12 +2717,11 @@ linux_verifier_ready() { # <arch>
 		return 0
 	fi
 	linux_verifier_cleanup
-	LINUX_VERIFIER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aterm-verifier.XXXXXX")" || {
-		LINUX_VERIFIER_DIR=""
+	trap linux_verifier_cleanup EXIT
+	temp_dir LINUX_VERIFIER_DIR "${TMPDIR:-/tmp}" aterm-verifier || {
 		LINUX_VERIFIER_WHY="cannot create a private directory for the bootstrap verifier under ${TMPDIR:-/tmp}"
 		return 1
 	}
-	trap linux_verifier_cleanup EXIT
 	(REPO_SLUG="$LINUX_VERIFIER_REPO" && download_release_asset "$LINUX_VERIFIER_TAG" "$at" "$size" "$LINUX_VERIFIER_DIR/$at") || {
 		LINUX_VERIFIER_WHY="could not download the bootstrap verifier $at from release $LINUX_VERIFIER_TAG of $LINUX_VERIFIER_REPO; retry in a few minutes"
 		return 1
@@ -3448,10 +3491,11 @@ own_bundle_as_root() { # <stage> <dest>
 # whose the app is. Under root, ditto keeps the container's owner
 # (own_bundle_as_root), so for the length of the copy every folder of the
 # copy is that account's, and it could change the app before root makes it
-# root's: the copy is made inside STAGE_DIR, a folder mktemp makes in <dest>,
-# and made root's there. An inheritable ACL entry on <dest> (SIP keeps one
-# off /Applications, not off another folder; root_dest_acl_open refuses a
-# <dest> with one, so this is for one added since) passes down to STAGE_DIR,
+# root's: the copy is made inside STAGE_DIR, a folder made in <dest> under a
+# random name (temp_dir), and made root's there. An inheritable ACL entry on
+# <dest> (SIP keeps one off /Applications, not off another folder;
+# root_dest_acl_open refuses a <dest> with one, so this is for one added
+# since) passes down to STAGE_DIR,
 # and until it is stripped an account it names may enter, replace, chmod or
 # take the folder, or hold a descriptor that later looks up names in it
 # without the search right. So STAGE_DIR loses its ACL (with -h, never
@@ -3468,7 +3512,7 @@ stage_bundle() { # <app> <dest>
 		ditto "$1" "$STAGE"
 		return
 	fi
-	STAGE_DIR="$(mktemp -d "$2/aterm.app.installing.XXXXXX")" || return 1
+	temp_dir STAGE_DIR "$2" aterm.app.installing || return 1
 	[[ "$(uname -s)" == Linux ]] || chmod -h -N "$STAGE_DIR" || return 1
 	staging_folder_sealed "$STAGE_DIR" || return 1
 	d="$(mktemp -d "$STAGE_DIR/copy.XXXXXX")" || return 1
@@ -3524,10 +3568,12 @@ drop_stage() {
 }
 
 # A command a NOTE names for the person to paste: each word spelled to read
-# back as one (shell_word), after `sudo` when acting in <dir> needs it, in a
-# root run or a folder this account cannot write, or always with --sudo, for
-# a command this account just ran and failed.
-note_command() { # <dir>|--sudo <word>...
+# back as one (shell_word), after `sudo` when acting on <path> needs it, in a
+# root run or a folder (or a file the command rewrites) this account cannot
+# write, or always with --sudo, for a command this account just ran and
+# failed. A cp back over a file asks of the file: asked of its folder, which
+# need take no new name, the NOTE said sudo to one this account can write.
+note_command() { # <path>|--sudo <word>...
 	local out="" word
 	[[ "$1" != --sudo && "$(installer_uid)" != 0 && -w "$1" ]] || out="sudo "
 	shift
@@ -3629,7 +3675,7 @@ install_app_cleanup() {
 			find "$TMP" -mindepth 1 -maxdepth 1 ! -name "${MNT##*/}" -exec rm -rf {} +
 		fi
 	fi
-	[[ "$mounted" == 1 ]] || rm -rf "$TMP"
+	[[ -z "$TMP" || "$mounted" == 1 ]] || rm -rf "$TMP"
 }
 
 # Enable at Startup, aterm Caffeine's login job (crates/aterm-caffeine
@@ -4901,11 +4947,33 @@ no_toolchain_plan() { # <cfg>
 		}' "$cfg"
 }
 
+# Whether persist_no_toolchain's write of <cfg> under <plan> would open it,
+# asked without writing a byte, so --dry-run says what the run does: the very
+# open each write makes, a read-write one for the insert's refill (the plan
+# has read the file, and one without O_TRUNC asks what the refill's does), an
+# appending one for the append, and for a create the folder mkdir -p and the
+# redirection need (would_create_writable). -w asked the mode and the ACLs,
+# not what an open meets beyond them: Linux's append-only attribute (chattr
+# +a) refuses a write open without O_APPEND, which -w allows, a macOS ACL or
+# the uappnd flag can allow appending and deny writing, or deny appending
+# alone, and -w allows a folder at the path, which no open for writing does.
+config_write_opens() { # <cfg> <plan>
+	case "$2" in
+	create) would_create_writable "$(dirname "$1")" ;;
+	insert) (: 1<>"$1") 2>/dev/null ;;
+	append) (: >>"$1") 2>/dev/null ;;
+	*) return 1 ;;
+	esac
+}
+
 # Persist the exclusion into <cfg> per no_toolchain_plan. Writes through a
 # symlinked config (a dotfiles repo keeps its link) and keeps the file's mode.
 persist_no_toolchain() { # <cfg>
 	local cfg="$1" plan tmp
-	plan="$(no_toolchain_plan "$cfg")"
+	# A file awk cannot read (its mode, its owner) has no plan, and the caller
+	# says to set the key by hand: the empty plan fell through to the line
+	# saying the key was written, over a file that still said otherwise.
+	plan="$(no_toolchain_plan "$cfg")" || return 1
 	case "$plan" in
 	create)
 		mkdir -p "$(dirname "$cfg")" || return 1
@@ -4922,23 +4990,51 @@ persist_no_toolchain() { # <cfg>
 		# run once the file is whole again (run_cut, which removes the copy).
 		# A TERM or HUP to this shell alone is held to run_cut the same way
 		# (hold_kills), from before the copy is made until it is gone: bash's
-		# own handler ended the run at once, the copy left.
+		# own handler ended the run at once, the copy left. A refill that
+		# fails (a full volume, a quota) can leave the file empty or cut
+		# short, its copy then its only whole text: the copy stays, out of
+		# BOUNDED_TEMPS, and a NOTE says where. It went with the rest, and
+		# the run said only that it could not write the file. A Ctrl-C or
+		# kill during the very refill that fails still takes it: its trap
+		# runs run_cut as the refill ends, before its status is read. The
+		# copy sits next to the file, not in TMPDIR, which the OS empties (at
+		# boot, or of files a few days old) maybe before its cp runs. A
+		# folder that takes no new file (its mode) puts it in TMPDIR after
+		# all: the file in it can still be rewritten in place, and the run
+		# left it unwritten. A volume too full for the copy fails its write
+		# first, the file untouched. A file this run can read but not open to
+		# write (its mode, an ACL, a file flag, a link into a read-only store)
+		# is refused before any copy (config_write_opens): the refill's open
+		# failed with the file untouched, and the NOTE said it might be empty,
+		# with a cp that failed too. Asked by an append that wrote nothing, an
+		# ACL that allows appending alone let a file through to that NOTE, and
+		# one that denies appending alone refused a file the refill writes;
+		# asked by -w, Linux's append-only attribute let one through.
+		config_write_opens "$cfg" insert || return 1
 		local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
 		hold_kills
-		probe_temp tmp aterm-config || {
+		probe_temp tmp .aterm-config "$(dirname "$cfg")" || probe_temp tmp aterm-config || {
 			release_kills
 			return 1
 		}
-		awk '
+		if ! awk '
 			{ print }
 			!done {
 				line = $0; sub(/[ \t]*#.*$/, "", line); gsub(/^[ \t]+|[ \t]+$/, "", line)
 				if (line ~ /^\[[ \t]*packages[ \t]*\]$/) { print "auto_install = false"; done = 1 }
-			}' "$cfg" >"$tmp" && (trap '' INT HUP TERM QUIT && exec cat "$tmp" >"$cfg")
-		local status=$?
+			}' "$cfg" >"$tmp"; then
+			rm -f "$tmp"
+			release_kills
+			return 1
+		fi
+		if ! (trap '' INT HUP TERM QUIT && exec cat "$tmp" >"$cfg"); then
+			unset 'BOUNDED_TEMPS[${#BOUNDED_TEMPS[@]}-1]'
+			release_kills
+			echo "install.sh: NOTE: $cfg may now be empty or cut short; its whole text, with \`auto_install = false\` added, is in $tmp (put it back with: $(note_command "$cfg" cp "$tmp" "$cfg"))" >&2
+			return 1
+		fi
 		rm -f "$tmp"
 		release_kills
-		[[ $status -eq 0 ]] || return 1
 		;;
 	keep*)
 		echo "install.sh: --no-toolchain: $cfg already says \`${plan#keep }\` — left as it is"
@@ -4965,8 +5061,15 @@ place_store_binary() {
 	# whose terminal is already running.
 	# The rename below replaces the aterm there.
 	may_replace "$STORE_DIR/aterm" || return 1
+	# Named before it is made (probe_temp), so a Ctrl-C during the copy
+	# removes it: made by mktemp, the partial copy stayed in STORE_DIR.
+	# probe_temp says nothing when it fails, where mktemp said why.
 	local staged
-	staged="$(mktemp "$STORE_DIR/.aterm-install.XXXXXX")" || return 1
+	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
+	probe_temp staged .aterm-install "$STORE_DIR" || {
+		echo "install.sh: could not create a file in $STORE_DIR to stage the aterm binary — nothing was installed there" >&2
+		return 1
+	}
 	if ! install -m 755 "$1" "$staged" || ! mv -f "$staged" "$STORE_DIR/aterm"; then
 		rm -f "$staged"
 		return 1
@@ -5114,10 +5217,21 @@ print_install_plan() {
 		echo "install.sh: toolset: excluded (--no-toolchain / ATERM_NO_TOOLCHAIN=1)"
 		local cfg plan
 		cfg="$(aterm_config_path)"
-		plan="$(no_toolchain_plan "$cfg")"
+		plan="$(no_toolchain_plan "$cfg")" || plan=unreadable
 		case "$plan" in
-		create) echo "  config:   creates $cfg with \`[packages] auto_install = false\` — the exclusion persists: $NO_TOOLCHAIN_EFFECT" ;;
-		append | insert) echo "  config:   adds \`auto_install = false\` to [packages] in $cfg — the exclusion persists: $NO_TOOLCHAIN_EFFECT" ;;
+		unreadable) echo "  config:   cannot read $cfg — the run would say to set \`[packages] auto_install = false\` there by hand" ;;
+		create | append | insert)
+			# Asked as the run's write asks (config_write_opens): this said it
+			# creates the file in a folder the run cannot write, and adds the key
+			# to a link into a read-only store.
+			if ! config_write_opens "$cfg" "$plan"; then
+				echo "  config:   cannot write $cfg — the run would say to set \`[packages] auto_install = false\` there by hand"
+			elif [[ "$plan" == create ]]; then
+				echo "  config:   creates $cfg with \`[packages] auto_install = false\` — the exclusion persists: $NO_TOOLCHAIN_EFFECT"
+			else
+				echo "  config:   adds \`auto_install = false\` to [packages] in $cfg — the exclusion persists: $NO_TOOLCHAIN_EFFECT"
+			fi
+			;;
 		keep*) echo "  config:   $cfg already says \`${plan#keep }\` — left as it is" ;;
 		esac
 	elif [[ "${TOOLSET_AS_ROOT:-0}" -eq 1 ]]; then
@@ -5172,23 +5286,27 @@ print_install_plan() {
 }
 
 # --- WHOLE-FILE EXECUTION GUARD ------------------------------------------------
-# Everything from here down executes ONLY through the `main "$@"` on this
-# file's LITERAL LAST LINE. The documented invocation is `curl … | bash`, and
-# bash runs a pipe as it arrives: unwrapped, a transfer truncated after the
-# argument loop would execute a PREFIX of the run (`head -n <pre-dispatch>
-# install.sh | bash` created ~/.local/bin, spent anonymous GitHub API budget,
-# and exited 0). Keeping every DESTRUCTIVE operation in a function with the
-# dispatch as the tail is not enough: the top-level pre-flight between the two
-# has side effects too, so the guard wraps the whole run. Do not remove it.
-# Wrapped, truncation has exactly two outcomes, both inert: a cut inside the
-# body is a parse error (bash executes none of an unterminated compound), and
-# a cut that keeps the body but loses the last line defines everything and
-# runs nothing. No side effect can happen unless the final byte arrived — the
-# same tail-call guard rustup and uv ship. Tested at every top-level cut point
-# by crates/aterm-update/tests/install_sh.
-# The body below is not indented under main() ON PURPOSE: re-indenting ~1,200
-# lines would be mechanical churn and risk pushing literal tabs into multi-line
-# strings.
+# The run executes ONLY through the `main "$@"; }` on this file's LITERAL LAST
+# LINE, whose brace closes the group the file opens above its first command.
+# The documented invocation is `curl … | bash`, and bash runs a pipe as it
+# arrives: unwrapped, a transfer truncated after the argument loop would
+# execute a PREFIX of the run (`head -n <pre-dispatch> install.sh | bash`
+# created ~/.local/bin, spent anonymous GitHub API budget, and exited 0).
+# Keeping every DESTRUCTIVE operation in a function with the dispatch as the
+# tail is not enough: the top-level pre-flight between the two has side
+# effects too. Wrapping main alone was not enough either: a cut just after
+# `main` on a bare `main "$@"` ran a whole install with no arguments, and one
+# inside a top-level word ran that word's first letters as a command (`make`
+# from make_download_dir builds the Makefile where the run was started,
+# `bundle` from bundle_identifier runs bundle install). So the whole file is
+# one group, and bash executes none of a group before its closing brace has
+# arrived: a cut anywhere inside it is bash's syntax error and runs nothing,
+# and a cut in the comments above it runs nothing either. Do not remove it.
+# Tested at every unindented line, every byte of each one's first word, and
+# every byte of the last line by crates/aterm-update/tests/install_sh.
+# Neither main's body nor the file's group is indented ON PURPOSE:
+# re-indenting would be mechanical churn and risk pushing literal tabs into
+# multi-line strings.
 main() {
 end_on_ctrl_c
 ARGV=("$@")
@@ -5625,12 +5743,12 @@ install_app() {
 	# bundle that stays costs no download.
 	may_replace "$DEST/aterm.app" || exit 1
 
-	TMP="$(mktemp -d "${TMPDIR:-/tmp}/aterm-install.XXXXXX")"
-	MNT="$TMP/mnt"
+	MNT=""
 	STAGE=""
 	STAGE_DIR=""
 	OLD=""
-	trap install_app_cleanup EXIT
+	make_download_dir install_app_cleanup
+	MNT="$TMP/mnt"
 
 	# The manifest, from the tag's own URL, held to the size the host names.
 	MANIFEST_SIZE="$(release_asset_size "$TAG" aterm-appcast.toml "$MANIFEST_MAX_BYTES")" || exit 1
@@ -5836,8 +5954,7 @@ install_app() {
 # canonical store layout.
 install_linux_app() {
 	echo "install.sh: installing $REPO_SLUG $TAG (linux-$LINUX_ARCH)"
-	TMP="$(mktemp -d "${TMPDIR:-/tmp}/aterm-install.XXXXXX")"
-	trap install_linux_app_cleanup EXIT
+	make_download_dir install_linux_app_cleanup
 
 	local asset minimum maximum proof verified remote_asset source_tag host_size
 	local name digest size build roster_seq
@@ -6323,6 +6440,7 @@ fi
 }
 
 # The guard's other half (see the whole-file execution guard above). This call
-# is the file's last line on purpose: nothing runs unless every byte before it
-# arrived, so a truncated `curl … | bash` is inert.
-main "$@"
+# is the file's last line on purpose, and its brace closes the group the file
+# opens above its first command: nothing runs unless every byte of the file
+# did, so a truncated `curl … | bash` is inert.
+main "$@"; }
