@@ -8559,13 +8559,28 @@ fn the_autocompact_offer_is_a_persons_unless_read_whole_and_on() {
     }
 }
 
-const AUTO_MODE_SETUP: [&str; 8] = [
+const AUTO_MODE_SETUP: [&str; 23] = [
     phase_fixtures::AUTO_MODE_SETUP,
     phase_fixtures::AUTO_MODE_SETUP_60COL,
     phase_fixtures::AUTO_MODE_SETUP_40COL,
+    phase_fixtures::AUTO_MODE_SETUP_34COL,
+    phase_fixtures::AUTO_MODE_SETUP_26COL,
+    phase_fixtures::AUTO_MODE_SETUP_23COL,
+    phase_fixtures::AUTO_MODE_SETUP_22COL,
+    phase_fixtures::AUTO_MODE_SETUP_20COL,
+    phase_fixtures::AUTO_MODE_SETUP_19COL,
+    phase_fixtures::AUTO_MODE_SETUP_17COL,
+    phase_fixtures::AUTO_MODE_SETUP_16COL,
     phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN,
     phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_60COL,
     phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_40COL,
+    phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_34COL,
+    phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_26COL,
+    phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_22COL,
+    phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_20COL,
+    phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_19COL,
+    phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_17COL,
+    phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_16COL,
     phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_SHELL,
     phase_fixtures::AUTO_MODE_SETUP_FULLSCREEN_SHELL_MODE,
 ];
@@ -8577,7 +8592,7 @@ fn the_auto_mode_setup_offer_is_put_off_with_not_now_at_every_level() {
         // The title's first row: a narrow pane wraps the title under it.
         let title = rows
             .iter()
-            .find(|r| r.trim().starts_with("Teach auto mode about your"))
+            .find(|r| r.trim().starts_with("Teach auto"))
             .expect("the title row");
         let guard = crate::supervise::policy::row_guard(title);
         for c in [ctx(), full(), none(full())] {

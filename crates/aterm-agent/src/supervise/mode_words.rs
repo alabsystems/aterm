@@ -51,6 +51,19 @@ pub const TIMED_CRUISE_CHIP: &str = "keeps going until then, finding more to do"
 pub const TIMED_CRUISE_RECORD: &str =
     "the harness keeps going until that time, then wraps it up on the remote main branch";
 
+/// A LANDING'S SENTENCE (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.9, slice 9a): what
+/// the chip's `✓ landed` title and the `Autopilot landed` record say after their head, on every
+/// leg a landing stands on. It says the agent's clean `Nothing left:` defense and that no
+/// repository check found work left to land, which holds whoever checked and whatever could be
+/// read: aterm's probe naming the commit it read clean (`RepoRead::Checked`, with a remote or
+/// none), its probe reading clean with nothing read at all (no `git`, no `HOME`, a folder macOS
+/// guards, a network or automounted volume, a folder that is no repository: `RepoRead::Clean`),
+/// and codex-alab's own landing (a proven self-claim's `landed@v1`), whose check is codex-alab's
+/// and lands past its limit. So it names no remote main and no checker; 9c puts what aterm
+/// checked in its place.
+pub const LANDED_WORDS: &str = "it said nothing is left, and no repository check found work left to land; the \
+     harness types nothing more until someone else's turn";
+
 /// `mode`'s sentences from [`MODE_WORDS`].
 #[must_use]
 pub const fn mode_words(mode: Autopilot) -> &'static ModeWords {

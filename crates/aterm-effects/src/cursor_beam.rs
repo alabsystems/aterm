@@ -199,12 +199,7 @@ impl CursorBeamRod {
 
         let fill = (!cfg.bar).then(|| {
             let styled = if cfg.dark_theme {
-                let k = 0.10 + 0.35 * e;
-                let mix = |sh: u32| {
-                    let c = ((cfg.color >> sh) & 0xff) as f32;
-                    (c + (255.0 - c) * k).min(255.0) as u32
-                };
-                (mix(16) << 16) | (mix(8) << 8) | mix(0)
+                lerp_rgb(cfg.color, 0x00FF_FFFF, 0.10 + 0.35 * e)
             } else {
                 let bg = cfg.theme_bg & 0x00FF_FFFF;
                 let key = (cfg.color, bg, e.to_bits());
@@ -275,18 +270,6 @@ impl CursorBeamRod {
         let cov_axis =
             (COV_IDLE + (COV_MAX - COV_IDLE) * e) * cfg.intensity * (0.90 + 0.10 * breathe);
         const WHITE: u32 = 0x00FF_FFFF;
-        let (cr_f, cg_f, cb_f) = (
-            ((cfg.color >> 16) & 0xff) as f32,
-            ((cfg.color >> 8) & 0xff) as f32,
-            (cfg.color & 0xff) as f32,
-        );
-        let lerp = |b: u32, t: f32| -> u32 {
-            let m = |x: f32, sh: u32| {
-                let y = ((b >> sh) & 0xff) as f32;
-                (x + (y - x) * t).min(255.0) as u32
-            };
-            (m(cr_f, 16) << 16) | (m(cg_f, 8) << 8) | m(cb_f, 0)
-        };
         let layers: [(f32, f32, u32, f32); 4] = [
             (0.045, 1.00, WHITE, 0.55),   // white-hot axis
             (0.13, 0.55, WHITE, 0.12),    // inner sleeve
@@ -302,7 +285,7 @@ impl CursorBeamRod {
             }
             let w = ((cw * hw * 2.0) as i32).max(1);
             let x = (ax - cw * hw) as i32;
-            let color = lerp(target, mix);
+            let color = lerp_rgb(cfg.color, target, mix);
             let premul = premul_rgb(color, cov);
             if i < 2 {
                 // Full rod including the overshoot caps.
@@ -330,10 +313,12 @@ impl CursorBeamRod {
         under: &mut Vec<GlowQuad>,
     ) {
         use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, light_body_ink};
+        const INV_COV_MAX: f32 = 1.0 / COV_MAX;
         let cw = geom.cw as f32;
         let ax = f32::from(geom.origin_x) + (cc as f32) * cw + cw * 0.10;
         let y = i32::from(geom.origin_y) + cr as i32 * geom.ch as i32;
-        let strength = (COV_IDLE + (COV_MAX - COV_IDLE) * e) / COV_MAX
+        let strength = (COV_IDLE + (COV_MAX - COV_IDLE) * e)
+            * INV_COV_MAX
             * cfg.intensity.clamp(0.0, 1.0)
             * (0.90 + 0.10 * breathe);
         let key = (
@@ -406,9 +391,10 @@ impl CursorBeamRod {
         let cell_x0 = (cx - hw).round() as i32;
         let cell_x1 = cell_x0 + geom.cw as i32;
         let ch_i = geom.ch as i32;
+        const INV_AURA_ROW_DIV: f32 = 1.0 / AURA_ROW_DIV;
         let band_y0 = i32::from(geom.origin_y) + i32::from(cr) * ch_i;
         let band_y1 = band_y0 + ch_i;
-        let row_h = ((ch / AURA_ROW_DIV) as i32).max(2);
+        let row_h = ((ch * INV_AURA_ROW_DIV) as i32).max(2);
         let mut y = band_y0;
         while y < band_y1 {
             let h = row_h.min(band_y1 - y);

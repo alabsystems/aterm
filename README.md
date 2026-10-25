@@ -481,8 +481,8 @@ aterm --window --validate-config
 Configuration is read from `$XDG_CONFIG_HOME/aterm/aterm.toml`, else
 `%APPDATA%\aterm\aterm.toml` on Windows and `~/.config/aterm/aterm.toml`
 elsewhere. Launch flags override it; no environment variable sets a key. The
-window applies supported changes without a restart, and Settings ▸ Manual opens
-the file in aterm's editor.
+window applies supported changes without a restart, and Settings ▸ Manual ▸
+Open aterm.toml opens the file in aterm's editor.
 
 aterm contains no telemetry. By default it goes online for two things: the app
 update check (eligible macOS installs and enrolled Linux installs) and the

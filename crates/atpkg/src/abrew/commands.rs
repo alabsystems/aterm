@@ -121,11 +121,9 @@ pub(super) fn cmd_on(prefix: &Prefix) -> ExitCode {
         eprintln!("abrew: stub not laid: {e}");
     }
     if crate::config::cached_abrew().enabled() {
-        println!(
-            "abrew: on — `brew` in aterm sessions runs abrew (`brew --real …` for real Homebrew)"
-        );
+        println!("abrew: on — `brew` in aterm sessions uses atpkg's native compatibility");
     } else {
-        println!("abrew: on for this prefix, but [abrew] enabled=false still runs real Homebrew");
+        println!("abrew: on for this prefix, but [abrew] enabled=false still disables native brew");
     }
     ExitCode::SUCCESS
 }
@@ -137,35 +135,15 @@ pub(super) fn cmd_off(prefix: &Prefix) -> ExitCode {
     if let Err(e) = super::prefix::write_metadata(&prefix.disabled_path(), b"off\n") {
         return failed(&format!("abrew: {e}"));
     }
-    if let Some(layout) = crate::store::resolve_from(crate::config::cached()) {
-        stub::remove(&layout);
+    if let Some(layout) = crate::store::resolve_from(crate::config::cached())
+        && let Err(error) = stub::lay(&layout)
+    {
+        return failed(&format!(
+            "abrew: native brew is off, but its managed wrapper could not be refreshed: {error}"
+        ));
     }
-    println!("abrew: off — `brew` runs real Homebrew until `abrew on`");
+    println!("abrew: off — native brew commands are disabled until `abrew on`");
     ExitCode::SUCCESS
-}
-
-/// What to change before `abrew bundle` (which passes through while any of these holds) can lay
-/// the bundled Homebrew, as `"<step>, …, then "`; empty when nothing stands in its way.
-pub(super) fn steps_before_bundle(prefix: &Prefix) -> String {
-    let engaged = |name: &str| stub::engaged(std::env::var(name).ok().as_deref());
-    let mut steps = Vec::new();
-    if engaged(stub::REAL_ENV) {
-        steps.push("unset ABREW_REAL");
-    }
-    if engaged(super::reroute_passthrough_env()) {
-        steps.push("leave this --no-reroute session");
-    }
-    if !crate::config::cached_abrew().enabled() {
-        steps.push("set [abrew] enabled=true");
-    }
-    if prefix.is_disabled() {
-        steps.push("run `abrew on`");
-    }
-    if steps.is_empty() {
-        String::new()
-    } else {
-        format!("{}, then ", steps.join(", "))
-    }
 }
 
 pub(super) fn cmd_status(prefix: &Prefix) -> ExitCode {
@@ -180,13 +158,7 @@ pub(super) fn cmd_status(prefix: &Prefix) -> ExitCode {
             "on"
         }
     );
-    match stub::resolve_real_brew(prefix) {
-        Some(p) => println!("real brew: {}", p.display()),
-        None => println!(
-            "real brew: none found ({}abrew bundle lays one)",
-            steps_before_bundle(prefix)
-        ),
-    }
+    println!("implementation: atpkg native (no Homebrew fallback)");
     bundle::bundle_status(prefix);
     println!(
         "installed: {} formulae, {} casks",
@@ -305,8 +277,7 @@ pub(super) fn cmd_search(api: &Api, rest: &[String]) -> ExitCode {
                         Ok(false) => {}
                         Err(_) => {
                             return failed(
-                                "abrew: regex search ran out of its work budget; \
-                                 `brew --real search` uses Homebrew's engine",
+                                "abrew: native regex search ran out of its work budget; simplify the pattern",
                             );
                         }
                     }
@@ -1345,8 +1316,7 @@ fn desc_search(api: &Api, rest: &[String], field: DescField) -> ExitCode {
                 Ok(false) => {}
                 Err(_) => {
                     return failed(
-                        "abrew: regex search ran out of its work budget; \
-                         `brew --real desc` uses Homebrew's engine",
+                        "abrew: native regex search ran out of its work budget; simplify the pattern",
                     );
                 }
             }
@@ -1593,7 +1563,7 @@ pub(super) fn cmd_cache_query(
                         return from_install(
                             prefix,
                             args,
-                            Err(install::InstallError::PassThrough(format!(
+                            Err(install::InstallError::Unsupported(format!(
                                 "no bottle for {} on this platform",
                                 f.name
                             ))),
@@ -1661,10 +1631,7 @@ pub(super) fn cmd_config(prefix: &Prefix) -> ExitCode {
     println!("ABREW_CASKROOM: {}", prefix.caskroom().display());
     println!("CPU: {}", std::env::consts::ARCH);
     println!("OS: {}", std::env::consts::OS);
-    match stub::resolve_real_brew(prefix) {
-        Some(p) => println!("REAL_BREW: {}", p.display()),
-        None => println!("REAL_BREW: none"),
-    }
+    println!("IMPLEMENTATION: atpkg native (no Homebrew fallback)");
     ExitCode::SUCCESS
 }
 
@@ -1825,9 +1792,6 @@ pub(super) fn cmd_doctor(prefix: &Prefix, rest: &[String]) -> ExitCode {
             "prefix {} cannot be created/written",
             prefix.root.display()
         ));
-    }
-    if stub::resolve_real_brew(prefix).is_none() {
-        note("no real Homebrew found; delegated commands will fail (run: abrew bundle)".into());
     }
     for sub in ["bin", "sbin", "lib", "Applications", "opt"] {
         if let Ok(entries) = std::fs::read_dir(prefix.root.join(sub)) {
@@ -2021,9 +1985,9 @@ pub(super) fn cmd_install(
                 eprintln!("{msg}");
                 failures += 1;
             }
-            Err(error @ install::InstallError::PassThrough(_)) => {
+            Err(error @ install::InstallError::Unsupported(_)) => {
                 if names.len() > 1 && landed {
-                    let install::InstallError::PassThrough(reason) = &error else {
+                    let install::InstallError::Unsupported(reason) = &error else {
                         unreachable!()
                     };
                     eprintln!("abrew: {reason}; skipped");
@@ -2172,7 +2136,7 @@ pub(super) fn cmd_uninstall(
         };
         match r {
             Ok(()) => completed = true,
-            Err(e @ install::InstallError::PassThrough(_)) => {
+            Err(e @ install::InstallError::Unsupported(_)) => {
                 return from_install(
                     prefix,
                     args,
@@ -2242,7 +2206,7 @@ pub(super) fn cmd_reinstall(
                     failures += 1;
                 }
             }
-            Err(e @ install::InstallError::PassThrough(_)) => {
+            Err(e @ install::InstallError::Unsupported(_)) => {
                 return from_install(
                     prefix,
                     args,
@@ -2489,7 +2453,7 @@ pub(super) fn cmd_upgrade(
                     }
                 }
                 Ok(_) => {}
-                Err(install::InstallError::PassThrough(reason)) => {
+                Err(install::InstallError::Unsupported(reason)) => {
                     eprintln!("abrew: {name}: {reason}; skipped");
                     failures += 1;
                 }
@@ -2560,9 +2524,9 @@ fn upgrade_formula_names(
                 eprintln!("{msg}");
                 failures += 1;
             }
-            Err(error @ install::InstallError::PassThrough(_)) => {
+            Err(error @ install::InstallError::Unsupported(_)) => {
                 if names.len() > 1 && landed {
-                    let install::InstallError::PassThrough(reason) = &error else {
+                    let install::InstallError::Unsupported(reason) = &error else {
                         unreachable!()
                     };
                     eprintln!("abrew: {reason}; skipped");
@@ -2649,13 +2613,13 @@ fn cmd_upgrade_casks(
                     failures += 1;
                 }
             }
-            Err(install::InstallError::PassThrough(reason)) => {
+            Err(install::InstallError::Unsupported(reason)) => {
                 if !names.is_empty() {
                     return from_install(
                         prefix,
                         args,
                         Err(super::after_native_progress(
-                            install::InstallError::PassThrough(reason),
+                            install::InstallError::Unsupported(reason),
                             completed,
                         )),
                     );
@@ -4213,7 +4177,7 @@ pub(super) fn cmd_options(
         from_install(
             prefix,
             args,
-            Err(install::InstallError::PassThrough(
+            Err(install::InstallError::Unsupported(
                 "options for tapped formulae live in tap recipes".to_string(),
             )),
         )
@@ -4587,7 +4551,11 @@ pub(super) fn cmd_bundle(
     rest: &[String],
     prepared: Option<Vec<bundle::BrewfileEntry>>,
 ) -> ExitCode {
-    let sub = rest.first().map(String::as_str).unwrap_or("");
+    let sub = rest
+        .first()
+        .map(String::as_str)
+        .filter(|word| !word.starts_with('-'))
+        .unwrap_or("install");
     match sub {
         "status" => {
             bundle::bundle_status(prefix);
@@ -4623,24 +4591,7 @@ pub(super) fn cmd_bundle(
             Some(entries) => bundle_file(prefix, api, args, &entries, sub),
             None => failed("abrew: Brewfile was not admitted"),
         },
-        _ => {
-            let mut version: Option<&str> = None;
-            let mut sha: Option<&str> = None;
-            let mut it = rest.iter();
-            while let Some(a) = it.next() {
-                match a.as_str() {
-                    "--version" => version = it.next().map(String::as_str),
-                    "--sha256" => sha = it.next().map(String::as_str),
-                    _ => {}
-                }
-            }
-            let force = has_flag(rest, "--force", "-f");
-            from_install(
-                prefix,
-                args,
-                bundle::install_bundle(prefix, version, sha, force),
-            )
-        }
+        _ => super::unsupported("bundle subcommand is not native"),
     }
 }
 
@@ -4726,8 +4677,8 @@ fn bundle_file(
                     landed = true;
                 }
             }
-            Err(e @ install::InstallError::PassThrough(_)) if landed && entries.len() > 1 => {
-                let install::InstallError::PassThrough(reason) = &e else {
+            Err(e @ install::InstallError::Unsupported(_)) if landed && entries.len() > 1 => {
+                let install::InstallError::Unsupported(reason) = &e else {
                     unreachable!()
                 };
                 eprintln!("abrew: skipping Brewfile entry ({reason})");

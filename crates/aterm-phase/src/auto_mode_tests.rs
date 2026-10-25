@@ -6,19 +6,40 @@
 use super::*;
 use crate::phase::Phase;
 use crate::prompt::fixtures::{
-    AUTO_MODE_SETUP, AUTO_MODE_SETUP_40COL, AUTO_MODE_SETUP_60COL, AUTO_MODE_SETUP_FULLSCREEN,
-    AUTO_MODE_SETUP_FULLSCREEN_40COL, AUTO_MODE_SETUP_FULLSCREEN_60COL,
-    AUTO_MODE_SETUP_FULLSCREEN_SHELL, AUTO_MODE_SETUP_FULLSCREEN_SHELL_MODE, screen,
+    AUTO_MODE_SETUP, AUTO_MODE_SETUP_16COL, AUTO_MODE_SETUP_17COL, AUTO_MODE_SETUP_19COL,
+    AUTO_MODE_SETUP_20COL, AUTO_MODE_SETUP_22COL, AUTO_MODE_SETUP_23COL, AUTO_MODE_SETUP_26COL,
+    AUTO_MODE_SETUP_34COL, AUTO_MODE_SETUP_40COL, AUTO_MODE_SETUP_60COL,
+    AUTO_MODE_SETUP_FULLSCREEN, AUTO_MODE_SETUP_FULLSCREEN_16COL, AUTO_MODE_SETUP_FULLSCREEN_17COL,
+    AUTO_MODE_SETUP_FULLSCREEN_19COL, AUTO_MODE_SETUP_FULLSCREEN_20COL,
+    AUTO_MODE_SETUP_FULLSCREEN_22COL, AUTO_MODE_SETUP_FULLSCREEN_26COL,
+    AUTO_MODE_SETUP_FULLSCREEN_34COL, AUTO_MODE_SETUP_FULLSCREEN_40COL,
+    AUTO_MODE_SETUP_FULLSCREEN_60COL, AUTO_MODE_SETUP_FULLSCREEN_SHELL,
+    AUTO_MODE_SETUP_FULLSCREEN_SHELL_MODE, screen,
 };
 use crate::prompt::parse_prompt_v2;
 
-const ALL: [(&str, &str); 8] = [
+const ALL: [(&str, &str); 23] = [
     ("inline", AUTO_MODE_SETUP),
     ("inline 60", AUTO_MODE_SETUP_60COL),
     ("inline 40", AUTO_MODE_SETUP_40COL),
+    ("inline 34", AUTO_MODE_SETUP_34COL),
+    ("inline 26", AUTO_MODE_SETUP_26COL),
+    ("inline 23", AUTO_MODE_SETUP_23COL),
+    ("inline 22", AUTO_MODE_SETUP_22COL),
+    ("inline 20", AUTO_MODE_SETUP_20COL),
+    ("inline 19", AUTO_MODE_SETUP_19COL),
+    ("inline 17", AUTO_MODE_SETUP_17COL),
+    ("inline 16", AUTO_MODE_SETUP_16COL),
     ("fullscreen", AUTO_MODE_SETUP_FULLSCREEN),
     ("fullscreen 60", AUTO_MODE_SETUP_FULLSCREEN_60COL),
     ("fullscreen 40", AUTO_MODE_SETUP_FULLSCREEN_40COL),
+    ("fullscreen 34", AUTO_MODE_SETUP_FULLSCREEN_34COL),
+    ("fullscreen 26", AUTO_MODE_SETUP_FULLSCREEN_26COL),
+    ("fullscreen 22", AUTO_MODE_SETUP_FULLSCREEN_22COL),
+    ("fullscreen 20", AUTO_MODE_SETUP_FULLSCREEN_20COL),
+    ("fullscreen 19", AUTO_MODE_SETUP_FULLSCREEN_19COL),
+    ("fullscreen 17", AUTO_MODE_SETUP_FULLSCREEN_17COL),
+    ("fullscreen 16", AUTO_MODE_SETUP_FULLSCREEN_16COL),
     ("fullscreen shell", AUTO_MODE_SETUP_FULLSCREEN_SHELL),
     (
         "fullscreen shell mode",
@@ -26,11 +47,68 @@ const ALL: [(&str, &str); 8] = [
     ),
 ];
 
+/// The captures where the footer wraps: onto two rows from 34 columns down to 20, three at 19 and
+/// 17, four at 16.
+const WRAPPED_FOOTER: [(&str, &str); 15] = [
+    ("inline 34", AUTO_MODE_SETUP_34COL),
+    ("inline 26", AUTO_MODE_SETUP_26COL),
+    ("inline 23", AUTO_MODE_SETUP_23COL),
+    ("inline 22", AUTO_MODE_SETUP_22COL),
+    ("inline 20", AUTO_MODE_SETUP_20COL),
+    ("inline 19", AUTO_MODE_SETUP_19COL),
+    ("inline 17", AUTO_MODE_SETUP_17COL),
+    ("inline 16", AUTO_MODE_SETUP_16COL),
+    ("fullscreen 34", AUTO_MODE_SETUP_FULLSCREEN_34COL),
+    ("fullscreen 26", AUTO_MODE_SETUP_FULLSCREEN_26COL),
+    ("fullscreen 22", AUTO_MODE_SETUP_FULLSCREEN_22COL),
+    ("fullscreen 20", AUTO_MODE_SETUP_FULLSCREEN_20COL),
+    ("fullscreen 19", AUTO_MODE_SETUP_FULLSCREEN_19COL),
+    ("fullscreen 17", AUTO_MODE_SETUP_FULLSCREEN_17COL),
+    ("fullscreen 16", AUTO_MODE_SETUP_FULLSCREEN_16COL),
+];
+
+/// The captures where the third answer wraps: onto two rows from 22 columns down to 17, three at
+/// 16.
+const WRAPPED_ANSWER: [(&str, &str); 10] = [
+    ("inline 22", AUTO_MODE_SETUP_22COL),
+    ("inline 20", AUTO_MODE_SETUP_20COL),
+    ("inline 19", AUTO_MODE_SETUP_19COL),
+    ("inline 17", AUTO_MODE_SETUP_17COL),
+    ("inline 16", AUTO_MODE_SETUP_16COL),
+    ("fullscreen 22", AUTO_MODE_SETUP_FULLSCREEN_22COL),
+    ("fullscreen 20", AUTO_MODE_SETUP_FULLSCREEN_20COL),
+    ("fullscreen 19", AUTO_MODE_SETUP_FULLSCREEN_19COL),
+    ("fullscreen 17", AUTO_MODE_SETUP_FULLSCREEN_17COL),
+    ("fullscreen 16", AUTO_MODE_SETUP_FULLSCREEN_16COL),
+];
+
+const FOOTER: &str = "Enter to confirm · Esc to cancel";
+
 /// The title's first row: the whole title, or its first part where a narrow pane wraps it.
 fn title_at(rows: &[String]) -> usize {
     rows.iter()
-        .position(|r| crate::text::trim(r).starts_with("Teach auto mode about your"))
+        .position(|r| crate::text::trim(r).starts_with("Teach auto"))
         .expect("the title row")
+}
+
+/// The footer's first and last rows: one row, or the two to four a narrow pane wraps it to.
+fn footer_at(rows: &[String]) -> (usize, usize) {
+    let first = rows
+        .iter()
+        .rposition(|r| crate::text::trim(r).starts_with("Enter to"))
+        .expect("the footer");
+    let mut joined = String::new();
+    for (last, row) in rows.iter().enumerate().skip(first) {
+        if !joined.is_empty() {
+            joined.push(' ');
+        }
+        joined.push_str(crate::text::trim(row));
+        if joined == FOOTER {
+            return (first, last);
+        }
+        assert!(FOOTER.starts_with(&joined), "the footer's rows: {joined:?}");
+    }
+    panic!("the footer's rows end the screen short of it: {joined:?}");
 }
 
 fn is_offer(rows: &[String]) -> bool {
@@ -101,14 +179,8 @@ fn every_capture_is_read_whole_with_the_focus_on_yes() {
             (Some(2), "Not now"),
             "{name}"
         );
-        assert_eq!(
-            p.span,
-            (
-                title_at(&rows),
-                row_of(&rows, "Enter to confirm · Esc to cancel")
-            ),
-            "{name}"
-        );
+        assert_eq!(p.span, (title_at(&rows), footer_at(&rows).1), "{name}");
+        assert_eq!(p.footer.as_deref(), Some(FOOTER), "{name}");
         assert_eq!(
             crate::prompt::prompt_box_span(&rows),
             Some(p.span),
@@ -277,6 +349,231 @@ fn a_wrapped_title_is_read_joined_and_only_in_its_words() {
         body_further[body] = format!("  {}", rows[body]);
         assert!(!is_offer(&body_further), "{name}: a body row further in");
     }
+}
+
+/// A narrow pane wraps the footer onto two to four rows: it is read joined, in its own words, its
+/// rows together at one column and where Claude Code draws them, the box's span ending on the
+/// last. A wrapped footer that is not the offer's is not the offer.
+#[test]
+fn a_wrapped_footer_is_read_joined_and_only_in_its_words() {
+    for (name, text) in WRAPPED_FOOTER {
+        let rows = screen(text);
+        let (first, last) = footer_at(&rows);
+        assert!(first < last, "{name}: the capture wraps the footer");
+        let p = parse_prompt_v2(&rows).unwrap_or_else(|| panic!("{name}: the offer"));
+        assert_eq!(p.kind, PromptKind::AutoModeSetup, "{name}");
+        assert_eq!(
+            p.span.1, last,
+            "{name}: the box ends on the footer's last row"
+        );
+        let fullscreen = rows[last + 1..].iter().any(|r| !r.trim().is_empty());
+        let at = |row: usize, to: String| -> Vec<String> {
+            let mut out = rows.clone();
+            out[row] = to;
+            out
+        };
+        let reworded = |from: &str, to: &str| -> Vec<String> {
+            let row = (first..=last)
+                .find(|&k| rows[k].contains(from))
+                .unwrap_or_else(|| panic!("{name}: {from:?} in the footer"));
+            at(row, rows[row].replace(from, to))
+        };
+        let without = |row: usize| -> Vec<String> {
+            let mut out = rows.clone();
+            out.remove(row);
+            out
+        };
+        let mut cases: Vec<(String, Vec<String>)> = vec![
+            (
+                "another box's footer, wrapped".to_string(),
+                reworded("confirm", "select"),
+            ),
+            (
+                "the footer's rest in other words".to_string(),
+                reworded("cancel", "go back"),
+            ),
+            ("the footer short its last row".to_string(), without(last)),
+            ("the footer short its first row".to_string(), without(first)),
+        ];
+        for k in first + 1..=last {
+            let mut apart = rows.clone();
+            apart.insert(k, String::new());
+            cases.push((format!("the footer's rows apart over row {k}"), apart));
+            cases.push((
+                format!("the footer's row {k} further in"),
+                at(k, format!("  {}", rows[k])),
+            ));
+            cases.push((
+                format!("the footer's row {k} at the pane's edge"),
+                at(k, rows[k].trim_start().to_string()),
+            ));
+        }
+        if fullscreen {
+            let mut said = rows.clone();
+            said.insert(last + 1, "✻ Cooked for 0s".to_string());
+            cases.push((
+                "a transcript row between the footer and the composer".to_string(),
+                said,
+            ));
+            let mut gap = rows.clone();
+            gap.insert(last + 1, String::new());
+            cases.push((
+                "a blank row between the footer and the composer".to_string(),
+                gap,
+            ));
+        } else {
+            let mut under = rows.clone();
+            under.push("  ⏵⏵ auto mode on".to_string());
+            cases.push(("a row under the footer".to_string(), under));
+        }
+        for (what, edited) in cases {
+            assert!(!is_offer(&edited), "{name}: {what}");
+            let r = crate::reader::read(None, &edited, None);
+            assert_ne!(
+                r.prompt.map(|p| p.kind),
+                Some(PromptKind::AutoModeSetup),
+                "{name}: {what}"
+            );
+        }
+    }
+}
+
+/// The footer drawn on more rows than the pane wraps it to, in a pane wide enough to hold it on
+/// one or in a narrow one, is no wrap Claude Code draws, and the box over it is not the offer;
+/// nor is a narrow pane's box quoted in the transcript, above a turn's end.
+#[test]
+fn a_footer_drawn_on_rows_that_are_no_wrap_is_not_the_offer() {
+    let split = |rows: &[String], into: &[&str]| -> Vec<String> {
+        let (first, last) = footer_at(rows);
+        let mut out = rows.to_vec();
+        out.splice(first..=last, into.iter().map(|r| (*r).to_string()));
+        out
+    };
+    for (name, text) in [
+        ("inline", AUTO_MODE_SETUP),
+        ("inline 40", AUTO_MODE_SETUP_40COL),
+        ("fullscreen", AUTO_MODE_SETUP_FULLSCREEN),
+        ("fullscreen 40", AUTO_MODE_SETUP_FULLSCREEN_40COL),
+    ] {
+        let rows = screen(text);
+        assert!(is_offer(&rows), "{name}: the screen the controls edit");
+        for into in [
+            &["  Enter to confirm · Esc to", "  cancel"][..],
+            &["  Enter to confirm", "  · Esc to", "  cancel"],
+            &["  Enter to", "  confirm ·", "  Esc to", "  cancel"],
+        ] {
+            assert!(
+                !is_offer(&split(&rows, into)),
+                "{name}: the footer split onto {} rows where it fits",
+                into.len()
+            );
+        }
+    }
+    for (name, text) in [
+        ("inline 26", AUTO_MODE_SETUP_26COL),
+        ("inline 19", AUTO_MODE_SETUP_19COL),
+        ("fullscreen 26", AUTO_MODE_SETUP_FULLSCREEN_26COL),
+        ("fullscreen 19", AUTO_MODE_SETUP_FULLSCREEN_19COL),
+    ] {
+        let rows = screen(text);
+        assert!(is_offer(&rows), "{name}: the screen the control edits");
+        let into = ["  Enter to", "  confirm ·", "  Esc to", "  cancel"];
+        assert!(
+            !is_offer(&split(&rows, &into)),
+            "{name}: the footer split onto more rows than the pane wraps it to"
+        );
+    }
+    let full = screen(AUTO_MODE_SETUP_FULLSCREEN_34COL);
+    let rule = title_at(&full) - 1;
+    let (_, last) = footer_at(&full);
+    let mut quoted: Vec<String> = full[..rule].to_vec();
+    quoted.extend(full[rule..=last].iter().cloned());
+    quoted.push(String::new());
+    quoted.push("✻ Cooked for 0s".to_string());
+    quoted.push(String::new());
+    quoted.extend(full[last + 1..].iter().cloned());
+    assert!(
+        !is_offer(&quoted),
+        "the narrow box's rows above a turn's end"
+    );
+}
+
+/// A pane 22 columns wide or narrower wraps the third answer's label to its column, onto two rows
+/// or (at 16) three: it is read joined, and only in its words, its rows together at that column.
+#[test]
+fn a_wrapped_answer_is_read_joined_and_only_in_its_words() {
+    for (name, text) in WRAPPED_ANSWER {
+        let rows = screen(text);
+        let third = rows
+            .iter()
+            .position(|r| crate::text::trim(r).starts_with("3. Don't"))
+            .unwrap_or_else(|| panic!("{name}: the third answer"));
+        let end = (third + 1..rows.len())
+            .find(|&k| crate::text::trim(&rows[k]).is_empty())
+            .unwrap_or_else(|| panic!("{name}: the blank row under the answers"));
+        let rest = third + 1..end;
+        assert!(!rest.is_empty(), "{name}: the capture wraps it");
+        assert!(
+            rest.clone()
+                .all(|k| crate::phase::leading_spaces(&rows[k]) == 7),
+            "{name}: at the label's column"
+        );
+        let p = parse_prompt_v2(&rows).unwrap_or_else(|| panic!("{name}: the offer"));
+        assert_eq!(
+            (p.options[2].label.as_str(), p.options[2].row),
+            ("Don't show again", third),
+            "{name}"
+        );
+        let at = |row: usize, to: String| -> Vec<String> {
+            let mut out = rows.clone();
+            out[row] = to;
+            out
+        };
+        let mut cases: Vec<(String, Vec<String>)> = vec![(
+            "its rest in other words".to_string(),
+            at(end - 1, format!("{} later", rows[end - 1])),
+        )];
+        for k in rest {
+            let drawn = crate::text::trim(&rows[k]);
+            cases.push((
+                format!("its row {k} further in"),
+                at(k, format!("        {drawn}")),
+            ));
+            cases.push((
+                format!("its row {k} at the digit's column"),
+                at(k, format!("    {drawn}")),
+            ));
+            let mut apart = rows.clone();
+            apart.insert(k, String::new());
+            cases.push((format!("its rows apart over row {k}"), apart));
+        }
+        for (what, edited) in cases {
+            assert!(!is_offer(&edited), "{name}: {what}");
+        }
+    }
+    let whole = screen(AUTO_MODE_SETUP_23COL);
+    assert_eq!(
+        whole[row_of(&whole, "3. Don't show again")]
+            .trim_end()
+            .len(),
+        23,
+        "at 23 columns the third answer runs whole to the pane's edge"
+    );
+    let rows = screen(AUTO_MODE_SETUP);
+    let third = row_of(&rows, "3. Don't show again");
+    let mut split = rows.clone();
+    split[third] = "    3. Don't show".to_string();
+    split.insert(third + 1, "       again".to_string());
+    assert!(!is_offer(&split), "the third answer split where it fits");
+    let rows = screen(AUTO_MODE_SETUP_19COL);
+    let third = row_of(&rows, "3. Don't show");
+    let mut more = rows.clone();
+    more[third] = "    3. Don't".to_string();
+    more.insert(third + 1, "       show".to_string());
+    assert!(
+        !is_offer(&more),
+        "the third answer split onto more rows than the pane wraps it to"
+    );
 }
 
 /// Over a shell-mode composer (`!` typed during the turn) the offer sits right on that composer's

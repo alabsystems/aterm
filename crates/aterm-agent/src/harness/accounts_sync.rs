@@ -4933,15 +4933,16 @@ pub(super) fn needed_renew_candidates_for(
 
 /// THE ROWS AN UPKEEP SIGNS IN for `cli`'s pool, best first, each with its tier, every pass and
 /// by default: every row with an email that has no login it can be run on here (not enrolled,
-/// or signed out) is one, whether or not any session needs it yet. Tier 0, the rows that would
+/// or signed out) is one, whether or not any session needs it yet. Tier 0, first every row a
+/// session runs on whose login is signed out, whatever else is ready, then the rows that would
 /// carry a session whose account is walled, low, signed out or already warned that a window is
 /// filling (Claude Code's first warning, well before the account is low), where no other row is
 /// ready to take it; tier 1, the enrolled logins due for renewal or ended; tier 2, every other
 /// row to sign in; tier 3, the rows to sign in that are themselves walled, ready once their wall
-/// ends. Within a tier, roster order (dedicated rows first in tiers 0, 2 and 3), a row with an
-/// unaddressed sign-in task after every row without one and the older task first (read through
-/// `store` where one is given, else from `logins` alone), a row whose last renewal answered
-/// another account last.
+/// ends. Within a tier, the signed-out rows sessions run on first, then roster order (dedicated
+/// rows first in tiers 0, 2 and 3), a row with an unaddressed sign-in task after every row without
+/// one and the older task first (read through `store` where one is given, else from `logins`
+/// alone), a row whose last renewal answered another account last.
 fn auto_renew_candidates_tiered(
     cli: Cli,
     store: Option<&accounts::Store>,
@@ -4994,6 +4995,32 @@ fn auto_renew_candidates_tiered(
             .any(|s| is_walled_or_low(&s.account));
     let mut tiered: Vec<(u8, accounts::Row)> = Vec::new();
     let mut seen = BTreeSet::new();
+    // A ROW A SESSION RUNS ON WHOSE LOGIN IS SIGNED OUT comes first, whatever else is ready, and
+    // ahead of every other row of tier 0 whatever its sign-in task or wrong account says
+    // (`waited_on`, the sort's second key): that session's lost login follows only its own row
+    // (`accounts::Point::LoginEnded`), and its supervisor waits on this sign-in rather than
+    // typing `/login` in its tab.
+    let mut waited_on = BTreeSet::new();
+    for row in roster
+        .rows
+        .iter()
+        .filter(|r| r.class == Class::Dedicated)
+        .chain(roster.rows.iter().filter(|r| r.class == Class::Shared))
+        .filter(|row| {
+            state.sessions.values().any(|s| s.account == row.label)
+                && wants_sign_in(row)
+                && !is_limited(&row.label)
+                && state
+                    .accounts
+                    .get(&row.label)
+                    .is_some_and(|a| a.auth == accounts::Auth::SignedOut)
+        })
+    {
+        if seen.insert(row.label.clone()) {
+            waited_on.insert(row.label.clone());
+            tiered.push((0, row.clone()));
+        }
+    }
     if any_walled {
         let wall_point = accounts::Point::Wall {
             window: String::new(),
@@ -5064,6 +5091,7 @@ fn auto_renew_candidates_tiered(
         };
         (
             *tier,
+            !waited_on.contains(&row.label),
             task_at,
             logins.get(&row.label).and_then(|b| b.wrong_at),
         )
@@ -11478,6 +11506,112 @@ totp = "JBSWY3DPEHPK3PXP"
         assert_eq!(
             warned_first,
             vec!["m27-3".to_owned(), "m27-2".to_owned(), "m27".to_owned()]
+        );
+    }
+
+    /// A session whose own row signed out waits on that row's sign-in (its lost login follows
+    /// only its own row), so the row is signed in first, ahead of another signed-out row before it
+    /// in the roster and even where another row is ready to run now; a signed-out row no session
+    /// runs on keeps its place among the ended logins.
+    #[test]
+    fn a_signed_out_row_a_session_runs_on_is_signed_in_first() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let made = |name: &str| {
+            let at = dir.path().join(name);
+            fs::create_dir_all(&at).unwrap();
+            fs::write(at.join(".claude.json"), "{}").unwrap();
+            at.display().to_string()
+        };
+        let empty = dir.path().join("m2-3-empty");
+        fs::create_dir_all(&empty).unwrap();
+        let row = |label: &str, dir: Option<String>| accounts::Row {
+            label: label.to_owned(),
+            dir,
+            email: Some(format!("{label}@example.test")),
+            class: Class::Dedicated,
+            ..accounts::Row::default()
+        };
+        let roster = Roster {
+            rows: vec![
+                row("m2", None),
+                row("m2-3", Some(empty.display().to_string())),
+                row("m2-4", Some(made("m2-4"))),
+                row("m2-1", Some(made("m2-1"))),
+                row("m2-2", Some(made("m2-2"))),
+            ],
+        };
+        let now = UPKEEP_NOW;
+        let mut state = accounts::State {
+            active: Some("m2".to_owned()),
+            proven: true,
+            ..accounts::State::default()
+        };
+        for label in ["m2-1", "m2-2"] {
+            let _ = accounts::note_auth(&mut state, label, accounts::Auth::SignedOut, now - 60);
+        }
+        let logins = accounts::Logins::default();
+        let order = |state: &accounts::State| -> Vec<String> {
+            auto_renew_candidates_tiered(Cli::Claude, None, &roster, state, &logins, now)
+                .into_iter()
+                .map(|(tier, row)| format!("{tier}:{}", row.label))
+                .collect()
+        };
+        assert_eq!(
+            order(&state),
+            ["1:m2-1", "1:m2-2", "2:m2-3"],
+            "the control: no session runs on m2-2, and m2-4 is ready, so nothing is tier 0"
+        );
+        let mut running = state.clone();
+        running.sessions.insert(
+            "s-1".to_owned(),
+            accounts::SessionRow {
+                account: "m2-2".to_owned(),
+                at: now - 30,
+                held: None,
+            },
+        );
+        assert_eq!(
+            order(&running),
+            ["0:m2-2", "1:m2-1", "2:m2-3"],
+            "the session's own signed-out row goes first, though m2-4 is ready"
+        );
+        let mut back = running.clone();
+        let _ = accounts::note_auth(&mut back, "m2-2", accounts::Auth::Ok, now - 10);
+        assert_eq!(
+            order(&back),
+            ["1:m2-1", "2:m2-3"],
+            "a row signed in again is no candidate"
+        );
+        // With no other row ready, the walled session's successors are tier 0 too, and its own
+        // row still goes first though its last renewal answered another account; another row's
+        // wrong account still sorts it last (the control).
+        let unready = Roster {
+            rows: roster
+                .rows
+                .iter()
+                .filter(|row| row.label != "m2-4")
+                .cloned()
+                .collect(),
+        };
+        let order_of = |logins: &accounts::Logins| -> Vec<String> {
+            auto_renew_candidates_tiered(Cli::Claude, None, &unready, &running, logins, now)
+                .into_iter()
+                .map(|(tier, row)| format!("{tier}:{}", row.label))
+                .collect()
+        };
+        let mut wrong = accounts::Logins::default();
+        let _ = accounts::note_wrong_account(&mut wrong, "m2-2", now - 20);
+        assert_eq!(
+            order_of(&wrong),
+            ["0:m2-2", "0:m2-3", "0:m2-1"],
+            "the session's own row first, its wrong account notwithstanding"
+        );
+        let mut wrong = accounts::Logins::default();
+        let _ = accounts::note_wrong_account(&mut wrong, "m2-3", now - 20);
+        assert_eq!(
+            order_of(&wrong),
+            ["0:m2-2", "0:m2-1", "0:m2-3"],
+            "the control: another row's wrong account sorts it last"
         );
     }
 

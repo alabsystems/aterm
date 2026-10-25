@@ -126,7 +126,7 @@ const MAX_PET_EYE_PATHS: usize = 8;
 struct PetEyeMeta {
     paths: &'static [&'static [PathSeg]],
     bounds: [Option<(f32, f32, f32, f32)>; MAX_PET_EYE_PATHS],
-    max_w: f32,
+    ratios: [f32; MAX_PET_EYE_PATHS],
     near_cx: f32,
 }
 
@@ -143,6 +143,7 @@ impl PetEyeMeta {
         }
         let mut paths: &'static [&'static [PathSeg]] = &[];
         let mut bounds = [None; MAX_PET_EYE_PATHS];
+        let mut ratios = [1.0_f32; MAX_PET_EYE_PATHS];
         let mut max_w = 0.0_f32;
         let mut near_cx = 0.5_f32;
         let mut best_w: Option<f32> = None;
@@ -170,11 +171,20 @@ impl PetEyeMeta {
                 }
                 p += 1;
             }
+            if max_w > 0.0 {
+                let mut p = 0;
+                while p < count {
+                    if let Some((x0, _, x1, _)) = bounds[p] {
+                        ratios[p] = (x1 - x0) / max_w;
+                    }
+                    p += 1;
+                }
+            }
         }
         Self {
             paths,
             bounds,
-            max_w,
+            ratios,
             near_cx,
         }
     }
@@ -184,7 +194,7 @@ static PET_EYE_META: [PetEyeMeta; PET_GLYPHS.len()] = {
     let mut meta = [PetEyeMeta {
         paths: &[],
         bounds: [None; MAX_PET_EYE_PATHS],
-        max_w: 0.0,
+        ratios: [1.0; MAX_PET_EYE_PATHS],
         near_cx: 0.5,
     }; PET_GLYPHS.len()];
     let mut i = 0;
@@ -209,25 +219,22 @@ fn paint_eye_dots(
     eye_mask: &mut Option<Tile>,
 ) {
     let bounds = &eye_meta.bounds[..eye_meta.paths.len()];
-    let max_w = eye_meta.max_w;
+    let ratios = &eye_meta.ratios[..eye_meta.paths.len()];
     let near_cx = eye_meta.near_cx;
-    let ratio = |x0: f32, x1: f32| {
-        if max_w > 0.0 { (x1 - x0) / max_w } else { 1.0 }
-    };
     let min_gap = EYE_DOT_GAP_PX / xform.scale_x.max(1.0);
     let core_min_w_px = EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y;
     let sx_eps = xform.scale_x.max(f32::EPSILON);
     let sy_eps = xform.scale_y.max(f32::EPSILON);
-    let fx = |v: f32| {
-        (v * f32::from(FIXED_ONE))
+    const fn fx(v: f32) -> u16 {
+        (v * (FIXED_ONE as f32))
             .round()
-            .clamp(0.0, f32::from(FIXED_ONE)) as u16
-    };
+            .clamp(0.0, FIXED_ONE as f32) as u16
+    }
     for (i, path) in eye_meta.paths.iter().enumerate() {
         let Some((x0, y0, x1, y1)) = bounds[i] else {
             continue;
         };
-        let r_i = ratio(x0, x1);
+        let r_i = ratios[i];
         if r_i < EYE_DOT_FAR_OCCLUDED_RATIO {
             continue;
         }
@@ -256,7 +263,7 @@ fn paint_eye_dots(
             let Some(&(ox0, _, ox1, _)) = other.as_ref() else {
                 continue;
             };
-            if j == i || ratio(ox0, ox1) < EYE_DOT_FAR_OCCLUDED_RATIO {
+            if j == i || ratios[j] < EYE_DOT_FAR_OCCLUDED_RATIO {
                 continue;
             }
             let gap = (ox0 - x1).max(x0 - ox1);
@@ -688,8 +695,17 @@ impl PetBaker {
     #[inline]
     #[must_use]
     pub const fn aspect(pose: PetGlyphId) -> f32 {
-        let a = (PET_GLYPHS[pose as usize].aspect_x1000 as f32) / 1000.0;
-        if a > 0.001 { a } else { 0.001 }
+        const POSE_ASPECTS: [f32; PET_GLYPHS.len()] = {
+            let mut out = [0.0f32; PET_GLYPHS.len()];
+            let mut i = 0;
+            while i < PET_GLYPHS.len() {
+                let a = (PET_GLYPHS[i].aspect_x1000 as f32) / 1000.0;
+                out[i] = if a > 0.001 { a } else { 0.001 };
+                i += 1;
+            }
+            out
+        };
+        POSE_ASPECTS[pose as usize]
     }
 }
 

@@ -58,7 +58,15 @@ fn the_moon_is_a_crescent() {
     let g = retina_geom();
     let (cx, cy, r) = (100.5f32, 60.5f32, 8.0f32);
     let mut dark = Vec::new();
-    push_crescent(&mut dark, g, (cx, cy), r, 0x00E6_E6F2, 200, false);
+    push_crescent(
+        &mut dark,
+        g,
+        (cx, cy),
+        r,
+        0x00E6_E6F2,
+        200,
+        CrescentInk::Add,
+    );
     let lit = covered(&dark);
     let at = |dx: f32, dy: f32| lit.contains(&((cx + dx * r) as i32, (cy + dy * r) as i32));
     assert!(
@@ -94,13 +102,90 @@ fn the_moon_is_a_crescent() {
         "one pixel row a quad, additive on dark"
     );
     let mut light = Vec::new();
-    push_crescent(&mut light, g, (cx, cy), r, 0x0043_4347, 180, true);
+    push_crescent(
+        &mut light,
+        g,
+        (cx, cy),
+        r,
+        0x0043_4347,
+        180,
+        CrescentInk::Over,
+    );
     assert_eq!(
         covered(&light),
         lit,
         "the light moon has the dark one's footprint"
     );
     assert!(light.iter().all(|q| q.alpha > 0), "source-over on light");
+}
+
+/// looks7 round 3, SPARKLE'S GOLD ON A TINTED PAGE: added to Solarized Dark's teal
+/// `#002b36`, the page's own green and blue turned the gold moons olive and sage (`#cbc165`,
+/// `#4b6348`, hue 113). Laid over a tinted dark page by [`page_matched`], at every coverage
+/// from a quarter up the moon's gold reads within eight degrees of the hue it reads added to
+/// the reference dark page, no brighter than it lays added to the tinted page, and a full
+/// moon reads as on the reference page. The reference page itself, and a grey one, are not tinted: the
+/// moon is added there as before. Negative control: added to the teal page, a moon at half
+/// its light reads more than twenty degrees off its gold.
+#[test]
+fn sparkle_s_gold_reads_gold_on_a_tinted_page() {
+    use crate::color_math::{relative_luminance, rgb2hsv};
+    const TEAL: u32 = 0x0000_2B36;
+    const REF: u32 = 0x0011_1318;
+    const GOLD: u32 = CursorGlow::MOON_GOLD;
+    let ch = |c: u32, sh: u32| (c >> sh) & 0xff;
+    let add = |page: u32, a: u32| {
+        let c = |sh: u32| (ch(page, sh) + ch(GOLD, sh) * a / 255).min(255);
+        (c(16) << 16) | (c(8) << 8) | c(0)
+    };
+    let over = |page: u32, (premul, alpha): (u32, u8)| {
+        let c = |sh: u32| (ch(page, sh) * (255 - u32::from(alpha)) / 255 + ch(premul, sh)).min(255);
+        (c(16) << 16) | (c(8) << 8) | c(0)
+    };
+    let hue_gap = |a: u32, b: u32| {
+        let d = (rgb2hsv(a).0 - rgb2hsv(b).0).abs();
+        d.min(360.0 - d)
+    };
+    assert_eq!(tinted_dark_page(TEAL), Some(TEAL));
+    assert_eq!(
+        tinted_dark_page(REF),
+        None,
+        "the reference page is not tinted"
+    );
+    assert_eq!(
+        tinted_dark_page(0x0020_2020),
+        None,
+        "a grey page is not tinted"
+    );
+    for a in (64..=255u32).step_by(8) {
+        let laid = over(TEAL, page_matched(GOLD, a as u8, TEAL));
+        let reference = add(REF, a);
+        let gap = hue_gap(laid, reference);
+        assert!(
+            gap <= 8.0,
+            "at {a}: the moon reads {laid:06x}, {gap:.1} degrees off its {reference:06x} on the reference page"
+        );
+        assert!(
+            relative_luminance(laid) <= relative_luminance(add(TEAL, a)) + 0.01,
+            "at {a}: the moon lays more light than added: {laid:06x}"
+        );
+    }
+    let full = over(TEAL, page_matched(GOLD, 255, TEAL));
+    let near = |a: u32, b: u32| {
+        [16, 8, 0]
+            .iter()
+            .all(|&sh| ch(a, sh).abs_diff(ch(b, sh)) <= 2)
+    };
+    assert!(
+        near(full, add(REF, 255)),
+        "a full moon reads {full:06x}, not its {:06x} on the reference page",
+        add(REF, 255)
+    );
+    let added = add(TEAL, 128);
+    assert!(
+        hue_gap(added, add(REF, 128)) > 20.0,
+        "control: added to the teal page, the half moon reads {added:06x}"
+    );
 }
 
 #[test]
@@ -537,12 +622,19 @@ fn the_shower_and_the_stardust_keep_off_the_lines_an_enter_printed() {
     let g = geom();
     let at = Instant::now();
     let line = "the quick brown fox";
-    let cells_of = |text: &str| -> Vec<RenderCell> {
+    // Each cell on its page's ground: a dark ground on paper is a filled
+    // cell (a powerline bar), which no sparkle stands on.
+    let cells_of = |text: &str, dark: bool| -> Vec<RenderCell> {
+        let (fg, bg) = if dark {
+            ([0xD0, 0xD0, 0xD0], [0x11, 0x13, 0x18])
+        } else {
+            ([0x1F, 0x23, 0x28], [0xFF, 0xFF, 0xFF])
+        };
         (0..g.cols)
             .map(|i| RenderCell {
                 ch: text.chars().nth(i).unwrap_or(' '),
-                fg: [0xD0, 0xD0, 0xD0],
-                bg: [0x11, 0x13, 0x18],
+                fg,
+                bg,
                 ..Default::default()
             })
             .collect()
@@ -552,13 +644,15 @@ fn the_shower_and_the_stardust_keep_off_the_lines_an_enter_printed() {
             .map(|i| text.chars().nth(i).unwrap_or(' '))
             .collect()
     };
-    let cells: Vec<Vec<RenderCell>> = (0..g.rows)
-        .map(|r| match r {
-            3 | 4 => cells_of(line),
-            5 => cells_of("$"),
-            _ => cells_of(""),
-        })
-        .collect();
+    let cells = |dark: bool| -> Vec<Vec<RenderCell>> {
+        (0..g.rows)
+            .map(|r| match r {
+                3 | 4 => cells_of(line, dark),
+                5 => cells_of("$", dark),
+                _ => cells_of("", dark),
+            })
+            .collect()
+    };
     let draws = |style: GlowStyle, dark: bool, (x, y): (f32, f32), seed: u32| {
         let mut c = cfg(style, true);
         if !dark {
@@ -568,7 +662,7 @@ fn the_shower_and_the_stardust_keep_off_the_lines_an_enter_printed() {
         let mut glow = CursorGlow::default();
         glow.observe_row(5, 2, &chars_of("$"), at);
         glow.observe_neighbor_rows(Some(&chars_of(line)), None);
-        glow.observe_frame_text(Some((5, 2)), &cells, at);
+        glow.observe_frame_text(Some((5, 2)), &cells(dark), at);
         let mut out = Vec::new();
         glow.tick(Some((5, 2)), at, &c, g, &mut out);
         glow.particles.clear();

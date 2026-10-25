@@ -9,8 +9,7 @@ use std::path::{Path, PathBuf};
 
 macro_rules! stderr_line {
     ($($arg:tt)*) => {{
-        use ::std::io::Write as _;
-        let _ = ::std::writeln!(::std::io::stderr().lock(), $($arg)*);
+        let _ = ::aterm_uds::stdout::stderr_line(::std::format_args!($($arg)*));
     }};
 }
 use std::collections::VecDeque;

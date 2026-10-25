@@ -1211,7 +1211,8 @@ fn the_rail_selects_the_themes_row_under_appearance() {
     assert!(
         compiled
             .semantic(&UiKey::new("settings/nav/themes"))
-            .is_none()
+            .is_some_and(|node| !selected(node)),
+        "the row stays on the rail, unselected"
     );
     assert!(
         compiled
@@ -4681,6 +4682,328 @@ fn the_strip_never_moves() {
     }
 }
 
+/// The words the strip's line 1 paints, its lines joined by a space where
+/// the name wraps.
+fn strip_title_text(compiled: &crate::native_ui::CompiledUi) -> String {
+    const TITLE: &str = "settings/showcase/status/title";
+    compiled
+        .paint
+        .iter()
+        .filter(|node| {
+            node.key.as_str() == TITLE
+                || node
+                    .key
+                    .as_str()
+                    .strip_prefix(TITLE)
+                    .is_some_and(|rest| rest.starts_with("/line-"))
+        })
+        .filter_map(|node| match &node.content {
+            crate::native_ui::UiContent::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// THE STRIP SAYS EACH FACT ONCE, IN ONE SENTENCE AT EVERY WIDTH: in every
+/// state — idle, idle under custom colors, trying, trying for one side of
+/// the Follow system pair, trying a Community theme, trying a theme that
+/// sets type, keeping, a refused Keep — the Status's label is the same in a
+/// strip too narrow for line 2 as in one that paints it, says each of "was
+/// …", the side, the custom colors and an error at most once, and holds
+/// every fact line 2 paints. ("Trying Linen, was Default; was Default" at
+/// 80x24, the facts of line 2 added to a sentence that said them; beside a
+/// line 2, "Keeping Nord" without its "was …" and a Community theme never
+/// said so.) Negative control: the narrow strip paints no line 2 and the wide
+/// one does, so both forms are measured.
+#[test]
+fn the_strip_says_each_fact_once_at_every_width() {
+    let mut narrow_cx = view_cx_at(584.0, 420.0);
+    narrow_cx.motion.system_dark = true;
+    let mut wide_cx = view_cx_at(1_284.0, 714.0);
+    wide_cx.motion.system_dark = true;
+    let sizes = [("narrow", narrow_cx), ("wide", wide_cx)];
+    let try_theme = |runtime: &mut NativeRuntime, instance, view, id: &str| {
+        let card = card_action(runtime, view, id);
+        let _ = act(runtime, instance, view, &card, None);
+    };
+    type Setup = Box<
+        dyn Fn() -> (
+            VersionedConfigService,
+            NativeRuntime,
+            crate::native_app::AppInstanceId,
+            crate::native_app::ViewId,
+        ),
+    >;
+    let states: Vec<(&str, Setup)> = vec![
+        ("idle", Box::new(|| themes_view("theme = \"Dracula\"\n"))),
+        (
+            "idle with custom colors",
+            Box::new(|| themes_view("theme = \"Dracula\"\nforeground = \"#fafafa\"\n")),
+        ),
+        (
+            "trying",
+            Box::new(move || {
+                let (service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+                try_theme(&mut runtime, instance, view, "Nord");
+                (service, runtime, instance, view)
+            }),
+        ),
+        (
+            "trying under custom colors",
+            Box::new(move || {
+                let (service, mut runtime, instance, view) =
+                    themes_view("theme = \"Dracula\"\nforeground = \"#fafafa\"\n");
+                try_theme(&mut runtime, instance, view, "Linen");
+                (service, runtime, instance, view)
+            }),
+        ),
+        (
+            "trying for a side",
+            Box::new(move || {
+                let (service, mut runtime, instance, view) =
+                    themes_view("theme = \"dark:Default,light:Solarized Light\"\n");
+                try_theme(&mut runtime, instance, view, "Linen");
+                (service, runtime, instance, view)
+            }),
+        ),
+        (
+            "trying a Community theme",
+            Box::new(move || {
+                let (service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+                try_theme(&mut runtime, instance, view, "Iceberg Light");
+                (service, runtime, instance, view)
+            }),
+        ),
+        (
+            "trying type",
+            Box::new(move || {
+                let (service, mut runtime, instance, view) =
+                    typography_view("theme = \"Dracula\"\n", studio_catalog(STUDIO_TYPE));
+                try_theme(&mut runtime, instance, view, "Studio");
+                (service, runtime, instance, view)
+            }),
+        ),
+        (
+            "keeping",
+            Box::new(move || {
+                let (service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+                try_theme(&mut runtime, instance, view, "Nord");
+                let _ = act(&mut runtime, instance, view, "settings/showcase/keep", None);
+                (service, runtime, instance, view)
+            }),
+        ),
+        (
+            "refused",
+            Box::new(move || {
+                let (service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+                try_theme(&mut runtime, instance, view, "Nord");
+                let kept = act(&mut runtime, instance, view, "settings/showcase/keep", None);
+                let (_, operation) = config_patches(&kept)[0].clone();
+                let _ = dispatch(
+                    &mut runtime,
+                    instance,
+                    view,
+                    AppEvent::ConfigPatchFinished {
+                        operation,
+                        outcome: ConfigPatchOutcome::Rejected {
+                            message: "the file changed under the write".to_string(),
+                        },
+                    },
+                );
+                (service, runtime, instance, view)
+            }),
+        ),
+    ];
+    let mut forms = std::collections::BTreeSet::new();
+    for (name, setup) in &states {
+        let mut labels = Vec::new();
+        for (size, cx) in &sizes {
+            let (_service, mut runtime, instance, view) = setup();
+            {
+                let Some(AppViewState::Settings(shown)) = runtime.view_state_mut(view) else {
+                    unreachable!()
+                };
+                shown.presented_motion.set(cx.motion);
+            }
+            list_at_top(&mut runtime, view);
+            let compiled = compile_settings_view(&runtime, instance, view, cx);
+            let label = compiled
+                .semantic(&UiKey::new(STATUS))
+                .map(|node| node.label.clone())
+                .unwrap_or_else(|| panic!("{name} {size}: the strip"));
+            let context = format!("{name} {size}: {label:?}");
+            for clause in ["was ", "for Light", "for Dark", "custom color", "Community"] {
+                assert!(
+                    label.matches(clause).count() <= 1,
+                    "{context} says {clause:?} twice"
+                );
+            }
+            if let Some(error) = state(&runtime, view).showcase.error.as_deref() {
+                assert_eq!(label.matches(error).count(), 1, "{context}: {error}");
+            }
+            let detail = compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == "settings/showcase/status/detail")
+                .and_then(|node| match &node.content {
+                    crate::native_ui::UiContent::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                });
+            forms.insert((*size, detail.is_some()));
+            for fact in detail.iter().flat_map(|line| line.split(" \u{b7} ")) {
+                if !fact.ends_with('\u{2026}') {
+                    assert!(label.contains(fact), "{context} never says {fact:?}");
+                }
+            }
+            let title = strip_title_text(&compiled);
+            let name_words = title.split("  Aa ").next().unwrap_or_default();
+            for word in name_words.split_whitespace() {
+                assert!(
+                    label.contains(word.trim_end_matches('\u{2026}')),
+                    "{context} never says {word:?}"
+                );
+            }
+            labels.push(label);
+        }
+        assert_eq!(labels[0], labels[1], "{name}: one sentence at every width");
+    }
+    assert!(
+        !forms.contains(&("narrow", true)) && forms.contains(&("wide", true)),
+        "premise: the narrow strip hides line 2 and the wide one paints it: {forms:?}"
+    );
+}
+
+/// A TRIED THEME'S NAME IS WHOLE: beside the buttons it takes a second line
+/// where it needs one, and in a strip too narrow for that it takes the
+/// strip's width on lines of its own, wrapped, never "GitHub…" (the word
+/// every GitHub theme shares), "Catppu…" or "GitHub Dark…" for GitHub Dark
+/// High Contrast. At every width and text size, trying each theme the page
+/// lists paints its whole name — every theme aterm ships even in a
+/// 22-column window at 2× text, every pack theme from 30 columns; narrower,
+/// a pack name that takes more than the strip's three lines keeps its first
+/// lines whole and cuts its last — and moving from one to another never
+/// changes the strip's height. Negative control: the narrowest strips at 2×
+/// take a name on three lines, so the wrapped form is measured.
+#[test]
+fn a_tried_themes_name_is_whole() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "tried names", |scale| {
+        let mut most = 0;
+        for width in [178.0, 206.0, 262.0, 318.0, 444.0, 584.0, 1_284.0] {
+            let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+            let cx = view_cx_at(width, 600.0);
+            let cards: Vec<(String, String, bool)> = state(&runtime, view)
+                .showcase
+                .cards
+                .iter()
+                // The theme in use is no trial: its row reverts.
+                .filter(|card| card.id != "Dracula")
+                .map(|card| {
+                    (
+                        card.id.clone(),
+                        card.label.clone(),
+                        card.section == Section::Community,
+                    )
+                })
+                .collect();
+            let mut heights = std::collections::BTreeSet::new();
+            for (id, label, pack) in cards {
+                let row = card_action(&runtime, view, &id);
+                let _ = act(&mut runtime, instance, view, &row, None);
+                list_at_top(&mut runtime, view);
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!()
+                    };
+                    state.common.last_focus = None;
+                }
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let title = strip_title_text(&compiled);
+                let squeeze = |text: &str| text.replace([' ', '-'], "");
+                let context = format!("{width} at {scale}×: {label} painted {title:?}");
+                if pack && width < 206.0 && !squeeze(&title).starts_with(&squeeze(&label)) {
+                    let first = label.split_whitespace().next().unwrap_or_default();
+                    assert!(
+                        title.starts_with(first) && title.ends_with('\u{2026}'),
+                        "{context}"
+                    );
+                } else {
+                    assert!(squeeze(&title).starts_with(&squeeze(&label)), "{context}");
+                }
+                most = most.max(
+                    (0..)
+                        .take_while(|line| {
+                            compiled.paint.iter().any(|node| {
+                                node.key.as_str()
+                                    == format!("settings/showcase/status/title/line-{line}")
+                            })
+                        })
+                        .count(),
+                );
+                heights.insert(rect_of(&compiled, STATUS).height.to_bits());
+            }
+            assert_eq!(
+                heights.len(),
+                1,
+                "{width} at {scale}×: one tried theme to another keeps the strip's height"
+            );
+        }
+        if scale >= 2.0 {
+            assert_eq!(most, 3, "premise: a name takes three lines at {scale}×");
+        }
+    });
+}
+
+/// THE FIRST SCREEN IS NEVER ONE ROW OF DEMO OVER A BLANK: where the strip leads a narrow list,
+/// the demo leaves its first stop (the tried theme's name over the first line of its buttons) a
+/// place on the first screen where that holds, and where even one row of demo leaves it none,
+/// the demo takes the screen. (Sized against the whole strip, the demo kept one row at 22x24 at
+/// 2x and the screen under it stood blank.) Negative control: at 1x the strip's first stop shares
+/// the first screen with the demo.
+#[test]
+fn the_first_screen_is_never_one_demo_row_over_a_blank() {
+    for (scale, shares) in [(2.0, false), (1.0, true)] {
+        at_each_text_scale(&[scale], "lead demo", |_| {
+            let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+            let card = card_action(&runtime, view, "GitHub Light");
+            let _ = act(&mut runtime, instance, view, &card, None);
+            list_at_top(&mut runtime, view);
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!()
+                };
+                state.common.last_focus = None;
+            }
+            let compiled =
+                compile_settings_view(&runtime, instance, view, &view_cx_at(178.0, 348.0));
+            let list = compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == "settings/showcase/list")
+                .expect("the list")
+                .clip;
+            let stage = rect_of(&compiled, STAGE);
+            let title_shown = compiled.paint.iter().any(|node| {
+                node.key
+                    .as_str()
+                    .starts_with("settings/showcase/status/title")
+                    && node.clip.height > 0.0
+                    && node.rect.bottom() <= list.bottom() + 0.5
+            });
+            let blank = list.bottom() - stage.bottom();
+            assert_eq!(
+                title_shown, shares,
+                "{scale}x: the strip's name on the first screen"
+            );
+            assert!(
+                title_shown || blank < stage.height,
+                "{scale}x: {blank}pt blank under a demo {}pt tall",
+                stage.height
+            );
+        });
+    }
+}
+
 #[test]
 fn the_list_does_not_move_on_a_trial() {
     for width in SHAPES {
@@ -6541,15 +6864,7 @@ fn the_strip_draws_its_title_and_every_button_whole() {
                 }
                 let compiled = compile_settings_view(&runtime, instance, view, &cx);
                 let context = format!("{width} at {scale}× {step}");
-                let title = compiled
-                    .paint
-                    .iter()
-                    .find(|node| node.key.as_str() == "settings/showcase/status/title")
-                    .and_then(|node| match &node.content {
-                        crate::native_ui::UiContent::Text(text) => Some(text.text.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
+                let title = strip_title_text(&compiled);
                 assert!(!title.is_empty(), "{context}: the strip names the theme");
                 let cut: Vec<String> = compiled
                     .fit_failures()

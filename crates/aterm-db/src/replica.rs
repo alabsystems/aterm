@@ -2,14 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! Bounded application repair after the sealed control exchange. Tables and paths
-//! are provisioned locally; peers never choose a local path. Every local batch
+//! are provisioned locally or discovered through the signed Commons catalog;
+//! peers never choose a local path. Every local batch
 //! reopens secrets custody and checks current peer membership. No journal lock
-//! crosses network I/O. This layer does not yet discover or subscribe to tables.
+//! crosses network I/O. Dynamic subscriptions default on within an enrolled lab.
 
 use crate::{
     Error, Result,
     control::{self, Side},
-    table::{Scope, Session, store::Store},
+    table::{Scope, Session, conflict::ProofKey, store::Store},
 };
 use astream_wire::sync::{Actor, Digest};
 use aterm_digest::Sha256;
@@ -25,13 +26,19 @@ use std::{
 
 const MAX_TABLES: usize = 64;
 const MAX_RECORDS: usize = 8192;
+const MAX_PROOFS: usize = MAX_RECORDS * 2 + aterm_secrets::commons::constraints::MAX_BINDINGS;
 const BATCH: usize = 16;
-const PROBE: &[u8] = b"ACTP2";
-const READY: &[u8] = b"ACTA2";
+const PROBE: &[u8] = b"ACTP3";
+const READY: &[u8] = b"ACTA3";
 
 /// A completed bounded application round, never a claim of global convergence.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Report {
+    /// The selected table, if both peers had one in common.
+    pub table: Option<Digest>,
+    /// Local retained operation count before this table's positive repair.
+    /// This is inventory knowledge, never a claim of complete network history.
+    pub retained: usize,
     pub sent: usize,
     pub received: usize,
     pub deferred: usize,
@@ -45,7 +52,7 @@ pub struct Repair {
     history: Option<Digest>,
     table: Option<Digest>,
     records: BTreeMap<Digest, Digest>,
-    conflicts: BTreeMap<Digest, Actor>,
+    conflicts: BTreeMap<Digest, ProofKey>,
 }
 
 /// A locally provisioned table set. The existing control channel supplies the
@@ -55,6 +62,7 @@ pub struct Replica {
     trust: Trust,
     actor: Actor,
     tables: BTreeMap<Digest, (Scope, PathBuf)>,
+    commons: Option<(crate::catalog::Directory, PathBuf)>,
 }
 impl Replica {
     pub fn new(paths: Paths, tables: Vec<(Scope, PathBuf)>) -> Result<Self> {
@@ -78,6 +86,28 @@ impl Replica {
             trust,
             actor,
             tables: map,
+            commons: None,
+        })
+    }
+    /// Automatic catalog and application subscriptions. Construction performs
+    /// no table initialization and does not stop control repair on table damage.
+    pub fn commons(paths: Paths, config: PathBuf) -> Result<Self> {
+        let bootstrap = Bootstrap::cached(&paths)
+            .map_err(crate::table::failure)?
+            .ok_or_else(|| Error::new("Commons repair has no secrets custody"))?;
+        let trust = bootstrap.trust();
+        let actor = bootstrap
+            .request()
+            .map_err(crate::table::failure)?
+            .binding()
+            .actor();
+        let directory = crate::catalog::Directory::new(&paths, trust);
+        Ok(Self {
+            paths,
+            trust,
+            actor,
+            tables: BTreeMap::new(),
+            commons: Some((directory, config)),
         })
     }
     pub(crate) fn matches(&self, trust: Trust, actor: Actor) -> bool {
@@ -108,9 +138,17 @@ impl Replica {
     }
 
     fn round(&self, peer: Actor) -> Result<Round<'_>> {
+        let policy = self
+            .commons
+            .as_ref()
+            .map(|(_, config)| crate::catalog::policy::Policy::read(config))
+            .transpose()?;
         Ok(Round {
             replica: self,
             observation: self.observe(peer, None, |session| session.observation())?,
+            policy,
+            tables: self.tables.clone(),
+            active_table: std::cell::Cell::new(None),
         })
     }
 
@@ -181,12 +219,6 @@ impl Replica {
         repair: &mut Repair,
     ) -> Result<Report> {
         let round = self.round(peer)?;
-        // Reconfiguring an endpoint must not accumulate cursor entries for
-        // tables outside its bounded, locally provisioned set.
-        repair.records.retain(|id, _| self.tables.contains_key(id));
-        repair
-            .conflicts
-            .retain(|id, _| self.tables.contains_key(id));
         round.exchange(stream, peer, side, repair)
     }
 }
@@ -205,6 +237,9 @@ struct Inventory {
 struct Round<'a> {
     replica: &'a Replica,
     observation: [u8; 64],
+    policy: Option<crate::catalog::policy::Policy>,
+    tables: BTreeMap<Digest, (Scope, PathBuf)>,
+    active_table: std::cell::Cell<Option<Digest>>,
 }
 impl std::ops::Deref for Round<'_> {
     type Target = Replica;
@@ -213,12 +248,46 @@ impl std::ops::Deref for Round<'_> {
     }
 }
 impl Round<'_> {
+    fn store(&self, session: &Session<'_>, id: Digest) -> Result<Store> {
+        let (scope, path) = &self.tables[&id];
+        if let Some((directory, _)) = &self.commons {
+            directory.enroll(session, *scope)
+        } else {
+            Store::open(session, path, *scope)
+        }
+    }
     fn local<T>(&self, peer: Actor, run: impl FnOnce(&Session<'_>) -> Result<T>) -> Result<T> {
-        self.replica.observe(peer, Some(self.observation), run)
+        if let Some((directory, config)) = &self.commons {
+            let policy = crate::catalog::policy::Policy::read(config)?;
+            if !policy.enabled
+                || Some(&policy) != self.policy.as_ref()
+                || policy
+                    .excluded
+                    .contains(&directory.catalog_scope().digest())
+            {
+                return Err(Error::new(
+                    "Commons subscription policy changed or disabled",
+                ));
+            }
+        }
+        self.replica
+            .observe(peer, Some(self.observation), |session| {
+                if let Some((directory, _)) = &self.commons
+                    && let Some(id) = self.active_table.get()
+                    && !directory.permits(
+                        session,
+                        self.policy.as_ref().expect("Commons policy captured"),
+                        id,
+                    )?
+                {
+                    return Err(Error::new("table subscription changed during repair"));
+                }
+                run(session)
+            })
     }
 
     fn exchange(
-        &self,
+        mut self,
         stream: &mut (impl Read + Write),
         peer: Actor,
         side: Side,
@@ -238,6 +307,18 @@ impl Round<'_> {
         }
         let mut report = Report::default();
         self.keys(stream, peer, side, repair, &mut report)?;
+        if let Some((directory, _)) = &self.commons {
+            self.tables = self.local(peer, |session| {
+                directory.subscriptions(
+                    session,
+                    self.policy.as_ref().expect("Commons policy captured"),
+                )
+            })?;
+        }
+        repair.records.retain(|id, _| self.tables.contains_key(id));
+        repair
+            .conflicts
+            .retain(|id, _| self.tables.contains_key(id));
         let local: BTreeSet<_> = self.local(peer, |_| Ok(self.tables.keys().copied().collect()))?;
         let remote = exchange_ids(stream, side, &local, MAX_TABLES, || {
             self.local(peer, |_| Ok(()))
@@ -271,6 +352,7 @@ impl Round<'_> {
             return Err(Error::new("peer selected an unprovisioned table"));
         }
         repair.table = Some(id);
+        report.table = Some(id);
         self.table(stream, peer, side, id, repair, &mut report)?;
         Ok(report)
     }
@@ -324,7 +406,6 @@ impl Round<'_> {
             session.handoffs(peer, &needs.iter().copied().collect::<Vec<_>>())
         })?;
         for key in keys {
-            self.local(peer, |_| Ok(()))?;
             stream.write_all(&[u8::from(key.is_some())])?;
             if let Some(key) = key {
                 control::send_frame(stream, &key)?;
@@ -340,37 +421,43 @@ impl Round<'_> {
         needs: &BTreeSet<Digest>,
         report: &mut Report,
     ) -> Result<()> {
+        let mut keys = Vec::with_capacity(needs.len());
         for source in needs {
             let mut present = [0];
             stream.read_exact(&mut present)?;
             match present[0] {
                 0 => {
-                    self.local(peer, |_| Ok(()))?;
-                    report.deferred += 1;
+                    keys.push((*source, None));
                 }
                 1 => {
                     let key = control::receive_frame(
                         stream,
                         aterm_secrets::commons::history::MAX_HANDOFF,
                     )?;
-                    if self.local(peer, |session| {
-                        Ok(session.import_handoff(*source, &key).is_ok())
-                    })? {
-                        report.keys_received += 1;
-                    } else {
-                        report.deferred += 1;
-                    }
+                    keys.push((*source, Some(key)));
                 }
                 _ => return Err(Error::new("invalid historical key response")),
             }
         }
+        // One bounded, fully buffered batch. Validate current membership after
+        // its final network read; never hold custody locks while receiving it.
+        let accepted = self.local(peer, |session| {
+            Ok(keys
+                .iter()
+                .filter(|(source, key)| {
+                    key.as_ref()
+                        .is_some_and(|key| session.import_handoff(*source, key).is_ok())
+                })
+                .count())
+        })?;
+        report.keys_received += accepted;
+        report.deferred += keys.len() - accepted;
         Ok(())
     }
 
     fn inventory(&self, peer: Actor, id: Digest) -> Result<Option<Inventory>> {
-        let (scope, path) = &self.tables[&id];
         self.local(peer, |session| {
-            let Ok(store) = Store::open(session, path, *scope) else {
+            let Ok(store) = self.store(session, id) else {
                 return Ok(None);
             };
             Ok(Some(Inventory {
@@ -396,35 +483,39 @@ impl Round<'_> {
         repair: &mut Repair,
         report: &mut Report,
     ) -> Result<bool> {
-        let (scope, path) = &self.tables[&id];
         let local = self.local(peer, |session| {
-            let Ok(store) = Store::open(session, path, *scope) else {
+            let Ok(store) = self.store(session, id) else {
                 return Ok(None);
             };
-            store.conflict_inventory(session).map(Some)
+            store.proof_inventory(session).map(Some)
         })?;
-        let remote = exchange_inventory(stream, side, local.as_ref(), || {
+        let remote = exchange_inventory(stream, side, local.as_ref(), MAX_PROOFS, || {
             self.local(peer, |_| Ok(()))
         })?;
         let (Some(local), Some(remote)) = (local, remote) else {
             report.deferred += 1;
             return Ok(false);
         };
-        let actors: Vec<_> = cycle(&local, repair.conflicts.get(&id).copied())
-            .filter(|actor| !remote.contains(*actor))
+        let proofs: Vec<_> = cycle(&local, repair.conflicts.get(&id).copied())
+            .filter(|key| {
+                let mut fork = [0; 81];
+                fork[..48].copy_from_slice(&key[..48]);
+                fork[48] = 1;
+                !remote.contains(*key) && !remote.contains(&fork)
+            })
             .take(BATCH)
             .copied()
             .collect();
-        if let Some(last) = actors.last() {
+        if let Some(last) = proofs.last() {
             repair.conflicts.insert(id, *last);
         }
         let batch = self.local(peer, |session| {
-            let store = Store::open(session, path, *scope)?;
-            actors
+            let store = self.store(session, id)?;
+            proofs
                 .iter()
-                .map(|actor| {
+                .map(|key| {
                     store
-                        .conflict_wire(session, actor)?
+                        .proof_wire(session, key)?
                         .ok_or_else(|| Error::new("table conflict disappeared"))
                 })
                 .collect::<Result<Vec<_>>>()
@@ -451,6 +542,7 @@ impl Round<'_> {
         repair: &mut Repair,
         report: &mut Report,
     ) -> Result<()> {
+        self.active_table.set(Some(id));
         if !self.conflicts(stream, peer, side, id, repair, report)? {
             return Ok(());
         }
@@ -460,12 +552,14 @@ impl Round<'_> {
             stream,
             side,
             local.as_ref().map(|inventory| &inventory.known),
+            MAX_RECORDS,
             || self.local(peer, |_| Ok(())),
         )?;
         let (Some(local), Some(remote)) = (local, remote) else {
             report.deferred += 1;
             return Ok(());
         };
+        report.retained = local.known.len();
         let ids: Vec<_> = cycle(&local.offered, repair.records.get(&id).copied())
             .filter(|v| !remote.contains(*v))
             .take(BATCH)
@@ -474,9 +568,8 @@ impl Round<'_> {
         if let Some(last) = ids.last() {
             repair.records.insert(id, *last);
         }
-        let (scope, path) = &self.tables[&id];
         let batch = self.local(peer, |session| {
-            let store = Store::open(session, path, *scope)?;
+            let store = self.store(session, id)?;
             ids.iter()
                 .map(|id| {
                     store
@@ -509,7 +602,6 @@ impl Round<'_> {
         self.local(peer, |_| Ok(()))?;
         stream.write_all(&(batch.len() as u32).to_le_bytes())?;
         for wire in batch {
-            self.local(peer, |_| Ok(()))?;
             control::send_frame(stream, wire)?;
         }
         stream.flush()?;
@@ -555,9 +647,8 @@ impl Round<'_> {
             }
             wires.push(wire);
         }
-        let (scope, path) = &self.tables[&id];
         let verdicts = self.local(peer, |session| {
-            let Ok(mut store) = Store::open(session, path, *scope) else {
+            let Ok(mut store) = self.store(session, id) else {
                 return Ok(vec![false; n]);
             };
             Ok(wires
@@ -656,18 +747,19 @@ fn exchange_inventory<const N: usize>(
     stream: &mut (impl Read + Write),
     side: Side,
     local: Option<&BTreeSet<[u8; N]>>,
+    maximum: usize,
     authorize: impl Fn() -> Result<()>,
 ) -> Result<Option<BTreeSet<[u8; N]>>> {
     match side {
         Side::Initiator => {
             authorize()?;
-            send_inventory(stream, local)?;
-            receive_inventory(stream)
+            send_inventory(stream, local, maximum)?;
+            receive_inventory(stream, maximum)
         }
         Side::Responder => {
-            let remote = receive_inventory(stream)?;
+            let remote = receive_inventory(stream, maximum)?;
             authorize()?;
-            send_inventory(stream, local)?;
+            send_inventory(stream, local, maximum)?;
             Ok(remote)
         }
     }
@@ -676,20 +768,24 @@ fn exchange_inventory<const N: usize>(
 fn send_inventory<const N: usize>(
     stream: &mut impl Write,
     ids: Option<&BTreeSet<[u8; N]>>,
+    maximum: usize,
 ) -> Result<()> {
     stream.write_all(&[u8::from(ids.is_some())])?;
     if let Some(ids) = ids {
-        send_ids(stream, ids, MAX_RECORDS)?;
+        send_ids(stream, ids, maximum)?;
     }
     stream.flush()?;
     Ok(())
 }
-fn receive_inventory<const N: usize>(stream: &mut impl Read) -> Result<Option<BTreeSet<[u8; N]>>> {
+fn receive_inventory<const N: usize>(
+    stream: &mut impl Read,
+    maximum: usize,
+) -> Result<Option<BTreeSet<[u8; N]>>> {
     let mut ready = [0];
     stream.read_exact(&mut ready)?;
     match ready[0] {
         0 => Ok(None),
-        1 => Ok(Some(receive_ids(stream, MAX_RECORDS)?)),
+        1 => Ok(Some(receive_ids(stream, maximum)?)),
         _ => Err(Error::new("invalid table inventory state")),
     }
 }

@@ -216,6 +216,20 @@ const TABLE: &[Verb] = &[
         run: cmd_machine,
     },
     Verb {
+        name: "capacity",
+        tier: Tier::Occasional,
+        usage: "aterm pkg capacity [--json] [<path>]  — this machine's capacity now (cores, load, \
+                available memory, swap, free disk above the floor the window's disk watch holds \
+                <path>'s volume to) and the \
+                claims every session's heavy or timing-sensitive work holds or waits for; \
+                read-only",
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: crate::capacity::verb,
+    },
+    Verb {
         name: "self-uninstall",
         tier: Tier::Occasional,
         usage: "aterm pkg self-uninstall [--dry-run] [--install-dir <dir>] [--bin-dir <dir>] \
@@ -330,10 +344,10 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "abrew",
         tier: Tier::Daily,
-        usage: "aterm pkg abrew <brew-command> [args…]  — aterm's Homebrew (`aterm help abrew`): \
-                bottles and tar/zip/DMG/single-file casks natively over abrew's own prefix, the rest delegated to real brew before effects; \
-                abrew bundle lays the bundled Homebrew; abrew on|off toggles the `brew` reroute; \
-                brew --real … runs real Homebrew unchanged",
+        usage: "aterm pkg abrew <brew-command> [args…]  — native brew compatibility (`aterm help abrew`): \
+                bottles and tar/zip/DMG/single-file casks over its own prefix; unsupported operations fail without Homebrew; \
+                abrew bundle [install|check|dump] handles native Brewfiles (bare bundle installs); \
+                bundle status|remove handles owned legacy bundles; on|off controls the managed brew stub",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
@@ -409,8 +423,8 @@ pub fn verb_usage(verb: &str) -> Option<&'static str> {
 }
 
 fn help_flag_addresses_atpkg(verb: &str, rest: &[String]) -> bool {
-    // `abrew` owns its whole argv (Arity::Own): its --help is abrew's (or,
-    // for delegated commands, real brew's), never the atpkg usage line.
+    // `abrew` owns its whole argv (Arity::Own): its --help is abrew's,
+    // never the atpkg usage line.
     if verb == "abrew" {
         return false;
     }
@@ -562,7 +576,9 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     if verb == Some(crate::reroute::HIDDEN_VERB) {
         return cmd_reroute(&args[1..]);
     }
-    if verb == Some(crate::abrew::stub::HIDDEN_VERB) {
+    // New wrappers name a native-only route an older retained backend cannot delegate.
+    // Keep the old entry for existing wrappers reaching this updated backend.
+    if verb == Some(crate::abrew::stub::HIDDEN_VERB) || verb == Some("__abrew") {
         return crate::abrew::rerouted_entry(&args[1..]);
     }
     if matches!(verb, Some("help" | "-h" | "--help")) {

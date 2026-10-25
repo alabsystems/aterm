@@ -6,15 +6,19 @@
 use core::fmt;
 
 use aterm_aos::checkpoint::{Checkpoint, CheckpointFault, RestoreRefusal};
+use aterm_aos::contract::{Contract, Verdict};
 use aterm_aos::effects::NoEffects;
-use aterm_aos::log::{EventLog, LogFault, Tail};
-use aterm_aos::replay::replay;
+use aterm_aos::log::{EventLog, IdentityMismatch, LogFault, Tail};
+use aterm_aos::replay::{Run, replay};
 use aterm_aos::task::StepRefusal;
 use aterm_aos::wire::{Dec, Enc, WireFault};
 use aterm_aos::{Digest, TaskIdentity};
 use aterm_time::Instant;
 
-use super::{MOMENTUM_MAX_EVENTS, MomentumCode, MomentumEvent, MomentumSchema, PrebuiltMomentum};
+use super::{
+    MOMENTUM_MAX_EVENTS, MomentumCode, MomentumEvent, MomentumSchema, NoStrandedLight,
+    PrebuiltMomentum, momentum_identity,
+};
 
 /// The bytes that open a momentum trace file.
 pub const TRACE_FILE_MAGIC: [u8; 8] = *b"AOSMTR\0\x01";
@@ -96,9 +100,18 @@ pub struct TraceReplay {
     pub observation_chain: Digest,
 }
 
+/// What [`MomentumTrace::check`] found: the replay and the contract's verdict on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceCheck {
+    pub replay: TraceReplay,
+    pub verdict: Verdict,
+}
+
 /// Why a trace file was not read or did not replay.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TraceFault {
+    /// The trace's identity is none this build runs the glow under: the first artifact that differs.
+    Identity(IdentityMismatch),
     /// The bytes do not open with `AOSMTR\0`.
     Magic,
     /// They open with another format byte than [`TRACE_FILE_MAGIC`]'s.
@@ -127,9 +140,36 @@ pub enum TraceFault {
     Chain { recorded: Digest, replayed: Digest },
 }
 
+impl TraceFault {
+    /// The refusal as one word (`identity`, `magic`, `state`, …).
+    #[must_use]
+    pub const fn word(&self) -> &'static str {
+        match self {
+            TraceFault::Identity(_) => "identity",
+            TraceFault::Magic => "magic",
+            TraceFault::Format { .. } => "format",
+            TraceFault::Seal { .. } => "seal",
+            TraceFault::Wire(_) => "wire",
+            TraceFault::Checkpoint(_) => "checkpoint",
+            TraceFault::Log(_) => "log",
+            TraceFault::Tail(_) => "tail",
+            TraceFault::Broken { .. } => "broken",
+            TraceFault::UnknownCode { .. } => "unknown-code",
+            TraceFault::Restore(_) => "restore",
+            TraceFault::Refused { .. } => "refused",
+            TraceFault::State { .. } => "state",
+            TraceFault::Chain { .. } => "chain",
+        }
+    }
+}
+
 impl fmt::Display for TraceFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            TraceFault::Identity(m) => write!(
+                f,
+                "the trace was recorded under an identity this build does not run: {m}"
+            ),
             TraceFault::Magic => f.write_str("the bytes are not a momentum trace file"),
             TraceFault::Format { found } => write!(
                 f,
@@ -275,6 +315,31 @@ impl MomentumTrace {
         })
     }
 
+    /// The first artifact where the trace's identity differs from the shipped code's identity in `build`, or `None` when it is the identity of a code this build carries.
+    #[must_use]
+    pub fn identity_mismatch(&self, build: &str) -> Option<IdentityMismatch> {
+        let ours = |c: MomentumCode| momentum_identity(&PrebuiltMomentum::new(c, build));
+        if MomentumCode::ALL.iter().any(|&c| ours(c) == self.identity) {
+            return None;
+        }
+        Some(
+            IdentityMismatch::first(&self.identity, &ours(MomentumCode::Shipped))
+                .unwrap_or(IdentityMismatch::Code),
+        )
+    }
+
+    /// Refuses a trace whose identity this build does not run ([`TraceFault::Identity`]), then replays it as [`Self::replay`] does and judges the run by the identity's contract.
+    /// # Errors
+    /// [`TraceFault::Identity`], then any of [`Self::replay`]'s.
+    pub fn check(&self, epoch: Instant, build: &str) -> Result<TraceCheck, TraceFault> {
+        if let Some(m) = self.identity_mismatch(build) {
+            return Err(TraceFault::Identity(m));
+        }
+        let (read, replay, run) = self.replayed(epoch, build)?;
+        let verdict = NoStrandedLight::new().judge(&read.schema, read.log.inputs(), &run);
+        Ok(TraceCheck { replay, verdict })
+    }
+
     /// Reads the trace on `epoch`, replays its log from its checkpoint, and checks the replay
     /// reached the recorded head.
     /// # Errors
@@ -282,6 +347,15 @@ impl MomentumTrace {
     /// [`TraceFault::Restore`], [`TraceFault::Refused`], [`TraceFault::State`] or
     /// [`TraceFault::Chain`], in that order.
     pub fn replay(&self, epoch: Instant, build: &str) -> Result<TraceReplay, TraceFault> {
+        self.replayed(epoch, build).map(|(_, replay, _)| replay)
+    }
+
+    /// [`Self::replay`], with the trace it read and the run.
+    fn replayed(
+        &self,
+        epoch: Instant,
+        build: &str,
+    ) -> Result<(ReadTrace, TraceReplay, Run<MomentumSchema>), TraceFault> {
         let read = self.read(epoch)?;
         if let Some(why) = read.log.broken() {
             return Err(TraceFault::Broken { why });
@@ -307,8 +381,11 @@ impl MomentumTrace {
             first_cursor,
             &mut NoEffects,
         );
-        if let Some((cursor, refusal)) = run.refused {
-            return Err(TraceFault::Refused { cursor, refusal });
+        if let Some((cursor, refusal)) = &run.refused {
+            return Err(TraceFault::Refused {
+                cursor: *cursor,
+                refusal: refusal.clone(),
+            });
         }
         if run.state_digest != self.head_state {
             return Err(TraceFault::State {
@@ -322,7 +399,7 @@ impl MomentumTrace {
                 replayed: run.observation_chain,
             });
         }
-        Ok(TraceReplay {
+        let replay = TraceReplay {
             code: named,
             checkpoint: read.checkpoint.digest(),
             log_epoch: read.log.header().log_epoch,
@@ -330,6 +407,7 @@ impl MomentumTrace {
             counts: read.counts,
             state_digest: run.state_digest,
             observation_chain: run.observation_chain,
-        })
+        };
+        Ok((read, replay, run))
     }
 }

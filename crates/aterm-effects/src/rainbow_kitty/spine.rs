@@ -112,7 +112,7 @@ impl Flow {
 #[must_use]
 const fn flow_heat(run: u32) -> f32 {
     let lo = FLOW_ENTRY_KEYS.saturating_sub(FLOW_OPEN_EASE_KEYS);
-    smoothstep01(run.saturating_sub(lo) as f32 / FLOW_OPEN_EASE_KEYS as f32)
+    smoothstep01(run.saturating_sub(lo) as f32 * (1.0 / FLOW_OPEN_EASE_KEYS as f32))
 }
 
 /// The erase mark a Backspace leaves for the next typed key.
@@ -328,14 +328,14 @@ impl Spine {
             self.slamming = false;
         }
         if rise != 0.0 {
-            let ease = if rise < 0.0 {
-                DISP_RELEASE_TAU
+            let inv_ease = if rise < 0.0 {
+                1.0 / DISP_RELEASE_TAU
             } else if self.slamming {
-                DISP_SLAM_S
+                1.0 / DISP_SLAM_S
             } else {
-                DISP_ATTACK_S
+                1.0 / DISP_ATTACK_S
             };
-            self.disp += rise * (1.0 - (-dt / ease).exp());
+            self.disp += rise * (1.0 - (-dt * inv_ease).exp());
         }
         if self.disp < DISP_SNAP_ZERO {
             self.disp = 0.0;
@@ -343,7 +343,7 @@ impl Spine {
         self.disp_peak = if self.disp >= self.disp_peak {
             self.disp
         } else {
-            (self.disp_peak * (-dt * std::f32::consts::LN_2 / DISP_PEAK_HALF_LIFE_S).exp())
+            (self.disp_peak * (-dt * (std::f32::consts::LN_2 / DISP_PEAK_HALF_LIFE_S)).exp())
                 .max(self.disp)
         };
         if self.disp_peak < DISP_SNAP_ZERO {
@@ -449,7 +449,7 @@ impl Spine {
         if self.key_rise < SURGE_MIN_RISE {
             return 0.0;
         }
-        (self.key_rise / SURGE_FULL_RISE).clamp(0.0, 1.0)
+        (self.key_rise * (1.0 / SURGE_FULL_RISE)).clamp(0.0, 1.0)
     }
 
     /// The lay/flow clock in sweeps, modulo [`PHASE_RING`].

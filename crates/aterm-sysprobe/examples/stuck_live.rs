@@ -258,6 +258,7 @@ impl Host {
         Ok(JobTick {
             at_ms,
             read_ms: at_ms,
+            probe_ms: at_ms,
             self_uid,
             sweep,
             procs,
@@ -370,9 +371,10 @@ fn fd(f: &probe::FdReading) -> Fd {
             lf_tail: *lf_tail,
             fresh_dylib: *fresh_dylib,
         },
-        probe::FdKind::Device { tty, read } => FdKind::Device {
+        probe::FdKind::Device { tty, read, ctty } => FdKind::Device {
             tty: *tty,
             read: *read,
+            ctty: *ctty,
         },
         probe::FdKind::Pipe {
             handle,
@@ -428,6 +430,7 @@ fn job_proc(p: &ProcFacts) -> JobProc {
         name: p.name.clone(),
         exe: p.exe.clone(),
         state: state(p.state),
+        traced: p.traced,
         tty: p.tty,
         tpgid: p.tpgid,
         term: p.term.map(|t| aterm_vitals::jobs::TermWord {

@@ -22,7 +22,7 @@ use crate::spectrum::{
 use super::companion::KeepOut;
 use super::ribbon::{
     BED_INK_LUT_LEN, SLABS_PER_CELL, WALK_FAST_CELLS, WALK_LAY_RATE, hot_edge_ink, paper_caret_ink,
-    paper_ink, paper_mark_ink, walk_pace, walk_t,
+    paper_ink, paper_mark_ink, paper_train_ink, walk_pace, walk_t,
 };
 use super::stardust::{
     FAN_RISE_MAX_CH, FanSow, GlyphProbe, ShedSow, Stardust, hash01, mix32, push_halo_quads,
@@ -92,7 +92,7 @@ pub const fn landing_field(t_land: f32, dx_cells: f32) -> f32 {
     if !dx_cells.is_finite() {
         return tri(t_land);
     }
-    tri(t_land + dx_cells / WALK_FAST_CELLS)
+    tri(t_land + dx_cells * (1.0 / WALK_FAST_CELLS))
 }
 
 /// The landing's walk: the one colour law every mark of a landing reads.
@@ -891,7 +891,7 @@ impl Meteor {
         let base = if age <= t {
             1.0
         } else {
-            (-(age - t) / TRAIN_COLOUR_TAU_MS).exp()
+            (-(age - t) * (1.0 / TRAIN_COLOUR_TAU_MS)).exp()
         };
         base * self.retire_alpha(now)
     }
@@ -901,7 +901,7 @@ impl Meteor {
         match self.retired_at {
             None => 1.0,
             Some(at) => {
-                let u = ms_since(at, now) / FLIGHT_RETIRE_MS;
+                let u = ms_since(at, now) * (1.0 / FLIGHT_RETIRE_MS);
                 (-u.max(0.0) * RETIRE_DECAY).exp()
             }
         }
@@ -912,11 +912,22 @@ impl Meteor {
     #[must_use]
     pub fn end(&self) -> Instant {
         match self.retired_at {
-            Some(at) => at + Duration::from_secs_f32(FLIGHT_RETIRE_MS / 1000.0),
-            None => self.arrival() + Duration::from_secs_f32(FLIGHT_OFF_GLASS_MS / 1000.0),
+            Some(at) => at + FLIGHT_RETIRE_DUR,
+            None => self.arrival() + FLIGHT_OFF_GLASS_DUR,
         }
     }
 }
+
+#[inline]
+const fn dur_from_ms(ms: f32) -> Duration {
+    Duration::from_nanos(((ms * (1.0 / 1000.0)) as f64 * 1_000_000_000.0).round() as u64)
+}
+
+const FLIGHT_RETIRE_DUR: Duration = dur_from_ms(FLIGHT_RETIRE_MS);
+const FLIGHT_OFF_GLASS_DUR: Duration = dur_from_ms(FLIGHT_OFF_GLASS_MS);
+const ROOT_SUCK_DUR: Duration = dur_from_ms(ROOT_SUCK_MS);
+const PIN_DUR: Duration = dur_from_ms(PIN_MS);
+const REDUCED_MOTION_FADE_DUR: Duration = dur_from_ms(REDUCED_MOTION_FADE_MS);
 
 /// The landing pin.
 #[derive(Clone, Copy, Debug)]
@@ -1157,16 +1168,22 @@ impl Landing {
         self.walk.at(dx_cells)
     }
 
+    /// Whether this is a peel's landing (a Return's or the program's): no
+    /// ring, so neither a flash nor a burst.
+    #[inline]
+    #[must_use]
+    pub const fn peel(&self) -> bool {
+        !self.flash && self.burst.is_none()
+    }
+
     /// When the last landing pixel leaves the glass.
     #[inline]
     #[must_use]
     pub fn end(&self) -> Instant {
+        const BASE_LIFE_MS: f32 = PIN_MS.max(FLASH_COLOUR_MS).max(SPARK_LIFE_MAX_MS);
         let burst_ms = self.burst.map_or(0.0, |b| b.ms);
-        let life = PIN_MS
-            .max(FLASH_COLOUR_MS)
-            .max(burst_ms)
-            .max(SPARK_LIFE_MAX_MS);
-        self.pin.at + Duration::from_secs_f32(life / 1000.0)
+        let life = BASE_LIFE_MS.max(burst_ms);
+        self.pin.at + Duration::from_secs_f32(life * (1.0 / 1000.0))
     }
 
     /// A party landing: the celebration's bar fan at the caret with no meteor behind it.
@@ -1218,7 +1235,7 @@ impl Landing {
     #[inline]
     #[must_use]
     fn static_end(&self) -> Instant {
-        self.pin.at + Duration::from_secs_f32(FLIGHT_OFF_GLASS_MS / 1000.0)
+        self.pin.at + FLIGHT_OFF_GLASS_DUR
     }
 
     #[inline]
@@ -1229,7 +1246,7 @@ impl Landing {
             .saturating_duration_since(now)
             .as_secs_f32()
             * 1000.0;
-        clamp01(left / REDUCED_MOTION_FADE_MS.max(1.0))
+        clamp01(left * (1.0 / REDUCED_MOTION_FADE_MS.max(1.0)))
     }
 
     /// The last instant any landing mark moves.
@@ -1246,7 +1263,7 @@ impl Landing {
                 .fold(0.0_f32, |acc, s| acc.max(s.life));
             ms = ms.max(max_spark * SPARK_CULL_U);
         }
-        self.pin.at + Duration::from_secs_f32(ms / 1000.0)
+        self.pin.at + Duration::from_secs_f32(ms * (1.0 / 1000.0))
     }
 }
 
@@ -1312,12 +1329,14 @@ pub struct Meteors {
     /// Whether tests lay each train layer cut square without end easing.
     #[cfg(test)]
     pub(crate) ends_square: bool,
-    /// Whether tests lay a dark train's fades as dims (the smudge's negative
-    /// control).
+    /// Whether tests lay a train's fades as dims, on dark (looks6 N6's
+    /// negative control) and on paper (looks7 M2's).
     #[cfg(test)]
     pub(crate) dims_dark_trains: bool,
-    /// Whether tests lay a train's warm stops like its others: at their level
-    /// on dark and their width on paper (the warm stops' negative control).
+    /// Whether tests lay a train's warm stops as its others, as they were:
+    /// at their level on dark (looks6 round 3's negative control), and on
+    /// paper bent through the darkened yellows as the caret's are (looks7
+    /// M2's).
     #[cfg(test)]
     pub(crate) warm_stops_plain: bool,
     /// Whether tests lay a train across a lettered row's letters (the
@@ -1332,6 +1351,11 @@ pub struct Meteors {
     /// negative control).
     #[cfg(test)]
     pub(crate) petals_stay: bool,
+    /// Whether tests ring a dark peel's head with its coma and lay its
+    /// lights behind the letters' bodies alone, as they were (looks7 M1's
+    /// negative control).
+    #[cfg(test)]
+    pub(crate) peel_coma: bool,
 }
 
 impl Default for Meteors {
@@ -1366,6 +1390,8 @@ impl Meteors {
             trains_in_guard: false,
             #[cfg(test)]
             petals_stay: false,
+            #[cfg(test)]
+            peel_coma: false,
         }
     }
 
@@ -1428,12 +1454,13 @@ impl Meteors {
         #[cfg(test)]
         let warm = !self.warm_stops_plain;
         #[cfg(not(test))]
-        let (behind, fold, skirts) = (true, true, true);
+        let (behind, fold, skirts, peel_coma) = (true, true, true, false);
         #[cfg(test)]
-        let (behind, fold, skirts) = (
+        let (behind, fold, skirts, peel_coma) = (
             !self.trains_over_text,
             !self.petals_stay,
             !self.trains_in_guard,
+            self.peel_coma,
         );
         let keep = &self.keep_out;
         let text = Behind::bodies(keep, behind);
@@ -1447,7 +1474,16 @@ impl Meteors {
         for m in live.iter_mut() {
             if let Some(f) = Flight::of(m, ctx) {
                 draw_train(&mut verts, m, &f, ctx, frame, (square, clean, warm), train);
-                draw_head(m, &f, ctx, frame, (clean, fold), text);
+                // A dark peel (a Return's or the program's, which rings no
+                // landing) is one tapering train: its head's coma, seven
+                // lights orbiting it apart, read as floating dabs beside
+                // the train and, the train hidden behind the echo and the
+                // printed line, as dabs alone in the gap between them
+                // (looks7 M1). Its core, laid where the train is, passes
+                // behind the letters as the train does.
+                let peel = clean && !m.ring && !peel_coma;
+                let head = if peel { train } else { text };
+                draw_head(m, &f, ctx, frame, (clean, fold, !peel), head);
                 if m.retired_at.is_none() && !m.chained {
                     shed(m, &f, ctx, sown);
                 }
@@ -1564,10 +1600,9 @@ impl Meteors {
         if self.reduced {
             return false;
         }
-        let root_suck = Duration::from_secs_f32(ROOT_SUCK_MS / 1000.0);
         self.live.iter().any(|m| match m.retired_at {
             Some(_) => now < m.end(),
-            None => now < m.arrival() + root_suck,
+            None => now < m.arrival() + ROOT_SUCK_DUR,
         }) || self.landings.iter().any(|l| now < l.moving_until())
     }
 
@@ -1576,11 +1611,10 @@ impl Meteors {
         if self.reduced {
             return false;
         }
-        let close = Duration::from_secs_f32(PIN_MS / 1000.0);
         self.live.iter().any(|m| match m.retired_at {
             Some(_) => now < m.end(),
-            None => now < m.arrival() + close,
-        }) || self.landings.iter().any(|l| now < l.pin.at + close)
+            None => now < m.arrival() + PIN_DUR,
+        }) || self.landings.iter().any(|l| now < l.pin.at + PIN_DUR)
     }
 
     /// The cadence law: the next instant a meteor changes what is on glass, `None` at rest.
@@ -1599,7 +1633,7 @@ impl Meteors {
         }
         for m in &self.live {
             if self.reduced {
-                let fade_from = m.end() - Duration::from_secs_f32(REDUCED_MOTION_FADE_MS / 1000.0);
+                let fade_from = m.end() - REDUCED_MOTION_FADE_DUR;
                 if m.retired_at.is_none() && now < fade_from {
                     cad.tail_at(fade_from);
                 } else {
@@ -1610,8 +1644,7 @@ impl Meteors {
         }
         for l in &self.landings {
             if self.reduced {
-                let fade_from =
-                    l.static_end() - Duration::from_secs_f32(REDUCED_MOTION_FADE_MS / 1000.0);
+                let fade_from = l.static_end() - REDUCED_MOTION_FADE_DUR;
                 if now < fade_from {
                     cad.tail_at(fade_from);
                 } else {
@@ -1745,7 +1778,7 @@ impl Meteors {
         }
         let cells_n = (len / cw.max(1.0)).round().clamp(1.0, f32::from(u16::MAX)) as u16;
         let cells = f32::from(cells_n);
-        let grade = (cells / GRADE_CELLS).clamp(0.0, 1.0);
+        let grade = (cells * (1.0 / GRADE_CELLS)).clamp(0.0, 1.0);
         let mom = clamp01(ctx.birth_disp);
         let w = ch * (W_BASE_CH + W_MOM_CH * mom) * (1.0 + W_GRADE_GAIN * grade);
         self.ord = self.ord.wrapping_add(1);
@@ -1872,7 +1905,8 @@ impl Meteors {
 /// dimming further, since a dimmed warm stop reads brown on a dark page.
 const DARK_TRAIN_CLEAN_SHARE: f32 = 1.0;
 
-/// A dark train's fade `k` of its light at half-width `half`, kept clean:
+/// A train's fade `k` of its light at half-width `half`, kept clean (a dark
+/// train's light, a paper train's ink):
 /// at or above `clean` it dims as asked; below, it keeps `clean` of its
 /// light and narrows by `k / clean` instead, and once narrower than
 /// [`DARK_TAPER_THREAD_PX`] it keeps that width and fades with its coverage
@@ -1883,15 +1917,15 @@ const fn dark_clean_taper(k: f32, half: f32, clean: f32) -> (f32, f32) {
     if k >= clean {
         return (k, half);
     }
-    let thread = DARK_TAPER_THREAD_PX * 0.5;
-    if half <= thread {
+    const THREAD: f32 = DARK_TAPER_THREAD_PX * 0.5;
+    if half <= THREAD {
         return (k, half);
     }
     let narrow = half * (k / clean).max(0.0);
-    if narrow >= thread {
+    if narrow >= THREAD {
         (clean, narrow)
     } else {
-        (clean * narrow / thread, thread)
+        (clean * narrow * (1.0 / THREAD), THREAD)
     }
 }
 
@@ -1905,11 +1939,11 @@ const fn fit_room(k: f32, half: f32, room: f32) -> (f32, f32) {
     if half <= room {
         return (k, half);
     }
-    let thread = DARK_TAPER_THREAD_PX * 0.5;
-    if room >= thread {
+    const THREAD: f32 = DARK_TAPER_THREAD_PX * 0.5;
+    if room >= THREAD {
         (k, room)
     } else {
-        (k * (room / thread).max(0.0), thread)
+        (k * (room * (1.0 / THREAD)).max(0.0), THREAD)
     }
 }
 
@@ -1925,31 +1959,32 @@ const DARK_WARM_TRAIN_GAIN: f32 = 1.8;
 const fn dark_warm_gain(stop: u32) -> f32 {
     let (hue, sat, _) = crate::color_math::rgb2hsv(stop);
     let warm = if hue >= 300.0 {
-        smoothstep01((hue - 300.0) / 45.0)
+        smoothstep01((hue - 300.0) * (1.0 / 45.0))
     } else {
-        1.0 - smoothstep01((hue - 55.0) / 30.0)
+        1.0 - smoothstep01((hue - 55.0) * (1.0 / 30.0))
     };
     1.0 + (DARK_WARM_TRAIN_GAIN - 1.0) * warm * sat.clamp(0.0, 1.0)
 }
 
-/// The share of its width a paper train keeps where its ink is a darkened
-/// yellow: held to the paper's contrast a yellow stop's ink reads mustard
-/// and olive, so the band thins out through it.
-const PAPER_GOLD_WIDTH: f32 = 0.4;
-
-/// [`PAPER_GOLD_WIDTH`]'s share for a paper train's `ink`: whole from a
-/// darkened orange (30 degrees) through olive (80), easing out toward red
-/// and across a yellowish green into green (100).
-#[inline]
-#[must_use]
-const fn paper_gold_width(ink: u32) -> f32 {
-    let (hue, sat, _) = crate::color_math::rgb2hsv(ink);
-    let gold = smoothstep01((hue - 20.0) / 10.0) * (1.0 - smoothstep01((hue - 80.0) / 20.0));
-    1.0 - (1.0 - PAPER_GOLD_WIDTH) * gold * smoothstep01(sat / 0.3)
-}
-
 /// The narrowest a dark train's clean taper draws before it fades instead.
 const DARK_TAPER_THREAD_PX: f32 = 2.0;
+
+/// A paper train's `ink` where its thread fades to `fade` of it: lifted
+/// toward its hue's full value as it goes. A darkened gold laid at a share
+/// over the paper is a tint of ochre, tan and khaki (looks7 M2: `c79b58`
+/// where the stick's thread faded out); a tint of its own hue at full value
+/// reads a pale gold.
+const fn paper_thread_ink(ink: u32, fade: f32) -> u32 {
+    if fade >= 1.0 {
+        return ink;
+    }
+    let (h, s, v) = crate::color_math::rgb2hsv(ink);
+    crate::color_math::hsv2rgb(
+        h,
+        s,
+        v + (1.0 - v) * crate::color_math::sqrt_f32(1.0 - fade.max(0.0)),
+    )
+}
 
 const WHITE_PRINTED_SHARE: f32 = 0.25;
 const WHITE_PRINTED_NEAR: f32 = 0.25;
@@ -1962,7 +1997,7 @@ const fn white_printed_share(dy: f32, rows_off: f32, ch: f32) -> f32 {
         return 1.0;
     }
     let ch = ch.max(1.0);
-    let u = (dy.abs() / ch - WHITE_PRINTED_NEAR) / (WHITE_PRINTED_FAR - WHITE_PRINTED_NEAR);
+    let u = (dy.abs() / ch - WHITE_PRINTED_NEAR) * (1.0 / (WHITE_PRINTED_FAR - WHITE_PRINTED_NEAR));
     WHITE_PRINTED_SHARE + (1.0 - WHITE_PRINTED_SHARE) * smoothstep01(u.clamp(0.0, 1.0))
 }
 
@@ -2068,6 +2103,8 @@ struct Behind<'a> {
     on: bool,
     band: (f32, f32),
     pad: f32,
+    /// How far past a row's last letter its span reaches ([`KeepOut::past`]).
+    past: f32,
 }
 
 impl<'a> Behind<'a> {
@@ -2079,6 +2116,7 @@ impl<'a> Behind<'a> {
             on,
             band: TRAIN_TEXT_BAND,
             pad: 0.0,
+            past: 0.0,
         }
     }
 
@@ -2089,6 +2127,7 @@ impl<'a> Behind<'a> {
         Self {
             band: DARK_TRAIN_TEXT_BAND,
             pad: DARK_TRAIN_TEXT_PAD_PX,
+            past: self.keep.past() as f32,
             ..self
         }
     }
@@ -2100,16 +2139,20 @@ impl<'a> Behind<'a> {
     /// train tapers to a point where it meets the zone rather than being
     /// sliced flat along it.
     #[inline]
-    fn room(self, x: f32, y: f32, limit: f32) -> f32 {
-        if !self.on || self.pad <= 0.0 || self.keep.rows().is_empty() || limit <= 0.0 {
+    const fn room(self, x: f32, y: f32, limit: f32) -> f32 {
+        let rows = self.keep.rows();
+        if !self.on || self.pad <= 0.0 || rows.is_empty() || limit <= 0.0 {
             return limit;
         }
         let limit_sq = limit * limit;
         let mut min_sq = limit_sq;
-        let pad = self.pad;
+        let (pad, past) = (self.pad, self.past);
         let (band0, band1) = self.band;
-        for &(x0, x1, y0, y1) in self.keep.rows() {
-            let (bx0, bx1) = (x0 as f32 - pad, x1 as f32 + pad);
+        let mut idx = 0;
+        while idx < rows.len() {
+            let (x0, x1, y0, y1) = rows[idx];
+            idx += 1;
+            let (bx0, bx1) = (x0 as f32 - pad, x1 as f32 + past + pad);
             let dx = (bx0 - x).max(x - bx1).max(0.0);
             let dx_sq = dx * dx;
             if dx_sq >= min_sq {
@@ -2129,7 +2172,7 @@ impl<'a> Behind<'a> {
         if min_sq >= limit_sq {
             limit
         } else {
-            min_sq.sqrt()
+            crate::color_math::sqrt_f32(min_sq)
         }
     }
 
@@ -2138,8 +2181,12 @@ impl<'a> Behind<'a> {
     #[must_use]
     const fn at(self, x: f32, y: f32) -> f32 {
         if self.on {
-            self.keep
-                .behind_text((x, y), self.band, self.pad, TRAIN_TEXT_FEATHER_PX)
+            self.keep.behind_text(
+                (x, y),
+                self.band,
+                (self.pad, self.past),
+                TRAIN_TEXT_FEATHER_PX,
+            )
         } else {
             1.0
         }
@@ -2147,27 +2194,39 @@ impl<'a> Behind<'a> {
 
     /// The rows `z0..z1` of a light over columns `x0..x1` and rows
     /// `y0..y1` that a lettered row's band touches, its eased edges and all.
-    fn zone(self, (x0, x1): (i32, i32), (y0, y1): (i32, i32)) -> Option<(i32, i32)> {
-        if !self.on || self.keep.rows().is_empty() {
+    const fn zone(self, (x0, x1): (i32, i32), (y0, y1): (i32, i32)) -> Option<(i32, i32)> {
+        let rows = self.keep.rows();
+        if !self.on || rows.is_empty() {
             return None;
         }
         let feather = TRAIN_TEXT_FEATHER_PX;
         let reach = feather.ceil() as i32;
         let pad = self.pad.ceil() as i32;
+        let past = self.past.ceil() as i32;
         let pad_reach = pad + reach;
         let (band0, band1) = self.band;
         let mut zone: Option<(i32, i32)> = None;
-        for &(rx0, rx1, ry0, ry1) in self.keep.rows() {
-            if x1 <= rx0 - pad || x0 >= rx1 + pad || y1 <= ry0 - pad_reach || y0 >= ry1 + pad_reach
+        let mut idx = 0;
+        while idx < rows.len() {
+            let (rx0, rx1, ry0, ry1) = rows[idx];
+            idx += 1;
+            if x1 <= rx0 - pad
+                || x0 >= rx1 + past + pad
+                || y1 <= ry0 - pad_reach
+                || y0 >= ry1 + pad_reach
             {
                 continue;
             }
             let ch = (ry1 - ry0) as f32;
             let b0 = (ry0 as f32 + band0 * ch).floor() as i32 - pad_reach;
             let b1 = (ry0 as f32 + band1 * ch).ceil() as i32 + pad_reach;
-            let (a, b) = (b0.max(y0), b1.min(y1));
+            let a = if b0 > y0 { b0 } else { y0 };
+            let b = if b1 < y1 { b1 } else { y1 };
             if a < b {
-                zone = Some(zone.map_or((a, b), |(p, q)| (p.min(a), q.max(b))));
+                zone = Some(match zone {
+                    Some((p, q)) => (if p < a { p } else { a }, if q > b { q } else { b }),
+                    None => (a, b),
+                });
             }
         }
         zone
@@ -2325,47 +2384,50 @@ impl Flight {
         if !l.is_finite() || l < 1.0 {
             return None;
         }
-        let unit = (dx / l, dy / l);
+        let inv_l = 1.0 / l;
+        let unit = (dx * inv_l, dy * inv_l);
         let t_ms = (m.t_flight.as_secs_f32() * 1000.0).max(1.0);
+        let inv_t_ms = 1.0 / t_ms;
         let age = ms_since(m.t0, ctx.now);
         let after = (age - t_ms).max(0.0);
         let reduced = ctx.cfg.reduced_motion;
 
         let (u, alpha_w, alpha_c) = if reduced {
             let life = t_ms + FLIGHT_OFF_GLASS_MS;
-            let a = REDUCED_MOTION_ALPHA * clamp01((life - age) / REDUCED_MOTION_FADE_MS.max(1.0));
+            let a = REDUCED_MOTION_ALPHA
+                * clamp01((life - age) * (1.0 / REDUCED_MOTION_FADE_MS.max(1.0)));
             (1.0, a, a)
         } else {
             let (alpha_w, alpha_c) = if after <= 0.0 {
                 (1.0, 1.0)
             } else {
                 (
-                    (-after / TRAIN_WHITE_TAU_MS).exp(),
-                    (-after / TRAIN_COLOUR_TAU_MS).exp(),
+                    (-after * (1.0 / TRAIN_WHITE_TAU_MS)).exp(),
+                    (-after * (1.0 / TRAIN_COLOUR_TAU_MS)).exp(),
                 )
             };
-            (clamp01(age / t_ms), alpha_w, alpha_c)
+            (clamp01(age * inv_t_ms), alpha_w, alpha_c)
         };
         let retire = m.retire_alpha(ctx.now);
         let (u, p, root) = if reduced {
             (1.0, 1.0, 0.0)
         } else if let Some(at) = m.retired_at {
             let age_at = ms_since(m.t0, at);
-            let u_at = clamp01(age_at / t_ms);
+            let u_at = clamp01(age_at * inv_t_ms);
             let p_at = enter_at_speed(u_at);
             let after_at = (age_at - t_ms).max(0.0);
             let root_at = if after_at <= 0.0 {
                 0.0
             } else {
-                suck_in(after_at / ROOT_SUCK_MS)
+                suck_in(after_at * (1.0 / ROOT_SUCK_MS))
             };
-            let r = suck_in(ms_since(at, ctx.now) / FLIGHT_RETIRE_MS);
+            let r = suck_in(ms_since(at, ctx.now) * (1.0 / FLIGHT_RETIRE_MS));
             (u_at, p_at, root_at + (p_at - root_at) * r)
         } else {
             let root = if after <= 0.0 {
                 0.0
             } else {
-                suck_in(after / ROOT_SUCK_MS)
+                suck_in(after * (1.0 / ROOT_SUCK_MS))
             };
             (u, enter_at_speed(u), root)
         };
@@ -2376,7 +2438,7 @@ impl Flight {
         let to_go = ((1.0 - p) * l).max(0.0);
 
         let head = (m.x0 + dx * p, m.y0 + dy * p);
-        let thin = 1.0 - (1.0 - THICKNESS_END_SHARE) * clamp01(after / ROOT_SUCK_MS);
+        let thin = 1.0 - (1.0 - THICKNESS_END_SHARE) * clamp01(after * (1.0 / ROOT_SUCK_MS));
         let cw = (ctx.geom.cw as f32).max(1.0);
 
         let travel = head_speed(l, t_ms, u) * SHOULDER_FRAME_MS + 2.0;
@@ -2386,7 +2448,7 @@ impl Flight {
         let close = if reduced {
             0.0
         } else {
-            suck_in(after / WHITE_CLOSE_MS)
+            suck_in(after * (1.0 / WHITE_CLOSE_MS))
         };
         let open = 1.0 - close;
         let white_shoulder = shoulder * open;
@@ -2423,7 +2485,7 @@ impl Flight {
                 1.0 + NUCLEUS_STRETCH_GAIN * (1.0 - u).powf(FLIGHT_ENTER_EXP - 1.0)
             },
             flash: if reduced { 1.0 } else { flash_scale(after) },
-            stride: (l / STATIONS_MAX as f32).max(STATION_STRIDE_MIN_PX),
+            stride: (l * (1.0 / STATIONS_MAX as f32)).max(STATION_STRIDE_MIN_PX),
             axis: Axis::of(dx, dy),
             headless: m.handed_over(),
             after_ms: after,
@@ -2586,11 +2648,14 @@ fn build_stations(
     let inv_white_fall = 1.0 / f.white_fall;
     let inv_white_shoulder = 1.0 / f.white_shoulder.max(1.0);
     let fine = END_EASE_STATIONS as f32;
-    let head_zone = (0..END_EASE_STATIONS).map(|i| ease_head * i as f32 / fine);
+    let inv_fine = 1.0 / fine;
+    let inv_body_n = 1.0 / ((n - 1) as f32);
+    let head_zone = (0..END_EASE_STATIONS).map(|i| ease_head * (i as f32) * inv_fine);
     let body = (0..n)
-        .map(|k| span * (k as f32) / ((n - 1) as f32))
+        .map(|k| span * (k as f32) * inv_body_n)
         .filter(|&s| s >= ease_head && s <= span - ease_tail);
-    let tail_zone = (1..=END_EASE_STATIONS).map(|i| span - ease_tail * (fine - i as f32) / fine);
+    let tail_zone =
+        (1..=END_EASE_STATIONS).map(|i| span - ease_tail * (fine - i as f32) * inv_fine);
     let light_cap = if rail > 0.0 {
         LIGHT_RAIL_ALPHA_CAP
     } else {
@@ -2599,6 +2664,7 @@ fn build_stations(
     let light_peak = (f.colour_cov * LIGHT_INK_GAIN).min(light_cap);
     let rows_off = (m.y1 - m.y0).abs();
     let gain = arc_gain(m.cells);
+    let lay_step = (1.0 / cw) * WALK_LAY_RATE * gain;
     for s in head_zone.chain(body).chain(tail_zone) {
         let end_ease = ends(s);
         if end_ease <= 0.0 {
@@ -2620,23 +2686,34 @@ fn build_stations(
                     } else {
                         light_peak * (-(s - f.shoulder) * inv_colour_fall).exp()
                     };
-                    let cov = ink * alpha * end_ease * shows;
+                    let half = f.width_at(s) * 0.5 * LIGHT_RAIL_SQUASH;
+                    // The paper train's fades along it, in time and at its
+                    // ends narrow it at its whole ink rather than thinning
+                    // its ink over the page: a darkened amber laid thin
+                    // over the paper reads tan and khaki (`b5a053`,
+                    // `cf9859`, `d3a46b`), a red-orange coral, where at its
+                    // whole ink it reads gold (looks7 M2). Its width eases
+                    // along it with the fades, one stick to a point.
+                    let (cov, half, fade) = if square || !clean {
+                        (ink * alpha * end_ease * shows, half, 1.0)
+                    } else {
+                        let (k, half) = dark_clean_taper(
+                            ink / light_peak.max(1.0) * alpha * end_ease,
+                            half,
+                            1.0,
+                        );
+                        (light_peak * k * shows, half, k)
+                    };
                     if cov < 1.0 {
                         continue;
                     }
-                    let stop = spectrum(walk_pace(tri(
-                        m.t_land - (f.to_go + s) / cw * WALK_LAY_RATE * gain
-                    )));
-                    let half = f.width_at(s) * 0.5 * LIGHT_RAIL_SQUASH;
-                    let rgb = if rail > 0.0 {
+                    let stop = spectrum(walk_pace(tri(m.t_land - (f.to_go + s) * lay_step)));
+                    let rgb = if rail > 0.0 && warm {
+                        paper_thread_ink(paper_train_ink(stop, ctx.cfg.theme_bg), fade)
+                    } else if rail > 0.0 {
                         paper_caret_ink(stop, ctx.cfg.theme_bg)
                     } else {
                         paper_ink(stop, ctx.cfg.theme_fg, ctx.cfg.theme_bg, InkRole::OverText)
-                    };
-                    let half = if warm && !square {
-                        half * paper_gold_width(rgb)
-                    } else {
-                        half
                     };
                     (rgb, cov, half)
                 } else {
@@ -2660,9 +2737,7 @@ fn build_stations(
                     if cov < 1.0 {
                         continue;
                     }
-                    let stop = spectrum(walk_pace(tri(
-                        m.t_land - (f.to_go + s) / cw * WALK_LAY_RATE * gain
-                    )));
+                    let stop = spectrum(walk_pace(tri(m.t_land - (f.to_go + s) * lay_step)));
                     let cov = if warm && clean && !square {
                         (cov * dark_warm_gain(stop)).min(255.0)
                     } else {
@@ -2701,7 +2776,7 @@ fn build_stations(
                     let off_print = if printed >= 1.0 {
                         1.0
                     } else {
-                        ((printed - WHITE_PRINTED_SHARE) / (1.0 - WHITE_PRINTED_SHARE))
+                        ((printed - WHITE_PRINTED_SHARE) * (1.0 / (1.0 - WHITE_PRINTED_SHARE)))
                             .clamp(0.0, 1.0)
                     };
                     let (k, half) = dark_clean_taper(fade * off_print, half, 1.0);
@@ -2739,7 +2814,7 @@ fn draw_head(
     f: &Flight,
     ctx: &Ctx<'_>,
     frame: &mut Frame<'_>,
-    (clean, fold): (bool, bool),
+    (clean, fold, coma): (bool, bool, bool),
     text: Behind<'_>,
 ) {
     if f.headless {
@@ -2785,7 +2860,7 @@ fn draw_head(
     let (coma_cov, petal_k, core_cov, core_k) = if clean {
         let level = f.head_cov.clamp(0.0, 255.0);
         let folded = if fold {
-            1.0 - smoothstep01(f.after_ms / HEAD_FOLD_MS)
+            1.0 - smoothstep01(f.after_ms * (1.0 / HEAD_FOLD_MS))
         } else {
             1.0
         };
@@ -2801,21 +2876,31 @@ fn draw_head(
     };
     let (petal_x, petal_y) = (petal_x * petal_k, petal_y * petal_k);
     let from = frame.halos.len();
-    if coma_on && coma_cov >= 1.0 && petal_x.min(petal_y) >= HEAD_LIGHT_MIN_R_PX {
+    if coma && coma_on && coma_cov >= 1.0 && petal_x.min(petal_y) >= HEAD_LIGHT_MIN_R_PX {
         let spin = if ctx.cfg.reduced_motion {
             0.0
         } else {
-            std::f32::consts::TAU * ms_since(m.t0, ctx.now) / COMA_SPIN_MS
+            ms_since(m.t0, ctx.now) * (std::f32::consts::TAU / COMA_SPIN_MS)
         };
         let (orbit_x, orbit_y) = (
             COMA_R_SCALE * COMA_PETAL_ORBIT * rx,
             COMA_R_SCALE * COMA_PETAL_ORBIT * ry,
         );
         let coma_alpha = coma_cov as u8;
-        let step = std::f32::consts::TAU / (COMA_PETALS as f32);
-        for i in 0..COMA_PETALS {
-            let a = spin + step * (i as f32);
-            let (sa, ca) = a.sin_cos();
+        const COMA_PETAL_UNIT: [(f32, f32); COMA_PETALS] = {
+            let mut out = [(0.0f32, 0.0f32); COMA_PETALS];
+            let step = std::f32::consts::TAU / (COMA_PETALS as f32);
+            let mut i = 0;
+            while i < COMA_PETALS {
+                out[i] = crate::supernova::sin_cos_f32(step * (i as f32));
+                i += 1;
+            }
+            out
+        };
+        let (ss, cs) = spin.sin_cos();
+        for (i, &(si, ci)) in COMA_PETAL_UNIT.iter().enumerate() {
+            let ca = cs * ci - ss * si;
+            let sa = ss * ci + cs * si;
             let (px, py) = (cx + orbit_x * ca, cy + orbit_y * sa);
             let rgb = if clean {
                 dark_head_stop_rgb(i)
@@ -2864,22 +2949,24 @@ const fn flash_scale(after_ms: f32) -> f32 {
     }
     let over = FLASH_OVERSHOOT - 1.0;
     if after_ms <= FLASH_MS {
-        let u = clamp01(after_ms / FLASH_MS);
+        let u = clamp01(after_ms * (1.0 / FLASH_MS));
         return 1.0 + over * (1.0 - crate::color_math::powf_pos_f32(1.0 - u, FLIGHT_ENTER_EXP));
     }
-    let v = clamp01((after_ms - FLASH_MS) / (FLASH_RELAX_MS - FLASH_MS));
+    let v = clamp01((after_ms - FLASH_MS) * (1.0 / (FLASH_RELAX_MS - FLASH_MS)));
     1.0 + over * (1.0 - smoothstep01(v))
 }
 
 fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     // On paper the pin would land on the caret's block itself, its arms
     // reading as a strike-through and a tick; the landing's flash marks it.
-    if ctx.cfg.reduced_motion || !ctx.cfg.dark_theme {
+    // A dark peel lands as one train: its pin stood on the new caret as a
+    // crosshair star (looks7 M3).
+    if ctx.cfg.reduced_motion || !ctx.cfg.dark_theme || l.peel() {
         return;
     }
-    let u = clamp01(ms_since(l.pin.at, ctx.now) / PIN_MS);
+    let u = clamp01(ms_since(l.pin.at, ctx.now) * (1.0 / PIN_MS));
     let ch = ctx.geom.ch as f32;
-    let close = smoothstep01((u - PIN_ARM_HOLD_U) / (1.0 - PIN_ARM_HOLD_U));
+    let close = smoothstep01((u - PIN_ARM_HOLD_U) * (1.0 / (1.0 - PIN_ARM_HOLD_U)));
     let arm_scale = if close <= 0.0 {
         1.0
     } else if close >= 1.0 {
@@ -2891,7 +2978,7 @@ fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     let alpha = if u <= PIN_ALPHA_HOLD_U {
         1.0
     } else {
-        1.0 - smoothstep01((u - PIN_ALPHA_HOLD_U) / (1.0 - PIN_ALPHA_HOLD_U))
+        1.0 - smoothstep01((u - PIN_ALPHA_HOLD_U) * (1.0 / (1.0 - PIN_ALPHA_HOLD_U)))
     };
     let cov = TRANSIENT_STAR_COV_CEIL * alpha * clamp01(ctx.cfg.intensity);
     if cov < 1.0 {
@@ -2947,9 +3034,9 @@ fn draw_flash(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         if age >= FLASH_COLOUR_MS {
             return;
         }
-        let turn = smoothstep01(age / FLASH_BURST_MS);
+        let turn = smoothstep01(age * (1.0 / FLASH_BURST_MS));
         let spent = spend(clamp01(
-            (age - FLASH_BURST_MS) / (FLASH_COLOUR_MS - FLASH_BURST_MS),
+            (age - FLASH_BURST_MS) * (1.0 / (FLASH_COLOUR_MS - FLASH_BURST_MS)),
         ));
         (1.0 - turn, turn * spent)
     };
@@ -3028,8 +3115,8 @@ const fn burst_rise_limit(dy: f32, rise_px: f32, half_thick_px: f32) -> f32 {
 
 #[inline]
 #[must_use]
-fn landing_ink_at(l: &Landing, x: f32, cw: f32, page: Option<u32>) -> u32 {
-    let t = l.field((x - l.x) / cw);
+const fn landing_ink_at(l: &Landing, x: f32, inv_cw: f32, page: Option<u32>) -> u32 {
+    let t = l.field((x - l.x) * inv_cw);
     match page {
         Some(bg) => landing_ink_light(t, bg),
         None => landing_ink(t),
@@ -3055,9 +3142,9 @@ fn burst_lance(
         return;
     }
     let clip = ctx.geom.beam_clip();
-    let cw = (ctx.geom.cw as f32).max(1.0);
+    let inv_cw = 1.0 / (ctx.geom.cw as f32).max(1.0);
     let page = light.then_some(ctx.cfg.theme_bg);
-    let hue_at_x = |px: f32| landing_ink_at(l, px, cw, page);
+    let hue_at_x = |px: f32| landing_ink_at(l, px, inv_cw, page);
     let inv_span = 1.0 / span;
     let inv_stations = 1.0 / (BURST_SEC_STATIONS - 1) as f32;
     let light_ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP);
@@ -3140,6 +3227,8 @@ fn burst_jet(
     let page = light.then_some(ctx.cfg.theme_bg);
     let step = burst_step(ch, JET_STEP_CH_SHARE, JET_STEP_PX);
     let sec_end = [root + span * JET_SEC_SHARE[0], tip];
+    let inv_cw = 1.0 / cw;
+    let inv_span = 1.0 / span;
     let mut s0 = root;
     for k in 0..2 {
         let s1 = sec_end[k];
@@ -3149,17 +3238,21 @@ fn burst_jet(
             continue;
         }
         let thick = (JET_SEC_THICK_CH[k] * ch).max(1.0);
-        let stations = ((seg / cw) * JET_STATIONS_PER_CELL as f32).ceil().max(1.0) as usize + 1;
+        let stations = ((seg * inv_cw) * JET_STATIONS_PER_CELL as f32)
+            .ceil()
+            .max(1.0) as usize
+            + 1;
         let denom = (stations - 1) as f32;
-        let w = ((seg / denom).round() as i32).max(1) + 1;
+        let inv_denom = 1.0 / denom;
+        let w = ((seg * inv_denom).round() as i32).max(1) + 1;
         let h = (thick.round() as i32).max(1);
         let (half_w, half_h) = (w / 2, h / 2);
         frame.beams.clear();
         for j in 0..stations {
-            let share = j as f32 / denom;
+            let share = j as f32 * inv_denom;
             let d = s0 + seg * share;
             let dx = dir.0 * d;
-            let cell = (dx / cw).round() as i32;
+            let cell = (dx * inv_cw).round() as i32;
             if !sky.row_blank(cell) {
                 if !light && !frame.beams.is_empty() {
                     comet_beam(frame.out, clip, frame.beams, thick, step, 0.0);
@@ -3167,8 +3260,9 @@ fn burst_jet(
                 }
                 continue;
             }
-            let t_all = ((d - root) / span).clamp(0.0, 1.0);
-            let fade = 1.0 - smoothstep01((t_all - JET_FEATHER_SHARE) / (1.0 - JET_FEATHER_SHARE));
+            let t_all = ((d - root) * inv_span).clamp(0.0, 1.0);
+            let fade =
+                1.0 - smoothstep01((t_all - JET_FEATHER_SHARE) * (1.0 / (1.0 - JET_FEATHER_SHARE)));
             let c = (cov * fade * ink_gain).min(alpha_cap);
             if c < 1.0 {
                 if !light && !frame.beams.is_empty() {
@@ -3178,7 +3272,7 @@ fn burst_jet(
                 continue;
             }
             let px = l.x + dx;
-            let stop = landing_ink_at(l, px, cw, page);
+            let stop = landing_ink_at(l, px, inv_cw, page);
             if light {
                 let rect = (
                     px.round() as i32 - half_w,
@@ -3213,7 +3307,7 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         (1.0, l.static_alpha(ctx.now))
     } else {
         let u = clamp01(ms_since(b.at, ctx.now) / b.ms);
-        let u_spend = clamp01((u - RING_COV_HOLD_U) / (1.0 - RING_COV_HOLD_U));
+        let u_spend = clamp01((u - RING_COV_HOLD_U) * (1.0 / (1.0 - RING_COV_HOLD_U)));
         (1.0 - (1.0 - u).powi(RING_R_EXP), spend(u_spend))
     };
     let cov = RING_COV_SHARE * TRANSIENT_STAR_COV_CEIL * alpha * clamp01(ctx.cfg.intensity);
@@ -3285,7 +3379,7 @@ const fn mint_spark(seed: u32, k: usize, ch: f32) -> Spark {
         std::f32::consts::PI * (SPARK_CONE_SHARE + (1.0 - 2.0 * SPARK_CONE_SHARE) * unit01(s, 2));
     let v = (SPARK_V_MIN_CH_PER_S + (SPARK_V_MAX_CH_PER_S - SPARK_V_MIN_CH_PER_S) * unit01(s, 3))
         * ch
-        / 1000.0;
+        * (1.0 / 1000.0);
     let sizes = SPARK_ARM_MAX_PX - SPARK_ARM_MIN_PX + 1;
     let raw_idx = (sizes as f32 * unit01(s, 4)) as i32;
     let idx = if raw_idx < sizes - 1 {
@@ -3307,7 +3401,7 @@ const fn mint_spark(seed: u32, k: usize, ch: f32) -> Spark {
 #[inline]
 #[must_use]
 const fn spark_at(spark: Spark, age_ms: f32, ch: f32) -> Option<((f32, f32), f32)> {
-    let g = SPARK_G_CH_PER_S2 * ch / 1_000_000.0;
+    let g = SPARK_G_CH_PER_S2 * ch * (1.0 / 1_000_000.0);
     spark_at_with_gravity(spark, age_ms, 0.5 * g * age_ms * age_ms)
 }
 
@@ -3325,7 +3419,7 @@ const fn spark_at_with_gravity(
     let alpha = if u <= SPARK_HOLD_U {
         1.0
     } else {
-        spend((u - SPARK_HOLD_U) / (1.0 - SPARK_HOLD_U))
+        spend((u - SPARK_HOLD_U) * (1.0 / (1.0 - SPARK_HOLD_U)))
     };
     if alpha < CHROMA_CULL_ALPHA {
         return None;
@@ -3348,12 +3442,12 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
     }
     let geom = ctx.geom;
     let ch = geom.ch as f32;
-    let cw = (geom.cw as f32).max(1.0);
+    let inv_cw = 1.0 / (geom.cw as f32).max(1.0);
     let intensity = clamp01(ctx.cfg.intensity);
     if intensity <= 0.0 {
         return;
     }
-    let g = SPARK_G_CH_PER_S2 * ch / 1_000_000.0;
+    let g = SPARK_G_CH_PER_S2 * ch * (1.0 / 1_000_000.0);
     let gravity_dy = 0.5 * g * age * age;
     let light = !ctx.cfg.dark_theme;
     let mut light_stops = [None; SPECTRUM_STOPS];
@@ -3365,7 +3459,7 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
         if cov < 1.0 {
             continue;
         }
-        let stop = spectrum_snap_index(walk_pace(l.field(dx / cw)));
+        let stop = spectrum_snap_index(walk_pace(l.field(dx * inv_cw)));
         let arm0 = i32::from(spark.arm).max(1);
         let arm = if alpha >= SPARK_SHRINK_ALPHA {
             arm0
@@ -3415,7 +3509,7 @@ fn shed(m: &mut Meteor, f: &Flight, ctx: &Ctx<'_>, sown: &mut Vec<Sow>) {
     if m.shed & mask == mask {
         return;
     }
-    let cw = (ctx.geom.cw as f32).max(1.0);
+    let inv_cw = 1.0 / (ctx.geom.cw as f32).max(1.0);
     let passed = f.head_travel_share();
     let t_ms = (m.t_flight.as_secs_f32() * 1000.0).max(1.0);
     let speed = head_speed(f.l, t_ms, f.u);
@@ -3440,7 +3534,7 @@ fn shed(m: &mut Meteor, f: &Flight, ctx: &Ctx<'_>, sown: &mut Vec<Sow>) {
             spec: ShedSow {
                 at_px,
                 v_head,
-                tint_t: m.arc((f.l - s) / cw),
+                tint_t: m.arc((f.l - s) * inv_cw),
                 seed: mix32(m.seed ^ (i as u32).wrapping_mul(0x9E37_79B9)),
                 n: 1,
             },
@@ -3450,12 +3544,14 @@ fn shed(m: &mut Meteor, f: &Flight, ctx: &Ctx<'_>, sown: &mut Vec<Sow>) {
 
 #[inline]
 #[must_use]
-fn spark_room(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> Option<f32> {
-    let (row, col) = hand_floor?;
+const fn spark_room(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> Option<f32> {
+    let Some((row, col)) = hand_floor else {
+        return None;
+    };
     let geom = ctx.geom;
     let ch = (geom.ch as f32).max(1.0);
     let land_row = ((m.y1 - geom.origin_y as f32) / ch).floor();
-    if !land_row.is_finite() || land_row < 0.0 || land_row != f32::from(row) {
+    if !land_row.is_finite() || land_row < 0.0 || land_row != row as f32 {
         return None;
     }
     Some((m.x1 - geom.cell_center(row, col).0).max(0.0))
@@ -3467,15 +3563,9 @@ fn mint_landing(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> La
     let (x, y) = (m.x1, m.y1);
 
     let small = !m.ring;
-    let cells_landing = if small {
-        let drow = (m.y1 - m.y0).abs() / ch.max(1.0);
-        ENTER_LANDING_CELLS_PER_ROW * drow
-    } else {
-        m.cells
-    };
-
     let n = if small {
-        let extra = (cells_landing / ENTER_LANDING_CELLS_PER_ROW).round() as usize;
+        let drow = (m.y1 - m.y0).abs() / ch.max(1.0);
+        let extra = drow.round() as usize;
         (ENTER_LANDING_M3_MIN + extra.min(ENTER_LANDING_M3_MAX - ENTER_LANDING_M3_MIN) + 1)
             .min(super::timing::FAN_MAX_N)
     } else {
@@ -3491,7 +3581,7 @@ fn mint_landing(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> La
     let sparks = if small {
         0
     } else {
-        ((SPARK_N_BASE + m.cells / SPARK_CELLS_PER).round() as usize).min(SPARK_N_MAX)
+        ((SPARK_N_BASE + m.cells * (1.0 / SPARK_CELLS_PER)).round() as usize).min(SPARK_N_MAX)
     };
     let seed = mix32(m.seed ^ 0xFA5E);
     let mut spark = [Spark::EMPTY; SPARK_N_MAX];
@@ -4459,7 +4549,7 @@ mod tests {
                         &f,
                         at,
                         &mut fr,
-                        (clean, fold),
+                        (clean, fold, true),
                         Behind::bodies(keep, true),
                     );
                 }
@@ -6419,12 +6509,16 @@ mod tests {
         m.trains_in_guard = in_guard;
         if let Some(past) = keep {
             let (ox, oy, cw, ch) = (12, 2, 14, 26);
-            // The echo row's letters (`past` cells past its last, at column
-            // 25) and the printed line's (its last at column 18).
-            m.keep_out.set_rows([
-                (ox, ox + (26 + past) * cw, oy + 11 * ch, oy + 12 * ch),
-                (ox, ox + (19 + past) * cw, oy + 12 * ch, oy + 13 * ch),
-            ]);
+            // The echo row's letters (its last at column 25) and the printed
+            // line's (its last at column 18), a dark train's span reaching
+            // `past` cells past them.
+            m.keep_out.set_rows_past(
+                [
+                    (ox, ox + 26 * cw, oy + 11 * ch, oy + 12 * ch),
+                    (ox, ox + 19 * cw, oy + 12 * ch, oy + 13 * ch),
+                ],
+                past * cw,
+            );
         }
         m.on_event(&mv_as((11, 26), (13, 2), Licence::Return), t0, &ctx_g(t0))
             .expect("a Return flies");
@@ -6439,7 +6533,8 @@ mod tests {
     /// (`CursorGlow::keep_out_boxes`), whether or not the train also keeps
     /// clear of the letter guard's reach (`DARK_TRAIN_TEXT_PAD_PX`); with the
     /// span cut at the letters and the train laid into the guard's reach (the
-    /// negative control) a brown stub stands there.
+    /// negative control) a brown stub stands there. The reach is a dark span's
+    /// alone ([`KeepOut::past`]): on paper the stick crosses that cell (looks7 M2).
     #[test]
     fn a_return_leaves_no_stub_at_the_cell_its_line_ended_in() {
         let mut cfg = config();
@@ -6466,11 +6561,10 @@ mod tests {
             peak
         };
         let kept = lift(1, false);
-        let spanned = lift(1, true);
         let stub = lift(0, true);
         assert!(
-            kept <= 12 && spanned <= 12,
-            "the old caret cell lifts by {kept} across the flight ({spanned} in the guard's reach)"
+            kept <= 12,
+            "the old caret cell lifts by {kept} across the flight"
         );
         assert!(
             stub >= 30,
@@ -6538,19 +6632,72 @@ mod tests {
         );
     }
 
-    /// On paper a yellow stop's ink held to the paper's contrast reads mustard,
-    /// so the gallery's `enter-bottom` Return thins out there: no column
-    /// carries more than a thread of mustard or olive; at full width (the
-    /// negative control) the band stands there whole.
+    /// The 8-connected runs of lit pixels in `px` (a pixel off `page` by
+    /// more than `delta` in any channel), their sizes, largest first.
+    fn lit_runs(px: &[u32], w: usize, page: u32, delta: i32) -> Vec<usize> {
+        let lit = |p: u32| {
+            [16u32, 8, 0]
+                .iter()
+                .any(|&sh| (((p >> sh) & 0xff) as i32 - ((page >> sh) & 0xff) as i32).abs() > delta)
+        };
+        let h = px.len() / w;
+        let mut seen = vec![false; px.len()];
+        let mut runs = Vec::new();
+        for start in 0..px.len() {
+            if seen[start] || !lit(px[start]) {
+                continue;
+            }
+            let (mut n, mut stack) = (0usize, vec![start]);
+            seen[start] = true;
+            while let Some(i) = stack.pop() {
+                n += 1;
+                let (x, y) = ((i % w) as i32, (i / w) as i32);
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let (xx, yy) = (x + dx, y + dy);
+                        if xx < 0 || yy < 0 || xx >= w as i32 || yy >= h as i32 {
+                            continue;
+                        }
+                        let k = yy as usize * w + xx as usize;
+                        if !seen[k] && lit(px[k]) {
+                            seen[k] = true;
+                            stack.push(k);
+                        }
+                    }
+                }
+            }
+            runs.push(n);
+        }
+        runs.sort_unstable_by(|a, b| b.cmp(a));
+        runs
+    }
+
+    /// The gallery's judges (looks7 M2, after looks6 round 3): on paper the
+    /// `enter-bottom` Return's stick was cut in two over the printed line's
+    /// blank cell after `fox` (the line's span held a dark train behind the
+    /// cell after its last letter, and the paper train with it), thinned to
+    /// beads on olive necks through its yellow, and its fades laid its
+    /// darkened amber thin over the paper, tan and khaki (`b5a053`,
+    /// `cf9859`, `d3a46b`), as its thread's fade still laid its gold
+    /// (`c79b58`). Along the gallery's Return the stick is one run
+    /// of lit pixels whose width rises to one peak and falls from it (a
+    /// pixel of anti-aliasing aside), and no column's core (its most
+    /// saturated pixel) reads tan or khaki, nor olive but where the walk
+    /// crosses from gold to green, in a few columns. Negative controls: the span held a cell past the
+    /// letters cuts the stick in two; the fades laid as dims read tan; the
+    /// caret's bend walks through the olives.
     #[test]
-    fn a_paper_return_thins_through_its_mustard() {
+    fn a_paper_return_lays_one_clean_stick() {
         let mut cfg = config();
         cfg.dark_theme = false;
         cfg.theme_fg = 0x001F_2328;
         cfg.theme_bg = 0x00FF_FFFF;
-        let thickest = |plain: bool| -> (usize, usize) {
-            let (mut most, mut lit) = (0usize, 0usize);
-            for after in [16u64, 35, 60, 90, 120, 156] {
+        let page = cfg.theme_bg;
+        // (most runs, worst pinch px, tan cores, widest olive crossing in
+        // columns) over the flight.
+        let stick = |past_cell: bool, dims: bool, plain: bool| -> (usize, usize, usize, usize) {
+            let (mut runs, mut pinch, mut tan, mut olive) = (0usize, 0usize, 0usize, 0usize);
+            for after in [20u64, 35, 60, 90, 120, 156] {
                 let g = gallery_geom();
                 let t0 = Instant::now();
                 let ctx_g = |now: Instant| Ctx {
@@ -6558,45 +6705,199 @@ mod tests {
                     ..ctx_at(now, &cfg, (13, 2), 0.25)
                 };
                 let mut m = Meteors::new();
+                m.dims_dark_trains = dims;
                 m.warm_stops_plain = plain;
+                let (ox, oy, cw, ch) = (12, 2, 14, 26);
+                let reach = i32::from(past_cell);
+                m.keep_out.set_rows([
+                    (ox, ox + (26 + reach) * cw, oy + 11 * ch, oy + 12 * ch),
+                    (ox, ox + (19 + reach) * cw, oy + 12 * ch, oy + 13 * ch),
+                ]);
                 m.on_event(&mv_as((11, 26), (13, 2), Licence::Return), t0, &ctx_g(t0))
                     .expect("a Return flies");
                 let mut sc = Scratch::default();
                 sc.emit(&mut m, &ctx_g(t0 + ms(after)));
-                let px = composite_scratch(&sc, g, cfg.theme_bg);
+                // The stick alone: the landing's marks are the sky's.
+                sc.out.clear();
+                sc.halos.clear();
+                let px = composite_scratch(&sc, g, page);
                 let (w, h) = (usize::from(g.win_w), usize::from(g.win_h));
+                runs = runs.max(lit_runs(&px, w, page, 24).len());
+                let mut widths = Vec::new();
+                let mut crossing = 0usize;
                 for x in 0..w {
-                    let (mut mustard, mut band) = (0usize, 0usize);
+                    let (mut n, mut core) = (0usize, None::<(f32, u32)>);
                     for y in 0..h {
                         let p = px[y * w + x];
-                        let (hue, sat, val) = crate::color_math::rgb2hsv(p);
-                        if p == cfg.theme_bg || sat < 0.25 {
+                        let lit = [16u32, 8, 0].iter().any(|&sh| {
+                            (((p >> sh) & 0xff) as i32 - ((page >> sh) & 0xff) as i32).abs() > 24
+                        });
+                        if !lit {
                             continue;
                         }
-                        band += 1;
-                        if (30.0..78.0).contains(&hue) && val < 0.8 {
-                            mustard += 1;
+                        n += 1;
+                        let sat = crate::color_math::rgb2hsv(p).1;
+                        if core.is_none_or(|(s, _)| sat > s) {
+                            core = Some((sat, p));
                         }
                     }
-                    most = most.max(mustard);
-                    lit = lit.max(band);
+                    widths.push(n);
+                    if let Some((sat, p)) = core {
+                        let (hue, _, val) = crate::color_math::rgb2hsv(p);
+                        // A tint of ochre: a warm mid value, half grey.
+                        if (20.0..50.0).contains(&hue) && (0.2..0.6).contains(&sat) && val < 0.86 {
+                            tan += 1;
+                        }
+                        if (48.0..80.0).contains(&hue) && val < 0.85 {
+                            crossing += 1;
+                            olive = olive.max(crossing);
+                        } else {
+                            crossing = 0;
+                        }
+                    } else {
+                        crossing = 0;
+                    }
+                }
+                // Away from its widest column, each column is no wider than
+                // the last but by a pixel of anti-aliasing; a pinch is how
+                // far it narrows before it widens again.
+                let Some(peak) = (0..w).max_by_key(|&x| widths[x]) else {
+                    continue;
+                };
+                for side in [-1i32, 1] {
+                    let mut least = widths[peak];
+                    let mut x = peak as i32 + side;
+                    while x >= 0 && (x as usize) < w && widths[x as usize] > 0 {
+                        let here = widths[x as usize];
+                        least = least.min(here);
+                        pinch = pinch.max(here.saturating_sub(least + 1));
+                        x += side;
+                    }
                 }
             }
-            (most, lit)
+            (runs, pinch, tan, olive)
         };
-        let (thin, lit) = thickest(false);
-        let (wide, wide_lit) = thickest(true);
+        let (runs, pinch, tan, olive) = stick(false, false, false);
+        assert_eq!(runs, 1, "the paper Return's stick falls into {runs} runs");
+        assert_eq!(pinch, 0, "the stick pinches by {pinch} px and widens again");
+        assert_eq!(tan, 0, "{tan} columns of the stick read tan at their core");
         assert!(
-            lit >= 4 && wide_lit >= 4,
-            "fixture: the Return's band is lit"
+            olive <= 4,
+            "the stick reads olive across {olive} columns in a row"
         );
+        let (cut, ..) = stick(true, false, false);
         assert!(
-            thin <= 3,
-            "a column of the paper Return carries {thin} px of mustard or olive"
+            cut >= 2,
+            "control: held a cell past the letters the stick is one run"
         );
+        let (_, _, dim_tan, _) = stick(false, true, false);
         assert!(
-            wide >= 5,
-            "control: at full width the mustard stands only {wide} px"
+            dim_tan >= 10,
+            "control: its fades laid as dims read tan in only {dim_tan} columns"
+        );
+        let (_, _, _, bent) = stick(false, false, true);
+        assert!(
+            bent >= olive + 2,
+            "control: the caret's bend reads olive across only {bent} columns ({olive})"
+        );
+    }
+
+    /// On a dark page a Return's landing lays no pin: its crosshair stood
+    /// on the new caret after the gallery's dark Return, a hairline left of
+    /// the block and a tick on its top (looks7 M3, `e120`). A jump's landing
+    /// (the negative control) pins its caret.
+    #[test]
+    fn a_dark_return_lands_without_a_pin() {
+        let cfg = config();
+        assert!(cfg.dark_theme, "fixture: the page is dark");
+        let t0 = Instant::now();
+        let pin = |licence: Licence| -> usize {
+            let (from, to) = ((5u16, 40u16), (7u16, 2u16));
+            let mut m = Meteors::new();
+            let ctx = ctx_at(t0, &cfg, to, 0.25);
+            let spawn = m
+                .on_event(&mv_as(from, to, licence), t0, &ctx)
+                .expect("a meteor flies");
+            let mut sc = Scratch::default();
+            sc.emit(&mut m, &ctx_at(t0 + spawn.t_flight + ms(4), &cfg, to, 0.25));
+            let l = *m.landings.first().expect("fixture: the meteor landed");
+            let mut n = 0;
+            for after in [8u64, 20, 40, 80] {
+                sc.clear();
+                {
+                    let at = ctx_at(t0 + spawn.t_flight + ms(after), &cfg, to, 0.25);
+                    let mut fr = sc.frame();
+                    draw_pin(&l, &at, &mut fr);
+                }
+                n += sc.out.len() + sc.halos.len();
+            }
+            n
+        };
+        let peel = pin(Licence::Return);
+        assert_eq!(peel, 0, "a dark Return's landing lays {peel} pin lights");
+        assert!(
+            pin(Licence::Nav) > 0,
+            "control: a jump's landing lays no pin"
+        );
+    }
+
+    /// The gallery's judges (looks7 M1): after a dark Return in
+    /// `enter-bottom` coloured dabs floated in the gap under `brown fox`
+    /// and beside the train's head: the head's coma, seven lights orbiting
+    /// it apart, laid where the train passed behind the echo and the
+    /// printed line. Over the gallery's Return (its landing's marks aside)
+    /// the lit pixels are one connected run or none; ringed with its coma
+    /// and laid behind the letters' bodies alone (the negative control),
+    /// they fall apart.
+    #[test]
+    fn a_dark_return_lays_one_train_or_none() {
+        let mut cfg = config();
+        cfg.theme_bg = 0x0011_1318;
+        let page = cfg.theme_bg;
+        let runs = |coma: bool| -> (usize, usize) {
+            let (mut worst, mut lit) = (0usize, 0usize);
+            for after in [10u64, 20, 35, 50, 70, 90, 120, 156, 200] {
+                let g = gallery_geom();
+                let t0 = Instant::now();
+                let ctx_g = |now: Instant| Ctx {
+                    geom: g,
+                    ..ctx_at(now, &cfg, (13, 2), 0.25)
+                };
+                let mut m = Meteors::new();
+                m.peel_coma = coma;
+                let (ox, oy, cw, ch) = (12, 2, 14, 26);
+                m.keep_out.set_rows_past(
+                    [
+                        (ox, ox + 26 * cw, oy + 11 * ch, oy + 12 * ch),
+                        (ox, ox + 19 * cw, oy + 12 * ch, oy + 13 * ch),
+                    ],
+                    cw,
+                );
+                m.on_event(&mv_as((11, 26), (13, 2), Licence::Return), t0, &ctx_g(t0))
+                    .expect("a Return flies");
+                // The flight alone: the landing's marks are the landing's.
+                for me in &mut m.live {
+                    me.landed = true;
+                }
+                let mut sc = Scratch::default();
+                sc.emit(&mut m, &ctx_g(t0 + ms(after)));
+                let px = composite_scratch(&sc, g, page);
+                let n = lit_runs(&px, usize::from(g.win_w), page, 24).len();
+                worst = worst.max(n);
+                lit += usize::from(n > 0);
+            }
+            (worst, lit)
+        };
+        let (worst, lit) = runs(false);
+        assert!(lit >= 4, "fixture: the Return shows in only {lit} frames");
+        assert!(
+            worst <= 1,
+            "the dark Return's light falls into {worst} runs"
+        );
+        let (ringed, _) = runs(true);
+        assert!(
+            ringed >= 3,
+            "control: ringed with its coma it lays only {ringed} runs"
         );
     }
 }

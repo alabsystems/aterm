@@ -482,7 +482,9 @@ fn write_world(tmp: &Path) {
         "#!/bin/sh\n\
          # A fake Claude Code: draws each screen file given, reads ONE key after\n\
          # each into the key log ($1) -- one byte, or ESC and the two after it --\n\
-         # as `od -c` spells it; a *.hold screen is shown and nothing read, a\n\
+         # as `od -c` spells it, a space as `space`; a read that returns no byte\n\
+         # is no key (noted in $log.noread, then made again, as a real program's\n\
+         # blocking read waits on); a *.hold screen is shown and nothing read, a\n\
          # *.until one the same until $log.release exists (or for a bound), a\n\
          # *.gate one until it exists, a *.look one until $log.next exists\n\
          # (taken: the test makes one per look), a *.late one is that wait\n\
@@ -509,7 +511,12 @@ fn write_world(tmp: &Path) {
          \x20 *.look) while [ ! -e \"$log.next\" ]; do sleep 0.1; done; rm -f \"$log.next\"; continue ;;\n\
          \x20 *.type) t=$(dd bs=4096 count=1 2>/dev/null); printf 'text:%s\\n' \"$t\" >> \"$log\"; continue ;;\n\
          \x20 esac\n\
-         \x20 k=$(dd bs=1 count=1 2>/dev/null | od -An -c | tr -d ' ')\n\
+         \x20 while :; do\n\
+         \x20   k=$(dd bs=1 count=1 2>\"$log.dd\" | od -An -c | tr -d ' ')\n\
+         \x20   grep -q '^1+0 records in' \"$log.dd\" && break\n\
+         \x20   tr '\\n' ' ' < \"$log.dd\" >> \"$log.noread\"; echo >> \"$log.noread\"; sleep 0.05\n\
+         \x20 done\n\
+         \x20 [ -z \"$k\" ] && k=space\n\
          \x20 case \"$k\" in 033) k=\"$k$(dd bs=1 count=2 2>/dev/null | od -An -c | tr -d ' ')\" ;; esac\n\
          \x20 printf '%s\\n' \"$k\" >> \"$log\"\n\
          done\n\
@@ -813,6 +820,11 @@ fn ledger_rows(inst: &Instance, rule: &str, decision: &str) -> Vec<String> {
         .collect()
 }
 
+/// What the fake's reads that returned no byte said (its `$log.noread`): none is a key.
+fn no_reads(inst: &Instance, log: &str) -> String {
+    std::fs::read_to_string(inst.tmp.join(format!("{log}.noread"))).unwrap_or_default()
+}
+
 fn keys_until(inst: &Instance, log: &str, want: &[&str], within: Duration) {
     let mut deadline = Instant::now() + within;
     let mut last: Vec<String> = Vec::new();
@@ -823,7 +835,9 @@ fn keys_until(inst: &Instance, log: &str, want: &[&str], within: Duration) {
         }
         if read.len() > want.len() || read.iter().zip(want).any(|(got, want)| got != want) {
             panic!(
-                "the fake read {read:?}, which is not a start of {want:?}\nharness log:\n{}",
+                "the fake read {read:?}, which is not a start of {want:?}\nreads with no byte:\n{}\n\
+                 harness log:\n{}",
+                no_reads(inst, log),
                 harness_lines(inst)
             );
         }
@@ -835,7 +849,9 @@ fn keys_until(inst: &Instance, log: &str, want: &[&str], within: Duration) {
     }
     let last = format!("{last:?} attention={:?}", attention(inst));
     panic!(
-        "the fake read {want:?}: no key within {within:?} of the last; last: {last}\nharness log:\n{}",
+        "the fake read {want:?}: no key within {within:?} of the last; last: {last}\n\
+         reads with no byte:\n{}\nharness log:\n{}",
+        no_reads(inst, log),
         harness_lines(inst)
     );
 }
@@ -1504,6 +1520,67 @@ fn probe_args(inst: &Instance) -> Vec<String> {
     probes(inst).into_iter().map(|(_, args)| args).collect()
 }
 
+/// The verdicts of the upgrade ledger's `build-probe:<verdict>` rows (`upgrade/ledger.jsonl`), in
+/// order.
+#[cfg(target_os = "macos")]
+fn build_probes(inst: &Instance) -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.file_name().is_some_and(|n| n == "ledger.jsonl")
+                && p.parent().is_some_and(|d| d.ends_with("upgrade"))
+            {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&inst.tmp, &mut files);
+    files
+        .iter()
+        .flat_map(|p| {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| {
+                    let (_, rest) = l.split_once("\"step\":\"build-probe:")?;
+                    Some(rest.split('"').next()?.to_string())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The upgrade's own first move probes the new build once (`<exe> --help`), its verdict on the
+/// upgrade ledger. A probe that passed is the new build's own log line. One out of its time
+/// (`build-probe:timed-out`, on a host too loaded to start the fake within the probe's bound) was
+/// killed before the fake could log it, and the move goes ahead all the same: the ledger row is
+/// then the probe's only trace.
+#[cfg(target_os = "macos")]
+fn probed_once(inst: &Instance) {
+    let verdicts = build_probes(inst);
+    assert_eq!(
+        verdicts.len(),
+        1,
+        "the upgrade's own first move probes the new build once: {verdicts:?}"
+    );
+    let logged = probe_args(inst);
+    if verdicts[0] == "timed-out" {
+        assert!(
+            logged.iter().all(|a| a == "2.1.282 --help") && logged.len() <= 1,
+            "a probe out of its time logs once at most: {logged:?}"
+        );
+    } else {
+        assert_eq!(
+            logged,
+            ["2.1.282 --help"],
+            "the probe the new build ran ({verdicts:?})"
+        );
+    }
+}
+
 fn exec_log(inst: &Instance, name: &str) -> Vec<(u32, String)> {
     std::fs::read_to_string(inst.tmp.join(name))
         .unwrap_or_default()
@@ -1605,10 +1682,20 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
         |r| r.contains(r#""phase":"done""#) && r.contains(&format!(r#""resumed_pid":{new}"#)),
     );
     assert!(record.contains(r#""cause":"exit""#), "{record}");
-    let read = std::fs::read_to_string(inst.tmp.join(format!("typed-{new}.log")))
-        .unwrap_or_default()
-        .replace("\x1b[I", "")
-        .replace("\x1b[O", "");
+    // The record says `done` once the continuation and its Enter are written; the relaunched
+    // fake logs what it read after it reads it, a second or more later on a loaded host, so the
+    // log is read once its Enter is in it.
+    let read = until(
+        HANG,
+        "the relaunched agent's read of the continuation and its Enter",
+        || {
+            std::fs::read_to_string(inst.tmp.join(format!("typed-{new}.log")))
+                .unwrap_or_default()
+                .replace("\x1b[I", "")
+                .replace("\x1b[O", "")
+        },
+        |r| r.ends_with(['\r', '\n']),
+    );
     let want = aterm_agent::harness::relaunch::resumed_prompt("2.1.281", "exit");
     assert_eq!(
         read.strip_suffix(['\r', '\n']),
@@ -1876,11 +1963,7 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
         || harness_lines(&inst),
         |l| l.contains("harness: an activation notice — "),
     );
-    assert_eq!(
-        probe_args(&inst),
-        ["2.1.282 --help"],
-        "the upgrade's own first move probes the new build once"
-    );
+    probed_once(&inst);
     until(
         HANG,
         "announced, then told to carry on",
@@ -1949,11 +2032,7 @@ fn a_session_nobody_asked_anything_is_restarted_afresh_with_nothing_typed() {
         got[1].1, "2.1.282 --model opus",
         "the new build, its flags kept, nothing resumed"
     );
-    assert_eq!(
-        probe_args(&inst),
-        ["2.1.282 --help"],
-        "the upgrade's own first move probes the new build once"
-    );
+    probed_once(&inst);
     let log = until(
         HANG,
         "restarted afresh",

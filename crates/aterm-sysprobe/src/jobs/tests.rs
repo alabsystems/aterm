@@ -112,7 +112,9 @@ fn a_vnode_answer_gives_mode_size_identity_and_path() {
         let mut at = path.as_bytes().to_vec();
         at.push(0);
         put(&mut b, darwin::VNODE_PATH_AT, &at);
-        assert_eq!(darwin::vnode(&b).unwrap().terminal(), terminal, "{path}");
+        let v = darwin::vnode(&b).unwrap();
+        assert_eq!(v.terminal(), terminal, "{path}");
+        assert_eq!(v.controlling(), path == "/dev/tty", "{path}");
     }
     put(
         &mut b,
@@ -124,6 +126,8 @@ fn a_vnode_answer_gives_mode_size_identity_and_path() {
         !darwin::vnode(&b).unwrap().terminal(),
         "a file is no terminal"
     );
+    put(&mut b, darwin::VNODE_PATH_AT, b"/dev/tty\0");
+    assert!(!darwin::vnode(&b).unwrap().controlling());
 }
 
 #[test]
@@ -546,6 +550,10 @@ fn io_status_schedstat_and_wchan_parse() {
         linux::parse_wchan("hrtimer_nanosleep"),
         Some("hrtimer_nanosleep".to_owned())
     );
+    assert_eq!(
+        linux::parse_wchan("poll_schedule_timeout.constprop.0"),
+        Some("poll_schedule_timeout".to_owned())
+    );
     assert_eq!(linux::parse_wchan("0"), None);
     assert_eq!(linux::parse_wchan(""), None);
     let [read, write, _, writev] = linux::READ_WRITE;
@@ -809,14 +817,16 @@ fn the_linux_arm_reads_a_fixture_tree() {
         kind(2),
         Some(FdKind::Device {
             tty: true,
-            read: true
+            read: true,
+            ctty: false
         })
     );
     assert_eq!(
         kind(6),
         Some(FdKind::Device {
             tty: true,
-            read: false
+            read: false,
+            ctty: true
         }),
         "`tee /dev/tty` only writes it"
     );
@@ -940,9 +950,24 @@ fn the_tail_check_reads_only_the_appended_bytes() {
 #[cfg(target_os = "macos")]
 #[test]
 fn this_process_reads_itself_with_threads_counters_and_descriptors() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let mut fds = [0 as std::ffi::c_int; 2];
     // SAFETY: two writable descriptors' room.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (mut m, mut s) = (-1, -1);
+    // SAFETY: two writable ints; no name, mode or size is asked for.
+    let rc = unsafe {
+        libc::openpty(
+            &raw mut m,
+            &raw mut s,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: `openpty` opened both, and nothing else owns them.
+    let (_master, follower) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
     let mut reader = JobsReader::new();
     let me = std::process::id();
     let f = reader
@@ -983,6 +1008,17 @@ fn this_process_reads_itself_with_threads_counters_and_descriptors() {
     let (wh, wp, ww) = pipe(fds[1]).expect("the write end");
     assert_eq!((rp, wp), (wh, rh), "each end's peer is the other's handle");
     assert_eq!((rw, ww), (Some(false), Some(true)));
+    assert_eq!(
+        list.iter()
+            .find(|d| d.fd == follower.as_raw_fd())
+            .map(|d| &d.kind),
+        Some(&FdKind::Device {
+            tty: true,
+            read: true,
+            ctty: false
+        }),
+        "a terminal opened by its own name is none opened as `/dev/tty`"
+    );
     // SAFETY: our own descriptors.
     unsafe {
         libc::close(fds[0]);
@@ -1428,10 +1464,14 @@ fn a_stopped_childs_counters_and_threads_read_its_cpu_time_as_wait4_counts_it() 
 
 /// A start-suspended spawn reads one thread whose handle is `0`, stopped and untraced, so its
 /// stop, not its age (read 21 s ahead), keeps it from reading held. The job probe reads the same
-/// facts, and a reader handed a mount table places the executable by that table.
+/// facts, and a reader handed a mount table places the executable by that table. A child runs
+/// translated exactly when this process does (the universal `/bin/sleep` follows its parent's
+/// architecture under Rosetta 2), and a translated one reads as translating, not held.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
+    let translated =
+        aterm_uds::process::translation() == aterm_uds::process::Translation::Translated;
     let held =
         aterm_uds::deadline::Held::start(aterm_uds::spawnfd::command("/bin/sleep").arg("30"))
             .expect("a start-suspended sleep");
@@ -1439,8 +1479,8 @@ fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
     let later = now_us() + 21_000_000;
     let facts = read_start(pid, later).expect("the child reads");
     assert!(
-        facts.lone_zero && facts.stopped && !facts.traced && !facts.translated,
-        "{facts:?}"
+        facts.lone_zero && facts.stopped && !facts.traced && facts.translated == translated,
+        "translated={translated}: {facts:?}"
     );
     assert_eq!(
         facts.local,
@@ -1458,7 +1498,11 @@ fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
             stopped: false,
             ..facts
         }),
-        AtStart::Held,
+        if translated {
+            AtStart::Translating
+        } else {
+            AtStart::Held
+        },
         "its stop, not its age, is what excludes it"
     );
     let f = JobsReader::new()
@@ -1500,11 +1544,15 @@ fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
 }
 
 /// A program stopped by `SIGSTOP` after it ran keeps its threads' handles:
-/// only a process whose thread never ran reads a lone `0`.
+/// only a process whose thread never ran reads a lone `0`. Under Rosetta 2 the child runs
+/// translated, as this process does, and also reads the translator's own thread, whose handle
+/// reads `0`: one such thread at most, beside the program's.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_program_stopped_after_it_ran_keeps_its_thread_handles() {
     use aterm_uds::spawnfd::Stdio;
+    let translated =
+        aterm_uds::process::translation() == aterm_uds::process::Translation::Translated;
     let mut cat = aterm_uds::spawnfd::command("/bin/cat")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1528,10 +1576,11 @@ fn a_program_stopped_after_it_ran_keeps_its_thread_handles() {
     let facts = read_start(pid, now_us() + 21_000_000).expect("the child reads");
     assert!(!facts.lone_zero, "{facts:?} {f:?}");
     assert!(
-        f.threads
-            .as_deref()
-            .is_some_and(|ts| !ts.is_empty() && ts.iter().all(|t| t.id != 0)),
-        "{f:?}"
+        f.threads.as_deref().is_some_and(|ts| {
+            ts.iter().any(|t| t.id != 0)
+                && ts.iter().filter(|t| t.id == 0).count() <= usize::from(translated)
+        }),
+        "translated={translated}: {f:?}"
     );
     assert_eq!(f.start_facts, Some(StartFacts::default()), "{f:?}");
     assert_eq!(f.program_check(), Some(AtStart::Started), "{f:?}");

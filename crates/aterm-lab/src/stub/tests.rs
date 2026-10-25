@@ -746,6 +746,155 @@ fn get(port: &str, path: &str, auth: Option<&str>) -> (u16, String) {
 }
 
 #[test]
+fn a_codex_websocket_probe_leaves_the_finite_post_reply_available() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("policy.json"),
+        r#"{"times":1,"status":400,"json":{"error":{"type":"invalid_request_error","code":"cyber_policy","message":"lab policy refusal"}}}"#,
+    )
+    .unwrap();
+    let (port, _) = start(Args {
+        mode: "policy".into(),
+        modes_dir: Some(dir.path().to_path_buf()),
+        ..Args::default()
+    })
+    .unwrap();
+    let get = |path: &str, headers: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n{headers}\r\n").as_bytes())
+            .unwrap();
+        let mut answer = String::new();
+        s.read_to_string(&mut answer).unwrap();
+        answer
+    };
+    let websocket = "cOnNeCtIoN: cLoSe, UpGrAdE\r\nuPgRaDe: WebSocket\r\n";
+    for (path, headers, status) in [
+        ("/v1/responses", "Connection: close\r\n", 404),
+        (
+            "/v1/responses",
+            "Connection: close\r\nUpgrade: websocket\r\n",
+            404,
+        ),
+        (
+            "/v1/responses",
+            "Connection: close, upgrade\r\nUpgrade: h2c\r\n",
+            404,
+        ),
+        ("/responses", websocket, 404),
+        ("/v1/responses/other", websocket, 404),
+        ("/v1/responses?model=gpt-5.5", websocket, 426),
+        (
+            "/v1/responses",
+            "Connection: close\r\nConnection: upgrade\r\nUpgrade: websocket\r\n",
+            426,
+        ),
+    ] {
+        let answer = get(path, headers);
+        let reason = reason(status);
+        assert!(
+            answer.starts_with(&format!("HTTP/1.1 {status} {reason}\r\n")),
+            "{path}: {answer}"
+        );
+    }
+    let status = J::parse(&control(&port.to_string(), "/__status").unwrap()).unwrap();
+    assert_eq!(status.get("custom_budget").unwrap().get("policy"), None);
+    let client = aterm_http::Client::new(
+        aterm_http::Trust::PlatformVerifier,
+        aterm_http::ProxyMode::Direct,
+        Duration::from_secs(60),
+    );
+    let post = || {
+        client
+            .post(&format!("http://127.0.0.1:{port}/v1/responses"))
+            .send(br#"{"model":"gpt-5.5","stream":true,"input":[{"role":"user","content":"hi"}]}"#)
+            .unwrap()
+    };
+    let refused = post();
+    assert_eq!(refused.status(), 400);
+    let error = J::parse(&String::from_utf8_lossy(refused.body())).unwrap();
+    assert_eq!(
+        error.get("error").unwrap().get("code").and_then(J::as_str),
+        Some("cyber_policy")
+    );
+    let recovered = post();
+    assert_eq!(recovered.status(), 200);
+    assert_eq!(
+        recovered.header("content-type"),
+        Some("text/event-stream; charset=utf-8")
+    );
+    assert!(String::from_utf8_lossy(recovered.body()).contains("event: response.completed\n"));
+}
+
+#[test]
+fn a_wham_usage_read_echoes_only_the_selected_account_header() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let headers_file = dir.path().join("headers.json");
+    // Fixed past deadlines keep payload equality independent of request timing.
+    std::fs::write(
+        &headers_file,
+        r#"{"x-codex-primary-used-percent":"18","x-codex-primary-window-minutes":"300","x-codex-primary-reset-at":"0","x-codex-secondary-used-percent":"30","x-codex-secondary-window-minutes":"10080","x-codex-secondary-reset-at":"0"}"#,
+    )
+    .unwrap();
+    let (port, _) = start(Args {
+        headers_file: Some(headers_file),
+        ..Args::default()
+    })
+    .unwrap();
+    let client = aterm_http::Client::new(
+        aterm_http::Trust::PlatformVerifier,
+        aterm_http::ProxyMode::Direct,
+        Duration::from_secs(60),
+    );
+    let auth = J::parse(&crate::codex::auth_json("A", "acct-lab-1", "pro", 0)).unwrap();
+    let token = auth
+        .get("tokens")
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(J::as_str)
+        .unwrap();
+    let read = |account: Option<&str>| {
+        let mut request = client
+            .get(&format!("http://127.0.0.1:{port}/backend-api/wham/usage"))
+            .header("Authorization", &format!("Bearer {token}"));
+        if let Some(account) = account {
+            request = request.header("ChatGPT-Account-Id", account);
+        }
+        let response = request.send(&[]).unwrap();
+        assert_eq!(response.status(), 200);
+        J::parse(&String::from_utf8_lossy(response.body())).unwrap()
+    };
+    let missing = read(None);
+    assert_eq!(missing.get("account_id"), None);
+    assert_eq!(missing.get("plan_type").and_then(J::as_str), Some("pro"));
+    let limits = J::parse(
+        r#"{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":18,"limit_window_seconds":18000,"reset_after_seconds":0,"reset_at":0},"secondary_window":{"used_percent":30,"limit_window_seconds":604800,"reset_after_seconds":0,"reset_at":0}}"#,
+    )
+    .unwrap();
+    assert_eq!(missing.get("rate_limit"), Some(&limits));
+    assert_eq!(
+        read(Some("")),
+        missing,
+        "an empty header invents no identity"
+    );
+
+    let selected = read(Some("acct-lab-1"));
+    let J::Obj(mut without_identity) = selected.clone() else {
+        panic!("the usage reply must remain an object");
+    };
+    without_identity.retain(|(key, _)| key != "account_id");
+    assert_eq!(
+        J::Obj(without_identity),
+        missing,
+        "selecting the fake account changes no existing quota fields"
+    );
+    assert_eq!(
+        selected.get("account_id").and_then(J::as_str),
+        Some("acct-lab-1"),
+        "the usage read must identify the selected account for durable quota history"
+    );
+}
+
+#[test]
 fn served_on_loopback_it_answers_codex_as_the_modes_say() {
     let dir = std::env::temp_dir().join(format!("lab-stub-codex-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("modes")).unwrap();

@@ -42,8 +42,21 @@ const PERCH_DWELL: f32 = 3.0;
 
 const VETO_DWELL: f32 = 0.25;
 const VETO_FADE: f32 = 0.20;
+const INV_VETO_FADE: f32 = 1.0 / VETO_FADE;
 const VETO_BLIND: f32 = 0.50;
 const Z_DWELL: f32 = VETO_DWELL;
+
+#[inline]
+const fn dur_from_secs_f32(secs: f32) -> Duration {
+    Duration::from_nanos((secs as f64 * 1_000_000_000.0).round() as u64)
+}
+
+const INPUT_HOLD_DUR: Duration = dur_from_secs_f32(INPUT_HOLD);
+const EDIT_HOLD_DUR: Duration = dur_from_secs_f32(EDIT_HOLD);
+const CONTACT_HOLD_DUR: Duration = dur_from_secs_f32(CONTACT_HOLD);
+const RESULT_HOLD_DUR: Duration = dur_from_secs_f32(RESULT_HOLD);
+const PERCH_DWELL_DUR: Duration = dur_from_secs_f32(PERCH_DWELL);
+const Z_DWELL_DUR: Duration = dur_from_secs_f32(Z_DWELL);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaretSeat {
@@ -137,7 +150,7 @@ impl VisibilityHold {
     #[inline]
     const fn ramp(&mut self, dt: f32) -> f32 {
         let target = if self.shown { 1.0 } else { 0.0 };
-        let step = dt / VETO_FADE;
+        let step = dt * INV_VETO_FADE;
         self.cover = if self.cover < target {
             (self.cover + step).min(target)
         } else {
@@ -191,7 +204,7 @@ impl ZHold {
             self.clear_since = None;
         } else if self.under {
             let since = *self.clear_since.get_or_insert(now);
-            if now.saturating_duration_since(since) >= Duration::from_secs_f32(Z_DWELL) {
+            if now.saturating_duration_since(since) >= Z_DWELL_DUR {
                 *self = Self::EMPTY;
             }
         }
@@ -200,8 +213,7 @@ impl ZHold {
 
     #[inline]
     fn deadline(&self) -> Option<Instant> {
-        self.clear_since
-            .map(|since| since + Duration::from_secs_f32(Z_DWELL))
+        self.clear_since.map(|since| since + Z_DWELL_DUR)
     }
 }
 
@@ -478,7 +490,7 @@ impl PetBrain {
                 self.console.repair_target =
                     self.last_caret.map(|(r, c)| (f32::from(r), f32::from(c)));
             }
-            self.console.repair_until = Some(now + Duration::from_secs_f32(EDIT_HOLD));
+            self.console.repair_until = Some(now + EDIT_HOLD_DUR);
         } else {
             self.console.repair_until = None;
             self.console.repair_target = None;
@@ -1554,8 +1566,7 @@ impl PetBrain {
             self.console.result_at = Some((sense.now, failed));
             self.console.source_seq = self.console.completion_seq;
             if failed {
-                self.console.failure_quiet_until =
-                    Some(sense.now + Duration::from_secs_f32(RESULT_HOLD));
+                self.console.failure_quiet_until = Some(sense.now + RESULT_HOLD_DUR);
             }
         }
         if completion.is_some() || self.console.result_at.is_some() {
@@ -2041,7 +2052,7 @@ impl PetBrain {
         self.alpha = if sense.reduced_motion {
             1.0
         } else {
-            (self.alpha + dt / FADE_IN).min(1.0)
+            (self.alpha + dt * (1.0 / FADE_IN)).min(1.0)
         };
         self.last_caret = sense.caret;
         self.quiet += dt;
@@ -2125,7 +2136,7 @@ impl PetBrain {
                         from: (self.col, self.row),
                         to: destination,
                         elapsed: 0.0,
-                        duration: (dist / 22.0).max(0.22),
+                        duration: (dist * (1.0 / 22.0)).max(0.22),
                         hop,
                     }
                 });
@@ -2141,14 +2152,19 @@ impl PetBrain {
                     0.0
                 };
                 let amble = !trip.hop && (trip.to.0 - trip.from.0).abs() <= 2.0;
-                let step = if amble {
-                    LAT_STRIDE_CELLS
+                let inv_step = if amble {
+                    1.0 / LAT_STRIDE_CELLS
                 } else {
-                    STRIDE_CELLS
+                    1.0 / STRIDE_CELLS
                 };
                 self.col = x;
                 self.row = y;
-                self.stride = (self.stride + travelled / step).rem_euclid(1024.0);
+                let next_stride = self.stride + travelled * inv_step;
+                self.stride = if (0.0..1024.0).contains(&next_stride) {
+                    next_stride
+                } else {
+                    next_stride.rem_euclid(1024.0)
+                };
                 self.console.moving = u < 1.0;
                 let arc = PetRect::new(
                     body.row.min(target.row) - 0.25,
@@ -2221,12 +2237,13 @@ impl PetBrain {
                                 || self.pointer_vy != 0.0
                                 || self.pointer_speed != 0.0
                             {
-                                let k = 1.0 - (-dt / DASH_WINDOW).exp();
+                                let k = 1.0 - (-dt * (1.0 / DASH_WINDOW)).exp();
                                 let (vx_inst, vy_inst, inst) = if stationary {
                                     (0.0, 0.0, 0.0)
                                 } else {
-                                    let vx = (px - lx) / dt;
-                                    let vy = (py - ly) / dt;
+                                    let inv_dt = 1.0 / dt;
+                                    let vx = (px - lx) * inv_dt;
+                                    let vy = (py - ly) * inv_dt;
                                     (vx, vy, vx.hypot(vy))
                                 };
                                 self.pointer_vx += (vx_inst - self.pointer_vx) * k;
@@ -2240,12 +2257,11 @@ impl PetBrain {
                             }
                         }
                         self.last_pointer = Some((px, py));
-                        self.pointer_heat =
-                            if self.pointer_speed >= GAZE_FOLLOW_MIN / GAZE_FOLLOW_WINDOW {
-                                (self.pointer_heat + dt * POINTER_RISE).min(1.0)
-                            } else {
-                                (self.pointer_heat - dt * POINTER_FALL).max(0.0)
-                            };
+                        self.pointer_heat = if self.pointer_speed >= GAZE_FOLLOW_SPEED_MIN {
+                            (self.pointer_heat + dt * POINTER_RISE).min(1.0)
+                        } else {
+                            (self.pointer_heat - dt * POINTER_FALL).max(0.0)
+                        };
                     }
                     _ => {
                         self.last_pointer = None;
@@ -2467,8 +2483,9 @@ impl PetBrain {
             && Self::stand_clearance(world, body, true) != Some(false)
         {
             const STEP: f32 = 0.25;
+            const INV_STEP: f32 = 1.0 / STEP;
             let limit = (f32::from(sense_dims.1) - width).max(0.0);
-            let steps = (REST_REACH / STEP) as usize;
+            let steps = (REST_REACH * INV_STEP) as usize;
             let here = Self::console_stand_rect((self.col, self.row), sense_dims.0, width);
             let may = |c: f32| {
                 let rect = Self::console_stand_rect((c, desired.1), sense_dims.0, width);
@@ -2507,8 +2524,9 @@ impl PetBrain {
             };
             if (desired.0 - col).abs() <= REST_REACH && may(col) {
                 const STEP: f32 = 0.25;
+                const INV_STEP: f32 = 1.0 / STEP;
                 let toward = STEP * (col - desired.0).signum();
-                let steps = ((desired.0 - col).abs() / STEP).floor() as usize;
+                let steps = ((desired.0 - col).abs() * INV_STEP).floor() as usize;
                 let wait = (1..=steps)
                     .map(|k| desired.0 + toward * k as f32)
                     .find(|&c| may(c))
@@ -2526,9 +2544,12 @@ impl PetBrain {
                 .max((f32::from(sense_dims.1) - body.col).abs());
             (2.0 * f32::from(sense_dims.0)).hypot(across)
         };
+        const REST_REACH_SQ: f32 = REST_REACH * REST_REACH;
         let keep = |seat: (f32, f32)| {
             let held = Self::console_stand_rect(seat, sense_dims.0, width);
-            ((2.0 * (held.row - body.row)).hypot(held.col - body.col) <= REST_REACH)
+            let dr = 2.0 * (held.row - body.row);
+            let dc = held.col - body.col;
+            (dr * dr + dc * dc <= REST_REACH_SQ)
                 .then(|| world.nearest_clear_perch(held, CLEARANCE, SEAT_KEPT, from))
                 .flatten()
         };
@@ -2557,7 +2578,9 @@ impl PetBrain {
         }
         let keep_under = |seat: (f32, f32)| {
             let held = Self::console_stand_rect(seat, sense_dims.0, width);
-            ((2.0 * (held.row - body.row)).hypot(held.col - body.col) <= REST_REACH)
+            let dr = 2.0 * (held.row - body.row);
+            let dc = held.col - body.col;
+            (dr * dr + dc * dc <= REST_REACH_SQ)
                 .then(|| world.nearest_under_text_perch_from(held, CLEARANCE, SEAT_KEPT, from))
                 .flatten()
         };
@@ -3011,13 +3034,13 @@ impl PetBrain {
         self.console.on_glass = frame.alpha > 0;
         if frame.motes.iter().any(Option::is_some) {
             let min_ch = f32::from(sense.cell_h.max(6));
-            let cw = f32::from(sense.cell_w.max(1));
-            let ch = f32::from(sense.cell_h.max(1));
+            let inv_cw = 1.0 / f32::from(sense.cell_w.max(1));
+            let inv_ch = 1.0 / f32::from(sense.cell_h.max(1));
             for mote in &mut frame.motes {
                 if mote.is_some_and(|m| {
                     let radius = min_ch * m.scale + 1.0;
-                    let rw = radius / cw;
-                    let rh = radius / ch;
+                    let rw = radius * inv_cw;
+                    let rh = radius * inv_ch;
                     !world.clear(
                         PetRect::new(m.row - rh, m.col - rw, 2.0 * rh, 2.0 * rw),
                         CLEARANCE,
@@ -3076,9 +3099,11 @@ impl PetBrain {
                 frame.alpha =
                     (u16::from(frame.alpha) + refused).min(u16::from(frame.lane_alpha)) as u8;
             }
-            let remaining = self.arrive_t / self.arrive_in;
-            if handed > 0.0 && remaining > 0.0 {
-                self.arrive_from = (self.arrive_from + handed / remaining).min(1.0);
+            if handed > 0.0 {
+                let remaining = self.arrive_t / self.arrive_in;
+                if remaining > 0.0 {
+                    self.arrive_from = (self.arrive_from + handed / remaining).min(1.0);
+                }
             }
         }
     }
@@ -3128,30 +3153,18 @@ impl PetBrain {
         if !self.console.presentable {
             return None;
         }
-        let input = self
-            .console
-            .input
-            .map(|e| e.at + Duration::from_secs_f32(INPUT_HOLD));
+        let input = self.console.input.map(|e| e.at + INPUT_HOLD_DUR);
         let contact_recover = self
             .console
             .contact_at
             .map(|at| at + Duration::from_millis(140));
-        let contact = self
-            .console
-            .contact_at
-            .map(|at| at + Duration::from_secs_f32(CONTACT_HOLD));
-        let result = self
-            .console
-            .result_at
-            .map(|(at, _)| at + Duration::from_secs_f32(RESULT_HOLD));
+        let contact = self.console.contact_at.map(|at| at + CONTACT_HOLD_DUR);
+        let result = self.console.result_at.map(|(at, _)| at + RESULT_HOLD_DUR);
         let progress = self
             .console
             .progress_at
             .map(|at| at + Duration::from_millis(350));
-        let perch = self
-            .console
-            .perched_since
-            .map(|at| at + Duration::from_secs_f32(PERCH_DWELL));
+        let perch = self.console.perched_since.map(|at| at + PERCH_DWELL_DUR);
         let floor = self.last_now.unwrap_or(now);
         [
             input,
@@ -3175,8 +3188,7 @@ impl PetBrain {
     pub(super) fn note_console_completion(&mut self, now: Instant, failed: bool) {
         self.console.completion_seq = self.console.completion_seq.wrapping_add(1).max(1);
         self.console.completion = Some((now, failed));
-        self.console.failure_quiet_until =
-            failed.then(|| now + Duration::from_secs_f32(RESULT_HOLD));
+        self.console.failure_quiet_until = failed.then(|| now + RESULT_HOLD_DUR);
     }
 
     #[inline]

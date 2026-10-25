@@ -114,6 +114,48 @@ fn every_host_answer_reads_back_as_written() {
             .expect("an older tape's clean probe"),
         crate::harness::repo_work::RepoRead::Clean
     );
+    for (main_ref, remote) in [("origin/main", true), ("", false)] {
+        let checked =
+            crate::harness::repo_work::RepoRead::Checked(crate::harness::repo_work::CleanAt {
+                repo: "/Users//a/Developer/r".to_string(),
+                head: "3f9a1c2e4b7d".repeat(4)[..40].to_string(),
+                main_ref: main_ref.to_string(),
+                remote,
+            });
+        let bytes = checked.to_tape();
+        assert!(
+            bytes.starts_with(br#"{"at":{"#),
+            "a checked reading is taped under `at`: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        same(Some(checked.clone()));
+        same(checked);
+    }
+    same(None::<crate::harness::repo_work::RepoRead>);
+    same(Some(crate::harness::repo_work::RepoRead::Unread));
+    for (old, read) in [
+        (&b"null"[..], crate::harness::repo_work::RepoRead::Clean),
+        (
+            &b"\"unread\""[..],
+            crate::harness::repo_work::RepoRead::Unread,
+        ),
+        (
+            &br#"{"repo":"/r","changed":1,"untracked":0,"stashes":0,"unpushed":0,"paths":[]}"#[..],
+            crate::harness::repo_work::RepoRead::Found(crate::harness::repo_work::RepoWork {
+                repo: "/r".to_string(),
+                changed: 1,
+                ..Default::default()
+            }),
+        ),
+    ] {
+        assert_eq!(
+            <Option<crate::harness::repo_work::RepoRead> as TapeValue>::from_tape(old)
+                .expect("an answer a tape held before a probe could read on"),
+            Some(read),
+            "{}",
+            String::from_utf8_lossy(old)
+        );
+    }
     same(None::<StandingLimit>);
     same(Some(StandingLimit {
         text: "You've hit your weekly limit · resets 6pm".to_string(),
@@ -493,11 +535,31 @@ fn a_request_names_each_argument() {
     assert!(request(&[]).is_empty());
     let point = IdlePoint {
         done_under_land: true,
+        held: None,
+        theirs: None,
     };
     let text = "a \"quoted\"\nline";
     assert_eq!(
         String::from_utf8(request(&[("point", &point), ("text", &text)])).expect("utf-8"),
-        "point=IdlePoint { done_under_land: true }\ntext=\"a \\\"quoted\\\"\\nline\""
+        "point=IdlePoint { done_under_land: true }\ntext=\"a \\\"quoted\\\"\\nline\"",
+        "a point nothing holds is spelled as tapes recorded before `held` spell it"
+    );
+    let held = IdlePoint {
+        held: Some(Guard::Person),
+        ..point
+    };
+    assert_eq!(
+        String::from_utf8(request(&[("point", &held)])).expect("utf-8"),
+        "point=IdlePoint { done_under_land: true, held: Person }"
+    );
+    let theirs = IdlePoint {
+        held: Some(Guard::Exchange),
+        theirs: Some(Guard::Exchange),
+        ..point
+    };
+    assert_eq!(
+        String::from_utf8(request(&[("point", &theirs)])).expect("utf-8"),
+        "point=IdlePoint { done_under_land: true, held: Exchange, theirs: Exchange }"
     );
 }
 

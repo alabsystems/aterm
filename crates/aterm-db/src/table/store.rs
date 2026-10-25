@@ -7,7 +7,7 @@
 
 use super::{
     Record, Scope, Session,
-    conflict::{Conflict, MAX_CONFLICT},
+    conflict::{Conflict, MAX_CONFLICT, ProofKey},
 };
 use crate::{
     Error, Result,
@@ -33,7 +33,8 @@ use witness::Witness;
 const MAX_RECORDS: usize = 8192;
 const MAX_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CONFLICTS: usize = aterm_secrets::commons::constraints::MAX_BINDINGS;
-const JOURNAL_RECORDS: usize = MAX_RECORDS + MAX_CONFLICTS;
+const DISCARDED_OVERHEAD: usize = 5 + 32 + 4;
+const JOURNAL_RECORDS: usize = MAX_RECORDS * 2 + MAX_CONFLICTS;
 
 #[derive(Clone, Copy)]
 struct Capacity {
@@ -61,9 +62,10 @@ impl Capacity {
     )]
     fn journal(self) -> Limits {
         Limits {
-            records: self.operations + self.conflicts,
-            bytes: self.bytes
-                + self.operations * charge(SUBJECT, 0)
+            records: self.operations * 2 + self.conflicts,
+            bytes: self.bytes * 2
+                + self.operations
+                    * (charge(SUBJECT, 0) + charge(CONFLICT_SUBJECT, DISCARDED_OVERHEAD))
                 + self.conflicts * charge(CONFLICT_SUBJECT, MAX_CONFLICT),
             record_bytes: MAX_CONFLICT + 8,
         }
@@ -79,6 +81,16 @@ const CONFLICT_SUBJECT: &str = "commons/table-conflict/1";
 const ANCHOR_LEN: usize = 5 + super::SCOPE_LEN + 48 + 16;
 const WITNESS_AT: usize = ANCHOR_LEN + 16;
 const CLAIM_LEN: usize = WITNESS_AT + 40;
+
+fn proof_key(actor: Actor, source: Option<Digest>) -> ProofKey {
+    let mut key = [0; 81];
+    key[..48].copy_from_slice(&actor);
+    match source {
+        Some(source) => key[49..].copy_from_slice(&source),
+        None => key[48] = 1,
+    }
+    key
+}
 
 /// First local durable observation; neither field orders distributed history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +123,21 @@ pub struct Quarantined {
     pub authored_ms: u64,
 }
 
+/// Retained evidence for metadata-level restrictions. A decrypted historical
+/// record is not permission to apply it: `catalog_eligible` is the current gate.
+/// An unavailable payload requires conservative handling of that author's
+/// unknown requests. Use `liability_evidence` for finite resource accounting.
+pub struct MetadataEvidence {
+    pub header: Header,
+    /// Direct custody receipt or the negative certificate carrying this source.
+    pub receipt: Receipt,
+    pub roster: Digest,
+    pub epoch: u64,
+    pub authored_ms: u64,
+    pub record: Option<Record>,
+    pub catalog_eligible: bool,
+}
+
 /// One exclusive local replica of one immutable table generation. The index
 /// retains authenticated records and previously witnessed quarantined headers.
 /// Plaintext is decrypted per read. Reopen after a control change; open for a
@@ -129,7 +156,7 @@ pub struct Store {
     operation_bytes: usize,
     index: Index,
     records: BTreeMap<Digest, Stored>,
-    conflicts: BTreeMap<Actor, StoredConflict>,
+    conflicts: BTreeMap<ProofKey, StoredConflict>,
     observation: [u8; 64],
 }
 impl Store {
@@ -335,7 +362,7 @@ impl Store {
             poisoned: false,
             capacity,
             operation_bytes: 0,
-            index: Index::new(MAX_RECORDS),
+            index: Index::new(MAX_RECORDS * 2),
             records: BTreeMap::new(),
             conflicts: BTreeMap::new(),
             observation: session.observation()?,
@@ -351,13 +378,17 @@ impl Store {
                 conflict,
             } = entry;
             if conflict {
-                let conflict = Conflict::authenticate(session, scope, &wire)?;
-                if store.conflicts.len() >= store.capacity.conflicts {
-                    return Err(Error::new("table conflict capacity exhausted"));
+                let conflict = Conflict::restore(session, scope, &wire)?;
+                store.admit_proof(&conflict)?;
+                if let Some(source) = conflict.discarded() {
+                    store
+                        .index
+                        .insert(source.header.clone())
+                        .map_err(|_| Error::new("invalid discarded-source header"))?;
                 }
                 if store
                     .conflicts
-                    .insert(conflict.actor(), StoredConflict { conflict, receipt })
+                    .insert(conflict.key(), StoredConflict { conflict, receipt })
                     .is_some()
                 {
                     return Err(Error::new("duplicate physical table conflict"));
@@ -432,7 +463,12 @@ impl Store {
             count += 1;
             size = size.saturating_add(stored.wire.len());
         }
-        if count >= WRITER_RECORDS || size > WRITER_BYTES {
+        let records = if self.scope == crate::catalog::scope(self.scope.trust()) {
+            crate::catalog::RECORDS_PER_CREATOR
+        } else {
+            WRITER_RECORDS
+        };
+        if count >= records || size > WRITER_BYTES {
             return Err(Error::new("table writer evidence quota exhausted"));
         }
         Ok(())
@@ -447,9 +483,18 @@ impl Store {
             project = "aterm_db::table::store::replay::tests::quarantine_transition"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbSourceReselection",
+            action = "Admit",
+            project = "aterm_db::table::store::replay::tests::conflict::reselection_transition"
+        )
+    )]
     pub fn ingest(&mut self, session: &Session<'_>, wire: &[u8]) -> Result<Receipt> {
         self.check(session)?;
         let record = session.authenticate(self.scope, wire)?;
+        operation_policy(self.scope, record.header(), record.payload().len())?;
         let id = record.header().id;
         if let Some(stored) = self.records.get(&id) {
             if stored.wire != wire {
@@ -458,7 +503,7 @@ impl Store {
             return Ok(stored.receipt);
         }
         if self.conflicted().contains(&record.header().actor) {
-            return Err(Error::new("table actor has contradictory signed history"));
+            return Err(Error::new("table actor has restricted signed history"));
         }
         self.admit(record.header(), wire.len())?;
         let mut proposed = self.index.clone();
@@ -501,8 +546,8 @@ impl Store {
     }
 
     /// Retain negative-only signed evidence independently of operation admission.
-    /// An exact retry returns the original durable receipt. One certificate per
-    /// actor bounds permanent evidence; alternative certificates cannot grow it.
+    /// An exact retry returns its durable receipt. Forks coalesce by actor;
+    /// discarded sources coalesce by source identity under separate quotas.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -522,18 +567,24 @@ impl Store {
     pub fn ingest_conflict(&mut self, session: &Session<'_>, wire: &[u8]) -> Result<Receipt> {
         self.check(session)?;
         let conflict = Conflict::authenticate(session, self.scope, wire)?;
-        if let Some(stored) = self.conflicts.get(&conflict.actor()) {
+        let key = conflict.key();
+        if let Some(stored) = self.conflicts.get(&key) {
             if stored.conflict.wire() != wire {
                 return Err(Error::new("table actor already has a conflict certificate"));
             }
             return Ok(stored.receipt);
         }
-        if self.conflicts.len() >= self.capacity.conflicts {
-            return Err(Error::new("table conflict capacity exhausted"));
+        self.admit_proof(&conflict)?;
+        let mut index = self.index.clone();
+        if let Some(source) = conflict.discarded() {
+            index
+                .insert(source.header.clone())
+                .map_err(|_| Error::new("invalid discarded-source header"))?;
         }
         let receipt = self.append(CONFLICT_SUBJECT, wire, conflict.id())?;
         self.conflicts
-            .insert(conflict.actor(), StoredConflict { conflict, receipt });
+            .insert(key, StoredConflict { conflict, receipt });
+        self.index = index;
         self.poisoned = false;
         Ok(receipt)
     }
@@ -542,37 +593,173 @@ impl Store {
         self.index
             .forks()
             .into_keys()
-            .chain(self.conflicts.keys().copied())
+            .chain(
+                self.conflicts
+                    .values()
+                    .filter(|stored| stored.conflict.discarded().is_none())
+                    .map(|stored| stored.conflict.actor()),
+            )
             .collect()
+    }
+
+    fn quarantined_actors(&self) -> BTreeSet<Actor> {
+        self.records
+            .values()
+            .filter(|record| record.quarantine.is_some())
+            .map(|record| record.header.actor)
+            .chain(
+                self.conflicts
+                    .values()
+                    .filter(|stored| {
+                        stored.conflict.active() && stored.conflict.discarded().is_some()
+                    })
+                    .map(|stored| stored.conflict.actor()),
+            )
+            .collect()
+    }
+
+    fn admit_proof(&self, proof: &Conflict) -> Result<()> {
+        if proof.discarded().is_none() {
+            if self
+                .conflicts
+                .values()
+                .filter(|stored| stored.conflict.discarded().is_none())
+                .count()
+                >= self.capacity.conflicts
+            {
+                return Err(Error::new("table fork evidence capacity exhausted"));
+            }
+            return Ok(());
+        }
+        let sources: Vec<_> = self
+            .conflicts
+            .values()
+            .filter(|stored| stored.conflict.discarded().is_some())
+            .collect();
+        let own: Vec<_> = sources
+            .iter()
+            .filter(|stored| stored.conflict.actor() == proof.actor())
+            .collect();
+        if sources.len() >= self.capacity.operations
+            || sources
+                .iter()
+                .map(|stored| stored.conflict.wire().len())
+                .sum::<usize>()
+                .saturating_add(proof.wire().len())
+                > self.capacity.bytes + self.capacity.operations * DISCARDED_OVERHEAD
+            || own.len() >= WRITER_RECORDS
+            || own
+                .iter()
+                .map(|stored| stored.conflict.wire().len())
+                .sum::<usize>()
+                .saturating_add(proof.wire().len())
+                > WRITER_BYTES + WRITER_RECORDS * DISCARDED_OVERHEAD
+        {
+            return Err(Error::new(
+                "table discarded-source evidence capacity exhausted",
+            ));
+        }
+        Ok(())
     }
 
     /// Identities restricted by native forks or separately retained certificates.
     /// This inventory is distinct from the positive operation inventory.
     pub fn conflict_inventory(&self, session: &Session<'_>) -> Result<BTreeSet<Actor>> {
         self.check(session)?;
-        Ok(self.conflicted())
+        Ok(self
+            .conflicted()
+            .into_iter()
+            .chain(self.quarantined_actors())
+            .collect())
+    }
+
+    /// Proof identity preserves every discarded source and lets a later fork
+    /// supersede quarantine. Knowing one source is not knowing the whole actor.
+    pub fn proof_inventory(&self, session: &Session<'_>) -> Result<BTreeSet<ProofKey>> {
+        self.check(session)?;
+        let forks = self.conflicted();
+        let mut keys: BTreeSet<_> = forks.iter().map(|actor| proof_key(*actor, None)).collect();
+        keys.extend(
+            self.conflicts
+                .values()
+                .filter(|stored| {
+                    stored.conflict.active()
+                        && stored.conflict.discarded().is_some()
+                        && !forks.contains(&stored.conflict.actor())
+                })
+                .map(|stored| stored.conflict.key()),
+        );
+        keys.extend(
+            self.records
+                .values()
+                .filter(|record| {
+                    record.quarantine.is_some() && !forks.contains(&record.header.actor)
+                })
+                .map(|record| proof_key(record.header.actor, Some(record.header.id))),
+        );
+        Ok(keys)
     }
 
     /// Export signed negative evidence without granting either source operation
     /// admission. Native witnesses are derived only from durable retained bytes.
     pub fn conflict_wire(&self, session: &Session<'_>, actor: &Actor) -> Result<Option<Vec<u8>>> {
         self.check(session)?;
-        if let Some(stored) = self.conflicts.get(actor) {
+        let key = self
+            .proof_inventory(session)?
+            .into_iter()
+            .find(|key| &key[..48] == actor);
+        key.map(|key| self.proof_wire(session, &key))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn proof_wire(&self, session: &Session<'_>, key: &ProofKey) -> Result<Option<Vec<u8>>> {
+        self.check(session)?;
+        if let Some(stored) = self
+            .conflicts
+            .get(key)
+            .filter(|stored| stored.conflict.active())
+        {
             return Ok(Some(stored.conflict.wire().to_vec()));
         }
-        self.index
-            .forks()
-            .get(actor)
-            .map(|fork| {
-                Conflict::from_pair(
-                    session,
-                    self.scope,
-                    &self.records[&fork.first].wire,
-                    &self.records[&fork.second].wire,
-                )
-                .map(|conflict| conflict.wire().to_vec())
+        let actor: Actor = key[..48].try_into().unwrap();
+        if key[48] == 1 {
+            return self
+                .index
+                .forks()
+                .get(&actor)
+                .map(|fork| {
+                    let a = self
+                        .source_wire(&fork.first)
+                        .ok_or_else(|| Error::new("missing fork source"))?;
+                    let b = self
+                        .source_wire(&fork.second)
+                        .ok_or_else(|| Error::new("missing fork source"))?;
+                    Conflict::from_pair(session, self.scope, a, b)
+                        .map(|proof| proof.wire().to_vec())
+                })
+                .transpose();
+        }
+        let id: Digest = key[49..].try_into().unwrap();
+        self.records
+            .get(&id)
+            .filter(|stored| stored.quarantine.is_some() && stored.header.actor == actor)
+            .map(|stored| {
+                Conflict::from_discarded(session, self.scope, &stored.wire)
+                    .map(|proof| proof.wire().to_vec())
             })
             .transpose()
+    }
+
+    fn source_wire(&self, id: &Digest) -> Option<&[u8]> {
+        self.records
+            .get(id)
+            .map(|stored| stored.wire.as_slice())
+            .or_else(|| {
+                self.conflicts
+                    .values()
+                    .find_map(|stored| stored.conflict.source_for(id))
+            })
     }
 
     fn publish_witness(&mut self, witness: Witness) -> Result<()> {
@@ -621,6 +808,18 @@ impl Store {
                 "local table writer has contradictory signed history",
             ));
         }
+        if self.quarantined_actors().contains(&self.actor)
+            || self.conflicts.values().any(|stored| {
+                stored.conflict.discarded().is_some_and(|source| {
+                    source.header.actor == self.actor
+                        && !self.records.contains_key(&source.header.id)
+                })
+            })
+        {
+            return Err(Error::new(
+                "local table writer has unavailable source history",
+            ));
+        }
         let projection = self.catalog_projection(session)?;
         let previous = projection
             .ordered
@@ -650,7 +849,11 @@ impl Store {
             return Err(Error::new("local catalog writer is cut off in this table"));
         }
         let previous = previous.map(|h| h.id);
-        let mut parents = projection.heads;
+        let mut parents = if self.scope == crate::catalog::scope(self.scope.trust()) {
+            BTreeSet::new()
+        } else {
+            projection.heads
+        };
         if let Some(id) = previous {
             parents.insert(id);
         }
@@ -699,7 +902,7 @@ impl Store {
             })
             .collect();
         let withheld = self.quarantine_closure();
-        let excluded = self
+        let mut excluded: BTreeSet<_> = self
             .records
             .iter()
             .filter(|(id, stored)| {
@@ -711,6 +914,7 @@ impl Store {
             })
             .map(|(id, _)| *id)
             .collect();
+        excluded.extend(withheld);
         // Keep all witnessed fork evidence restrictive. Filtering the cutoff
         // input must not make a conflicting selected writer valid again.
         Ok(self.index.project_excluding(&excluded))
@@ -725,12 +929,92 @@ impl Store {
             .map(|id| session.authenticate(self.scope, &self.records[id].wire))
             .collect()
     }
+    /// Keep negative application evidence when membership or causal filtering
+    /// withdraws a positive record. Quarantined payloads stay unavailable, with
+    /// their independently witnessed header metadata. Callers must not interpret
+    /// an unavailable payload as absence of a prior request or restriction.
+    pub fn metadata_evidence(&self, session: &Session<'_>) -> Result<Vec<MetadataEvidence>> {
+        let eligible: BTreeSet<_> = self
+            .catalog_projection(session)?
+            .ordered
+            .into_iter()
+            .collect();
+        let mut evidence = self
+            .records
+            .values()
+            .map(|stored| {
+                let record = if stored.quarantine.is_none() {
+                    Some(session.authenticate(self.scope, &stored.wire)?)
+                } else {
+                    None
+                };
+                let (roster, epoch, authored_ms) = match &record {
+                    Some(record) => (*record.roster(), record.epoch(), record.authored_ms()),
+                    None => stored
+                        .quarantine
+                        .expect("unavailable payload has witnessed quarantine metadata"),
+                };
+                Ok(MetadataEvidence {
+                    header: stored.header.clone(),
+                    receipt: stored.receipt,
+                    roster,
+                    epoch,
+                    authored_ms,
+                    record,
+                    catalog_eligible: eligible.contains(&stored.header.id),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for stored in self.conflicts.values() {
+            let Some(source) = stored.conflict.discarded() else {
+                continue;
+            };
+            if self.records.contains_key(&source.header.id) {
+                continue;
+            }
+            let record = if stored.conflict.active() {
+                None
+            } else {
+                let Some(record) = session.negative_record(
+                    self.scope,
+                    stored
+                        .conflict
+                        .source_for(&source.header.id)
+                        .ok_or_else(|| Error::new("discarded source is missing"))?,
+                )?
+                else {
+                    continue;
+                };
+                Some(record)
+            };
+            evidence.push(MetadataEvidence {
+                header: source.header.clone(),
+                receipt: stored.receipt,
+                roster: source.roster,
+                epoch: source.epoch,
+                authored_ms: source.authored_ms,
+                record,
+                catalog_eligible: false,
+            });
+        }
+        Ok(evidence)
+    }
     /// Local operation inventory, including pending, forked and quarantined
     /// records. Certificates have a separate inventory. Neither is a claim of
     /// complete network history.
     pub fn inventory(&self, session: &Session<'_>) -> Result<impl Iterator<Item = &Digest>> {
         self.check(session)?;
         Ok(self.records.keys())
+    }
+    /// Retained positive operations from an actor, including withheld records.
+    /// Application admission limits must not reset when projection hides data.
+    pub fn retained_by(&self, session: &Session<'_>, actor: Actor) -> Result<usize> {
+        self.check(session)?;
+        Ok(self
+            .records
+            .values()
+            .filter(|record| record.header.actor == actor)
+            .count())
     }
     /// Operations eligible for strict peer ingestion. Quarantined records,
     /// conflicting actors and their causal dependents are withheld; negative
@@ -774,11 +1058,17 @@ impl Store {
     fn quarantine_closure(&self) -> BTreeSet<Digest> {
         let mut children: BTreeMap<Digest, Vec<Digest>> = BTreeMap::new();
         let mut writers = BTreeMap::<Actor, BTreeMap<u64, Vec<Digest>>>::new();
-        let mut pending: Vec<_> = self
-            .conflicts
-            .values()
-            .flat_map(|stored| stored.conflict.headers().iter().map(|header| header.id))
-            .collect();
+        let mut pending = Vec::new();
+        for stored in self.conflicts.values() {
+            for header in stored.conflict.headers() {
+                if stored.conflict.discarded().is_none()
+                    || stored.conflict.active()
+                    || !self.records.contains_key(&header.id)
+                {
+                    pending.push(header.id);
+                }
+            }
+        }
         let forked = self.conflicted();
         for (id, stored) in &self.records {
             if stored.quarantine.is_some() || forked.contains(&stored.header.actor) {
@@ -799,10 +1089,9 @@ impl Store {
         while let Some(id) = pending.pop() {
             if excluded.insert(id) {
                 pending.extend(children.get(&id).into_iter().flatten().copied());
-                let Some(stored) = self.records.get(&id) else {
+                let Some(header) = self.index.get(&id) else {
                     continue;
                 };
-                let header = &stored.header;
                 // Dense sequences above an excluded record either depend on it
                 // through a missing link or belong to an unproved competing
                 // branch. If any branch is known to fork, retain all its claims
@@ -816,8 +1105,10 @@ impl Store {
                 if old.is_none_or(|old| floor < old) {
                     let end = old.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
                     pending.extend(
-                        writers[&header.actor]
-                            .range((std::ops::Bound::Included(floor), end))
+                        writers
+                            .get(&header.actor)
+                            .into_iter()
+                            .flat_map(|rows| rows.range((std::ops::Bound::Included(floor), end)))
                             .flat_map(|(_, ids)| ids.iter().copied()),
                     );
                     floors.insert(header.actor, floor);
@@ -841,7 +1132,7 @@ impl Store {
     /// Explicit status for retained records excluded by control recovery.
     pub fn quarantined(&self, session: &Session<'_>) -> Result<Vec<Quarantined>> {
         self.check(session)?;
-        Ok(self
+        let mut quarantined: BTreeMap<_, _> = self
             .records
             .values()
             .filter_map(|stored| {
@@ -855,14 +1146,35 @@ impl Store {
                         authored_ms,
                     })
             })
-            .collect())
+            .map(|record| (record.header.id, record))
+            .collect();
+        for stored in self.conflicts.values() {
+            if !stored.conflict.active() {
+                continue;
+            }
+            if let Some(source) = stored.conflict.discarded() {
+                quarantined
+                    .entry(source.header.id)
+                    .or_insert_with(|| Quarantined {
+                        header: source.header.clone(),
+                        receipt: stored.receipt,
+                        roster: source.roster,
+                        epoch: source.epoch,
+                        authored_ms: source.authored_ms,
+                    });
+            }
+        }
+        Ok(quarantined.into_values().collect())
     }
     /// All retained authenticated records, including catalog-withheld debits.
     /// Quarantine, missing causal history or a missing cutoff frontier makes
     /// this view unavailable. Keep allocations reserved until reconciliation
     /// instead of inferring a refund from incomplete or conflicting evidence.
-    /// A certificate with no retained operation by its actor adds no local
-    /// liability. This view never establishes complete network history.
+    /// A fork certificate with no retained operation by its actor adds no local
+    /// liability. An opaque discarded source might itself contain a debit, so
+    /// it keeps this coarse table-wide view unavailable. Once selected history
+    /// proves that source had no valid payload or writer grant it is harmless.
+    /// This view never establishes complete network history.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -914,15 +1226,51 @@ impl Store {
                 "table liability evidence is quarantined; keep allocations reserved",
             ));
         }
-        // A bound reader can contradict itself without ever having written a
-        // table operation. It must not freeze unrelated liabilities. Affected
-        // retained operations still block interpretation, never disappear.
-        let conflicted = self.conflicted();
+        for stored in self.conflicts.values() {
+            let Some(source) = stored.conflict.discarded() else {
+                continue;
+            };
+            if self.records.contains_key(&source.header.id) {
+                continue;
+            }
+            // Absence of positive custody cannot refund a potential debit.
+            // An obsolete proof can be ignored only after selected history
+            // establishes that its source was never a valid writer payload.
+            if stored.conflict.active()
+                || session
+                    .negative_record(
+                        self.scope,
+                        stored
+                            .conflict
+                            .source_for(&source.header.id)
+                            .ok_or_else(|| Error::new("discarded source is missing"))?,
+                    )?
+                    .is_some()
+            {
+                return Err(Error::new(
+                    "table liability source is unresolved; keep allocations reserved",
+                ));
+            }
+        }
+        // A bound reader's bare fork need not imply any table operation. That
+        // alone cannot freeze unrelated liabilities. Affected retained
+        // operations still block interpretation, never disappear.
+        let conflicted: BTreeSet<_> = self
+            .conflicted()
+            .into_iter()
+            .chain(self.quarantined_actors())
+            .collect();
+        let mut positive = Index::new(MAX_RECORDS);
+        for stored in self.records.values() {
+            positive
+                .insert(stored.header.clone())
+                .map_err(|_| Error::new("invalid liability header"))?;
+        }
         if self
             .records
             .values()
             .any(|stored| conflicted.contains(&stored.header.actor))
-            || !self.index.project().pending.is_empty()
+            || !positive.project().pending.is_empty()
         {
             return Err(Error::new(
                 "table liability graph is incomplete or conflicting; keep allocations reserved",
@@ -965,6 +1313,19 @@ impl Store {
         self.check(session)?;
         Ok(self.records.get(id).map(|stored| stored.receipt))
     }
+}
+
+fn operation_policy(scope: Scope, header: &Header, payload: usize) -> Result<()> {
+    if scope == crate::catalog::scope(scope.trust())
+        && (payload > crate::catalog::MAX_PAYLOAD
+            || header.sequence > crate::catalog::RECORDS_PER_CREATOR as u64
+            || header.parents.iter().copied().ne(header.previous))
+    {
+        return Err(Error::new(
+            "catalog operation exceeds its schema or causal bounds",
+        ));
+    }
+    Ok(())
 }
 fn claims(session: &Session<'_>) -> Result<PathBuf> {
     session

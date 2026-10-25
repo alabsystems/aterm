@@ -728,9 +728,7 @@ pub fn parse_baseline(args: &[String]) -> Result<BaselineArgs, Fail> {
                 .to_string(),
         ));
     }
-    if b.arches.is_empty() {
-        b.arches = Arch::ALL.to_vec();
-    }
+    b.arches = crate::linux_gpu::arches(std::mem::take(&mut b.arches), "baseline")?;
     if b.screens.is_empty() {
         b.screens = Screen::BASELINE.to_vec();
     }
@@ -4088,12 +4086,22 @@ impl Session<'_> {
     fn percentiles(&mut self, journal: &str) {
         let gpu = proof::renderer(journal).unwrap_or("?").to_string();
         self.rec.stack("gpu", &gpu);
+        // The GL arm's windows can draw on another driver than the probe `gpu` names.
+        let windows = proof::window_renderer(journal);
+        if let Some(w) = windows {
+            self.rec.stack("gpu.window", w);
+        }
+        let drew = windows.unwrap_or(&gpu).to_string();
         match self.ctl(&["metrics", "percentiles"]) {
             Ok(m) => {
                 let get = |k: &str| proof::field(&m, k).unwrap_or("?").to_string();
                 self.rec.measured(
                     "present.software",
-                    format!("software rendering ({gpu}): {}", proof::present_summary(&m)),
+                    format!(
+                        "{} ({drew}): {}",
+                        rendering_kind(&drew),
+                        proof::present_summary(&m)
+                    ),
                 );
                 self.rec.measured(
                     "input.software",
@@ -4376,6 +4384,21 @@ fn record_session(
     s.text_input_v3_ime();
     up.stop_units();
     Ok(s.rec)
+}
+
+/// What drew a session's frames, as its `present.software` line names it: Mesa's software
+/// rasterizer (llvmpipe, which lavapipe and zink over lavapipe also name) or a GPU, as zink over
+/// Venus is on the lane's GPU instance (`lab linux --gpu`); neither when the renderer was not
+/// read. The line keeps its recorded name.
+#[must_use]
+pub fn rendering_kind(gpu: &str) -> &'static str {
+    if gpu.contains("llvmpipe") || gpu.contains("softpipe") {
+        "software rendering"
+    } else if gpu.is_empty() || gpu == "?" {
+        "rendering"
+    } else {
+        "GPU rendering"
+    }
 }
 
 /// Summarize the slowest present in `metrics` against the item start timestamps in `marks`.
@@ -4769,6 +4792,29 @@ pub fn cmd_baseline(args: &[String]) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_present_line_names_software_only_for_mesa_s_software_rasterizer() {
+        assert_eq!(
+            rendering_kind("llvmpipe (LLVM 20.1.2, 128 bits) (Gl)"),
+            "software rendering"
+        );
+        assert_eq!(
+            rendering_kind(
+                "zink Vulkan 1.4(llvmpipe (LLVM 20.1.2, 128 bits) (MESA_LLVMPIPE)) (Gl)"
+            ),
+            "software rendering"
+        );
+        assert_eq!(
+            rendering_kind("zink Vulkan 1.3(Virtio-GPU Venus (Apple M4 Pro) (MESA_VENUS)) (Gl)"),
+            "GPU rendering"
+        );
+        assert_eq!(
+            rendering_kind("?"),
+            "rendering",
+            "an unread renderer claims neither"
+        );
+    }
 
     fn rec(lines: &[(Class, &str, &str)]) -> Recording {
         let mut r = Recording::default();

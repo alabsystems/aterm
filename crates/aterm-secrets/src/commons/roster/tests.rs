@@ -292,7 +292,8 @@ fn retirement_rejects_the_entire_unsafe_roster_and_a_fresh_rotation_excludes_the
     // Even an authority-signed, internally consistent roster is unusable if one
     // member is retired. The new epoch itself observes the retirement.
     let members = fixture.grants(2).into_iter().map(|g| g.member).collect();
-    let (unsafe_node, _) = prepare(&ROOT, NETWORK, 2, members, Some(retired.id()), &[]).unwrap();
+    let (unsafe_node, _) =
+        prepare(&ROOT, NETWORK, 2, members, Some(retired.id()), &[], &[]).unwrap();
     fixture.journal.ingest(unsafe_node.bytes()).unwrap();
     assert!(current(&fixture.journal, &fixture.identities[0]).is_err());
     let safe = rotate(
@@ -859,7 +860,7 @@ fn access_transition(state: &aterm_spec::interp::State, action: &str) -> aterm_s
             fixture.journal.ingest(retired.bytes()).unwrap();
             let members = fixture.grants(2).into_iter().map(|g| g.member).collect();
             let (unsafe_node, _) =
-                prepare(&ROOT, NETWORK, 2, members, Some(retired.id()), &[]).unwrap();
+                prepare(&ROOT, NETWORK, 2, members, Some(retired.id()), &[], &[]).unwrap();
             fixture.journal.ingest(unsafe_node.bytes()).unwrap();
             (2, exposed(&fixture, &fixture.identities[0]))
         }

@@ -1157,6 +1157,93 @@ struct HandoffEgressFence<'a> {
     _admission: crate::control::InputRepliesFence<'a>,
 }
 
+#[cfg(unix)]
+struct HandoffClaimSource {
+    expected: crate::session_store::CarriedClaims,
+    ctx: std::sync::Arc<crate::SessionCtx>,
+    topics: Vec<String>,
+}
+
+/// Each handed session needs exactly one drawn claim. The standing fabric hold
+/// fence freezes topics; sample them before taking any timeline guard.
+#[cfg(unix)]
+fn handoff_claim_sources(
+    pool: &crate::SessionPool,
+    live: &[(u64, i32, i32)],
+    drawn: &[crate::session_store::CarriedClaims],
+) -> Option<Vec<HandoffClaimSource>> {
+    if live.len() != drawn.len() {
+        return None;
+    }
+    live.iter()
+        .map(|(id, _, _)| {
+            let mut matches = drawn.iter().filter(|claims| claims.local_id == *id);
+            let expected = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            let ctx = std::sync::Arc::clone(&pool.get(*id)?.ctx);
+            // Topic writers take topics before timeline, so keep this order.
+            let topics = crate::fabric::render_topics(&ctx.fabric.topics());
+            Some(HandoffClaimSource {
+                expected: expected.clone(),
+                ctx,
+                topics,
+            })
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+struct HandoffClaimGuards<'a> {
+    meta: std::sync::MutexGuard<'a, crate::session_timeline::SessionMeta>,
+    timeline: std::sync::MutexGuard<'a, crate::session_timeline::SessionTimeline>,
+    banner: std::sync::MutexGuard<'a, crate::box_banner::Snapshot>,
+}
+
+/// Keep the final claim and metadata comparison true through the atomic Commit write.
+/// No blocking acquisition or callback may sit between this fence and that write.
+#[cfg(unix)]
+fn with_handoff_claims<R>(sources: &[HandoffClaimSource], write: impl FnOnce() -> R) -> Option<R> {
+    fn try_guard<T>(lock: &std::sync::Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
+        match lock.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poison)) => Some(poison.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    let held = sources
+        .iter()
+        .map(|source| {
+            Some(HandoffClaimGuards {
+                meta: try_guard(&source.ctx.meta)?,
+                timeline: try_guard(&source.ctx.timeline)?,
+                banner: source.ctx.box_banner.try_guard()?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let now_us = crate::metrics::now_us();
+    let own_holder = crate::harness_host::holder();
+    for (source, guards) in sources.iter().zip(&held) {
+        if crate::session_store::CarriedClaims::of_guarded(
+            source.expected.local_id,
+            &guards.meta,
+            &guards.timeline,
+            source.topics.clone(),
+            *guards.banner,
+            now_us,
+            &own_holder,
+        ) != source.expected
+        {
+            return None;
+        }
+    }
+    let result = write();
+    drop(held);
+    Some(result)
+}
+
 const EXPECTED_BUILD_ENV: &str = "ATERM_UPDATE_EXPECTED_BUILD";
 const EXPECTED_COMMIT_ENV: &str = "ATERM_UPDATE_EXPECTED_COMMIT";
 const EXPECTED_DIGEST_ENV: &str = "ATERM_UPDATE_EXPECTED_DMG_SHA256";
@@ -4081,6 +4168,16 @@ impl App {
                 "a sudo password prompt is still open",
             ));
         }
+        if self.system_state_handoff_pending() {
+            #[cfg(unix)]
+            return Err(crate::UpdateHandoffStartError::activity(
+                "a System State Apply or Restore is still pending",
+            ));
+            #[cfg(not(unix))]
+            return Err(crate::UpdateHandoffStartError::refused(
+                "a System State Apply or Restore is still pending",
+            ));
+        }
         // A System State Stop whose save has not landed would die with the
         // handoff's `_exit`: it gets the bounded wait a quit gives it, here,
         // before the screen is frozen, and again at the Commit for one clicked
@@ -4811,7 +4908,9 @@ impl App {
         let manifest = stamp_fg_holders(manifest, &fg_holders);
         let manifest = stamp_render_debts(manifest, &render_debts);
         let manifest = stamp_journal_keys(manifest, &self.journal_keys());
-        let manifest = stamp_status_seen(manifest, &self.status_carry_rows());
+        let status = self.status_carry_snapshots();
+        let manifest = stamp_status_seen(manifest, &status);
+        let carried_claims = stamp_claim_banners(carried_claims, &status);
         let manifest = stamp_autopilot_end(manifest, &self.end_carry_rows());
         let manifest = stamp_fleet_told(manifest, self.fleet_told_rows());
 
@@ -6158,6 +6257,9 @@ impl App {
         let Some(prelaunch) = self.update_handoff_prelaunch.as_ref() else {
             return ParkAttempt::NotYet("no attempt is prelaunched");
         };
+        if self.system_state_handoff_pending() {
+            return ParkAttempt::NotYet("a System State Apply or Restore is still pending");
+        }
         let attempt_id = prelaunch.attempt_id;
         let mode = prelaunch.mode;
         let apply_attempt = prelaunch.apply_attempt.clone();
@@ -6432,7 +6534,9 @@ impl App {
         let manifest = stamp_fg_holders(manifest, &fg_holders);
         let manifest = stamp_render_debts(manifest, &render_debts);
         let manifest = stamp_journal_keys(manifest, &self.journal_keys());
-        let manifest = stamp_status_seen(manifest, &self.status_carry_rows());
+        let status = self.status_carry_snapshots();
+        let manifest = stamp_status_seen(manifest, &status);
+        let carried_claims = stamp_claim_banners(carried_claims, &status);
         let manifest = stamp_autopilot_end(manifest, &self.end_carry_rows());
         let manifest = stamp_fleet_told(manifest, self.fleet_told_rows());
         let layout = self.capture_handoff_layout();
@@ -6808,6 +6912,7 @@ impl App {
         }
         let exact_activity = self.update_handoff_activity_epoch == pending_activity_epoch
             && !self.workstation_setup.pending()
+            && !self.system_state_handoff_pending()
             && self.tab_spawns.is_empty()
             && {
                 #[cfg(target_os = "macos")]
@@ -7133,9 +7238,6 @@ impl App {
             if let Some(pid) = child_pid {
                 crate::identity_claim::mark_successor(&carried, pid);
             }
-            if let Some(host) = self.harness.as_ref() {
-                host.suspend();
-            }
             #[cfg(unix)]
             crate::fabric_launch::bye_at_handoff(&self.store, attempt_id);
             let person_stamps = nonce
@@ -7151,6 +7253,8 @@ impl App {
                 .as_ref()
                 .map(|pending| handoff_sinks(&self.pool, &pending.live));
             let replies = crate::control::input_replies_of(&self.store);
+            let mut claims_fence_missed = false;
+            let mut write_attempted = false;
             let commit_result = match sinks
                 .as_deref()
                 .and_then(|sinks| fence_handoff_egress(sinks, &replies))
@@ -7162,9 +7266,48 @@ impl App {
                     Self::audit_connections_left_out(left_out);
                     #[cfg(target_os = "macos")]
                     self.note_launch_left_stage_landing();
-                    Some(crate::seamless::commit_and_exit(commit_fd, proof))
+                    // Activation and audit callbacks may re-enter the host. Acquire only
+                    // after they finish, and release before any failed-Commit rollback.
+                    // Setup's pending fields are GUI-owned; the remaining write path
+                    // dispatches no action or status callback that can change them.
+                    let sources = if self.system_state_handoff_pending() {
+                        None
+                    } else {
+                        self.pending_update_handoff.as_ref().and_then(|pending| {
+                            handoff_claim_sources(
+                                &self.pool,
+                                &pending.live,
+                                &pending.carried_claims,
+                            )
+                        })
+                    };
+                    let committed = sources
+                        .as_deref()
+                        .and_then(|sources| {
+                            with_handoff_claims(sources, || {
+                                let mut write = || {
+                                    write_attempted = true;
+                                    crate::seamless::commit_and_exit(commit_fd, proof)
+                                };
+                                match self.harness.as_ref() {
+                                    Some(host) => host.with_suspended_at_commit(write),
+                                    None => Some(write()),
+                                }
+                            })
+                        })
+                        .flatten();
+                    if committed.is_none() {
+                        claims_fence_missed = true;
+                        facts.exact_activity = false;
+                    }
+                    committed
                 }
             };
+            if write_attempted && let Some(host) = self.harness.as_ref() {
+                // A returned Commit left this process alive. Claim and egress guards
+                // have dropped, so worker interruptions may now settle their cleanup.
+                host.suspend();
+            }
             if commit_result.as_ref().is_some_and(Result::is_err) && !left_out.is_empty() {
                 aterm_log::warn!(
                     "update apply: the Commit was not written, so the {} connection \
@@ -7193,7 +7336,7 @@ impl App {
                     );
                 }
             }
-            if let Some(host) = self.harness.as_ref() {
+            if write_attempted && let Some(host) = self.harness.as_ref() {
                 host.resume();
             }
             if let Some(path) = person_stamps {
@@ -7204,7 +7347,8 @@ impl App {
             }
             match commit_result {
                 Some(Err(_)) => commit_write_failed = true,
-                None => facts.egress_settled = false,
+                None if !claims_fence_missed => facts.egress_settled = false,
+                None => {}
                 Some(Ok(never)) => match never {},
             }
             let _ = arbiter.commit_failed_to_rejecting();
@@ -8456,15 +8600,41 @@ fn stamp_fg_holders(
 #[cfg(unix)]
 fn stamp_status_seen(
     mut manifest: crate::session_store::SessionHandoff,
-    rows: &[(u64, String)],
+    rows: &[(
+        u64,
+        crate::status_item::StatusCarry,
+        crate::box_banner::Snapshot,
+    )],
 ) -> crate::session_store::SessionHandoff {
     for record in &mut manifest.sessions {
         record.status_seen = rows
             .iter()
-            .find(|(local_id, _)| *local_id == record.local_id)
-            .map(|(_, row)| row.clone());
+            .find(|(local_id, _, _)| *local_id == record.local_id)
+            .and_then(|(_, carry, _)| carry.row());
     }
     manifest
+}
+
+#[cfg(unix)]
+fn stamp_claim_banners(
+    claims: Vec<crate::session_store::CarriedClaims>,
+    rows: &[(
+        u64,
+        crate::status_item::StatusCarry,
+        crate::box_banner::Snapshot,
+    )],
+) -> Vec<crate::session_store::CarriedClaims> {
+    claims
+        .into_iter()
+        .map(|claim| {
+            let banner = rows
+                .iter()
+                .find(|(id, _, _)| *id == claim.local_id)
+                .map(|(_, _, banner)| *banner)
+                .unwrap_or_default();
+            claim.with_banner(banner)
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -9003,7 +9173,7 @@ impl App {
         let manifest = stamp_fg_holders(manifest, &fg_holders);
         let manifest = stamp_render_debts(manifest, &render_debts);
         let manifest = stamp_journal_keys(manifest, &self.journal_keys());
-        let manifest = stamp_status_seen(manifest, &self.status_carry_rows());
+        let manifest = stamp_status_seen(manifest, &self.status_carry_snapshots());
         let manifest = stamp_autopilot_end(manifest, &self.end_carry_rows());
         let manifest = stamp_fleet_told(manifest, self.fleet_told_rows());
         let layout = self.capture_handoff_layout();

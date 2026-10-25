@@ -58,8 +58,11 @@ admin (a machine in [admins]):
                                          every one, asked at a terminal), or a key by name
                                          (how a machine joins a <path> vault)
   aterm secrets revoke <host|code> [--drop-sections]
-                                         let a machine go; a section that names only it
+                                         permanently retire its Commons membership,
+                                         then remove it from the vault; a section naming only it
                                          must be empty unless --drop-sections drops it too
+  aterm secrets retire <host|code|age1...>... permanently retire Commons membership alone;
+                                         a full age key can name a device already removed
   aterm secrets admins add|remove <host|code>   (remove also rotates the vault key)
   aterm secrets rotate-key               sign with a new vault key the current one endorses
 server and services:
@@ -171,6 +174,7 @@ enum Command {
         host: String,
         drop_sections: bool,
     },
+    Retire(Vec<String>),
     Admins {
         add: bool,
         host: String,
@@ -568,6 +572,13 @@ fn parse(words: &[String]) -> Result<Command, String> {
             }
             Ok(Command::Approve { which, all, name })
         }
+        "retire" => {
+            if !rest.is_empty() && rest.iter().all(|subject| !subject.starts_with('-')) {
+                Ok(Command::Retire(rest.to_vec()))
+            } else {
+                Err("retire takes hosts, codes, or full age recipients".into())
+            }
+        }
         "revoke" => {
             let f = flags(rest, &[], &["--drop-sections"])?;
             match f.operands.as_slice() {
@@ -744,6 +755,15 @@ mod unix {
                 host,
                 drop_sections,
             } => revoke(&paths, &host, drop_sections),
+            Command::Retire(subjects) => {
+                let admin = client::admin_open(&paths)?;
+                let retired = client::admin_retire(&paths, &admin, &subjects)?;
+                println!(
+                    "Commons membership permanently retired ({} recipients, {} prior device bindings).",
+                    retired.recipients, retired.bindings
+                );
+                Ok(ExitCode::SUCCESS)
+            }
             Command::Admins { add, host } => {
                 let admin = client::admin_open(&paths)?;
                 let mut doc = admin.doc.clone();
@@ -1541,7 +1561,26 @@ mod unix {
         subscriber: &Subscriber<'_>,
     ) -> crate::Result<ExitCode> {
         let import = import.map(|dir| expand(paths, &dir));
-        let created = client::create(paths, source, import.as_deref(), name.as_deref())?;
+        let created = match client::create(paths, source, import.as_deref(), name.as_deref()) {
+            Ok(created) => created,
+            Err(error) => {
+                // The server may have committed a PUT whose reply was lost.
+                // A retained intent needs its subscriber even before the
+                // first source.toml has been installed.
+                if agent && client::creation_pending(paths).unwrap_or(false) {
+                    let approver = approver_here(agent, subscriber);
+                    if let Some(words) = approver_words(&approver, Approval::Password) {
+                        eprintln!("{words}");
+                    }
+                    if approver.runs() {
+                        eprintln!(
+                            "creation is retained locally; this Mac's subscriber will retry it"
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        };
         if !agent {
             record_no_agent(paths, subscriber.state);
         }
@@ -1936,6 +1975,8 @@ mod unix {
                     )?;
                 }
                 doc.set_open(true).map_err(text_error)?;
+                // Opening the vault's bulk prompt is not a pairing-code check
+                // and does not create Manual Commons admission evidence.
                 let done = client::admin_publish(paths, &admin, &doc)?;
                 let code = published("opened the vault", &done);
                 if let Some(words) = lets_in_words(queued, &doc) {
@@ -2117,7 +2158,7 @@ mod unix {
         Ok(ExitCode::SUCCESS)
     }
 
-    fn approve(
+    pub(super) fn approve(
         paths: &Paths,
         which: &[String],
         all: bool,
@@ -2171,15 +2212,32 @@ mod unix {
             return Ok(ExitCode::SUCCESS);
         }
         let mut approved = Vec::with_capacity(chosen.len());
+        let mut recipients = Vec::with_capacity(chosen.len());
         for (recipient, host) in chosen {
-            let host = client::free_name(&doc, &host);
-            doc.add_machine(&host, &recipient).map_err(text_error)?;
+            let host = if let Some(existing) = doc
+                .machines()
+                .into_iter()
+                .find(|m| m.recipient == recipient)
+            {
+                if host != existing.name {
+                    return Err(Error::new(format!(
+                        "that key already belongs to {}; approve it with --name {}",
+                        existing.name, existing.name
+                    )));
+                }
+                existing.name
+            } else {
+                let host = client::free_name(&doc, &host);
+                doc.add_machine(&host, &recipient).map_err(text_error)?;
+                host
+            };
             let code = crate::age::Recipient::parse(&recipient)
                 .map(|r| client::join_code(&r))
                 .unwrap_or_default();
             approved.push(format!("{host} (code {code})"));
+            recipients.push(recipient);
         }
-        let done = client::admin_publish(paths, &admin, &doc)?;
+        let done = client::admin_publish_approved(paths, &admin, &doc, &recipients)?;
         Ok(published(
             &format!("approved {}", approved.join(", ")),
             &done,
@@ -2252,17 +2310,16 @@ mod unix {
 
     fn revoke(paths: &Paths, host: &str, drop_sections: bool) -> crate::Result<ExitCode> {
         let admin = client::admin_open(paths)?;
-        let mut doc = admin.doc.clone();
-        let host = &client::machine_named(&doc, host)?;
-        let held = exposure(&doc, host);
-        if !doc
-            .remove_machine(host, drop_sections)
-            .map_err(text_error)?
-        {
-            return Err(Error::new(format!("no machine {host} in the vault")));
+        let host = &client::machine_named(&admin.doc, host)?;
+        let held = exposure(&admin.doc, host);
+        let done = client::admin_revoke(paths, &admin, host, drop_sections)?;
+        let code = published(&format!("revoked {host}"), &done.published);
+        if let Some(retirement) = done.retirement {
+            println!(
+                "Commons membership permanently retired ({} recipients, {} prior device bindings).",
+                retirement.recipients, retirement.bindings
+            );
         }
-        let done = client::admin_publish(paths, &admin, &doc)?;
-        let code = published(&format!("revoked {host}"), &done);
         if let Some(held) = held {
             println!("{held}");
         }
@@ -2704,6 +2761,38 @@ mod tests {
             Ok(vec![pair("age1k", "m30")])
         );
         assert!(unix::from_queue(&moved, &[code_j.into()], false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_approval_can_record_existing_recipient_without_duplicating_machine() {
+        use crate::client::{self, AdmissionMethod, Paths};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(&root.path().join("m1"));
+        let source = root.path().join("manual.vault");
+        client::create(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+        let recipient = crate::age::Identity::from_secret_bytes([38; 32])
+            .recipient()
+            .to_bech32();
+        for expected_seq in [2, 3] {
+            assert_eq!(
+                unix::approve(
+                    &paths,
+                    std::slice::from_ref(&recipient),
+                    false,
+                    Some("m2".into())
+                )
+                .unwrap(),
+                std::process::ExitCode::SUCCESS
+            );
+            let admin = client::admin_open(&paths).unwrap();
+            assert_eq!(admin.doc.machines().len(), 2);
+            let evidence = admin.commons_admission("m2").unwrap();
+            assert_eq!(evidence.sequence, expected_seq);
+            assert_eq!(evidence.method, AdmissionMethod::Manual);
+        }
+        assert!(unix::approve(&paths, &[recipient], false, Some("wrong-host".into())).is_err());
+        assert_eq!(client::admin_open(&paths).unwrap().seq(), 3);
     }
 
     #[test]
@@ -3525,6 +3614,10 @@ mod tests {
     #[cfg(unix)]
     impl LostAfterThePut {
         fn start() -> LostAfterThePut {
+            Self::start_with_dropped_reply(false)
+        }
+
+        fn start_with_dropped_reply(drop_reply: bool) -> LostAfterThePut {
             use std::io::{Read, Write};
             use std::sync::atomic::Ordering;
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -3563,6 +3656,9 @@ mod tests {
                     let _ = stream.read_exact(&mut body);
                     let status = if head.starts_with("PUT ") {
                         put = true;
+                        if drop_reply {
+                            continue;
+                        }
                         "204 No Content"
                     } else if put {
                         "503 Service Unavailable"
@@ -3593,11 +3689,11 @@ mod tests {
         }
     }
 
-    /// A `create` whose initial sync fails after publishing still succeeds and installs the
-    /// approver.
+    /// A server becoming unavailable after publication does not prevent the
+    /// retained initial envelope from installing locally with its approver.
     #[cfg(unix)]
     #[test]
-    fn a_create_whose_own_sync_fails_still_puts_the_approver_in() {
+    fn a_create_installs_locally_when_the_server_stops_answering_after_put() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let installs = std::cell::Cell::new(0);
         let install = || {
@@ -3623,24 +3719,48 @@ mod tests {
             status.config.map(|config| config.source),
             Some(crate::transport::Source::Url(lost.url.clone()))
         );
-        assert_eq!(
+        assert!(matches!(
             status.membership,
-            crate::client::Membership::Pending,
-            "not synced yet"
-        );
+            crate::client::Membership::In { seq: 1, .. }
+        ));
         lost.end();
 
         let lost = LostAfterThePut::start();
         let other = crate::client::Paths::for_home(&root.path().join("mb"));
         let created = crate::client::create(&other, &lost.url, None, Some("mb")).expect("created");
-        assert!(
-            created
-                .local
-                .as_ref()
-                .is_some_and(|why| why.contains("503")),
-            "{:?}",
-            created.local
+        assert_eq!(
+            created.local, None,
+            "installs from retained authenticated bytes"
         );
+        lost.end();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lost_creation_reply_still_starts_its_recovery_subscriber() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = crate::client::Paths::for_home(&root.path().join("m1"));
+        let installs = std::cell::Cell::new(0);
+        let install = || {
+            installs.set(installs.get() + 1);
+            Ok("played: installed".to_string())
+        };
+        let absent = || Ok(crate::service::State::Absent);
+        let lost = LostAfterThePut::start_with_dropped_reply(true);
+        assert!(
+            unix::create(
+                &paths,
+                &lost.url,
+                None,
+                Some("m1".into()),
+                true,
+                &played(&absent, &install)
+            )
+            .is_err()
+        );
+        assert_eq!(installs.get(), 1);
+        assert!(crate::client::creation_pending(&paths).unwrap());
+        assert!(crate::client::config(&paths).unwrap().is_none());
         lost.end();
     }
 

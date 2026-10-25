@@ -39,6 +39,13 @@ aterm-bootstrap-verify = { workspace = true }
 # The x86_64 slice's Rosetta session holds an `aterm_uds::lifeline`: a cut killed
 # mid-drive takes the translated instance with it.
 aterm-uds = { workspace = true }
+# The Trust lane reads the host's load while each check runs (`load_average`): the judge
+# files a shortfall as the clock's only for a starved run. Already in the graph through
+# aterm-uds.
+aterm-sysprobe = { workspace = true }
+# The trust lane's run lock: a lock file that names its holder, and the wait on a held one
+# (`named_lock`). Std only, and already in the graph through atpkg.
+aterm-toolchain = { workspace = true }
 # The cutter builds with the toolchain atpkg installs, so it resolves the store the
 # same way atpkg does rather than guessing at a path.
 atpkg = { workspace = true }

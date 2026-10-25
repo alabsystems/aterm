@@ -28,6 +28,13 @@ pub const FLYING_LOOKBACK_MS: f32 = 250.0;
 /// The squint holds 200 ms past the arrival edge (§7.2, row "Eyes").
 pub const FLYING_SQUINT_TAIL_MS: f32 = 200.0;
 
+const FLYING_LOOKBACK_DUR: std::time::Duration = std::time::Duration::from_nanos(
+    ((FLYING_LOOKBACK_MS * (1.0 / 1000.0)) as f64 * 1_000_000_000.0).round() as u64,
+);
+const FLYING_SQUINT_TAIL_DUR: std::time::Duration = std::time::Duration::from_nanos(
+    ((FLYING_SQUINT_TAIL_MS * (1.0 / 1000.0)) as f64 * 1_000_000_000.0).round() as u64,
+);
+
 /// Which body owns this frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Body {
@@ -110,14 +117,18 @@ impl Flight {
     #[inline]
     #[must_use]
     pub fn squint_until(&self) -> Instant {
-        add_ms(self.land_at, FLYING_SQUINT_TAIL_MS)
+        self.land_at
+            .checked_add(FLYING_SQUINT_TAIL_DUR)
+            .unwrap_or(self.land_at)
     }
 
     /// The 1-px look-back toward the launch ends here ([`FLYING_LOOKBACK_MS`] after arrival).
     #[inline]
     #[must_use]
     pub fn settled_at(&self) -> Instant {
-        add_ms(self.land_at, FLYING_LOOKBACK_MS)
+        self.land_at
+            .checked_add(FLYING_LOOKBACK_DUR)
+            .unwrap_or(self.land_at)
     }
 }
 
@@ -500,6 +511,7 @@ impl PetOnGlass {
         if cw <= 0.0 {
             return None;
         }
+        let inv_cw = 1.0 / cw;
         let (ox, oy) = (geom.origin_x as i32, geom.origin_y as i32);
         let row_u32 = frame.row.round().max(0.0) as u32;
         let row = if row_u32 <= u16::MAX as u32 {
@@ -509,8 +521,8 @@ impl PetOnGlass {
         };
         Some((
             Self {
-                col: x0 as f32 / cw,
-                width: (x1 - x0) as f32 / cw,
+                col: x0 as f32 * inv_cw,
+                width: (x1 - x0) as f32 * inv_cw,
                 row,
                 settled: frame.action.settled(),
                 purr: frame.purr,
@@ -619,6 +631,9 @@ pub struct KeepOut {
     /// Each lettered row's span, first lettered or filled cell to last, a
     /// row tall ([`Self::behind_text`]).
     rows: Vec<(i32, i32, i32, i32)>,
+    /// How far past its last letter a row's span reaches for a light kept
+    /// clear of the letter guard's reach, px ([`Self::past`]).
+    past: i32,
 }
 
 impl Default for KeepOut {
@@ -635,6 +650,7 @@ impl Clone for KeepOut {
             boxes: self.boxes.clone(),
             cells: self.cells.clone(),
             rows: self.rows.clone(),
+            past: self.past,
         }
     }
 
@@ -643,6 +659,7 @@ impl Clone for KeepOut {
         self.boxes.clone_from(&source.boxes);
         self.cells.clone_from(&source.cells);
         self.rows.clone_from(&source.rows);
+        self.past = source.past;
     }
 }
 
@@ -652,6 +669,7 @@ impl KeepOut {
         boxes: Vec::new(),
         cells: Vec::new(),
         rows: Vec::new(),
+        past: 0,
     };
     /// This frame's boxes, window pixels, all of them lettered or filled
     /// cells ([`Self::set_split`] with no icon).
@@ -680,22 +698,50 @@ impl KeepOut {
     /// lettered or filled cell to its last, the row's whole height.
     #[inline]
     pub fn set_rows(&mut self, rows: impl IntoIterator<Item = (i32, i32, i32, i32)>) {
+        self.set_rows_past(rows, 0);
+    }
+
+    /// [`Self::set_rows`], each span reaching `past` px beyond its last
+    /// letter for a light kept clear of the letter guard's reach
+    /// ([`Self::past`]): a cell, where the row's caret stood when it was
+    /// typed.
+    #[inline]
+    pub fn set_rows_past(
+        &mut self,
+        rows: impl IntoIterator<Item = (i32, i32, i32, i32)>,
+        past: i32,
+    ) {
         self.rows.clear();
         self.rows
             .extend(rows.into_iter().filter(|b| b.0 < b.1 && b.2 < b.3));
+        self.past = past.max(0);
     }
 
-    /// The lettered rows' spans ([`Self::set_rows`]).
+    /// The lettered rows' spans ([`Self::set_rows`]), each to its last letter.
     #[inline]
     #[must_use]
     pub const fn rows(&self) -> &[(i32, i32, i32, i32)] {
         self.rows.as_slice()
     }
 
+    /// How far past its last letter a row's span reaches for a dark train,
+    /// which keeps clear of the letter guard's reach, px: the cell after the
+    /// last letter, where its caret stood, so a Return's root there is held
+    /// behind the line (looks6 round 3's brown stub). A paper train passes
+    /// behind the letters' bodies alone: held behind that cell too, the
+    /// printed line's blank cell after `fox` cut the paper Return's stick in
+    /// two (looks7 M2).
+    #[inline]
+    #[must_use]
+    pub const fn past(&self) -> i32 {
+        self.past
+    }
+
     /// How much of a light at `(x, y)` shows in front of the letters: 0
     /// inside a lettered row's span between `band`'s shares of its height
-    /// (its letters' bodies, the cap line to the baseline), widened by
-    /// `pad` px on every side, 1 clear of it, eased over `feather` px
+    /// (its letters' bodies, the cap line to the baseline), reaching `past`
+    /// px beyond its last letter and widened by `pad` px on every side, 1
+    /// clear of it, eased over `feather` px
     /// inside its edges. A thread laid across a word passes behind its
     /// letters instead of striking them through, and with no `pad` shows
     /// again below their baseline.
@@ -705,7 +751,7 @@ impl KeepOut {
         &self,
         (x, y): (f32, f32),
         band: (f32, f32),
-        pad: f32,
+        (pad, past): (f32, f32),
         feather: f32,
     ) -> f32 {
         let rows = self.rows.as_slice();
@@ -719,7 +765,7 @@ impl KeepOut {
         while i < rows.len() {
             let (x0, x1, y0, y1) = rows[i];
             i += 1;
-            let (x0, x1) = (x0 as f32 - pad, x1 as f32 + pad);
+            let (x0, x1) = (x0 as f32 - pad, x1 as f32 + past + pad);
             let dx = (x - x0).min(x1 - x);
             if dx <= 0.0 {
                 continue;
@@ -922,14 +968,6 @@ pub const fn cell_ink(
     let line = cells[r].as_slice();
     let c = col as usize;
     Some(c < line.len() && !matches!(line[c].ch, ' ' | '\0'))
-}
-
-/// `at + ms`, saturating. The module's one ms-to-`Instant` conversion, so nothing rounds to
-/// whole milliseconds and lands a frame early.
-#[inline]
-fn add_ms(at: Instant, ms: f32) -> Instant {
-    at.checked_add(std::time::Duration::from_secs_f32(ms / 1000.0))
-        .unwrap_or(at)
 }
 
 #[cfg(test)]

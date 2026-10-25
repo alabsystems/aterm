@@ -36,6 +36,51 @@ use crate::word_decorations::{DecoConfig, EffectGeom, Resolved, SelView, WordDec
 /// The symbols a US layout types with Shift held.
 const WEB_SHIFTED_SYMBOLS: &str = "~!@#$%^&*()_+{}|:\"<>?";
 
+#[inline]
+const fn is_web_shifted_symbol(b: u8) -> bool {
+    matches!(
+        b,
+        b'~' | b'!'
+            | b'@'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'^'
+            | b'&'
+            | b'*'
+            | b'('
+            | b')'
+            | b'_'
+            | b'+'
+            | b'{'
+            | b'}'
+            | b'|'
+            | b':'
+            | b'"'
+            | b'<'
+            | b'>'
+            | b'?'
+    )
+}
+
+const _: () = {
+    let bytes = WEB_SHIFTED_SYMBOLS.as_bytes();
+    let mut b = 0u8;
+    while b <= 127 {
+        let mut in_slice = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b {
+                in_slice = true;
+                break;
+            }
+            i += 1;
+        }
+        assert!(is_web_shifted_symbol(b) == in_slice);
+        b += 1;
+    }
+};
+
 /// The glyph class a committed web character carries to the rainbow engine.
 #[inline]
 #[must_use]
@@ -168,6 +213,14 @@ pub struct EffectsPipeline {
     /// light on the word icons ([`Self::shade_word_icons`]).
     #[cfg(test)]
     word_icons_unshaded: bool,
+    /// A test's negative control: a frame whose host hands no cells runs its
+    /// word pass but names none of its icons ([`Self::note_word_icons`]).
+    #[cfg(test)]
+    word_icons_unnamed: bool,
+    /// A test's negative control: the pet's veil drawn in the trail's step,
+    /// by the body the pet drew a frame before ([`Self::veil_pet_letters`]).
+    #[cfg(test)]
+    pet_veil_stale: bool,
     /// The opaque comet's own colour, where `set_cursor_trail` gave one.
     trail_body_color: Option<u32>,
     /// Keystrokes noted since the last [`Self::advance`], replayed evenly across its `dt`.
@@ -308,6 +361,10 @@ impl EffectsPipeline {
             block_fill: None,
             #[cfg(test)]
             word_icons_unshaded: false,
+            #[cfg(test)]
+            word_icons_unnamed: false,
+            #[cfg(test)]
+            pet_veil_stale: false,
             pending_keys: 0,
             row_probe_scratch: Vec::new(),
             flying_sky_row: None,
@@ -412,8 +469,9 @@ impl EffectsPipeline {
             self.pending_keys = 0;
             let dt = self.clock - prev;
             let mut newest = self.t0 + self.clock;
+            let inv_n = 1.0 / f64::from(n);
             for i in 1..=n {
-                let at = self.t0 + prev + dt.mul_f64(f64::from(i) / f64::from(n));
+                let at = self.t0 + prev + dt.mul_f64(f64::from(i) * inv_n);
                 self.cursor.cadence.on_keystroke(at);
                 self.cursor.momentum.on_key(at, MOMENTUM_GLOW_TAU_S);
                 self.cursor.glow.note_typed_cells(at, 1);
@@ -603,8 +661,8 @@ impl EffectsPipeline {
             rain.note_keystroke();
         }
         let class = web_typed_class(ch);
-        let shifted = class == TypedClass::Capital
-            || (ch.is_ascii() && WEB_SHIFTED_SYMBOLS.as_bytes().contains(&(ch as u8)));
+        let shifted =
+            class == TypedClass::Capital || (ch.is_ascii() && is_web_shifted_symbol(ch as u8));
         self.cursor
             .glow
             .note_typed_glyph(now, width as u16, shifted, class);
@@ -766,7 +824,7 @@ impl EffectsPipeline {
     /// The glow's config from the page's last [`Self::set_cursor_glow`] and its trail colour
     /// ([`crate::cursor_fx::resolve_glow_config`]).
     #[inline]
-    fn resolve_glow(&mut self) {
+    const fn resolve_glow(&mut self) {
         let Some(request) = self.glow_request else {
             return;
         };
@@ -812,7 +870,7 @@ impl EffectsPipeline {
     /// guard (`CursorGlow::set_letter_guard`).
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    pub fn set_letter_guard(&mut self, on: bool) {
+    pub const fn set_letter_guard(&mut self, on: bool) {
         self.cursor.glow.set_letter_guard(on);
     }
 
@@ -828,8 +886,72 @@ impl EffectsPipeline {
     /// no ramp along the row (`CursorGlow::set_letter_guard_ramp`).
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    pub fn set_letter_guard_ramp(&mut self, on: bool) {
+    pub const fn set_letter_guard_ramp(&mut self, on: bool) {
         self.cursor.glow.set_letter_guard_ramp(on);
+    }
+
+    /// A test's negative control: a word gap climbs the letter guard's ramp
+    /// from each of its letters (`CursorGlow::set_letter_guard_word_gaps`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_word_gaps(&mut self, on: bool) {
+        self.cursor.glow.set_letter_guard_word_gaps(on);
+    }
+
+    /// A test's negative control: a dim letter's bar at its bare share, the
+    /// letter guard keeping no room over it (`CursorGlow::set_letter_guard_room`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_room(&mut self, on: bool) {
+        self.cursor.glow.set_letter_guard_room(on);
+    }
+
+    /// A test's negative control: the pet's veil laid over every light, not
+    /// beneath them (`CursorGlow::set_pet_veil_beneath`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_pet_veil_beneath(&mut self, on: bool) {
+        self.cursor.glow.set_pet_veil_beneath(on);
+    }
+
+    /// A test's negative control: the letter guard's cut pieces rounded to
+    /// the nearest byte (`CursorGlow::set_letter_guard_cuts_rounded`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_cuts_rounded(&mut self, on: bool) {
+        self.cursor.glow.set_letter_guard_cuts_rounded(on);
+    }
+
+    /// A test's negative control: the letter guard feathers its cuts into a
+    /// rail laid clear of the ring (`CursorGlow::set_letter_guard_rails_clear`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_rails_clear(&mut self, on: bool) {
+        self.cursor.glow.set_letter_guard_rails_clear(on);
+    }
+
+    /// A test's negative control: a lit page's bed laid at the page's
+    /// luminance in the air too (`CursorGlow::set_bed_air_light`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_bed_air_light(&mut self, on: bool) {
+        self.cursor.glow.set_bed_air_light(on);
+    }
+
+    /// A test's negative control: a bed sample in the air by its own cell's
+    /// text alone (`CursorGlow::set_bed_air_beside_text`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_bed_air_beside_text(&mut self, on: bool) {
+        self.cursor.glow.set_bed_air_beside_text(on);
+    }
+
+    /// A test's negative control: the dark bed held to its budget alone,
+    /// never lit at the page's luminance (`CursorGlow::set_bed_page_lit`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_bed_page_lit(&mut self, on: bool) {
+        self.cursor.glow.set_bed_page_lit(on);
     }
 
     /// Opt the resident pet in (or out).
@@ -1495,6 +1617,13 @@ impl EffectsPipeline {
         let trail_fp = fx.trail_fp;
         let glow_fp = fx.glow_fp;
         self.publish_cursor(input);
+        #[cfg(test)]
+        if self.pet_veil_stale {
+            let _ = self
+                .cursor
+                .glow
+                .veil_pet_letters(&mut input.glow_under, &[]);
+        }
         if self.trail_cfg.enabled {
             input.cursor_trail_color = fx.trail_color;
         }
@@ -1634,7 +1763,7 @@ impl EffectsPipeline {
                         sel: term.text_selection(),
                         display_offset: term.grid().display_offset() as i32,
                     };
-                    self.decos.tick(
+                    let fp = self.decos.tick(
                         now,
                         &rs.cfg,
                         geom,
@@ -1645,7 +1774,19 @@ impl EffectsPipeline {
                         &mut self.ink_scratch,
                         &mut self.free_scratch,
                         &mut self.nova_scratch,
-                    )
+                    );
+                    // The word pass from the terminal names its icons to the
+                    // next frame's sky, ribbon and embers as the grid's does
+                    // (looks7 M10): unnamed, a host that hands no cells laid
+                    // stars and embers on the `fox`.
+                    #[cfg(test)]
+                    let named = !self.word_icons_unnamed;
+                    #[cfg(not(test))]
+                    let named = true;
+                    if named {
+                        self.note_word_icons(0);
+                    }
+                    fp
                 };
                 self.sparkle = Some(rs);
                 fp
@@ -1669,6 +1810,7 @@ impl EffectsPipeline {
         self.sprite_layers
             .publish(&self.free_scratch, &mut input.fx_layers);
         self.shade_word_icons(input);
+        self.veil_pet_letters(input);
         let streak = self.streak.is_some().then(|| {
             let mut cfg = self.streak_cfg;
             cfg.intensity *= cursor_motion.amplitude(MotionEffect::OutputStreak);
@@ -4755,6 +4897,143 @@ mod tests {
         assert!(
             margin > 0,
             "the box's transparent margin keeps its light (no notch beside the face)"
+        );
+    }
+
+    /// A FRAME WITHOUT CELLS NAMES ITS WORD ICONS (looks7 M10): a host that
+    /// hands no cells runs the word pass from the terminal, and the icons it
+    /// draws reach the next frame's sky, ribbon and embers as the grid's
+    /// pass's do, where they were never named and the sky drew its stars on
+    /// the `fox`. Negative control: unnamed, the glow holds none of them.
+    #[test]
+    fn a_frame_without_cells_names_its_word_icons() {
+        use aterm_render::sprites::FreeZ;
+        // (frames that drew an icon, frames whose icons the glow does not hold).
+        let run = |unnamed: bool| -> (usize, usize) {
+            let mut p = EffectsPipeline::new();
+            rainbow_kitty_glow(&mut p, "rainbow kitty");
+            p.set_sparkle_enabled(true);
+            p.word_icons_unnamed = unnamed;
+            let (mut term, mut input) = glass(8, 40);
+            term.process(b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n");
+            idle(&mut p, &mut term, &mut input, 2, 33.0);
+            type_line(&mut p, &mut term, &mut input, b"the quick brown fox", 33.0);
+            idle(&mut p, &mut term, &mut input, 45, 33.0);
+            p.note_console_input(PetInputKind::Submit);
+            term.process(b"\r\n");
+            let (rows, cols) = (input.rows, input.cols);
+            let (mut framed, mut unheld) = (0, 0);
+            for _ in 0..30 {
+                p.advance(16.0);
+                term.cell_frame_into(&mut input, rows, cols);
+                input.cells.clear();
+                input.line_sizes.clear();
+                let _ = p.apply(&mut term, &mut input, 10, 19);
+                let drawn = free_sprites(&input)
+                    .iter()
+                    .filter(|s| s.z == FreeZ::UnderText && !s.is_blank())
+                    .count();
+                framed += usize::from(drawn > 0);
+                unheld += usize::from(drawn > 0 && p.cursor.glow.word_icon_boxes().len() != drawn);
+            }
+            (framed, unheld)
+        };
+        let (framed, unheld) = run(false);
+        assert!(
+            framed > 10,
+            "fixture: the word pass drew the `fox` in {framed} frames"
+        );
+        assert_eq!(
+            unheld, 0,
+            "{unheld} of {framed} frames' icons are not the glow's"
+        );
+        let (control_framed, control_unheld) = run(true);
+        assert!(
+            control_framed > 10 && control_unheld == control_framed,
+            "control: unnamed, {control_unheld} of {control_framed} frames' icons are not the glow's"
+        );
+    }
+
+    /// THE PET'S VEIL LIES UNDER THE BODY ITS FRAME DREW (looks7 M10): the
+    /// page veil a dim theme's letters take over the pet is drawn after the
+    /// pet's tick, by the body that tick drew. Drawn in the trail's step it
+    /// read the body of the frame before, so a moving pet's veil lay a frame
+    /// behind it: page over letters the body had left, the letters it had
+    /// reached bare over its coat. A line typed on a dim page under the pet
+    /// as it runs on with the caret: every frame's veil runs (the page's
+    /// colour at a veil's opacity in the under stream) keep to the box the
+    /// frame's body drew. Negative control: drawn in the step, runs stray
+    /// outside it.
+    #[test]
+    fn the_pet_s_veil_lies_under_the_body_its_frame_drew() {
+        // (frames with a veil, frames with a run outside the frame's body).
+        let run = |stale: bool| -> (usize, usize) {
+            let mut p = pet_pipeline(0x5EED);
+            p.pet_veil_stale = stale;
+            let (mut term, mut input) = glass(8, 40);
+            let rgb =
+                |c: u32| aterm_core::terminal::Rgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8);
+            let page = 0x0011_1318;
+            term.set_default_foreground(rgb(0x0085_8585));
+            term.set_default_background(rgb(page));
+            stamp_effective_terminal_background(&term, &mut input);
+            idle(&mut p, &mut term, &mut input, 90, 16.0);
+            let pad = 3 + 3;
+            let (mut veiled, mut astray) = (0, 0);
+            let mut look = |p: &EffectsPipeline, input: &RenderInput| {
+                let veil: Vec<&GlowQuad> = input
+                    .glow_under
+                    .iter()
+                    .filter(|q| {
+                        q.alpha.max(q.alpha2) >= 32
+                            && q.color & 0x00FF_FFFF
+                                == aterm_render::premul_rgb(page, q.alpha) & 0x00FF_FFFF
+                            && q.color2 & 0x00FF_FFFF
+                                == aterm_render::premul_rgb(page, q.alpha2) & 0x00FF_FFFF
+                    })
+                    .collect();
+                if veil.is_empty() {
+                    return;
+                }
+                veiled += 1;
+                let Some((x0, x1, y0, y1)) = p.cursor.glow.pet_body_box() else {
+                    astray += 1;
+                    return;
+                };
+                astray += usize::from(veil.iter().any(|q| {
+                    let (qx0, qy0) = (i32::from(q.x), i32::from(q.y));
+                    let (qx1, qy1) = (qx0 + i32::from(q.w), qy0 + i32::from(q.h));
+                    qx0 < x0 - pad || qx1 > x1 + pad || qy0 < y0 - pad || qy1 > y1 + pad
+                }));
+            };
+            for b in b"the quick brown fox jumps over the lazy".iter() {
+                p.note_console_input(PetInputKind::Text);
+                let _ = commit_ascii(&mut p, &mut term, &mut input, &[*b], 16.0);
+                look(&p, &input);
+                for _ in 0..2 {
+                    let _ = idle(&mut p, &mut term, &mut input, 1, 16.0);
+                    look(&p, &input);
+                }
+            }
+            for _ in 0..90 {
+                let _ = idle(&mut p, &mut term, &mut input, 1, 16.0);
+                look(&p, &input);
+            }
+            (veiled, astray)
+        };
+        let (veiled, astray) = run(false);
+        let (control_veiled, control_astray) = run(true);
+        assert!(
+            veiled >= 3,
+            "fixture: the pet crossed the dim letters in {veiled} frames"
+        );
+        assert_eq!(
+            astray, 0,
+            "{astray} of {veiled} frames veil letters off the body"
+        );
+        assert!(
+            control_astray > 0,
+            "control: drawn by the frame before, no veil strayed ({control_veiled} veiled)"
         );
     }
 

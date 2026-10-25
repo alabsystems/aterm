@@ -936,12 +936,17 @@ pub(super) struct HeldPark {
 }
 
 impl HeldPark {
+    const CROSS_ROW_PATIENCE: Duration =
+        Duration::from_nanos((IN_FLIGHT_PATIENCE_S as f64 * 1_000_000_000.0).round() as u64);
+    const SAME_ROW_PATIENCE: Duration =
+        Duration::from_nanos((CursorGlow::TYPE_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64);
+
     #[inline]
-    pub(super) fn patience(&self) -> Duration {
+    pub(super) const fn patience(&self) -> Duration {
         if self.cross_row {
-            Duration::from_secs_f32(IN_FLIGHT_PATIENCE_S)
+            Self::CROSS_ROW_PATIENCE
         } else {
-            Duration::from_secs_f32(CursorGlow::TYPE_HINT_FRESH)
+            Self::SAME_ROW_PATIENCE
         }
     }
 
@@ -2391,10 +2396,7 @@ impl CursorGlow {
     pub(super) fn retire_all_movement_provenance(&mut self) {
         self.flush_held_park();
         self.type_hint.clear();
-        self.insert.clear();
-        self.insert.pending_hop = None;
-        self.insert.orphans = None;
-        self.insert.orphan_exact = None;
+        self.insert.teardown();
         self.quench_hint = None;
         self.nav_hint = None;
         self.return_hint = None;

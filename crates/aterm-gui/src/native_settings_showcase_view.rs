@@ -397,8 +397,28 @@ pub(crate) fn themes_page(
     let gap = settings_page_gap(state, width, viewport);
     let maximum = PageLayout::Stage.maximum(width);
     let page_width = settings_page_content_width(viewport.width, width, maximum);
-    let (mut out, used) = pinned_heading(state, width, viewport, gap, SHOWCASE_TITLE, "");
+    let (mut out, mut used) = pinned_heading(state, width, viewport, gap, SHOWCASE_TITLE, "");
     let body = settings_list_body_height(state, width, viewport);
+    // Its chooser lists in a panel beside or under the demo, so the page's name, where nothing
+    // else names it, is pinned over the page where the body still holds the chooser's filter
+    // under it, as short windows shed chrome before content; else the chooser's list leads with
+    // it wherever it lists its filter too ([`chooser_panel`]).
+    let mut name = state.take_list_head();
+    if let Some((node, height)) = name.take_if(|(_, height)| {
+        let filter = 2.0 * PANEL_INSET
+            + chooser_pinned_height(
+                state,
+                ChooserPins {
+                    head: true,
+                    footer: false,
+                },
+            );
+        body - used - *height - gap >= filter - 0.01
+    }) {
+        out.push(node);
+        used += height + gap;
+    }
+    let name = name.is_some().then_some(SHOWCASE_TITLE);
     let (spec, frame) = demo_spec_and_frame(
         state,
         cx.animation_phase_ms,
@@ -447,14 +467,14 @@ pub(crate) fn themes_page(
                 let _ = if state.showcase.sheet_open {
                     sheet_panel(state, chooser, room, (Vec::new(), None))
                 } else {
-                    chooser_panel(state, chooser, room, shape, (Vec::new(), None))
+                    chooser_panel(state, chooser, room, shape, (Vec::new(), None), name)
                 };
                 return out;
             }
             let left = if state.showcase.sheet_open {
                 sheet_panel(state, chooser, room, (Vec::new(), None))
             } else {
-                chooser_panel(state, chooser, room, shape, (Vec::new(), None))
+                chooser_panel(state, chooser, room, shape, (Vec::new(), None), name)
             };
             let right = UiNode::new(
                 "settings/showcase/stage-column",
@@ -516,7 +536,11 @@ pub(crate) fn themes_page(
                     let inner = (page_width - 2.0 * PANEL_INSET - THUMB_GUTTER).max(0.0);
                     let list_room = (room - 2.0 * PANEL_INSET).max(0.0);
                     let (strip_box, strip) = strip_node(state, inner);
-                    let sizing = LeadSizing::new(frame, strip, list_room);
+                    let first = match lead_item(strip_box.clone(), strip, 0.0, inner) {
+                        ListItem::Split(card) => card.first_stop_height(list_room),
+                        ListItem::Card(_, height) => height,
+                    };
+                    let sizing = LeadSizing::new(frame, first, list_room);
                     let lead = vec![
                         (demo_node(spec, sizing.chosen), sizing.chosen),
                         (strip_box, strip),
@@ -530,6 +554,7 @@ pub(crate) fn themes_page(
                             room,
                             Shape::Stacked,
                             (lead, Some(sizing)),
+                            name,
                         )
                     });
                 }
@@ -556,6 +581,7 @@ pub(crate) fn themes_page(
                             panel_height,
                             Shape::Stacked,
                             (Vec::new(), None),
+                            name,
                         )
                     });
                 }
@@ -566,7 +592,8 @@ pub(crate) fn themes_page(
 }
 
 /// How the demo that leads a stacked list over the strip is sized by the list's room: the demo's
-/// heights by its rows, the strip's height, and the height chosen.
+/// heights by its rows, the height of the strip's first stop (its words over its first line of
+/// buttons, as the list lists it), and the height chosen.
 #[derive(Clone, Copy)]
 struct LeadSizing {
     heights: [f32; 6],
@@ -585,15 +612,19 @@ impl LeadSizing {
         sizing
     }
 
-    /// The tallest demo that leaves the strip room in a list `list_room` tall, else one row's.
+    /// The tallest demo that leaves the strip's first stop a place beside it in a list
+    /// `list_room` tall; where even one row leaves it none, the tallest that list's screen holds,
+    /// so the first screen is never one row of demo over a blank; else one row's.
     fn demo_in(self, list_room: f32) -> f32 {
-        self.heights
-            .iter()
-            .rev()
-            .copied()
-            .find(|&height| {
-                height + DEMO_STRIP_GAP + self.strip + DEMO_STRIP_GAP <= list_room + 0.01
-            })
+        let tallest = |under: f32| {
+            self.heights
+                .iter()
+                .rev()
+                .copied()
+                .find(|&height| height + under <= list_room + 0.01)
+        };
+        tallest(DEMO_STRIP_GAP + self.strip + DEMO_STRIP_GAP)
+            .or_else(|| tallest(DEMO_STRIP_GAP))
             .unwrap_or(self.heights[0])
     }
 
@@ -1008,6 +1039,78 @@ pub(crate) fn demo_font_candidate(
     candidate
 }
 
+/// One thing the strip says about what the demo draws, beyond the theme's
+/// name ([`StripWords`]).
+enum StripFact {
+    /// The side of the Follow system pair a trial is for ("for Light").
+    Side(&'static str),
+    /// The tried theme comes from the community pack.
+    Community,
+    /// The theme the trial replaces ("was Default").
+    Was(String),
+    /// The person's colors, drawn on every theme
+    /// ("1 custom color on every theme").
+    Note(String),
+    /// Why the theme cannot be drawn, or why the trial ended.
+    Error(String),
+}
+
+/// THE STRIP'S WORDS, FROM ONE SET OF FACTS: line 1 paints the theme's name
+/// and what follows it there; line 2 paints the facts, where the strip has
+/// room for a second line; the strip's Status says one sentence holding the
+/// name and every fact once, at every width. (Line 2's words were added to a
+/// sentence that already said them wherever line 2 was hidden: "Trying
+/// Linen, was Default; was Default" at 80x24.)
+struct StripWords {
+    /// The theme's name, painted whole ([`strip_title`]).
+    name: String,
+    /// What line 1 paints after the name: the type the theme sets, or the
+    /// custom colors the sheet edits.
+    after_name: String,
+    /// What line 2 paints, in order ([`painted_facts`]).
+    facts: Vec<StripFact>,
+    /// The Status's sentence.
+    spoken: String,
+}
+
+/// The strip's sentence: `headline` and the side a trial is for ("Trying
+/// Linen for Light"), the type the theme sets, then every other fact once.
+fn spoken_facts(headline: String, type_words: Option<&str>, facts: &[StripFact]) -> String {
+    let mut sentence = headline;
+    for fact in facts {
+        if let StripFact::Side(side) = fact {
+            sentence.push_str(&format!(" for {side}"));
+        }
+    }
+    if let Some(type_words) = type_words {
+        sentence.push_str(&format!(", {type_words}"));
+    }
+    for fact in facts {
+        match fact {
+            StripFact::Side(_) => {}
+            StripFact::Community => sentence.push_str(", a Community theme"),
+            StripFact::Was(theme) => sentence.push_str(&format!(", was {theme}")),
+            StripFact::Note(note) => sentence.push_str(&format!(", {note}")),
+            StripFact::Error(error) => sentence.push_str(&format!("; {error}")),
+        }
+    }
+    sentence
+}
+
+/// Line 2: the facts in their short forms, ` · ` between them.
+fn painted_facts(facts: &[StripFact]) -> String {
+    facts
+        .iter()
+        .map(|fact| match fact {
+            StripFact::Side(side) => format!("for {side}"),
+            StripFact::Community => "Community".to_string(),
+            StripFact::Was(theme) => format!("was {theme}"),
+            StripFact::Note(words) | StripFact::Error(words) => words.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ")
+}
+
 /// The strip and its height at a width, shared while [`BlocksShared`] is open.
 pub(in crate::native_settings) type SharedStrip = (u32, (UiNode, f32));
 
@@ -1040,7 +1143,7 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
     let side = theme_visible_side(state, state.presented_motion.get().system_dark);
     let overrides = override_count(&state.showcase_colors());
     let mut buttons: Vec<UiNode> = Vec::new();
-    let (title, detail, live) = if showcase.sheet_open {
+    let words = if showcase.sheet_open {
         buttons.push(button(
             CUSTOMIZE_DONE,
             "Done",
@@ -1055,16 +1158,21 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
         let shown = showcase
             .trial_id()
             .map_or_else(|| in_use.clone(), |id| showcase.label_of(id));
-        let title = if overrides > 0 {
-            format!("{shown} \u{b7} {}", custom_colors(overrides))
+        let after_name = if overrides > 0 {
+            format!(" \u{b7} {}", custom_colors(overrides))
         } else {
-            shown.clone()
+            String::new()
         };
-        (title.clone(), String::new(), format!("Customize {title}"))
+        StripWords {
+            spoken: format!("Customize {shown}{after_name}"),
+            name: shown,
+            after_name,
+            facts: Vec::new(),
+        }
     } else {
         match &showcase.trial {
             ShowcaseTrial::Idle => {
-                let note = override_note(&state.showcase_colors()).unwrap_or_default();
+                let note = override_note(&state.showcase_colors());
                 let visual = if overrides > 0 {
                     format!("Customize \u{b7} {overrides}")
                 } else {
@@ -1090,7 +1198,7 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
                     control.value = SemanticValue::Text(custom_colors(overrides));
                 }
                 buttons.push(customize);
-                let live = showcase
+                let headline = showcase
                     .settled
                     .as_ref()
                     .filter(|settled| settled.id.eq_ignore_ascii_case(&configured))
@@ -1098,8 +1206,16 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
                         || format!("Using {in_use}"),
                         |settled| settled.words.clone(),
                     );
-                let detail = showcase.error.clone().unwrap_or(note);
-                (in_use.clone(), detail, live)
+                let facts: Vec<StripFact> = match &showcase.error {
+                    Some(error) => vec![StripFact::Error(error.clone())],
+                    None => note.into_iter().map(StripFact::Note).collect(),
+                };
+                StripWords {
+                    spoken: spoken_facts(headline, None, &facts),
+                    name: in_use.clone(),
+                    after_name: String::new(),
+                    facts,
+                }
             }
             ShowcaseTrial::Trying { id } | ShowcaseTrial::Keeping { id, .. } => {
                 let keeping = matches!(showcase.trial, ShowcaseTrial::Keeping { .. })
@@ -1107,21 +1223,27 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
                 let label = showcase.label_of(id);
                 let in_use = showcase.label_of(&state.theme_id_under_trial());
                 let card = showcase.card(id);
-                let typed = card.and_then(|card| card.typography.clone());
+                let typed = card.and_then(|card| {
+                    Some((card.typography.clone()?, card.typography_spoken.clone()))
+                });
                 let community = card.is_some_and(|card| card.section == Section::Community);
                 let trial = state.trial_typography(id);
                 let split = trial.keeps_colours_only();
-                let mut was = format!("was {in_use}");
-                if following {
-                    was = format!("for {} \u{b7} {was}", appearance_label(side));
-                }
-                if community {
-                    was = format!("Community \u{b7} {was}");
-                }
-                let note = override_note(&state.showcase_colors());
-                if let Some(note) = &note {
-                    was = format!("{was} \u{b7} {note}");
-                }
+                // What the strip says of the trial, each fact once: the side
+                // it is tried for, where it comes from, what it replaces, and
+                // the person's colors it is drawn under too (said, so a
+                // washed-out demo has its reason in view) — or why it cannot
+                // be drawn, in their place.
+                let facts: Vec<StripFact> = match &showcase.error {
+                    Some(error) => vec![StripFact::Error(error.clone())],
+                    None => community
+                        .then_some(StripFact::Community)
+                        .into_iter()
+                        .chain(following.then_some(StripFact::Side(appearance_label(side))))
+                        .chain([StripFact::Was(in_use.clone())])
+                        .chain(override_note(&state.showcase_colors()).map(StripFact::Note))
+                        .collect(),
+                };
                 if showcase.keep_more && split {
                     buttons.push(button(
                         SHOWCASE_KEEP_COLOURS,
@@ -1190,30 +1312,49 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
                     );
                     buttons.push(more);
                 }
-                let title = match &typed {
-                    Some(typography) => format!("{label}  Aa {typography}"),
-                    None => label.clone(),
-                };
-                let detail = showcase.error.clone().unwrap_or(was);
-                let live = match &showcase.error {
+                let after_name = typed
+                    .as_ref()
+                    .map(|(typography, _)| format!("  Aa {typography}"))
+                    .unwrap_or_default();
+                let spoken = match &showcase.error {
                     Some(error) => format!("{label}: {error}"),
-                    None if keeping => format!("Keeping {label}"),
-                    None if following => format!(
-                        "Trying {label} for {}, was {in_use}",
-                        appearance_label(side)
-                    ),
-                    None => format!("Trying {label}, was {in_use}"),
-                };
-                let live = match &note {
-                    Some(note) if showcase.error.is_none() && !keeping => {
-                        format!("{live}, {note}")
+                    None => {
+                        let verb = if keeping { "Keeping" } else { "Trying" };
+                        let type_words = typed.as_ref().map(|(visual, spoken)| {
+                            spoken.clone().unwrap_or_else(|| format!("type {visual}"))
+                        });
+                        spoken_facts(format!("{verb} {label}"), type_words.as_deref(), &facts)
                     }
-                    _ => live,
                 };
-                (title, detail, live)
+                StripWords {
+                    name: label,
+                    after_name,
+                    facts,
+                    spoken,
+                }
             }
         }
     };
+    let detail = painted_facts(&words.facts);
+    let danger = words
+        .facts
+        .iter()
+        .any(|fact| matches!(fact, StripFact::Error(_)));
+    // THE STRIP MEASURES ITS LINE, AND NEVER CUTS A NAME: the title sits
+    // beside the buttons where every theme's whole name takes at most two
+    // lines there, between its words ([`strip_names`], so moving the
+    // highlight from theme to theme never changes the strip's form),
+    // measured against what every trial shows (Revert, Keep, Keep ▾), so a
+    // trial starting never changes it either; where it cannot, the title
+    // takes the strip's whole width on its own lines, the name wrapped
+    // between its words, and the buttons the lines under it, each no wider
+    // than the strip. Either way it keeps as many lines as the longest name
+    // takes there. (At 22 columns at 2× Customize took the whole strip and
+    // more, so the name was not drawn and the button was cut; Keep ▾ open cut
+    // Revert to nothing at 444pt; the name kept only its first word,
+    // "GitHub…", the word GitHub Light shares with every GitHub theme, and
+    // beside the buttons at 80x24 "GitHub Dark…" stood for GitHub Dark High
+    // Contrast, Dimmed and Default alike.)
     let gap = 8.0;
     let span = |widths: &[f32]| {
         widths.iter().map(|width| width + gap).sum::<f32>()
@@ -1227,40 +1368,61 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
         })
         .collect();
     let trial = span(&[hug_width("Revert"), hug_width("Keep"), button_height]);
-    let title_floor = name_floor(state, SemanticRole::Heading, StyleRef::Plain);
-    let stacked =
-        !buttons.is_empty() && width - span(&widths).max(trial) - gap + 0.01 < title_floor;
-    let title_room = if stacked {
-        width
+    // Beside a trial's buttons — Keep ▾ only for a theme whose type a Keep
+    // can change — or this state's, where they are wider than any trial's
+    // (Keep colors only).
+    let beside_room = |buttons: f32| (width - buttons - gap).max(0.0);
+    let current = span(&widths);
+    let beside = strip_names(
+        state,
+        &in_use,
+        if current > trial + 0.01 {
+            (beside_room(current), beside_room(current))
+        } else {
+            (
+                beside_room(span(&[hug_width("Revert"), hug_width("Keep")])),
+                beside_room(trial),
+            )
+        },
+    );
+    let stacked = !buttons.is_empty() && (beside.broken || beside.lines > NAME_LINES_BESIDE);
+    let (title_room, name_lines) = if stacked {
+        (
+            width,
+            strip_names(state, &in_use, (width, width))
+                .lines
+                .min(NAME_LINES_MOST),
+        )
     } else {
-        (width - span(&widths) - gap).max(0.0)
+        ((width - span(&widths) - gap).max(0.0), beside.lines)
     };
     let detail_line = width >= DETAIL_LINE_FROM;
     let two_lines = detail_line && !detail.is_empty();
+    // Line 1 sits on the buttons' band in every state, so the name never
+    // jumps when a trial starts or ends; line 2 takes the band under it. A
+    // name some theme takes two lines for keeps their band in every state.
     let line_one = button_height;
-    let words_height = if detail_line {
-        strip_height()
+    let title_height = if name_lines > 1 {
+        line_one.max(name_lines as f32 * strip_name_line_height())
     } else {
         line_one
     };
-    let mut lines = vec![
-        UiNode::new(
-            "settings/showcase/status/title",
-            UiContent::Text(TextSpec {
-                text: fit_text(&title, SemanticRole::Heading, StyleRef::Plain, title_room),
-                role: SemanticRole::Heading,
-                style: StyleRef::Plain,
-            }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(line_one)),
-        )
-        .paint_only(),
-    ];
+    // The words keep line 2's band only where a line 2 can show, in every
+    // state alike.
+    let words_height = title_height
+        + if detail_line {
+            strip_height() - line_one
+        } else {
+            0.0
+        };
+    let mut lines = vec![strip_title(
+        &words.name,
+        &words.after_name,
+        title_room,
+        title_height,
+        name_lines,
+    )];
     if two_lines {
-        let danger = showcase.error.is_some();
         lines.push(
             UiNode::new(
                 "settings/showcase/status/detail",
@@ -1293,11 +1455,10 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
     }))
     .children(lines)
     .paint_only();
-    let spoken = if two_lines || detail.is_empty() {
-        live
-    } else {
-        format!("{live}; {detail}")
-    };
+    // ONE SENTENCE AT EVERY WIDTH, each fact in it once: line 2 is a painted
+    // subset of it, shown where the strip has room, so a hidden line 2 loses
+    // nothing and a shown one says nothing twice.
+    let spoken = words.spoken;
     let status = |height: f32, layout: Layout, children: Vec<UiNode>| {
         UiNode::new(
             "settings/showcase/status",
@@ -1316,7 +1477,8 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
         .children(children)
     };
     if !stacked {
-        let under = (strip_height() - button_height).max(0.0);
+        let height = strip_height().max(words_height);
+        let under = (height - button_height).max(0.0);
         let actions = UiNode::new(
             "settings/showcase/status/actions",
             UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
@@ -1334,7 +1496,6 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
                 }),
         )
         .children(buttons);
-        let height = strip_height();
         return (status(height, Layout::row(), vec![texts, actions]), height);
     }
     let mut button_lines: Vec<(Vec<UiNode>, f32)> = Vec::new();
@@ -1431,6 +1592,216 @@ fn flow_lines(widths: &[f32], width: f32, gap: f32) -> usize {
     lines
 }
 
+/// What the strip lays its names out for in a given room ([`strip_names`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NamesMeasure {
+    /// The most lines a name takes there.
+    lines: usize,
+    /// Whether some name has a word wider than the room, which only a break
+    /// inside it would fit.
+    broken: bool,
+}
+
+/// The most lines a name takes beside the strip's buttons: more, and the
+/// title goes over them, where it has the strip's whole width.
+const NAME_LINES_BESIDE: usize = 2;
+
+/// The most lines the strip keeps for a name over its buttons: every theme
+/// aterm ships is whole in them down to a 22-column window at 2× text
+/// ("Catppuc-" / "cin" / "Mocha"), and every pack theme from 30 columns; a
+/// name that takes more there keeps its first lines whole and its last cut
+/// between words. A taller strip pushes the chooser's own rows screens
+/// down, the strip's lines blank for the shorter names.
+const NAME_LINES_MOST: usize = 3;
+
+/// A name's lines wrapped to `width` in the strip's title face: between its
+/// words, inside one only where that word alone is wider than `width`.
+fn strip_name_lines(name: &str, width: f32) -> Vec<String> {
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Plain);
+    wrap_to_box(name, width, &|line| {
+        crate::tray_raster::ui_text_width_for(face, line, px)
+    })
+}
+
+/// THE STRIP'S NAMES, every one it can show — each row's (a trial's title)
+/// and `in_use`'s (the theme the configuration draws, which a row may not
+/// name) — in the room its title has: `plain` beside a trial's Revert and
+/// Keep, `typed` beside those and Keep ▾ too, which only a trial that can
+/// change the type in force shows (the tried theme sets type, or the theme
+/// it replaces does: Keep colors only needs a type change). The most
+/// lines a name takes there, and whether a word of one is wider than its
+/// room. The strip sits its title beside its buttons only where every name
+/// takes a line or two there, whole words each, and keeps as many lines as
+/// the longest takes, so neither a trial nor the highlight moving changes
+/// its form or its height, and no name is cut ([`strip_node`]). The rows'
+/// share is measured once a frame for its rows, text scale and rooms.
+fn strip_names(
+    state: &SettingsViewState,
+    in_use: &str,
+    (plain, typed): (f32, f32),
+) -> NamesMeasure {
+    let showcase = &state.showcase;
+    let under_typed = showcase
+        .card(&state.theme_id_under_trial())
+        .is_some_and(|card| card.typography.is_some());
+    let key = (
+        std::sync::Arc::as_ptr(&showcase.cards).cast::<()>() as usize,
+        settings_text_scale().to_bits(),
+        (plain.to_bits(), typed.to_bits(), under_typed),
+    );
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Plain);
+    let measure = |name: &str, room: f32| NamesMeasure {
+        lines: strip_name_lines(name, room).len().max(1),
+        broken: name.split_whitespace().any(|word| {
+            crate::tray_raster::ui_text_width_for(face, word, px)
+                > room + crate::native_ui::TEXT_FIT_SLACK
+        }),
+    };
+    let most = |a: NamesMeasure, b: NamesMeasure| NamesMeasure {
+        lines: a.lines.max(b.lines),
+        broken: a.broken || b.broken,
+    };
+    let cached = showcase.strip_names.borrow().iter().find_map(|entry| {
+        ((entry.cards, entry.scale, entry.rooms) == key).then_some(NamesMeasure {
+            lines: entry.lines,
+            broken: entry.broken,
+        })
+    });
+    let rows = cached.unwrap_or_else(|| {
+        let rows = showcase
+            .cards
+            .iter()
+            .map(|card| {
+                let room = if under_typed || card.typography.is_some() {
+                    typed
+                } else {
+                    plain
+                };
+                measure(&card.label, room)
+            })
+            .fold(
+                NamesMeasure {
+                    lines: 1,
+                    broken: false,
+                },
+                most,
+            );
+        let mut entries = showcase.strip_names.borrow_mut();
+        entries.retain(|entry| entry.cards == key.0 && entry.scale == key.1);
+        // Two rooms a frame (beside the buttons, the strip's width), and a
+        // window resized by hand passes through many.
+        if entries.len() >= 8 {
+            entries.remove(0);
+        }
+        entries.push(StripNames {
+            cards: key.0,
+            scale: key.1,
+            rooms: key.2,
+            lines: rows.lines,
+            broken: rows.broken,
+        });
+        rows
+    });
+    most(rows, measure(in_use, plain))
+}
+
+/// One line of the strip's name where it wraps: two of them are the
+/// strip's own height ([`strip_height`]), so two lines beside the buttons
+/// cost it nothing where no line 2 shows.
+fn strip_name_line_height() -> f32 {
+    strip_height() / 2.0
+}
+
+/// THE STRIP'S LINE 1, `height` tall: the theme's `name` on `band` lines
+/// `room` wide (beside the buttons, or over them), wrapped between its words
+/// from the band's top, or on one line where `band` is 1 — whole wherever
+/// the band holds it ([`strip_names`] sizes it so), else its last line cut
+/// between words — and `after_name` (the type it sets, the custom colors the
+/// sheet edits) after it on its last line, fitted to what the name leaves
+/// there: cut between its words, and left off where none of it fits, never
+/// leaving an ellipsis after a whole name that reads as one cut.
+fn strip_title(name: &str, after_name: &str, room: f32, height: f32, band: usize) -> UiNode {
+    let key = "settings/showcase/status/title";
+    let text = |text: String| {
+        UiContent::Text(TextSpec {
+            text,
+            role: SemanticRole::Heading,
+            style: StyleRef::Plain,
+        })
+    };
+    let fit = |words: &str| fit_text(words, SemanticRole::Heading, StyleRef::Plain, room);
+    // The name's last line, with what follows the name after it.
+    let finish = |last: &str| {
+        if after_name.is_empty() {
+            return fit(last);
+        }
+        let whole = format!("{last}{after_name}");
+        let fitted = fit(&whole);
+        let kept = fitted.trim_end_matches('\u{2026}').trim_end();
+        if fitted != whole && kept.len() <= last.trim_end().len() {
+            fit(last)
+        } else {
+            fitted
+        }
+    };
+    if band <= 1 {
+        return UiNode::new(key, text(finish(name)))
+            .layout(
+                Layout::default()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(height)),
+            )
+            .paint_only();
+    }
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Plain);
+    let mut lines = wrap_to_box_from(
+        name,
+        room,
+        &|line| crate::tray_raster::ui_text_width_for(face, line, px),
+        "-",
+    );
+    if lines.len() > band {
+        // The band's last line takes the rest of the name, cut to it.
+        let (at, _) = lines[band - 1];
+        lines.truncate(band - 1);
+        lines.push((at, name[at..].to_string()));
+    }
+    let count = lines.len();
+    let line_height = strip_name_line_height();
+    UiNode::new(
+        key,
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(
+        Layout::column()
+            .width(Length::Fill)
+            .height(Length::Fixed(height)),
+    )
+    .children(
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, line))| {
+                let line = if index + 1 == count {
+                    finish(&line)
+                } else {
+                    line
+                };
+                UiNode::new(format!("{key}/line-{index}"), text(line))
+                    .layout(
+                        Layout::default()
+                            .width(Length::Fill)
+                            .height(Length::Fixed(line_height)),
+                    )
+                    .paint_only()
+            })
+            .collect(),
+    )
+    .paint_only()
+}
+
+/// The strip's least width for a second line of words (what the theme
+/// replaces, the side it is tried for).
 const DETAIL_LINE_FROM: f32 = 400.0;
 
 const STRIP_LINE_GAP: f32 = 4.0;
@@ -1442,12 +1813,16 @@ const fn appearance_label(side: aterm_types::Appearance) -> &'static str {
     }
 }
 
+/// The theme chooser: its filter and footer pinned where its room holds them over whole rows,
+/// else listed, its list led by `lead`, and by the page's name (`name`) where nothing over the
+/// page names it and the list leads with its filter too.
 fn chooser_panel(
     state: &SettingsViewState,
     panel_width: f32,
     height: f32,
     shape: Shape,
     (lead, sizing): Lead,
+    name: Option<&str>,
 ) -> UiNode {
     let stacked = !matches!(shape, Shape::Beside { .. });
     let inner = (panel_width - 2.0 * PANEL_INSET).max(0.0);
@@ -1500,6 +1875,15 @@ fn chooser_panel(
         })
         .unwrap_or(ChooserPins::NONE);
     let room = room_for(pins);
+    let lead: Vec<(UiNode, f32)> = match name.filter(|_| !pins.head) {
+        Some(title) => std::iter::once(super::page_name_node(
+            title,
+            (inner - THUMB_GUTTER).max(0.0),
+        ))
+        .chain(lead)
+        .collect(),
+        None => lead,
+    };
     let laid = ListRoom {
         panel: (panel_width, height),
         held: (pins.head, pins.footer, lead.len()),

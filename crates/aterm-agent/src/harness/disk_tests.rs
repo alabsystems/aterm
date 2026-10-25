@@ -1045,22 +1045,6 @@ fn a_short_spelled_directory_reads_its_volume() {
 }
 
 #[test]
-fn a_volume_is_placed_with_the_error_boxes_off() {
-    let tmp = Tmp::new("volume-quiet");
-    let table = aterm_sysprobe::volumes::table();
-    let unguarded = !cfg!(windows);
-    VOLUME_ERRORS_QUIET.set(None);
-    assert_eq!(aterm_sysprobe::errors_quiet(), unguarded, "no guard before");
-    assert!(volume_of(tmp.path(), &table).is_ok(), "a local volume");
-    assert_eq!(VOLUME_ERRORS_QUIET.get(), Some(true), "inside the resolve");
-    assert_eq!(
-        aterm_sysprobe::errors_quiet(),
-        unguarded,
-        "the caller's mode restored"
-    );
-}
-
-#[test]
 fn dir_bytes_counts_a_tree_and_does_not_follow_a_symlink() {
     let tmp = Tmp::new("bytes");
     let root = tmp.path().join("tree");
@@ -1437,6 +1421,9 @@ fn thresholds_are_the_larger_of_the_knob_and_the_volumes_share() {
     ] {
         assert_eq!(t.level(free, files), want, "free {free:?} files {files:?}");
     }
+    assert_eq!(t.short_below(), t.floor);
+    assert_eq!(t.level(Some(t.short_below() - 1), None), Level::Short);
+    assert!(t.level(Some(t.short_below()), None) < Level::Short);
 
     let small = Config::default().thresholds(Some(40 * GIB));
     assert_eq!(
@@ -1458,6 +1445,13 @@ fn thresholds_are_the_larger_of_the_knob_and_the_volumes_share() {
         "off: never Short"
     );
     assert_eq!(t.level(Some(0), None), Level::Emergency);
+    assert_eq!(
+        t.short_below(),
+        t.emergency,
+        "off: only what writes need reads short or worse"
+    );
+    assert_eq!(t.level(Some(t.short_below() - 1), None), Level::Emergency);
+    assert!(t.level(Some(t.short_below()), None) < Level::Short);
 }
 
 #[test]

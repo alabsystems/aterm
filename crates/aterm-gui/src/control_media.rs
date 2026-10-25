@@ -1103,7 +1103,7 @@ mod window_target_refusal_tests {
             "any route is the Settings surface"
         );
 
-        app.switch_tab(0);
+        app.switch_tab_in(WindowId(0), 0);
         assert!(
             app.read_aux_controls(AuxTarget::Prefs)[0].starts_with("state open=true"),
             "`controls prefs` still reads the background Settings tab"

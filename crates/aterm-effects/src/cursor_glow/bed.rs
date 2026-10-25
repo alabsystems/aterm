@@ -25,10 +25,147 @@ pub(crate) const fn dark_bed_budget(ink: u32) -> f32 {
     bar.clamp(DARK_BED_LUMA_MIN, DARK_BED_LUMA_MAX)
 }
 
-/// The bed's ink for the stop `rgb` over the page `bg` under `budget`.
+/// How far a bed on a page too lit for any light under its letters lies
+/// from the page toward its stop's own colour, in linear light at the
+/// page's luminance ([`page_lit_ink`]). Whole, laid in sRGB over the page
+/// at a soft edge's half opacity, Solarized Dark's red stop reads at 58% of
+/// the page's luminance (a dark seam round a vivid core); at this share the
+/// edge keeps seven tenths of it and the core still wears its hue.
+pub(crate) const PAGE_LIT_CHROMA: f32 = 0.7;
+
+/// The bed's ink on a page too lit for its letters to take any light
+/// (Solarized Dark: its text reads 4.75:1 on `#002b36`, and a dim letter
+/// keeps 97% of its own reading under the lights): the stop `rgb`'s
+/// colour at the page's own luminance, [`PAGE_LIT_CHROMA`] of the way
+/// from the page in linear light, never over the page's luminance. The
+/// bed lays neither light nor shade there, only its hue. Held under the
+/// page's luminance instead, the dark bed solved to black, and every
+/// style's bed, tube and tracer drew black smoke on the page (looks7
+/// round 2; the ribbons' maroon-black blocks, Beam's black tube, Phaser's
+/// black word gaps).
+#[must_use]
+pub(crate) const fn page_lit_ink(rgb: u32, page: u32) -> u32 {
+    #[inline]
+    const fn at(c: u32, sh: u32) -> f32 {
+        crate::color_math::relative_luminance_table().linear[((c >> sh) & 0xff) as usize]
+    }
+    #[inline]
+    const fn lum(c: [f32; 3]) -> f32 {
+        0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    }
+    #[inline]
+    const fn mix_ch(pi: f32, qi: f32, k: f32) -> f32 {
+        let qk = qi * k;
+        let qk = if qk < 1.0 { qk } else { 1.0 };
+        let m = pi + (qk - pi) * PAGE_LIT_CHROMA;
+        if m > 0.0 { m } else { 0.0 }
+    }
+    #[inline]
+    const fn byte(c: f32) -> f32 {
+        let n = if c <= 0.003_130_8 {
+            12.92 * c
+        } else {
+            1.055 * crate::color_math::powf_pos_f32(c, 1.0 / 2.4) - 0.055
+        };
+        (n * 255.0).clamp(0.0, 255.0)
+    }
+    #[inline]
+    const fn ceil_u8(b: f32) -> u32 {
+        let u = b.ceil() as u32;
+        if u < 255 { u } else { 255 }
+    }
+    let p = [at(page, 16), at(page, 8), at(page, 0)];
+    let q = [at(rgb, 16), at(rgb, 8), at(rgb, 0)];
+    let (lp, lq) = (lum(p), lum(q));
+    if lp <= 0.0 || lq <= 0.0 {
+        return page & 0x00FF_FFFF;
+    }
+    let k = lp / lq;
+    let b0 = byte(mix_ch(p[0], q[0], k));
+    let b1 = byte(mix_ch(p[1], q[1], k));
+    let b2 = byte(mix_ch(p[2], q[2], k));
+    let lo = [b0.floor() as u32, b1.floor() as u32, b2.floor() as u32];
+    let hi = [ceil_u8(b0), ceil_u8(b1), ceil_u8(b2)];
+    // Of the bytes round the mix, the brightest that stays at or under the
+    // page's luminance: rounded at a dim page's few bytes a channel swings
+    // the luminance by several percent either way.
+    let page_l = crate::color_math::relative_luminance(page & 0x00FF_FFFF);
+    let mut best = (lo[0] << 16) | (lo[1] << 8) | lo[2];
+    let mut best_l = crate::color_math::relative_luminance(best);
+    let mut bit = 1u32;
+    while bit < 8 {
+        let c0 = if (bit & 1) != 0 { hi[0] } else { lo[0] };
+        let c1 = if (bit & 2) != 0 { hi[1] } else { lo[1] };
+        let c2 = if (bit & 4) != 0 { hi[2] } else { lo[2] };
+        let c = (c0 << 16) | (c1 << 8) | c2;
+        let l = crate::color_math::relative_luminance(c);
+        if l <= page_l && l > best_l {
+            best = c;
+            best_l = l;
+        }
+        bit += 1;
+    }
+    best
+}
+
+/// A lit page's bed in the air ([`page_lit_ink`]): where no letter lies
+/// (a blank cell: the leading past a line's end, a blank row a Return's
+/// tube crosses), no letter's reading bounds the bed, and it wears the
+/// light it wears on the reference dark theme ([`CursorGlow::STREAK_REF_INK`]),
+/// laid as on that theme (held to that budget, each channel's larger of
+/// it and the page counted). The letter guard cuts whatever of it reaches
+/// a letter. Laid at the page's luminance in the air too, Beam's ice tube
+/// and Lumen's grey tracer did not show on Solarized Dark at all.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AirLight {
+    budget: f32,
+}
+
+impl AirLight {
+    /// The air's light on `page` for a bed solved to `budget`; `None` where
+    /// the bed is not lit at the page's luminance, or where the page's own
+    /// letters already allow it the reference theme's budget (on the
+    /// reference ground itself a dim shape's bed is lit by its own budget,
+    /// and the air adds nothing: Sparkle's gold rail stays gold and keeps
+    /// to the leading).
+    #[must_use]
+    pub(crate) const fn of(page: u32, budget: f32, shape: BedShape) -> Option<Self> {
+        let lit = page_lit(page, budget);
+        let air = dim_budget(dark_bed_budget(CursorGlow::STREAK_REF_INK), page, shape.dim);
+        if lit && air > budget {
+            Some(Self { budget: air })
+        } else {
+            None
+        }
+    }
+
+    /// The bed's ink for the stop `rgb` in the air over `page`.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn ink(self, rgb: u32, page: u32, sat: f32) -> u32 {
+        dark_bed_ink_unlit(rgb, page, self.budget, sat)
+    }
+}
+
+/// The bed's ink for the stop `rgb` over the page `bg` under `budget`; on a
+/// page whose luminance the solved ink falls under, [`page_lit_ink`].
 #[must_use]
 pub(crate) const fn dark_bed_ink(rgb: u32, bg: u32, budget: f32, sat: f32) -> u32 {
-    let table = crate::color_math::relative_luminance_table();
+    let solved = dark_bed_ink_unlit(rgb, bg, budget, sat);
+    if crate::color_math::relative_luminance(solved)
+        < crate::color_math::relative_luminance(bg & 0x00FF_FFFF)
+    {
+        let rgb = crate::spectrum::spectrum_with_min_saturation(rgb & 0x00FF_FFFF, sat);
+        page_lit_ink(rgb, bg)
+    } else {
+        solved
+    }
+}
+
+/// [`dark_bed_ink`] held under the budget alone, never lit at the page's
+/// luminance (a test's negative control: on a lit page it lays a shade).
+#[must_use]
+pub(crate) const fn dark_bed_ink_unlit(rgb: u32, bg: u32, budget: f32, sat: f32) -> u32 {
     let rgb = crate::spectrum::spectrum_with_min_saturation(rgb & 0x00FF_FFFF, sat);
     #[inline]
     const fn ch(c: u32, sh: u32) -> u32 {
@@ -66,11 +203,7 @@ pub(crate) const fn dark_bed_ink(rgb: u32, bg: u32, budget: f32, sat: f32) -> u3
         [pick_c(full[0], t), pick_c(full[1], t), pick_c(full[2], t)]
     }
     #[inline]
-    const fn seen(
-        table: &crate::color_math::RelativeLuminanceTable,
-        bg_rgb: [usize; 3],
-        ink: [usize; 3],
-    ) -> f32 {
+    const fn seen(bg_rgb: [usize; 3], ink: [usize; 3]) -> f32 {
         let r = if ink[0] > bg_rgb[0] {
             ink[0]
         } else {
@@ -86,7 +219,12 @@ pub(crate) const fn dark_bed_ink(rgb: u32, bg: u32, budget: f32, sat: f32) -> u3
         } else {
             bg_rgb[2]
         };
-        crate::color_math::relative_luminance_rgb(table, r, g, b)
+        crate::color_math::relative_luminance_rgb(
+            crate::color_math::relative_luminance_table(),
+            r,
+            g,
+            b,
+        )
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (pick_rgb(full, 0.0), pick_rgb(full, 1.0));
@@ -107,7 +245,7 @@ pub(crate) const fn dark_bed_ink(rgb: u32, bg: u32, budget: f32, sat: f32) -> u3
             && mid_rgb[2] == hi_rgb[2]
         {
             hi = mid;
-        } else if seen(table, bg_rgb, mid_rgb) <= budget {
+        } else if seen(bg_rgb, mid_rgb) <= budget {
             lo = mid;
             lo_rgb = mid_rgb;
             lo_ok = true;
@@ -148,6 +286,69 @@ pub(crate) struct BedShape {
     pub(crate) leap_path: bool,
     /// A leap's tube runs its whole path ([`LEAP_GAP_CELLS`], [`CursorGlow::split_air_runs`]).
     pub(crate) leap_air: bool,
+    /// The rail a style that lays none on the reference dark lays on a lit
+    /// page ([`Self::on_lit_page`]), as a share of the cell height (`0` for none).
+    pub(crate) lit_rail: f32,
+    /// The HSV saturation under which the bed keeps its colour's own chroma
+    /// instead of [`Self::sat`] (`0` for none): a near-grey colour's hue is
+    /// noise, and floored to `sat` it laid a hue the colour does not have
+    /// (Lumen on Solarized Dark's grey cursor `#93a1a1` drew a saturated
+    /// cyan tracer `#94edfb`, looks7 round 3).
+    pub(crate) own_chroma: f32,
+    /// The bed's colour is one the user chose ([`crate::cursor_glow::ColourPins`],
+    /// [`Self::pinned`]): every ink the bed lays keeps the colour's own chroma.
+    pub(crate) pinned: bool,
+}
+
+/// Whether `page` is too lit for a bed solved to `budget` to lay any light
+/// under its letters (Solarized Dark: [`page_lit_ink`]). Asked of the
+/// letters' own budget ([`dark_bed_budget`]), it is the page's: a shape
+/// dimmed under it ([`BedShape::dim`], Sparkle's gold rail's) solves to
+/// black on any page.
+#[must_use]
+pub(crate) const fn page_lit(page: u32, budget: f32) -> bool {
+    let probe = dark_bed_ink_unlit(0x00FF_0000, page, budget, 1.0);
+    crate::color_math::relative_luminance(probe)
+        < crate::color_math::relative_luminance(page & 0x00FF_FFFF)
+}
+
+/// How far below its row's bottom a bed's rail lies on a lit page
+/// ([`BedShape::on_lit_page`]), px: the ribbons' hairline
+/// ([`crate::rainbow_kitty::ribbon::rail_gap_px`]), and never inside the
+/// judge's ring round a descender's foot ([`crate::cursor_glow::LETTER_GUARD_RING`]).
+#[inline]
+#[must_use]
+pub(crate) const fn lit_rail_drop(ch: f32) -> f32 {
+    crate::rainbow_kitty::ribbon::rail_gap_px(ch).max(crate::cursor_glow::LETTER_GUARD_RING as f32)
+}
+
+/// The vivid rail's ink for the colour `rgb` of a bed of `shape`
+/// ([`crate::rainbow_kitty::ribbon::rail_ink`]); a near-grey colour of a
+/// shape that keeps its own chroma ([`BedShape::own_chroma`]) keeps it,
+/// brought to the rail's brightness.
+/// A chosen colour ([`BedShape::pinned`]) keeps its chroma the same way.
+#[must_use]
+pub(crate) const fn bed_rail_ink(rgb: u32, shape: BedShape) -> u32 {
+    #[inline]
+    const fn max_u32(a: u32, b: u32) -> u32 {
+        if a > b { a } else { b }
+    }
+    #[inline]
+    const fn up(rgb: u32, mx: u32, sh: u32) -> u32 {
+        let v = (((rgb >> sh) & 0xff) * 255) / mx;
+        if v < 255 { v } else { 255 }
+    }
+    let rgb = rgb & 0x00FF_FFFF;
+    let (_, s, _) = crate::color_math::rgb2hsv(rgb);
+    if shape.pinned || s < shape.own_chroma {
+        let mx = max_u32(
+            max_u32((rgb >> 16) & 0xff, (rgb >> 8) & 0xff),
+            max_u32(rgb & 0xff, 1),
+        );
+        (up(rgb, mx, 16) << 16) | (up(rgb, mx, 8) << 8) | up(rgb, mx, 0)
+    } else {
+        crate::rainbow_kitty::ribbon::rail_ink(rgb)
+    }
 }
 
 /// The hue family of a style's bed ([`BedShape::hue`]).
@@ -174,7 +375,76 @@ impl BedShape {
         dim: 1.0,
         leap_path: false,
         leap_air: false,
+        lit_rail: 0.0,
+        own_chroma: 0.0,
+        pinned: false,
     };
+
+    /// The shape for a colour the user chose ([`crate::cursor_glow::ColourPins`]):
+    /// a chosen colour is drawn as itself, so its bed, the air's light and
+    /// the rail keep its own chroma, on every page; only their light is
+    /// spent to the budget. Floored to [`Self::sat`] and the rail's
+    /// saturation, Beam pinned to `#b0b0c8` (0.12) laid its Solarized Dark
+    /// rail in `#6464ff` (0.61) and Lumen pinned to `#d09090` (0.31) in
+    /// `#ff0000` (looks7 round 3's review).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn pinned(self) -> Self {
+        Self {
+            pinned: true,
+            ..self
+        }
+    }
+
+    /// The shape on a lit page ([`page_lit`]): its rail a hairline below
+    /// the judge's ring ([`lit_rail_drop`]) with no soft top rising into the
+    /// row, where no cut of the row's letters reaches it; a style whose bed
+    /// lays no rail on the reference dark lays [`Self::lit_rail`] there. On
+    /// Solarized Dark a letter keeps 97% of its own reading and its bed lays
+    /// only its hue at the page's luminance: Beam, Lumen and Comet drew
+    /// nothing behind the caret while typing, each a bare glowing caret
+    /// (looks7 round 3).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn on_lit_page(self) -> Self {
+        Self {
+            rail: if self.rail > 0.0 {
+                self.rail
+            } else {
+                self.lit_rail
+            },
+            rail_rise: 0.0,
+            ..self
+        }
+    }
+
+    /// The saturation floor the bed's ink takes for the colour `rgb`
+    /// ([`Self::own_chroma`]).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn sat_for(self, rgb: u32) -> f32 {
+        let (_, s, _) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
+        if self.pinned || s < self.own_chroma {
+            s
+        } else {
+            self.sat
+        }
+    }
+
+    /// The saturation floor the bed's ink under the letters takes for the
+    /// colour `rgb`: a chosen colour's own ([`Self::pinned`]), else
+    /// [`Self::sat`] (a near-grey's bed under a lit page's letters lies at
+    /// the page's luminance, where a grey only greys the page, so its
+    /// floored hue is kept).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn under_sat_for(self, rgb: u32) -> f32 {
+        if self.pinned {
+            crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF).1
+        } else {
+            self.sat
+        }
+    }
 
     /// The shape of `style`'s bed, or `None` for a style that lays none.
     #[inline]
@@ -186,6 +456,8 @@ impl BedShape {
                 sat: 0.90,
                 full: 215.0,
                 leap_air: true,
+                lit_rail: LUMEN_LIT_RAIL,
+                own_chroma: LUMEN_OWN_CHROMA,
                 ..Self::BASE
             }),
             GlowStyle::Comet => Some(Self {
@@ -234,6 +506,7 @@ impl BedShape {
                 sat: 0.85,
                 full: 235.0,
                 leap_air: true,
+                lit_rail: BEAM_LIT_RAIL,
                 ..Self::BASE
             }),
             _ => None,
@@ -255,6 +528,18 @@ impl BedShape {
 
 /// The bed's spine below the cell's middle, as a share of the cell height.
 const DARK_BED_DY: f32 = 0.04;
+
+/// Beam's rail on a lit page ([`BedShape::lit_rail`]): its tube's light in
+/// the air below its letters, as deep as the ribbons' vivid rail may reach.
+const BEAM_LIT_RAIL: f32 = 0.22;
+/// Lumen's rail on a lit page ([`BedShape::lit_rail`]): a hairline of its
+/// tracer's light.
+const LUMEN_LIT_RAIL: f32 = 0.10;
+/// The saturation under which Lumen's bed keeps its colour's own chroma
+/// ([`BedShape::own_chroma`]): a grey cursor's (Solarized Dark's `#93a1a1`
+/// is 0.09) keeps its grey; the dark gallery's green `#50fa7b` (0.68) is
+/// floored as before.
+const LUMEN_OWN_CHROMA: f32 = 0.2;
 
 /// Sparkle's gold rail's reach below the row, as a share of the cell height ([`BedShape::rail`]).
 const SPARKLE_RAIL: f32 = 0.24;
@@ -325,6 +610,58 @@ pub(crate) struct BedScratch {
     pub(crate) wedges: Vec<f32>,
     /// Caret cell `(row, col)` when laying the bed around a live caret.
     pub(crate) caret: Option<(i32, i32)>,
+    /// How far under the row's bottom the rail's spine lies, px: on a lit
+    /// page ([`AirLight`]) the ribbon's hairline ([`crate::rainbow_kitty::ribbon::rail_gap_px`]),
+    /// so a descender's foot keeps its ring of page clear of the rail's light
+    /// (laid at the row's bottom, Phaser's spectrum underline was cut to
+    /// nothing under Solarized Dark's letters).
+    pub(crate) rail_drop: f32,
+    /// Each sample of the run being inked: whether it lies in the air
+    /// ([`air_lit`]).
+    pub(crate) air: Vec<bool>,
+}
+
+/// Fill `out` with whether each sample of `run` wears the air's light
+/// ([`AirLight`]): on a lit page (`lit`), a sample whose cell and the cells
+/// either side of it hold no text, nor its neighbours' along the run
+/// (unless `alone`, a test's control: its own cell's text alone). A sample
+/// beside text keeps the page's luminance, so the bed's colour, drawn
+/// between samples, turns from the hue to the light in the air and never
+/// over a letter: read by its own cell, the sample past a line's last
+/// letter lit the bed's ramp under that letter.
+pub(crate) fn air_lit(
+    run: &[CometSample],
+    geom: Geom,
+    text: &TextView<'_>,
+    (lit, alone): (bool, bool),
+    out: &mut Vec<bool>,
+) {
+    out.clear();
+    if !lit {
+        out.resize(run.len(), false);
+        return;
+    }
+    let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
+    let (inv_cw, inv_ch) = (1.0 / (geom.cw as f32), 1.0 / (geom.ch as f32));
+    let reach = i32::from(!alone);
+    let blank = |s: &CometSample| {
+        let (row, col) = (
+            ((s.y - oyf) * inv_ch).floor() as i32,
+            ((s.x - oxf) * inv_cw).floor() as i32,
+        );
+        (col - reach..=col + reach).all(|c| !text.over_text(row, c))
+    };
+    out.extend(run.iter().map(blank));
+    if alone {
+        return;
+    }
+    let mut before = true;
+    for i in 0..out.len() {
+        let own = out[i];
+        let after = out.get(i + 1).copied().unwrap_or(true);
+        out[i] = own && before && after;
+        before = own;
+    }
 }
 
 impl BedScratch {
@@ -336,6 +673,8 @@ impl BedScratch {
         taper: Vec::new(),
         wedges: Vec::new(),
         caret: None,
+        rail_drop: 0.0,
+        air: Vec::new(),
     };
 }
 
@@ -362,6 +701,7 @@ pub(crate) fn lay_dark_bed(
     under: &mut Vec<GlowQuad>,
 ) {
     let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
+    let (inv_cw, inv_ch) = (1.0 / cwf, 1.0 / chf);
     let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
     let clip = geom.beam_clip();
     let stride = (geom.cw / 8).max(1);
@@ -375,18 +715,20 @@ pub(crate) fn lay_dark_bed(
         taper,
         wedges,
         caret,
+        rail_drop,
+        air: _,
     } = scratch;
-    let caret = *caret;
+    let (caret, rail_drop) = (*caret, *rail_drop);
     let cell_of = |x: f32, y: f32| {
         (
-            ((y - oyf) / chf).floor() as i32,
-            ((x - oxf) / cwf).floor() as i32,
+            ((y - oyf) * inv_ch).floor() as i32,
+            ((x - oxf) * inv_cw).floor() as i32,
         )
     };
-    let smooth = |t: f32| {
+    const fn smooth(t: f32) -> f32 {
         let t = t.clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
-    };
+    }
     let mut at = 0usize;
     for (index, run) in runs.iter().enumerate() {
         if run.is_empty() {
@@ -474,9 +816,15 @@ pub(crate) fn lay_dark_bed(
             let feather_span = dir * cwf * DARK_BED_HEAD_FEATHER_CELLS;
             let from = head_x - feather_span;
             let taper_from = taper_at(from);
-            let feather = |j: usize| {
-                let u = j as f32 / DARK_BED_HEAD_FEATHER_KNOTS as f32;
-                (from + feather_span * u, taper_from * (1.0 - smooth(u)))
+            const HEAD_FEATHER_KNOTS: [(f32, f32); DARK_BED_HEAD_FEATHER_KNOTS + 1] = {
+                let mut out = [(0.0f32, 0.0f32); DARK_BED_HEAD_FEATHER_KNOTS + 1];
+                let mut j = 0;
+                while j <= DARK_BED_HEAD_FEATHER_KNOTS {
+                    let u = j as f32 / DARK_BED_HEAD_FEATHER_KNOTS as f32;
+                    out[j] = (u, 1.0 - smooth(u));
+                    j += 1;
+                }
+                out
             };
             let feather_over =
                 |verts: &mut Vec<RibbonVertex>, at: &dyn Fn(f32, f32) -> RibbonVertex| {
@@ -484,9 +832,8 @@ pub(crate) fn lay_dark_bed(
                     {
                         verts.pop();
                     }
-                    for j in 0..=DARK_BED_HEAD_FEATHER_KNOTS {
-                        let (x, k) = feather(j);
-                        verts.push(at(x, k));
+                    for &(u, w) in &HEAD_FEATHER_KNOTS {
+                        verts.push(at(from + feather_span * u, taper_from * w));
                     }
                 };
             if left {
@@ -508,11 +855,12 @@ pub(crate) fn lay_dark_bed(
                 && shape.rail > 0.0
                 && row + 1 < geom.rows as i32
             {
-                let bottom = oyf + (row + 1) as f32 * chf;
+                let bottom = oyf + (row + 1) as f32 * chf + rail_drop;
                 let reach = shape.rail * chf;
                 let rail_up = reach * shape.rail_rise;
                 let rail_core_dn = reach * DARK_RAIL_CORE * (1.0 - shape.rail_rise);
-                let leading = |x: f32| !text.over_text(row + 1, ((x - oxf) / cwf).floor() as i32);
+                let leading =
+                    |x: f32| !text.over_text(row + 1, ((x - oxf) * inv_cw).floor() as i32);
                 let rail_vertex = |x: f32, s: &CometSample, rgb: u32, k: f32| RibbonVertex {
                     x,
                     spine: bottom,
@@ -545,6 +893,7 @@ pub(crate) fn lay_dark_bed(
                         rail_vertex(x, &last, rail[rail.len() - 1], k)
                     });
                 }
+                let from = under.len();
                 ribbon_beam(
                     under,
                     clip,
@@ -554,6 +903,9 @@ pub(crate) fn lay_dark_bed(
                     quad_budget,
                     GlowBlend::Over,
                 );
+                if rail_up <= 0.0 && rail_drop >= crate::cursor_glow::LETTER_GUARD_RING as f32 {
+                    ledger.note_rail(from, under.len());
+                }
             }
         } else {
             let over = |s: &CometSample| {
@@ -647,7 +999,7 @@ pub(crate) fn lay_dark_bed(
                     tube.clear();
                     tube.extend([at(0.0, 0), at(f, ca), at(1.0 - f, cb), at(1.0, 0)]);
                     for k in 0..LEAP_LAYERS {
-                        let shrink = 1.0 - k as f32 / LEAP_LAYERS as f32;
+                        let shrink = 1.0 - k as f32 * (1.0 / LEAP_LAYERS as f32);
                         comet_beam_over(
                             under,
                             clip,
@@ -676,7 +1028,8 @@ fn wedge_runs(
     lengths: &mut Vec<f32>,
 ) -> usize {
     lengths.clear();
-    let cwf = geom.cw as f32;
+    let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
+    let (inv_cw, inv_ch) = (1.0 / cwf, 1.0 / chf);
     let wedge = shape.wedge;
     let knots = (wedge * 4.0).ceil().max(1.0) as usize;
     let mut n = 0usize;
@@ -719,11 +1072,11 @@ fn wedge_runs(
             };
             let mut cells = wedge;
             if !kind {
-                cells = (head.x - tail.x).abs() / cwf + 1.0;
-                let row = ((head.y - f32::from(geom.origin_y)) / geom.ch as f32)
+                cells = (head.x - tail.x).abs() * inv_cw + 1.0;
+                let row = ((head.y - f32::from(geom.origin_y)) * inv_ch)
                     .floor()
                     .clamp(0.0, f32::from(u16::MAX)) as u16;
-                let col = ((head.x - f32::from(geom.origin_x)) / cwf).floor();
+                let col = ((head.x - f32::from(geom.origin_x)) * inv_cw).floor();
                 if let Some(&(_, _, first, last)) = leaps.iter().find(|(_, r, first, last)| {
                     *r == row && col >= f32::from(*first) - 1.0 && col <= f32::from(*last) + 1.0
                 }) {
@@ -743,13 +1096,14 @@ fn wedge_runs(
             let cov = piece.iter().map(|s| s.cov).max().unwrap_or(head.cov);
             lengths.push(cells);
             let span = cells * cwf;
+            let inv_knots = 1.0 / knots as f32;
             out[at].extend((0..=knots).rev().map(|k| {
-                let d = span * k as f32 / knots as f32;
+                let u = k as f32 * inv_knots;
                 CometSample {
-                    x: head.x + back * d,
+                    x: head.x + back * (span * u),
                     y: head.y,
                     cov,
-                    pos: 1.0 - d / span,
+                    pos: 1.0 - u,
                 }
             }));
             start = end;
@@ -780,21 +1134,15 @@ pub(crate) fn clip_quads_to(
         c.w = (cx1 - cx0) as u16;
         c.h = (cy1 - cy0) as u16;
         if cx0 != qx0 || cx1 != qx1 {
-            let w = f32::from(q.w.max(1));
+            let inv_w = 1.0 / f32::from(q.w.max(1));
             if q.color != q.color2 {
-                let lerp = |a: u32, b: u32, x: i32| {
-                    let t = (x - qx0) as f32 / w;
-                    let ch = |sh: u32| {
-                        let (u, v) = (((a >> sh) & 0xff) as f32, ((b >> sh) & 0xff) as f32);
-                        ((u + (v - u) * t).round() as u32).min(255)
-                    };
-                    (ch(16) << 16) | (ch(8) << 8) | ch(0)
-                };
                 if cx0 != qx0 {
-                    c.color = lerp(q.color, q.color2, cx0);
+                    c.color =
+                        crate::effect_util::lerp_rgb(q.color, q.color2, (cx0 - qx0) as f32 * inv_w);
                 }
                 if cx1 != qx1 {
-                    c.color2 = lerp(q.color, q.color2, cx1);
+                    c.color2 =
+                        crate::effect_util::lerp_rgb(q.color, q.color2, (cx1 - qx0) as f32 * inv_w);
                 }
             }
             if q.alpha != 0 {
@@ -803,7 +1151,7 @@ pub(crate) fn clip_quads_to(
                     c.alpha2 = q.alpha2.max(1);
                 } else {
                     let lerp_a = |a: u8, b: u8, x: i32| {
-                        let t = (x - qx0) as f32 / w;
+                        let t = (x - qx0) as f32 * inv_w;
                         (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8
                     };
                     c.alpha = if cx0 != qx0 {
@@ -837,11 +1185,12 @@ pub(crate) fn split_air_runs(
     air: &mut Vec<Vec<CometSample>>,
 ) -> usize {
     let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
+    let (inv_cw, inv_ch) = (1.0 / cwf, 1.0 / chf);
     let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
     let over_text = |s: &CometSample| {
         let (row, col) = (
-            ((s.y - oyf) / chf).floor() as i32,
-            ((s.x - oxf) / cwf).floor() as i32,
+            ((s.y - oyf) * inv_ch).floor() as i32,
+            ((s.x - oxf) * inv_cw).floor() as i32,
         );
         text.over_text(row, col)
     };
@@ -903,6 +1252,82 @@ pub(crate) fn split_air_runs(
     n
 }
 
+/// The most blank columns between two letters whose bed is bridged as one
+/// word gap ([`bridge_word_gaps`]).
+pub(crate) const BED_WORD_GAP_COLS: i32 = 2;
+
+/// A word gap's bed takes the line between its letters' inks (looks7 M4).
+/// The bed walks the trail's hue knot by knot at one luminance, and at that
+/// luminance a saturated blue reads far brighter than the violet or the teal
+/// beside it. A letter shows its knot only between its strokes; a knot that
+/// fell in a word gap stood its hue there as a solid block: Phaser's dark bar
+/// a bright blue stripe between `the` and `quick` (the gallery's `context`
+/// `mid`: `#032BE7` in the gap against `#034591` and `#2F1DD3` on the
+/// letters beside it, all within 0.063 to 0.075 luminance; the stripe lies
+/// in the bed alone, the letter guard and the over-ink account on or off
+/// alike). A sample in a cell no letter covers, with a letter within
+/// [`BED_WORD_GAP_COLS`] blank columns on each side of it on its row, takes
+/// the ink interpolated between the first samples on those two letters, by
+/// its x between theirs. A longer run of blanks, a gap one of whose letters
+/// has no sample in the run, and every letter keep their own ink. `inks` is
+/// one entry a sample, `runs` in order.
+pub(crate) fn bridge_word_gaps(
+    runs: &[Vec<CometSample>],
+    geom: Geom,
+    lettered: impl Fn(i32, i32) -> bool,
+    inks: &mut [u32],
+) {
+    let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
+    if cwf <= 0.0 || chf <= 0.0 {
+        return;
+    }
+    let (inv_cw, inv_ch) = (1.0 / cwf, 1.0 / chf);
+    let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
+    let cell_of = |s: &CometSample| {
+        (
+            ((s.y - oyf) * inv_ch).floor() as i32,
+            ((s.x - oxf) * inv_cw).floor() as i32,
+        )
+    };
+    let reach = BED_WORD_GAP_COLS + 1;
+    let mut at = 0usize;
+    for run in runs {
+        let base = at;
+        at += run.len();
+        if inks.len() < at {
+            return;
+        }
+        for (i, s) in run.iter().enumerate() {
+            let (row, col) = cell_of(s);
+            if lettered(row, col) {
+                continue;
+            }
+            let left = (1..=reach)
+                .map(|d| col - d)
+                .find(|&c| c >= 0 && lettered(row, c));
+            let right = (1..=reach).map(|d| col + d).find(|&c| lettered(row, c));
+            let (Some(a), Some(b)) = (left, right) else {
+                continue;
+            };
+            if b - a - 1 > BED_WORD_GAP_COLS {
+                continue;
+            }
+            let on = |c: i32| run.iter().position(|q| cell_of(q) == (row, c));
+            let (Some(ja), Some(jb)) = (on(a), on(b)) else {
+                continue;
+            };
+            let (xa, xb) = (run[ja].x, run[jb].x);
+            let u = if (xb - xa).abs() > 1e-3 {
+                ((s.x - xa) / (xb - xa)).clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            let (ca, cb) = (inks[base + ja], inks[base + jb]);
+            inks[base + i] = crate::effect_util::lerp_rgb(ca, cb, u);
+        }
+    }
+}
+
 impl CursorGlow {
     /// Lay the dark bed under `self.comet_runs[..runs_len]`.
     #[allow(
@@ -959,24 +1384,52 @@ impl CursorGlow {
         } else {
             &self.comet_runs[..runs_len]
         };
-        let mut last: Option<(u32, u32, u32)> = None;
+        let shape = if self.colour_pins.trail && cfg.style.draws_trail_color() {
+            shape.pinned()
+        } else {
+            shape
+        };
+        let air = AirLight::of(page, budget, shape).filter(|_| !self.bed_air_off());
+        let lit_page = page_lit(page, dark_bed_budget(ink)) && !self.bed_air_off();
+        let shape = if lit_page { shape.on_lit_page() } else { shape };
+        scratch.rail_drop = if lit_page {
+            lit_rail_drop(geom.ch as f32)
+        } else {
+            0.0
+        };
+        let air_text = TextView::new(self.probed_text_spans(), Some(&self.frame_text));
+        let mut lit = std::mem::take(&mut scratch.air);
+        let mut last: Option<(u32, bool, u32, u32)> = None;
         for run in runs {
-            for s in run {
+            air_lit(
+                run,
+                geom,
+                &air_text,
+                (air.is_some(), self.bed_air_alone()),
+                &mut lit,
+            );
+            for (s, &in_air) in run.iter().zip(&lit) {
                 let raw = color(self, s.pos);
                 let (bed_c, rail_c) = match last {
-                    Some((prev, b, r)) if prev == raw => (b, r),
+                    Some((prev, was_air, b, r)) if prev == raw && was_air == in_air => (b, r),
                     _ => {
                         let hue = match shape.hue {
                             BedHue::Night => night_rgb(raw),
                             BedHue::True => raw,
                         };
-                        let b = self.bed_ink(hue, page, budget, shape.sat);
+                        // Under the letters a lit page's bed lays its hue at
+                        // the page's luminance: a grey there only greys the
+                        // page, so the floored hue is kept (and is the page's).
+                        let b = match air {
+                            Some(air) if in_air => air.ink(hue, page, shape.sat_for(hue)),
+                            _ => self.bed_ink(hue, page, budget, shape.under_sat_for(hue)),
+                        };
                         let r = if shape.rail > 0.0 {
-                            crate::rainbow_kitty::ribbon::rail_ink(raw & 0x00FF_FFFF)
+                            bed_rail_ink(raw, shape)
                         } else {
                             0
                         };
-                        last = Some((raw, b, r));
+                        last = Some((raw, in_air, b, r));
                         (b, r)
                     }
                 };
@@ -985,6 +1438,16 @@ impl CursorGlow {
                     scratch.rails.push(rail_c);
                 }
             }
+        }
+        scratch.air = lit;
+        if !self.bed_gaps_unbridged() {
+            let ft = &self.frame_text;
+            bridge_word_gaps(
+                runs,
+                geom,
+                |row, col| ft.pair(row, col).is_some_and(|(ink, _)| ink.is_some()),
+                &mut scratch.inks,
+            );
         }
         let text = TextView::new(self.probed_text_spans(), Some(&self.frame_text));
         lay_dark_bed(
@@ -1001,8 +1464,29 @@ impl CursorGlow {
         self.wedge_runs = wedges;
     }
 
+    /// A test's negative control: a word gap's bed keeps its own knot's ink
+    /// ([`bridge_word_gaps`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_bed_word_gaps(&mut self, on: bool) {
+        self.bed_gaps_unbridged = !on;
+    }
+
+    /// Whether a word gap's bed keeps its own knot's ink ([`Self::set_bed_word_gaps`]).
+    #[inline]
+    const fn bed_gaps_unbridged(&self) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.bed_gaps_unbridged
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            false
+        }
+    }
+
     /// [`dark_bed_ink`] ([`Self::bed_unsolved`]).
-    const fn bed_ink(&self, rgb: u32, page: u32, budget: f32, sat: f32) -> u32 {
+    fn bed_ink(&self, rgb: u32, page: u32, budget: f32, sat: f32) -> u32 {
         if self.bed_unsolved() {
             let rgb = crate::spectrum::spectrum_with_min_saturation(rgb & 0x00FF_FFFF, sat);
             let r = (rgb >> 16) & 0xff;
@@ -1017,8 +1501,63 @@ impl CursorGlow {
                 if v < 255 { v } else { 255 }
             }
             (up(rgb, mx, 16) << 16) | (up(rgb, mx, 8) << 8) | up(rgb, mx, 0)
+        } else if self.bed_page_unlit() {
+            dark_bed_ink_unlit(rgb, page, budget, sat)
         } else {
             dark_bed_ink(rgb, page, budget, sat)
+        }
+    }
+
+    /// Whether the bed is held to its budget alone ([`Self::bed_page_unlit`]).
+    #[inline]
+    const fn bed_page_unlit(&self) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.bed_page_unlit
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            false
+        }
+    }
+
+    /// A test's negative control: a lit page's bed laid at the page's
+    /// luminance in the air too (`on` false: no [`AirLight`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_bed_air_light(&mut self, on: bool) {
+        self.bed_air_off = !on;
+    }
+
+    /// A test's negative control: a sample in the air by its own cell's
+    /// text alone (`on` false), not its neighbours' ([`air_lit`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_bed_air_beside_text(&mut self, on: bool) {
+        self.bed_air_alone = !on;
+    }
+
+    #[inline]
+    const fn bed_air_off(&self) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.bed_air_off
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            false
+        }
+    }
+
+    #[inline]
+    const fn bed_air_alone(&self) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.bed_air_alone
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            false
         }
     }
 

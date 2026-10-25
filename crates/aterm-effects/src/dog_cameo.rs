@@ -15,12 +15,18 @@ const HOLD: Duration = Duration::from_millis(2600);
 const FADE_OUT: Duration = Duration::from_millis(420);
 const FADE_IN_HOLD: Duration = Duration::from_millis(140 + 2600);
 const VISIT_LIFE: Duration = Duration::from_millis(140 + 2600 + 420);
+const FADE_IN_SECS: f32 = FADE_IN.as_secs_f32();
+const FADE_OUT_SECS: f32 = FADE_OUT.as_secs_f32();
+const INV_FADE_IN_SECS: f32 = 1.0 / FADE_IN_SECS;
+const INV_FADE_OUT_SECS: f32 = 1.0 / FADE_OUT_SECS;
 const _: () = assert!(FADE_IN_HOLD.as_nanos() == FADE_IN.as_nanos() + HOLD.as_nanos());
 const _: () = assert!(VISIT_LIFE.as_nanos() == FADE_IN_HOLD.as_nanos() + FADE_OUT.as_nanos());
 
 const HOP_MS: u64 = 420;
 const HOPS: u64 = 2;
 const HOP_LIFT: f32 = 0.22;
+const HOP_LIFTS: [f32; HOPS as usize] = [HOP_LIFT, HOP_LIFT * 0.5];
+const HOP_PHASE_RAD_PER_MS: f32 = std::f32::consts::PI / (HOP_MS as f32);
 
 const BREED_SALT: u64 = 0x646f_6721_6272_6564; // b"dog!bred"
 const COAT_SALT: u64 = 0x646f_6721_636f_6174; // b"dog!coat"
@@ -105,12 +111,12 @@ impl DogCameo {
         };
         let t = now.saturating_duration_since(at);
         if t < FADE_IN {
-            let f = t.as_secs_f32() / FADE_IN.as_secs_f32();
+            let f = t.as_secs_f32() * INV_FADE_IN_SECS;
             (f * 255.0).round().clamp(0.0, 255.0) as u8
         } else if t < FADE_IN_HOLD {
             255
         } else if t < VISIT_LIFE {
-            let f = (t - FADE_IN_HOLD).as_secs_f32() / FADE_OUT.as_secs_f32();
+            let f = (t - FADE_IN_HOLD).as_secs_f32() * INV_FADE_OUT_SECS;
             ((1.0 - f) * 255.0).round().clamp(0.0, 255.0) as u8
         } else {
             0
@@ -128,10 +134,9 @@ impl DogCameo {
         if ms >= HOP_MS * HOPS {
             return 0.0;
         }
-        let hop = ms / HOP_MS;
-        let phase = (ms % HOP_MS) as f32 / HOP_MS as f32;
-        let lift = HOP_LIFT / (1 << hop) as f32;
-        -lift * (phase * std::f32::consts::PI).sin()
+        let hop = (ms / HOP_MS) as usize;
+        let rem_ms = (ms % HOP_MS) as f32;
+        -HOP_LIFTS[hop] * (rem_ms * HOP_PHASE_RAD_PER_MS).sin()
     }
 
     /// The current visit's rolled identity (`None` before the first summon).

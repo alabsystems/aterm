@@ -795,6 +795,59 @@ fn agent_gone_expires_the_wake() {
     }
 }
 
+/// Levels whose `file:` paths are lost for `why` and whose `gone:` atoms read `gone`.
+struct LostFiles {
+    why: ExpireWhy,
+    gone: Option<bool>,
+}
+
+impl Levels for LostFiles {
+    fn source(&self, atom: &SourceAtom) -> Option<bool> {
+        match atom {
+            SourceAtom::Gone { .. } => self.gone,
+            SourceAtom::File { .. } | SourceAtom::Pid { .. } => None,
+        }
+    }
+    fn sys(&self, _: &SysWait) -> Option<bool> {
+        None
+    }
+    fn agent_alive(&self, _: AgentId) -> bool {
+        true
+    }
+    fn lost(&self, atom: &SourceAtom) -> Option<ExpireWhy> {
+        matches!(atom, SourceAtom::File { .. }).then_some(self.why)
+    }
+}
+
+/// A LOST PATH ENDS ITS WAKE for its reason: a `when=` atom that has not held, or an `unless=`
+/// atom, whose path met a link (`why=path`) or the rules no longer admit (`why=admit`).
+/// NEGATIVE CONTROL: a `when=` atom that held before its path was lost keeps its wake ready.
+#[test]
+fn a_lost_path_ends_its_wake_unless_its_atom_held() {
+    for why in [ExpireWhy::Path, ExpireWhy::Admit] {
+        for decl in [
+            "label=t when=file:~/scratch.noindex/x/flag",
+            "label=t when=gone:~/scratch.noindex/x/lock unless=file:~/scratch.noindex/x/stop",
+        ] {
+            let (mut book, ord) = declared(decl);
+            let lv = LostFiles { why, gone: None };
+            assert_eq!(book.on_look(&lv, T0 + 1), [(ord, Change::Expired(why))]);
+            assert_eq!(state(&book, ord), WakeState::Expired { why }, "{decl}");
+        }
+    }
+    let (mut book, ord, _) = ready();
+    let lost = LostFiles {
+        why: ExpireWhy::Path,
+        gone: None,
+    };
+    assert_eq!(book.on_look(&lost, T0 + 2), NOTHING);
+    assert_eq!(
+        state(&book, ord),
+        WakeState::Ready,
+        "a held atom's path is read no more"
+    );
+}
+
 #[test]
 fn a_held_wake_ends_at_its_by_or_with_its_agent() {
     let gone = Lv {

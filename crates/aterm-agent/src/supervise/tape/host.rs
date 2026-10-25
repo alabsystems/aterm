@@ -17,7 +17,7 @@ use crate::harness::accounts::Sample;
 use crate::harness::acts::{Act, LandHeld, TaskFace};
 use crate::harness::disk::Level;
 use crate::harness::profile::AccountKey;
-use crate::harness::repo_work::{RepoRead, RepoWork};
+use crate::harness::repo_work::{CleanAt, RepoRead, RepoWork};
 use crate::harness::upgrade::{LastTurn, StandingLimit};
 use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
 use crate::supervise::facts::FactsReading;
@@ -1228,9 +1228,29 @@ struct RepoWorkWire {
     state: Option<u64>,
 }
 
+/// [`CleanAt`] as a tape holds it, under [`CheckedWire`]'s `at`.
+#[derive(Serialize, Deserialize)]
+struct CleanAtWire {
+    repo: String,
+    head: String,
+    #[serde(default)]
+    main_ref: String,
+    remote: bool,
+}
+
+/// [`RepoRead::Checked`] on a tape: `{"at":{…}}`, which no [`RepoWorkWire`]
+/// reads (it has no `repo` at its top), as no [`RepoWorkWire`] reads as this
+/// (it has no `at`).
+#[derive(Serialize, Deserialize)]
+struct CheckedWire {
+    at: CleanAtWire,
+}
+
 /// The word a tape holds for [`RepoRead::Unread`]; [`RepoRead::Clean`] is
-/// `null` and [`RepoRead::Found`] its [`RepoWorkWire`], as a tape recorded
-/// before the probe could read as unread holds them.
+/// `null`, [`RepoRead::Checked`] its [`CheckedWire`] and [`RepoRead::Found`]
+/// its [`RepoWorkWire`]. A tape recorded before the probe could read as
+/// unread or name what it checked holds `null` for every clean reading, and
+/// reads back [`RepoRead::Clean`], which every decision reads as a checked one.
 const REPO_UNREAD: &str = "unread";
 
 impl TapeValue for RepoRead {
@@ -1238,6 +1258,22 @@ impl TapeValue for RepoRead {
         let found = match self {
             RepoRead::Unread => return json(&REPO_UNREAD),
             RepoRead::Clean => None,
+            RepoRead::Checked(at) => {
+                let CleanAt {
+                    repo,
+                    head,
+                    main_ref,
+                    remote,
+                } = at;
+                return json(&CheckedWire {
+                    at: CleanAtWire {
+                        repo: repo.clone(),
+                        head: head.clone(),
+                        main_ref: main_ref.clone(),
+                        remote: *remote,
+                    },
+                });
+            }
             RepoRead::Found(w) => Some(w),
         };
         json(&found.map(|w| {
@@ -1270,6 +1306,14 @@ impl TapeValue for RepoRead {
         if of_json::<String>(bytes).is_ok_and(|w| w == REPO_UNREAD) {
             return Ok(RepoRead::Unread);
         }
+        if let Ok(CheckedWire { at }) = of_json::<CheckedWire>(bytes) {
+            return Ok(RepoRead::Checked(CleanAt {
+                repo: at.repo,
+                head: at.head,
+                main_ref: at.main_ref,
+                remote: at.remote,
+            }));
+        }
         Ok(RepoRead::of_found(
             of_json::<Option<RepoWorkWire>>(bytes)?.map(|w| RepoWork {
                 repo: w.repo,
@@ -1283,6 +1327,26 @@ impl TapeValue for RepoRead {
                 state: w.state,
             }),
         ))
+    }
+}
+
+/// The word a tape holds for a probe that still reads
+/// ([`crate::supervise::IdleHost::repo_work`]'s `None`); its answer is its
+/// [`RepoRead`]'s, as a tape recorded before a host could answer while its
+/// probe read holds every answer.
+const REPO_READING: &str = "reading";
+
+impl TapeValue for Option<RepoRead> {
+    fn to_tape(&self) -> Vec<u8> {
+        self.as_ref()
+            .map_or_else(|| json(&REPO_READING), TapeValue::to_tape)
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        if of_json::<String>(bytes).is_ok_and(|w| w == REPO_READING) {
+            return Ok(None);
+        }
+        RepoRead::from_tape(bytes).map(Some)
     }
 }
 

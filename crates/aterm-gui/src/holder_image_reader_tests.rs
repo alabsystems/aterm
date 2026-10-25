@@ -177,6 +177,8 @@ struct Knobs {
     /// A process watch (scripted): the kernel edges, as on macOS.
     kernel: bool,
     no_retire: bool,
+    /// Temporal recording, seeded before the reader attaches.
+    record: bool,
 }
 
 const SHIPPING: Knobs = Knobs {
@@ -185,6 +187,7 @@ const SHIPPING: Knobs = Knobs {
     no_c_cut: false,
     kernel: false,
     no_retire: false,
+    record: false,
 };
 
 const KERNEL: Knobs = Knobs {
@@ -220,6 +223,7 @@ impl Rig {
         if knobs.kernel {
             app.session_factory.proc_watch = scripted_watch;
         }
+        app.session_factory.temporal_recording = knobs.record;
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
         // SAFETY: A zeroed termios is a valid out-slot for tcgetattr, then cfmakeraw/tcsetattr on the test-owned slave fd.
         unsafe {
@@ -239,6 +243,12 @@ impl Rig {
             let mut t = session.term.lock().expect("terminal lock");
             t.authorize_shell_integration(KEY);
             t.set_require_shell_integration_nonce(true);
+        }
+        if knobs.record {
+            assert!(
+                super::seed_temporal_keyframe(&session.term, &session.ctx.temporal, id),
+                "the recording is seeded"
+            );
         }
         hold_hook::watch(
             id,
@@ -1096,4 +1106,71 @@ fn a_reader_attaching_seeds_the_jobs_feed_with_the_block_already_running() {
         .block
         .expect("the seeded block");
     assert_eq!((block.open, block.command.as_str()), (true, "make"));
+}
+
+/// A BYTE-FREE EDGE'S HOLD IS ON THE SPINE: its empty parse runs at the hold's own clock and ends
+/// a mode-2026 frame the program left open past its timeout, so a replay to the instant after
+/// the edge shows the frame ended, as the live engine does.
+#[test]
+fn a_byte_free_edge_records_the_clock_its_empty_parse_ran_at() {
+    const ID: u64 = 9350;
+    const SHELL: i32 = 8600;
+    const JOB: i32 = 8700;
+    const SYNC_TIMEOUT: Duration = Duration::from_secs(1);
+    set_image(SHELL, zsh(SHELL));
+    let mut rig = Rig::attach(
+        ID,
+        SHELL,
+        Knobs {
+            record: true,
+            ..KERNEL
+        },
+    );
+    let open = |t: &Terminal| t.modes().synchronized_output;
+    rig.write(SHELL, b"\x1b[?2026hframe", "<f>");
+    assert!(
+        open(&rig.session.term.lock().expect("terminal lock")),
+        "precondition: the frame is open"
+    );
+    std::thread::sleep(SYNC_TIMEOUT + Duration::from_millis(100));
+    set_image(JOB, launcher(JOB, 23));
+    let exec = ProcEvent::Exec {
+        pid: JOB,
+        pgid: JOB,
+        late: false,
+    };
+    rig.hear(
+        JOB,
+        &[ProcEvent::Fork { child: JOB }, exec],
+        launcher(JOB, 23).token,
+    );
+    let ended = aterm_spec::wait::within(PATIENCE, Duration::from_millis(1), || {
+        (!open(&rig.session.term.lock().expect("terminal lock"))).then_some(())
+    });
+    assert!(
+        ended.is_some(),
+        "the edge's empty parse ended the frame live"
+    );
+    assert!(
+        park_reader(&mut rig.session, Instant::now() + PATIENCE),
+        "parked"
+    );
+    let live = rig.session.term.lock().expect("terminal lock");
+    let replay = rig
+        .session
+        .ctx
+        .temporal
+        .lock()
+        .expect("recorder")
+        .replay_at(None)
+        .expect("the spine's end replays");
+    assert_eq!(open(&replay), open(&live), "the frame after the edge");
+    assert_eq!(
+        (0..usize::from(live.rows()))
+            .map(|r| replay.row_text(r))
+            .collect::<Vec<_>>(),
+        (0..usize::from(live.rows()))
+            .map(|r| live.row_text(r))
+            .collect::<Vec<_>>()
+    );
 }

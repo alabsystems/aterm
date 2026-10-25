@@ -3,6 +3,13 @@
 
 //! Fabric bridge runtime (`aterm-link serve`).
 
+macro_rules! stderr_line {
+    ($($arg:tt)*) => {
+        ::aterm_uds::stdout::stderr_line(::std::format_args!($($arg)*))
+            .unwrap_or_else(|error| panic!("failed printing to stderr: {error}"))
+    };
+}
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::sync::Arc;
@@ -525,7 +532,7 @@ impl Fault {
             Some("drop-meta-event-while-marked") => Fault::DropMetaEventWhileMarked,
             Some("park-retire-while-marked") => Fault::ParkRetireWhileMarked,
             other => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: ATERM_LINK_FAULT={:?} names no fault this bridge has; \
                      nothing is armed",
                     other.unwrap_or("<not UTF-8>")
@@ -537,7 +544,7 @@ impl Fault {
 
     fn fired(self, state: &StateDir) {
         let _ = std::fs::write(state.root().join("fault-fired"), b"1\n");
-        eprintln!("aterm-link: ATERM_LINK_FAULT={self:?} fired");
+        stderr_line!("aterm-link: ATERM_LINK_FAULT={self:?} fired");
     }
 }
 
@@ -650,7 +657,7 @@ fn sent_past_an_owed_ack(e: &io::Error) -> bool {
     let Some(owed) = astream_broker::acks_owed(e) else {
         return false;
     };
-    eprintln!(
+    stderr_line!(
         "aterm-link: BUG: a request was sent past {} unread pipelined ack(s) and astream \
          refused it, sending nothing: {e}; the connection is dropped and redialled",
         owed.owed
@@ -1230,7 +1237,7 @@ impl Bridge {
         let attachment = match (attachment, probe.ok()) {
             (Attachment::Inherited, true) => Attachment::Inherited,
             (_, _) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: OBSERVER MODE: aterm refused `outbox` ({}); \
                      carries no mail, applies no fleet halt",
                     probe.header()
@@ -1386,7 +1393,7 @@ impl Bridge {
         match verdict {
             Ok(ring) => {
                 if ring != self.caps {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: the cap ring on disk changed ({} grant(s)); attaching with it",
                         ring.len()
                     );
@@ -1396,7 +1403,7 @@ impl Bridge {
             }
             Err(why) => {
                 if self.ring_kept.as_deref() != Some(why.as_str()) {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: kept the cap ring this bridge holds; the one in {} is not \
                          taken: {why}",
                         self.cfg.cap_files.join(" ")
@@ -1458,11 +1465,11 @@ impl Bridge {
         match self.ctl_request(&line) {
             Ok(reply) if matches!(reply.header(), "OK" | "OK forgot=1") => true,
             Ok(reply) => {
-                eprintln!("aterm-link: `{line}` not acknowledged: {}", reply.header());
+                stderr_line!("aterm-link: `{line}` not acknowledged: {}", reply.header());
                 false
             }
             Err(e) => {
-                eprintln!("aterm-link: `{line}` failed: {e}");
+                stderr_line!("aterm-link: `{line}` failed: {e}");
                 false
             }
         }
@@ -1582,7 +1589,7 @@ impl Bridge {
         match (then, outcome) {
             (Then::Ev { .. }, Ok(_)) => {}
             (Then::Ev { payload, .. }, Err(e)) => {
-                eprintln!("aterm-link: could not publish ev {payload:?}: {e}");
+                stderr_line!("aterm-link: could not publish ev {payload:?}: {e}");
             }
             (Then::Presence { sid, mark, exited }, Ok(_)) => {
                 if exited {
@@ -1593,7 +1600,7 @@ impl Bridge {
                 }
             }
             (Then::Presence { sid, mark, exited }, Err(e)) => {
-                eprintln!("aterm-link: could not publish presence for {sid}: {e}");
+                stderr_line!("aterm-link: could not publish presence for {sid}: {e}");
                 if exited {
                     self.exits_owed.insert(sid.clone());
                 }
@@ -1608,7 +1615,7 @@ impl Bridge {
                 }
             }
             (Then::HaltAck { off }, Err(e)) => {
-                eprintln!("aterm-link: could not ack the halt at {off}: {e}");
+                stderr_line!("aterm-link: could not ack the halt at {off}: {e}");
             }
             (Then::Mirror { .. }, _) => {}
             (Then::Post(sent), outcome) => self.conclude_post(*sent, outcome),
@@ -1623,7 +1630,7 @@ impl Bridge {
                 }
             }
             (Then::Commit { upto, .. }, Err(e)) => {
-                eprintln!("aterm-link: commit through {upto} failed: {e}");
+                stderr_line!("aterm-link: commit through {upto} failed: {e}");
                 self.commit_refused = self.conn.is_some();
             }
         }
@@ -1813,7 +1820,7 @@ impl Bridge {
     fn dial_failed(&mut self, e: &io::Error) {
         let reason = link_reason(e, "attach");
         if self.link.down_wants_report(reason) {
-            eprintln!("aterm-link: the broker link is down ({reason}): {e}");
+            stderr_line!("aterm-link: the broker link is down ({reason}): {e}");
         } else {
             // A BROKER THAT STAYS DOWN FOR ONE REASON IS SAID AGAIN: said once, a
             // minute of redials that all failed alike reads as one failed redial.
@@ -1825,7 +1832,7 @@ impl Bridge {
                 .or(self.link.reported_at)
                 .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
             if quiet >= LINK_DOWN_RETELL {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: the broker link is still down ({reason}): {} more redials \
                      failed in {}s, the last: {e}",
                     self.quiet_dials.kept,
@@ -1857,8 +1864,8 @@ impl Bridge {
         }
         match self.ctl_request(line) {
             Ok(reply) if reply.ok() => {}
-            Ok(reply) => eprintln!("aterm-link: `{line}` refused: {}", reply.header()),
-            Err(e) => eprintln!("aterm-link: `{line}` failed: {e}"),
+            Ok(reply) => stderr_line!("aterm-link: `{line}` refused: {}", reply.header()),
+            Err(e) => stderr_line!("aterm-link: `{line}` failed: {e}"),
         }
     }
 
@@ -1985,7 +1992,7 @@ impl Bridge {
     }
 
     fn collision(&mut self, seq: u64, off: u64) -> io::Error {
-        eprintln!(
+        stderr_line!(
             "aterm-link: sequence {seq} was already used by another writer under this node's \
              producer id (@{off}): dropping the connection to roll the incarnation"
         );
@@ -2194,7 +2201,7 @@ impl Bridge {
                     true
                 }
                 Err(e) => {
-                    eprintln!("aterm-link: could not publish presence for {sid}: {e}");
+                    stderr_line!("aterm-link: could not publish presence for {sid}: {e}");
                     false
                 }
             };
@@ -2336,7 +2343,7 @@ impl Bridge {
                 match self.observe(started, answer, Some("read")) {
                     Ok((p, floor)) => {
                         if let Some(floor) = floor {
-                            eprintln!(
+                            stderr_line!(
                                 "aterm-link: refill of {sid}: the broker's retention gave up \
                                  this lane's records below @{floor} (from @{cursor}); reading on \
                                  from there"
@@ -2345,7 +2352,7 @@ impl Bridge {
                         p
                     }
                     Err(e) => {
-                        eprintln!("aterm-link: refill of {sid} stopped: {e}");
+                        stderr_line!("aterm-link: refill of {sid} stopped: {e}");
                         return false;
                     }
                 }
@@ -2366,7 +2373,7 @@ impl Bridge {
                 return true;
             }
             if next <= cursor {
-                eprintln!("aterm-link: refill of {sid} made no progress at {cursor}");
+                stderr_line!("aterm-link: refill of {sid} made no progress at {cursor}");
                 return false;
             }
             cursor = next;
@@ -2404,7 +2411,7 @@ impl Bridge {
                 self.owe_inbox_commit(*off);
             }
             Delivery::Unaccounted => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: record {off} left for the next bridge: the connection to aterm \
                      is lost"
                 );
@@ -2435,7 +2442,7 @@ impl Bridge {
     fn on_gap(&mut self, source: Source, g: astream_broker::Gap) {
         let lost = transport::gap_lost(&g);
         if source != Source::Inbox {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: the broker's retention gave up {lost} below the {} subscription; \
                  reading on from there",
                 face_name(source)
@@ -2448,13 +2455,13 @@ impl Bridge {
             } else {
                 "this bridge only observes"
             };
-            eprintln!(
+            stderr_line!(
                 "aterm-link: the broker's retention gave up {lost} of this node's unread mail \
                  before this bridge read it; no session is told, as {why}"
             );
             return;
         }
-        eprintln!(
+        stderr_line!(
             "aterm-link: the broker's retention gave up {lost} of this node's unread mail \
              before this bridge read it; every session this node serves is told"
         );
@@ -2464,11 +2471,11 @@ impl Bridge {
         }
         match self.ctl_request(&line) {
             Ok(reply) if reply.ok() => {}
-            Ok(reply) => eprintln!(
+            Ok(reply) => stderr_line!(
                 "aterm-link: aterm did not take `{line}`: {}",
                 reply.header()
             ),
-            Err(e) => eprintln!("aterm-link: `{line}` failed: {e}"),
+            Err(e) => stderr_line!("aterm-link: `{line}` failed: {e}"),
         }
     }
 
@@ -2531,11 +2538,11 @@ impl Bridge {
             return;
         }
         match self.state.set_inbox_owed(upto) {
-            Ok(()) => eprintln!(
+            Ok(()) => stderr_line!(
                 "aterm-link: the inbox group's commit through {upto} is left for the next bridge \
                  (no broker connection to make it on)"
             ),
-            Err(e) => eprintln!(
+            Err(e) => stderr_line!(
                 "aterm-link: could not leave the inbox group's commit through {upto} for the \
                  next bridge ({e}); it offers those records again"
             ),
@@ -2672,7 +2679,7 @@ impl Bridge {
             return true;
         };
         if let Err(e) = self.state.set_topics(sid, &snapshot) {
-            eprintln!("aterm-link: the broadcast cursors of {sid} could not be persisted: {e}");
+            stderr_line!("aterm-link: the broadcast cursors of {sid} could not be persisted: {e}");
             return false;
         }
         true
@@ -2756,7 +2763,7 @@ impl Bridge {
             .map(floors_of)
             .unwrap_or_default();
         if let Err(e) = self.state.set_topic_floors(sid, &floors) {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: the broadcast refill floors of {sid} could not be persisted: {e}"
             );
             self.per_sid.topic_floors_dirty.insert(sid.to_string());
@@ -2811,7 +2818,7 @@ impl Bridge {
         }
         if addr.src == self.node && !self.settled_before_delivery(off) {
             if self.link.down_wants_report("error") {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: @{off} is not delivered while its in-flight entry stands (the \
                      state dir refused a write); reconnecting to offer it again"
                 );
@@ -2934,7 +2941,7 @@ impl Bridge {
                 None => self.hold_back(&addr.sid, off, reply.header()),
             },
             Err(e) => {
-                eprintln!("aterm-link: deliver failed: {e}");
+                stderr_line!("aterm-link: deliver failed: {e}");
                 if self.ctl.lost() {
                     Delivery::Unaccounted
                 } else {
@@ -2965,7 +2972,7 @@ impl Bridge {
     ) -> Delivery {
         match topic {
             Some(t) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: broadcast off={off} topic={t} not delivered to {}: {why}",
                     addr.sid
                 );
@@ -2979,7 +2986,7 @@ impl Bridge {
         if !self.per_sid.lane_owed.contains_key(sid) {
             self.per_sid.lane_owed.insert(sid.to_string(), None);
             let reply = reason_token(header);
-            eprintln!(
+            stderr_line!(
                 "aterm-link: aterm answered `deliver {sid} off={off}` with no verdict ({}): \
                  this bridge and aterm do not read the lane alike; {sid}'s mail stays on the \
                  bus for a bridge that does, and this one delivers it nothing more",
@@ -3143,7 +3150,7 @@ impl Bridge {
             self.publish_own_at(seq, &subject, &encoded).map(drop)
         };
         if let Err(e) = published {
-            eprintln!("aterm-link: could not publish {subject}: {e}");
+            stderr_line!("aterm-link: could not publish {subject}: {e}");
         }
     }
 
@@ -3211,7 +3218,7 @@ impl Bridge {
                 return Err(e);
             }
             Err(e) if refused_for_good(&e) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: the broker refused the receipt for {}: {e}",
                     r.off
                 );
@@ -3223,7 +3230,7 @@ impl Bridge {
                 return Ok(());
             }
             Err(e) if past_the_budget(&e) && self.writes_alone(&subject) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: the receipt for {} opens a lane past this node's subject \
                      budget: {e}",
                     r.off
@@ -3256,15 +3263,16 @@ impl Bridge {
             Ok(reply) if reply.ok() || reply.header().starts_with("ERR no such session") => {
                 self.state.clear_receipt_seq(&r.sid, r.rid);
             }
-            Ok(reply) => eprintln!(
+            Ok(reply) => stderr_line!(
                 "aterm-link: retiring receipt {} for {} refused: {}",
                 r.rid,
                 r.sid,
                 reply.header()
             ),
-            Err(e) => eprintln!(
+            Err(e) => stderr_line!(
                 "aterm-link: retiring receipt {} for {} failed: {e}",
-                r.rid, r.sid
+                r.rid,
+                r.sid
             ),
         }
     }
@@ -3309,7 +3317,7 @@ impl Bridge {
             match self.ctl_request(&line) {
                 Ok(reply) if reply.ok() => {}
                 Ok(reply) => {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: fetched {off} for {sid} refused: {}",
                         reply.header()
                     );
@@ -3320,7 +3328,7 @@ impl Bridge {
                     return;
                 }
                 Err(e) => {
-                    eprintln!("aterm-link: fetched {off} for {sid} failed: {e}");
+                    stderr_line!("aterm-link: fetched {off} for {sid} failed: {e}");
                     return;
                 }
             }
@@ -3520,7 +3528,7 @@ impl Bridge {
 
     fn drop_in_flight(&self, seq: u64) {
         if let Err(e) = self.state.drop_in_flight(seq) {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: the in-flight entry at sequence {seq} was not dropped durably: {e}"
             );
         }
@@ -3580,7 +3588,7 @@ impl Bridge {
         let entries = match self.state.in_flight() {
             Ok(entries) => entries,
             Err(e) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: the in-flight journal could not be read; not attaching: {e}"
                 );
                 return false;
@@ -3592,7 +3600,7 @@ impl Bridge {
                 match (entry.log, current_log) {
                     (Some(was), Some(now)) if was == now => {}
                     (Some(was), Some(now)) => {
-                        eprintln!(
+                        stderr_line!(
                             "aterm-link: in-flight sequence {seq} refers to an offset on log \
                              {was}, not {now}; not replaying its old reference"
                         );
@@ -3600,7 +3608,7 @@ impl Bridge {
                         continue;
                     }
                     _ => {
-                        eprintln!(
+                        stderr_line!(
                             "aterm-link: in-flight sequence {seq} refers to an offset without \
                              a matching journal and broker log identity; keeping it and not attaching"
                         );
@@ -3616,13 +3624,13 @@ impl Bridge {
                     self.land_replayed(seq, off, ours);
                 }
                 Err(e) if self.fate_unknown(&e) => {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: the in-flight record at sequence {seq} is unsettled: {e}"
                     );
                     return false;
                 }
                 Err(e) => {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: the in-flight record at sequence {seq} is not this node's \
                          to remember: {e}"
                     );
@@ -3690,7 +3698,7 @@ impl Bridge {
             })
             .collect();
         if let Err(e) = self.state.set_asked(&list) {
-            eprintln!("aterm-link: could not persist the asked table: {e}");
+            stderr_line!("aterm-link: could not persist the asked table: {e}");
         }
     }
 
@@ -3723,7 +3731,7 @@ impl Bridge {
     fn persist_deadlines(&mut self) {
         let list: Vec<Deadline> = self.deadlines.values().cloned().collect();
         if let Err(e) = self.state.set_deadlines(&list) {
-            eprintln!("aterm-link: could not persist the deadline table: {e}");
+            stderr_line!("aterm-link: could not persist the deadline table: {e}");
         }
     }
 
@@ -3760,7 +3768,7 @@ impl Bridge {
             }
             match self.settled_on_bus(&d.sid, d.off) {
                 Err(e) => {
-                    eprintln!("aterm-link: deadline sweep stopped at {}: {e}", d.off);
+                    stderr_line!("aterm-link: deadline sweep stopped at {}: {e}", d.off);
                     break;
                 }
                 Ok(Some(kind)) => {
@@ -3787,7 +3795,7 @@ impl Bridge {
                             changed = true;
                         }
                         Err(e) => {
-                            eprintln!("aterm-link: could not record expired for {}: {e}", d.off);
+                            stderr_line!("aterm-link: could not record expired for {}: {e}", d.off);
                             break;
                         }
                     }
@@ -3814,7 +3822,7 @@ impl Bridge {
             let answer = transport::fetch_kept(conn, cursor, &filter, 256);
             let ((rows, (next, head)), floor) = self.observe(started, answer, Some("read"))?;
             if let Some(floor) = floor {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: the deadline of @{off} on {sid}'s lane: the broker's retention \
                      gave up its records below @{floor}; judged on what it keeps"
                 );
@@ -3851,7 +3859,7 @@ impl Bridge {
             && match self.state.clear_in_flight(seq) {
                 Ok(()) => true,
                 Err(e) => {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: the in-flight entry at sequence {seq} (@{off}) could not be \
                          cleared: {e}; the record is delivered once it is"
                     );
@@ -3994,7 +4002,7 @@ impl Bridge {
             }
             Err(e) => {
                 self.acked_appendable = false;
-                eprintln!("aterm-link: could not record @{off} as this node's own: {e}");
+                stderr_line!("aterm-link: could not record @{off} as this node's own: {e}");
                 Err(e)
             }
         }
@@ -4169,7 +4177,7 @@ impl Bridge {
             }
         }
         if let Err(e) = roster {
-            eprintln!("aterm-link: the roster could not be read while holding: {e}");
+            stderr_line!("aterm-link: the roster could not be read while holding: {e}");
         }
         if !reached {
             self.publish_ev(&format!("hold-unconfirmed state={}", u8::from(on)));
@@ -4189,11 +4197,11 @@ impl Bridge {
         match self.ctl_request(&line) {
             Ok(reply) if reply.ok() || reply.header() == "ERR no such session" => true,
             Ok(reply) => {
-                eprintln!("aterm-link: {line} refused: {}", reply.header());
+                stderr_line!("aterm-link: {line} refused: {}", reply.header());
                 false
             }
             Err(e) => {
-                eprintln!("aterm-link: {line} failed: {e}");
+                stderr_line!("aterm-link: {line} failed: {e}");
                 false
             }
         }
@@ -4209,7 +4217,7 @@ impl Bridge {
             return;
         }
         let reason = reason.unwrap_or_default();
-        eprintln!(
+        stderr_line!(
             "aterm-link: {sid}: {}",
             if on {
                 "held: fleet halt stands"
@@ -4307,7 +4315,7 @@ impl Bridge {
         if !self.kept_halts.is_empty() {
             let by: Vec<&str> = self.kept_halts.keys().map(String::as_str).collect();
             let by = by.join(",");
-            eprintln!(
+            stderr_line!(
                 "aterm-link: the bus carries no halt row for {by}, whose halt this node held: \
                  it stands until each writes a `state=off` (or `on`) row on this log"
             );
@@ -4362,7 +4370,7 @@ impl Bridge {
             return;
         }
         if let Err(e) = self.state.set_standing_halts(&self.cfg.fleet, &set) {
-            eprintln!("aterm-link: could not record the standing halts: {e}");
+            stderr_line!("aterm-link: could not record the standing halts: {e}");
         }
     }
 
@@ -4404,7 +4412,7 @@ impl Bridge {
         let saved = match self.state.rewound_log() {
             Ok(saved) => saved,
             Err(e) => {
-                eprintln!("aterm-link: could not read the rewound log fact: {e}; not attaching");
+                stderr_line!("aterm-link: could not read the rewound log fact: {e}; not attaching");
                 return false;
             }
         };
@@ -4413,7 +4421,7 @@ impl Bridge {
             if let Some(log) = ident {
                 if found.was_log == Some(log) && head < found.was_high {
                     self.rewound_log = Some(log);
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: log {log} rewound from head {} to {head}; \
                          its reused offsets are uncertain, so it cannot attach",
                         found.was_high
@@ -4425,12 +4433,12 @@ impl Bridge {
             // Retry a failed durable write before allowing any later attach.
             if saved != Some(log) {
                 if let Err(e) = self.state.set_rewound_log(log) {
-                    eprintln!("aterm-link: could not preserve the rewound log refusal: {e}; not attaching");
+                    stderr_line!("aterm-link: could not preserve the rewound log refusal: {e}; not attaching");
                     return false;
                 }
             }
             if ident.is_none() || ident == Some(log) {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: log {log} previously rewound; a different known log \
                      identity is required before attaching"
                 );
@@ -4475,7 +4483,7 @@ impl Bridge {
             self.mirror_forget_log();
         }
         for (seq, face) in &dropped {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: the in-flight record at sequence {seq} on {face} was decided on \
                  another log; it is not published on this one"
             );
@@ -4563,7 +4571,7 @@ impl Bridge {
                 true
             }
             Err(e) => {
-                eprintln!("aterm-link: could not record the bus log's witness: {e}");
+                stderr_line!("aterm-link: could not record the bus log's witness: {e}");
                 false
             }
         }
@@ -4678,7 +4686,7 @@ impl Bridge {
         let floors = match self.state.topic_floors(sid) {
             Ok(floors) => floors,
             Err(e) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: the broadcast refill floors of {sid} could not be read: {e}"
                 );
                 return false;
@@ -4691,7 +4699,7 @@ impl Bridge {
                 TopicCursor { next: *floor }
             });
             if *floor < cursor.next {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: {sid} had not handled every broadcast on {topic} below \
                      @{}: offering them again from @{floor}",
                     cursor.next
@@ -4702,7 +4710,7 @@ impl Bridge {
         }
         if rewound {
             if let Err(e) = self.state.set_topics(sid, &persisted) {
-                eprintln!("aterm-link: the rewound broadcast cursors of {sid} could not be persisted: {e}");
+                stderr_line!("aterm-link: the rewound broadcast cursors of {sid} could not be persisted: {e}");
                 return false;
             }
         }
@@ -4801,7 +4809,7 @@ impl Bridge {
             return false;
         };
         if let Some(floor) = floor {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: the broadcast topic {topic}: the broker's retention gave up its \
                  records below @{floor} (from @{from}); replaying from there"
             );
@@ -4927,7 +4935,7 @@ impl Bridge {
             match self.last_face(&filter) {
                 Ok(rows) => rows,
                 Err(e) => {
-                    eprintln!("aterm-link: could not sweep the presence roster: {e}");
+                    stderr_line!("aterm-link: could not sweep the presence roster: {e}");
                     return;
                 }
             }
@@ -5010,12 +5018,12 @@ impl Bridge {
 
     fn retire_on_request(&mut self, sid: &str) {
         if self.locals.values().any(|s| s == sid) {
-            eprintln!("aterm-link: refusing to retire @{sid}: this instance hosts it");
+            stderr_line!("aterm-link: refusing to retire @{sid}: this instance hosts it");
             return;
         }
         match crate::fabric::retire_refusal(sid, &crate::fabric::node_hosted()) {
             Some(crate::fabric::RetireRefusal::Hosted(pid)) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: refusing to retire @{sid}: the instance at pid {pid} hosts it"
                 );
                 self.publish_ev(&format!(
@@ -5024,7 +5032,7 @@ impl Bridge {
                 return;
             }
             Some(crate::fabric::RetireRefusal::Unaskable(why)) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: refusing to retire @{sid}: the node could not be asked: {why}"
                 );
                 self.publish_ev(&format!(
@@ -5042,13 +5050,13 @@ impl Bridge {
             match self.last_face(&subject) {
                 Ok(rows) => rows.into_iter().find(|(_, s, _)| *s == subject),
                 Err(e) => {
-                    eprintln!("aterm-link: could not read @{sid}'s presence row: {e}");
+                    stderr_line!("aterm-link: could not read @{sid}'s presence row: {e}");
                     return;
                 }
             }
         };
         let Some((_, _, raw)) = row else {
-            eprintln!("aterm-link: @{sid} has no presence row on this node; nothing to retire");
+            stderr_line!("aterm-link: @{sid} has no presence row on this node; nothing to retire");
             return;
         };
         let body = String::from_utf8_lossy(&raw).into_owned();
@@ -5059,13 +5067,13 @@ impl Bridge {
             .map(String::as_str)
             != Some("live")
         {
-            eprintln!("aterm-link: @{sid}'s presence row is not live; nothing to retire");
+            stderr_line!("aterm-link: @{sid}'s presence row is not live; nothing to retire");
             return;
         }
         let retired = crate::fabric::retired_body(&body);
         match self.publish(&subject, retired.as_bytes()) {
             Ok(_) => self.publish_ev(&format!("presence-retired sid={sid} reason=operator")),
-            Err(e) => eprintln!("aterm-link: could not retire @{sid}: {e}"),
+            Err(e) => stderr_line!("aterm-link: could not retire @{sid}: {e}"),
         }
     }
 
@@ -5243,11 +5251,11 @@ impl Bridge {
         let drained = match reply {
             Ok(reply) if reply.ok() => reply.body().to_vec(),
             Ok(reply) => {
-                eprintln!("aterm-link: outbox refused: {}", reply.header());
+                stderr_line!("aterm-link: outbox refused: {}", reply.header());
                 return None;
             }
             Err(e) => {
-                eprintln!("aterm-link: outbox failed: {e}");
+                stderr_line!("aterm-link: outbox failed: {e}");
                 return None;
             }
         };
@@ -5268,7 +5276,7 @@ impl Bridge {
             return whole;
         }
         if let Err(e) = self.refresh_sessions() {
-            eprintln!("aterm-link: the roster could not be re-read before a drain: {e}");
+            stderr_line!("aterm-link: the roster could not be re-read before a drain: {e}");
             return None;
         }
         let mut stalled: BTreeSet<String> = BTreeSet::new();
@@ -5280,9 +5288,10 @@ impl Bridge {
                 continue;
             }
             if let Err(e) = self.send_receipt(&receipt) {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: could not publish the receipt for {} ({}): {e}",
-                    receipt.off, receipt.sid
+                    receipt.off,
+                    receipt.sid
                 );
                 self.conn.as_ref()?;
                 stalled.insert(receipt.sid.clone());
@@ -5322,9 +5331,10 @@ impl Bridge {
         let routed = match self.resolve_to(&post.to, Some(&post.sid)) {
             Ok(routed) => routed,
             Err(e) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: could not route post {} to {}: {e}",
-                    post.id, post.to
+                    post.id,
+                    post.to
                 );
                 if self.conn.is_none() {
                     return false;
@@ -5359,7 +5369,7 @@ impl Bridge {
                 let (existing_pin, keyed) = match existing {
                     Ok(existing) => existing,
                     Err(e) => {
-                        eprintln!(
+                        stderr_line!(
                             "aterm-link: post {} reservation unreadable, left queued: {e}",
                             post.id
                         );
@@ -5440,7 +5450,7 @@ impl Bridge {
                 let pin = match reserved {
                     Ok(pin) => pin,
                     Err(e) => {
-                        eprintln!(
+                        stderr_line!(
                             "aterm-link: post {} reservation refused, left queued: {e}",
                             post.id
                         );
@@ -5604,7 +5614,7 @@ impl Bridge {
         if (actual.is_none() || own_attempt.is_none())
             && WAITING_KINDS.contains(&post.kind.as_str())
         {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: post {} has no verifiable original reply route or key offset; left queued",
                 post.id
             );
@@ -5620,7 +5630,7 @@ impl Bridge {
                 off,
                 appended.then_some(post.id),
             ) {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: post {} key identity could not persist, left queued: {e}",
                     post.id
                 );
@@ -5668,12 +5678,12 @@ impl Bridge {
         seq: u64,
         e: io::Error,
     ) -> PostNext {
-        eprintln!("aterm-link: publish of post {} failed: {e}", post.id);
+        stderr_line!("aterm-link: publish of post {} failed: {e}", post.id);
         if e.kind() == io::ErrorKind::AlreadyExists {
             self.state.clear_post_seq(&post.sid, post.id);
             if let Some(k) = post.key.as_deref() {
                 if let Err(e) = self.state.forget_key_seq(&post.sid, k, seq) {
-                    eprintln!("aterm-link: could not forget key {k:?}: {e}");
+                    stderr_line!("aterm-link: could not forget key {k:?}: {e}");
                 }
             }
             return PostNext::Ends;
@@ -5750,7 +5760,7 @@ impl Bridge {
             self.indexed_subjects.insert(subject.to_string());
             return true;
         }
-        eprintln!(
+        stderr_line!(
             "aterm-link: the post to {subject} would open a subject with {} of this \
              node's {} left: the last {reserve} are kept for {}",
             budget.remaining(),
@@ -5939,7 +5949,7 @@ impl Bridge {
             generation,
         );
         if let Err(e) = spawned {
-            eprintln!("aterm-link: the presence view's reader could not start: {e}");
+            stderr_line!("aterm-link: the presence view's reader could not start: {e}");
             self.presence_view.close();
         }
     }
@@ -6158,10 +6168,10 @@ impl Bridge {
         }
         match self.ctl_request(&format!("link bye {}", bye.word())) {
             Ok(reply) if !reply.ok() => {
-                eprintln!("aterm-link: `link bye` refused: {}", reply.header());
+                stderr_line!("aterm-link: `link bye` refused: {}", reply.header());
             }
             Ok(_) => {}
-            Err(e) => eprintln!("aterm-link: `link bye` failed: {e}"),
+            Err(e) => stderr_line!("aterm-link: `link bye` failed: {e}"),
         }
         self.bye = Some(bye);
         match bye {
@@ -6178,7 +6188,7 @@ impl Bridge {
             return;
         }
         if self.conn.is_none() {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: aterm is quitting and the broker is unreachable: its sessions are \
                  withdrawn once the link is back, or read `away` until then"
             );
@@ -6265,7 +6275,7 @@ impl Bridge {
         self.conn = Some(Link::from(conn));
         self.commit_refused = false;
         let Some((halts, (fleet_from, head))) = self.read_fleet_halts() else {
-            eprintln!("aterm-link: the standing fleet halt could not be read; not attaching");
+            stderr_line!("aterm-link: the standing fleet halt could not be read; not attaching");
             self.conn = None;
             return false;
         };
@@ -6301,7 +6311,7 @@ impl Bridge {
                     self.log_replaced = Some(found);
                 }
                 Err(e) => {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: the bus log is not the one this node last read ({}), and \
                          its offsets could not be forgotten: {e}; not attaching",
                         found.why()
@@ -6314,7 +6324,7 @@ impl Bridge {
         }
         self.note_log(head, ident, found.is_some());
         if let Err(e) = self.bring_presence_up() {
-            eprintln!("aterm-link: presence could not come up: {e}");
+            stderr_line!("aterm-link: presence could not come up: {e}");
             if e.kind() == io::ErrorKind::Other {
                 self.link_down(link_reason(&e, "attach"));
             }
@@ -6325,7 +6335,7 @@ impl Bridge {
             let alarm = format!("cap-compromised seq={seq} off={off} reason=deduped");
             match self.try_publish_ev_for(None, &alarm) {
                 Ok(_) => self.collided = None,
-                Err(e) => eprintln!("aterm-link: could not publish ev {alarm:?}: {e}"),
+                Err(e) => stderr_line!("aterm-link: could not publish ev {alarm:?}: {e}"),
             }
             if self.conn.is_none() {
                 return false;
@@ -6334,7 +6344,7 @@ impl Bridge {
         self.apply_fleet_halts(halts, fleet_from);
         if let Some(found) = self.log_replaced {
             match found.continues {
-                Some(fork) => eprintln!(
+                Some(fork) => stderr_line!(
                     "aterm-link: the bus log moved to its next generation: {} (a power loss \
                      under a weak tier, a torn batch cut, or a repair); every offset this node \
                      held at or above {fork} is forgotten and its cursors resume there — {} \
@@ -6345,7 +6355,7 @@ impl Bridge {
                     found.deadlines,
                     found.inflight
                 ),
-                None => eprintln!(
+                None => stderr_line!(
                     "aterm-link: the bus log is not the one this node last read: {} (deleted, \
                      moved aside, repaired, restored, or another broker's); every offset this \
                      node held there is forgotten — the seen and topic cursors, the halt and \
@@ -6376,7 +6386,7 @@ impl Bridge {
             self.log_replaced = None;
             if self.rewound_log.is_some() {
                 if let Err(e) = self.state.clear_rewound_log(&self.log_witness) {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: could not retire the rewound log refusal: {e}; not attaching"
                     );
                     self.conn = None;
@@ -6404,7 +6414,7 @@ impl Bridge {
             // re-base owed ([`Bridge::log_replaced`]), and the next attach
             // finishes it.
             if self.link.down_wants_report("error") {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: the bus log's witness could not be written; not attaching \
                      until it is (a record delivered on this log meanwhile would be offered \
                      again as new)"
@@ -6452,7 +6462,7 @@ impl Bridge {
         }
         if self.inbox_pending.is_none() && handed_over.is_some() {
             if let Err(e) = self.state.clear_inbox_owed() {
-                eprintln!("aterm-link: could not clear the inbox commit handed over: {e}");
+                stderr_line!("aterm-link: could not clear the inbox commit handed over: {e}");
             }
         }
         if !self.subscribe_inbox() {
@@ -6540,7 +6550,7 @@ impl Bridge {
     fn subscription_lost(&mut self, source: Source) {
         let face = face_name(source);
         if self.conn.is_none() {
-            eprintln!("aterm-link: the broker's {face} subscription ended; reconnecting");
+            stderr_line!("aterm-link: the broker's {face} subscription ended; reconnecting");
             return;
         }
         let answers = self.unyielding(|bridge| {
@@ -6555,13 +6565,13 @@ impl Bridge {
         });
         if answers {
             let reason = cut_reason(source);
-            eprintln!(
+            stderr_line!(
                 "aterm-link: the broker ended the {face} subscription and still answers \
                  ({reason}); reconnecting every subscription"
             );
             self.link_down(reason);
         } else {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: the broker's {face} subscription ended and the broker does not \
                  answer; reconnecting"
             );
@@ -6570,7 +6580,7 @@ impl Bridge {
     }
 
     fn subscription_refused(&mut self, source: Source, reason: &'static str) {
-        eprintln!(
+        stderr_line!(
             "aterm-link: the broker refused the {} subscription ({reason}); reconnecting",
             face_name(source)
         );
@@ -6631,7 +6641,7 @@ impl Bridge {
             self.mailbox.clone(),
         );
         if let Err(e) = reader {
-            eprintln!("aterm-link: the {source:?} reader thread could not start: {e}");
+            stderr_line!("aterm-link: the {source:?} reader thread could not start: {e}");
             closer.close();
             self.link_down("subscribe");
             return false;
@@ -6710,26 +6720,27 @@ impl Bridge {
         match swept {
             Ok(moved) => {
                 for m in &moved {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: {} did not read whole after the last bridge stopped \
                          uncleanly in an earlier boot (a power cut tears what was not yet on \
                          disk); moved aside to {} in the state dir — it served sessions that \
                          boot ended, and nothing reads it again",
-                        m.from, m.to
+                        m.from,
+                        m.to
                     );
                 }
                 self.set_aside += moved.len() as u64;
                 true
             }
             Err(e) if crate::state::a_clean_disk_heals(&e) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: the files a power cut may have torn could not all be set \
                      aside: {e}; tried again before the run record is written"
                 );
                 false
             }
             Err(e) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: the files a power cut may have torn could not all be set \
                      aside: {e}; what is left is refused where it is read, until a person \
                      repairs the state dir"
@@ -6750,25 +6761,26 @@ impl Bridge {
         match self.state.retire_in_flight_of_an_earlier_boot() {
             Ok(retired) => {
                 for m in &retired {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: {} was in flight when the last bridge stopped uncleanly in \
                          an earlier boot; retired to {} in the state dir and never published \
                          again — it served sessions that boot ended, and a power cut may have \
                          brought it back after its record landed",
-                        m.from, m.to
+                        m.from,
+                        m.to
                     );
                 }
                 true
             }
             Err(e) if crate::state::a_clean_disk_heals(&e) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: the in-flight entries of an earlier boot could not all be \
                      retired: {e}; tried again before the run record is written"
                 );
                 false
             }
             Err(e) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: the in-flight entries of an earlier boot could not all be \
                      retired: {e}; what is left is published again at the attach"
                 );
@@ -6800,7 +6812,7 @@ impl Bridge {
         }
         match done {
             Ok(crate::state::Reconciled::Kept) => {}
-            Ok(crate::state::Reconciled::Raised { from, to }) => eprintln!(
+            Ok(crate::state::Reconciled::Raised { from, to }) => stderr_line!(
                 "aterm-link: mirror: the last bridge stopped uncleanly in an earlier boot, and \
                  nothing tells logpin from an older version a power cut brought back, so its \
                  total ({from} bytes) is raised to its floor ({to}): what the floor leased \
@@ -6808,17 +6820,18 @@ impl Bridge {
                 crate::mirror::FLOOR_LEASE_BYTES
             ),
             Ok(crate::state::Reconciled::SetAside(m)) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: {} did not read whole after the last bridge stopped uncleanly \
                      in an earlier boot (a power cut tears what was not yet on disk); moved \
                      aside to {} in the state dir, and a whole logpin written from logkey and \
                      logfloor in its place — the mirror resumes under the same alias key, its \
                      total at the floor",
-                    m.from, m.to
+                    m.from,
+                    m.to
                 );
                 self.set_aside += 1;
             }
-            Ok(crate::state::Reconciled::Restored) => eprintln!(
+            Ok(crate::state::Reconciled::Restored) => stderr_line!(
                 "aterm-link: mirror: no logpin after the last bridge stopped uncleanly in an \
                  earlier boot; a whole one written from logkey and logfloor — the same alias \
                  key, its total at the floor"
@@ -6831,7 +6844,7 @@ impl Bridge {
                     "a pin that does not read stops the mirror, as before, and the stop names \
                      the file to repair"
                 };
-                eprintln!(
+                stderr_line!(
                     "aterm-link: the mirror's pin could not be reconciled after an unclean stop: \
                      {e}; {then}"
                 );
@@ -6858,7 +6871,7 @@ impl Bridge {
         let owed = !(swept && retired && reconciled)
             && matches!(self.state.torn_files_possible(), Ok(true));
         if owed && !self.recovery_owed {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: the recovery the last bridge's unclean stop in an earlier boot owes \
                  is not complete: the run record is not written, no attach goes on and the \
                  mirror judges no pin until it is; each attach tries it again"
@@ -6871,7 +6884,7 @@ impl Bridge {
     fn begin_run(&self) {
         let began = self.fx.now();
         match self.state.begin_run() {
-            Ok(flushed) if flushed.full + flushed.ordered > 0 => eprintln!(
+            Ok(flushed) if flushed.full + flushed.ordered > 0 => stderr_line!(
                 "aterm-link: the run record says a bridge runs in this boot: {} barriers and {} \
                  full flushes in {} us",
                 flushed.ordered,
@@ -6879,7 +6892,7 @@ impl Bridge {
                 self.fx.now().saturating_duration_since(began).as_micros()
             ),
             Ok(_) => {}
-            Err(e) => eprintln!(
+            Err(e) => stderr_line!(
                 "aterm-link: the state dir's run record could not be written: {e}; no marker \
                  is removed to force legacy recovery; unavailable recovery stays fail-closed"
             ),
@@ -6901,7 +6914,7 @@ impl Bridge {
             let old_wait = false;
             if !old_wait && !self.recover() {
                 if self.link.down_wants_report("error") {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: the recovery an unclean stop in an earlier boot owes could \
                          not be completed; not attaching until it is (a torn file left now \
                          would be refused at every attach of this boot)"
@@ -6920,7 +6933,7 @@ impl Bridge {
             Ok(_) => true,
             Err(e) => {
                 if self.link.down_wants_report("error") {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: the state dir's OPEN run record could not be admitted: \
                          {e}; not attaching until its required publication succeeds"
                     );
@@ -6933,7 +6946,7 @@ impl Bridge {
 
     fn end_run(&self) {
         if self.bye == Some(Bye::Handoff) {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: handed off: the run goes on in the successor's bridge, so nothing \
                  is flushed and the run record stays open"
             );
@@ -6947,7 +6960,7 @@ impl Bridge {
         #[cfg(not(test))]
         let owed = self.recovery_owed;
         if owed {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: no clean stop: the recovery the last bridge's unclean stop in an \
                  earlier boot owes is not complete, so the run record stays as it is and the \
                  next start does it"
@@ -6956,7 +6969,7 @@ impl Bridge {
         }
         let began = self.fx.now();
         match self.state.end_run_clean() {
-            Ok(flushed) => eprintln!(
+            Ok(flushed) => stderr_line!(
                 "aterm-link: the run stopped cleanly: {} state files and {} directories \
                  flushed, then the run record: {} barriers and {} full flushes in {} us",
                 flushed.files,
@@ -6965,7 +6978,7 @@ impl Bridge {
                 flushed.full,
                 self.fx.now().saturating_duration_since(began).as_micros()
             ),
-            Err(e) => eprintln!(
+            Err(e) => stderr_line!(
                 "aterm-link: this run's state files could not all be flushed: {e}; no marker \
                  is removed to force legacy recovery; unavailable recovery stays fail-closed"
             ),
@@ -6986,11 +6999,11 @@ impl Bridge {
         }
         match self.ctl_request(&format!("link set-aside files={files}")) {
             Ok(reply) if reply.ok() => {}
-            Ok(reply) => eprintln!(
+            Ok(reply) => stderr_line!(
                 "aterm-link: aterm did not take `link set-aside files={files}`: {}",
                 reply.header()
             ),
-            Err(e) => eprintln!("aterm-link: `link set-aside` failed: {e}"),
+            Err(e) => stderr_line!("aterm-link: `link set-aside` failed: {e}"),
         }
     }
 
@@ -7002,7 +7015,7 @@ impl Bridge {
             Ok(held) => held.unwrap_or(0),
             Err(e) => {
                 if !self.quarantine_unread {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: the state dir's quarantine could not be read ({e}); aterm \
                          is not told whether the torn files set aside are still there"
                     );
@@ -7023,11 +7036,11 @@ impl Bridge {
         }
         match self.ctl_request(&format!("link quarantine torn={held}")) {
             Ok(reply) if reply.ok() => {}
-            Ok(reply) => eprintln!(
+            Ok(reply) => stderr_line!(
                 "aterm-link: aterm did not take `link quarantine torn={held}`: {}",
                 reply.header()
             ),
-            Err(e) => eprintln!("aterm-link: `link quarantine` failed: {e}"),
+            Err(e) => stderr_line!("aterm-link: `link quarantine` failed: {e}"),
         }
         self.quarantine_said = Some(held);
     }
@@ -7049,7 +7062,7 @@ impl Bridge {
         let reply = match self.ctl_request(&line) {
             Ok(reply) => reply,
             Err(e) => {
-                eprintln!("aterm-link: `hello` failed: {e}");
+                stderr_line!("aterm-link: `hello` failed: {e}");
                 return;
             }
         };
@@ -7058,9 +7071,9 @@ impl Bridge {
             self.endpoint_lane = 0;
             self.endpoint_build = None;
             if !header.starts_with("ERR unknown verb") {
-                eprintln!("aterm-link: aterm refused `hello` ({header})");
+                stderr_line!("aterm-link: aterm refused `hello` ({header})");
             }
-            eprintln!(
+            stderr_line!(
                 "aterm-link: treating aterm as lane 0 (no lane handshake); this bridge is {own}, \
                  lane {}",
                 aterm_types::control_verbs::BRIDGE_LANE
@@ -7079,7 +7092,7 @@ impl Bridge {
         if self.endpoint_build.as_deref() != Some(own.as_str())
             || self.endpoint_lane != aterm_types::control_verbs::BRIDGE_LANE
         {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: this bridge is {own} (lane {}) under aterm {} (lane {}): \
                  [fabric] command names another build than this instance's; the two speak \
                  lane {}",
@@ -7095,7 +7108,7 @@ impl Bridge {
     fn first_roster(&mut self) -> bool {
         match self.refresh_sessions() {
             Err(e) if e.kind() == io::ErrorKind::Unsupported => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: {e}: this aterm does not list its sessions in the grammar this \
                      bridge reads; attaching nothing until it goes away"
                 );
@@ -7148,7 +7161,7 @@ impl Bridge {
         self.tell_quarantine();
         if !self.first_roster() {
             while !self.park_detached(UNSERVED_PARK) {}
-            eprintln!("aterm-link: aterm closed the bridge connection; exiting");
+            stderr_line!("aterm-link: aterm closed the bridge connection; exiting");
             self.end_run();
             return Some(Ok(()));
         }
@@ -7167,7 +7180,7 @@ impl Bridge {
         // not there, while the successor's bridge waits on the lock.
         if self.aterm_gone() {
             self.on_aterm_closed();
-            eprintln!("aterm-link: aterm closed the bridge connection; exiting");
+            stderr_line!("aterm-link: aterm closed the bridge connection; exiting");
             self.wind_down();
             return Some(Ok(()));
         }
@@ -7184,7 +7197,7 @@ impl Bridge {
             if let Some(wait) = backoff.lost_with(self.fx.now(), self.fx.jitter()) {
                 if self.park_detached(wait) {
                     self.on_aterm_closed();
-                    eprintln!("aterm-link: aterm closed the bridge connection; exiting");
+                    stderr_line!("aterm-link: aterm closed the bridge connection; exiting");
                     self.wind_down();
                     return Some(Ok(()));
                 }
@@ -7205,7 +7218,7 @@ impl Bridge {
                 let wait = backoff.failed_with(self.fx.jitter());
                 if self.park_detached(wait) {
                     self.on_aterm_closed();
-                    eprintln!("aterm-link: aterm closed the bridge connection; exiting");
+                    stderr_line!("aterm-link: aterm closed the bridge connection; exiting");
                     self.wind_down();
                     return Some(Ok(()));
                 }
@@ -7356,7 +7369,7 @@ impl Bridge {
             Some(Item::Closed(Source::Aterm)) => {
                 self.in_round = false;
                 self.on_aterm_closed();
-                eprintln!("aterm-link: aterm closed the bridge connection; exiting");
+                stderr_line!("aterm-link: aterm closed the bridge connection; exiting");
                 self.wind_down();
                 false
             }
@@ -7486,10 +7499,10 @@ fn hold_state_dir(
             format!("{held}; {STATE_LOCKED_REMEDY}"),
         ));
     };
-    eprintln!("aterm-link: {held}; standing by until it exits ({STATE_LOCKED_REMEDY})");
+    stderr_line!("aterm-link: {held}; standing by until it exits ({STATE_LOCKED_REMEDY})");
     let reply = ctl.request("link down reason=state-locked")?;
     if !reply.ok() {
-        eprintln!(
+        stderr_line!(
             "aterm-link: `link down reason=state-locked` refused: {}",
             reply.header()
         );
@@ -8187,7 +8200,7 @@ fn spawn_event_reader(push: Ctl, mailbox: Arc<Mailbox>) {
             }
         });
     if let Err(e) = spawned {
-        eprintln!("aterm-link: the push-lane reader thread could not start: {e}");
+        stderr_line!("aterm-link: the push-lane reader thread could not start: {e}");
         lost.push_aterm_closed();
     }
 }

@@ -98,6 +98,8 @@ fn project(dst: &mut RenderInput, clip: Option<ComposedCursorEffectClip>, layers
             trail_color: 0,
             active_cursor_fill: None,
             fx_layers: layers,
+            bloom_held: false,
+            pet_veil: &[],
         },
         clip,
         None,

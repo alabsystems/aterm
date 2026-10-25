@@ -278,6 +278,14 @@ struct Mock {
     /// For this long after the first `send` on the run's clock, the screen does not move: every
     /// read serves the screen the write found at its seq, and an `await seq` sits until then.
     unmoved_after_send: Option<Duration>,
+    /// For this long after the first `key` on the run's clock, the screen does not move, as
+    /// [`Self::unmoved_after_send`] after a write: a starved worker that has not drawn the key.
+    unmoved_after_key: Option<Duration>,
+    /// For this long after each `key` or `send` on the run's clock, `status` reads the write
+    /// unread (`input=pending`), in place of [`Self::input`]: a worker not scheduled to read it.
+    unread_after_write: Option<Duration>,
+    /// When the last `key` or `send` was made, on the run's clock ([`Self::unread_after_write`]).
+    last_write_at: Option<Instant>,
     /// How many reads after the first `send` move on as scripted before the screen stands
     /// ([`Self::unmoved_after_send`]): a frame drawn after the write that does not show it.
     unmoved_from_read: usize,
@@ -623,6 +631,7 @@ impl ResetWorld {
 const PARKED: Duration = Duration::from_secs(10);
 
 const INPUT_CLEAR: &str = "input=clear input_bytes=0 input_wait_ms=0 fg_rss_mb=-";
+const INPUT_KEY_UNREAD: &str = "input=pending input_bytes=1 input_wait_ms=0 fg_rss_mb=-";
 const INPUT_STALLED: &str = "input=stalled input_bytes=1 input_wait_ms=161000 fg_rss_mb=39731";
 
 fn ok(stdout: &str) -> CtlReply {
@@ -1034,6 +1043,9 @@ impl Mock {
             attention_at: None,
             idle_never_for: None,
             unmoved_after_send: None,
+            unmoved_after_key: None,
+            unread_after_write: None,
+            last_write_at: None,
             unmoved_wakes: 0,
             unmoved_from_read: 0,
             reads_at_send: None,
@@ -1200,6 +1212,13 @@ impl Mock {
             if self.status_reads > n {
                 self.input = input;
             }
+        }
+        if let Some((unread, written)) = self.unread_after_write.zip(self.last_write_at) {
+            self.input = if run_since(self.waits.as_deref(), written) < unread {
+                INPUT_KEY_UNREAD
+            } else {
+                INPUT_CLEAR
+            };
         }
         if ["input=pending", "input=typeahead"]
             .iter()
@@ -1410,6 +1429,11 @@ impl Mock {
         self.alt_screen.get_or_insert(false);
     }
     fn unmoved_for(&self) -> Option<Duration> {
+        if let Some((hold, (_, keyed))) = self.unmoved_after_key.zip(self.key_times.first()) {
+            return hold
+                .checked_sub(run_since(self.waits.as_deref(), *keyed))
+                .filter(|left| !left.is_zero());
+        }
         let (hold, sent) = self.unmoved_after_send.zip(self.first_send_at)?;
         if self
             .reads_at_send
@@ -2615,6 +2639,7 @@ impl Mock {
             "key" => {
                 self.key_times
                     .push((line.clone(), run_now(self.waits.as_deref())));
+                self.last_write_at = Some(run_now(self.waits.as_deref()));
                 if self.card_debounce.is_some() {
                     self.reactive_index();
                 }
@@ -2756,6 +2781,7 @@ impl Mock {
                 .unwrap_or_else(|| ok("OK restarting pid 4242 cause=stall\n"))),
             "send" if self.gen_fence => {
                 self.keyed = true;
+                self.last_write_at = Some(run_now(self.waits.as_deref()));
                 if self.first_send_at.is_none() {
                     self.first_send_at = Some(run_now(self.waits.as_deref()));
                     self.reads_at_send = Some(self.read_times.len());

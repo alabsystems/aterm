@@ -6,11 +6,22 @@
 
 use std::cell::Cell;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
-/// How long the whole probe may take ([`probe`]).
-/// A probe cut by this deadline is [`RepoRead::Unread`].
+/// How long each read of [`probe`] may take, the one-minute hang detector: a
+/// read that ends gives the next this long, and a read cut by it makes the
+/// probe [`RepoRead::Unread`].
 pub const PROBE_LIMIT: Duration = Duration::from_secs(60);
+
+/// How long one ask of a probe read beside its asker waits for the answer
+/// ([`Probing::ask`]): the loop that asks renews its claim between asks, well
+/// inside the claim's lease.
+pub const PROBE_ASK: Duration = Duration::from_secs(5);
+
+/// How often an ask that waits looks at its asker's stop ([`Probing::ask`]).
+const STOP_LOOK: Duration = Duration::from_millis(100);
 
 /// The most paths a finding names ([`RepoWork::paths`]).
 pub const NAMED_PATHS: usize = 3;
@@ -160,17 +171,46 @@ impl RepoWork {
     }
 }
 
+/// WHAT A CLEAN PROBE CHECKED ([`RepoRead::Checked`]; `docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §14.9, slice 9a): the repository it read, the commit its `HEAD` named, the remote main it
+/// counted against and whether any remote-tracking ref was there to count against. The probe
+/// found nothing no remote main has; these say what that was measured against, for a landing's
+/// receipt. No decision reads them: a checked reading decides as a clean one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CleanAt {
+    /// The repository's top-level directory, in [`RepoWork::repo`]'s form.
+    pub repo: String,
+    /// `HEAD`'s commit in full lowercase hex (`git rev-parse --verify --quiet HEAD`).
+    pub head: String,
+    /// The remote default branch commits off it were counted against (`origin/main`;
+    /// [`RepoWork::main_ref`]); empty where the repository has none.
+    pub main_ref: String,
+    /// Whether the repository holds any remote-tracking ref (`for-each-ref refs/remotes`, a
+    /// read that answered: one git refused names no reading): `false`, nothing was pushed
+    /// anywhere, so no unpushed commit was counted.
+    pub remote: bool,
+}
+
 /// What one probe of a session's repository read ([`probe`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum RepoRead {
-    /// Nothing no remote main has: the probe finished and found nothing, or
-    /// it cannot run here (no `git`, no repository, a folder macOS guards).
+    /// Nothing no remote main has, and nothing checked to name: the probe
+    /// cannot run here (no `git`, no `HOME`, no repository, a folder macOS
+    /// guards, a network or automounted volume), so it read nothing; or it
+    /// found nothing in a repository whose `HEAD` it could not name (no commit
+    /// yet, or that one read cut after every other read finished) or where git
+    /// refused a read its counts rest on (the stash list, the remote-tracking
+    /// refs, an unpushed or unlanded count).
     #[default]
     Clean,
+    /// Nothing no remote main has, in the repository and at the commit it names
+    /// ([`CleanAt`]): the probe finished every read and found nothing. Every
+    /// decision reads it as [`Self::Clean`] ([`Self::is_clean`], [`Self::same`]).
+    Checked(CleanAt),
     /// What the repository holds that no remote main has.
     Found(RepoWork),
-    /// The probe did not finish within its limit (a hung or starved `git`),
-    /// or could not read the repository it found (a `git` that could not
+    /// A read of the probe did not end within its limit (a hung `git`), or
+    /// the probe could not read the repository it found (a `git` that could not
     /// start for want of a file descriptor or process, one a signal ended,
     /// a status read a broken index or submodule fails): what the repository
     /// holds is not known.
@@ -189,7 +229,7 @@ impl RepoRead {
     pub const fn found(&self) -> Option<&RepoWork> {
         match self {
             Self::Found(work) => Some(work),
-            Self::Clean | Self::Unread => None,
+            Self::Clean | Self::Checked(_) | Self::Unread => None,
         }
     }
 
@@ -198,28 +238,40 @@ impl RepoRead {
     pub fn into_found(self) -> Option<RepoWork> {
         match self {
             Self::Found(work) => Some(work),
-            Self::Clean | Self::Unread => None,
+            Self::Clean | Self::Checked(_) | Self::Unread => None,
         }
     }
 
-    /// Whether the reading is [`Self::Clean`]: nothing found, or no probe can run here.
+    /// What a clean probe checked, where it named it ([`Self::Checked`]).
     #[must_use]
-    pub const fn is_clean(&self) -> bool {
-        matches!(self, Self::Clean)
+    pub const fn checked(&self) -> Option<&CleanAt> {
+        match self {
+            Self::Checked(at) => Some(at),
+            Self::Clean | Self::Found(_) | Self::Unread => None,
+        }
     }
 
-    /// Whether the probe did not finish ([`Self::Unread`]).
+    /// Whether the reading is clean: [`Self::Clean`] (nothing found, or no
+    /// probe can run here) or [`Self::Checked`] (nothing found at a named `HEAD`).
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        matches!(self, Self::Clean | Self::Checked(_))
+    }
+
+    /// Whether the probe could not read the repository ([`Self::Unread`]).
     #[must_use]
     pub const fn is_unread(&self) -> bool {
         matches!(self, Self::Unread)
     }
 
-    /// Whether two probes read the same work: both clean, or both the same finding of a
-    /// known state ([`RepoWork::same`]). An unread probe never matches.
+    /// Whether two probes read the same work: both clean ([`Self::is_clean`]: a
+    /// checked reading is the same as a clean one, whatever `HEAD` each names),
+    /// or both the same finding of a known state ([`RepoWork::same`]). An unread
+    /// probe never matches.
     #[must_use]
     pub fn same(a: &Self, b: &Self) -> bool {
         match (a, b) {
-            (Self::Clean, Self::Clean) => true,
+            (Self::Clean | Self::Checked(_), Self::Clean | Self::Checked(_)) => true,
             (Self::Found(a), Self::Found(b)) => RepoWork::same(Some(a), Some(b)),
             _ => false,
         }
@@ -489,8 +541,10 @@ pub fn printable(text: &str) -> String {
 }
 
 /// What the repository `dir` is in holds that no remote main has.
-/// A deadline-cut read, and a repository whose reads could not be made, is
-/// [`RepoRead::Unread`], not a clean result.
+/// Each read has `limit` from the end of the one before it (the first, from
+/// the call), so reads that each end in time are read whole however long they
+/// take together. A read cut by its limit, and a repository whose reads could
+/// not be made, is [`RepoRead::Unread`], not a clean result.
 #[must_use]
 pub fn probe(dir: &Path, home: Option<&Path>, limit: Duration) -> RepoRead {
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
@@ -515,21 +569,86 @@ pub fn probe_with(
         return RepoRead::Clean;
     };
     let reads = Reads {
-        deadline,
+        deadline: Cell::new(deadline),
+        each: Some(limit),
         home,
         xdg: xdg.filter(|x| x.is_absolute()),
         cut: Cell::new(false),
     };
     match probe_reads(dir, &reads) {
-        Some(work) => RepoRead::Found(work),
+        Some(read) => read,
         None if reads.cut.get() => RepoRead::Unread,
         None => RepoRead::Clean,
     }
 }
 
-/// [`probe_with`]'s reads: the finding, `None` for none. A finding whose
-/// state read was cut keeps its counts, its state unknown ([`RepoWork::state`]).
-fn probe_reads(dir: &Path, reads: &Reads<'_>) -> Option<RepoWork> {
+/// A PROBE READ BESIDE ITS ASKER ([`crate::supervise::IdleHost::repo_work`]):
+/// its reads go on on a thread of their own, and an ask waits a bounded time
+/// for their answer, so the loop that asks keeps its claim and sees its stop
+/// between asks however long the reads take together ([`PROBE_LIMIT`] bounds
+/// each read).
+#[derive(Debug, Default)]
+pub struct Probing {
+    /// The answer of the probe that reads now, until an ask takes it.
+    reading: Mutex<Option<mpsc::Receiver<RepoRead>>>,
+}
+
+impl Probing {
+    /// The answer of the probe that reads now, or else of the one `begin`
+    /// hands it, once that probe ends within `wait`; `None` while it reads on
+    /// past `wait`, or once `stop` is raised, the probe left reading for the
+    /// next ask. A probe whose thread could not start, or that panicked, is
+    /// [`RepoRead::Unread`].
+    pub fn ask<F>(
+        &self,
+        begin: impl FnOnce() -> F,
+        wait: Duration,
+        stop: &AtomicBool,
+    ) -> Option<RepoRead>
+    where
+        F: FnOnce() -> RepoRead + Send + 'static,
+    {
+        let mut reading = self.reading.lock().unwrap_or_else(PoisonError::into_inner);
+        let answer = if let Some(answer) = reading.take() {
+            answer
+        } else {
+            let read = begin();
+            let (said, answer) = mpsc::sync_channel(1);
+            let started = std::thread::Builder::new()
+                .name("aterm-repo-probe".into())
+                .spawn(move || {
+                    if let Ok(found) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read))
+                    {
+                        let _ = said.send(found);
+                    }
+                });
+            if started.is_err() {
+                return Some(RepoRead::Unread);
+            }
+            answer
+        };
+        let by = Instant::now().checked_add(wait);
+        loop {
+            let left = by.map_or(STOP_LOOK, |by| by.saturating_duration_since(Instant::now()));
+            match answer.recv_timeout(left.min(STOP_LOOK)) {
+                Ok(found) => return Some(found),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Some(RepoRead::Unread),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if stop.load(Ordering::SeqCst) || by.is_some_and(|by| Instant::now() >= by) {
+                        *reading = Some(answer);
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// [`probe_with`]'s reads: the finding ([`RepoRead::Found`]), or, where it
+/// found nothing, what it checked ([`RepoRead::Checked`]); `None` for nothing
+/// to name. A finding whose state read was cut keeps its counts, its state
+/// unknown ([`RepoWork::state`]).
+fn probe_reads(dir: &Path, reads: &Reads<'_>) -> Option<RepoRead> {
     let home = reads.home;
     let table = aterm_sysprobe::volumes::table();
     let dir = unattended_dir(dir, Some(home), &table)?;
@@ -560,8 +679,8 @@ fn probe_reads(dir: &Path, reads: &Reads<'_>) -> Option<RepoWork> {
     )
     .map(|b| b.trim().to_string())
     .filter(|b| !b.is_empty());
-    let stash = git(&root, &["stash", "list", "--format=%gs"], reads).unwrap_or_default();
-    let stash = stashes_on(&stash, branch.as_deref());
+    let listed = git(&root, &["stash", "list", "--format=%gs"], reads);
+    let stash = stashes_on(listed.as_deref().unwrap_or_default(), branch.as_deref());
     let remotes = git(
         &root,
         &[
@@ -571,42 +690,72 @@ fn probe_reads(dir: &Path, reads: &Reads<'_>) -> Option<RepoWork> {
             "refs/remotes",
         ],
         reads,
-    )
-    .unwrap_or_default();
-    let unpushed = if remotes.trim().is_empty() {
-        0
-    } else {
+    );
+    let remote = remotes.as_deref().is_some_and(|r| !r.trim().is_empty());
+    let pushed = remote.then(|| {
         git(
             &root,
             &["rev-list", "--count", "HEAD", "--not", "--remotes"],
             reads,
         )
         .and_then(|n| n.trim().parse().ok())
-        .unwrap_or(0)
+    });
+    let unpushed = pushed.flatten().unwrap_or(0);
+    let main = main_ref(&root, reads);
+    let landed = main.as_ref().map(|full| {
+        git(
+            &root,
+            &["rev-list", "--count", &format!("{full}..HEAD")],
+            reads,
+        )
+        .and_then(|n| n.trim().parse().ok())
+    });
+    let (unlanded, main_ref) = match (&main, landed) {
+        (Some(full), Some(Some(n))) => (n, full.trim_start_matches("refs/remotes/").to_string()),
+        _ => (0, String::new()),
     };
-    let (unlanded, main_ref) = main_ref(&root, reads)
-        .and_then(|full| {
-            let n = git(
-                &root,
-                &["rev-list", "--count", &format!("{full}..HEAD")],
-                reads,
-            )?
-            .trim()
-            .parse()
-            .ok()?;
-            Some((n, full.trim_start_matches("refs/remotes/").to_string()))
-        })
-        .unwrap_or_default();
-    let mut work = RepoWork::of_git(&top, &status, &stash, unpushed, unlanded, &main_ref)?;
+    // Whether every read a clean finding's counts rest on gave an answer: a
+    // read git refused (an unreadable ref, output that is no text) counted
+    // nothing, so a clean reading over it names nothing it did not read.
+    let counted = listed.is_some()
+        && remotes.is_some()
+        && pushed.is_none_or(|n| n.is_some())
+        && landed.is_none_or(|n| n.is_some());
+    let cut_before_head = reads.cut.get();
+    let head = git(&root, &["rev-parse", "--verify", "--quiet", "HEAD"], reads);
+    let Some(mut work) = RepoWork::of_git(&top, &status, &stash, unpushed, unlanded, &main_ref)
+    else {
+        // Nothing found. The head read is the clean path's last and only adds a
+        // name: a reading cut before it stays unread, and a head read cut or
+        // refused leaves the reading what it was before the head was read. A
+        // count git refused names nothing either: clean, as it read before.
+        reads.cut.set(cut_before_head);
+        if cut_before_head || !counted {
+            return None;
+        }
+        let head = head.as_deref().map(str::trim).filter(|h| is_head(h))?;
+        return Some(RepoRead::Checked(CleanAt {
+            repo: printable(&top),
+            head: head.to_ascii_lowercase(),
+            main_ref: printable(&main_ref),
+            remote,
+        }));
+    };
     let mut all_args: Vec<&str> = Vec::new();
     if let Some(flag) = &excludes {
         all_args.extend(["-c", flag]);
     }
     all_args.extend(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
-    let head = git(&root, &["rev-parse", "--verify", "--quiet", "HEAD"], reads).unwrap_or_default();
+    let head = head.unwrap_or_default();
     work.state = git(&root, &all_args, reads)
         .and_then(|listed| state_of(&root, head.trim(), &stash, &listed));
-    Some(work)
+    Some(RepoRead::Found(work))
+}
+
+/// Whether `text` is a commit name `git rev-parse --verify` prints: 40 hex
+/// digits (SHA-1) or 64 (SHA-256).
+fn is_head(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Probe repository hygiene and drift from the main branch ([`RepoHygiene::main_ref`]) at `dir`.
@@ -617,7 +766,8 @@ pub fn probe_hygiene(dir: &Path, home: Option<&Path>, limit: Duration) -> Option
         return None;
     }
     let reads = Reads {
-        deadline: Instant::now().checked_add(limit)?,
+        deadline: Cell::new(Instant::now().checked_add(limit)?),
+        each: None,
         home,
         xdg: None,
         cut: Cell::new(false),
@@ -781,7 +931,7 @@ fn probe_hygiene_disk(
 
     if let Ok(rd) = std::fs::read_dir(root) {
         for entry in rd.flatten() {
-            if Instant::now() >= reads.deadline || budget == 0 {
+            if Instant::now() >= reads.deadline.get() || budget == 0 {
                 break;
             }
             let path = entry.path();
@@ -793,7 +943,7 @@ fn probe_hygiene_disk(
             {
                 temp_total = temp_total.saturating_add(bounded_dir_bytes(
                     &safe,
-                    reads.deadline,
+                    reads.deadline.get(),
                     &mut budget,
                     false,
                     &mut 0,
@@ -807,14 +957,14 @@ fn probe_hygiene_disk(
         .filter_map(|l| l.strip_prefix("worktree "))
         .skip(1)
     {
-        if Instant::now() >= reads.deadline || budget == 0 {
+        if Instant::now() >= reads.deadline.get() || budget == 0 {
             break;
         }
         let Some(safe) = unattended_dir(Path::new(wt_path.trim()), Some(reads.home), table) else {
             continue;
         };
         let mut wt_temp = 0u64;
-        let bytes = bounded_dir_bytes(&safe, reads.deadline, &mut budget, true, &mut wt_temp);
+        let bytes = bounded_dir_bytes(&safe, reads.deadline.get(), &mut budget, true, &mut wt_temp);
         wt_total = wt_total.saturating_add(bytes);
         if wt_temp > 0 {
             temp_total = temp_total.saturating_add(wt_temp);
@@ -1009,8 +1159,11 @@ fn git(dir: &Path, args: &[&str], reads: &Reads<'_>) -> Option<String> {
 }
 
 struct Reads<'a> {
-    /// Every child shares it; expired calls do not start.
-    deadline: Instant,
+    /// What the next read must end by; a call past it does not start.
+    deadline: Cell<Instant>,
+    /// What a read that ends gives the next ([`Self::ended`]); `None` where
+    /// every read shares [`Self::deadline`] ([`probe_hygiene`]).
+    each: Option<Duration>,
     /// The person's home.
     home: &'a Path,
     /// The person's `XDG_CONFIG_HOME` (absolute), for [`global_excludes`]'s read alone.
@@ -1021,8 +1174,24 @@ struct Reads<'a> {
     cut: Cell<bool>,
 }
 
+impl Reads<'_> {
+    /// A read ended: the next has [`Self::each`] from now. A read its limit
+    /// cut never ends, so none after it starts.
+    fn ended(&self) {
+        let Some(each) = self.each else {
+            return;
+        };
+        // A test's starved reads have run the probe's clock on ([`read_stall::lost`]).
+        #[cfg(test)]
+        let each = each.saturating_add(read_stall::lost());
+        if let Some(next) = Instant::now().checked_add(each) {
+            self.deadline.set(next);
+        }
+    }
+}
+
 fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<String> {
-    let deadline = reads.deadline;
+    let deadline = reads.deadline.get();
     #[cfg(test)]
     let deadline = deadline
         .checked_sub(read_stall::spent())
@@ -1067,6 +1236,7 @@ fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<
             return None;
         }
     };
+    reads.ended();
     if output.status.code().is_none() {
         // A signal ended it: what it would have said is not known.
         reads.cut.set(true);
@@ -1087,6 +1257,7 @@ pub(crate) mod read_stall {
     std::thread_local! {
         static SKIP: Cell<u32> = const { Cell::new(0) };
         static NEXT: Cell<u64> = const { Cell::new(0) };
+        static EVERY: Cell<u64> = const { Cell::new(0) };
         static SPENT: Cell<u64> = const { Cell::new(0) };
     }
 
@@ -1101,7 +1272,22 @@ pub(crate) mod read_stall {
     pub(crate) fn set_after(skip: u32, ms: u64) {
         SKIP.with(|k| k.set(skip));
         NEXT.with(|n| n.set(ms));
+        EVERY.with(|e| e.set(0));
         SPENT.with(|s| s.set(0));
+    }
+
+    /// Starve every read this thread starts `ms`, clearing the time already spent.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn every(ms: u64) {
+        set_after(0, 0);
+        EVERY.with(|e| e.set(ms));
+    }
+
+    /// The time this thread's reads have lost so far: how far the probe's clock
+    /// runs ahead of the machine's, which every deadline is set on
+    /// ([`super::Reads::ended`]).
+    pub(super) fn lost() -> Duration {
+        Duration::from_millis(SPENT.with(Cell::get))
     }
 
     /// The time this thread's reads have lost so far, the read starting now included.
@@ -1116,6 +1302,7 @@ pub(crate) mod read_stall {
         } else {
             NEXT.with(|n| n.replace(0))
         };
+        let next = next.saturating_add(EVERY.with(Cell::get));
         SPENT.with(|s| {
             s.set(s.get().saturating_add(next));
             Duration::from_millis(s.get())

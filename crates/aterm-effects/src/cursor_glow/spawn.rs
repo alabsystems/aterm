@@ -25,13 +25,14 @@ pub(super) const ERASE_ROUND_SCALE: f32 = 0.5;
 
 /// The weight term ([`ERASE_WEIGHT_CAP`]).
 #[inline]
-pub(super) fn erase_weight(cells: u16) -> f32 {
-    f32::from(cells.max(1)).sqrt().min(ERASE_WEIGHT_CAP)
+pub(super) const fn erase_weight(cells: u16) -> f32 {
+    let c = if cells > 1 { cells } else { 1 };
+    crate::color_math::sqrt_f32(c as f32).min(ERASE_WEIGHT_CAP)
 }
 
 /// The poof's energy ([`ERASE_MOM_FLOOR`], [`erase_weight`]).
 #[inline]
-pub(super) fn erase_poof_drive(mom: f32, cells: u16) -> f32 {
+pub(super) const fn erase_poof_drive(mom: f32, cells: u16) -> f32 {
     (ERASE_MOM_FLOOR + (1.0 - ERASE_MOM_FLOOR) * mom.clamp(0.0, 1.0)) * erase_weight(cells)
 }
 
@@ -222,10 +223,10 @@ impl CursorGlow {
         if self.particles.is_empty() {
             return;
         }
-        let (oy, chf) = (f32::from(geom.origin_y), geom.ch as f32);
+        let (oy, inv_ch) = (f32::from(geom.origin_y), 1.0 / (geom.ch as f32));
         let cr_i32 = i32::from(cr);
         for p in &mut self.particles {
-            if back_leap || ((p.y0 - oy) / chf).floor() as i32 != cr_i32 {
+            if back_leap || ((p.y0 - oy) * inv_ch).floor() as i32 != cr_i32 {
                 let age = now.saturating_duration_since(p.born).as_secs_f32();
                 p.life = p.life.min(age + within_s);
             }
@@ -630,7 +631,10 @@ impl CursorGlow {
             let comet_drift = {
                 let (mvx, mvy) = (ox - leap_from.0, oy - leap_from.1);
                 let ml = (mvx * mvx + mvy * mvy).sqrt();
-                (ml > 0.5).then(|| (-mvx / ml, -mvy / ml))
+                (ml > 0.5).then(|| {
+                    let inv_ml = 1.0 / ml;
+                    (-mvx * inv_ml, -mvy * inv_ml)
+                })
             };
             for _ in 0..burst {
                 let r0 = self.frand();
@@ -974,9 +978,10 @@ impl CursorGlow {
         let cell = geom.ch as f32;
         let (dx, dy) = (m.x1 - m.x0, m.y1 - m.y0);
         let len = (dx * dx + dy * dy).sqrt().max(1.0);
+        let inv_len = 1.0 / len;
         let dist_cells = len / geom.cw.max(1) as f32;
-        let (ux, uy) = (dx / len, dy / len);
-        let burst = ((6.0 + dist_cells * 1.0) as usize).min(24);
+        let (ux, uy) = (dx * inv_len, dy * inv_len);
+        let burst = ((6.0 + dist_cells) as usize).min(24);
         for _ in 0..burst {
             if self.particles.len() >= Self::MAX_PARTICLES {
                 break;
@@ -1200,7 +1205,7 @@ impl CursorGlow {
             GlowStyle::Water | GlowStyle::Comet => {
                 let comet = matches!(cfg.style, GlowStyle::Comet);
                 let drops = (3 + (n as usize) / 8).min(5);
-                let drops_f = drops as f32;
+                let inv_drops = 1.0 / (drops as f32);
                 let gy = if comet { 0.25 * cell } else { 3.0 * cell };
                 for k in 0..drops {
                     if self.particles.len() >= Self::MAX_PARTICLES {
@@ -1212,7 +1217,7 @@ impl CursorGlow {
                     let r3 = self.frand();
                     let r4 = self.frand();
                     self.particles.push(Particle {
-                        x0: span_x0 + ((k as f32 + 0.5) / drops_f) * span_w + (r0 - 0.5) * cwf,
+                        x0: span_x0 + ((k as f32 + 0.5) * inv_drops) * span_w + (r0 - 0.5) * cwf,
                         y0: oy,
                         vx: (r1 - 0.5) * 1.4 * cell,
                         vy: -(0.5 + r2 * 0.9) * cell,
@@ -1230,8 +1235,8 @@ impl CursorGlow {
             }
             GlowStyle::Fire => {
                 let puffs = ((1.0 + nf.sqrt()) as usize).clamp(1, 5);
-                let puffs_f = puffs as f32;
-                let x_at = |k: usize| span_x0 + ((k as f32 + 0.5) / puffs_f) * span_w;
+                let inv_puffs = 1.0 / (puffs as f32);
+                let x_at = |k: usize| span_x0 + ((k as f32 + 0.5) * inv_puffs) * span_w;
                 self.spawn_quench_steam(puffs, x_at, oy, cell, cwf, now);
             }
             _ => {
@@ -1264,9 +1269,9 @@ impl CursorGlow {
             1.0
         };
         let stars = ((ERASE_POOF_STARS * drive) as usize).clamp(4, ERASE_POOF_CAP);
-        let stars_f = stars as f32;
+        let inv_stars = 1.0 / (stars as f32);
         let speed = 0.55 + 0.85 * mom.clamp(0.0, 1.0);
-        let heft = erase_weight(n) / ERASE_WEIGHT_CAP;
+        let heft = erase_weight(n) * (1.0 / ERASE_WEIGHT_CAP);
         let spread_w = span_w.min(cwf * ERASE_POOF_SPREAD_CELLS);
         let heft_y = 0.6 + 0.9 * heft;
         let gy = 0.9 * cell;
@@ -1280,7 +1285,7 @@ impl CursorGlow {
             let r2 = self.frand();
             let r3 = self.frand();
             let r4 = self.frand();
-            let f = (k as f32 + 0.5) / stars_f;
+            let f = (k as f32 + 0.5) * inv_stars;
             self.particles.push(Particle {
                 x0: span_x0 + spread_w * f * f + (r0 - 0.5) * cwf,
                 y0: oy + (r1 - 0.5) * cell * heft_y,
@@ -1326,14 +1331,14 @@ impl CursorGlow {
         now: Instant,
     ) {
         let puffs = ((1.0 + f32::from(n).sqrt() * 1.4) as usize).clamp(1, 8);
-        let puffs_f = puffs as f32;
+        let inv_puffs = 1.0 / (puffs as f32);
         let spread_w = span_w.min(cwf * ERASE_POOF_SPREAD_CELLS);
         for k in 0..puffs {
             if self.vapor.len() >= Self::MAX_VAPOR {
                 break;
             }
             let (r0, r1, r2) = (self.frand(), self.frand(), self.frand());
-            let f = (k as f32 + 0.5) / puffs_f;
+            let f = (k as f32 + 0.5) * inv_puffs;
             self.vapor.push(Vapor {
                 x0: span_x0 + spread_w * f * f + (r0 - 0.5) * cwf,
                 y0: oy,

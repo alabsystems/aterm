@@ -1952,9 +1952,13 @@ impl Reader {
         let now = Instant::now();
         let split = self.split.due(req, now);
         let live_split = split && self.fixture.is_none();
+        // Every whole reading reads the pid version of each process whose
+        // start it cannot read (another user's), so the births kept for them
+        // (`SplitReader::known`) hold from one reading to the next.
         let sweep = (self.split.probe.sweep)(
             aterm_sysprobe::SweepOpts {
                 coalitions: live_split,
+                versions: true,
             },
             &mut self.split.coalition_ids,
         );

@@ -302,22 +302,23 @@ const AGAIN_AFTER: Duration = Duration::from_secs(1);
 const AGAIN_FOR: Duration = Duration::from_secs(60);
 
 fn driven_leg(drive: crate::FleetDriveFn, host: &str, request: &str, wait: Duration) -> Leg {
-    let mut link = match drive(host, wait + DRIVEN_SLACK) {
+    let within = wait + DRIVEN_SLACK;
+    let mut link = match drive(host, within) {
         Ok(link) => link,
         Err(refused) if refused.again => return Leg::Again(io::Error::other(refused)),
         Err(refused) => return Leg::Failed(io::Error::other(refused)),
     };
+    let label = link.label;
     if let Err(e) = io::Write::write_all(&mut link.stream, request.as_bytes())
         .and_then(|()| io::Write::flush(&mut link.stream))
     {
         return if redial::is_hangup(&e) {
             Leg::Again(e)
         } else {
-            Leg::Failed(e)
+            Leg::Failed(crate::remote::closed(&label, request, within, e))
         };
     }
-    let label = link.label;
-    read_leg(
+    let leg = read_leg(
         &mut BufReader::new(link.stream),
         super::MAX_BODY_BYTES,
         || {
@@ -326,7 +327,11 @@ fn driven_leg(drive: crate::FleetDriveFn, host: &str, request: &str, wait: Durat
                 format!("{label} closed the drive connection before it answered `await task`"),
             ))
         },
-    )
+    );
+    match leg {
+        Leg::Failed(e) => Leg::Failed(crate::remote::closed(&label, request, within, e)),
+        leg => leg,
+    }
 }
 
 fn read_leg<R: io::BufRead>(reader: &mut R, max_bytes: usize, hung_up: impl Fn() -> Leg) -> Leg {

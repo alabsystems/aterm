@@ -323,17 +323,59 @@ impl App {
         self.palette_live_for_window(self.frontmost_window)
     }
 
+    /// Selection geometry in the focused terminal or its visible terminal siblings.
+    /// An unread lock stays unknown unless another pane proves a selection exists.
+    fn terminal_selection_in(
+        &self,
+        wid: crate::WindowId,
+        mut read: impl FnMut(&std::sync::Mutex<aterm_core::terminal::Terminal>) -> Option<bool>,
+    ) -> Option<bool> {
+        let Some(focused) = self.front_terminal(wid) else {
+            return Some(false);
+        };
+        let mut selected = read(&focused.term);
+        if selected == Some(true)
+            || self
+                .windows
+                .get(&wid)
+                .and_then(|window| window.tab_set.active())
+                .is_none_or(|tab| tab.root.len() <= 1)
+        {
+            return selected;
+        }
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return selected;
+        };
+        for leaf in &plan.leaves {
+            let Some(crate::tab_model::View::Terminal(view)) = self.view_store.get(leaf.view)
+            else {
+                continue;
+            };
+            if view.session == focused.session {
+                continue;
+            }
+            let Some(session) = self.pool.get(view.session) else {
+                continue;
+            };
+            match read(&session.term) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => selected = None,
+            }
+        }
+        selected
+    }
+
     fn palette_live_for_window(&self, wid: Option<crate::WindowId>) -> PaletteLive {
         let window = wid.and_then(|wid| self.windows.get(&wid));
         let has_selection = wid.is_some_and(|wid| {
             if self.active_native_view(wid).is_some() {
                 self.native_has_selection(wid)
             } else {
-                self.front_terminal(wid).is_some_and(|terminal| {
-                    crate::term_lock(&terminal.term)
-                        .text_selection()
-                        .has_selection()
+                self.terminal_selection_in(wid, |term| {
+                    Some(crate::term_lock(term).text_selection().has_selection())
                 })
+                .unwrap_or(false)
             }
         });
         let fullscreen = window
@@ -407,6 +449,7 @@ impl App {
             front_tab_split: window
                 .and_then(|ws| ws.tab_set.active())
                 .is_some_and(|tab| tab.root.len() > 1),
+            can_rewind: wid.is_some_and(|wid| self.front_can_rewind(wid)),
             multi_tab,
             native_tab_active,
             terminal_front,
@@ -461,10 +504,11 @@ impl App {
             self.vitals.snapshot.is_some()
         } else if let Some(wid) = front.filter(|wid| self.active_native_view(*wid).is_some()) {
             self.native_has_selection(wid)
-        } else if let Some(terminal) = terminal {
-            crate::term_try_lock(&terminal.term).map_or(last.has_selection, |term| {
-                term.text_selection().has_selection()
+        } else if let Some(wid) = front {
+            self.terminal_selection_in(wid, |term| {
+                crate::term_try_lock(term).map(|term| term.text_selection().has_selection())
             })
+            .unwrap_or(last.has_selection)
         } else {
             false
         };
@@ -481,6 +525,7 @@ impl App {
             rain_on: terminal.is_some_and(|t| self.session_rain_enabled(t.session)),
             kitty_favourited: self.kitty_log.is_favourite(promotable),
             front_tab_split: self.front_tab_split(),
+            can_rewind: front.is_some_and(|wid| self.front_can_rewind(wid)),
         });
         crate::menu::set_stats_bars_form(self.stats_bars_form());
         crate::menu::set_deck_size_pref(self.deck_size_pref());

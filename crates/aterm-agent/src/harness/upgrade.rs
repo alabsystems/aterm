@@ -1,7 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pure state machine, transcript scanners, and argv/shell helpers for live agent upgrades.
+//! Pure state machine, transcript scanners, and argv/shell helpers for live agent upgrades; the
+//! line builders' one read is the shim environment of a store binary they type
+//! ([`with_store_env`]).
 
 use std::cmp::Ordering;
 use std::fmt::Write as _;
@@ -687,6 +689,10 @@ const _: () =
     assert!(LineDiscipline::Linux.max_line() + PASTE_FRAME < LineDiscipline::Linux.line_keeps());
 
 /// Builds the space-prefixed shell command line to relaunch a session.
+///
+/// Every line these builders make for an `exe` inside an atpkg store build also exports what that
+/// package's shim does, read from atpkg's record of it; a line too long with all of it keeps only
+/// the program's updater switch ([`with_store_env`]).
 pub fn relaunch_line(
     dialect: Dialect,
     heal: Option<&Path>,
@@ -759,16 +765,67 @@ pub fn task_line_env_clear(
 ) -> Result<String, String> {
     let tty = LineDiscipline::HOST;
     let unset = Some(unset).filter(|names| !names.is_empty());
-    let line = relaunch_line_with_clear(tty, dialect, None, None, env, unset, exe, args)?;
-    let line = format!("{line} {operand}");
-    let max = tty.max_line();
-    if line.len() > max {
-        return Err(format!(
-            "the line would be {} bytes (max {max})",
-            line.len()
-        ));
-    }
-    Ok(line)
+    with_store_env(env, unset, exe, |env| {
+        let line = relaunch_line_exact(tty, dialect, None, None, env, unset, exe, args)?;
+        let line = format!("{line} {operand}");
+        let max = tty.max_line();
+        if line.len() > max {
+            return Err(format!(
+                "the line would be {} bytes (max {max})",
+                line.len()
+            ));
+        }
+        Ok(line)
+    })
+}
+
+/// `env`, then each pair of `shim` that `env` neither sets nor `unset` removes: a line that types a
+/// store binary by its own path gives it what its managed shim exports
+/// ([`atpkg::shim_env::of_store_binary`]), and a value the caller names for itself wins.
+pub(super) fn with_shim_env<'a>(
+    env: &[(&'a str, &'a str)],
+    unset: &[&str],
+    shim: &'a [(String, String)],
+) -> Vec<(&'a str, &'a str)> {
+    let named = |name: &str| env.iter().any(|(n, _)| *n == name) || unset.contains(&name);
+    env.iter()
+        .copied()
+        .chain(
+            shim.iter()
+                .filter(|(name, _)| !named(name))
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
+        .collect()
+}
+
+/// `build`'s line with `env` and every pair of `exe`'s shim record ([`with_shim_env`]), or, when
+/// that line is refused, with only the record's pairs that turn the program's own updater off
+/// ([`atpkg::shim_env::turns_updater_off`]): the record's other pairs (Claude Code's survey switch)
+/// are niceties a line drops before it is refused for length, as a caller drops its own, and the
+/// updater switch it never drops.
+fn with_store_env(
+    env: &[(&str, &str)],
+    unset: Option<&[&str]>,
+    exe: &Path,
+    build: impl Fn(&[(&str, &str)]) -> Result<String, String>,
+) -> Result<String, String> {
+    let shim = atpkg::shim_env::of_store_binary(exe);
+    let unset = unset.unwrap_or_default();
+    let all = with_shim_env(env, unset, shim.entries());
+    let switches: Vec<(String, String)> = shim
+        .entries()
+        .iter()
+        .filter(|(name, value)| atpkg::shim_env::turns_updater_off(name, value))
+        .cloned()
+        .collect();
+    let lean = with_shim_env(env, unset, &switches);
+    build(&all).or_else(|refused| {
+        if lean.len() < all.len() {
+            build(&lean)
+        } else {
+            Err(refused)
+        }
+    })
 }
 
 fn relaunch_line_on(
@@ -785,6 +842,23 @@ fn relaunch_line_on(
 
 #[allow(clippy::too_many_arguments)]
 fn relaunch_line_with_clear(
+    tty: LineDiscipline,
+    dialect: Dialect,
+    heal: Option<&Path>,
+    cd: Option<&str>,
+    env: &[(&str, &str)],
+    unset: Option<&[&str]>,
+    exe: &Path,
+    args: &[String],
+) -> Result<String, String> {
+    with_store_env(env, unset, exe, |env| {
+        relaunch_line_exact(tty, dialect, heal, cd, env, unset, exe, args)
+    })
+}
+
+/// The line with exactly `env` exported ([`relaunch_line_with_clear`] adds the store record's).
+#[allow(clippy::too_many_arguments)]
+fn relaunch_line_exact(
     tty: LineDiscipline,
     dialect: Dialect,
     heal: Option<&Path>,

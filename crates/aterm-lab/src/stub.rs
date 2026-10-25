@@ -1241,6 +1241,15 @@ impl Request {
             .map(|(_, v)| v.as_str())
     }
 
+    fn websocket_upgrade(&self) -> bool {
+        let has_token = |name: &str, token: &str| {
+            self.headers.iter().any(|(k, v)| {
+                k == name && v.split(',').any(|v| v.trim().eq_ignore_ascii_case(token))
+            })
+        };
+        has_token("connection", "upgrade") && has_token("upgrade", "websocket")
+    }
+
     fn keep_alive(&self) -> bool {
         let conn = self.header("connection").unwrap_or("").to_ascii_lowercase();
         if conn.contains("close") {
@@ -1381,6 +1390,7 @@ const fn reason(status: u16) -> &'static str {
         404 => "Not Found",
         408 => "Request Timeout",
         413 => "Request Entity Too Large",
+        426 => "Upgrade Required",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         501 => "Not Implemented",
@@ -1712,6 +1722,17 @@ impl Stub {
         };
         let result = if req.method == "POST" && path == "/v1/messages" {
             self.messages(&req.method, path, &req.body, mode, &mut out)
+        } else if req.method == "GET" && path == "/v1/responses" && req.websocket_upgrade() {
+            // Codex falls back to HTTP on 426; a handshake must not take a scripted POST reply.
+            out.json(
+                426,
+                &err_body(
+                    "websocket_not_supported",
+                    "lab stub supports HTTP POST /v1/responses only",
+                ),
+                &[],
+            )
+            .map(|st| self.record(&req.method, path, st, blen, &mode, "websocket refused"))
         } else if req.method == "POST" && path == "/v1/responses" {
             let d = Dialect::Codex;
             self.responses(&req.method, path, &req.body, &mode, auth, d, &mut out)
@@ -1724,7 +1745,14 @@ impl Stub {
         } else if req.method == "GET" && path == "/backend-api/wham/accounts/check" {
             self.accounts_check(&req.method, path, &mode, req, &mut out)
         } else if req.method == "GET" && path == "/backend-api/wham/usage" {
-            self.wham_usage(&req.method, path, &mode, auth, &mut out)
+            self.wham_usage(
+                &req.method,
+                path,
+                &mode,
+                auth,
+                req.header("chatgpt-account-id"),
+                &mut out,
+            )
         } else if let Some(route) = account::Route::of(&req.method, path) {
             self.account(&req.method, path, &q, route, &mode, req, &mut out)
         } else if let Some((model, verb)) = gemini::route(&req.method, path) {
@@ -2531,6 +2559,7 @@ impl Stub {
         path: &str,
         mode: &str,
         auth: Option<&str>,
+        account_id: Option<&str>,
         out: &mut Out<'_>,
     ) -> io::Result<()> {
         let now = crate::util::now_secs();
@@ -2581,7 +2610,7 @@ impl Stub {
             .filter(|t| !t.is_empty())
             .map_or(J::Null, |t| J::obj([("type", J::s(t))]));
         let has_credits = credits.is_some();
-        let body = J::obj([
+        let mut body = J::obj([
             (
                 "plan_type",
                 claims
@@ -2608,6 +2637,9 @@ impl Stub {
             ("credits", credits.unwrap_or(J::Null)),
             ("rate_limit_reached_type", reached_type),
         ]);
+        if let Some(account_id) = account_id.filter(|id| !id.is_empty()) {
+            body.set("account_id", J::s(account_id));
+        }
         let st = out.json(200, &body, &[])?;
         let pct = |w: &Option<(i64, J)>| {
             w.as_ref()

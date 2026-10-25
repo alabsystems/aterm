@@ -14,6 +14,10 @@ mod every;
 #[path = "harness_landings_tests.rs"]
 mod landings;
 
+/// The page's plain counts (design §14.6).
+#[path = "harness_counts_tests.rs"]
+mod counts;
+
 #[cfg(target_os = "macos")]
 #[test]
 fn lan_discovery_uses_only_the_resolved_service_endpoint() {
@@ -1262,48 +1266,37 @@ fn what_the_harness_did_draws_every_family_the_fold_keeps() {
             .map(|(_, w)| w.clone())
             .unwrap_or_else(|| panic!("no {label} row: {rows:?}"))
     };
-    assert_eq!(words("Approved"), "40 today \u{b7} 212 in 7 days");
-    assert_eq!(
-        words("of those"),
-        "no safe rule proved 40 today \u{b7} 45 in 7 days"
-    );
-    assert_eq!(words("Land prompts"), "2 today \u{b7} 9 in 7 days");
-    assert_eq!(words("Declined"), "1 today \u{b7} 4 in 7 days");
+    assert_eq!(words(APPROVED.label), "40 today \u{b7} 212 in 7 days");
+    assert_eq!(words(UNPROVEN_OF_APPROVED), "40 today \u{b7} 45 in 7 days");
+    assert_eq!(words(LAND_PROMPTS.label), "2 today \u{b7} 9 in 7 days");
+    assert_eq!(words(DECLINED.label), "1 today \u{b7} 4 in 7 days");
     assert_eq!(words("Waited at limits"), "2m today \u{b7} 2h 5m in 7 days");
     let said = |words: &str| {
         rows.iter()
             .map(|(l, w)| format!("{l} {w}").to_lowercase().matches(words).count())
             .sum::<usize>()
     };
-    assert_eq!(said("no safe rule proved"), 1, "said once: {rows:?}");
+    assert_eq!(said(UNPROVEN_OF_APPROVED), 1, "said once: {rows:?}");
     assert_eq!(said("unproven"), 0, "never the ledger's word: {rows:?}");
     let labels: Vec<&str> = rows.iter().map(|(l, _)| l.as_str()).collect();
     assert_eq!(
-        labels[..13],
+        labels[..6],
         [
-            "Approved",
-            "of those",
-            "Declined",
-            "Answered",
-            "Kept going",
-            "Landed",
-            "Land prompts",
-            "Resumed",
-            "Relaunched",
-            "Upgraded",
-            "Needed you",
-            "Waited on you",
+            APPROVED.label,
+            UNPROVEN_OF_APPROVED,
+            DECLINED.label,
+            LAND_PROMPTS.label,
+            NONE_IN_7_DAYS,
             "Waited at limits",
         ]
     );
-    assert_eq!(words("Landed"), "0 today \u{b7} 0 in 7 days");
     today.unproven = 0;
     week.unproven = 0;
     state.stats.report = report(&today, &week);
     let rows = state.projection().did_rows;
     assert!(
         rows.iter()
-            .all(|(l, w)| l != "of those" && !w.contains("no safe rule")),
+            .all(|(l, w)| l != UNPROVEN_OF_APPROVED && !w.contains("no safe rule")),
         "a week with none says none: {rows:?}"
     );
     week.unproven = 3;
@@ -1311,22 +1304,23 @@ fn what_the_harness_did_draws_every_family_the_fold_keeps() {
     let rows = state.projection().did_rows;
     assert_eq!(
         rows.iter()
-            .find(|(l, _)| l == "of those")
+            .find(|(l, _)| l == UNPROVEN_OF_APPROVED)
             .map(|(_, w)| w.as_str()),
-        Some("no safe rule proved 0 today \u{b7} 3 in 7 days"),
+        Some("0 today \u{b7} 3 in 7 days"),
     );
     today.needs_told = 1;
     week.needs_told = 2;
+    week.escalated = 1;
     state.stats.report = report(&today, &week);
     let rows = state.projection().did_rows;
     let at = |label: &str| rows.iter().position(|(l, _)| l == label);
     assert_eq!(
-        at("Needs told"),
-        at("Needed you").map(|i| i + 1),
+        at(NEEDS_TOLD.label),
+        at(NEEDED_YOU.label).map(|i| i + 1),
         "{rows:?}"
     );
     assert_eq!(
-        rows[at("Needs told").unwrap()].1,
+        rows[at(NEEDS_TOLD.label).unwrap()].1,
         "1 today \u{b7} 2 in 7 days"
     );
 }
@@ -1403,7 +1397,7 @@ fn one_name_for_each_count_from_the_chip_to_the_page() {
             .ends_with(&format!("; {NO_SAFE_RULE_PROVED} it")),
         "DECIDED FOR YOU says it in the page's words"
     );
-    for words in FAMILY_WORDS.iter().chain([&NEEDED_YOU]) {
+    for words in FAMILY_WORDS.iter().chain([&NEEDED_YOU, &NEEDS_TOLD]) {
         let mut first = words.many.chars();
         let label: String = first
             .next()
@@ -1452,7 +1446,7 @@ fn one_name_for_each_count_from_the_chip_to_the_page() {
     assert!(lead.starts_with("3 kept going today"), "{lead:?}");
     let did = |label: &str| projection.did_rows.iter().any(|(l, _)| l == label);
     assert!(
-        did("Kept going") && did("Needed you"),
+        did(KEPT_GOING.label) && did(NEEDED_YOU.label),
         "{:?}",
         projection.did_rows
     );
@@ -1468,7 +1462,7 @@ fn one_name_for_each_count_from_the_chip_to_the_page() {
     };
     let day = day_line(&tally, Some(0)).expect("a day");
     assert!(
-        day.contains("needed you once") && day.contains("3 kept going"),
+        day.contains(&format!("{} once", NEEDED_YOU.one)) && day.contains("3 kept going"),
         "{day:?}"
     );
 }
@@ -2486,7 +2480,7 @@ fn statuss_today_says_its_nonzero_families_in_their_order() {
         state_with_today(Some(full), false).today_lines(),
         Some((
             "37 approved today \u{b7} 12 kept going \u{b7} 4 answered".to_string(),
-            "2 resumed \u{b7} 1 land prompt \u{b7} 3 upgraded \u{b7} waited on you 4m".to_string()
+            "2 resumed \u{b7} 1 land prompt \u{b7} 3 upgraded \u{b7} waited for you 4m".to_string()
         ))
     );
     let short = day_of(|d| {
@@ -2503,7 +2497,7 @@ fn statuss_today_says_its_nonzero_families_in_their_order() {
     let wait = day_of(|d| d.human_wait_ms = 60_000);
     assert_eq!(
         state_with_today(Some(wait), false).today_lines(),
-        Some(("waited on you 1m today".to_string(), String::new()))
+        Some(("waited for you 1m today".to_string(), String::new()))
     );
 }
 
@@ -2521,11 +2515,11 @@ fn a_rows_day_line_says_its_need_then_three_families_then_partial() {
     };
     assert_eq!(
         day_line(&need, Some(0)).as_deref(),
-        Some("today: needed you once, 1m at 18:29 \u{b7} 31 approved \u{b7} 1 kept going")
+        Some("today: waited for you once, 1m at 18:29 \u{b7} 31 approved \u{b7} 1 kept going")
     );
     assert_eq!(
         day_line(&need, None).as_deref(),
-        Some("today: needed you once, 1m at 18:29 UTC \u{b7} 31 approved \u{b7} 1 kept going")
+        Some("today: waited for you once, 1m at 18:29 UTC \u{b7} 31 approved \u{b7} 1 kept going")
     );
     let many = Tally {
         escalated: 2,
@@ -2540,7 +2534,7 @@ fn a_rows_day_line_says_its_need_then_three_families_then_partial() {
     assert_eq!(
         day_line(&many, Some(0)).as_deref(),
         Some(
-            "today: needed you twice \u{b7} 3 approved \u{b7} 2 kept going \u{b7} 1 answered \u{b7} partial"
+            "today: waited for you twice \u{b7} 3 approved \u{b7} 2 kept going \u{b7} 1 answered \u{b7} partial"
         )
     );
     let thrice = Tally {
@@ -2549,7 +2543,7 @@ fn a_rows_day_line_says_its_need_then_three_families_then_partial() {
     };
     assert_eq!(
         day_line(&thrice, Some(0)).as_deref(),
-        Some("today: needed you 3 times")
+        Some("today: waited for you 3 times")
     );
     assert_eq!(day_line(&Tally::default(), Some(0)), None);
     let unproven = Tally {
@@ -2568,7 +2562,7 @@ fn a_rows_day_line_says_its_need_then_three_families_then_partial() {
     };
     assert_eq!(
         day_line(&told, Some(0)).as_deref(),
-        Some("today: 2 needs told \u{b7} 1 approved")
+        Some("today: 2 needs, carried on \u{b7} 1 approved")
     );
     let both = Tally {
         escalated: 1,
@@ -2577,7 +2571,7 @@ fn a_rows_day_line_says_its_need_then_three_families_then_partial() {
     };
     assert_eq!(
         day_line(&both, Some(0)).as_deref(),
-        Some("today: needed you once \u{b7} 1 need told")
+        Some("today: waited for you once \u{b7} 1 need, carried on")
     );
 }
 
@@ -2709,7 +2703,7 @@ fn a_rows_escalation_clock_uses_the_events_offset_not_the_readings() {
         let (checked, got) = read(now, before, after, &|_| offset);
         let expected: Vec<String> = expected
             .into_iter()
-            .map(|at| format!("today: needed you once at {at}"))
+            .map(|at| format!("today: waited for you once at {at}"))
             .collect();
         assert_eq!(got, expected, "fixed or unknown offset {offset:?}");
         assert_eq!(checked, read_at_words(now, offset));
@@ -2747,7 +2741,7 @@ fn a_rows_escalation_clock_uses_the_events_offset_not_the_readings() {
         assert_eq!(checked, "at 12:00", "the reading keeps its own offset");
         let expected: Vec<String> = want
             .into_iter()
-            .map(|at| format!("today: needed you once at {at}"))
+            .map(|at| format!("today: waited for you once at {at}"))
             .collect();
         observations.push((got, expected));
     }

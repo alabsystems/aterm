@@ -150,6 +150,14 @@ pub const RAIL_GAIN: f32 = 1.0;
 /// The rail's full-strength plateau as a share of its reach.
 pub const RAIL_CORE_SHARE: f32 = aterm_render::RIBBON_CORE_SHARE;
 
+/// The share of its reach the flat ribbon's rail on a dim page holds at
+/// full strength ([`Ribbon::flat_dim`]): softer than the vivid rail's
+/// ([`RAIL_CORE_SHARE`]) and as deep as a rail may reach, a band of the
+/// rainbow's light below the letters, not an underline. At the vivid
+/// rail's strength: fainter, its warm stops faded through maroon and brown
+/// on the teal page.
+pub const FLAT_DIM_RAIL_CORE: f32 = 0.2;
+
 /// The from-the-hand attack's duration, seconds.
 pub const ATTACK_WIPE_S: f32 = 0.040;
 
@@ -210,18 +218,8 @@ const BED_LUMA_MAX: f32 = 0.150;
 pub const BED_SAT_FLOOR: f32 = 1.0;
 
 /// A dark theme whose text reads under this on its page is dim: its bed is
-/// held at its edge too ([`dim_edge_held`]).
+/// laid at the page's own luminance ([`dim_page_bed`]).
 pub const DIM_THEME_BARE: f32 = 7.0;
-
-/// Where the bed's top crosses a letter, the letter's anti-aliased pixels sit
-/// on page above and bed below, and a reader of that edge sees each channel's
-/// larger of the two. On a dim theme the bed is held so that this mix keeps a
-/// letter's edge pixel ([`DIM_EDGE_SOLID`] of the text's reading) at
-/// [`PAPER_BAR_THEME_SHARE`] of the theme's own, with this margin.
-pub const DIM_EDGE_GUARD: f32 = 0.03;
-
-/// The share of the text's reading a letter's weakest solid pixel keeps.
-pub const DIM_EDGE_SOLID: f32 = 0.85;
 
 /// The light bed's one weight.
 pub const PAPER_WEIGHT: f32 = 0.24;
@@ -243,6 +241,20 @@ pub const PAPER_CARET_CONTRAST: f32 = crate::cursor_fx::CARET_PAGE_MIN_CONTRAST;
 pub const PAPER_MARK_CONTRAST: f32 = 4.5;
 
 const PAPER_HUE_BEND: [(f32, f32); 4] = [(30.0, 30.0), (72.0, 40.0), (90.0, 85.0), (110.0, 110.0)];
+
+/// A paper train's hue bend ([`paper_train_ink`]): as [`PAPER_HUE_BEND`],
+/// yellow walks to gold, and the walk from gold to green crosses the
+/// darkened yellows (an olive and a khaki at the paper's contrast) in a
+/// few degrees of the spectrum, not the 18 the caret's bend takes. Bent
+/// through them over its whole interval, the `enter-bottom` Return's stick
+/// read olive and khaki (`b1b774`) for a cell and more (looks7 M2).
+const PAPER_TRAIN_HUE_BEND: [(f32, f32); 5] = [
+    (30.0, 30.0),
+    (72.0, 40.0),
+    (86.0, 44.0),
+    (92.0, 88.0),
+    (110.0, 110.0),
+];
 
 /// Entries in the bed-ink lookup table.
 pub const BED_INK_LUT_LEN: usize = 129;
@@ -574,7 +586,7 @@ impl Cohort {
     #[inline]
     #[must_use]
     pub const fn flow_progress(&self, idle: f32) -> f32 {
-        1.0 - spend(clamp01(idle / FLOW_TOTAL_S))
+        1.0 - spend(clamp01(idle * (1.0 / FLOW_TOTAL_S)))
     }
 
     /// The flow's fade at a column, `1 -> 0`.
@@ -1009,13 +1021,12 @@ const fn solve_for_luma(base_rgb: u32, k_full: f32, walk_white: bool, target: f3
             scale_rgb(base_rgb, u * k_full)
         }
     }
-    let table = crate::color_math::relative_luminance_table();
     let hi0 = eval_family(base_rgb, k_full, walk_white, 1.0);
-    if crate::color_math::relative_luminance_with(table, hi0) < target {
+    if relative_luminance(hi0) < target {
         return hi0;
     }
     let lo0 = eval_family(base_rgb, k_full, walk_white, 0.0);
-    if crate::color_math::relative_luminance_with(table, lo0) >= target {
+    if relative_luminance(lo0) >= target {
         return lo0;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -1028,7 +1039,7 @@ const fn solve_for_luma(base_rgb: u32, k_full: f32, walk_white: bool, target: f3
             lo = mid;
         } else if mid_rgb == hi_rgb {
             hi = mid;
-        } else if crate::color_math::relative_luminance_with(table, mid_rgb) < target {
+        } else if relative_luminance(mid_rgb) < target {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -1059,67 +1070,75 @@ const fn onto_luma(rgb: u32, target: f32) -> u32 {
     }
 }
 
-/// The dim theme's bed `bed`, scaled down until each channel's larger of it
-/// and the page `page` keeps a letter's edge at the bar ([`DIM_EDGE_GUARD`]);
-/// `bed` unchanged on a theme whose text `fg` reads past [`DIM_THEME_BARE`].
+/// The dim theme's bed `bed`: its colour at the page's own luminance
+/// ([`crate::cursor_glow::page_lit_ink`]); `bed` unchanged on a theme whose
+/// text `fg` reads past [`DIM_THEME_BARE`]. A dim theme's letter keeps 97%
+/// of its own reading under the lights, which leaves a bed no light to lay
+/// under it. Held instead until each channel's larger of bed and page kept
+/// a letter's edge at four fifths of the theme's reading, the bed scaled
+/// toward black: Solarized Dark's ribbons laid maroon-black blocks behind
+/// the letters (`#150301` on `#002b36`) and the flat rainbow no rainbow at
+/// all (looks7 round 2). The bed's edge is a soft ramp, so the judge's ring
+/// at a letter crossing it reads a ramp's step, not each channel's larger
+/// of bed and page.
+#[inline]
 #[must_use]
-pub const fn dim_edge_held(bed: u32, fg: u32, page: u32) -> u32 {
-    #[inline]
-    const fn chmax(c: u32, page: u32) -> u32 {
-        #[inline]
-        const fn ch(c: u32, page: u32, sh: u32) -> u32 {
-            let a = (c >> sh) & 0xff;
-            let b = (page >> sh) & 0xff;
-            (if a > b { a } else { b }) << sh
-        }
-        ch(c, page, 16) | ch(c, page, 8) | ch(c, page, 0)
+pub const fn dim_page_bed(bed: u32, fg: u32, page: u32) -> u32 {
+    if !dim_theme(fg, page) {
+        return bed;
     }
+    crate::cursor_glow::page_lit_ink(bed & 0x00FF_FFFF, page & 0x00FF_FFFF)
+}
+
+/// Whether text `fg` on the dark page `page` reads under [`DIM_THEME_BARE`].
+#[inline]
+#[must_use]
+pub const fn dim_theme(fg: u32, page: u32) -> bool {
     let (fg, page) = (fg & 0x00FF_FFFF, page & 0x00FF_FFFF);
-    let table = crate::color_math::relative_luminance_table();
-    let (lf, lp) = (
-        crate::color_math::relative_luminance_with(table, fg),
-        crate::color_math::relative_luminance_with(table, page),
-    );
-    let bare = (lf.max(lp) + 0.05) / (lf.min(lp) + 0.05);
-    if bare >= DIM_THEME_BARE || lf <= lp {
+    let (lf, lp) = (relative_luminance(fg), relative_luminance(page));
+    lf > lp && (lf + 0.05) / (lp + 0.05) < DIM_THEME_BARE
+}
+
+/// [`dim_page_bed`]'s forerunner (a test's negative control): the bed scaled
+/// toward black until each channel's larger of it and the page keeps a
+/// letter's edge (the judge's solid share of the text's reading) at four
+/// fifths of the theme's own.
+#[cfg(test)]
+pub(crate) fn dim_edge_held(bed: u32, fg: u32, page: u32) -> u32 {
+    const DIM_EDGE_GUARD: f32 = 0.03;
+    const DIM_EDGE_SOLID: f32 = 0.85;
+    let (fg, page) = (fg & 0x00FF_FFFF, page & 0x00FF_FFFF);
+    let lp = relative_luminance(page);
+    if !dim_theme(fg, page) {
         return bed;
     }
     let edge = (lp + 0.05) * DIM_EDGE_SOLID / (PAPER_BAR_THEME_SHARE + DIM_EDGE_GUARD) - 0.05;
+    let chmax = |c: u32| {
+        let ch = |sh: u32| ((c >> sh) & 0xff).max((page >> sh) & 0xff) << sh;
+        ch(16) | ch(8) | ch(0)
+    };
     let hi0 = bed & 0x00FF_FFFF;
-    if crate::color_math::relative_luminance_with(table, chmax(hi0, page)) <= edge {
+    if relative_luminance(chmax(hi0)) <= edge {
         return bed;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (None, Some(hi0));
-    let mut i = 0;
-    while i < 24 {
+    for _ in 0..24 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = scale_rgb(bed, mid);
-        let same_lo = match lo_rgb {
-            Some(prev) => prev == mid_rgb,
-            None => false,
-        };
-        let same_hi = match hi_rgb {
-            Some(prev) => prev == mid_rgb,
-            None => false,
-        };
-        if same_lo {
+        if lo_rgb == Some(mid_rgb) {
             lo = mid;
-        } else if same_hi {
+        } else if hi_rgb == Some(mid_rgb) {
             hi = mid;
-        } else if crate::color_math::relative_luminance_with(table, chmax(mid_rgb, page)) <= edge {
+        } else if relative_luminance(chmax(mid_rgb)) <= edge {
             lo = mid;
             lo_rgb = Some(mid_rgb);
         } else {
             hi = mid;
             hi_rgb = Some(mid_rgb);
         }
-        i += 1;
     }
-    match lo_rgb {
-        Some(rgb) => rgb,
-        None => scale_rgb(bed, lo),
-    }
+    lo_rgb.unwrap_or_else(|| scale_rgb(bed, lo))
 }
 
 /// The bed's on-glass ink: the stop, its hue bent off the dark bed's mud
@@ -1303,41 +1322,48 @@ pub const fn paper_mark_ink(rgb: u32, bg: u32) -> u32 {
     paper_vivid_ink(rgb, bg, PAPER_MARK_CONTRAST)
 }
 
+/// A paper train's ink (a Return's stick): the caret's ink, its walk from
+/// gold to green crossing the darkened yellows quickly
+/// ([`PAPER_TRAIN_HUE_BEND`]).
+#[inline]
+#[must_use]
+pub const fn paper_train_ink(rgb: u32, bg: u32) -> u32 {
+    paper_vivid_ink_bent(rgb, bg, PAPER_CARET_CONTRAST, &PAPER_TRAIN_HUE_BEND)
+}
+
 const fn paper_vivid_ink(rgb: u32, bg: u32, bar: f32) -> u32 {
+    paper_vivid_ink_bent(rgb, bg, bar, &PAPER_HUE_BEND)
+}
+
+/// The hue `h` walked along `bend`'s knots (degrees in -> out); off the
+/// bend's span no knot pair holds it and it is left as it is.
+const fn bent_hue(h: f32, bend: &[(f32, f32)]) -> f32 {
+    let mut i = 0;
+    while i + 1 < bend.len() {
+        let (x0, y0) = bend[i];
+        let (x1, y1) = bend[i + 1];
+        if h >= x0 && h < x1 {
+            return y0 + (y1 - y0) * (h - x0) / (x1 - x0);
+        }
+        i += 1;
+    }
+    h
+}
+
+const fn paper_vivid_ink_bent(rgb: u32, bg: u32, bar: f32, bend: &[(f32, f32)]) -> u32 {
     let (h, s, v) = rgb2hsv(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR));
     if v <= 0.0 {
         return 0;
     }
-    let h = if h >= 30.0 && h < 110.0 {
-        let mut bent = h;
-        let mut i = 0;
-        while i + 1 < PAPER_HUE_BEND.len() {
-            let (x0, y0) = PAPER_HUE_BEND[i];
-            let (x1, y1) = PAPER_HUE_BEND[i + 1];
-            if h >= x0 && h < x1 {
-                bent = y0 + (y1 - y0) * (h - x0) / (x1 - x0);
-                break;
-            }
-            i += 1;
-        }
-        bent
-    } else {
-        h
-    };
+    let h = bent_hue(h, bend);
     let full = hsv2rgb(h, s, 1.0);
-    let table = crate::color_math::relative_luminance_table();
-    let y_bg = crate::color_math::relative_luminance_with(table, bg & 0x00FF_FFFF);
+    let y_bg = relative_luminance(bg & 0x00FF_FFFF);
     #[inline]
-    const fn holds(
-        table: &crate::color_math::RelativeLuminanceTable,
-        y_bg: f32,
-        bar: f32,
-        cand: u32,
-    ) -> bool {
-        let y = crate::color_math::relative_luminance_with(table, cand);
+    const fn holds(y_bg: f32, bar: f32, cand: u32) -> bool {
+        let y = relative_luminance(cand);
         (y.max(y_bg) + 0.05) / (y.min(y_bg) + 0.05) >= bar
     }
-    if holds(table, y_bg, bar, full) {
+    if holds(y_bg, bar, full) {
         return full;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -1352,7 +1378,7 @@ const fn paper_vivid_ink(rgb: u32, bg: u32, bar: f32) -> u32 {
         };
         if mid_rgb == hi_rgb {
             hi = mid;
-        } else if same_lo || holds(table, y_bg, bar, mid_rgb) {
+        } else if same_lo || holds(y_bg, bar, mid_rgb) {
             lo = mid;
             lo_rgb = Some(mid_rgb);
         } else {
@@ -1375,7 +1401,6 @@ const fn channel_contrast(linear: &[f32; 256], a: u8, b: u8) -> f32 {
 }
 
 /// Whether a composited pixel is still a stop.
-#[cfg(test)]
 #[inline]
 #[must_use]
 pub(crate) const fn seen(rgb: u32, bg: u32) -> bool {
@@ -1411,11 +1436,10 @@ pub(crate) const fn seen_with(linear: &[f32; 256], rgb: u32, bg: u32) -> bool {
 #[inline]
 #[must_use]
 const fn seen_floor(ink: u32, bg: u32) -> f32 {
-    let linear = &crate::color_math::relative_luminance_table().linear;
     let mut a = 255u16;
     while a >= 1 {
         let alpha = a as u8;
-        if !seen_with(linear, over_premul(bg, premul_rgb(ink, alpha), alpha), bg) {
+        if !seen(over_premul(bg, premul_rgb(ink, alpha), alpha), bg) {
             return (alpha as f32) + 1.0;
         }
         a -= 1;
@@ -1490,7 +1514,7 @@ const fn cov_cap(cfg: &Config) -> f32 {
 
 #[inline]
 const fn walk_arc_at(i: usize) -> u32 {
-    spectrum(walk_pace(i as f32 / (BED_INK_LUT_LEN - 1) as f32))
+    spectrum(walk_pace(i as f32 * (1.0 / (BED_INK_LUT_LEN - 1) as f32)))
 }
 
 static HOT_EDGE_INK_LUT: [u32; BED_INK_LUT_LEN] = {
@@ -1600,7 +1624,7 @@ impl BedInkLut {
         seen: [0.0; BED_INK_LUT_LEN],
     };
 
-    const fn sync(&mut self, cfg: &Config) {
+    fn sync(&mut self, cfg: &Config) {
         let key = (cfg.theme_fg, cfg.theme_bg, cfg.dark_theme, cfg.ribbon_tall);
         if let Some((fg, bg, dark, tall)) = self.key
             && fg == key.0
@@ -1626,7 +1650,6 @@ impl BedInkLut {
             return;
         }
         let light_a = (cov_cap(cfg) + 16.0).min(255.0) as u8;
-        let linear = &crate::color_math::relative_luminance_table().linear;
         let mut i = 0;
         while i < BED_INK_LUT_LEN {
             let bed = if let Some(max_lut) = dark_max {
@@ -1634,11 +1657,10 @@ impl BedInkLut {
             } else {
                 let arc = walk_arc_at(i);
                 if cfg.dark_theme {
-                    dim_edge_held(bed_ink(arc, budget), cfg.theme_fg, cfg.theme_bg)
+                    dim_page_bed(bed_ink(arc, budget), cfg.theme_fg, cfg.theme_bg)
                 } else {
                     let paper = paper_ink(arc, cfg.theme_fg, cfg.theme_bg, role);
-                    let shows = seen_with(
-                        linear,
+                    let shows = seen(
                         over_premul(cfg.theme_bg, premul_rgb(paper, light_a), light_a)
                             & 0x00FF_FFFF,
                         cfg.theme_bg,
@@ -1761,7 +1783,8 @@ pub const fn walk_pace(x: f32) -> f32 {
     if x <= CROSS_ARC0 || x >= CROSS_ARC1 {
         return x;
     }
-    let f = (x - CROSS_ARC0) / (CROSS_ARC1 - CROSS_ARC0) * (CROSS_PACE_KNOTS - 1) as f32;
+    const SCALE: f32 = (CROSS_PACE_KNOTS - 1) as f32 / (CROSS_ARC1 - CROSS_ARC0);
+    let f = (x - CROSS_ARC0) * SCALE;
     let u = f as usize;
     let i = if u < CROSS_PACE_KNOTS - 2 {
         u
@@ -1769,7 +1792,7 @@ pub const fn walk_pace(x: f32) -> f32 {
         CROSS_PACE_KNOTS - 2
     };
     let (a, b) = (CROSS_PACE[i] as f32, CROSS_PACE[i + 1] as f32);
-    (a + (b - a) * (f - i as f32)) / 65535.0
+    (a + (b - a) * (f - i as f32)) * (1.0 / 65535.0)
 }
 
 /// The classic walk.
@@ -1780,7 +1803,7 @@ pub const fn walk_t(d: f32) -> f32 {
         return 0.0;
     }
     if d <= WALK_FAST_CELLS {
-        d / WALK_FAST_CELLS
+        d * (1.0 / WALK_FAST_CELLS)
     } else {
         1.0 + (d - WALK_FAST_CELLS) * WALK_LAY_RATE
     }
@@ -1794,7 +1817,7 @@ pub const fn expiry_melt(u: f32) -> f32 {
     if rem >= EXPIRY_MELT_SHARE {
         return 1.0;
     }
-    let taper = smoothstep01(rem / EXPIRY_MELT_SHARE);
+    let taper = smoothstep01(rem * (1.0 / EXPIRY_MELT_SHARE));
     if taper <= 0.0 {
         0.0
     } else if taper >= 1.0 {
@@ -1816,7 +1839,7 @@ pub const fn ember_level(floor: f32, f: f32) -> f32 {
 #[inline]
 #[must_use]
 pub const fn reduced_fade(remaining_s: f32) -> f32 {
-    clamp01(remaining_s / (REDUCED_MOTION_FADE_MS / 1000.0))
+    clamp01(remaining_s * (1000.0 / REDUCED_MOTION_FADE_MS))
 }
 
 /// Seconds until [`expiry_melt`] next takes a mark of `peak` levels down one u8 level, `u` of the way through its `life_s`.
@@ -2104,6 +2127,9 @@ pub struct Ribbon {
     ink: BedInkLut,
     ground: u32,
     ink_quads: usize,
+    /// The frame's rails laid clear of their row's ring, as `[from, to)`
+    /// spans of the under stream ([`Self::rail_spans`]).
+    rail_spans: Vec<(usize, usize)>,
     ember_at: Option<Instant>,
     rearm: Option<(Instant, f32)>,
     translated_at: Option<Instant>,
@@ -2339,6 +2365,7 @@ impl Ribbon {
             ink: BedInkLut::EMPTY,
             ground: 0,
             ink_quads: 0,
+            rail_spans: Vec::new(),
             ember_at: None,
             rearm: None,
             translated_at: None,
@@ -2509,6 +2536,40 @@ impl Ribbon {
     #[must_use]
     pub const fn rail_lit(cfg: &Config) -> bool {
         Self::comet(cfg)
+    }
+
+    /// Whether the flat ribbon lies on a dim theme's page ([`dim_theme`]):
+    /// its body there lays only its hue at the page's luminance
+    /// ([`dim_page_bed`]), and the warm half of the rainbow, at a luminance
+    /// that low, is the page's own teal or olive (Solarized Dark's flat
+    /// rainbow showed no rainbow past `jumps`, looks7 round 3). It lays a
+    /// soft rail in the air below its letters ([`FLAT_DIM_RAIL_CORE`]).
+    #[inline]
+    #[must_use]
+    pub const fn flat_dim(cfg: &Config) -> bool {
+        !Self::comet(cfg) && cfg.dark_theme && dim_theme(cfg.theme_fg, cfg.theme_bg)
+    }
+
+    /// Whether a rail is drawn under the body ([`Self::rail_lit`],
+    /// [`Self::flat_dim`]).
+    #[inline]
+    #[must_use]
+    pub const fn rail_drawn(cfg: &Config) -> bool {
+        Self::rail_lit(cfg) || Self::flat_dim(cfg)
+    }
+
+    /// The frame's rails laid clear of their row's ring, as `[from, to)`
+    /// spans of the under stream ([`crate::cursor_glow::InkLedger::note_rail`]).
+    #[inline]
+    #[must_use]
+    pub const fn rail_spans(&self) -> &[(usize, usize)] {
+        self.rail_spans.as_slice()
+    }
+
+    /// Forget the rails' spans: the frame drew none, or what it drew was cut away.
+    #[inline]
+    pub fn forget_rails(&mut self) {
+        self.rail_spans.clear();
     }
 
     /// Ingest one engine event at its own edge, before this frame's plan.
@@ -2981,7 +3042,7 @@ impl Ribbon {
             .filter(|c| c.row == coh.row && c.cohort == coh.id && c.col == edge)
             .max_by(|a, b| a.born.cmp(&b.born))
             .map_or(0.0, |c| c.birth_disp);
-        let heat = smoothstep01((disp - HOT_EDGE_DISP_MIN) / HOT_EDGE_DISP_SPAN);
+        let heat = smoothstep01((disp - HOT_EDGE_DISP_MIN) * (1.0 / HOT_EDGE_DISP_SPAN));
         let kept = f32::from(hi - lo) + 1.0;
         let drift = (FLOW_DRIFT_MIN_CELLS + (FLOW_DRIFT_MAX_CELLS - FLOW_DRIFT_MIN_CELLS) * heat)
             .min(FLOW_DRIFT_MAX_SHARE * kept);
@@ -3060,7 +3121,7 @@ impl Ribbon {
     #[inline]
     fn regain_focus(&mut self, at: Instant) {
         if let Some(ember) = self.ember_at.take() {
-            let r = at.saturating_duration_since(ember).as_secs_f32() / FOCUS_EMBER_S;
+            let r = at.saturating_duration_since(ember).as_secs_f32() * (1.0 / FOCUS_EMBER_S);
             if r < 1.0 {
                 self.rearm = Some((at, spend(clamp01(r))));
             }
@@ -3879,11 +3940,11 @@ impl Ribbon {
         };
         let cohort = self.cohorts[idx];
         let inherited = typing && self.attach == Some((row, col));
+        const EDGE_ATTACK_INHERITED_DUR: std::time::Duration = std::time::Duration::from_nanos(
+            ((EDGE_IN_S + ATTACK_WIPE_S) as f64 * 1_000_000_000.0).round() as u64,
+        );
         let attack_at = if inherited {
-            at.checked_sub(std::time::Duration::from_secs_f32(
-                EDGE_IN_S + ATTACK_WIPE_S,
-            ))
-            .unwrap_or(at)
+            at.checked_sub(EDGE_ATTACK_INHERITED_DUR).unwrap_or(at)
         } else {
             at
         };
@@ -4566,8 +4627,10 @@ impl Ribbon {
 
     /// Release specific live cells to the swoosh.
     pub fn release_cells(&mut self, cells: &[(u16, u16, Instant)], at: Instant) -> usize {
-        let Some(rewound) = at.checked_sub(std::time::Duration::from_secs_f32(RETRACT_START_S))
-        else {
+        const RETRACT_START_DUR: std::time::Duration = std::time::Duration::from_nanos(
+            (RETRACT_START_S as f64 * 1_000_000_000.0).round() as u64,
+        );
+        let Some(rewound) = at.checked_sub(RETRACT_START_DUR) else {
             return 0;
         };
         let mut n = 0;
@@ -4646,6 +4709,44 @@ impl Ribbon {
         n
     }
 
+    /// A resident partial release can return without being laid again.
+    pub(super) fn partial_custody_valid(&self, cell: &Cell, now: Instant) -> bool {
+        let Some(stamp) = cell.released_at else {
+            return false;
+        };
+        if cell.retire_at.is_some() {
+            return false;
+        }
+        let Some(cohort) = self.cohorts.iter().find(|cohort| cohort.id == cell.cohort) else {
+            return false;
+        };
+        let alive = now
+            .saturating_duration_since(cell.born.max(cohort.alive_at))
+            .as_secs_f32()
+            < cell.life_s;
+        if cohort.leaving_at(now)
+            || cohort.parts_revoked_at.is_some_and(|cutoff| stamp < cutoff)
+            || !alive
+        {
+            return false;
+        }
+        self.matching_partial_release(cell.cohort, stamp)
+            .is_some_and(|index| self.release_parts[index].cells > 0)
+    }
+
+    fn matching_partial_release(&self, id: u32, stamp: Instant) -> Option<usize> {
+        let index = self
+            .release_parts
+            .binary_search_by_key(&(id, stamp), |part| (part.cohort, part.stamp))
+            .ok()?;
+        let resident = self
+            .cells
+            .iter()
+            .filter(|cell| cell.cohort == id && cell.released_at == Some(stamp))
+            .count();
+        (resident == self.release_parts[index].cells).then_some(index)
+    }
+
     /// Lift the releases whose text the witness found back.
     pub(super) fn restore_releases(
         &mut self,
@@ -4674,21 +4775,9 @@ impl Ribbon {
                 accepted.push(id);
                 continue;
             };
-            let Ok(part_at) = self
-                .release_parts
-                .binary_search_by_key(&(id, stamp), |part| (part.cohort, part.stamp))
-            else {
+            let Some(part_at) = self.matching_partial_release(id, stamp) else {
                 continue;
             };
-            let part = self.release_parts[part_at];
-            let resident = self
-                .cells
-                .iter()
-                .filter(|c| c.cohort == id && c.released_at == Some(stamp))
-                .count();
-            if resident != part.cells {
-                continue;
-            }
             for cell in &mut self.cells {
                 if cell.cohort == id && cell.released_at == Some(stamp) {
                     cell.retract_at = None;
@@ -4982,7 +5071,8 @@ impl Ribbon {
             if phase != Phase::Reaching || ctx.cfg.reduced_motion || self.curtain.is_some() {
                 continue;
             }
-            let beats = (((idle - coh.grace_s) / REACH_STEP_S).floor() as i32 + 1)
+            const INV_REACH_STEP_S: f32 = 1.0 / REACH_STEP_S;
+            let beats = (((idle - coh.grace_s) * INV_REACH_STEP_S).floor() as i32 + 1)
                 .clamp(0, i32::from(REACH_BEATS)) as u16;
             let span = coh.col1.saturating_sub(coh.col0);
             let want = FOUR_LETTER_CELLS.saturating_sub(span).min(beats);
@@ -5223,11 +5313,11 @@ impl Ribbon {
     }
 
     #[inline]
-    const fn slabs_for(ctx: &Ctx<'_>, cells: usize) -> usize {
+    fn slabs_for(ctx: &Ctx<'_>, cells: usize) -> usize {
         let prof = Self::body_profile(ctx.cfg);
         let ch = ctx.geom.ch as f32;
         let body = ((prof.up_ch + DN_TOP_CH) * ch).ceil().max(1.0) + 2.0;
-        let rail = if Self::rail_lit(ctx.cfg) {
+        let rail = if Self::rail_drawn(ctx.cfg) {
             (DN_TOP_CH * ch).ceil() + 1.0
         } else {
             0.0
@@ -5236,14 +5326,7 @@ impl Ribbon {
         let cells = cells + 1;
         let per_slab = (cells as f32 * rows).max(1.0);
         let fit = (RIBBON_QUAD_BUDGET as f32 / per_slab).floor();
-        let n = fit.max(1.0) as usize;
-        if n < 1 {
-            1
-        } else if n > SLABS_PER_CELL {
-            SLABS_PER_CELL
-        } else {
-            n
-        }
+        (fit.max(1.0) as usize).clamp(1, SLABS_PER_CELL)
     }
 
     fn build_runs(
@@ -5453,9 +5536,9 @@ impl Ribbon {
             (Some(target), Some((level, at))) if !steps && !ctx.cfg.reduced_motion => {
                 let dt = ctx.now.saturating_duration_since(at).as_secs_f32();
                 if target > level {
-                    (level + dt / HOLD_EASE_S).min(target)
+                    (level + dt * (1.0 / HOLD_EASE_S)).min(target)
                 } else {
-                    (level - dt / HOLD_RELEASE_S).max(target)
+                    (level - dt * (1.0 / HOLD_RELEASE_S)).max(target)
                 }
             }
             (Some(target), _) => target,
@@ -5573,7 +5656,7 @@ impl Ribbon {
             0.0
         } else {
             (WAVE_AMP_CELLS * chf * disp).min(rs.room)
-                * smoothstep01(sp / WAVE_HEAD_PIN)
+                * smoothstep01(sp * (1.0 / WAVE_HEAD_PIN))
                 * (1.0 - rs.settle)
         };
         let wave = if amp == 0.0 {
@@ -5586,7 +5669,7 @@ impl Ribbon {
         let bloom = if disp <= 0.0 || behind >= BLOOM_REACH_CELLS {
             0.0
         } else {
-            clamp01(disp * (1.0 - smoothstep01(behind / BLOOM_REACH_CELLS)))
+            clamp01(disp * (1.0 - smoothstep01(behind * (1.0 / BLOOM_REACH_CELLS))))
         };
         let row_bot = rs.row_bot;
         let dn_floor = rs.dn_floor;
@@ -5600,7 +5683,7 @@ impl Ribbon {
             prof.up_ch
                 * (1.0
                     - (1.0 - COMET_UP_TAIL_CH / TALL_UP_CH)
-                        * smoothstep01(behind / COMET_TAPER_CELLS))
+                        * smoothstep01(behind * (1.0 / COMET_TAPER_CELLS)))
         } else {
             prof.up_ch
         };
@@ -5675,7 +5758,7 @@ impl Ribbon {
             env *= if reduced {
                 reduced_fade(RETRACT_FADE_S - r)
             } else {
-                spend(clamp01(r / RETRACT_FADE_S))
+                spend(clamp01(r * (1.0 / RETRACT_FADE_S)))
             };
         }
         if let Some(at) = cell.retire_at {
@@ -5683,7 +5766,7 @@ impl Ribbon {
             env *= if reduced {
                 reduced_fade(RETIRE_MELT_S - r)
             } else {
-                spend(clamp01(r / RETIRE_MELT_S))
+                spend(clamp01(r * (1.0 / RETIRE_MELT_S)))
             };
         }
         if let Some(at) = self.curtain {
@@ -5693,12 +5776,12 @@ impl Ribbon {
             } else {
                 let rank = coh.map_or(1.0, |c| c.drain_rank(cell.col));
                 let t0 = CURTAIN_STAGGER_S * (1.0 - rank);
-                spend(clamp01((r - t0) / CURTAIN_SPEND_S))
+                spend(clamp01((r - t0) * (1.0 / CURTAIN_SPEND_S)))
             };
         }
         if let Some(at) = coh.and_then(|c| c.printed) {
             let r = now.saturating_duration_since(at).as_secs_f32();
-            env *= 1.0 - (1.0 - RETURN_PRINTED_SHARE) * smoothstep01(r / RETURN_DIM_S);
+            env *= 1.0 - (1.0 - RETURN_PRINTED_SHARE) * smoothstep01(r * (1.0 / RETURN_DIM_S));
         }
         if let Some(coh) = coh
             && coh.phase.is_retracting()
@@ -5716,7 +5799,7 @@ impl Ribbon {
                 } else {
                     let t0 =
                         coh.retract_start() + coh.retract_span() * (1.0 - coh.drain_rank(cell.col));
-                    env *= spend(clamp01((idle - t0) / RETRACT_FADE_S));
+                    env *= spend(clamp01((idle - t0) * (1.0 / RETRACT_FADE_S)));
                 }
             }
         }
@@ -5725,7 +5808,7 @@ impl Ribbon {
             let f = if reduced {
                 reduced_fade(FOCUS_EMBER_S - r)
             } else {
-                spend(clamp01(r / FOCUS_EMBER_S))
+                spend(clamp01(r * (1.0 / FOCUS_EMBER_S)))
             };
             env *= ember_level(self.ember_floor(ctx, cell, env), f);
         }
@@ -5781,8 +5864,8 @@ impl Ribbon {
         if ramp <= 0.0 {
             return 1.0;
         }
-        let front = clamp01(age / ATTACK_WIPE_S) * (1.0 + ATTACK_WIPE_FRONT);
-        let gate = smoothstep01((front - clamp01(dist)) / ATTACK_WIPE_FRONT);
+        let front = clamp01(age * (1.0 / ATTACK_WIPE_S)) * (1.0 + ATTACK_WIPE_FRONT);
+        let gate = smoothstep01((front - clamp01(dist)) * (1.0 / ATTACK_WIPE_FRONT));
         let uniform = BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * ramp;
         let wiped = BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * ramp * gate;
         wiped / uniform
@@ -5794,7 +5877,8 @@ impl Ribbon {
             return RetractX::Identity;
         }
         if let Some(at) = self.curtain {
-            let u = clamp01(ctx.now.saturating_duration_since(at).as_secs_f32() / CURTAIN_S);
+            let u =
+                clamp01(ctx.now.saturating_duration_since(at).as_secs_f32() * (1.0 / CURTAIN_S));
             let Some(col) = coh.and_then(|c| c.retract_col) else {
                 return RetractX::Identity;
             };
@@ -5899,7 +5983,7 @@ impl Ribbon {
             .map(|c| c.born)
             .max()
             .unwrap_or(ctx.now);
-        let span = f32::from(col1 - col0).max(1.0);
+        let inv_span = 1.0 / f32::from(col1 - col0).max(1.0);
         let cell_at = |col: u16| -> Option<&Cell> {
             let i = usize::from(col.checked_sub(col0)?);
             let e = run.get(i)?;
@@ -5945,7 +6029,7 @@ impl Ribbon {
         let mut doubled: Option<usize> = None;
         let caret_side_right = stream_dir < 0;
         let ox = f32::from(ctx.geom.origin_x);
-        let slabs_f = slabs as f32;
+        let inv_slabs = 1.0 / (slabs as f32);
         let retract = self.retract_x(ctx, coh);
         let flow_settle = if ctx.cfg.reduced_motion {
             (0.0, 0.0)
@@ -5955,7 +6039,7 @@ impl Ribbon {
                     let idle = c.idle_s(ctx.now);
                     (
                         c.flow_progress(idle),
-                        smoothstep01((idle - (FLOW_TOTAL_S - FLOW_TAIL_S)) / FLOW_TAIL_S),
+                        smoothstep01((idle - (FLOW_TOTAL_S - FLOW_TAIL_S)) * (1.0 / FLOW_TAIL_S)),
                     )
                 })
         };
@@ -5975,7 +6059,7 @@ impl Ribbon {
                     continue;
                 }
             };
-            let sp = |c: &Cell| f32::from(head_col.abs_diff(c.col)) / span;
+            let sp = |c: &Cell| f32::from(head_col.abs_diff(c.col)) * inv_span;
             debug_assert_eq!(left_sample.is_some(), left.is_some());
             let sa = left_sample.unwrap_or_else(|| self.sample_with(ctx, a, coh, sp(a), &rs));
             let sb = if a.col == b.col {
@@ -6029,7 +6113,7 @@ impl Ribbon {
             let x = ox + boundary as f32 * cw;
             if let Some((px, p)) = prev {
                 for j in 1..slabs {
-                    let f = j as f32 / slabs_f;
+                    let f = j as f32 * inv_slabs;
                     let l = |u: f32, v: f32| u + (v - u) * f;
                     let own =
                         sa.3 * self.wipe_of(ctx, a, if caret_side_right { 1.0 - f } else { f });
@@ -6082,7 +6166,7 @@ impl Ribbon {
         {
             let x = px + cw;
             for j in 1..=slabs {
-                let f = j as f32 / slabs_f;
+                let f = j as f32 * inv_slabs;
                 let cov = af.level(self, ctx, f);
                 self.plan.push(Segment {
                     x: retract.at(px + (x - px) * f).round(),
@@ -6129,6 +6213,7 @@ impl Ribbon {
     /// Draw the body into `frame.under` and the hot edge into `frame.out`.
     pub fn emit(&mut self, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         self.ink_quads = 0;
+        self.rail_spans.clear();
         if self.plan.is_empty() || self.runs.is_empty() {
             return;
         }
@@ -6139,7 +6224,8 @@ impl Ribbon {
         let alike = self.paper_alike && !ctx.cfg.dark_theme;
         #[cfg(not(test))]
         let alike = false;
-        let rail = Self::rail_lit(ctx.cfg) && !alike;
+        let flat_dim = Self::flat_dim(ctx.cfg);
+        let rail = (Self::rail_lit(ctx.cfg) || flat_dim) && !alike;
         let chf = ctx.geom.ch as f32;
         let ceiling = if ctx.cfg.dark_theme {
             BODY_FRAME_TOP
@@ -6169,6 +6255,9 @@ impl Ribbon {
         };
         #[cfg(not(test))]
         let rail_gap = rail_gap_px(chf);
+        let rail_clear = rail_gap >= crate::cursor_glow::LETTER_GUARD_RING as f32;
+        let mut rail_spans = mem::take(&mut self.rail_spans);
+        rail_spans.clear();
         let plan = &self.plan;
         let ink = &self.ink;
         let keep_out_ease = KEEP_OUT_EASE_CELLS * ctx.geom.cw as f32;
@@ -6199,6 +6288,10 @@ impl Ribbon {
         };
         {
             let mut paint = |out: &mut Vec<GlowQuad>, run: &Run, rail_layer: bool| -> bool {
+                // A span past the stream's end was cut away with what it
+                // drew (the body-first repaint): it is spent.
+                let at = out.len();
+                rail_spans.retain(|&(_, to)| to <= at);
                 let row_bottom = f32::from(ctx.geom.origin_y) + (f32::from(run.row) + 1.0) * chf;
                 if rail_layer && (!rail || run.hold >= 1.0 || row_bottom >= pane_bot) {
                     return true;
@@ -6239,14 +6332,21 @@ impl Ribbon {
                         }
                         // The vivid rail lies a hairline below the row's bottom.
                         let top = (row_bottom + rail_gap).max(seg.spine);
-                        let dn = (seg.spine + seg.dn - top).max(dn_floor).min(rail_reach_max);
+                        let (dn, core) = if flat_dim {
+                            (rail_reach_max, FLAT_DIM_RAIL_CORE)
+                        } else {
+                            (
+                                (seg.spine + seg.dn - top).max(dn_floor).min(rail_reach_max),
+                                RAIL_CORE_SHARE,
+                            )
+                        };
                         verts.push(RibbonVertex {
                             x: seg.x,
                             spine: top,
                             up: 0.0,
                             dn,
                             core_up: 0.0,
-                            core_dn: dn * RAIL_CORE_SHARE,
+                            core_dn: dn * core,
                             color: ink.rail_at(seg.t),
                             cov: seg.cov * rail_scale * feather(seg.x),
                             lift: 0.0,
@@ -6300,6 +6400,9 @@ impl Ribbon {
                         out, clip, &mut verts, head, shoulder, stride, budget,
                     );
                 }
+                if rail_layer && rail_clear && out.len() > start {
+                    rail_spans.push((start, out.len()));
+                }
                 complete
             };
             let mut retry_body_first = false;
@@ -6340,6 +6443,8 @@ impl Ribbon {
                 }
             }
         }
+        rail_spans.retain(|&(_, to)| to <= frame.under.len());
+        self.rail_spans = rail_spans;
         self.runs = runs;
         self.verts = verts;
         self.emit_hot_edge(ctx, frame);
@@ -6467,7 +6572,8 @@ impl Ribbon {
         }
         let floor = if typed { HOT_EDGE_GAIN_FLOOR } else { 0.0 };
         floor
-            + (1.0 - floor) * smoothstep01((clamp01(disp) - HOT_EDGE_DISP_MIN) / HOT_EDGE_DISP_SPAN)
+            + (1.0 - floor)
+                * smoothstep01((clamp01(disp) - HOT_EDGE_DISP_MIN) * (1.0 / HOT_EDGE_DISP_SPAN))
     }
 
     fn emit_hot_edge(&self, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
@@ -6514,7 +6620,8 @@ impl Ribbon {
                     f32::from(ctx.geom.origin_x) + f32::from(self.hand_floor_on(run.row)?) * cw;
                 let lvl = SEAM_LEVEL
                     * spend(clamp01(
-                        ctx.now.saturating_duration_since(s.at).as_secs_f32() / FLOW_TOTAL_S,
+                        ctx.now.saturating_duration_since(s.at).as_secs_f32()
+                            * (1.0 / FLOW_TOTAL_S),
                     ));
                 (lvl > 0.0).then_some((floor_x, lvl))
             });
@@ -6754,14 +6861,15 @@ impl Ribbon {
     #[inline]
     #[must_use]
     pub fn brisk(&self, now: Instant) -> bool {
+        const TWIN_TRANSLATED_WINDOW_DUR: std::time::Duration =
+            super::witness::TWIN_MIN.saturating_add(std::time::Duration::from_millis(16));
         let ramping = |at: Instant| now.saturating_duration_since(at).as_secs_f32() < EDGE_IN_S;
         (!self.reduced && self.curtain.is_some() && !self.cells.is_empty())
             || (!self.reduced && self.seam.is_some() && !self.cells.is_empty())
             || self.rearm.is_some_and(|(at, _)| ramping(at))
-            || self.translated_at.is_some_and(|at| {
-                now.saturating_duration_since(at)
-                    < super::witness::TWIN_MIN + std::time::Duration::from_millis(16)
-            })
+            || self
+                .translated_at
+                .is_some_and(|at| now.saturating_duration_since(at) < TWIN_TRANSLATED_WINDOW_DUR)
             || self.cells.iter().rev().any(|c| ramping(c.attack_at))
             || (!self.reduced
                 && self
@@ -6777,7 +6885,7 @@ impl Ribbon {
         if self.cells.is_empty() || !disp.is_finite() || disp <= 0.0 {
             return None;
         }
-        let wedge = self.wedge_px * disp / DISP_RELEASE_TAU;
+        let wedge = self.wedge_px * disp * (1.0 / DISP_RELEASE_TAU);
         let wave = if self.reduced {
             0.0
         } else {
@@ -6804,9 +6912,22 @@ impl Ribbon {
         }
         let since = |at: Instant| now.saturating_duration_since(at).as_secs_f32();
         let dur = std::time::Duration::from_secs_f32;
+        const RETRACT_FADE_DUR: std::time::Duration = std::time::Duration::from_nanos(
+            (RETRACT_FADE_S as f64 * 1_000_000_000.0).round() as u64,
+        );
+        const RETIRE_MELT_DUR: std::time::Duration = std::time::Duration::from_nanos(
+            (RETIRE_MELT_S as f64 * 1_000_000_000.0).round() as u64,
+        );
+        const FOCUS_EMBER_DUR: std::time::Duration = std::time::Duration::from_nanos(
+            (FOCUS_EMBER_S as f64 * 1_000_000_000.0).round() as u64,
+        );
+        const CURTAIN_DUR: std::time::Duration =
+            std::time::Duration::from_nanos((CURTAIN_S as f64 * 1_000_000_000.0).round() as u64);
         let reduced_fade_s = REDUCED_MOTION_FADE_MS / 1000.0;
         let ember_left = self.ember_at.map(|at| FOCUS_EMBER_S - since(at));
-        let ember_u = self.ember_at.map(|at| clamp01(since(at) / FOCUS_EMBER_S));
+        let ember_u = self
+            .ember_at
+            .map(|at| clamp01(since(at) * (1.0 / FOCUS_EMBER_S)));
         let ember_spend = ember_u.map(spend);
         let mut cached_coh: Option<(u32, Option<&Cohort>)> = None;
         for cell in &self.cells {
@@ -6851,16 +6972,18 @@ impl Ribbon {
             let melt = expiry_melt(u);
             let retract_u = cell
                 .retract_at
-                .map(|at| clamp01(since(at) / RETRACT_FADE_S));
+                .map(|at| clamp01(since(at) * (1.0 / RETRACT_FADE_S)));
             let swoosh_u = coh.and_then(|c| {
                 let idle = c.idle_s(now);
                 if c.phase_at(idle) != Some(Phase::Fading) {
                     return None;
                 }
                 let t0 = c.retract_start() + c.retract_span() * (1.0 - c.drain_rank(cell.col));
-                Some(clamp01((idle - t0) / RETRACT_FADE_S))
+                Some(clamp01((idle - t0) * (1.0 / RETRACT_FADE_S)))
             });
-            let retire_u = cell.retire_at.map(|at| clamp01(since(at) / RETIRE_MELT_S));
+            let retire_u = cell
+                .retire_at
+                .map(|at| clamp01(since(at) * (1.0 / RETIRE_MELT_S)));
             let f_r = retract_u.map_or(1.0, spend);
             let f_s = swoosh_u.map_or(1.0, spend);
             let f_m = retire_u.map_or(1.0, spend);
@@ -6901,10 +7024,10 @@ impl Ribbon {
             }
             if let Some(at) = cell.retract_at {
                 cad.tail_at(at);
-                cad.tail_at(at + dur(RETRACT_FADE_S));
+                cad.tail_at(at + RETRACT_FADE_DUR);
             }
             if let Some(at) = cell.retire_at {
-                cad.tail_at(at + dur(RETIRE_MELT_S));
+                cad.tail_at(at + RETIRE_MELT_DUR);
             }
         }
         for coh in &self.cohorts {
@@ -6929,10 +7052,10 @@ impl Ribbon {
             cad.tail_at(coh.alive_at + dur(coh.retract_start() + coh.retract_span()));
         }
         if let Some(at) = self.ember_at {
-            cad.tail_at(at + dur(FOCUS_EMBER_S));
+            cad.tail_at(at + FOCUS_EMBER_DUR);
         }
         if let Some(at) = self.curtain {
-            cad.tail_at(at + dur(CURTAIN_S));
+            cad.tail_at(at + CURTAIN_DUR);
         }
         cad.take()
     }
@@ -10572,6 +10695,15 @@ mod tests {
                 .count(),
             2
         );
+        let held = rib
+            .cells
+            .iter()
+            .find(|cell| cell.released_at == Some(stamp))
+            .expect("a released identity remains resident");
+        assert!(
+            !rib.partial_custody_valid(held, at(stamp, 20)),
+            "a saved-count collision cannot suppress a genuine revive"
+        );
         let mut accepted = Vec::new();
         rib.restore_releases(&[(rib.cohorts[0].id, Some(stamp))], &mut accepted);
         assert!(
@@ -10592,6 +10724,15 @@ mod tests {
         assert_eq!(
             rib.release_parts[0].cells, 0,
             "the first count can reach zero while another fragment remains"
+        );
+        let held = rib
+            .cells
+            .iter()
+            .find(|cell| cell.released_at == Some(stamp))
+            .expect("the zero-count guard still has a resident fragment");
+        assert!(
+            !rib.partial_custody_valid(held, at(stamp, 20)),
+            "a zero saved count never makes resident custody valid"
         );
         rib.restore_releases(&[(rib.cohorts[0].id, Some(stamp))], &mut accepted);
         assert!(
@@ -10623,6 +10764,65 @@ mod tests {
         );
         assert_eq!(rib.release_parts[0].cells, 2);
         assert!(rib.field_at(2, 14).is_none() && rib.field_at(2, 15).is_none());
+        let now = at(stamp, 300);
+        let held = |rib: &Ribbon| {
+            rib.cells
+                .iter()
+                .find(|cell| cell.col == 14)
+                .copied()
+                .expect("the original cell remains resident")
+        };
+        assert!(
+            rib.partial_custody_valid(&held(&rib), now),
+            "a complete dark release part remains eligible to return"
+        );
+        assert!(
+            !rib.partial_custody_valid(&rib.cells[0], now),
+            "standing unstamped ink is not partial custody"
+        );
+
+        let mut short_lived = rib.clone();
+        let index = short_lived
+            .cells
+            .iter()
+            .position(|cell| cell.col == 14)
+            .unwrap();
+        let since = short_lived.cells[index]
+            .born
+            .max(short_lived.cohorts[0].alive_at);
+        short_lived.cells[index].life_s = now.saturating_duration_since(since).as_secs_f32();
+        assert!(
+            short_lived.partial_custody_valid(
+                &held(&short_lived),
+                now - std::time::Duration::from_millis(1)
+            ),
+            "the cell is eligible immediately before its own expiry"
+        );
+        assert!(
+            !short_lived.partial_custody_valid(&held(&short_lived), now),
+            "the cell's expiry is exclusive even while its cohort stands"
+        );
+
+        let mut retired = rib.clone();
+        retired.cells[index].retire_at = Some(now);
+        assert!(
+            !retired.partial_custody_valid(&held(&retired), now),
+            "a content-retired cell cannot borrow partial custody"
+        );
+
+        let mut whole = rib.clone();
+        let standing: Vec<_> = whole
+            .cells
+            .iter()
+            .filter(|cell| !cell.leaving())
+            .map(|cell| (cell.row, cell.col, cell.born))
+            .collect();
+        assert_eq!(whole.release_cells(&standing, now), 4);
+        assert!(whole.cohorts[0].abandoned && whole.cohorts[0].release_clock.is_some());
+        assert!(
+            !whole.partial_custody_valid(&held(&whole), now),
+            "a whole clear abandons the earlier partial custody too"
+        );
 
         let mut replaced = rib.clone();
         let mut replacement = *replaced
@@ -10646,18 +10846,34 @@ mod tests {
 
         let mut revoked = rib.clone();
         revoked.cohorts[0].revoke_releases(stamp);
+        assert!(
+            revoked.partial_custody_valid(&held(&revoked), now),
+            "an equal pending cutoff preserves its own stamp"
+        );
         revoked.settle_revoked_parts();
         assert_eq!(
             revoked.release_parts.len(),
             1,
             "the revocation cutoff is strictly earlier stamps"
         );
+        assert!(revoked.partial_custody_valid(&held(&revoked), now));
         revoked.cohorts[0].revoke_releases(at(stamp, 1));
+        assert!(
+            !revoked.partial_custody_valid(&held(&revoked), now),
+            "a newer pending cutoff already revokes custody before settlement"
+        );
         revoked.settle_revoked_parts();
+        assert!(!revoked.partial_custody_valid(&held(&revoked), now));
         revoked.restore_releases(&[(cohort, Some(stamp))], &mut accepted);
         assert!(accepted.is_empty() && revoked.release_parts.is_empty());
 
         let mut expired = rib.clone();
+        expired.cells[index].life_s = 100.0;
+        assert!(expired.cohorts[0].leaving_at(at(stamp, 30_000)));
+        assert!(
+            !expired.partial_custody_valid(&held(&expired), at(stamp, 30_000)),
+            "an expired cohort cannot retain even a longer-lived cell's custody"
+        );
         expired.plan(&ctx(at(stamp, 30_000), &c, (2, 16), 0.0));
         assert!(expired.cells.is_empty() && expired.release_parts.is_empty());
         let mut reset = rib.clone();
@@ -11656,78 +11872,73 @@ mod tests {
         }
     }
 
-    /// Every stop of the walk on a dim dark theme keeps a letter's edge pixel
-    /// (the judge's solid share of the text's reading) at four fifths of the
-    /// theme's own contrast over each channel's larger of page and bed, and a
-    /// theme past the dim bar keeps its bed byte for byte. Negative control:
-    /// the bed unheld fails that edge on Solarized Dark.
+    /// looks7 round 2, A DIM PAGE'S BED: on a dim dark theme every stop of
+    /// the walk lays its bed at the page's own luminance (never over it,
+    /// never more than a rounding under it), in its own colour (the walk's
+    /// reds and blues stand well off the page in OKLab), and laid at half
+    /// opacity over the page (a soft edge's middle) keeps three quarters of
+    /// the page's luminance; a theme past the dim bar keeps its bed byte for
+    /// byte. Negative control: the bed held toward black (its forerunner,
+    /// [`dim_edge_held`]) lays a shade under half the page's luminance on
+    /// Solarized Dark (the gallery's maroon-black `#150301`).
     #[test]
-    fn a_dim_theme_s_bed_keeps_the_letters_at_its_edge() {
-        let chmax = |a: u32, b: u32| {
-            let ch = |sh: u32| ((a >> sh) & 0xff).max((b >> sh) & 0xff) << sh;
-            ch(16) | ch(8) | ch(0)
-        };
-        // The text's weakest solid pixel: on the way from the ink to the
-        // page, reading the judge's solid share of the text's own.
-        let edge_ink = |fg: u32, page: u32| {
-            let want = DIM_EDGE_SOLID * contrast(fg, page);
-            let (mut lo, mut hi) = (0.0f32, 1.0f32);
-            for _ in 0..24 {
-                let mid = 0.5 * (lo + hi);
-                if contrast(lerp_rgb(fg, page, mid), page) >= want {
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
-            }
-            lerp_rgb(fg, page, lo)
-        };
-        let walk = |fg: u32, held: bool| -> Vec<u32> {
+    fn a_dim_theme_s_bed_lays_its_hue_at_the_page_s_luminance() {
+        const SOLARIZED_PAGE: u32 = 0x0000_2B36;
+        let stops = |fg: u32, held: &dyn Fn(u32, u32, u32) -> u32, page: u32| -> Vec<u32> {
             (0..64)
                 .map(|i| {
                     let arc = walk_arc_at(i * BED_INK_LUT_LEN / 64);
-                    let bed = bed_ink(arc, bed_luma_budget(fg));
-                    if held {
-                        dim_edge_held(bed, fg, SOLARIZED_PAGE)
-                    } else {
-                        bed
-                    }
+                    held(bed_ink(arc, bed_luma_budget(fg)), fg, page)
                 })
                 .collect()
         };
-        const SOLARIZED_PAGE: u32 = 0x0000_2B36;
         for (fg, page) in [(0x0083_9496, SOLARIZED_PAGE), (0x0085_8585, 0x0011_1318)] {
-            let bar = 0.8 * contrast(fg, page);
-            let ink = edge_ink(fg, page);
-            for i in 0..64 {
-                let arc = walk_arc_at(i * BED_INK_LUT_LEN / 64);
-                let bed = dim_edge_held(bed_ink(arc, bed_luma_budget(fg)), fg, page);
-                let read = contrast(ink, chmax(bed, page));
+            assert!(
+                dim_theme(fg, page),
+                "fixture: {fg:06x} on {page:06x} is dim"
+            );
+            let lp = relative_luminance(page);
+            let beds = stops(fg, &dim_page_bed, page);
+            let mut far = 0.0f32;
+            for (i, &bed) in beds.iter().enumerate() {
+                let l = relative_luminance(bed);
                 assert!(
-                    read >= bar,
-                    "fg {fg:06x} on {page:06x}: stop {i} bed {bed:06x} reads the edge at {read:.2}:1, under {bar:.2}"
+                    l <= lp && l >= 0.95 * lp,
+                    "{fg:06x} on {page:06x}: stop {i} bed {bed:06x} at {l:.4}, the page at {lp:.4}"
                 );
+                let half = over_premul(page, premul_rgb(bed, 128), 128) & 0x00FF_FFFF;
+                let lh = relative_luminance(half);
+                assert!(
+                    lh >= 0.75 * lp,
+                    "{fg:06x} on {page:06x}: stop {i} bed {bed:06x} at half opacity reads {lh:.4}, \
+                     under three quarters of the page's {lp:.4}"
+                );
+                far = far.max(crate::color_math::oklab_distance(bed, page));
             }
+            assert!(
+                far >= 0.08,
+                "{fg:06x} on {page:06x}: the walk lies on the page ({far:.3} OKLab at most)"
+            );
         }
         let fg = 0x00D0_D0D0;
         for i in 0..64 {
             let arc = walk_arc_at(i * BED_INK_LUT_LEN / 64);
             let bed = bed_ink(arc, bed_luma_budget(fg));
             assert_eq!(
-                dim_edge_held(bed, fg, 0x001E_1E1E),
+                dim_page_bed(bed, fg, 0x001E_1E1E),
                 bed,
                 "a bright theme's bed is its own"
             );
         }
-        let (fg, page) = (0x0083_9496, SOLARIZED_PAGE);
-        let ink = edge_ink(fg, page);
-        let unheld = walk(fg, false)
+        let fg = 0x0083_9496;
+        let lp = relative_luminance(SOLARIZED_PAGE);
+        let darkest = stops(fg, &dim_edge_held, SOLARIZED_PAGE)
             .into_iter()
-            .map(|bed| contrast(ink, chmax(bed, page)))
+            .map(relative_luminance)
             .fold(f32::INFINITY, f32::min);
         assert!(
-            unheld < 0.8 * contrast(fg, page),
-            "control: the unheld bed keeps the edge ({unheld:.2}:1), so the hold proves nothing"
+            darkest < 0.5 * lp,
+            "control: the bed held toward black lays no shade ({darkest:.4} on the page's {lp:.4})"
         );
     }
 
@@ -11843,6 +12054,76 @@ mod tests {
                 q.y
             );
         }
+    }
+
+    /// looks7 round 3, THE FLAT RIBBON ON A DIM PAGE: on Solarized Dark the
+    /// flat body lays only its hue at the page's luminance, and its warm half
+    /// is the page's own teal or olive (no rainbow past `jumps`); there it
+    /// lays a soft rail of the rainbow's light in the air below its letters,
+    /// a hairline under the row, in the rail's own inks. The pet's rail is
+    /// unchanged, and on the reference dark page and on paper the flat
+    /// spelling draws none. Negative control: the same run on the reference
+    /// dark page lays none of the rail's inks under the row.
+    #[test]
+    fn the_flat_spelling_lays_a_soft_rail_on_a_dim_page() {
+        let dim = |mut c: Config| {
+            (c.theme_fg, c.theme_bg) = (0x0083_9496, 0x0000_2B36);
+            c
+        };
+        let sol_flat = dim(flat(true, true));
+        assert!(Ribbon::flat_dim(&sol_flat) && Ribbon::rail_drawn(&sol_flat));
+        assert!(
+            !Ribbon::flat_dim(&dim(cfg(true, true))),
+            "the pet keeps its own rail"
+        );
+        assert!(!Ribbon::flat_dim(&flat(true, true)) && !Ribbon::rail_drawn(&flat(true, true)));
+        assert!(
+            !Ribbon::rail_drawn(&flat(false, true)),
+            "paper draws the flat spelling none"
+        );
+        let g = geom();
+        let ch = g.ch as f32;
+        let gap = rail_gap_px(ch);
+        let row_bottom = f32::from(g.origin_y) + 3.0 * ch;
+        let rail_quads = |c: &Config| {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            type_run(&mut rib, t0, 10, 8, c, 0.9);
+            let cx = ctx(at(t0, 8 * 60), c, (2, 18), 0.9);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            {
+                let mut f = sink.frame();
+                rib.emit(&cx, &mut f);
+            }
+            let inks: Vec<u32> = (0..BED_INK_LUT_LEN)
+                .map(|i| rail_ink(walk_arc_at(i)))
+                .collect();
+            sink.under
+                .iter()
+                .filter(|q| f32::from(q.y) >= row_bottom + gap && q.alpha >= 32)
+                .filter(|q| {
+                    let straight =
+                        |sh: u32| (((q.color >> sh) & 0xFF) * 255 / u32::from(q.alpha)).min(255);
+                    let rgb = (straight(16) << 16) | (straight(8) << 8) | straight(0);
+                    inks.iter().any(|&ink| {
+                        [16u32, 8, 0]
+                            .iter()
+                            .all(|&sh| ((ink >> sh) & 0xFF).abs_diff((rgb >> sh) & 0xFF) <= 6)
+                    })
+                })
+                .count()
+        };
+        let lit = rail_quads(&sol_flat);
+        assert!(
+            lit >= 40,
+            "the flat ribbon lays {lit} rail quads under its row on a dim page"
+        );
+        let reference = rail_quads(&flat(true, true));
+        assert_eq!(
+            reference, 0,
+            "control: on the reference dark page the flat ribbon lays {reference} rail quads"
+        );
     }
 
     /// A row of light whose next line holds ink stays inside its own row: no

@@ -803,7 +803,9 @@ pub fn harness_upgrade_work_end_model() -> Model {
     }
 }
 
-/// The login wall (`aterm_agent::harness::upgrade`: `gate_announce`, `next_step`, `announce_asks`, `transcript_login`, `clock_held` and the driver's `login_facts`; `aterm_agent::supervise::policy::turn_end`: `decide_turn_end`'s auth arm and its login hold; both over `aterm_phase`'s wall reader).
+/// The login wall (`aterm_agent::harness::upgrade`: `gate_announce`, `next_step`, `announce_asks`, `transcript_login`, `clock_held` and the driver's `login_facts`; `aterm_agent::supervise::policy::turn_end`: `decide_turn_end`'s auth arm, its login hold and `login_wall_waits`; both over `aterm_phase`'s wall reader).
+///
+/// A roster row's lost login (`rostered`) is signed in by aterm itself (`Renew`, the sign-in ladder; the owner, 2026-10-24: sign-in is autonomous, and no person is asked): the tab types no `/login`, whose browser sign-in only a person could finish (`NoRosterRowSignedInByAPerson`), and is relaunched onto the login the renewal made. `RenewAtLogin` is the roster learning, and the ladder renewing, the row of a login whose `/login` aterm typed before the row was known (the dialog it opened still up), which the relaunch then follows; its guard leaves out the states a mutant already broke a law in (`relooped`, `overrode`), which keeps Buggy=4's space inside the interpreter's budget.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_login_wall_model() -> Model {
@@ -815,7 +817,7 @@ pub fn harness_login_wall_model() -> Model {
             const ClockAtWall = 0;
             const NoSee = 0;
             const NoHold = 0;
-            const WaitOnRoster = 0;
+            const LoginOnRoster = 0;
             const NoFollow = 0;
             const CheckIdle = 0;
             const NoDoneWall = 0;
@@ -867,6 +869,7 @@ pub fn harness_login_wall_model() -> Model {
             var doubled = 0;
             var misled = 0;
             var reasked = 0;
+            var asked = 0;
 
             action Expire when (login == 1 && picker <= 1 && elsewhere == 0) {
                 login = 0;
@@ -952,6 +955,14 @@ pub fn harness_login_wall_model() -> Model {
                 rostered = 1;
                 known = 1;
             }
+            action RenewAtLogin when (
+                rostered == 0 && track == 1 && wall == 1 && picker == 1 && back == 0 &&
+                elsewhere == 0 && left == 0 && done == 0 && relooped == 0 && overrode == 0
+            ) {
+                rostered = 1;
+                known = 1;
+                renewed = 1;
+            }
             action Profiled when (known == 0) {
                 known = 1;
             }
@@ -965,7 +976,7 @@ pub fn harness_login_wall_model() -> Model {
                 ((wall == 1 && track == 0 &&
                     (renewed == 0 || Buggy == 3 || NoFollow == 1) &&
                     (Buggy <= 1 || Buggy > 2) && NoSee == 0 &&
-                    (rostered == 0 || ((Buggy <= 2 || Buggy > 3) && WaitOnRoster == 0)) &&
+                    (rostered == 0 || Buggy == 3 || LoginOnRoster == 1) &&
                     (done == 0 ||
                         ((Buggy <= 2 || Buggy > 3) && NoDoneWall == 0 && GraceHolds == 0)) &&
                     (left == 0 || Buggy == 4 || ReloginOverLeft == 1) &&
@@ -974,6 +985,7 @@ pub fn harness_login_wall_model() -> Model {
                         (Buggy == 4 || Relogin == 1)))
             ) {
                 relooped = if (track == 1) { 1 } else { relooped };
+                asked = if (rostered == 1) { 1 } else { asked };
                 overrode = if (left == 1) { 1 } else { overrode };
                 doubled = if (elsewhere == 0) { doubled } else { 1 };
                 stranded = if (renewed == 1) { 1 } else { stranded };
@@ -1002,9 +1014,8 @@ pub fn harness_login_wall_model() -> Model {
                 told = 1;
             }
             action Rest when (
-                wall == 1 && track == 0 && told == 0 && renewed == 0 &&
-                ((rostered == 1 && (Buggy == 3 || WaitOnRoster == 1)) ||
-                    (done == 1 && (Buggy == 3 || NoDoneWall == 1)))
+                wall == 1 && track == 0 && told == 0 && renewed == 0 && done == 1 &&
+                (Buggy == 3 || NoDoneWall == 1)
             ) {
                 silent = 1;
             }
@@ -1156,6 +1167,7 @@ pub fn harness_login_wall_model() -> Model {
             invariant OneSignInPerLogin: doubled == 0;
             invariant NoSignInAskedOfALoginBack: misled == 0;
             invariant NoSignInAskedOverARenewal: reasked == 0;
+            invariant NoRosterRowSignedInByAPerson: asked == 0;
         }
     }
 }

@@ -20,6 +20,7 @@ aterm-json.workspace = true
 aterm-net.workspace = true
 aterm-uds.workspace = true
 aterm-time.workspace = true
+aterm-types.workspace = true
 aterm-toml.workspace = true
 ring.workspace = true
 zeroize = { version = "1", default-features = false }

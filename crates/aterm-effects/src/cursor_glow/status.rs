@@ -173,10 +173,14 @@ impl AdmissionLog {
             && Self::str_eq(record.reason, CursorGlow::DECLINE_NO_FRESH_HINT)
             && head_preservable
         {
+            const {
+                assert!(ADMISSION_LOG_CAP.is_power_of_two());
+            }
+            const MASK: usize = ADMISSION_LOG_CAP - 1;
             let mut offset = None;
             let mut off = 1;
             while off < ADMISSION_LOG_CAP {
-                let idx = (self.head + off) % ADMISSION_LOG_CAP;
+                let idx = (self.head + off) & MASK;
                 if let Some(r) = &self.records[idx]
                     && matches!(r.phase, AdmissionPhase::Declined)
                     && Self::str_eq(r.reason, CursorGlow::DECLINE_NO_FRESH_HINT)
@@ -189,18 +193,18 @@ impl AdmissionLog {
             if let Some(offset) = offset {
                 let mut step = offset;
                 while step < ADMISSION_LOG_CAP - 1 {
-                    let dst = (self.head + step) % ADMISSION_LOG_CAP;
-                    let src = (self.head + step + 1) % ADMISSION_LOG_CAP;
+                    let dst = (self.head + step) & MASK;
+                    let src = (self.head + step + 1) & MASK;
                     self.records[dst] = self.records[src];
                     step += 1;
                 }
-                let newest = (self.head + ADMISSION_LOG_CAP - 1) % ADMISSION_LOG_CAP;
+                let newest = (self.head + ADMISSION_LOG_CAP - 1) & MASK;
                 self.records[newest] = Some(record);
                 return;
             }
         }
         self.records[self.head] = Some(record);
-        self.head = (self.head + 1) % ADMISSION_LOG_CAP;
+        self.head = (self.head + 1) & (ADMISSION_LOG_CAP - 1);
     }
 
     /// Entries oldest → newest.
@@ -957,6 +961,17 @@ impl TextSpans {
     #[inline]
     pub(super) fn lines(&self) -> impl Iterator<Item = (i32, i32, i32)> + '_ {
         self.rows.iter().flatten().copied()
+    }
+
+    /// A test's probe of up to three lines `(row, first, end)`, each row read.
+    #[cfg(test)]
+    pub(crate) fn of_lines(lines: &[(i32, i32, i32)]) -> Self {
+        let mut s = Self::default();
+        for (i, &line) in lines.iter().take(3).enumerate() {
+            s.rows[i] = Some(line);
+            s.read[i] = Some(line.0);
+        }
+        s
     }
 
     /// Column span `(first, end)` for probed `row`, if present.

@@ -163,8 +163,9 @@ pub(crate) fn push_soft_disc(
         return;
     }
     let inv_rx = 1.0 / rx;
+    let inv_ry = 1.0 / ry;
     for y in y0..y1 {
-        let dy = (y as f32 + 0.5 - cy) / ry;
+        let dy = (y as f32 + 0.5 - cy) * inv_ry;
         let dy2 = dy * dy;
         let rest = 1.0 - dy2;
         if rest <= 0.0 {
@@ -232,19 +233,20 @@ pub(crate) fn push_fx_ramp(
     let ((c0, a0), (c1, a1)) = if left == right || (x0 == x && x1 == x + w) {
         (left, right)
     } else {
+        let inv_w = 1.0 / w as f32;
         let at = |px: i32| -> (u32, u8) {
-            let t = (px - x) as f32 / w as f32;
-            let lerp = |a: u32, b: u32| (a as f32 + (b as f32 - a as f32) * t).round() as u32;
-            let ch = |sh: u32| lerp((left.0 >> sh) & 0xff, (right.0 >> sh) & 0xff).min(255) << sh;
+            let t = (px - x) as f32 * inv_w;
             let color = if left.0 == right.0 {
                 left.0 & 0x00FF_FFFF
             } else {
-                ch(16) | ch(8) | ch(0)
+                lerp_rgb(left.0, right.0, t)
             };
             let alpha = if left.1 == right.1 {
                 left.1
             } else {
-                (lerp(u32::from(left.1), u32::from(right.1)).min(255) as u8).max(1)
+                let a = (f32::from(left.1) + (f32::from(right.1) - f32::from(left.1)) * t).round()
+                    as u32;
+                (a.min(255) as u8).max(1)
             };
             (color, alpha)
         };

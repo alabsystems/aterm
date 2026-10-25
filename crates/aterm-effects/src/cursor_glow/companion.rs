@@ -103,8 +103,31 @@ impl CursorGlow {
     /// the sky draws no star on its body ([`rk::companion::PetShade`]).
     #[inline]
     pub const fn note_pet_body(&mut self, body: Option<(i32, i32, i32, i32)>) {
+        #[cfg(any(test, debug_assertions))]
+        let body = match self.pet_body_pinned {
+            Some(pinned) => Some(pinned),
+            None => body,
+        };
         self.pet_body = body;
         self.v2.note_pet_body(body);
+    }
+
+    /// A test's stand-in pet: every frame's [`Self::note_pet_body`] notes
+    /// `body` (window pixels) in place of the box its pet offered (`None`:
+    /// the offered box), so a host's frames veil the letters under it with
+    /// no pet drawn.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn pin_pet_body(&mut self, body: Option<(i32, i32, i32, i32)>) {
+        self.pet_body_pinned = body;
+    }
+
+    /// The pet's body box the frame's offer noted, window pixels
+    /// ([`Self::note_pet_body`]).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub const fn pet_body_box(&self) -> Option<(i32, i32, i32, i32)> {
+        self.pet_body
     }
 
     /// The pet's body box the sky last drew no star on, window pixels
@@ -195,12 +218,13 @@ impl CursorGlow {
                     _ => {}
                 }
             }
-            // The span reaches a cell past the row's last letter, where its
-            // caret stood when it was typed: a Return's train roots there,
-            // and cut at the letters its root stood alone after the line as
-            // a brown stub (looks6 round 3).
+            // For a dark train the span reaches a cell past the row's last
+            // letter, where its caret stood when it was typed: a Return's
+            // train roots there, and cut at the letters its root stood alone
+            // after the line as a brown stub (looks6 round 3). A paper train
+            // keeps to the letters (`KeepOut::past`).
             if let Some((c0, c1)) = span {
-                rows.push((ox + c0 * cw, ox + (c1 + 1) * cw, y0, y0 + ch));
+                rows.push((ox + c0 * cw, ox + c1 * cw, y0, y0 + ch));
             }
         }
         let icons = self
@@ -208,7 +232,7 @@ impl CursorGlow {
             .iter()
             .map(|&(x0, x1, y0, y1)| (x0 + ox, x1 + ox, y0 + oy, y1 + oy));
         self.v2
-            .note_keep_out((icons, boxes.iter().copied()), rows.iter().copied());
+            .note_keep_out((icons, boxes.iter().copied()), (rows.iter().copied(), cw));
         self.keep_out_scratch = boxes;
         self.keep_rows_scratch = rows;
     }

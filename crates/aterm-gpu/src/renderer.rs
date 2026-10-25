@@ -14067,7 +14067,8 @@ impl GpuRenderer {
     ) -> Option<u32> {
         let (w, h) = win.offscreen.as_ref().map(|o| (o.w, o.h))?;
         self.ensure_present_offscreen(win, w, h);
-        let (glow_count, glow_bbox, extract_first) = if self.enable_bloom {
+        let bloom = self.enable_bloom && fx_gpu::bloom_source_live(input);
+        let (glow_count, glow_bbox, extract_first) = if bloom {
             self.build_bloom_glow(input)
         } else {
             (0, None, 0)
@@ -14151,7 +14152,7 @@ impl GpuRenderer {
         }
         win.offscreen_dirty_since_sync = Some([0, 0, 0, 0]);
         win.present_offscreen_fx = fx;
-        self.enable_bloom.then_some(glow_count)
+        bloom.then_some(glow_count)
     }
 
     #[cfg(wgpu_arm)]

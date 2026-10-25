@@ -14957,6 +14957,7 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
         cursor_effect_style_override,
         cursor_color,
         cursor_fill_override,
+        bloom_gate,
         selection,
         selection_clip,
         selections,
@@ -15041,6 +15042,7 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
     dst.cursor_effect_style_override = *cursor_effect_style_override;
     dst.cursor_color = *cursor_color;
     dst.cursor_fill_override = *cursor_fill_override;
+    dst.bloom_gate = *bloom_gate;
     dst.selection.clone_from(selection);
     dst.selection_clip = *selection_clip;
     dst.selections.clone_from(selections);

@@ -184,7 +184,8 @@ USAGE
       release, 3 a gate could not run (each line names its fix), 130 interrupted
   targo --unverified ship trust run (-p <crate>... | --whole-tree | --remeasure)
         [--jobs N|auto] [--target-root DIR] [--crate-budget SECONDS] [--prover BIN-DIR]
-        [--update-ratchet] [--try-refused] [--obligations] [--stop-if-narrowed]
+        [--update-ratchet] [--try-refused] [--obligations|--no-obligations] [--stop-if-narrowed]
+        [--no-wait]
                            the Trust lane: `targo trust check -p <lib> --lib
                            --allow-l0-gaps` over the named libraries (-p <lib>
                            also selects its <lib>+<feature> rows, one for each
@@ -195,8 +196,12 @@ USAGE
                            own slot (--jobs; default sized from cores and
                            memory) under --target-root (default
                            <repo>/target-trust.noindex, else a per-user cache
-                           directory), is ended OVER-BUDGET at --crate-budget
-                           (default 21600 s), and is held to
+                           directory; one run at a time: another run on it
+                           waits for the one that holds it, naming its pid,
+                           scope, checkout and since when, as the wait starts
+                           and once a minute, and --no-wait is COULD NOT RUN at
+                           once instead, naming it), is ended OVER-BUDGET at
+                           --crate-budget (default 21600 s), and is held to
                            crates/aterm-release/trust/floors.tsv. --prover names
                            another toolchain's bin/ (an absolute path). A
                            whole-tree run on a clean checkout files the facts
@@ -204,8 +209,18 @@ USAGE
                            a run meets and keeps trust/memory.tsv current;
                            --try-refused verifies what this host would refuse for
                            memory; --stop-if-narrowed stops before any check when
-                           memory would narrow the run; --obligations keeps each
-                           check's per-obligation record. Every run also prints
+                           memory would narrow the run. Each check keeps its
+                           per-obligation record (--obligations, the default;
+                           --no-obligations keeps none, and then no floor is
+                           set from a check a backstop stopped) and its pace
+                           (CPU/wall, load). A shortfall is put down to the
+                           machine only in a starved run (CPU/wall under 0.8,
+                           or load above the cores), and only for what a
+                           backstop stopped that the floor's run did not and
+                           the proof checks cancelled beyond that run's count
+                           (trust/backstops.tsv). No floor is set or raised
+                           from a starved run the machine can be credited
+                           with. Every run also prints
                            the D27 gate's proved (calculus) counter from each
                            check's trust.obligations.v1 record (0, and
                            `ungraded`, from a prover that states no grade), held

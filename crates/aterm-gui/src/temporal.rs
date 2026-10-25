@@ -478,6 +478,8 @@ pub(crate) struct TemporalRecorder {
     ends_mid_sequence: bool,
     #[cfg(test)]
     disabled_trigger: Option<RekeyTrigger>,
+    #[cfg(test)]
+    frozen_now: Option<Ticks>,
     epoch: Instant,
     resize_policy: ResizePolicy,
     host_resyncs_alt_screen: bool,
@@ -490,19 +492,11 @@ pub(crate) struct TemporalRecorder {
 }
 
 /// What the live witnesses say of one replayed instant ([`TemporalRecorder::fidelity_at`]); only `Faithful` may be shown as what was on screen.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the Rewind view (R0b) reads it; until then only `fidelity_at` (itself expected \
-                  dead) does, and an `expect` here is unmet on the Linux cell"
-    )
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fidelity {
-    /// The first witness at or after the instant, and every one before it since the instant's keyframe, matched the replay.
+    /// The first witness after the last slice a replay to the instant folds, and every one before it since the instant's keyframe, matched the replay.
     Faithful,
-    /// A witness since the instant's keyframe, up to the first at or after the instant, did not match the replay.
+    /// A witness since the instant's keyframe, up to the first after the last slice the replay folds, did not match the replay.
     Diverged,
     /// No fold has judged every witness that covers the instant yet, or none covers it.
     Unwitnessed,
@@ -512,14 +506,6 @@ pub(crate) enum Fidelity {
 struct Witnessed {
     id: WitnessId,
     seq: Seq,
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the Rewind view (R0b) reads it; until then only `fidelity_at` (itself \
-                      expected dead) does, and an `expect` here is unmet on the Linux cell"
-        )
-    )]
     ts: Ticks,
     state: WitnessState,
 }
@@ -580,6 +566,8 @@ impl TemporalRecorder {
             ends_mid_sequence: false,
             #[cfg(test)]
             disabled_trigger: None,
+            #[cfg(test)]
+            frozen_now: None,
             epoch: Instant::now(),
             resize_policy: ResizePolicy::Native,
             host_resyncs_alt_screen: false,
@@ -618,6 +606,10 @@ impl TemporalRecorder {
     /// The current tick on this recorder's timeline (micros since the epoch).
     #[must_use]
     pub(crate) fn now(&self) -> Ticks {
+        #[cfg(test)]
+        if let Some(frozen) = self.frozen_now {
+            return frozen;
+        }
         Ticks(u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX))
     }
 
@@ -685,7 +677,7 @@ impl TemporalRecorder {
         self.witnesses.get_mut(idx).filter(|w| w.id == id)
     }
 
-    /// Record the verdicts a fold reached ([`ReplayPlan::fold`]); a mismatch in the newest keyframe's chain asks the reader for a live keyframe and keeps the chain from minting one.
+    /// Record the verdicts a fold reached ([`ReplayPlan::fold`]), refunding each judged snapshot to the budget and, in the newest keyframe's chain only, to its rekey count; a mismatch there asks the reader for a live keyframe and keeps the chain from minting one.
     pub(crate) fn judge(&mut self, judged: Judged) {
         let newest = self.keyframes.back().map(|kf| kf.seq);
         for (id, matched) in judged.0 {
@@ -701,13 +693,15 @@ impl TemporalRecorder {
             } else {
                 WitnessState::Diverged
             };
-            let seq = w.seq;
+            let in_newest_chain = newest.is_some_and(|kf| w.seq > kf);
             self.used = self.used.saturating_sub(charge);
-            self.bytes_since_keyframe = self.bytes_since_keyframe.saturating_sub(charge);
+            if in_newest_chain {
+                self.bytes_since_keyframe = self.bytes_since_keyframe.saturating_sub(charge);
+            }
             self.witnessed += 1;
             if !matched {
                 self.diverged += 1;
-                if newest.is_some_and(|kf| seq > kf) {
+                if in_newest_chain {
                     self.chain_diverged = true;
                     self.spine.keyframe_wanted.store(true, Ordering::Release);
                 }
@@ -715,38 +709,58 @@ impl TemporalRecorder {
         }
     }
 
-    /// What the live witnesses say of a replay to `at`, from the verdicts folds have reached so far.
+    /// What the live witnesses say of a replay to `at`, from the verdicts folds have reached so far: the witness that covers it is the first after the last slice the replay folds, whatever its tick.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Rewind view (R0b) reads it")
-    )]
     pub(crate) fn fidelity_at(&self, at: Ticks) -> Fidelity {
         let Some(base) = self.base_keyframe(at) else {
             return Fidelity::Unwitnessed;
         };
-        let end = self
-            .keyframes
-            .iter()
-            .find(|kf| kf.seq > base.seq)
-            .map(|kf| kf.seq);
+        let folded = self.last_folded(base.seq, at);
         let mut verdict = Fidelity::Faithful;
-        for w in self
-            .witnesses
-            .iter()
-            .skip_while(|w| w.seq <= base.seq)
-            .take_while(|w| end.is_none_or(|end| w.seq < end))
-        {
+        for w in self.chain_witnesses(base.seq) {
             match w.state {
                 WitnessState::Diverged => return Fidelity::Diverged,
                 WitnessState::Pending(_) => verdict = Fidelity::Unwitnessed,
                 WitnessState::Matched => {}
             }
-            if w.ts >= at {
+            if w.seq > folded {
                 return verdict;
             }
         }
         Fidelity::Unwitnessed
+    }
+
+    /// The instant of the witness that covers `at` ([`Self::fidelity_at`]), so a fold to it passes every witness `fidelity_at` reads for `at`.
+    #[must_use]
+    pub(crate) fn covering_witness(&self, at: Ticks) -> Option<Ticks> {
+        let base = self.base_keyframe(at)?;
+        let folded = self.last_folded(base.seq, at);
+        self.chain_witnesses(base.seq)
+            .find(|w| w.seq > folded)
+            .map(|w| w.ts)
+    }
+
+    /// The witnesses after keyframe `base` and before the next retained one, in seq order.
+    fn chain_witnesses(&self, base: Seq) -> impl Iterator<Item = &Witnessed> {
+        let end = self
+            .keyframes
+            .iter()
+            .find(|kf| kf.seq > base)
+            .map(|kf| kf.seq);
+        self.witnesses
+            .iter()
+            .skip_while(move |w| w.seq <= base)
+            .take_while(move |w| end.is_none_or(|end| w.seq < end))
+    }
+
+    /// The seq of the last slice or resize after `base` that a replay to `at` folds ([`Self::plan`]), or `base` when it folds none.
+    fn last_folded(&self, base: Seq, at: Ticks) -> Seq {
+        self.log
+            .live_after(base)
+            .take_while(|ev| ev.ts <= at)
+            .filter(|ev| matches!(ev.op, Op::RawIn(_) | Op::Resize { .. }))
+            .last()
+            .map_or(base, |ev| ev.seq)
     }
 
     /// Witnesses a fold has judged (`temporal status` `witnessed=`).
@@ -1109,6 +1123,26 @@ impl TemporalRecorder {
             return None;
         }
         self.plan(at.unwrap_or(latest))
+    }
+
+    /// The distinct instants a Rewind view steps through, oldest first: the oldest keyframe every later instant replays from, then each later slice or resize.
+    #[must_use]
+    pub(crate) fn rewind_instants(&self) -> Vec<Ticks> {
+        if self.spine.break_open() {
+            return Vec::new();
+        }
+        let Some(base) = self.oldest_replayable() else {
+            return Vec::new();
+        };
+        let mut out = vec![base.ts];
+        for ev in self.log.live_after(base.seq) {
+            if matches!(ev.op, Op::RawIn(_) | Op::Resize { .. })
+                && out.last().is_some_and(|last| ev.ts > *last)
+            {
+                out.push(ev.ts);
+            }
+        }
+        out
     }
 
     /// [`Self::replay_plan`], folded in place.
@@ -2557,6 +2591,22 @@ mod tests {
                     Fidelity::Faithful
                 }
             );
+            let at_burst = r
+                .log
+                .live()
+                .filter(|e| matches!(e.op, Op::RawIn(_)))
+                .last()
+                .map(|e| e.ts)
+                .expect("the burst");
+            assert_eq!(
+                r.fidelity_at(at_burst),
+                if live_clock {
+                    Fidelity::Diverged
+                } else {
+                    Fidelity::Unwitnessed
+                },
+                "no witness covers the burst after the last one"
+            );
             assert_eq!(
                 feed(&mut live, &mut r, b"\r\nthree", 3200),
                 [if live_clock { "live-keyframe" } else { "in" }]
@@ -2568,9 +2618,14 @@ mod tests {
         }
     }
 
-    /// A span is faithful only up to the first matched witness at or after it, diverged from a mismatch on, and unwitnessed past the last judged witness or before any.
+    /// An instant is faithful once the first witness after the last slice its replay folds, and every one before it in the chain, matched; diverged from a mismatch on; unwitnessed while that witness is pending, and with no keyframe.
     #[test]
     fn the_fidelity_of_an_instant_is_the_verdict_of_the_witnesses_that_cover_it() {
+        assert_eq!(
+            TemporalRecorder::new().fidelity_at(Ticks(0)),
+            Fidelity::Unwitnessed,
+            "no keyframe"
+        );
         let mut live = Terminal::new(6, 30);
         let mut r = seeded(&live);
         let (tx, rx) = queue(64);
@@ -2586,6 +2641,14 @@ mod tests {
         feed(&mut live, &mut r, b"c", 2000);
         assert_eq!(r.witnesses.len(), 2, "REACH: one witness a second");
         let [first, second] = [r.witnesses[0].ts, r.witnesses[1].ts];
+        let at_c = r
+            .log
+            .live()
+            .filter(|e| matches!(e.op, Op::RawIn(_)))
+            .last()
+            .map(|e| e.ts)
+            .expect("slice c");
+        assert!(first < at_c, "precondition: c follows the first witness");
         assert_eq!(
             r.fidelity_at(before),
             Fidelity::Unwitnessed,
@@ -2603,6 +2666,11 @@ mod tests {
         assert_eq!(r.fidelity_at(first), Fidelity::Faithful);
         assert_eq!(
             r.fidelity_at(Ticks(first.0 + 1)),
+            Fidelity::Faithful,
+            "a replay past the witness that folds no more slices is the screen it saw"
+        );
+        assert_eq!(
+            r.fidelity_at(at_c),
             Fidelity::Unwitnessed,
             "its next witness is pending"
         );
@@ -2622,9 +2690,209 @@ mod tests {
             Fidelity::Faithful,
             "before the mismatch"
         );
+        assert_eq!(r.fidelity_at(at_c), Fidelity::Diverged);
         assert_eq!(r.fidelity_at(second), Fidelity::Diverged);
         assert_eq!(r.fidelity_at(Ticks(second.0 + 1)), Fidelity::Diverged);
         assert!(r.spine_watermark().keyframe_wanted());
+    }
+
+    /// A witness and the slice after it on one tick, as when the writer drains a backlog: a replay to that tick folds the slice, so only the next witness covers it.
+    #[test]
+    fn a_slice_on_its_witness_tick_is_covered_by_the_next_witness() {
+        for poisoned in [false, true] {
+            let mut live = Terminal::new(6, 30);
+            let mut r = seeded(&live);
+            let put = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8], ms| {
+                live.process_at(bytes, clock(ms));
+                r.apply_inline(TemporalMsg::RawIn(InputSlice::at(bytes, clock(ms))));
+            };
+            tick_past(&r, r.latest_tick());
+            put(&mut live, &mut r, b"one", 0);
+            let one = r.latest_tick();
+            tick_past(&r, one);
+            let tie = r.now();
+            r.frozen_now = Some(tie);
+            let seen = live.checkpoint_visible().expect("at ground");
+            r.apply_inline(TemporalMsg::Witness(Arc::new(seen)));
+            put(&mut live, &mut r, b"\r\ntwo", 10);
+            r.frozen_now = None;
+            assert_eq!(
+                (r.witnesses[0].ts, r.latest_tick()),
+                (tie, tie),
+                "precondition: the witness and the slice after it share a tick"
+            );
+            let fold = r.replay_plan(Some(tie)).expect("replay").fold();
+            r.judge(fold.judged);
+            assert_eq!((r.witnessed(), r.diverged()), (1, 0));
+            assert_eq!(r.fidelity_at(one), Fidelity::Faithful);
+            assert_eq!(r.covering_witness(one), Some(tie));
+            assert_eq!(
+                r.fidelity_at(tie),
+                Fidelity::Unwitnessed,
+                "the witness on the tick saw the screen before its slice"
+            );
+            assert_eq!(
+                r.covering_witness(tie),
+                None,
+                "no witness covers the tick yet"
+            );
+
+            tick_past(&r, tie);
+            let mut seen = live.checkpoint_visible().expect("at ground");
+            if poisoned {
+                seen.cols += 1;
+            }
+            r.apply_inline(TemporalMsg::Witness(Arc::new(seen)));
+            assert_eq!(
+                r.fidelity_at(tie),
+                Fidelity::Unwitnessed,
+                "the covering witness is pending"
+            );
+            let to = r.covering_witness(tie);
+            assert_eq!(
+                to,
+                Some(r.witnesses[1].ts),
+                "a view at the tick folds to the next witness for its verdict"
+            );
+            let fold = r.replay_plan(to).expect("replay").fold();
+            r.judge(fold.judged);
+            assert_eq!((r.witnessed(), r.diverged()), (2, u64::from(poisoned)));
+            assert_eq!(
+                r.fidelity_at(tie),
+                if poisoned {
+                    Fidelity::Diverged
+                } else {
+                    Fidelity::Faithful
+                },
+                "poisoned: {poisoned}"
+            );
+        }
+    }
+
+    /// A fold that judges a witness of an older chain refunds its grids from the budget only: the newest chain's byte count, which a rekey is due by, never held them.
+    #[test]
+    fn judging_an_older_chains_witness_leaves_the_newest_chains_bytes() {
+        for live_keyframe in [false, true] {
+            let mut live = Terminal::new(6, 30);
+            let mut r = seeded(&live);
+            let put = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8]| {
+                live.process_at(bytes, clock(0));
+                r.apply_inline(TemporalMsg::RawIn(InputSlice::at(bytes, clock(0))));
+            };
+            put(&mut live, &mut r, b"old chain\r\n");
+            let seen = live.checkpoint_visible().expect("at ground");
+            let charge = charge_of(&seen);
+            r.apply_inline(TemporalMsg::Witness(Arc::new(seen)));
+            let at = r.witnesses[0].ts;
+            tick_past(&r, at);
+            let next = Arc::new(keyframe_of(&live, usize::MAX).expect("at ground"));
+            r.apply_inline(if live_keyframe {
+                TemporalMsg::LiveKeyframe(next)
+            } else {
+                TemporalMsg::Keyframe(next)
+            });
+            let tail = vec![b'.'; 4 * charge];
+            put(&mut live, &mut r, &tail);
+            assert_eq!(r.keyframe_count(), 2, "precondition: no rekey");
+            assert_eq!(r.bytes_since_keyframe, tail.len());
+            let used = r.used;
+
+            let fold = r.replay_plan(Some(at)).expect("replay").fold();
+            r.judge(fold.judged);
+            assert_eq!((r.witnessed(), r.diverged()), (1, 0));
+            assert_eq!(r.used, used - charge, "the witness's grids are refunded");
+            assert_eq!(
+                r.bytes_since_keyframe,
+                tail.len(),
+                "live keyframe: {live_keyframe}"
+            );
+        }
+    }
+
+    /// The first slice at parser ground that brings the output since the last witness to 256 KiB takes one, inside the second; a slice off ground leaves it due.
+    #[test]
+    fn a_witness_is_due_after_256_kib_of_output() {
+        let mut live = Terminal::new(6, 30);
+        let mut r = seeded(&live);
+        let (tx, rx) = queue(64);
+        let mut mark = SpineMark::attach(r.spine_watermark());
+        let mut feed = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8], ms| {
+            slice_at(live, &mut mark, &tx, bytes, clock(ms));
+            drain_named(&rx, r)
+        };
+        assert_eq!(feed(&mut live, &mut r, b"a", 0), ["in"]);
+        let short = vec![b'.'; WITNESS_BYTES - 2];
+        assert_eq!(
+            feed(&mut live, &mut r, &short, 10),
+            ["in"],
+            "one byte short"
+        );
+        assert_eq!(feed(&mut live, &mut r, b".", 20), ["in", "witness"]);
+
+        let open = [&b"\x1b]2;"[..], &vec![b'.'; WITNESS_BYTES]].concat();
+        assert_eq!(feed(&mut live, &mut r, &open, 30), ["in"], "off ground");
+        assert_eq!(feed(&mut live, &mut r, b"\x07", 40), ["in", "witness"]);
+    }
+
+    /// A rekey mints its keyframe with the session's shell nonce, so the signed marks after it replay and the next witness matches.
+    #[test]
+    fn a_rekeyed_keyframe_carries_the_shell_nonce() {
+        let nonce = [0x5Au8; 32];
+        let mut live = Terminal::new(6, 40);
+        live.authorize_shell_integration(nonce);
+        live.set_require_shell_integration_nonce(true);
+        let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
+        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("at ground"));
+        let put = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8]| {
+            live.process_at(bytes, clock(0));
+            r.apply_inline(TemporalMsg::RawIn(InputSlice::at(bytes, clock(0))));
+        };
+        put(&mut live, &mut r, &vec![b'.'; MIN_REKEY_BYTES]);
+        assert_eq!(r.keyframe_count(), 2, "precondition: the burst rekeyed");
+        assert!(
+            r.keyframes
+                .back()
+                .is_some_and(|kf| kf.checkpoint.shell_integration_nonce.is_some())
+        );
+        put(&mut live, &mut r, signed_marks(nonce).as_bytes());
+        assert_eq!(live.command_marks().len(), 1, "precondition");
+        let seen = live.checkpoint_visible().expect("at ground");
+        r.apply_inline(TemporalMsg::Witness(Arc::new(seen)));
+        let fold = r.replay_plan(None).expect("replay").fold();
+        r.judge(fold.judged);
+        assert_eq!((r.witnessed(), r.diverged()), (1, 0));
+    }
+
+    /// The live keyframe a divergence asks for carries the shell nonce, so the signed marks after it replay and the next witness matches.
+    #[test]
+    fn a_live_keyframe_carries_the_shell_nonce() {
+        let nonce = [0x5Au8; 32];
+        let mut live = Terminal::new(6, 40);
+        live.authorize_shell_integration(nonce);
+        live.set_require_shell_integration_nonce(true);
+        let mut r = TemporalRecorder::new();
+        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("at ground"));
+        r.spine_watermark().seed(SpinePre::take(&live));
+        let (tx, rx) = queue(64);
+        let mut mark = SpineMark::attach(r.spine_watermark());
+        r.spine.keyframe_wanted.store(true, Ordering::Release);
+        slice_at(&mut live, &mut mark, &tx, b"x", clock(0));
+        assert_eq!(drain_named(&rx, &mut r), ["live-keyframe"]);
+        let signed = signed_marks(nonce);
+        slice_at(&mut live, &mut mark, &tx, signed.as_bytes(), clock(10));
+        slice_at(&mut live, &mut mark, &tx, b"more", clock(1100));
+        assert_eq!(drain_named(&rx, &mut r), ["in", "in", "witness"]);
+        let fold = r.replay_plan(None).expect("replay").fold();
+        r.judge(fold.judged);
+        assert_eq!((r.witnessed(), r.diverged()), (1, 0));
+    }
+
+    fn signed_marks(nonce: [u8; 32]) -> String {
+        let hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        format!(
+            "\x1b]133;A;id={hex}\x07$ \x1b]133;B;id={hex}\x07ls\r\n\x1b]133;C;id={hex}\x07\
+             out\r\n\x1b]133;D;0;id={hex}\x07"
+        )
     }
 
     /// A replay keyframe carries the session's shell-integration nonce, so its replay accepts the shell's signed marks as the live engine did; a keyframe without it drops them.

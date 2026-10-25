@@ -540,3 +540,193 @@ fn the_app_moves_the_live_edge_only_where_motion_is_allowed() {
     assert_eq!(app.stats_live_deadline(t0), None);
     assert_eq!(app.deck_live(wid), DeckLive::STILL);
 }
+
+/// A frame that moves only the live edge lays the deck out once, for its fingerprint and its
+/// raster both, over the words and the header line the last layout read: it measures no words and
+/// plans no header line. A new reading, a form, a width or a tab of its own reads them again. Every
+/// card is what a layout of its frame from nothing rasters whole, at the live edge it says it
+/// shows, also when that edge moved between the fingerprint's layout and the raster.
+#[cfg(unix)]
+#[test]
+fn a_live_frame_lays_the_deck_out_once_over_what_it_kept() {
+    let _attached = crate::stats_deck::tests::attach_stats();
+    let (mut app, wid) = live_app(Instant::now());
+    // Read at an hour's cadence, the reading stays fresh for the whole test.
+    app.vitals.landed_period = Some(Duration::from_secs(3600));
+    let fit = |app: &mut crate::App| {
+        let (_, cell) = app.win_cell_size(wid);
+        let ws = app.windows.get_mut(&wid).expect("the window");
+        ws.metrics.head = crate::stats_deck::deck_px(
+            crate::stats_deck::StatsBars::Deck,
+            ws.deck_form,
+            ws.scale,
+            cell,
+        );
+    };
+    fit(&mut app);
+    // The frame's fingerprint, then `between`, then its raster.
+    let split = |app: &mut crate::App, between: &dyn Fn(&mut crate::App)| {
+        let was = crate::stats_deck::layout_work();
+        let _ = app.stats_deck_fp(wid);
+        between(app);
+        app.splice_stats_deck(wid);
+        let now = crate::stats_deck::layout_work();
+        [0, 1, 2].map(|i| now[i] - was[i])
+    };
+    let frame = |app: &mut crate::App| split(app, &|_| {});
+    let card = |app: &crate::App| {
+        app.windows[&wid]
+            .deck_card
+            .as_ref()
+            .map(|c| (c.geom, c.rgba.clone()))
+            .expect("a card")
+    };
+    // The card's pixels are a fresh layout's of the frame's inputs, at the live edge the card
+    // records (the next patch's `was`).
+    let whole = |app: &crate::App, at: &str| {
+        let mut f = app.deck_frame(wid).expect("the deck draws");
+        f.live = app.windows[&wid].deck_live_card.get().1;
+        let prims = crate::stats_deck::deck_prims(&f.geom, &app.deck_input(&f));
+        let (rgba, ..) = crate::tray_raster::rasterize_tray(
+            &prims,
+            f.geom.w as u32,
+            f.geom.h as u32,
+            1.0,
+            [0, 0, 0, 0],
+        );
+        assert!(
+            card(app).1 == rgba,
+            "{at}: the card is not what a fresh layout rasters"
+        );
+    };
+    let shows = |app: &crate::App| app.windows[&wid].deck_live_card.get().1;
+    let work = frame(&mut app);
+    whole(&app, "the first frame");
+    assert_eq!(work, [1, 1, 1], "CONTROL: the first frame reads all");
+    let first = card(&app);
+    // The reading's landing forgotten: the marker greys and the strips stand still, and nothing
+    // else the deck draws moved.
+    app.vitals.landed_at = None;
+    let work = frame(&mut app);
+    whole(&app, "a live frame");
+    assert_eq!(shows(&app), DeckLive::STALE);
+    assert_eq!(work, [1, 0, 0], "a live frame reads nothing again");
+    let grey = card(&app);
+    assert_ne!(
+        grey.0, first.0,
+        "CONTROL: the live edge moved the card's key"
+    );
+    assert_ne!(
+        grey.1, first.1,
+        "CONTROL: the live edge moved the card's pixels"
+    );
+    // Under the same reading, what else the layout reads reads the words and the header again.
+    type Change = fn(&mut crate::App, crate::WindowId);
+    let changes: [(&str, Change); 3] = [
+        ("the other form", |app, wid| {
+            let ws = app.windows.get_mut(&wid).expect("the window");
+            ws.deck_form = match ws.deck_form {
+                DeckForm::Full => DeckForm::Folded,
+                DeckForm::Folded => DeckForm::Full,
+            };
+        }),
+        ("a wider window", |app, wid| {
+            app.windows.get_mut(&wid).expect("the window").cols += 40;
+        }),
+        ("a second tab, in front", |app, wid| {
+            let id = app.tab_ids.allocate().expect("a tab id");
+            let ws = app.windows.get_mut(&wid).expect("the window");
+            let mut tab = ws.tab_set.tabs()[0].clone();
+            tab.id = id;
+            ws.tab_set.push(tab).expect("a fresh tab id");
+        }),
+    ];
+    for (at, change) in changes {
+        let was = card(&app);
+        change(&mut app, wid);
+        fit(&mut app);
+        let work = frame(&mut app);
+        whole(&app, at);
+        assert_ne!(card(&app).1, was.1, "CONTROL {at}: the card's pixels moved");
+        assert_eq!(work, [1, 1, 1], "{at} reads all again");
+    }
+    // The live edge moves after the fingerprint laid the deck out: the raster draws that layout
+    // and records its edge, and the next frame patches from there.
+    app.config.motion = Some("reduced".into());
+    app.vitals.landed_at = Some(Instant::now());
+    let work = frame(&mut app);
+    whole(&app, "a still frame");
+    assert_eq!(shows(&app), DeckLive::STILL);
+    assert_eq!(work, [1, 0, 0]);
+    app.config.motion = None;
+    let work = split(&mut app, &|app| app.vitals.landed_at = None);
+    whole(&app, "a frame whose edge moved after its fingerprint");
+    assert!(
+        shows(&app).fresh && shows(&app).glide_ms.is_some(),
+        "the raster draws the fingerprint's gliding edge, not {:?}",
+        shows(&app)
+    );
+    assert_eq!(work, [1, 0, 0]);
+    let work = frame(&mut app);
+    whole(&app, "the frame after it");
+    assert_eq!(shows(&app), DeckLive::STALE);
+    assert_eq!(work, [1, 0, 0]);
+    let mut next = app.vitals.snapshot.as_deref().expect("a reading").clone();
+    next.seq += 1;
+    app.vitals.snapshot = Some(std::sync::Arc::new(next));
+    let work = frame(&mut app);
+    whole(&app, "a new reading");
+    assert_eq!(work, [1, 1, 1], "a new reading reads all again");
+}
+
+/// A deck turned off and on again lays its card out again, so its hits and the live edge it drew
+/// come back with it, even when a layout made for the fingerprint alone (a pointer's hit test)
+/// was never rastered.
+#[cfg(unix)]
+#[test]
+fn a_deck_turned_off_and_on_lays_its_card_out_again() {
+    let _attached = crate::stats_deck::tests::attach_stats();
+    let (mut app, wid) = live_app(Instant::now());
+    app.vitals.landed_period = Some(Duration::from_secs(3600));
+    let (_, cell) = app.win_cell_size(wid);
+    let ws = app.windows.get_mut(&wid).expect("the window");
+    ws.metrics.head = crate::stats_deck::deck_px(
+        crate::stats_deck::StatsBars::Deck,
+        ws.deck_form,
+        ws.scale,
+        cell,
+    );
+    let _ = app.stats_deck_fp(wid);
+    app.splice_stats_deck(wid);
+    // The edge moves and only a hit test lays the deck out for it.
+    app.vitals.landed_at = None;
+    let _ = app.stats_deck_fp(wid);
+    let set = |app: &mut crate::App, bars: &str| {
+        app.config
+            .sys
+            .get_or_insert_with(Default::default)
+            .stats_bars = Some(bars.into());
+    };
+    set(&mut app, "off");
+    let _ = app.stats_deck_fp(wid);
+    app.splice_stats_deck(wid);
+    let ws = &app.windows[&wid];
+    assert!(
+        ws.deck_card.is_none() && ws.stats_hits.borrow().is_empty(),
+        "CONTROL: the deck off holds no card and no hits"
+    );
+    set(&mut app, "deck");
+    let _ = app.stats_deck_fp(wid);
+    app.splice_stats_deck(wid);
+    let ws = &app.windows[&wid];
+    assert!(ws.deck_card.is_some(), "CONTROL: the card is back");
+    assert!(
+        !ws.stats_hits.borrow().is_empty(),
+        "the card's hits are back"
+    );
+    assert_eq!(
+        ws.deck_live_drawn.get(),
+        Some(DeckLive::STALE.key()),
+        "the live edge it drew is known"
+    );
+}

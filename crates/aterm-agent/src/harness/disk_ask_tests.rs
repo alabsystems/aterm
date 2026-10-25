@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Tests for the ask (`disk-free@v1`): the election, one line an episode across hosts, the
-//! hand-off's bounds, the cooldown, the lease file and the line.
+//! hand-off's bounds, the cooldown, the floor an episode is held to, the release of a pick the
+//! seat rule bars, the lease file and the line.
 
 use std::path::PathBuf;
 
@@ -27,14 +28,23 @@ fn seat(sid: &str, held_gib: u64, at_break: bool) -> Seat {
     }
 }
 
+/// The floor [`At::short`] reads the volume short against.
+const FLOOR: u64 = 25 * GIB;
+
+/// The inode line every host reads an emergency below.
+const FILES_FLOOR: u64 = crate::harness::disk::EMERGENCY_FILES_FREE;
+
 /// One host's look at `now`: `seats` are its candidates, every one of them supervised and live.
 struct At<'a> {
     host: &'a HostId,
     level: Level,
     free: u64,
+    floor: u64,
+    files_free: Option<u64>,
     done: Option<Done>,
     seats: Vec<Seat>,
     supervised: Vec<String>,
+    barred: Vec<String>,
     live: Vec<String>,
     dead: Vec<u32>,
 }
@@ -46,12 +56,26 @@ impl<'a> At<'a> {
             host,
             level: Level::Short,
             free: 20 * GIB,
+            floor: FLOOR,
+            files_free: None,
             done: Some(Done::Spent),
             seats,
             supervised: live.clone(),
+            barred: Vec::new(),
             live,
             dead: Vec::new(),
         }
+    }
+
+    /// A look at `free` bytes free, its level judged against its own floor as a host's is.
+    fn reads(&mut self, free: u64) -> &mut Self {
+        self.free = free;
+        self.level = if free < self.floor {
+            Level::Short
+        } else {
+            Level::Ok
+        };
+        self
     }
 
     fn step(&self, lease: &mut Lease, now_ms: i64) -> Said {
@@ -65,9 +89,13 @@ impl<'a> At<'a> {
                 key: KEY,
                 level: self.level,
                 free: self.free,
+                floor: self.floor,
+                files_free: self.files_free,
+                files_floor: FILES_FLOOR,
                 done: self.done,
                 seats: &self.seats,
                 supervised: &self.supervised,
+                barred: &self.barred,
                 live: &self.live,
                 alive: &alive,
             },
@@ -231,7 +259,13 @@ fn the_line_goes_once_then_free_space_rising_settles_the_episode_and_rising_past
     );
     assert_eq!(two.step(&mut lease, t + 190_000), Said::Settled);
     assert_eq!(one.step(&mut lease, t + 240_000), Said::Settled);
-    one.level = Level::Low;
+    one.reads(FLOOR + END_MARGIN - 1);
+    assert_eq!(
+        one.step(&mut lease, t + 270_000),
+        Said::Settled,
+        "back at its floor, but not past it by the margin"
+    );
+    one.reads(FLOOR + END_MARGIN);
     assert_eq!(one.step(&mut lease, t + 300_000), Said::Ended { asks: 1 });
     let e = lease.entry(KEY).expect("entry kept for its cooldown");
     assert_eq!(
@@ -248,6 +282,526 @@ fn the_line_goes_once_then_free_space_rising_settles_the_episode_and_rising_past
             Said::Opened { done: Done::Spent }
         ),
         "the cooldown is over"
+    );
+}
+
+/// What each look of `looks` said, in order: host `h` at `free` bytes free, a minute apart.
+fn said_over(lease: &mut Lease, hosts: &mut [At<'_>], looks: &[(usize, u64)]) -> Vec<Said> {
+    looks
+        .iter()
+        .zip(0i64..)
+        .map(|(&(h, free), i)| hosts[h].reads(free).step(lease, T0 + i * 60_000))
+        .collect()
+}
+
+fn count(said: &[Said], word: &str) -> usize {
+    said.iter().filter(|s| s.word() == word).count()
+}
+
+#[test]
+fn two_hosts_whose_floors_differ_hold_one_episode_open_until_an_election() {
+    let (h1, h2) = (host(1), host(2));
+    let mut high = At::short(&h1, vec![seat("s-a", 2, true)]);
+    high.floor = 48 * GIB;
+    let mut low = At::short(&h2, vec![seat("s-c", 30, true)]);
+    low.floor = 32 * GIB;
+    let mut hosts = [high, low];
+    // 40 GiB free: short against the first host's floor, not against the second's.
+    let looks: Vec<(usize, u64)> = (0..10).map(|i| (i % 2, 40 * GIB)).collect();
+    let mut lease = Lease::default();
+    let said = said_over(&mut lease, &mut hosts, &looks);
+    assert_eq!(count(&said, "opened"), 1, "{said:#?}");
+    assert_eq!(count(&said, "ended"), 0, "{said:#?}");
+    assert!(
+        said.iter().any(|s| matches!(s,
+            Said::Elected { pick, .. } if pick.sid == "s-c" && pick.host == h2)),
+        "the host that does not read it short still nominates, and its session is elected: \
+         {said:#?}"
+    );
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!(
+        e.floor,
+        Some(Floor {
+            host: h1.clone(),
+            bytes: 48 * GIB
+        })
+    );
+    assert!(matches!(&e.phase, Phase::Owed { pick, .. } if pick.sid == "s-c"));
+    let late = T0 + 10 * 60_000;
+    assert!(
+        matches!(
+            hosts[1]
+                .reads(48 * GIB + END_MARGIN - 1)
+                .step(&mut lease, late),
+            Said::Owed { .. }
+        ),
+        "past both floors, but within the margin of the one it is held to"
+    );
+    assert_eq!(
+        hosts[1]
+            .reads(48 * GIB + END_MARGIN)
+            .step(&mut lease, late + 60_000),
+        Said::Ended { asks: 0 },
+        "any host ends it once free space clears the floor it is held to by the margin"
+    );
+    // The defect: each host held the episode to its own floor, so the second ended what the
+    // first opened at every look, inside the round, and nobody was ever elected.
+    let mut flapping = Lease::default();
+    let said = fault::with(fault::Fault::EndAtOwnFloor, || {
+        said_over(&mut flapping, &mut hosts, &looks)
+    });
+    assert_eq!(count(&said, "opened"), 5, "{said:#?}");
+    assert_eq!(count(&said, "ended"), 5, "{said:#?}");
+    assert_eq!(count(&said, "elected"), 0, "{said:#?}");
+}
+
+#[test]
+fn a_lower_floors_episode_is_raised_to_a_higher_one_that_reads_it_short() {
+    let (h1, h2) = (host(1), host(2));
+    let mut high = At::short(&h1, vec![seat("s-a", 2, true)]);
+    high.floor = 48 * GIB;
+    let mut low = At::short(&h2, vec![seat("s-c", 30, true)]);
+    low.floor = 32 * GIB;
+    let mut hosts = [high, low];
+    let mut lease = Lease::default();
+    let said = said_over(
+        &mut lease,
+        &mut hosts,
+        &[(1, 30 * GIB), (0, 30 * GIB), (1, 40 * GIB), (1, 40 * GIB)],
+    );
+    assert!(matches!(said[0], Said::Opened { .. }), "{said:#?}");
+    assert_eq!(count(&said, "ended"), 0, "{said:#?}");
+    assert_eq!(
+        lease.entry(KEY).and_then(|e| e.floor.clone()),
+        Some(Floor {
+            host: h1.clone(),
+            bytes: 48 * GIB
+        }),
+        "the host that read it short against a higher floor holds it there"
+    );
+    hosts[1].dead = vec![1];
+    assert_eq!(
+        hosts[1].reads(40 * GIB).step(&mut lease, T0 + 600_000),
+        Said::Ended { asks: 0 },
+        "a floor whose host ended holds nothing: the looking host's own does"
+    );
+}
+
+#[test]
+fn free_space_hovering_a_gib_either_side_of_the_floor_is_one_episode() {
+    let h1 = host(1);
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true), seat("s-b", 2, true)]);
+    one.floor = 32 * GIB;
+    let mut hosts = [one];
+    let looks: Vec<(usize, u64)> = (0..12)
+        .map(|i| (0, if i % 2 == 0 { 31 * GIB } else { 33 * GIB }))
+        .collect();
+    let mut lease = Lease::default();
+    let said = said_over(&mut lease, &mut hosts, &looks);
+    assert_eq!(count(&said, "opened"), 1, "{said:#?}");
+    assert_eq!(count(&said, "ended"), 0, "{said:#?}");
+    assert_eq!(count(&said, "elected"), 1, "{said:#?}");
+    let mut flapping = Lease::default();
+    let said = fault::with(fault::Fault::EndAtOwnFloor, || {
+        said_over(&mut flapping, &mut hosts, &looks)
+    });
+    assert_eq!(
+        (count(&said, "opened"), count(&said, "ended")),
+        (6, 6),
+        "the defect: with no margin every look above the floor ended it: {said:#?}"
+    );
+}
+
+#[test]
+fn free_inodes_hovering_at_their_line_with_bytes_to_spare_is_one_episode() {
+    let h1 = host(1);
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true), seat("s-b", 2, true)]);
+    one.floor = 32 * GIB;
+    one.free = 200 * GIB;
+    // A build creates and removes small files: free inodes read either side of their line at
+    // each look, with 200 GiB free.
+    let over = |one: &mut At<'_>, lease: &mut Lease| -> Vec<Said> {
+        (0..12i64)
+            .map(|i| {
+                let short = i % 2 == 0;
+                one.files_free = Some(if short {
+                    FILES_FLOOR - 10
+                } else {
+                    FILES_FLOOR + 10
+                });
+                one.level = if short { Level::Emergency } else { Level::Ok };
+                one.done = short.then_some(Done::Inodes);
+                one.step(lease, T0 + i * 60_000)
+            })
+            .collect()
+    };
+    let mut lease = Lease::default();
+    let said = over(&mut one, &mut lease);
+    assert_eq!(count(&said, "opened"), 1, "{said:#?}");
+    assert_eq!(count(&said, "ended"), 0, "{said:#?}");
+    assert_eq!(count(&said, "elected"), 1, "{said:#?}");
+    let said = fault::with(fault::Fault::EndAtHeldFloor, || {
+        over(&mut one, &mut Lease::default())
+    });
+    assert_eq!(
+        (
+            count(&said, "opened"),
+            count(&said, "ended"),
+            count(&said, "elected")
+        ),
+        (6, 6, 0),
+        "the defect: with no inode margin every look past the line ended it: {said:#?}"
+    );
+    one.files_free = Some(FILES_FLOOR + END_FILES_MARGIN - 1);
+    assert!(
+        !matches!(one.step(&mut lease, T0 + 13 * 60_000), Said::Ended { .. }),
+        "past the line, but within the margin of it"
+    );
+    one.files_free = Some(FILES_FLOOR + END_FILES_MARGIN);
+    assert_eq!(
+        one.step(&mut lease, T0 + 14 * 60_000),
+        Said::Ended { asks: 0 }
+    );
+}
+
+#[test]
+fn an_episode_parked_out_or_settled_gives_way_to_a_new_one_after_the_cooldown() {
+    let h1 = host(1);
+    let mut one = At::short(&h1, Vec::new());
+    one.floor = 32 * GIB;
+    let mut lease = Lease::default();
+    // Nobody to ask at 31 GiB: the episode runs out.
+    assert!(matches!(
+        one.reads(31 * GIB).step(&mut lease, T0),
+        Said::Opened { .. }
+    ));
+    assert_eq!(
+        one.step(&mut lease, T0 + NOMINATE_MS),
+        Said::Out { last: None }
+    );
+    // Free space then sits within the margin above the floor for days: ordinary churn.
+    let mut now = T0 + NOMINATE_MS;
+    for gib in [33, 36, 34, 35, 33, 36] {
+        now += 12 * 3_600_000;
+        assert_eq!(one.reads(gib * GIB).step(&mut lease, now), Said::Spent);
+    }
+    // Later builds take it down to an emergency, while sessions sit there to ask.
+    one.seats = vec![seat("s-a", 12, true), seat("s-b", 2, true)];
+    one.supervised = vec!["s-a".to_owned(), "s-b".to_owned()];
+    one.live = one.supervised.clone();
+    let parked = lease.clone();
+    one.reads(3 * GIB).level = Level::Emergency;
+    now += 60_000;
+    let kept = fault::with(fault::Fault::ParkForever, || {
+        one.step(&mut parked.clone(), now)
+    });
+    assert_eq!(
+        kept,
+        Said::Spent,
+        "the defect: an out episode stayed parked, and nobody was asked again"
+    );
+    assert_eq!(
+        one.step(&mut lease, now),
+        Said::Opened { done: Done::Spent },
+        "the parked episode gives way to a new one"
+    );
+    assert_eq!(
+        lease.entry(KEY).and_then(|e| e.floor.clone()),
+        Some(Floor {
+            host: h1.clone(),
+            bytes: 32 * GIB
+        })
+    );
+    let said = one.step(&mut lease, now + NOMINATE_MS);
+    assert!(
+        matches!(&said, Said::Elected { pick, .. } if pick.sid == "s-a"),
+        "{said:?}"
+    );
+    // Settled: the asked session frees space, free stays within the margin above the floor,
+    // then drops below it again.
+    let t = now + NOMINATE_MS + 1_000;
+    assert!(typed(&mut lease, KEY, &h1, "s-a", t, 3 * GIB));
+    one.reads(31 * GIB);
+    assert!(matches!(
+        one.step(&mut lease, t + 60_000),
+        Said::Freed { .. }
+    ));
+    one.reads(32 * GIB + GIB / 2);
+    assert_eq!(one.step(&mut lease, t + 120_000), Said::Settled);
+    one.reads(31 * GIB);
+    assert_eq!(
+        one.step(&mut lease, t + COOLDOWN_MS - 1),
+        Said::Settled,
+        "within the cooldown of its line it stays settled"
+    );
+    let said = one.step(&mut lease, t + 60_000 + COOLDOWN_MS);
+    assert_eq!(said, Said::Opened { done: Done::Spent });
+    let e = lease.entry(KEY).expect("entry");
+    assert!(
+        e.picks.is_empty() && e.asks == 0 && e.last_ask_ms == Some(t),
+        "a new episode, its cooldown kept: {e:?}"
+    );
+    // aterm's own passes may free again: the parked episode waits for them.
+    let mut lease = Lease::default();
+    one.seats.clear();
+    assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+    assert_eq!(
+        one.step(&mut lease, T0 + NOMINATE_MS),
+        Said::Out { last: None }
+    );
+    one.done = None;
+    assert_eq!(
+        one.step(&mut lease, T0 + NOMINATE_MS + COOLDOWN_MS),
+        Said::Spent
+    );
+}
+
+#[test]
+fn a_look_that_steps_an_episode_records_the_floor_it_holds_it_to_short_or_not() {
+    let (h1, h2) = (host(1), host(2));
+    let mut high = At::short(&h1, vec![seat("s-a", 30, true)]);
+    high.floor = 48 * GIB;
+    let mut low = At::short(&h2, vec![seat("s-c", 2, true)]);
+    low.floor = 32 * GIB;
+    let floor = |l: &Lease| l.entry(KEY).and_then(|e| e.floor.clone());
+    let held = |host: &HostId, gib: u64| {
+        Some(Floor {
+            host: host.clone(),
+            bytes: gib * GIB,
+        })
+    };
+    let mut lease = Lease::default();
+    assert!(matches!(
+        low.reads(30 * GIB).step(&mut lease, T0),
+        Said::Opened { .. }
+    ));
+    assert_eq!(floor(&lease), held(&h2, 32));
+    // The lower floor's host ends before the higher one reads the volume short: free space is
+    // past the higher floor, but within its margin, at every look of the higher one.
+    high.dead = vec![2];
+    assert!(matches!(
+        high.reads(50 * GIB).step(&mut lease, T0 + 60_000),
+        Said::Nominating { .. }
+    ));
+    assert_eq!(
+        floor(&lease),
+        held(&h1, 48),
+        "held to the looking host's floor, so the record says so"
+    );
+    let said = high.step(&mut lease, T0 + NOMINATE_MS);
+    assert!(matches!(&said, Said::Elected { pick, .. } if pick.sid == "s-a"));
+    // While the lower one lives, the higher one's look not short raises the record too.
+    let mut lease = Lease::default();
+    high.dead.clear();
+    assert!(matches!(
+        low.reads(30 * GIB).step(&mut lease, T0),
+        Said::Opened { .. }
+    ));
+    assert!(matches!(
+        high.reads(50 * GIB).step(&mut lease, T0 + 60_000),
+        Said::Nominating { .. }
+    ));
+    assert_eq!(floor(&lease), held(&h1, 48));
+    assert!(matches!(
+        low.reads(50 * GIB).step(&mut lease, T0 + 120_000),
+        Said::Nominating { .. }
+    ));
+    assert_eq!(
+        floor(&lease),
+        held(&h1, 48),
+        "a lower floor's look keeps a live host's higher one"
+    );
+}
+
+#[test]
+fn a_lease_written_before_floors_were_recorded_holds_its_episode_to_the_looking_hosts_floor() {
+    let h1 = host(1);
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+    let mut text: Value = aterm_json::from_str(&lease.encode()).expect("json");
+    let entry = text
+        .as_object_mut()
+        .and_then(|o| o.get_mut("volumes"))
+        .and_then(Value::as_array_mut)
+        .and_then(|v| v.get_mut(0))
+        .and_then(Value::as_object_mut)
+        .expect("an entry");
+    assert!(entry.remove("floor").is_some(), "the lease records it now");
+    let mut old = Lease::decode(&aterm_json::to_string(&text).expect("json"));
+    assert_eq!(old.entry(KEY).map(|e| e.floor.clone()), Some(None));
+    assert!(
+        matches!(
+            old.entry(KEY).map(|e| &e.phase),
+            Some(Phase::Nominating { .. })
+        ),
+        "an old lease is read, not dropped"
+    );
+    assert!(matches!(
+        one.reads(FLOOR + END_MARGIN - 1)
+            .step(&mut old, T0 + 60_000),
+        Said::Nominating { .. }
+    ));
+    assert_eq!(
+        one.reads(FLOOR + END_MARGIN).step(&mut old, T0 + 120_000),
+        Said::Ended { asks: 0 }
+    );
+}
+
+#[test]
+fn an_elected_session_whose_task_is_done_before_its_turn_break_is_released_at_the_next_look() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true), seat("s-b", 2, true)]);
+    let mut two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    let said = elected(&mut lease, &one, &two);
+    assert!(
+        matches!(&said, Said::Elected { pick, .. } if pick.sid == "s-a"),
+        "{said:?}"
+    );
+    // Its task turns done: the seat rule drops its seat and bars it.
+    one.seats.retain(|s| s.sid != "s-a");
+    one.barred = vec!["s-a".to_owned()];
+    let at = T0 + NOMINATE_MS + 60_000;
+    let kept = fault::with(fault::Fault::KeepBarred, || {
+        let mut l = lease.clone();
+        (
+            one.step(&mut l, at),
+            one.step(&mut l, T0 + NOMINATE_MS + DELIVER_MS),
+        )
+    });
+    assert!(
+        matches!(
+            kept,
+            (
+                Said::Owed { .. },
+                Said::Handoff {
+                    why: Miss::Undelivered,
+                    ..
+                }
+            )
+        ),
+        "the defect: it stayed owed for the delivery window and then cost an election: {kept:?}"
+    );
+    two.barred = vec!["s-a".to_owned()];
+    assert!(
+        matches!(two.step(&mut lease, at - 1), Said::Owed { .. }),
+        "another host does not release this host's pick"
+    );
+    assert_eq!(
+        one.step(&mut lease, at),
+        Said::Handoff {
+            from: Pick {
+                host: h1.clone(),
+                sid: "s-a".to_owned()
+            },
+            why: Miss::Released
+        }
+    );
+    let e = lease.entry(KEY).expect("entry").clone();
+    assert_eq!(
+        (e.picks.len(), e.released, e.asks),
+        (1, 1, 0),
+        "no election spent"
+    );
+    two.step(&mut lease, at + 1_000);
+    let said = one.step(&mut lease, at + NOMINATE_MS);
+    assert!(
+        matches!(&said, Said::Elected { pick, .. } if pick.sid == "s-c"),
+        "the next best session is elected: {said:?}"
+    );
+}
+
+#[test]
+fn an_elected_session_whose_agent_exited_is_released_though_it_left_supervision() {
+    let h1 = host(1);
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true), seat("s-b", 2, true)]);
+    assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+    assert!(matches!(
+        one.step(&mut lease, T0 + NOMINATE_MS),
+        Said::Elected { pick, .. } if pick.sid == "s-a"
+    ));
+    // Its Claude Code exits with no relaunch: the tab lives on, its task record says exited,
+    // and it is no longer on the supervised roster.
+    one.seats.retain(|s| s.sid != "s-a");
+    one.supervised.retain(|s| s != "s-a");
+    one.barred = vec!["s-a".to_owned()];
+    let at = T0 + NOMINATE_MS + 60_000;
+    let gone_first = fault::with(fault::Fault::GoneFirst, || one.step(&mut lease.clone(), at));
+    assert!(
+        matches!(
+            gone_first,
+            Said::Handoff {
+                why: Miss::Undelivered,
+                ..
+            }
+        ),
+        "the defect: an exited pick cost an election: {gone_first:?}"
+    );
+    assert!(matches!(
+        one.step(&mut lease, at),
+        Said::Handoff {
+            why: Miss::Released,
+            ..
+        }
+    ));
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!((e.picks.len(), e.released), (1, 1), "no election spent");
+    // A pick that left supervision with nothing barring it (its Autopilot turned Off) is still
+    // handed off as undelivered.
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true), seat("s-b", 2, true)]);
+    one.step(&mut lease, T0);
+    one.step(&mut lease, T0 + NOMINATE_MS);
+    one.supervised.retain(|s| s != "s-a");
+    assert!(matches!(
+        one.step(&mut lease, at),
+        Said::Handoff {
+            why: Miss::Undelivered,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_turn_break_releases_a_line_the_seat_rule_bars_and_claims_one_it_admits() {
+    let h1 = host(1);
+    let mut lease = Lease::default();
+    let one = At::short(&h1, vec![seat("s-a", 12, true), seat("s-b", 2, true)]);
+    assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+    assert!(matches!(
+        one.step(&mut lease, T0 + NOMINATE_MS),
+        Said::Elected { .. }
+    ));
+    let at = T0 + NOMINATE_MS + 1_000;
+    let blind = fault::with(fault::Fault::TypeBarred, || {
+        at_break(&mut lease.clone(), KEY, &h1, "s-a", at, true)
+    });
+    assert_eq!(
+        blind,
+        Break::Yours,
+        "the defect: a barred session was claimed"
+    );
+    assert_eq!(
+        at_break(&mut lease.clone(), KEY, &h1, "s-a", at, false),
+        Break::Yours
+    );
+    assert_eq!(
+        at_break(&mut lease.clone(), KEY, &h1, "s-b", at, false),
+        Break::Gone
+    );
+    assert!(matches!(
+        at_break(&mut lease, KEY, &h1, "s-a", at, true),
+        Break::Released(Said::Handoff {
+            why: Miss::Released,
+            ..
+        })
+    ));
+    assert_eq!(
+        at_break(&mut lease, KEY, &h1, "s-a", at + 1, true),
+        Break::Gone,
+        "released once"
     );
 }
 
@@ -530,12 +1084,19 @@ fn an_owed_pick_whose_session_left_its_hosts_supervision_is_handed_off_at_once()
     assert!(
         matches!(
             two.step(&mut lease, T0 + NOMINATE_MS + 120_000),
+            Said::Owed { .. }
+        ),
+        "its host ended, but a successor may yet adopt it"
+    );
+    assert!(
+        matches!(
+            two.step(&mut lease, T0 + NOMINATE_MS + 120_000 + ADOPT_MS),
             Said::Handoff {
                 why: Miss::Undelivered,
                 ..
             }
         ),
-        "its host ended before the line"
+        "its host ended before the line, and nobody adopted it"
     );
 }
 
@@ -567,6 +1128,518 @@ fn an_asked_session_that_ends_hands_off_and_a_claim_holds_the_pick_while_it_is_t
             ..
         }
     ));
+}
+
+#[test]
+fn a_successor_that_supervises_a_pick_whose_host_ended_adopts_it_owed_or_asked() {
+    let (h1, h2, h3) = (host(1), host(2), host(3));
+    let mut lease = Lease::default();
+    let one = At::short(&h1, vec![seat("s-a", 12, true), seat("s-b", 2, true)]);
+    let two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    elected(&mut lease, &one, &two);
+    let mut successor = At::short(&h3, vec![seat("s-a", 12, true), seat("s-b", 2, true)]);
+    successor.dead = vec![1];
+    let t = T0 + NOMINATE_MS + 60_000;
+    let adopted = Pick {
+        host: h3.clone(),
+        sid: "s-a".to_owned(),
+    };
+    assert_eq!(
+        successor.step(&mut lease, t),
+        Said::Owed {
+            pick: adopted.clone(),
+            until_ms: T0 + NOMINATE_MS + DELIVER_MS
+        },
+        "a seamless update's successor adopts its session's pick, not hands it off"
+    );
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!(
+        (e.picks.as_slice(), e.asks),
+        ([adopted.clone()].as_slice(), 0)
+    );
+    assert_eq!(claim(&mut lease, KEY, &h1, "s-a", t + 1), Claim::Gone);
+    assert_eq!(claim(&mut lease, KEY, &h3, "s-a", t + 1), Claim::Yours);
+    assert!(typed(&mut lease, KEY, &h3, "s-a", t + 2, 20 * GIB));
+    // Its successor in turn ends: the next one judges the asked session's answer.
+    let h4 = host(4);
+    let mut next = At::short(&h4, vec![seat("s-a", 12, true)]);
+    next.dead = vec![1, 3];
+    assert!(matches!(
+        next.step(&mut lease, t + 60_000),
+        Said::Asked { pick, .. } if pick.host == h4
+    ));
+    next.live.clear();
+    next.supervised.clear();
+    next.seats.clear();
+    assert!(
+        matches!(
+            next.step(&mut lease, t + 120_000),
+            Said::Handoff {
+                why: Miss::Ended,
+                ..
+            }
+        ),
+        "the host that adopted it sees it end"
+    );
+    // A host that does not supervise the session cannot adopt it: its host ended, so it is
+    // handed off once a successor has had the adoption window to look.
+    let mut lease = Lease::default();
+    elected(&mut lease, &one, &two);
+    let mut other = At::short(&h2, vec![seat("s-c", 3, true)]);
+    other.dead = vec![1];
+    assert!(matches!(other.step(&mut lease, t), Said::Owed { .. }));
+    assert!(matches!(
+        other.step(&mut lease, t + ADOPT_MS),
+        Said::Handoff {
+            why: Miss::Undelivered,
+            ..
+        }
+    ));
+    // Nor is a pick whose host still runs adopted by another host holding the same sid.
+    let mut lease = Lease::default();
+    elected(&mut lease, &one, &two);
+    let twin = At::short(&h3, vec![seat("s-a", 12, true)]);
+    assert!(matches!(
+        twin.step(&mut lease, t),
+        Said::Owed { pick, .. } if pick.host == h1
+    ));
+    assert_eq!(
+        fault::with(fault::Fault::NoAdopt, || {
+            let mut lease = Lease::default();
+            elected(&mut lease, &one, &two);
+            successor.step(&mut lease, t);
+            successor.step(&mut lease, t + ADOPT_MS)
+        }),
+        Said::Handoff {
+            from: Pick {
+                host: h1.clone(),
+                sid: "s-a".to_owned()
+            },
+            why: Miss::Undelivered
+        },
+        "the planted defect the conformance control arms"
+    );
+}
+
+#[test]
+fn another_hosts_look_leaves_an_ended_hosts_pick_owed_until_its_successor_adopts_it() {
+    let (h1, h2, h3) = (host(1), host(2), host(3));
+    let mut lease = Lease::default();
+    let one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    let two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    elected(&mut lease, &one, &two);
+    // The first host is replaced by a seamless update; the second host's looks come first.
+    let mut other = At::short(&h2, vec![seat("s-c", 3, true)]);
+    other.dead = vec![1];
+    let ended = T0 + NOMINATE_MS + 30_000;
+    assert!(
+        matches!(other.step(&mut lease, ended), Said::Owed { pick, .. } if pick.host == h1),
+        "the session may still run under a successor that has not looked yet"
+    );
+    assert!(
+        matches!(
+            phase(&lease),
+            Phase::Owed { orphan_ms: Some(at), .. } if *at == ended
+        ),
+        "{:?}",
+        phase(&lease)
+    );
+    assert!(matches!(
+        other.step(&mut lease, ended + ADOPT_MS - 1),
+        Said::Owed { .. }
+    ));
+    assert!(
+        why_lines(&lease, &[], ended)
+            .iter()
+            .any(|l| l.contains("read ended")),
+        "{:?}",
+        why_lines(&lease, &[], ended)
+    );
+    let mut successor = At::short(&h3, vec![seat("s-a", 12, true)]);
+    successor.dead = vec![1];
+    let adopted = Pick {
+        host: h3.clone(),
+        sid: "s-a".to_owned(),
+    };
+    assert_eq!(
+        successor.step(&mut lease, ended + ADOPT_MS - 1),
+        Said::Owed {
+            pick: adopted.clone(),
+            until_ms: T0 + NOMINATE_MS + DELIVER_MS
+        }
+    );
+    assert!(
+        matches!(
+            phase(&lease),
+            Phase::Owed {
+                orphan_ms: None,
+                ..
+            }
+        ),
+        "adopted: its host runs"
+    );
+    assert!(
+        matches!(other.step(&mut lease, ended + 2 * ADOPT_MS), Said::Owed { pick, .. } if pick == adopted),
+        "a pick its successor adopted is no other host's to hand on"
+    );
+    assert_eq!(
+        lease.entry(KEY).map(|e| e.picks.clone()),
+        Some(vec![adopted])
+    );
+    // A pick whose host is read ended and then running again (a misread) is owed afresh.
+    let mut lease = Lease::default();
+    elected(&mut lease, &one, &two);
+    other.step(&mut lease, ended);
+    two.step(&mut lease, ended + 60_000);
+    assert!(matches!(
+        phase(&lease),
+        Phase::Owed {
+            orphan_ms: None,
+            ..
+        }
+    ));
+    assert!(matches!(
+        other.step(&mut lease, ended + ADOPT_MS),
+        Said::Owed { .. }
+    ));
+    assert_eq!(
+        fault::with(fault::Fault::OrphanAtOnce, || {
+            let mut lease = Lease::default();
+            elected(&mut lease, &one, &two);
+            other.step(&mut lease, ended)
+        }),
+        Said::Handoff {
+            from: Pick {
+                host: h1.clone(),
+                sid: "s-a".to_owned()
+            },
+            why: Miss::Undelivered
+        },
+        "the planted defect the conformance control arms"
+    );
+}
+
+#[test]
+fn a_late_record_that_spends_the_episodes_lines_withdraws_a_pick_elected_since() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let one = At::short(&h1, vec![seat("s-a", 12, true), seat("s-b", 6, true)]);
+    let two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    // A is asked and frees nothing; B is elected and its line goes, but its record is lost; the
+    // second host hands B off at its deadline and elects C before B's host looks again.
+    elected(&mut lease, &one, &two);
+    let t = T0 + NOMINATE_MS + 1_000;
+    assert_eq!(claim(&mut lease, KEY, &h1, "s-a", t), Claim::Yours);
+    assert!(typed(&mut lease, KEY, &h1, "s-a", t, 20 * GIB));
+    assert!(matches!(
+        one.step(&mut lease, t + ANSWER_MS),
+        Said::Handoff {
+            why: Miss::NothingFreed,
+            ..
+        }
+    ));
+    let round = t + ANSWER_MS + NOMINATE_MS;
+    one.step(&mut lease, round - 1_000);
+    assert!(matches!(
+        one.step(&mut lease, round),
+        Said::Elected { pick, .. } if pick.sid == "s-b"
+    ));
+    let at = round + DELIVER_MS - 60_000;
+    let handed = round + DELIVER_MS;
+    assert!(matches!(
+        two.step(&mut lease, handed),
+        Said::Handoff {
+            why: Miss::Undelivered,
+            ..
+        }
+    ));
+    two.step(&mut lease, handed + 60_000);
+    assert!(matches!(
+        two.step(&mut lease, handed + NOMINATE_MS),
+        Said::Elected { pick, .. } if pick.sid == "s-c"
+    ));
+    let mut late = lease.clone();
+    assert!(typed_unrecorded(&mut lease, KEY, &h1, "s-b", at, 21 * GIB));
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!(
+        (e.asks, e.asked.as_slice()),
+        (2, ["s-a".to_owned(), "s-b".to_owned()].as_slice())
+    );
+    assert_eq!(
+        e.phase,
+        Phase::Asked {
+            pick: Pick {
+                host: h1.clone(),
+                sid: "s-b".to_owned()
+            },
+            typed_ms: at,
+            until_ms: at + ANSWER_MS,
+            free_at: 21 * GIB,
+            best_free: 21 * GIB
+        },
+        "B's line is the episode's second: C is withdrawn, and B's answer awaited"
+    );
+    assert_eq!(
+        claim(&mut lease, KEY, &h2, "s-c", handed + NOMINATE_MS + 1_000),
+        Claim::Gone,
+        "no third line"
+    );
+    assert_eq!(
+        one.step(&mut lease, at + ANSWER_MS),
+        Said::Out {
+            last: Some(Miss::NothingFreed)
+        }
+    );
+    // The planted defect the conformance control arms: C stays owed, and takes a third line.
+    fault::with(fault::Fault::OwedPastTwo, || {
+        assert!(typed_unrecorded(&mut late, KEY, &h1, "s-b", at, 21 * GIB));
+    });
+    assert_eq!(
+        claim(&mut late, KEY, &h2, "s-c", handed + NOMINATE_MS + 1_000),
+        Claim::Yours
+    );
+}
+
+#[test]
+fn a_late_record_after_a_later_pick_was_handed_off_waits_on_its_answer() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    let mut two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    elected(&mut lease, &one, &two);
+    let at = T0 + NOMINATE_MS + DELIVER_MS - 60_000;
+    let handed = T0 + NOMINATE_MS + DELIVER_MS;
+    two.step(&mut lease, handed);
+    two.step(&mut lease, handed + 60_000);
+    assert!(matches!(
+        two.step(&mut lease, handed + NOMINATE_MS),
+        Said::Elected { pick, .. } if pick.sid == "s-c"
+    ));
+    // C may not be asked: its host releases it, at no election's cost, and nobody else is there.
+    two.barred = vec!["s-c".to_owned()];
+    assert!(matches!(
+        two.step(&mut lease, handed + NOMINATE_MS + 60_000),
+        Said::Handoff {
+            why: Miss::Released,
+            ..
+        }
+    ));
+    assert!(typed_unrecorded(&mut lease, KEY, &h1, "s-a", at, 20 * GIB));
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!(
+        (e.asks, e.released),
+        (1, 1),
+        "C's release is C's: it stands"
+    );
+    assert!(
+        matches!(&e.phase, Phase::Asked { pick, .. } if pick.sid == "s-a"),
+        "no line went since A's hand-off: A's answer is awaited before anyone else is elected: {:?}",
+        e.phase
+    );
+}
+
+#[test]
+fn a_lost_record_is_counted_after_its_pick_was_handed_off_and_waits_on_its_answer_again() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    let two = At::short(&h2, vec![seat("s-c", 3, true), seat("s-d", 1, true)]);
+    elected(&mut lease, &one, &two);
+    // A's line went just before its deadline; its record (and its claim) never reached the lease.
+    let at = T0 + NOMINATE_MS + DELIVER_MS - 60_000;
+    assert!(matches!(
+        two.step(&mut lease, T0 + NOMINATE_MS + DELIVER_MS),
+        Said::Handoff {
+            why: Miss::Undelivered,
+            ..
+        }
+    ));
+    assert!(typed_unrecorded(&mut lease, KEY, &h1, "s-a", at, 20 * GIB));
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!(
+        (e.asks, e.asked.as_slice(), e.last_ask_ms),
+        (1, ["s-a".to_owned()].as_slice(), Some(at)),
+        "the line counts as one of the episode's two"
+    );
+    assert_eq!(
+        e.phase,
+        Phase::Asked {
+            pick: Pick {
+                host: h1.clone(),
+                sid: "s-a".to_owned()
+            },
+            typed_ms: at,
+            until_ms: at + ANSWER_MS,
+            free_at: 20 * GIB,
+            best_free: 20 * GIB
+        },
+        "nobody was elected since its hand-off: the episode waits on its answer"
+    );
+    assert!(
+        !typed_unrecorded(&mut lease, KEY, &h1, "s-a", at, 20 * GIB),
+        "counted once"
+    );
+    // A frees nothing: one other session is asked, then the episode is out at two lines.
+    assert!(matches!(
+        one.step(&mut lease, at + ANSWER_MS),
+        Said::Handoff {
+            why: Miss::NothingFreed,
+            ..
+        }
+    ));
+    two.step(&mut lease, at + ANSWER_MS + 1_000);
+    assert!(matches!(
+        two.step(&mut lease, at + ANSWER_MS + NOMINATE_MS + 1_000),
+        Said::Elected { pick, .. } if pick.sid == "s-c"
+    ));
+    let t = at + ANSWER_MS + NOMINATE_MS + 2_000;
+    assert_eq!(claim(&mut lease, KEY, &h2, "s-c", t), Claim::Yours);
+    assert!(typed(&mut lease, KEY, &h2, "s-c", t, 20 * GIB));
+    assert_eq!(
+        two.step(&mut lease, t + ANSWER_MS),
+        Said::Out {
+            last: Some(Miss::NothingFreed)
+        },
+        "two lines went: nobody else is asked"
+    );
+}
+
+#[test]
+fn a_lost_record_counts_though_another_was_elected_or_a_later_line_went() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    let two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    elected(&mut lease, &one, &two);
+    let at = T0 + NOMINATE_MS + DELIVER_MS - 60_000;
+    two.step(&mut lease, T0 + NOMINATE_MS + DELIVER_MS);
+    two.step(&mut lease, T0 + NOMINATE_MS + DELIVER_MS + 1_000);
+    let elected_c = T0 + 2 * NOMINATE_MS + DELIVER_MS + 1_000;
+    assert!(matches!(
+        two.step(&mut lease, elected_c),
+        Said::Elected { pick, .. } if pick.sid == "s-c"
+    ));
+    assert!(typed(
+        &mut lease,
+        KEY,
+        &h2,
+        "s-c",
+        elected_c + 1_000,
+        20 * GIB
+    ));
+    assert!(
+        typed_unrecorded(&mut lease, KEY, &h1, "s-a", at, 20 * GIB),
+        "a later line hides no line the episode has not counted"
+    );
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!(
+        (e.asks, e.asked.len(), e.last_ask_ms),
+        (2, 2, Some(elected_c + 1_000)),
+        "both lines count, and the cooldown runs from the later"
+    );
+    assert!(
+        matches!(&e.phase, Phase::Asked { pick, .. } if pick.sid == "s-c"),
+        "C was elected after A's hand-off, so C's answer is the one awaited: {:?}",
+        e.phase
+    );
+}
+
+#[test]
+fn a_lost_record_undoes_a_release_its_own_host_made_before_recording_it() {
+    let h1 = host(1);
+    let mut lease = Lease::default();
+    let one = At::short(&h1, vec![seat("s-a", 12, true), seat("s-b", 2, true)]);
+    assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+    one.step(&mut lease, T0 + NOMINATE_MS);
+    let at = T0 + NOMINATE_MS + 10_000;
+    assert!(release(&mut lease, KEY, &h1, "s-a", at + 5_000).is_some());
+    assert_eq!(lease.entry(KEY).expect("entry").released, 1);
+    assert!(typed_unrecorded(&mut lease, KEY, &h1, "s-a", at, 20 * GIB));
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!(
+        (e.released, e.asks),
+        (0, 1),
+        "its line went: it was no release"
+    );
+    assert!(matches!(&e.phase, Phase::Asked { pick, .. } if pick.sid == "s-a"));
+}
+
+#[test]
+fn a_lost_record_of_an_earlier_episode_counts_for_the_cooldown_alone() {
+    let h1 = host(1);
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+    one.step(&mut lease, T0 + NOMINATE_MS);
+    let at = T0 + NOMINATE_MS + 10_000;
+    // The line went unrecorded; the episode ended and, once its cooldown was over, a new one
+    // elected the same session before its host recorded the old line.
+    one.reads(100 * GIB);
+    assert!(matches!(
+        one.step(&mut lease, at + 1_000),
+        Said::Ended { .. }
+    ));
+    one.reads(20 * GIB);
+    let later = at + COOLDOWN_MS;
+    assert!(matches!(one.step(&mut lease, later), Said::Opened { .. }));
+    one.step(&mut lease, later + NOMINATE_MS);
+    assert!(typed_unrecorded(&mut lease, KEY, &h1, "s-a", at, 20 * GIB));
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!(e.last_ask_ms, Some(at));
+    assert_eq!(
+        e.asks, 0,
+        "a line before the episode opened is none of its lines"
+    );
+}
+
+#[test]
+fn a_hosts_start_is_judged_in_its_own_spelling_with_no_child_for_a_boot_clock_one() {
+    let boot = format!("{BOOT_START}12345");
+    assert!(
+        alive_in(
+            &boot,
+            || Some(boot.clone()),
+            || panic!("no ps for a boot-clock start")
+        ),
+        "the same boot-clock start: the same process, whatever the wall clock did"
+    );
+    assert!(!alive_in(
+        &boot,
+        || Some(format!("{BOOT_START}999")),
+        || panic!("no ps for a boot-clock start")
+    ));
+    assert!(!alive_in(
+        &boot,
+        || None,
+        || panic!("no ps for a boot-clock start")
+    ));
+    let lstart = "Sat Oct 24 10:00:00 2026";
+    assert!(
+        alive_in(
+            lstart,
+            || panic!("no boot read for an older spelling"),
+            || true
+        ),
+        "a lease an older build wrote: its live host is judged by that spelling"
+    );
+    assert!(!alive_in(lstart, || None, || false));
+    assert!(alive_in("", || None, || false), "unsaid: read as running");
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn on_linux_a_host_is_named_by_its_boot_clock_start() {
+    let this = HostId::this();
+    assert!(this.start.starts_with(BOOT_START), "{this:?}");
+    assert!(this.alive());
+    assert!(
+        !HostId {
+            start: format!("{BOOT_START}1"),
+            ..this.clone()
+        }
+        .alive(),
+        "another start of this pid is no one's host"
+    );
 }
 
 #[test]
@@ -685,6 +1758,27 @@ fn the_line_names_the_volume_the_holders_and_the_rule_within_its_cap() {
     assert!(text.contains("Only this tab was asked."), "{text}");
     assert!(text.chars().count() <= LINE_CAP, "{}", text.chars().count());
     assert!(!text.contains('\n'));
+}
+
+#[test]
+fn a_line_owed_while_the_episode_is_held_past_its_floor_says_how_near_it_is() {
+    let text = line(&Line {
+        mount: Path::new("/"),
+        total: 1000 * GIB,
+        free: 50 * GIB,
+        floor: 48 * GIB,
+        emergency: false,
+        done: Done::Spent,
+        holders: &[],
+        checkout: None,
+        home: None,
+    });
+    assert!(
+        text.contains("50.0 GiB free, within 5.0 GiB of its 48.0 GiB floor"),
+        "{text}"
+    );
+    assert!(!text.contains("below"), "{text}");
+    assert!(text.chars().count() <= LINE_CAP, "{}", text.chars().count());
 }
 
 #[test]

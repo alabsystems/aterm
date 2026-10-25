@@ -11,6 +11,7 @@ use crate::{App, VisibleContentRoute, WindowId};
 pub(crate) enum ChromeStep {
     PaneOverlay,
     FindBar,
+    RewindBand,
     SettingsPanel,
     BuildBadge,
     RouteCard,
@@ -29,12 +30,20 @@ impl ChromeStep {
         use ChromeStep::*;
         let (before, after): (&'static [ChromeStep], &'static [ChromeStep]) = match route {
             VisibleContentRoute::Terminal { .. } => (
-                &[PaneOverlay, FindBar, SettingsPanel, BuildBadge, StatsDeck],
+                &[
+                    PaneOverlay,
+                    FindBar,
+                    RewindBand,
+                    SettingsPanel,
+                    BuildBadge,
+                    StatsDeck,
+                ],
                 &[Wallpaper],
             ),
-            VisibleContentRoute::Native { .. } | VisibleContentRoute::Heterogeneous => {
-                (&[FindBar, BuildBadge, RouteCard, StatsDeck], &[])
-            }
+            VisibleContentRoute::Native { .. } | VisibleContentRoute::Heterogeneous => (
+                &[FindBar, RewindBand, BuildBadge, RouteCard, StatsDeck],
+                &[],
+            ),
         };
         before
             .iter()
@@ -78,6 +87,7 @@ impl App {
             match step {
                 ChromeStep::PaneOverlay => self.splice_pane_overlay(wid),
                 ChromeStep::FindBar => self.splice_find_bar(wid),
+                ChromeStep::RewindBand => self.splice_rewind_band(wid),
                 ChromeStep::SettingsPanel => self.splice_settings_panel(wid),
                 ChromeStep::BuildBadge => self.splice_build_badge(wid),
                 ChromeStep::RouteCard => {

@@ -82,6 +82,8 @@ mod restore_take_live_headless;
 #[cfg(unix)]
 mod retired_hook_shape;
 #[cfg(unix)]
+mod rewind_live_headless;
+#[cfg(unix)]
 mod selector_live_headless;
 #[cfg(unix)]
 mod session0_before_loop_live_headless;

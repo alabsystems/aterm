@@ -518,8 +518,9 @@ impl ToneModel {
             z += *o;
         }
         if z > 0.0 {
+            let inv_z = 1.0 / z;
             for o in &mut out {
-                *o /= z;
+                *o *= inv_z;
             }
         }
         Some(out)

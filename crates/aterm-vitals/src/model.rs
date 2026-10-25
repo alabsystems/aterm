@@ -60,7 +60,8 @@ pub struct ProcSample {
     pub at_ns: Option<u64>,
     /// macOS resource coalition ID (read on split ticks only).
     pub coalition: Option<u64>,
-    /// macOS pid version (`p_idversion`), new at each process and exec (read on split ticks only).
+    /// macOS pid version (`p_idversion`), new at each process and exec: read on split ticks, and
+    /// on every whole reading for a process whose [`Self::start`] is unread (another user's).
     pub version: Option<i32>,
     /// When it started, unix ms (a fork's time, which an exec keeps); the host reads it on
     /// every whole reading (one with a sweep), `None` where unread.

@@ -77,6 +77,7 @@ fn rows() -> Vec<Row> {
     use ChipTone::{Accent, Amber, Dim};
     use aterm_agent::supervise::Autopilot;
     let timed = crate::autopilot::TIMED_CRUISE_CHIP;
+    let landed = aterm_agent::supervise::mode_words::LANDED_WORDS;
     let (cruise, land, off) = (
         mode_words(Autopilot::Cruise).chip,
         mode_words(Autopilot::Land).chip,
@@ -218,9 +219,10 @@ fn rows() -> Vec<Row> {
             "\u{2713} landed",
             "\u{2713}",
             (Amber, Amber),
-            "autopilot: land, landed 17:42 \u{2014} all of the work is on the remote main \
-             branch; the harness types nothing more until someone else's turn \u{b7} click: off \
-             \u{b7} right-click: more",
+            &format!(
+                "autopilot: land, landed 17:42 \u{2014} {landed} \u{b7} click: off \u{b7} \
+                 right-click: more"
+            ),
             "autopilot: land, landed 17:42",
             "Autopilot: land. Landed at 17:42.",
         ),
@@ -297,6 +299,36 @@ fn lights(view: AutopilotView, glass: ChipGlass) -> WindowLights {
     let mut w = WindowLights::default();
     w.note_autopilot_at(7, view.mode(), view, glass, Instant::now);
     w
+}
+
+/// A LANDING'S FIXED WORDS CLAIM NO REMOTE (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.9,
+/// slice 9a): the hovered `✓ landed` title and the `Autopilot landed` record's line say
+/// [`aterm_agent::supervise::mode_words::LANDED_WORDS`], true on every leg a landing stands on,
+/// and never "remote main", which no check reads for a repository with no remote, a folder that
+/// is no repository or one the probe may not read, nor a checker: the record says the same words
+/// for codex-alab's own landing, which aterm did not check. NEGATIVE CONTROLS (mutants, run by
+/// hand): main's sentence, "all of the work is on the remote main branch; …", and §14.9's first
+/// draft, "aterm's check found nothing left to land; …", each fail it.
+#[test]
+fn the_landed_words_claim_no_remote() {
+    use aterm_agent::supervise::mode_words::LANDED_WORDS;
+    let (whole, _) = autopilot_title(
+        AutopilotView::Land,
+        &told(TaskFace::Landed),
+        "",
+        Some(TODAY),
+        TitleWords::default(),
+    );
+    let record = crate::harness_task::task_record("s-1", "in tab 3", "in tab 3", TaskFace::Landed)
+        .expect("a landing's record");
+    for (surface, text) in [
+        ("title", whole.as_str()),
+        ("record", record.detail[0].as_str()),
+    ] {
+        assert!(text.contains(LANDED_WORDS), "{surface}: {text}");
+        assert!(!text.contains("remote main"), "{surface}: {text}");
+        assert!(!text.contains("aterm"), "{surface} names a checker: {text}");
+    }
 }
 
 #[test]

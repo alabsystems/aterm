@@ -13,6 +13,7 @@ pub mod evidence;
 pub mod ident;
 pub mod log;
 pub mod publish;
+pub mod registry;
 pub mod replay;
 pub mod task;
 pub mod wire;

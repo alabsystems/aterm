@@ -787,10 +787,12 @@ impl FxGpu {
     }
 }
 
-/// Whether a frame feeds the bloom.
+/// Whether a frame feeds the bloom: it has light to blur, and its text can
+/// take the blur ([`RenderInput::bloom_gate`]).
 #[inline]
 pub(crate) fn bloom_source_live(input: &RenderInput) -> bool {
-    !input.cursor_glow_add.is_empty() || input.fx_layers.iter().any(|l| l.bloom)
+    !input.bloom_gate.held()
+        && (!input.cursor_glow_add.is_empty() || input.fx_layers.iter().any(|l| l.bloom))
 }
 
 /// Whether the present's crown (the HDR or SDR aurora boost over the bloom source) has
@@ -1068,6 +1070,28 @@ pub(crate) fn fx_tex_due(slot: &Option<FxArmTex>, side: &FxAtlasSide, drawing: b
 mod tests {
     use super::*;
     use aterm_core::render::{FxRect, FxSpace, FxSprite, PxRect};
+
+    /// looks7: a frame whose text holds the bloom ([`RenderInput::bloom_gate`],
+    /// a dim theme's) feeds the bloom nothing, its over-text light and the
+    /// crown over it kept; the same frame unheld feeds it (the negative
+    /// control).
+    #[test]
+    fn a_held_frame_feeds_the_bloom_nothing() {
+        let mut input = RenderInput {
+            rows: 4,
+            ..RenderInput::default()
+        };
+        input
+            .cursor_glow_add
+            .push(GlowQuad::flat(1, 30, 16, 8, 8, 0x00E0_2020, 0));
+        assert!(
+            bloom_source_live(&input),
+            "control: unheld, the light feeds the bloom"
+        );
+        input.bloom_gate = aterm_core::render::BloomGate::Held;
+        assert!(!bloom_source_live(&input), "the held frame feeds the bloom");
+        assert!(crown_glow_present(&input), "the crown is the light's own");
+    }
 
     fn art(w: u16, h: u16, seed: u8) -> Arc<FxArt> {
         let data: Vec<u8> = (0..usize::from(w) * usize::from(h))

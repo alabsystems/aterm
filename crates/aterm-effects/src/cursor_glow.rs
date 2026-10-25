@@ -52,8 +52,8 @@ mod status;
 mod style;
 mod thermal;
 pub(crate) use bed::{
-    BedScratch, BedShape, clip_quads_to, dark_bed_budget, dark_bed_ink, lay_dark_bed, night_rgb,
-    split_air_runs,
+    AirLight, BedScratch, BedShape, air_lit, clip_quads_to, dark_bed_budget, dark_bed_ink,
+    lay_dark_bed, lit_rail_drop, night_rgb, page_lit, page_lit_ink, split_air_runs,
 };
 pub use companion::*;
 pub use custody::*;
@@ -394,6 +394,18 @@ pub struct CursorGlow {
     streak_unbudgeted: bool,
     #[cfg(test)]
     bed_unsolved: bool,
+    /// A test's negative control: the bed held to its budget alone, never
+    /// lit at the page's luminance ([`bed::dark_bed_ink_unlit`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) bed_page_unlit: bool,
+    /// A test's negative control: a lit page's bed laid at the page's
+    /// luminance in the air too, no [`bed::AirLight`].
+    #[cfg(any(test, debug_assertions))]
+    bed_air_off: bool,
+    /// A test's negative control: a sample in the air by its own cell
+    /// alone, beside a letter too ([`bed::air_lit`]).
+    #[cfg(any(test, debug_assertions))]
+    bed_air_alone: bool,
     #[cfg(test)]
     over_ink_idle: bool,
     #[cfg(test)]
@@ -444,6 +456,10 @@ pub struct CursorGlow {
     /// the band, the negative control of the cap's ease.
     #[cfg(test)]
     fire_kept_cap_hard: bool,
+    /// Test-only: stand a kept tongue in each word gap between the burning
+    /// letters, as it stood (looks7 M6's negative control).
+    #[cfg(test)]
+    fire_gap_tongues: bool,
     #[cfg(test)]
     fire_meteor_joined: bool,
     #[cfg(test)]
@@ -492,9 +508,38 @@ pub struct CursorGlow {
     /// The pet's drawn body box this frame, window pixels `(x0, x1, y0, y1)`
     /// ([`Self::note_pet_body`]).
     pet_body: Option<(i32, i32, i32, i32)>,
+    /// A test's stand-in pet's body box ([`Self::pin_pet_body`]).
+    #[cfg(any(test, debug_assertions))]
+    pet_body_pinned: Option<(i32, i32, i32, i32)>,
     /// A test's negative control: no page veil under the pet's letters.
     #[cfg(any(test, debug_assertions))]
     pet_veil_off: bool,
+    /// The caret and geometry the frame's step drew by, which the pet's veil,
+    /// drawn after the pet's tick, lays its runs by ([`Self::veil_pet_letters`]).
+    veil_frame: Option<(Option<(u16, u16)>, Geom)>,
+    /// The veil the last [`Self::veil_pet_letters`] laid, which a host that
+    /// projects the trail's streams again without a pet tick (a split
+    /// pane's cursor-only frame) lays again ([`Self::pet_veil`]).
+    pet_veil: Vec<GlowQuad>,
+    /// A test's negative control: the veil over the body's box, not its silhouette.
+    #[cfg(any(test, debug_assertions))]
+    pet_veil_boxed: bool,
+    /// A test's negative control: the veil laid over every light, not
+    /// beneath them ([`Self::set_pet_veil_beneath`]).
+    #[cfg(any(test, debug_assertions))]
+    pet_veil_over: bool,
+    /// A test's negative control: the veil cut at its row's edges, with no
+    /// rise ([`Self::set_pet_veil_risen`]).
+    #[cfg(any(test, debug_assertions))]
+    pet_veil_sliced: bool,
+    /// A test's negative control: the rise feathered its whole height
+    /// however shallow the coat's cut ([`Self::set_pet_veil_feather_deep`]).
+    #[cfg(any(test, debug_assertions))]
+    pet_veil_deep: bool,
+    /// A test's negative control: a word gap's bed keeps its own knot's ink
+    /// ([`bed::bridge_word_gaps`]).
+    #[cfg(any(test, debug_assertions))]
+    bed_gaps_unbridged: bool,
     /// This frame's keep-out boxes, window pixels ([`Self::keep_out_boxes`]).
     keep_out_scratch: Vec<(i32, i32, i32, i32)>,
     /// This frame's lettered rows' spans, window pixels ([`Self::keep_out_boxes`]).
@@ -510,6 +555,7 @@ pub struct CursorGlow {
     icon_scratch: Vec<(i32, i32, i32, i32)>,
     icon_quads: Vec<GlowQuad>,
     icon_halos: Vec<RainHalo>,
+    icon_patches: Vec<FirePatch>,
     icon_cut: Vec<(i32, i32, i32, i32)>,
 }
 
@@ -1204,10 +1250,17 @@ impl CursorGlow {
     /// Returns the deadline for the next visible change, or `None` when idle.
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant, frame_interval: Duration) -> Option<Instant> {
+        const POOF_FALLBACK_GRACE_DUR: Duration = Duration::from_nanos(
+            (CursorGlow::POOF_FALLBACK_GRACE as f64 * 1_000_000_000.0).round() as u64,
+        );
+        const IN_FLIGHT_PATIENCE_DUR: Duration =
+            Duration::from_nanos((IN_FLIGHT_PATIENCE_S as f64 * 1_000_000_000.0).round() as u64);
+        const TORN_REST_DUR: Duration =
+            Duration::from_nanos((CursorGlow::TORN_REST_S as f64 * 1_000_000_000.0).round() as u64);
         let v1_due = if self.needs_frame_cadence() {
             Some(now + frame_interval)
         } else if let Some(t) = self.poof_hint_pending() {
-            let grace_open = t + Duration::from_secs_f32(Self::POOF_FALLBACK_GRACE);
+            let grace_open = t + POOF_FALLBACK_GRACE_DUR;
             let poll = now + Self::KILL_HINT_POLL_INTERVAL;
             Some(if grace_open > now {
                 grace_open.min(poll)
@@ -1228,17 +1281,16 @@ impl CursorGlow {
             let credit_expiry = p.cross_row.then(|| {
                 self.type_press_ring
                     .newest_unpaid(now)
-                    .map_or(now, |at| at + Duration::from_secs_f32(IN_FLIGHT_PATIENCE_S))
+                    .map_or(now, |at| at + IN_FLIGHT_PATIENCE_DUR)
                     + rk::ARM_MIN
             });
             park_expiry
                 .min(credit_expiry.unwrap_or(park_expiry))
                 .max(now + rk::ARM_MIN)
         });
-        let torn_due = self.torn_lay.map(|l| {
-            (l.moved_at + Duration::from_secs_f32(Self::TORN_REST_S) + rk::ARM_MIN)
-                .max(now + rk::ARM_MIN)
-        });
+        let torn_due = self
+            .torn_lay
+            .map(|l| (l.moved_at + TORN_REST_DUR + rk::ARM_MIN).max(now + rk::ARM_MIN));
         [v1_due, v2_due, park_due, torn_due]
             .into_iter()
             .flatten()
@@ -1295,6 +1347,7 @@ impl CursorGlow {
         self.halo_out.clear();
         self.patch_out.clear();
         self.under_out.clear();
+        self.ink_ledger.clear_rails();
         self.char_out.clear();
         self.fire_halo_out.clear();
         self.v2_beams.clear();
@@ -1403,6 +1456,14 @@ impl CursorGlow {
         self.print_anchor_tick_seq = print_seq;
         self.last_ch = geom.ch.min(u16::MAX as usize) as u16;
         self.last_origin_y = geom.origin_y;
+        if geom.cw != 0 {
+            // Every style's word icons shade by it ([`Self::shade_word_icons`]).
+            self.keep_geom = Some((
+                i32::from(geom.origin_x),
+                i32::from(geom.origin_y),
+                geom.cw as i32,
+            ));
+        }
         out.clear();
         self.halo_out.clear();
         self.patch_out.clear();
@@ -1410,6 +1471,7 @@ impl CursorGlow {
         self.char_out.clear();
         self.fire_halo_out.clear();
         self.ink_ledger.close();
+        self.ink_ledger.clear_rails();
         if self.frame_text.at != Some(now) {
             self.frame_text.rows.clear();
             self.frame_text.pairs.clear();
@@ -1567,19 +1629,19 @@ impl CursorGlow {
                     }
                 }
                 if self.flare > 0.0 {
-                    self.flare *= (-dt / Self::FLARE_DECAY_TAU).exp();
+                    self.flare *= (-dt * (1.0 / Self::FLARE_DECAY_TAU)).exp();
                     if self.flare < 0.005 {
                         self.flare = 0.0;
                     }
                 }
                 if self.coal > 0.0 {
-                    self.coal *= (-dt / Self::COAL_TAU).exp();
+                    self.coal *= (-dt * (1.0 / Self::COAL_TAU)).exp();
                     if self.coal < 0.005 {
                         self.coal = 0.0;
                     }
                 }
                 if self.quench > 0.0 {
-                    self.quench *= (-dt / Self::QUENCH_TAU).exp();
+                    self.quench *= (-dt * (1.0 / Self::QUENCH_TAU)).exp();
                     if self.quench < 0.005 {
                         self.quench = 0.0;
                     }
@@ -1932,6 +1994,9 @@ impl CursorGlow {
                 self.v2.tick(now, geom, &v2_cfg, &mut frame);
             }
             self.v2_caret = frame.caret;
+            for &(from, to) in self.v2.ribbon().rail_spans() {
+                self.ink_ledger.note_rail(from, to);
+            }
             self.read_fresh_run_origin(now);
             for cue in self.v2_cues.drain(..) {
                 if self.sound_cues.len() < Self::MAX_SOUND_CUES {
@@ -2098,7 +2163,7 @@ impl CursorGlow {
         let Some(t0) = self.ramp_in_at else {
             return 1.0;
         };
-        let u = now.saturating_duration_since(t0).as_secs_f32() / Self::RAMP_IN_S;
+        let u = now.saturating_duration_since(t0).as_secs_f32() * (1.0 / Self::RAMP_IN_S);
         if u >= 1.0 {
             self.ramp_in_at = None;
             return 1.0;
@@ -2114,7 +2179,8 @@ impl CursorGlow {
         let mut fades = std::mem::take(&mut self.fading);
         let mut scratch = std::mem::take(&mut self.fade_scratch);
         fades.retain_mut(|f| {
-            let u = now.saturating_duration_since(f.started).as_secs_f32() / Self::FADE_OUT_S;
+            let u =
+                now.saturating_duration_since(f.started).as_secs_f32() * (1.0 / Self::FADE_OUT_S);
             if u >= 1.0 {
                 return false;
             }
@@ -2154,7 +2220,7 @@ impl CursorGlow {
         x ^= x >> 17;
         x ^= x << 5;
         self.rng = x;
-        (x >> 8) as f32 / (1u32 << 24) as f32
+        (x >> 8) as f32 * (1.0 / (1u32 << 24) as f32)
     }
 }
 

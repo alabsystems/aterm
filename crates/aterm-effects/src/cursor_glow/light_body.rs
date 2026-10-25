@@ -49,25 +49,21 @@ const fn over_at(bg: u32, ink: u32, a: u8) -> u32 {
 /// The opacity `0..=255` at which source-over `ink` on `theme_bg` leaves `theme_fg` `keep` of its contrast on the bare paper, composited as the renderer composites a quad.
 #[must_use]
 pub(crate) const fn light_alpha_keeping(ink: u32, theme_fg: u32, theme_bg: u32, keep: f32) -> f32 {
-    use crate::color_math::{
-        RelativeLuminanceTable, relative_luminance_table, relative_luminance_with,
-    };
-    let table = relative_luminance_table();
     let (fg, bg) = (theme_fg & 0x00FF_FFFF, theme_bg & 0x00FF_FFFF);
-    let lum_fg = relative_luminance_with(table, fg);
+    let lum_fg = relative_luminance(fg);
     #[inline]
-    const fn ratio(table: &RelativeLuminanceTable, lum_fg: f32, c: u32) -> f32 {
-        let l = relative_luminance_with(table, c);
+    const fn ratio(lum_fg: f32, c: u32) -> f32 {
+        let l = relative_luminance(c);
         (lum_fg.max(l) + 0.05) / (lum_fg.min(l) + 0.05)
     }
-    let want = ratio(table, lum_fg, bg) * keep;
-    if ratio(table, lum_fg, over_at(bg, ink, u8::MAX)) >= want {
+    let want = ratio(lum_fg, bg) * keep;
+    if ratio(lum_fg, over_at(bg, ink, u8::MAX)) >= want {
         return u8::MAX as f32;
     }
     let (mut lo, mut hi) = (0u8, u8::MAX);
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
-        if ratio(table, lum_fg, over_at(bg, ink, mid)) >= want {
+        if ratio(lum_fg, over_at(bg, ink, mid)) >= want {
             lo = mid;
         } else {
             hi = mid;
@@ -103,14 +99,13 @@ pub(crate) const fn light_ink_vivid_over_floor(
     a_max: u8,
     floor: f32,
 ) -> u32 {
-    use crate::color_math::{relative_luminance_table, relative_luminance_with, rgb2hsv};
+    use crate::color_math::rgb2hsv;
     let bold = light_ink_bold(rgb & 0x00FF_FFFF);
     let r = (bold >> 16) & 0xff;
     let g = (bold >> 8) & 0xff;
     let b = bold & 0xff;
     let peak = if r > g { r } else { g };
     let peak = if peak > b { peak } else { b };
-    let table = relative_luminance_table();
     #[inline]
     const fn scaled(bold: u32, k: f32) -> u32 {
         #[inline]
@@ -123,8 +118,8 @@ pub(crate) const fn light_ink_vivid_over_floor(
     let top_rgb = scaled(bold, top);
     if a_max == 0
         || rgb2hsv(bold).1 < VIVID_LIFT_CHROMA_MIN
-        || relative_luminance_with(table, over_at(theme_bg, bold, a_max)) >= floor
-        || relative_luminance_with(table, over_at(theme_bg, top_rgb, a_max)) < floor
+        || relative_luminance(over_at(theme_bg, bold, a_max)) >= floor
+        || relative_luminance(over_at(theme_bg, top_rgb, a_max)) < floor
     {
         return light_ink_over_floor(rgb, theme_bg, a_max, floor);
     }
@@ -134,7 +129,7 @@ pub(crate) const fn light_ink_vivid_over_floor(
     while i < FRESH_INK_GLYPH_BISECT {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = scaled(bold, mid);
-        let mid_lum = relative_luminance_with(table, over_at(theme_bg, mid_rgb, a_max));
+        let mid_lum = relative_luminance(over_at(theme_bg, mid_rgb, a_max));
         if mid_rgb == hi_rgb || (mid_rgb != lo_rgb && mid_lum >= floor) {
             hi = mid;
             hi_rgb = mid_rgb;
@@ -160,54 +155,42 @@ pub(crate) const fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floo
     if a_max == 0 {
         return ink;
     }
-    let table = crate::color_math::relative_luminance_table();
-    if crate::color_math::relative_luminance_with(table, over_at(theme_bg, ink, a_max)) >= floor {
+    if relative_luminance(over_at(theme_bg, ink, a_max)) >= floor {
         return ink;
     }
-    let (w_bar, bar_rgb) =
-        if crate::color_math::relative_luminance_with(table, over_at(theme_bg, 0x00FF_FFFF, a_max))
-            >= floor
-        {
-            let (mut lo, mut hi) = (0.0f32, 1.0f32);
-            let (mut lo_rgb, mut hi_rgb) = (ink, 0x00FF_FFFF);
-            let mut i = 0;
-            while i < FRESH_INK_GLYPH_BISECT {
-                let mid = 0.5 * (lo + hi);
-                let mid_rgb = toward_white(ink, mid);
-                let matches = if mid_rgb == lo_rgb {
-                    false
-                } else if mid_rgb == hi_rgb {
-                    true
-                } else {
-                    crate::color_math::relative_luminance_with(
-                        table,
-                        over_at(theme_bg, mid_rgb, a_max),
-                    ) >= floor
-                };
-                if matches {
-                    hi = mid;
-                    hi_rgb = mid_rgb;
-                } else {
-                    lo = mid;
-                    lo_rgb = mid_rgb;
-                }
-                if lo_rgb == hi_rgb {
-                    break;
-                }
-                i += 1;
+    let (w_bar, bar_rgb) = if relative_luminance(over_at(theme_bg, 0x00FF_FFFF, a_max)) >= floor {
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        let (mut lo_rgb, mut hi_rgb) = (ink, 0x00FF_FFFF);
+        let mut i = 0;
+        while i < FRESH_INK_GLYPH_BISECT {
+            let mid = 0.5 * (lo + hi);
+            let mid_rgb = toward_white(ink, mid);
+            let matches = if mid_rgb == lo_rgb {
+                false
+            } else if mid_rgb == hi_rgb {
+                true
+            } else {
+                relative_luminance(over_at(theme_bg, mid_rgb, a_max)) >= floor
+            };
+            if matches {
+                hi = mid;
+                hi_rgb = mid_rgb;
+            } else {
+                lo = mid;
+                lo_rgb = mid_rgb;
             }
-            (hi, hi_rgb)
-        } else {
-            (1.0, 0x00FF_FFFF)
-        };
-    let linear = &table.linear;
-    if !crate::rainbow_kitty::ribbon::seen_with(linear, over_at(theme_bg, ink, a_max), theme_bg) {
+            if lo_rgb == hi_rgb {
+                break;
+            }
+            i += 1;
+        }
+        (hi, hi_rgb)
+    } else {
+        (1.0, 0x00FF_FFFF)
+    };
+    if !crate::rainbow_kitty::ribbon::seen(over_at(theme_bg, ink, a_max), theme_bg) {
         ink
-    } else if crate::rainbow_kitty::ribbon::seen_with(
-        linear,
-        over_at(theme_bg, bar_rgb, a_max),
-        theme_bg,
-    ) {
+    } else if crate::rainbow_kitty::ribbon::seen(over_at(theme_bg, bar_rgb, a_max), theme_bg) {
         bar_rgb
     } else {
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -222,11 +205,7 @@ pub(crate) const fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floo
             } else if hi_known && mid_rgb == hi_rgb {
                 true
             } else {
-                !crate::rainbow_kitty::ribbon::seen_with(
-                    linear,
-                    over_at(theme_bg, mid_rgb, a_max),
-                    theme_bg,
-                )
+                !crate::rainbow_kitty::ribbon::seen(over_at(theme_bg, mid_rgb, a_max), theme_bg)
             };
             if matches {
                 hi = mid;
@@ -298,7 +277,7 @@ pub(crate) fn push_ink_ring(
     }
     let chf = geom.ch as f32;
     let oy = f32::from(geom.origin_y);
-    let row_top = oy + ((cy - oy) / chf).floor() * chf;
+    let row_top = oy + ((cy - oy) * (1.0 / chf)).floor() * chf;
     let y0 = (cy - r).max(row_top).floor() as i32;
     let y1 = (cy + r).min(row_top + chf).ceil() as i32;
     let span = |under: &mut Vec<GlowQuad>, y: i32, a: f32, b: f32, alpha: f32| {
@@ -363,7 +342,8 @@ pub(crate) fn push_ink_ellipse_shaped(
         return;
     }
     let chf = geom.ch as f32;
-    let row_top = f32::from(geom.origin_y) + ((cy - f32::from(geom.origin_y)) / chf).floor() * chf;
+    let oy = f32::from(geom.origin_y);
+    let row_top = oy + ((cy - oy) * (1.0 / chf)).floor() * chf;
     let available = (cy - row_top).min(row_top + chf - cy).max(0.0);
     soft_ellipse(
         under,
@@ -405,18 +385,7 @@ fn soft_ellipse(
         let mut i = 0;
         while i <= STEPS {
             let u = i as f32 / STEPS as f32 * 2.0 - 1.0;
-            let s = (1.0 - u * u).max(0.0) as f64;
-            let round = if s <= 0.0 {
-                0.0
-            } else {
-                let mut r = s;
-                let mut step = 0;
-                while step < 16 {
-                    r = 0.5 * (r + s / r);
-                    step += 1;
-                }
-                r as f32
-            };
+            let round = crate::color_math::sqrt_f32((1.0 - u * u).max(0.0));
             table[i] = (u, round);
             i += 1;
         }

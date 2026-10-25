@@ -54,9 +54,7 @@ pub fn parse(args: &[String]) -> Result<BrowserArgs, Fail> {
             }
         }
     }
-    if p.arches.is_empty() {
-        p.arches = Arch::ALL.to_vec();
-    }
+    p.arches = crate::linux_gpu::arches(std::mem::take(&mut p.arches), "browser")?;
     Ok(p)
 }
 
@@ -128,13 +126,15 @@ pub fn cmd_browser(args: &[String]) -> Res {
     std::fs::create_dir_all(&results)
         .map_err(|e| Fail::die(format!("{}: {e}", results.display())))?;
     let t0 = Instant::now();
+    let mut waited = std::time::Duration::ZERO;
     let mut rows = Vec::new();
     let site = results.join("site");
     let laid = lay_site(&site);
     let ok = laid.verdict == Verdict::Pass;
     rows.push(laid);
     if ok {
-        let _lock = linux::LaneLock::take()?;
+        let lock = linux::LaneLock::take()?;
+        waited = lock.waited();
         let up = linux::bring_up()?;
         rows.extend(up.timings.iter().map(|step| Row {
             name: format!("vm {}", step.name),
@@ -157,8 +157,12 @@ pub fn cmd_browser(args: &[String]) -> Res {
             return Err(s.into());
         }
     }
-    let report =
-        crate::linux_proof::render_as("LINUX LANE BROWSER", &rows, &[], t0.elapsed().as_secs_f64());
+    let report = crate::linux_proof::render_as(
+        "LINUX LANE BROWSER",
+        &rows,
+        &[],
+        t0.elapsed().saturating_sub(waited).as_secs_f64(),
+    );
     print!("\n{report}");
     let path = results.join("report.txt");
     if let Err(e) = std::fs::write(&path, &report) {

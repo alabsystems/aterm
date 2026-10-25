@@ -244,23 +244,30 @@ impl CatBaker {
     /// Spend one bake from this frame's budget and pick the slot to bake into: a
     /// free slot first, else the least-recently-used (lowest index on ties).
     #[inline]
-    fn bake_slot(&mut self) -> Option<usize> {
+    const fn bake_slot(&mut self) -> Option<usize> {
         if self.bakes_left == 0 {
             return None;
         }
         self.bakes_left -= 1;
+        let slots = self.slots.as_slice();
         let mut victim: Option<(usize, u64)> = None;
-        for (idx, slot) in self.slots.iter().enumerate() {
-            let Some(s) = slot.as_ref() else {
+        let mut idx = 0;
+        while idx < slots.len() {
+            let Some(s) = slots[idx].as_ref() else {
                 return Some(idx);
             };
-            if s.last_used != self.clock
-                && victim.is_none_or(|(_, best_used)| s.last_used < best_used)
-            {
-                victim = Some((idx, s.last_used));
+            if s.last_used != self.clock {
+                match victim {
+                    Some((_, best_used)) if s.last_used >= best_used => {}
+                    _ => victim = Some((idx, s.last_used)),
+                }
             }
+            idx += 1;
         }
-        victim.map(|(idx, _)| idx)
+        match victim {
+            Some((idx, _)) => Some(idx),
+            None => None,
+        }
     }
 
     /// Intern the `w × h` top-left of the `tw`-wide straight RGBA `src` as
@@ -377,6 +384,7 @@ pub const EYE_RAMP: [u32; 16] = [
 ];
 
 const CATCH_LIGHT: u32 = 0x00FF_FFFF;
+const CATCH_LIGHT_RGB: (f32, f32, f32) = rgb(CATCH_LIGHT);
 
 const OPEN_EYE_REFLECTION_MIN_PX: f32 = 3.0;
 const OPEN_EYE_SHALLOW_ASPECT: f32 = 0.6;
@@ -487,7 +495,7 @@ pub(crate) fn paint_dark_masked_disc(
                 }
             }
             if hit > 0 {
-                tile.over(x, y, col, alpha * hit as f32 / 16.0);
+                tile.over(x, y, col, alpha * (hit as f32 * 0.0625));
             }
         }
     }
@@ -813,15 +821,14 @@ const fn mix3(a: (f32, f32, f32), b: (f32, f32, f32), t: f32) -> (f32, f32, f32)
 }
 
 const fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f32) {
-    let table = crate::color_math::relative_luminance_table();
     let mut lo_rgb = packed_rgb(coat);
-    if crate::color_math::relative_luminance_with(table, lo_rgb) >= floor {
+    if relative_luminance(lo_rgb) >= floor {
         return coat;
     }
     let (h, s, _v) = rgb2hsv(lo_rgb);
     let pale = rgb(hsv2rgb(h, s * 0.55, 0.78));
     let mut hi_rgb = packed_rgb(pale);
-    if crate::color_math::relative_luminance_with(table, hi_rgb) <= floor {
+    if relative_luminance(hi_rgb) <= floor {
         return pale;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -829,10 +836,7 @@ const fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f3
     while step < 6 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = packed_rgb(mix3(coat, pale, mid));
-        if mid_rgb == lo_rgb
-            || (mid_rgb != hi_rgb
-                && crate::color_math::relative_luminance_with(table, mid_rgb) < floor)
-        {
+        if mid_rgb == lo_rgb || (mid_rgb != hi_rgb && relative_luminance(mid_rgb) < floor) {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -860,9 +864,8 @@ pub(crate) const fn dark_bg_coat_stop(coat: u8) -> (f32, f32, f32) {
 
 #[inline]
 const fn contrast_ratio(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
-    let table = crate::color_math::relative_luminance_table();
-    let a = crate::color_math::relative_luminance_with(table, packed_rgb(a));
-    let b = crate::color_math::relative_luminance_with(table, packed_rgb(b));
+    let a = relative_luminance(packed_rgb(a));
+    let b = relative_luminance(packed_rgb(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
@@ -888,13 +891,13 @@ pub const fn resolve_layer(layer: &Layer, fills: &ResolvedFills) -> ((f32, f32, 
 const fn resolve_glyph_layer(
     layer: &Layer,
     fills: &ResolvedFills,
-    coat_lum: Option<(&crate::color_math::RelativeLuminanceTable, f32)>,
+    coat_lum: Option<f32>,
 ) -> ((f32, f32, f32), f32) {
     if matches!(layer.role, GlyphRole::Eye)
         && matches!(layer.recolor, Recolor::Fixed)
-        && let Some((table, coat_lum)) = coat_lum
+        && let Some(coat_lum) = coat_lum
     {
-        let eye_lum = crate::color_math::relative_luminance_with(table, layer.fill);
+        let eye_lum = relative_luminance(layer.fill);
         let contrast = (eye_lum.max(coat_lum) + 0.05) / (eye_lum.min(coat_lum) + 0.05);
         if contrast < MIN_EYE_CONTRAST {
             return (fills.eye_ink, 1.0);
@@ -1029,7 +1032,7 @@ const fn layer_eye_line(layer: &Layer) -> Option<f32> {
         p += 1;
     }
     if seen {
-        Some((lo as f32 + hi as f32) * 0.5 / FIXED_ONE as f32)
+        Some((lo as f32 + hi as f32) * (0.5 / FIXED_ONE as f32))
     } else {
         None
     }
@@ -1038,6 +1041,7 @@ const fn layer_eye_line(layer: &Layer) -> Option<f32> {
 /// Normalized control-hull bounds `(x0, y0, x1, y1)` of one subpath.
 #[must_use]
 pub(crate) const fn path_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)> {
+    const INV_FIXED_ONE: f32 = 1.0 / FIXED_ONE as f32;
     let (mut x0, mut y0, mut x1, mut y1) = (u16::MAX, u16::MAX, 0u16, 0u16);
     let mut seen = false;
     let mut i = 0;
@@ -1085,10 +1089,10 @@ pub(crate) const fn path_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)
     }
     if seen {
         Some((
-            x0 as f32 / FIXED_ONE as f32,
-            y0 as f32 / FIXED_ONE as f32,
-            x1 as f32 / FIXED_ONE as f32,
-            y1 as f32 / FIXED_ONE as f32,
+            x0 as f32 * INV_FIXED_ONE,
+            y0 as f32 * INV_FIXED_ONE,
+            x1 as f32 * INV_FIXED_ONE,
+            y1 as f32 * INV_FIXED_ONE,
         ))
     } else {
         None
@@ -1319,7 +1323,7 @@ fn paint_open_eye_reflections(
             xform.dx + reflection.pcx * xform.scale_x,
             xform.dy + reflection.pcy * xform.scale_y,
             primary_r,
-            rgb(CATCH_LIGHT),
+            CATCH_LIGHT_RGB,
             1.0,
         );
 
@@ -1351,13 +1355,9 @@ fn paint_glyph(
     let idx = id as usize;
     let def = &GLYPHS[idx];
     let meta = &GLYPH_META[idx];
-    let coat_lum = meta.needs_coat_lum.then(|| {
-        let table = crate::color_math::relative_luminance_table();
-        (
-            table,
-            crate::color_math::relative_luminance_with(table, packed_rgb(fills.coat)),
-        )
-    });
+    let coat_lum = meta
+        .needs_coat_lum
+        .then(|| relative_luminance(packed_rgb(fills.coat)));
     let eye_xform = (!matches!(eyes, EyesFrame::Open))
         .then_some(meta.eye_line)
         .flatten()
@@ -1429,7 +1429,7 @@ fn paint_variant_onto(
     }
     if tile.width() > w {
         let r = f32::from(PATCH_STRIP) * 0.5;
-        tile.disc(w as f32 + r, r, r.max(1.0), rgb(CATCH_LIGHT), 1.0);
+        tile.disc(w as f32 + r, r, r.max(1.0), CATCH_LIGHT_RGB, 1.0);
     }
 }
 

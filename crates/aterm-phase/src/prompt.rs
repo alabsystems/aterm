@@ -1653,7 +1653,9 @@ fn last_footer(rows: &[String]) -> Option<(usize, usize)> {
     })
 }
 
-fn wraps_onto(above: &str, below: &str, width: usize) -> bool {
+/// Whether row `below` is the rest of a footer or hint line drawn from row `above`, at column 3
+/// or nearer the edge, that Ink wrapped in a pane `width` cells wide ([`crate::wrap::continues`]).
+pub(crate) fn wraps_onto(above: &str, below: &str, width: usize) -> bool {
     let col = crate::phase::leading_spaces(above);
     let room = crate::wrap::room(col, width);
     col <= 3 && crate::wrap::continues(crate::text::trim(above), col, below, room)
@@ -3989,6 +3991,39 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.310-auto-mode-setup-40col.txt");
     pub const AUTO_MODE_SETUP_FULLSCREEN_40COL: &str =
         include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-40col.txt");
+    // In a pane 35 columns wide or narrower the offer's footer wraps onto two rows (three from 19
+    // columns, four at 16), and in one 22 or narrower its third answer wraps too (onto three rows
+    // at 16). The 19, 17 and 16 column panes are the halves of a window split left/right.
+    pub const AUTO_MODE_SETUP_34COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-34col.txt");
+    pub const AUTO_MODE_SETUP_26COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-26col.txt");
+    pub const AUTO_MODE_SETUP_23COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-23col.txt");
+    pub const AUTO_MODE_SETUP_22COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-22col.txt");
+    pub const AUTO_MODE_SETUP_20COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-20col.txt");
+    pub const AUTO_MODE_SETUP_FULLSCREEN_34COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-34col.txt");
+    pub const AUTO_MODE_SETUP_FULLSCREEN_26COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-26col.txt");
+    pub const AUTO_MODE_SETUP_FULLSCREEN_22COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-22col.txt");
+    pub const AUTO_MODE_SETUP_FULLSCREEN_20COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-20col.txt");
+    pub const AUTO_MODE_SETUP_19COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-19col.txt");
+    pub const AUTO_MODE_SETUP_17COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-17col.txt");
+    pub const AUTO_MODE_SETUP_16COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-16col.txt");
+    pub const AUTO_MODE_SETUP_FULLSCREEN_19COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-19col.txt");
+    pub const AUTO_MODE_SETUP_FULLSCREEN_17COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-17col.txt");
+    pub const AUTO_MODE_SETUP_FULLSCREEN_16COL: &str =
+        include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-16col.txt");
     pub const MCP_SERVER_TWO: &str = include_str!("fixtures/claude-2.1.301-mcp-server-two.txt");
     pub const MCP_SERVER_NARROW: [&str; 24] = [
         include_str!("fixtures/claude-2.1.302-mcp-server-one-40col.txt"),

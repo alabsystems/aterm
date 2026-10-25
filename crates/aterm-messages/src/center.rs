@@ -590,6 +590,8 @@ pub struct MessageCenter {
     log: MessageLog,
     committed_rows: u16,
     shrink_since: Option<Instant>,
+    /// A change of view waived the pending shrink's quiet ([`Self::view_changed`]).
+    shrink_taken: bool,
     /// The windows' chrome regrow floor the host handed at its last commit.
     regrow_floor: Option<Instant>,
     revision: u64,
@@ -653,6 +655,7 @@ impl MessageCenter {
             log,
             committed_rows: 0,
             shrink_since: None,
+            shrink_taken: false,
             regrow_floor: None,
             revision: 0,
             motion_input_epoch: 0,
@@ -1506,6 +1509,7 @@ impl MessageCenter {
             std::cmp::Ordering::Greater => {
                 self.committed_rows = want;
                 self.shrink_since = None;
+                self.shrink_taken = false;
                 moved = Some(want);
             }
             std::cmp::Ordering::Less => {
@@ -1515,15 +1519,20 @@ impl MessageCenter {
                 if afford < self.committed_rows {
                     self.committed_rows = want;
                     self.shrink_since = None;
+                    self.shrink_taken = false;
                     moved = Some(want);
                 } else if quiet {
                     self.echoes.retain(|e| now < e.until);
                     self.committed_rows = want;
                     self.shrink_since = None;
+                    self.shrink_taken = false;
                     moved = Some(want);
                 }
             }
-            std::cmp::Ordering::Equal => self.shrink_since = None,
+            std::cmp::Ordering::Equal => {
+                self.shrink_since = None;
+                self.shrink_taken = false;
+            }
         }
         let placed = self.glass_signature();
         self.rebalance(now);
@@ -1542,11 +1551,25 @@ impl MessageCenter {
     #[must_use]
     pub fn quiet_shrink_at(&self) -> Option<Instant> {
         self.shrink_since.map(|s| {
-            self.echoes
-                .iter()
-                .map(|e| e.until)
-                .fold(at(s, SHRINK_QUIET), Instant::max)
+            let own = if self.shrink_taken {
+                s
+            } else {
+                at(s, SHRINK_QUIET)
+            };
+            self.echoes.iter().map(|e| e.until).fold(own, Instant::max)
         })
+    }
+
+    /// What is on screen changed (the front window or its tab): a shrink the
+    /// band wants is taken at the next commit without its [`SHRINK_QUIET`],
+    /// since the new view is laid out at once anyway. It still waits a playing
+    /// echo and the chrome regrow floor. `true` when a shrink is wanted.
+    pub fn view_changed(&mut self) -> bool {
+        let fall = self.wanted_rows() < self.committed_rows;
+        if fall {
+            self.shrink_taken = true;
+        }
+        fall
     }
 
     /// The committed row count.
@@ -4277,6 +4300,79 @@ mod tests {
         );
         assert_eq!(c.committed_rows(), 1);
         assert_eq!(glass_ids(&c), vec![a]);
+    }
+
+    #[test]
+    fn a_change_of_view_takes_the_shrink_its_rows_wanted_at_once() {
+        let now = t0();
+        let mut c = fresh(now);
+        let a = c.post(standing("a"), stamp(1), now).id;
+        assert_eq!(c.commit_rows(now, 3), Some(1));
+        let mut quiet = c.clone();
+        let later = now + ms(2_000);
+        assert!(c.keep_as_record(a, &standing("a"), later));
+        assert!(quiet.keep_as_record(a, &standing("a"), later));
+        assert!(c.view_changed(), "a shrink is wanted");
+        assert_eq!(c.commit_rows(later, 3), Some(0), "taken with the change");
+        assert_eq!(c.deadline(true), None, "no quiet left pending");
+        assert_eq!(quiet.commit_rows(later, 3), None, "CONTROL: it waits");
+        assert_eq!(
+            quiet.deadline(true),
+            Some(later + SHRINK_QUIET),
+            "CONTROL: its quiet"
+        );
+
+        // A change of view with nothing to shrink marks nothing.
+        let b = c.post(standing("b"), stamp(2), later).id;
+        assert_eq!(c.commit_rows(later, 3), Some(1));
+        assert!(!c.view_changed(), "no shrink wanted");
+        let gone = later + ms(100);
+        assert!(c.withdraw(b, gone));
+        assert_eq!(c.commit_rows(gone, 3), None, "the withdraw waits its quiet");
+        assert_eq!(c.deadline(true), Some(gone + SHRINK_QUIET));
+        // ...and a want back cancels a taken shrink as it does a quiet one.
+        assert!(c.view_changed());
+        let d = c.post(standing("d"), stamp(3), gone).id;
+        assert_eq!(c.commit_rows(gone, 3), None, "one wanted, one committed");
+        let again = gone + ms(100);
+        assert!(c.withdraw(d, again));
+        assert_eq!(c.commit_rows(again, 3), None, "no taken shrink is left");
+        assert_eq!(c.deadline(true), Some(again + SHRINK_QUIET));
+    }
+
+    #[test]
+    fn a_shrink_a_change_of_view_takes_waits_only_the_floor_and_the_echo() {
+        let now = t0();
+        let mut c = fresh(now);
+        let a = c.post(standing("a"), stamp(1), now).id;
+        assert_eq!(c.commit_rows(now, 3), Some(1));
+        let floor = now + crate::chrome::CHROME_REGROW_SETTLE;
+        c.set_regrow_floor(Some(floor));
+        let switched = now + ms(100);
+        assert!(c.keep_as_record(a, &standing("a"), switched));
+        assert!(c.view_changed());
+        assert_eq!(c.commit_rows(switched, 3), None, "inside the floor");
+        assert_eq!(c.deadline(true), Some(floor), "the floor, not the quiet");
+        assert_eq!(c.commit_rows(floor, 3), Some(0), "at the floor");
+
+        let now = t0();
+        let mut c = fresh(now);
+        let work = c.post(busy("Installing"), stamp(1), now).id;
+        let shown = now + crate::PROGRESS_GRACE + ms(1);
+        let _ = c.settle(shown, true);
+        assert_eq!(c.commit_rows(shown, 3), Some(1));
+        let done = shown + ms(500);
+        assert!(c.resolve(work, Outcome::Ok, done));
+        let until = c
+            .echoes()
+            .first()
+            .map(|e| e.until)
+            .expect("a Complete echo");
+        assert!(c.view_changed());
+        assert_eq!(c.commit_rows(done, 3), None, "the echo plays");
+        assert_eq!(c.deadline(true), Some(until), "to its end");
+        let _ = c.settle(until, true);
+        assert_eq!(c.commit_rows(until, 3), Some(0), "then the row goes");
     }
 
     #[test]

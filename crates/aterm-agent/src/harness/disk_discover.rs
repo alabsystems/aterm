@@ -1608,12 +1608,21 @@ struct Record {
 
 type Registry = Option<Vec<Record>>;
 
+/// The session records under `claude_dir` whose writer still runs: its pid is this user's live
+/// process ([`upgrade_drive::writer_may_live`](super::super::upgrade_drive::writer_may_live):
+/// no zombie, and no other user's process that took the number) and started when the record
+/// says (an unread start may), as [`conversation_live`](super::super::upgrade_drive::conversation_live)
+/// judges a conversation. Claude Code keeps a file whose pid answers anything but `ESRCH`.
 fn live_records(claude_dir: &Path) -> Registry {
+    use super::super::upgrade_drive::{kernel_start, squash, writer_may_live};
     let files = super::super::upgrade_drive::session_files_in(claude_dir)?;
     Some(
         files
             .into_iter()
-            .filter(|f| super::super::upgrade_drive::alive(f.pid))
+            .filter(|f| {
+                writer_may_live(f.pid)
+                    && kernel_start(f.pid).is_none_or(|start| start == squash(&f.proc_start))
+            })
             .map(|f| Record {
                 pid: f.pid,
                 started: super::super::upgrade_drive::squash(&f.proc_start),

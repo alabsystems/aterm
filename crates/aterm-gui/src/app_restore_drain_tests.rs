@@ -183,6 +183,56 @@ fn a_cold_drain_lands_the_front_tab_second_and_ends_as_recorded() {
     );
 }
 
+/// A shell the restore places keeps the grid it came with while its window may hold another (a
+/// seamless update's handoff is `a_handoff_s_close_regrids_each_handed_over_tab_its_window_moved_under`).
+/// The sliced drain's close re-grids every tab to its window once, booked `site=restore`, and a
+/// close that finds them at size books nothing.
+#[test]
+fn the_restore_s_close_regrids_every_tab_to_its_window_once() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.pending_restore = Some(restore::RestoreManifest::new(vec![window(
+        &["A", "B", "C"],
+        1,
+    )]));
+    let grid = (27, 80);
+    {
+        let ws = app.windows.get_mut(&wid).expect("the window");
+        (ws.rows, ws.cols) = grid;
+    }
+    drain(&mut app);
+
+    let sessions: Vec<u64> = app.windows[&wid]
+        .tab_set
+        .tabs()
+        .iter()
+        .filter_map(|tab| {
+            app.view_store
+                .get(tab.focus)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+        })
+        .collect();
+    assert_eq!(sessions.len(), 3, "every tab is a shell");
+    let sites = |app: &App| -> Vec<Vec<String>> {
+        sessions
+            .iter()
+            .map(|id| super::tests::resize_sites(app, *id))
+            .collect()
+    };
+    for id in &sessions {
+        assert_eq!(
+            super::tests::grid_of(&app, *id),
+            grid,
+            "session {id} took its window's grid"
+        );
+    }
+    let once = vec![vec!["site=restore".to_string()]; 3];
+    assert_eq!(sites(&app), once, "one re-grid each, booked restore");
+    app.regrid_restored_windows();
+    assert_eq!(sites(&app), once, "a tab at its size books nothing");
+}
+
 #[test]
 fn a_person_s_tabs_outlive_the_drain_and_a_closed_tab_stays_closed() {
     let mut app = App::headless_for_test();

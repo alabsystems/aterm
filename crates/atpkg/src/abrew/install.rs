@@ -32,7 +32,7 @@ fn preflight(
         || !super::valid_cask_version(&version)
         || f.full_name != f.name
     {
-        return Err(InstallError::PassThrough(
+        return Err(InstallError::Unsupported(
             "unsupported formula name/version".to_string(),
         ));
     }
@@ -47,8 +47,8 @@ fn preflight(
             opts.reinstall && inst.version == version
         };
         if !admitted_replacement && (opts.force || older) {
-            return Err(InstallError::PassThrough(format!(
-                "replacement of {} is handled by brew",
+            return Err(InstallError::Unsupported(format!(
+                "replacement of {} is not implemented natively",
                 f.name
             )));
         }
@@ -60,7 +60,7 @@ fn preflight(
         }
     }
     if let Err(needs) = f.native_bottle(&machine.bottle_tags()) {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "{} needs its Homebrew build/relocation recipe ({needs})",
             f.name
         )));
@@ -72,7 +72,7 @@ fn preflight(
         )));
     }
     if f.pour_requires_clt && !machine.has_clt() {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "{} pours only with the Command Line Tools installed",
             f.name
         )));
@@ -106,7 +106,7 @@ fn preflight(
             ),
         };
         if !met {
-            return Err(InstallError::PassThrough(format!(
+            return Err(InstallError::Unsupported(format!(
                 "{} needs {what}",
                 f.name
             )));
@@ -125,8 +125,8 @@ fn preflight(
 pub enum InstallError {
     /// Local installation failure message.
     Failed(String),
-    /// Recipe requires delegating to real `brew`.
-    PassThrough(String),
+    /// Recipe or arguments need a native capability that is not implemented.
+    Unsupported(String),
 }
 
 impl From<String> for InstallError {
@@ -195,7 +195,7 @@ fn dependency_plan(
     ) -> Result<(), InstallError> {
         let name = name.strip_prefix("homebrew/core/").unwrap_or(name);
         if !super::valid_component(name) {
-            return Err(InstallError::PassThrough(format!(
+            return Err(InstallError::Unsupported(format!(
                 "qualified dependency {name} needs its tap recipe"
             )));
         }
@@ -506,8 +506,8 @@ fn relocate_staged(
     install_name_tool: Option<&Path>,
 ) -> Result<(), InstallError> {
     use std::os::unix::fs::MetadataExt;
-    let passthrough = |what: String| {
-        InstallError::PassThrough(format!(
+    let unsupported = |what: String| {
+        InstallError::Unsupported(format!(
             "{} bottle relocation needs Homebrew ({what})",
             f.name
         ))
@@ -515,7 +515,7 @@ fn relocate_staged(
     let root = prefix.root.to_string_lossy().into_owned();
     let cellar = prefix.cellar().to_string_lossy().into_owned();
     if root.contains('\0') || cellar.contains('\0') {
-        return Err(passthrough("prefix path is not spellable".into()));
+        return Err(unsupported("prefix path is not spellable".into()));
     }
     let java = f
         .dependencies
@@ -577,14 +577,14 @@ fn relocate_staged(
         let shown = path.to_string_lossy().into_owned();
         if is_mach_o(&bytes) {
             let names = crate::macho::load_names(&bytes)
-                .map_err(|e| passthrough(format!("{shown}: {e}")))?;
+                .map_err(|e| unsupported(format!("{shown}: {e}")))?;
             let mut args = relocation_args(&names, |name| relocate_name(name, &pairs))
-                .map_err(|e| passthrough(format!("{shown}: {e}")))?;
+                .map_err(|e| unsupported(format!("{shown}: {e}")))?;
             if args.is_empty() {
                 continue;
             }
             let Some(install_name_tool) = install_name_tool else {
-                return Err(passthrough(format!(
+                return Err(unsupported(format!(
                     "{shown} needs install_name_tool, and no developer tools are installed"
                 )));
             };
@@ -597,9 +597,9 @@ fn relocate_staged(
             args.push(shown.clone());
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let out = fetch::run_capture(&install_name_tool, &refs)
-                .map_err(|e| passthrough(e.clone()))?;
+                .map_err(|e| unsupported(e.clone()))?;
             if !out.status.success() {
-                return Err(passthrough(format!(
+                return Err(unsupported(format!(
                     "install_name_tool: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 )));
@@ -614,9 +614,9 @@ fn relocate_staged(
                     &shown,
                 ],
             )
-            .map_err(|e| passthrough(e.clone()))?;
+            .map_err(|e| unsupported(e.clone()))?;
             if !out.status.success() {
-                return Err(passthrough(format!(
+                return Err(unsupported(format!(
                     "codesign: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 )));
@@ -720,7 +720,7 @@ fn install_one(
     }
     let leftovers = linkage_leftovers(&poured);
     if !leftovers.is_empty() {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "{} bottle may still reference its build prefix ({}); needs Homebrew relocation",
             f.name,
             leftovers.first().cloned().unwrap_or_default()
@@ -1534,7 +1534,7 @@ fn activate_keg_with(
         return if refused.is_empty() {
             Err(error)
         } else {
-            let (InstallError::Failed(message) | InstallError::PassThrough(message)) = error;
+            let (InstallError::Failed(message) | InstallError::Unsupported(message)) = error;
             Err(InstallError::Failed(format!(
                 "{message}; could not restore aliases: {}",
                 refused.join(", ")
@@ -1589,7 +1589,7 @@ fn owned_keg_links(prefix: &Prefix, name: &str, include_opt: bool) -> Result<Vec
         return Err("abrew: invalid formula name".to_string());
     }
     check_directory(&prefix.cellar().join(name), &prefix.root).map_err(|e| match e {
-        InstallError::Failed(message) | InstallError::PassThrough(message) => message,
+        InstallError::Failed(message) | InstallError::Unsupported(message) => message,
     })?;
     let cellar = prefix.cellar().join(name);
     let mut links = Vec::new();
@@ -1681,7 +1681,7 @@ pub fn remove_dangling_links(prefix: &Prefix, name: &str) -> Result<usize, Strin
 
 fn pour_bottle(prefix: &Prefix, f: &Formula, staging: &Path) -> Result<PathBuf, InstallError> {
     let Some(bottle) = f.bottle_for(&Machine::this().bottle_tags()).cloned() else {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "no bottle for {} on this platform",
             f.name
         )));
@@ -1849,13 +1849,13 @@ pub fn uninstall(
 /// Downloads and verifies `f`'s bottle or source tarball into the cache without installing.
 pub fn fetch_only(prefix: &Prefix, f: &Formula) -> Result<(), InstallError> {
     if !super::valid_component(&f.name) || !super::valid_cask_version(&keg_version(f)) {
-        return Err(InstallError::PassThrough(
+        return Err(InstallError::Unsupported(
             "unsupported formula name/version".to_string(),
         ));
     }
     prefix.ensure()?;
     let Some(bottle) = f.bottle_for(&Machine::this().bottle_tags()).cloned() else {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "no bottle for {} on this platform; fetch -s for source",
             f.name
         )));
@@ -2530,7 +2530,7 @@ mod tests {
         cache_formula(&prefix, 3, &url3, &sha3, ":any_skip_relocation", &[]);
         assert!(matches!(
             install(&api, &prefix, "demo", &InstallOpts::default()),
-            Err(InstallError::PassThrough(_))
+            Err(InstallError::Unsupported(_))
         ));
         assert!(matches!(
             install(
@@ -2542,7 +2542,7 @@ mod tests {
                     ..InstallOpts::default()
                 }
             ),
-            Err(InstallError::PassThrough(_))
+            Err(InstallError::Unsupported(_))
         ));
         assert_eq!(
             aterm_uds::spawnfd::command(prefix.bin().join("demo"))
@@ -2720,14 +2720,14 @@ mod tests {
     /// `:any` relocation runs the developer directory's own
     /// `install_name_tool`, never the `/usr/bin` shim, which raises Apple's
     /// install dialog on a Mac without the developer tools: with none, a
-    /// bottle whose Mach-O carries a placeholder name is handed to real
-    /// Homebrew before anything runs, its bytes untouched. NEGATIVE CONTROL:
+    /// bottle whose Mach-O carries a placeholder name is refused as unsupported
+    /// before anything runs, its bytes untouched. NEGATIVE CONTROL:
     /// with a tool given, that tool runs on the file with the names'
     /// arguments (a stand-in that records them and refuses, so nothing is
     /// signed), and a bottle with no placeholder Mach-O needs no tool at all.
     #[cfg(target_os = "macos")]
     #[test]
-    fn relocation_without_the_developer_tools_delegates_before_running_anything() {
+    fn relocation_without_the_developer_tools_is_refused_before_running_anything() {
         use crate::macho::fixtures::{ID_DYLIB, LOAD_DYLIB, dylib_command, thin};
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = aterm_tempfile::tempdir().unwrap();
@@ -2748,7 +2748,7 @@ mod tests {
         );
         std::fs::write(&lib, &bytes).unwrap();
         match relocate_staged(&prefix, &f, &staged, None) {
-            Err(InstallError::PassThrough(why)) => assert!(
+            Err(InstallError::Unsupported(why)) => assert!(
                 why.contains("needs install_name_tool, and no developer tools are installed"),
                 "{why}"
             ),
@@ -2769,7 +2769,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
         match relocate_staged(&prefix, &f, &staged, Some(&stand_in)) {
-            Err(InstallError::PassThrough(why)) => {
+            Err(InstallError::Unsupported(why)) => {
                 assert!(why.contains("install_name_tool: stand-in refuses"), "{why}");
             }
             other => panic!("{other:?}"),
@@ -2885,7 +2885,7 @@ mod tests {
         let api = Api::new(prefix.clone());
         assert!(matches!(
             install(&api, &prefix, "demo", &InstallOpts::default()),
-            Err(InstallError::PassThrough(_))
+            Err(InstallError::Unsupported(_))
         ));
         assert!(!prefix.cellar().exists());
         assert!(!prefix.cellar().exists());

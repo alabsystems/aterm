@@ -293,12 +293,15 @@ mod workstation_setup;
 #[cfg(target_os = "macos")]
 pub use devtools_helper_drive::run_devtools_helper_drive;
 pub use quit_reopen::{REOPEN_VERB, run_reopen_after};
-#[cfg(unix)]
-pub use system_state::note_journal_refused;
 pub use system_state::{
     Admission as InitialSetupAdmission, CHECK_FAILED_NOTE, InitialSetupPermissionPolicy,
-    RESTORE_FAILED_NOTE, SETUP_ROW, STATE_UNREAD_NOTE, SetupCheck, SetupOperation, SetupStatus,
-    SetupStatusRow, journal_refused_entry, pass_rows, restore_rows,
+    RESTORE_BACKUP_UNREAD_NOTE, RESTORE_FAILED_NOTE, SETUP_ROW, STARTUP_RETRY_NOTE,
+    STATE_UNREAD_NOTE, SetupCheck, SetupOperation, SetupStatus, SetupStatusRow, calm_setup_row,
+    journal_refused_entry, pass_rows, restore_rows, setup_not_started_entry, setup_set_aside_entry,
+};
+#[cfg(unix)]
+pub use system_state::{
+    clear_setup_not_started, note_journal_refused, note_setup_not_started, note_setup_set_aside,
 };
 /// Mend this Mac's vault subscriber off the event loop, at once and every
 /// `secrets_join::MEND_EVERY` (`secrets_join::spawn_mend_lane`): for a windowed launch whose
@@ -674,6 +677,10 @@ mod resize_epoch;
 mod resize_ledger;
 mod restart_act;
 mod restore;
+mod rewind;
+mod rewind_band;
+mod rewind_verb;
+mod rewind_worker;
 mod route_chrome;
 mod scroll_motion;
 mod scrollbar;
@@ -2766,6 +2773,7 @@ struct RepaintKey {
     system_dark: bool,
     link_caption: Option<link_target::LinkHover>,
     claude_footer_fp: u64,
+    rewind_fp: u64,
 }
 
 fn preedit_fingerprint(preedit: &str, caret: Option<usize>) -> u64 {
@@ -3203,6 +3211,20 @@ enum Wake {
     Aos {
         ask: aos_verb::Ask,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
+    /// A `rewind` verb request for `session` ([`rewind_verb`]).
+    Rewind {
+        session: u64,
+        asked: rewind_verb::Asked,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
+    /// A Rewind fold finished off the main thread ([`rewind_worker`]).
+    RewindFolded(Box<rewind_worker::Folded>),
+    /// A host worker's prepare or judgements for the `aos` verb's glow.
+    AosWorked(Box<aos_host::Worked>),
+    AosExport {
+        kept: Option<u64>,
+        reply: std::sync::mpsc::Sender<Result<aos_host::Exported, String>>,
     },
     PersonStandIn {
         asked: control::control_media::PersonAsked,
@@ -5316,6 +5338,11 @@ struct Session {
 }
 
 impl Session {
+    /// The live terminal, for what acts on the program's screen rather than shows it (resizes, reports, scroll state).
+    pub(crate) const fn live_term(&self) -> &Arc<Mutex<Terminal>> {
+        &self.term
+    }
+
     fn reap_child(&self) -> Option<aterm_pty::ChildExit> {
         let collected = if self.shell_identity.own_child {
             aterm_pty::collect_exit_status(self.pid)
@@ -5472,6 +5499,7 @@ struct PooledSession {
     theme: Option<session_theme::SessionTheme>,
     own_colors: Option<Arc<aterm_core::config::TerminalConfig>>,
     focus_arms_told: u32,
+    rewind: Option<rewind::RewindView>,
 }
 
 impl SessionPool {
@@ -5488,9 +5516,55 @@ impl SessionPool {
                 theme: None,
                 own_colors: None,
                 focus_arms_told,
+                rewind: None,
             },
         );
         id
+    }
+    /// The terminal a render of session `id` shows: its Rewind view's past screen while one is shown, else the live one.
+    fn shown_term(&self, id: u64) -> Option<Arc<Mutex<Terminal>>> {
+        self.shown(id).map(|(term, _)| term)
+    }
+    /// [`Self::shown_term`] with the session it belongs to.
+    fn shown(&self, id: u64) -> Option<(Arc<Mutex<Terminal>>, &Session)> {
+        let p = self.sessions.get(&id)?;
+        let term = p
+            .rewind
+            .as_ref()
+            .and_then(|view| view.shown.clone())
+            .unwrap_or_else(|| p.session.term.clone());
+        Some((term, &p.session))
+    }
+    /// Whether session `id` has a Rewind view open, so the person's keys and mouse reports are withheld from it.
+    fn is_rewound(&self, id: u64) -> bool {
+        self.sessions.get(&id).is_some_and(|p| p.rewind.is_some())
+    }
+    /// Whether any session has a Rewind view open, so a frame with none builds no plan to look for one.
+    fn any_rewound(&self) -> bool {
+        self.sessions.values().any(|p| p.rewind.is_some())
+    }
+    fn rewind(&self, id: u64) -> Option<&rewind::RewindView> {
+        self.sessions.get(&id)?.rewind.as_ref()
+    }
+    fn rewind_mut(&mut self, id: u64) -> Option<&mut rewind::RewindView> {
+        self.sessions.get_mut(&id)?.rewind.as_mut()
+    }
+    /// Install or end session `id`'s Rewind view, returning the one it replaces.
+    fn set_rewind(
+        &mut self,
+        id: u64,
+        view: Option<rewind::RewindView>,
+    ) -> Option<rewind::RewindView> {
+        let p = self.sessions.get_mut(&id)?;
+        std::mem::replace(&mut p.rewind, view)
+    }
+    /// The Rewind fingerprint of session `id`'s frame: 0 while live.
+    fn rewind_fp(&self, id: u64) -> u64 {
+        self.sessions.get(&id).map_or(0, |p| {
+            p.rewind
+                .as_ref()
+                .map_or(0, |view| view.fingerprint(p.session.ctx.job_feed.bytes()))
+        })
     }
     fn focus_arms_told(&self, id: u64) -> Option<u32> {
         self.sessions.get(&id).map(|p| p.focus_arms_told)
@@ -6747,6 +6821,8 @@ struct WindowState {
     scroll_frac_px: i32,
     pill_shown: bool,
     pane_overlay: pane_chrome::PaneOverlay,
+    /// The Rewind borders the last frame added to `input_scratch.nova_add` ([`rewind_band`]).
+    rewind_quads: Vec<aterm_render::GlowQuad>,
     last_resize_at: Option<Instant>,
     pending_resize: Option<PhysicalSize<u32>>,
     next_resize_settle: Option<Instant>,
@@ -6754,6 +6830,9 @@ struct WindowState {
     #[cfg(any(target_os = "linux", test))]
     initial_frame_settle: Option<InitialFrameSettle>,
     panes_stale: bool,
+    /// The restore asked the OS to maximize this window or put it in full screen
+    /// (`App::regrid_restored_windows`).
+    restore_show_awaited: bool,
     last_visible_views: Vec<tab_model::ViewId>,
     win_px: Option<PhysicalSize<u32>>,
     carried_inner_px: Option<PhysicalSize<u32>>,
@@ -6880,6 +6959,11 @@ struct WindowState {
     deck_card: Option<SettingsCard>,
     deck_fold: Option<SettingsCard>,
     deck_memo: std::cell::Cell<(u64, u64)>,
+    /// The deck card's last layout by its key, from the fingerprint that made it to the splice
+    /// that rasters it in the same frame, and what its layouts read that the live edge never
+    /// moves.
+    deck_laid: std::cell::RefCell<Option<crate::stats_deck::DeckLaid>>,
+    deck_still: std::cell::RefCell<crate::stats_deck::DeckStill>,
     /// The deck's live edge as its last layout drew it ([`crate::stats_live`]): its key, what
     /// the card's raster holds, the card's rects that move with it, and how fast its strips
     /// glide (device px a second).
@@ -7724,6 +7808,7 @@ impl WindowState {
             scroll_frac_px: 0,
             pill_shown: false,
             pane_overlay: pane_chrome::PaneOverlay::default(),
+            rewind_quads: Vec::new(),
             last_resize_at: None,
             pending_resize: None,
             next_resize_settle: None,
@@ -7731,6 +7816,7 @@ impl WindowState {
             #[cfg(any(target_os = "linux", test))]
             initial_frame_settle: None,
             panes_stale: false,
+            restore_show_awaited: false,
             last_visible_views: Vec::new(),
             win_px: None,
             carried_inner_px: None,
@@ -7858,6 +7944,8 @@ impl WindowState {
             deck_card: None,
             deck_fold: None,
             deck_memo: std::cell::Cell::new((0, 0)),
+            deck_laid: std::cell::RefCell::new(None),
+            deck_still: std::cell::RefCell::default(),
             deck_live_drawn: std::cell::Cell::new(None),
             deck_live_card: std::cell::Cell::new((0, crate::stats_live::DeckLive::STILL)),
             deck_live_rects: std::cell::RefCell::new(Vec::new()),
@@ -9307,6 +9395,8 @@ struct App {
     linux_held_said: Option<u64>,
     config_cleared: std::collections::BTreeSet<String>,
     config_settings_shows: std::collections::BTreeSet<String>,
+    /// The front window and its tab at the last sync (`App::band_meets_the_front`).
+    band_front: Option<(WindowId, Option<tab_model::TabId>)>,
     managed_current_recorded:
         Option<(Vec<toolchain_words::ManagedItem>, aterm_messages::MessageId)>,
     harness_note_recorded: Option<String>,
@@ -9735,6 +9825,7 @@ impl App {
             .unwrap_or(u64::MAX);
         now.saturating_duration_since(self.last_update_activity_at) >= AUTOMATIC_UPDATE_QUIET_EPOCH
             && !pending_user_input
+            && !self.system_state_handoff_pending()
             && self.pool.iter().all(|session| {
                 automatic_output_activity_quiet(
                     now_ns,
@@ -14003,7 +14094,14 @@ impl App {
             return;
         };
         self.sync_window(front);
-        self.record_config_rows_settings_shows();
+        let shown = (
+            front,
+            self.windows
+                .get(&front)
+                .and_then(|ws| ws.tab_set.active_id()),
+        );
+        let changed = self.band_front.replace(shown) != Some(shown);
+        self.band_meets_the_front(changed);
         let focused_session = self.front_terminal(front).map(|terminal| terminal.session);
         if let Some(session) = focused_session {
             self.note_session_seen(front, session);
@@ -14138,6 +14236,7 @@ impl App {
             cwd: None,
             sandbox_wrap: None,
             terminal_config: None,
+            tab_status: true,
             integrate: false,
             lat_epoch: Instant::now(),
             loop_idle: Arc::default(),
@@ -14566,6 +14665,7 @@ impl App {
             linux_held_said: None,
             config_cleared: std::collections::BTreeSet::new(),
             config_settings_shows: std::collections::BTreeSet::new(),
+            band_front: None,
             managed_current_recorded: None,
             harness_note_recorded: None,
             upgrade_view: upgrade_host::UpgradeView::default(),
@@ -15597,6 +15697,13 @@ impl App {
     }
 
     fn deliver_paste(&mut self, wid: WindowId, session: Option<u64>, text: String, source: Source) {
+        let target = session.or_else(|| self.front_terminal(wid).map(|t| t.session));
+        if let Some(rewound) =
+            target.filter(|s| matches!(source, Source::Human) && self.pool.is_rewound(*s))
+        {
+            self.note_rewind_withheld(rewound);
+            return;
+        }
         let bracketed = match session {
             Some(owner) => self
                 .pool
@@ -16866,6 +16973,7 @@ impl ApplicationHandler<Wake> for App {
         let _root = crate::watchdog::enter_about_to_wait();
         self.prune_deferred_gpu_captures();
         self.drain_message_inbox();
+        self.aos_watch();
         self.release_documents_at_park();
         if !self.consent_observer_reconciled {
             self.consent_observer_reconciled = true;
@@ -17136,6 +17244,7 @@ impl ApplicationHandler<Wake> for App {
                 Some(false)
             } else if !headless && ws.os_window.is_some() && ws.focused {
                 match ws.front_terminal() {
+                    Some(terminal) if self.pool.is_rewound(terminal.session) => Some(false),
                     Some(terminal) => terminal.term.try_lock().ok().map(|term| {
                         blink_clock_armed(
                             term.cursor_visible(),
@@ -18738,9 +18847,27 @@ impl App {
             Wake::CardSeed { asked, reply } => {
                 let _ = reply.send(self.control_card_seed(asked));
             }
-            Wake::Aos { ask, reply } => {
-                let _ = reply.send(self.control_aos(ask, Instant::now()));
+            Wake::Aos { ask, reply } => match ask {
+                aos_verb::Ask::Asked(aos_verb::Asked::Repair(code)) => {
+                    self.aos_repair_begin(code, Instant::now(), reply);
+                }
+                ask => {
+                    let _ = reply.send(self.control_aos(ask, Instant::now()));
+                }
+            },
+            Wake::AosWorked(worked) => self.aos_worked(*worked),
+            Wake::AosExport { kept, reply } => {
+                let _ = reply.send(
+                    self.aos_export_now(kept)
+                        .map_err(|refusal| refusal.to_string()),
+                );
             }
+            Wake::Rewind {
+                session,
+                asked,
+                reply,
+            } => self.control_rewind(session, asked, reply),
+            Wake::RewindFolded(folded) => self.rewind_folded(*folded),
             Wake::PersonStandIn { asked, reply } => {
                 let _ = reply.send(self.person_stand_in(asked));
             }
@@ -25073,6 +25200,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         cwd,
         sandbox_wrap,
         terminal_config: Some(config.applied_terminal_config_from(&startup_colors)),
+        tab_status: config.tab_status_or_default(),
         integrate,
         lat_epoch,
         loop_idle: Arc::default(),
@@ -25729,6 +25857,9 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
             let _ = proxy.send_event(Wake::HostNote(note));
         })
     });
+    // A file atom's admission guards the owner's `[privacy] protected_roots` too (each reload
+    // sets them again, `reconcile_consent_config`).
+    occupancy_wakes::set_privacy(config.privacy_protected_roots());
 
     // The board's mode is the launch policy's before the host's first look (the ring is
     // written only while it observes); the policy's Entry follows once the app is built.
@@ -26388,6 +26519,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         linux_held_said: None,
         config_cleared: std::collections::BTreeSet::new(),
         config_settings_shows: launch_settings_shows,
+        band_front: None,
         managed_current_recorded: None,
         harness_note_recorded: None,
         upgrade_view: upgrade_host::UpgradeView::with_writer(upgrade_host::live_word_writer(
@@ -27298,6 +27430,10 @@ mod tests;
 #[cfg(test)]
 #[path = "lib_aos_repair_tests.rs"]
 mod aos_repair_tests;
+
+#[cfg(test)]
+#[path = "lib_aos_r2_tests.rs"]
+mod aos_r2_tests;
 
 /// An admitted schedule plan published over the front window's glow on the host path (design §10.6); only a debug build publishes plans.
 #[cfg(all(test, debug_assertions))]

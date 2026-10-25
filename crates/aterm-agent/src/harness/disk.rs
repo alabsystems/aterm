@@ -11,50 +11,19 @@ use aterm_json::{Map, Value};
 use super::truncate_bytes;
 use super::usage::rfc3339_utc;
 
-/// `disk.warn_free_gib` (design §5.5).
-pub const DEFAULT_WARN_FREE_GIB: u64 = 40;
-
 /// `disk.target_stale_days` (design §5.5).
 pub const DEFAULT_TARGET_STALE_DAYS: i64 = 1;
 
 /// `disk.apply` (design §5.5): the owner's verb removes nothing until this is on.
 pub const DEFAULT_APPLY: bool = false;
 
-/// `disk.auto_free_gib`.
-pub const DEFAULT_AUTO_FREE_GIB: u64 = 10;
-
-/// How far above the floor the pressure pass reclaims before it stops.
-pub const PRESSURE_MARGIN_GIB: u64 = 5;
-
-/// The automatic floor is at least this percent of the volume's size ([`Config::for_volume`]).
-pub const AUTO_FREE_PCT: u64 = 5;
-
-/// The warning threshold is at least this percent of the volume's size ([`Config::for_volume`]).
-pub const WARN_FREE_PCT: u64 = 8;
-
-/// The most the volume's share ([`AUTO_FREE_PCT`]) raises the automatic floor to.
-pub const AUTO_FREE_SHARE_MAX_GIB: u64 = 32;
-
-/// The most the volume's share ([`WARN_FREE_PCT`]) raises the warning to.
-pub const WARN_FREE_SHARE_MAX_GIB: u64 = 64;
-
-/// The most the volume's share ([`EMERGENCY_FREE_PCT`]) raises the emergency line to.
-pub const EMERGENCY_FREE_SHARE_MAX_GIB: u64 = 8;
-
-/// An UNWRITTEN `warn_free_gib` is held to at most this percent of the volume ([`Config::on_volume`]).
-pub const SMALL_WARN_MAX_PCT: u64 = 20;
-
-/// An UNWRITTEN `auto_free_gib` is held to at most this percent of the volume ([`Config::on_volume`]).
-pub const SMALL_FLOOR_MAX_PCT: u64 = 10;
-
-/// THE EMERGENCY: below the larger of this many GiB and [`EMERGENCY_FREE_PCT`] of the volume ([`Thresholds::emergency`]), or with fewer than [`EMERGENCY_FILES_FREE`] inodes, writes are about to fail with `ENOSPC`.
-pub const EMERGENCY_FREE_GIB: u64 = 4;
-
-/// See [`EMERGENCY_FREE_GIB`].
-pub const EMERGENCY_FREE_PCT: u64 = 1;
-
-/// Fewer free inodes than this is an emergency whatever the bytes say: a volume out of inodes fails a write with `ENOSPC` too.
-pub const EMERGENCY_FILES_FREE: u64 = 50_000;
+/// The volume's lines (the warning, the floor, the emergency) are one definition, which the tools that admit a disk need read too (`aterm_capacity::floor`, `docs/DESIGN-adaptive-build-2026-10-24.md` CAP-1); [`Config`] carries the owner's knobs into it.
+pub use aterm_capacity::floor::{
+    AUTO_FREE_PCT, AUTO_FREE_SHARE_MAX_GIB, DEFAULT_AUTO_FREE_GIB, DEFAULT_WARN_FREE_GIB,
+    EMERGENCY_FILES_FREE, EMERGENCY_FREE_GIB, EMERGENCY_FREE_PCT, EMERGENCY_FREE_SHARE_MAX_GIB,
+    PRESSURE_MARGIN_GIB, SMALL_FLOOR_MAX_PCT, SMALL_WARN_MAX_PCT, WARN_FREE_PCT,
+    WARN_FREE_SHARE_MAX_GIB, Written,
+};
 
 /// The `CACHEDIR.TAG` signature every cargo-compatible build tool writes into a target directory (the Cache Directory Tagging Specification's fixed line, which cargo emits verbatim).
 pub const CACHEDIR_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
@@ -326,49 +295,21 @@ impl Config {
     /// [`Self::on_volume`], the lines raised to this machine's ROOM (`room` bytes, [`room`]; `disk.room_gib` pins it, read as written).
     #[must_use]
     pub fn on_volume_with(self, total: Option<u64>, written: Written, room: Option<u64>) -> Config {
-        let base = self.on_volume_base(total, written);
-        let Some(room) = self.room_gib.map(|g| g.saturating_mul(GIB)).or(room) else {
-            return base;
-        };
-        if total.is_none() {
-            return base;
-        }
-        let room_gib = room.div_ceil(GIB);
+        let c = aterm_capacity::floor::in_force(self.knobs(written), total, room);
         Config {
-            warn_free_gib: if written.warn_free_gib {
-                base.warn_free_gib
-            } else {
-                base.warn_free_gib.max(room_gib.saturating_mul(2))
-            },
-            auto_free_gib: if base.auto_free_gib == 0 || written.auto_free_gib {
-                base.auto_free_gib
-            } else {
-                base.auto_free_gib.max(room_gib)
-            },
-            ..base
+            warn_free_gib: c.warn_free_gib,
+            auto_free_gib: c.auto_free_gib,
+            ..self
         }
     }
 
-    fn on_volume_base(self, total: Option<u64>, written: Written) -> Config {
-        let Some(total) = total else {
-            return self;
-        };
-        let share = |pct: u64, max: u64| (total / 100).saturating_mul(pct).div_ceil(GIB).min(max);
-        let held = |knob: u64, pct: u64| knob.min((total.saturating_mul(pct) / 100 / GIB).max(1));
-        Config {
-            warn_free_gib: if written.warn_free_gib {
-                self.warn_free_gib
-            } else {
-                held(self.warn_free_gib, SMALL_WARN_MAX_PCT)
-                    .max(share(WARN_FREE_PCT, WARN_FREE_SHARE_MAX_GIB))
-            },
-            auto_free_gib: if self.auto_free_gib == 0 || written.auto_free_gib {
-                self.auto_free_gib
-            } else {
-                held(self.auto_free_gib, SMALL_FLOOR_MAX_PCT)
-                    .max(share(AUTO_FREE_PCT, AUTO_FREE_SHARE_MAX_GIB))
-            },
-            ..self
+    /// The knobs the volume's lines are made from ([`aterm_capacity::floor`]).
+    const fn knobs(self, written: Written) -> aterm_capacity::floor::Knobs {
+        aterm_capacity::floor::Knobs {
+            warn_free_gib: self.warn_free_gib,
+            auto_free_gib: self.auto_free_gib,
+            room_gib: self.room_gib,
+            written,
         }
     }
 
@@ -392,22 +333,13 @@ impl Config {
         written: Written,
         room: Option<u64>,
     ) -> Thresholds {
-        let c = self.on_volume_with(total, written, room);
-        let pct = |p: u64| total.map_or(0, |t| (t / 100).saturating_mul(p));
-        let floor = c.auto_free_gib.saturating_mul(GIB);
-        let emergency = EMERGENCY_FREE_GIB
-            .saturating_mul(GIB)
-            .max(pct(EMERGENCY_FREE_PCT).min(EMERGENCY_FREE_SHARE_MAX_GIB.saturating_mul(GIB)));
+        let l = aterm_capacity::floor::lines(self.knobs(written), total, room);
         Thresholds {
-            warn: c.warn_free_gib.saturating_mul(GIB),
-            floor,
-            target: c.pressure_target_bytes(),
-            emergency: if floor > 0 {
-                emergency.min(floor)
-            } else {
-                emergency
-            },
-            files_emergency: EMERGENCY_FILES_FREE,
+            warn: l.warn,
+            floor: l.floor,
+            target: l.target,
+            emergency: l.emergency,
+            files_emergency: l.files_emergency,
         }
     }
 
@@ -416,15 +348,6 @@ impl Config {
     pub fn quiet_s(&self) -> i64 {
         self.target_stale_days.max(1).saturating_mul(DAY_S)
     }
-}
-
-/// Which of the volume-scaled `[disk]` knobs the owner WROTE in aterm.toml ([`Config::on_volume`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Written {
-    /// `disk.auto_free_gib` is written.
-    pub auto_free_gib: bool,
-    /// `disk.warn_free_gib` is written.
-    pub warn_free_gib: bool,
 }
 
 /// The free-space thresholds in force on one volume ([`Config::thresholds`]), in bytes.
@@ -480,6 +403,17 @@ impl Thresholds {
             Some(f) if f < self.warn => Level::Low,
             Some(_) => Level::Ok,
             None => Level::Unknown,
+        }
+    }
+
+    /// The free bytes below which [`Self::level`] reads `short` or worse by bytes alone: the
+    /// floor, or with the floor at 0 what writes need.
+    #[must_use]
+    pub const fn short_below(&self) -> u64 {
+        if self.floor > 0 {
+            self.floor
+        } else {
+            self.emergency
         }
     }
 }
@@ -3388,32 +3322,8 @@ fn walk_bytes_until(
     (total, unread)
 }
 
-#[cfg(test)]
-thread_local! {
-    static VOLUME_ERRORS_QUIET: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// The volume holding `path`, read now through the mount table `table` ([`aterm_sysprobe::volumes`]).
-pub fn volume_of(
-    path: &Path,
-    table: &aterm_sysprobe::volumes::Table,
-) -> Result<aterm_sysprobe::volumes::Reading, aterm_sysprobe::volumes::Unread> {
-    use aterm_sysprobe::volumes::{self, Unread};
-    let path = table.long_spelling(path);
-    let spelled = volumes::mount_of(&path, table).ok_or(Unread::NoMount)?;
-    if spelled.automounted || !spelled.local {
-        return volumes::read(spelled);
-    }
-    let _quiet = aterm_sysprobe::quiet_errors();
-    #[cfg(test)]
-    VOLUME_ERRORS_QUIET.set(Some(aterm_sysprobe::errors_quiet()));
-    let placed = path
-        .ancestors()
-        .find_map(|a| std::fs::canonicalize(a).ok())
-        .ok_or(Unread::NoMount)?;
-    volumes::read_path(&placed, table)
-}
+/// The volume holding `path`, read now through the mount table `table`: one reader with the tools that admit a disk need, so both place a path on the same volume and key its room alike.
+pub use aterm_capacity::reading::volume_of;
 
 /// Free bytes on the volume holding `path` ([`volume_of`] through a fresh mount table), or `None` on any failure.
 #[must_use]

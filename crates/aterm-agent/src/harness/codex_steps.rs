@@ -19,14 +19,13 @@ use super::steps::{
 };
 use super::transcript;
 
-/// The codex-alab builds whose rollouts the lab measured and reduced (`harness/testdata/steps/<stem>-<leg>.jsonl`).
-pub const CODEX_MEASURED_BUILDS: &[&str] = &[
-    "0.164.0-dev.12521+g3d3eb12d8",
-    "0.164.0-dev.12479+g07a25d86a",
-    "0.164.0-dev.12672+g089291d37",
-    "0.164.0-dev.13172+g32a73bca2",
-    "0.165.0-dev.13594+g870dabaa6",
-];
+/// The codex-alab builds whose rollouts the lab measured and reduced (`harness/testdata/steps/<stem>-<leg>.jsonl`):
+/// exactly the builds those reductions' own `# codex <build>` lines name, read by `build.rs` from the files the
+/// checkout holds. A release builds from a clean clone, so there a build is listed when its reductions are committed
+/// (`lab codex-measure`) and by nothing else; in a working tree an uncommitted reduction counts too, which is why
+/// `lab codex-measure` refuses one HEAD does not hold. Sorted, matched whole.
+pub const CODEX_MEASURED_BUILDS: &[&str] =
+    include!(concat!(env!("OUT_DIR"), "/codex_measured_builds.rs"));
 
 /// The build `build` as the log says it (`ver=`).
 #[must_use]

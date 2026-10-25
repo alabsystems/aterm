@@ -864,16 +864,7 @@ const fn heat_color(base: u32, q: f32) -> u32 {
     const HOT: u32 = crate::cursor_comet::ICE_WHITE;
     const HEAT_COLOR_MAX: f32 = 0.5;
     let t = (q.clamp(0.0, 1.0) * HEAT_COLOR_MAX).clamp(0.0, 1.0);
-    if t == 0.0 {
-        return base & 0x00FF_FFFF;
-    }
-    const fn lerp(base: u32, hot: u32, t: f32, sh: u32) -> u32 {
-        let a = ((base >> sh) & 0xff) as f32;
-        let b = ((hot >> sh) & 0xff) as f32;
-        let v = (a + (b - a) * t).round() as u32;
-        if v < 255 { v } else { 255 }
-    }
-    (lerp(base, HOT, t, 16) << 16) | (lerp(base, HOT, t, 8) << 8) | lerp(base, HOT, t, 0)
+    crate::effect_util::lerp_rgb(base, HOT, t)
 }
 
 /// Stamp `intensity` and `warmth` onto `cfg` and heat its colour toward ice white.

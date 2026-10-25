@@ -1546,7 +1546,8 @@ pub struct Binding {
     /// The remaining human step of a renewal, cleared by a successful sign-in.
     pub sign_in_task: Option<SignInTask>,
     /// How the row's last automatic sign-in ended and the routes it tried
-    /// ([`note_sign_in_attempt`]); a failed one is cleared by a renewal ([`note_renewed`]).
+    /// ([`note_sign_in_attempt`]); a failed one is cleared by a new login, a renewal's
+    /// ([`note_renewed`]) or one signed back in where it stands ([`note_signed_back`]).
     pub sign_in_attempt: Option<SignInAttempt>,
 }
 
@@ -1699,6 +1700,18 @@ impl Default for Binding {
 }
 
 impl Binding {
+    /// Ends a failed automatic sign-in's record once the row has a login again: what it tried is
+    /// no news of the new login, whose own end, due date or failed renewal is told afresh.
+    fn clear_failed_sign_in(&mut self) {
+        if self
+            .sign_in_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.outcome.failing())
+        {
+            self.sign_in_attempt = None;
+        }
+    }
+
     /// Clamped login lifetime in seconds used to forecast expiration.
     #[must_use]
     pub fn lifetime(&self) -> i64 {
@@ -2106,8 +2119,23 @@ pub fn note_sign_in_attempt(
     vec![event]
 }
 
-/// The rows of `roster` whose last automatic sign-in failed and which are still without a login
-/// they can be run on here (not enrolled, or signed out), in roster order, with that attempt.
+/// Whether `row` still needs a sign-in on this machine: it has no login it can be run on here
+/// (not enrolled, or signed out), or it has an email and its login is due for renewal (as
+/// [`renew_due`] lists it). A failed automatic sign-in of such a row is still news
+/// ([`failing_sign_ins`]); one of a row whose login works and is not due is not.
+#[must_use]
+pub fn needs_sign_in(row: &Row, state: &State, logins: &Logins, enrolled: bool, now: i64) -> bool {
+    matches!(
+        condition(row, state, enrolled, now),
+        Condition::NotEnrolled | Condition::SignedOut
+    ) || (row.email.is_some()
+        && enrolled
+        && matches!(login_state(row, logins, state, now), LoginState::Due { .. }))
+}
+
+/// The rows of `roster` whose last automatic sign-in failed and which still need one
+/// ([`needs_sign_in`]: not enrolled, signed out, or due for renewal), in roster order, with that
+/// attempt.
 #[must_use]
 pub fn failing_sign_ins(
     roster: &Roster,
@@ -2119,12 +2147,7 @@ pub fn failing_sign_ins(
     roster
         .rows
         .iter()
-        .filter(|row| {
-            matches!(
-                condition(row, state, is_enrolled(row, &enrolled), now),
-                Condition::NotEnrolled | Condition::SignedOut
-            )
-        })
+        .filter(|row| needs_sign_in(row, state, logins, is_enrolled(row, &enrolled), now))
         .filter_map(|row| {
             let attempt = logins.get(&row.label)?.sign_in_attempt.clone()?;
             attempt
@@ -2209,6 +2232,7 @@ pub fn note_signed_back(
         binding.renewed_at = Some(at);
         binding.notice_end = None;
         binding.served_at = Some(binding.served_at.map_or(at, |held| held.max(at)));
+        binding.clear_failed_sign_in();
     }
     out
 }
@@ -2240,13 +2264,7 @@ pub fn note_renewed(
     binding.wrong_at = None;
     binding.proved_by = None;
     binding.sign_in_task = None;
-    if binding
-        .sign_in_attempt
-        .as_ref()
-        .is_some_and(|attempt| attempt.outcome.failing())
-    {
-        binding.sign_in_attempt = None;
-    }
+    binding.clear_failed_sign_in();
     binding.subscription = subscription
         .map(|s| one_line(s, SUBSCRIPTION_MAX))
         .filter(|s| !s.is_empty());

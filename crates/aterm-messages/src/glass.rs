@@ -960,17 +960,19 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
             caps = capsules_width(kept, true, width);
             clear = clearance(kept, true);
         }
+        // The spare clear cell goes to the title where it keeps a word more.
         let left = budget.saturating_sub(2 + clear + caps);
         let spare = clear.saturating_sub(1);
-        title = title_in(&title_words, left, width)
-            .or_else(|| {
-                if spare > 0 {
-                    title_in(&title_words, left + spare, width)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+        let tight = title_in(&title_words, left, width);
+        let roomy = if spare > 0 {
+            title_in(&title_words, left + spare, width)
+        } else {
+            None
+        };
+        title = match (tight, roomy) {
+            (Some(tight), Some(roomy)) if roomy != tight => roomy,
+            (tight, roomy) => tight.or(roomy).unwrap_or_default(),
+        };
     }
     Fit {
         short,
@@ -1447,13 +1449,15 @@ pub(crate) mod tests {
     ) -> bool {
         let shown = &row.title.1;
         let cells = width(shown);
+        let words = |text: &str| text.trim_end_matches('\u{2026}').split_whitespace().count();
         cells > 0
             && [Some(spec.title), spec.title_short]
                 .into_iter()
                 .flatten()
-                .any(|words| {
-                    title_in(words, cells, width).as_deref() == Some(shown.as_str())
-                        && title_in(words, cells - 1, width).is_none()
+                .any(|title| {
+                    title_in(title, cells, width).as_deref() == Some(shown.as_str())
+                        && title_in(title, cells - 1, width)
+                            .is_none_or(|fewer| words(&fewer) < words(shown))
                 })
     }
 

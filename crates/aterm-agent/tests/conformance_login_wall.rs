@@ -453,10 +453,16 @@ fn gate_at(st: &TurnEndState, r: &TurnEndReading) -> PickerGate {
     )
 }
 
+/// The state the tab walled in: another tab's sign-in was still carried there before it came
+/// back, and a `/login` aterm typed was typed before the roster knew the login's row (a roster
+/// row's lost login types none: `RenewAtLogin`).
 fn earlier(s: &S) -> S {
     let mut then = s.clone();
     if then["elsewhere"] == 2 {
         then.insert("elsewhere", if s["track"] == 1 { 0 } else { 1 });
+    }
+    if then["track"] == 1 {
+        then.insert("rostered", 0);
     }
     then
 }
@@ -823,7 +829,7 @@ fn defective() -> Vec<(&'static str, Model)> {
             "ClockAtWall",
             "NoSee",
             "NoHold",
-            "WaitOnRoster",
+            "LoginOnRoster",
             "NoFollow",
             "CheckIdle",
             "NoDoneWall",

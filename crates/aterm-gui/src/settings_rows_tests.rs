@@ -720,8 +720,8 @@ fn arrows_and_tab_reach_the_themes_row() {
     assert_eq!(focus(&lab).as_deref(), Some("settings/nav/appearance"));
     let compiled = lab.compile(1_200.0, 820.0);
     assert!(
-        compiled.semantic(&key("settings/nav/themes")).is_none(),
-        "the row goes with its page"
+        compiled.semantic(&key("settings/nav/themes")).is_some(),
+        "the row stays on the rail: no page moves its rows"
     );
 
     open_themes(&mut lab);
@@ -770,10 +770,8 @@ fn the_category_grid_moves_by_column_and_row() {
         &mut lab,
         AppEvent::TextInput(TextInputEvent::Right { extend: false }),
     );
-    assert_eq!(
-        focus(&lab).as_deref(),
-        Some("settings/categories/wallpaper")
-    );
+    // Appearance | Themes: its sub-page beside it.
+    assert_eq!(focus(&lab).as_deref(), Some("settings/categories/themes"));
     dispatch(&mut lab, AppEvent::StepFocus(-1));
     assert_eq!(focus(&lab).as_deref(), Some("settings/categories/manual"));
 }
@@ -5144,7 +5142,12 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                     kinds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let feedback = lab.state().feedback.clone().unwrap_or_default();
                     if kind != "reset-all" {
-                        let bare = |text: &str| text.split_whitespace().collect::<String>();
+                        let separator = FACT_SEPARATOR.trim();
+                        let bare = |text: &str| {
+                            text.split_whitespace()
+                                .filter(|word| *word != separator)
+                                .collect::<String>()
+                        };
                         let read = status_words(&after, "settings/status/visual");
                         let (px, face) = crate::native_ui::text_paint_metrics(
                             SemanticRole::Status,
@@ -5172,7 +5175,10 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push(format!("{context}: sets {every:?} of {feedback:?}"));
                         }
-                        for word in feedback.split_whitespace() {
+                        for word in feedback
+                            .split_whitespace()
+                            .filter(|word| *word != separator)
+                        {
                             for (_, piece) in line_pieces(word) {
                                 let whole = every.len() <= 1
                                     || every.iter().any(|line| {
@@ -5697,7 +5703,11 @@ fn the_keyboard_on_a_status_bar_reads_its_words() {
                 );
             }
             let whole = seen.values().cloned().collect::<Vec<_>>().join(" ");
-            let bare = |text: &str| text.split_whitespace().collect::<String>();
+            let bare = |text: &str| {
+                text.split_whitespace()
+                    .filter(|word| *word != FACT_SEPARATOR.trim())
+                    .collect::<String>()
+            };
             assert_eq!(
                 bare(&whole),
                 bare(&feedback),
@@ -5744,7 +5754,12 @@ fn a_save_that_failed_is_read_whole_in_a_short_bar() {
             "{feedback:?}"
         );
         let every = every_status_line(&mut lab, 178.0, 348.0, "settings/status/visual");
-        let bare = |text: &str| text.split_whitespace().collect::<String>();
+        // A fact separator is no word: a break takes it.
+        let bare = |text: &str| {
+            text.split_whitespace()
+                .filter(|word| *word != FACT_SEPARATOR.trim())
+                .collect::<String>()
+        };
         assert_eq!(bare(&every.concat()), bare(&feedback), "{every:#?}");
         assert!(
             every.iter().all(|line| !line.contains('\u{2026}')),

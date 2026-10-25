@@ -96,11 +96,27 @@ fn answer_with_retry(
     stop_after_persist: bool,
     retry: bool,
 ) -> (PreparedSetup<StartupClaim>, StartupSent) {
+    answer_with_sent(
+        setup,
+        fault,
+        stop_after_persist,
+        retry,
+        StartupSent::default(),
+    )
+}
+
+pub(super) fn answer_with_sent(
+    setup: &mut InitialSetupAdmissionStopTest<'_>,
+    fault: InitialSetupAdmissionFault,
+    stop_after_persist: bool,
+    retry: bool,
+    sent: StartupSent,
+) -> (PreparedSetup<StartupClaim>, StartupSent) {
     let plan = setup.plan();
     let mut host = ScratchStartup {
         setup,
         fault,
-        sent: StartupSent::default(),
+        sent,
         stop_after_persist,
         retry,
         stop_on_error: false,
@@ -318,6 +334,13 @@ impl SetupRestartHost for ScratchRestartRetry<'_, '_> {
         panic!("Stop must retire this exact admission before any run dispatch")
     }
     fn failure(&mut self, _: &str) {}
+    fn held_elsewhere(&self, _: &str) -> bool {
+        false
+    }
+    fn queue(&mut self) -> bool {
+        // No other setup holds this scratch Mac's records: the choice is let go, as before.
+        false
+    }
 }
 
 #[test]
@@ -366,7 +389,8 @@ fn admission_stop_handoff_stops_its_published_target_after_the_answer_is_refused
         let (prepared, sent) = answer(&mut setup, fault, true);
         assert!(matches!(prepared, PreparedSetup::Unavailable));
         assert!(!setup.pending(), "write authority is terminally refused");
-        let revision = setup.snapshot().unwrap().revision;
+        // The Stop's worker may be saving its request now, which a snapshot sees changing.
+        let revision = setup.revision().unwrap();
         run_prepared_setup(prepared, None, sent);
         assert!(settle_setup_stop(HANG));
         assert_eq!(script().stops, [revision]);
@@ -458,6 +482,12 @@ impl SetupRestartHost for ScratchChoice<'_, '_> {
     }
     fn failure(&mut self, why: &str) {
         panic!("the fresh explicit choice was refused: {why}")
+    }
+    fn held_elsewhere(&self, _: &str) -> bool {
+        false
+    }
+    fn queue(&mut self) -> bool {
+        panic!("no other setup holds this scratch Mac's records")
     }
 }
 

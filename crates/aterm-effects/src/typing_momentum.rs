@@ -67,7 +67,7 @@ impl TypingMomentum {
         let v = if dt == 0.0 {
             self.value
         } else {
-            self.value * (-dt / TYPING_MOMENTUM_TAU).exp()
+            self.value * (-dt * (1.0 / TYPING_MOMENTUM_TAU)).exp()
         };
         if v < SNAP_ZERO { 0.0 } else { v }
     }

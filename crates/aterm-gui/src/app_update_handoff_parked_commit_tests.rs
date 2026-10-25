@@ -44,6 +44,23 @@ impl Drop for Pty {
 
 impl Parked {
     fn new(armed: &[u8]) -> Self {
+        Self::with_attention(armed, None)
+    }
+
+    fn with_attention(armed: &[u8], attention: Option<&str>) -> Self {
+        let (parked, attempt) = Self::with_app(armed, attention, |_| {});
+        assert!(
+            matches!(attempt, ParkAttempt::Parked),
+            "PRECONDITION: the park landed ({attempt:?})"
+        );
+        parked
+    }
+
+    fn with_app(
+        armed: &[u8],
+        attention: Option<&str>,
+        configure: impl FnOnce(&mut crate::App),
+    ) -> (Self, ParkAttempt) {
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
         // SAFETY: a zeroed termios filled by `tcgetattr` on the live slave.
         unsafe {
@@ -60,27 +77,36 @@ impl Parked {
         let term = session.term.clone();
         let ctx = session.ctx.clone();
         crate::term_lock(&term).process(armed);
+        if let Some(attention) = attention {
+            crate::session_timeline::write_attention_owned(
+                &ctx,
+                "review",
+                crate::session_timeline::MetaEdit::Set(attention),
+                aterm_slog::Actor::Ctl,
+            )
+            .expect("the alert stands before the manifest is drawn");
+        }
+        configure(&mut app);
         let (record, cancelled, stood_down, transferred) =
             prelaunch_record(7, ApplyMode::Immediate);
         let nonce = record.nonce.clone();
         app.update_handoff_prelaunch = Some(record);
-        let parked = app.park_and_transfer_to_prelaunched_successor(std::time::Instant::now());
-        assert!(
-            matches!(parked, ParkAttempt::Parked),
-            "PRECONDITION: the park landed ({parked:?})"
-        );
+        let attempt = app.park_and_transfer_to_prelaunched_successor(std::time::Instant::now());
         app.handoff_reposts = Some(Vec::new());
         let (reject, rejected) = std::sync::mpsc::sync_channel(1);
-        Self {
-            app,
-            slave,
-            term,
-            ctx,
-            nonce,
-            reject: Some(reject),
-            _channels: (cancelled, stood_down, transferred, rejected),
-            _pty: Pty(master, slave),
-        }
+        (
+            Self {
+                app,
+                slave,
+                term,
+                ctx,
+                nonce,
+                reject: Some(reject),
+                _channels: (cancelled, stood_down, transferred, rejected),
+                _pty: Pty(master, slave),
+            },
+            attempt,
+        )
     }
 
     fn proof_ready(&mut self) -> crate::UpdateHandoffCompletion {
@@ -203,6 +229,485 @@ fn assert_whole(frame: &[u8]) {
 }
 
 const WRITTEN: &str = "attempt-bound Commit pipe closed before its atomic write";
+
+#[cfg(target_os = "macos")]
+mod queued_setup_custody {
+    use std::cell::RefCell;
+
+    use super::*;
+    use crate::native_app::{ActionInvocation, AppEvent};
+    use crate::native_ui::ActionId;
+    use crate::system_state::{SetupOperation, SetupStatus};
+    use crate::system_state_host::{InitialSetupApplyReceipt, InitialSetupHandlers};
+    use aterm_types::macos_setup::Plan;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Operation {
+        Apply,
+        Restore,
+    }
+
+    #[derive(Default)]
+    struct Worker {
+        operation: Option<Operation>,
+        plan: Option<Plan>,
+        receipt: Option<InitialSetupApplyReceipt>,
+    }
+
+    thread_local! {
+        static WORKER: RefCell<Worker> = const { RefCell::new(Worker {
+            operation: None,
+            plan: None,
+            receipt: None,
+        }) };
+    }
+
+    struct WorkerScope;
+
+    impl WorkerScope {
+        fn new() -> Self {
+            WORKER.with(|worker| *worker.borrow_mut() = Worker::default());
+            Self
+        }
+    }
+
+    impl Drop for WorkerScope {
+        fn drop(&mut self) {
+            WORKER.with(|worker| *worker.borrow_mut() = Worker::default());
+        }
+    }
+
+    /// The setup worker boundary: an Apply's actual receipt is retained without
+    /// accepting it, as while another process holds the setup records. No Mac
+    /// setup or profile lock runs in this GUI test.
+    fn handlers() -> InitialSetupHandlers {
+        InitialSetupHandlers {
+            apply: |plan, _, _, receipt| {
+                WORKER.with(|worker| {
+                    let mut worker = worker.borrow_mut();
+                    assert!(worker.operation.is_none());
+                    worker.operation = Some(Operation::Apply);
+                    worker.plan = Some(plan);
+                    worker.receipt = Some(receipt);
+                });
+                true
+            },
+            restore: || {
+                WORKER.with(|worker| {
+                    let mut worker = worker.borrow_mut();
+                    assert!(worker.operation.is_none());
+                    worker.operation = Some(Operation::Restore);
+                });
+                true
+            },
+            ..InitialSetupHandlers::inert_for_test()
+        }
+    }
+
+    fn pending(operation: Operation) -> bool {
+        WORKER.with(|worker| {
+            let worker = worker.borrow();
+            worker.operation == Some(operation)
+                && (operation != Operation::Apply || worker.receipt.is_some())
+        })
+    }
+
+    fn queued_status(operation: Operation) -> SetupStatus {
+        assert!(
+            pending(operation),
+            "the actual handler owns the queued intent"
+        );
+        SetupStatus {
+            busy: true,
+            queued: true,
+            operation: (operation == Operation::Restore).then_some(SetupOperation::Restore),
+            plan: WORKER
+                .with(|worker| worker.borrow().plan.clone())
+                .or_else(|| Some(Plan::default())),
+            ..SetupStatus::default()
+        }
+    }
+
+    fn cannot_cut_queued_operation(operation: Operation) {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        for queue in [false, true] {
+            let _worker = WorkerScope::new();
+            let wid = crate::WindowId(0);
+            let mut view = None;
+            let (mut parked, attempt) = Parked::with_app(b"", None, |app| {
+                let window = app.windows.get_mut(&wid).expect("the private window");
+                window.rows = 90;
+                window.cols = 160;
+                assert!(app.open_system_state_tab());
+                view = Some(app.active_native_view(wid).expect("System State"));
+                app.set_system_state_handlers_for_test(handlers());
+                app.publish_system_state(SetupStatus {
+                    plan: Some(Plan::default()),
+                    ..SetupStatus::default()
+                });
+                if queue {
+                    let (_, view) = view.expect("the setup page");
+                    let key = match operation {
+                        Operation::Apply => "system-state/group/2/leave",
+                        Operation::Restore => "system-state/restore",
+                    };
+                    app.dispatch_native_view_event(
+                        wid,
+                        view,
+                        AppEvent::Action(ActionInvocation {
+                            id: ActionId::new(key),
+                            value: None,
+                        }),
+                    )
+                    .expect("the page's real action is dispatched before the park");
+                    app.drain_system_state_actions();
+                    assert!(pending(operation), "the real action reached its handler");
+                    app.publish_system_state(queued_status(operation));
+                    app.resolve_system_state_apply();
+                    assert!(pending(operation), "no durable admission was acknowledged");
+                }
+            });
+            let (instance, view) = view.expect("the page was open before the park");
+            if queue {
+                assert!(
+                    parked
+                        .app
+                        .native_runtime
+                        .presentation(instance, view)
+                        .expect("the actual page projection")
+                        .indicators
+                        .busy,
+                    "the queued worker is still presented as pending"
+                );
+            }
+            assert!(
+                !parked.app.workstation_setup.pending(),
+                "this is a manual page operation, not the original startup offer"
+            );
+            match attempt {
+                ParkAttempt::Parked => {}
+                ParkAttempt::NotYet(_) | ParkAttempt::Failed(_) if queue => {
+                    assert!(pending(operation), "a refusal retains the queued intent");
+                    assert!(
+                        parked.app.pending_update_handoff.is_none(),
+                        "a refused startup has no parked transfer to Commit"
+                    );
+                    assert!(
+                        parked
+                            .app
+                            .handoff_reposts
+                            .as_ref()
+                            .is_some_and(Vec::is_empty),
+                        "a refused startup posts no Commit continuation"
+                    );
+                    continue;
+                }
+                other => panic!("PRECONDITION: the unchanged park must land ({other:?})"),
+            }
+            let capture = parked
+                .app
+                .pending_update_handoff
+                .as_ref()
+                .expect("the queued operation predates this actual manifest");
+            assert_eq!(
+                parked.app.update_handoff_activity_epoch, capture.activity_epoch,
+                "the manifest was drawn after the page action, without resetting its epoch"
+            );
+            assert!(
+                parked.app.carried_claims_held(&capture.carried_claims),
+                "the ordinary session claims remain unchanged"
+            );
+            let completion = parked.proof_ready();
+            let verdict = parked.run_to_verdict(completion);
+            if queue {
+                assert!(
+                    pending(operation),
+                    "the queued intent still has no durable successor"
+                );
+                assert_ne!(
+                    verdict, WRITTEN,
+                    "a queued {operation:?} must survive instead of reaching Commit's atomic write"
+                );
+            } else {
+                assert_eq!(
+                    verdict, WRITTEN,
+                    "CONTROL: the unchanged page permits the actual Commit write"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_queued_apply_waiting_for_setup_cannot_be_cut_by_commit() {
+        cannot_cut_queued_operation(Operation::Apply);
+    }
+
+    #[test]
+    fn a_queued_restore_waiting_for_setup_cannot_be_cut_by_commit() {
+        cannot_cut_queued_operation(Operation::Restore);
+    }
+}
+
+#[test]
+fn an_alert_clear_acknowledged_at_the_commit_write_cannot_restore_the_drawn_alert() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    for clear in [false, true] {
+        let mut parked = Parked::with_attention(b"", Some("Review is needed"));
+        let drawn = parked
+            .app
+            .pending_update_handoff
+            .as_ref()
+            .expect("the parked attempt")
+            .carried_claims
+            .clone();
+        assert!(
+            parked.app.carried_claims_held(&drawn),
+            "PRECONDITION: the manifest carries the standing alert"
+        );
+        assert!(
+            !parked
+                .ctx
+                .meta
+                .lock()
+                .unwrap()
+                .handoff_attention_owners()
+                .is_empty(),
+            "PRECONDITION: the live alert stands"
+        );
+        let (term, ctx, store) = (
+            parked.term.clone(),
+            parked.ctx.clone(),
+            parked.app.store.clone(),
+        );
+        let (answered, reply) = std::sync::mpsc::sync_channel(1);
+        parked.app.handoff_before_egress_fence = Some(Box::new(move || {
+            let result = clear.then(|| {
+                crate::control::cmd_meta(&term, &store, 0, &ctx, "unset attention owner=review")
+            });
+            answered.send(result).expect("the test receives the reply");
+        }));
+        let completion = parked.proof_ready();
+        let verdict = parked.run_to_verdict(completion);
+        let answered = reply.try_recv().expect("the hook ran before the write");
+        if clear {
+            assert_eq!(answered, Some(("OK\n".to_string(), true)));
+            assert!(
+                parked
+                    .ctx
+                    .meta
+                    .lock()
+                    .unwrap()
+                    .handoff_attention_owners()
+                    .is_empty(),
+                "the acknowledged clear took the live alert down"
+            );
+            assert!(
+                !parked.app.carried_claims_held(&drawn),
+                "the manifest's alert is obsolete"
+            );
+            assert!(
+                verdict.contains("structural activity"),
+                "an acknowledged alert clear stands down the stale Commit: {verdict}"
+            );
+        } else {
+            assert_eq!(answered, None);
+            assert_eq!(
+                verdict, WRITTEN,
+                "NEGATIVE CONTROL: an unchanged alert does not hold the Commit"
+            );
+        }
+    }
+}
+
+#[test]
+fn persisted_policy_changes_at_the_commit_write_stand_down_the_old_manifest() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    for change in [None, Some("set autopilot off"), Some("set questions ask")] {
+        let mut parked = Parked::new(b"");
+        let (term, ctx, store) = (
+            parked.term.clone(),
+            parked.ctx.clone(),
+            parked.app.store.clone(),
+        );
+        let (answered, reply) = std::sync::mpsc::sync_channel(1);
+        parked.app.handoff_before_egress_fence = Some(Box::new(move || {
+            answered
+                .send(change.map(|change| crate::control::cmd_meta(&term, &store, 0, &ctx, change)))
+                .expect("the test receives the metadata reply");
+        }));
+        let completion = parked.proof_ready();
+        let verdict = parked.run_to_verdict(completion);
+        let answered = reply.try_recv().expect("the write-edge hook ran");
+        if change.is_some() {
+            assert_eq!(answered, Some(("OK\n".to_string(), true)));
+            assert!(
+                verdict.contains("structural activity"),
+                "the acknowledged policy must cross the next handoff: {change:?}: {verdict}"
+            );
+        } else {
+            assert_eq!(answered, None);
+            assert_eq!(
+                verdict, WRITTEN,
+                "unchanged metadata permits the actual write"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_final_claim_fence_refuses_contention_and_holds_its_locks_through_the_write() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let parked = Parked::new(b"");
+    let expected = parked
+        .app
+        .pending_update_handoff
+        .as_ref()
+        .expect("parked attempt")
+        .carried_claims
+        .first()
+        .expect("one handed session")
+        .clone();
+    let sources = [super::HandoffClaimSource {
+        expected,
+        ctx: parked.ctx.clone(),
+        topics: crate::fabric::render_topics(&parked.ctx.fabric.topics()),
+    }];
+    for busy in ["meta", "timeline", "banner"] {
+        let meta = (busy == "meta").then(|| parked.ctx.meta.lock().unwrap());
+        let timeline = (busy == "timeline").then(|| parked.ctx.timeline.lock().unwrap());
+        let banner = (busy == "banner").then(|| parked.ctx.box_banner.try_guard().unwrap());
+        let mut wrote = false;
+        let refused = super::with_handoff_claims(&sources, || wrote = true);
+        assert_eq!(refused, None);
+        assert!(!wrote, "a contended claim fence cannot write a Commit");
+        drop(banner);
+        drop(timeline);
+        drop(meta);
+        let written = super::with_handoff_claims(&sources, || {
+            assert!(matches!(
+                parked.ctx.meta.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            assert!(matches!(
+                parked.ctx.timeline.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            assert!(parked.ctx.box_banner.try_guard().is_none());
+            Err::<(), _>("fixture write failure")
+        });
+        assert_eq!(written, Some(Err("fixture write failure")));
+        assert!(
+            parked.ctx.meta.try_lock().is_ok(),
+            "rollback can acquire meta"
+        );
+        assert!(
+            parked.ctx.timeline.try_lock().is_ok(),
+            "rollback can acquire timeline"
+        );
+        assert!(
+            parked.ctx.box_banner.try_guard().is_some(),
+            "rollback can acquire banner state"
+        );
+    }
+}
+
+#[test]
+fn a_notice_admitted_after_the_manifest_stands_commit_down() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let parked = Parked::new(b"");
+    let expected = parked
+        .app
+        .pending_update_handoff
+        .as_ref()
+        .unwrap()
+        .carried_claims[0]
+        .clone();
+    let mut sources = [super::HandoffClaimSource {
+        expected,
+        ctx: parked.ctx.clone(),
+        topics: crate::fabric::render_topics(&parked.ctx.fabric.topics()),
+    }];
+    assert_eq!(
+        super::with_handoff_claims(&sources, || "unchanged"),
+        Some("unchanged")
+    );
+    let report = crate::term_lock(&parked.term).program_state();
+    assert!(
+        parked.ctx.box_banner.admit(&report),
+        "the program notification passed after capture"
+    );
+    let mut wrote = false;
+    assert_eq!(super::with_handoff_claims(&sources, || wrote = true), None);
+    assert!(
+        !wrote,
+        "the manifest cannot lose the admitted notice's custody"
+    );
+    sources[0].expected = sources[0]
+        .expected
+        .clone()
+        .with_banner(parked.ctx.box_banner.snapshot());
+    assert_eq!(
+        super::with_handoff_claims(&sources, || "recaptured"),
+        Some("recaptured")
+    );
+    assert!(
+        parked.ctx.box_banner.admit(&report),
+        "another notice may leave the same seq standing"
+    );
+    assert_eq!(
+        super::with_handoff_claims(&sources, || "stale"),
+        None,
+        "the revision detects equal-valued repeated notices"
+    );
+    sources[0].expected = sources[0]
+        .expected
+        .clone()
+        .with_banner(parked.ctx.box_banner.snapshot());
+    assert_eq!(
+        super::with_handoff_claims(&sources, || "current"),
+        Some("current")
+    );
+    parked.ctx.box_banner.herald(7, |_| ((), true));
+    assert_eq!(
+        super::with_handoff_claims(&sources, || "stale"),
+        None,
+        "a newly queued box receipt cannot be omitted by Commit"
+    );
+}
+
+#[test]
+fn every_handed_session_needs_exactly_one_claim_row_at_the_write() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let parked = Parked::new(b"");
+    let pending = parked
+        .app
+        .pending_update_handoff
+        .as_ref()
+        .expect("parked attempt");
+    assert!(
+        super::handoff_claim_sources(&parked.app.pool, &pending.live, &pending.carried_claims)
+            .is_some(),
+        "the unchanged manifest covers its actual handed session"
+    );
+    assert!(
+        super::handoff_claim_sources(&parked.app.pool, &pending.live, &[]).is_none(),
+        "a missing claim row cannot leave that session unfenced"
+    );
+    let mut wrong = pending.carried_claims.clone();
+    wrong[0].local_id = u64::MAX;
+    assert!(
+        super::handoff_claim_sources(&parked.app.pool, &pending.live, &wrong).is_none(),
+        "matching counts cannot substitute a different session"
+    );
+    let duplicate = [
+        pending.carried_claims[0].clone(),
+        pending.carried_claims[0].clone(),
+    ];
+    assert!(
+        super::handoff_claim_sources(&parked.app.pool, &pending.live, &duplicate).is_none(),
+        "an extra row cannot borrow the handed session"
+    );
+}
 
 #[test]
 fn a_control_paste_in_flight_holds_the_commit_until_its_frame_is_whole() {

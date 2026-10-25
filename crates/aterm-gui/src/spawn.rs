@@ -572,6 +572,8 @@ pub(crate) struct SessionFactory {
     pub(crate) sandbox_wrap: Option<String>,
     /// Engine config (scrollback/cursor/theme/palette) applied to each tab's `Terminal`.
     pub(crate) terminal_config: Option<aterm_core::config::TerminalConfig>,
+    /// Whether program-state projection can keep an adopted box receipt standing.
+    pub(crate) tab_status: bool,
     /// Whether to inject OSC 133/633 shell integration, with a fresh nonce per tab.
     pub(crate) integrate: bool,
     /// Latency epoch shared across tabs.
@@ -651,6 +653,7 @@ impl SessionFactory {
             cwd,
             sandbox_wrap,
             terminal_config: _,
+            tab_status: _,
             integrate,
             lat_epoch: _,
             loop_idle: _,
@@ -1232,6 +1235,8 @@ pub(crate) struct Adopted {
     pub autopilot_end: Option<String>,
     /// The record's book of declared wakes (`SessionRecord::wakes`), unparsed.
     pub wakes: Option<String>,
+    /// The actual queued box receipt from the handoff's status row, bound before reads.
+    pub box_receipt: Option<crate::box_banner::Receipt>,
 }
 
 /// Seed a seamless update's carried end, or a proven self-claim's carried face, onto an adopted
@@ -1451,6 +1456,26 @@ pub(crate) fn install_adopted_archive(
     }
 }
 
+/// Require session `id`'s shell-integration nonce (authorizing it unless it was lost), then seed its recording when `record`, so the seed keyframe carries the nonce its shell signs marks with.
+pub(crate) fn arm_shell_nonce_then_seed(
+    term: &Mutex<Terminal>,
+    temporal: &std::sync::Mutex<crate::temporal::TemporalRecorder>,
+    nonce: Option<([u8; 32], bool)>,
+    record: bool,
+    id: u64,
+) {
+    if let Some((nonce, lost)) = nonce {
+        let mut t = term_lock(term);
+        if !lost {
+            t.authorize_shell_integration(nonce);
+        }
+        t.set_require_shell_integration_nonce(true);
+    }
+    if record {
+        seed_temporal_keyframe(term, temporal, id);
+    }
+}
+
 /// Take the temporal recorder's first keyframe of session `id`'s engine before its reader runs.
 pub(crate) fn seed_temporal_keyframe(
     term: &Mutex<Terminal>,
@@ -1593,6 +1618,7 @@ pub(crate) fn spawn_session(
         .as_ref()
         .and_then(|adopted| adopted.autopilot_end.clone());
     let adopt_wakes: Option<String> = adopt.as_ref().and_then(|adopted| adopted.wakes.clone());
+    let adopt_box_receipt = adopt.as_ref().and_then(|adopted| adopted.box_receipt);
     let substitute = records_shell_start(adopt.is_some(), factory.exec_command.as_deref())
         .then(|| {
             substitute_shell(
@@ -1936,6 +1962,10 @@ pub(crate) fn spawn_session(
         );
         factory.edge_inbox.push(id);
     }
+    if factory.tab_status {
+        ctx.box_banner
+            .adopt(adopt_box_receipt, term_lock(&term).program_state());
+    }
     if let Some(debt) = carried_render_debt {
         seed_adopted_render_debt(&term, &ctx.timeline, debt);
     }
@@ -1953,14 +1983,6 @@ pub(crate) fn spawn_session(
         );
     }
 
-    if let Some(nonce) = shell_nonce {
-        let mut t = term_lock(&term);
-        if !lost_nonce {
-            t.authorize_shell_integration(nonce);
-        }
-        t.set_require_shell_integration_nonce(true);
-    }
-
     let reach = session_host_reach();
     match spare {
         Some(s) => crate::spare::wire_spare_taint(&term, &s.link),
@@ -1973,9 +1995,13 @@ pub(crate) fn spawn_session(
 
     configure_palette_refusal(&term);
 
-    if factory.temporal_recording {
-        seed_temporal_keyframe(&term, &temporal, id);
-    }
+    arm_shell_nonce_then_seed(
+        &term,
+        &temporal,
+        shell_nonce.map(|nonce| (nonce, lost_nonce)),
+        factory.temporal_recording,
+        id,
+    );
 
     match crate::keeper_link::journal_refusal() {
         #[cfg(unix)]
@@ -2405,10 +2431,47 @@ mod adoption_wiring_tests {
 
 #[cfg(test)]
 mod temporal_seed_tests {
-    use super::seed_temporal_keyframe;
+    use super::{arm_shell_nonce_then_seed, seed_temporal_keyframe};
     use crate::temporal::TemporalRecorder;
     use aterm_core::terminal::Terminal;
     use std::sync::Mutex;
+
+    /// The seed is taken after the session's shell nonce is installed, so a replay from it accepts the shell's signed marks and captures as the live engine does.
+    #[test]
+    fn the_seed_carries_the_shell_nonce_its_marks_are_signed_with() {
+        let nonce = [0x3Cu8; 32];
+        let hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let signed = format!(
+            "\x1b]133;A;id={hex}\x07$ \x1b]133;B;id={hex}\x07ls\r\n\x1b]133;C;id={hex}\x07\
+             out\r\n\x1b]133;D;0;id={hex}\x07"
+        );
+        let term = Mutex::new(Terminal::new(6, 40));
+        let recorder = Mutex::new(TemporalRecorder::new());
+        arm_shell_nonce_then_seed(&term, &recorder, Some((nonce, false)), true, 1);
+        assert_eq!(recorder.lock().unwrap().keyframe_count(), 1, "seeded");
+
+        let clock = aterm_core::terminal::ClockReading::now();
+        crate::term_lock(&term).process_at(signed.as_bytes(), clock);
+        recorder
+            .lock()
+            .unwrap()
+            .apply_inline(crate::temporal::TemporalMsg::RawIn(
+                crate::temporal::InputSlice::at(signed.as_bytes(), clock),
+            ));
+        let live = crate::term_lock(&term);
+        assert_eq!(
+            live.command_marks().len(),
+            1,
+            "precondition: the live engine took the mark"
+        );
+        let replay = recorder
+            .lock()
+            .unwrap()
+            .replay_at(None)
+            .expect("the seed replays");
+        assert_eq!(replay.command_marks().len(), 1, "the replay took it too");
+        assert_eq!(replay.checkpoint_visible(), live.checkpoint_visible());
+    }
 
     #[test]
     fn an_engine_adopted_mid_sequence_seeds_a_keyframe_that_continues_it() {
@@ -7267,7 +7330,6 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             job_feed.fed(&t, &bytes[off..end], moved, Instant::now);
                             if let (Some(tx), Some(pre), Some(copy)) =
                                 (&temporal_tx, spine_pre, &spine_copy)
-                                && end > off
                             {
                                 let input =
                                     crate::temporal::InputSlice::new(copy.clone(), off..end, clock);

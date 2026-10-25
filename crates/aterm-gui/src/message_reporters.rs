@@ -239,6 +239,31 @@ impl ConfigFamily {
         }
     }
 
+    /// The band's short title for `n` warnings, led by what is wrong so a narrow
+    /// band never paints a bare count (`2…`) or a lone `Couldn't…`; at most 11
+    /// cells (whole beside `Edit` at 22 columns) or cut to its subject.
+    pub(crate) const fn short_title(self, n: usize) -> Option<&'static str> {
+        let one = n == 1;
+        match self {
+            Self::Keybindings if one => None,
+            Self::Keybindings => Some("Keybindings"),
+            Self::IgnoredKeys if one => Some("Unknown key"),
+            // `Unknown keys` is a cell too long for 22 columns, where its cut
+            // kept `Unknown…` alone.
+            Self::IgnoredKeys => Some("Bad keys"),
+            Self::UnacceptedValues if one => Some("Bad value"),
+            Self::UnacceptedValues => Some("Bad values"),
+            Self::CursorTrail if one => Some("Trail error"),
+            Self::CursorTrail => Some("Bad trail"),
+            Self::Fonts if one => Some("Font error"),
+            Self::Fonts => Some("Font errors"),
+            Self::Assets if one => Some("Image error"),
+            Self::Assets => Some("Bad images"),
+            Self::SecureKeyboard => Some("Secure Entry"),
+            Self::Restart | Self::RetiredKeys => None,
+        }
+    }
+
     /// Resolution log title when a clean reload clears `n` warnings in this family.
     pub(crate) fn fixed_title(self, title: &str, n: usize) -> Option<String> {
         let one = n == 1;
@@ -563,24 +588,30 @@ pub(crate) fn excerpt_head(sentence: &str, cap: usize) -> &str {
 
 fn config_family_message(family: ConfigFamily, sentences: &[String]) -> Message {
     let stripped: Vec<&str> = sentences.iter().map(|s| family.strip_prefix(s)).collect();
-    let title = match (family, stripped.as_slice()) {
-        (ConfigFamily::Restart, [only]) => restart_title(only),
+    let (title, short) = match (family, stripped.as_slice()) {
+        (ConfigFamily::Restart, [only]) => (restart_title(only), None),
         (ConfigFamily::IgnoredKeys, all)
             if all
                 .iter()
                 .all(|s| unknown_key_excerpt(s).is_some_and(|e| e.contains('\u{2192}'))) =>
         {
             match all.len() {
-                1 => "Misspelled setting".to_string(),
-                n => format!("{n} misspelled settings"),
+                1 => ("Misspelled setting".to_string(), Some("Key typo")),
+                n => (format!("{n} misspelled settings"), Some("Key typos")),
             }
         }
-        _ => family.title(stripped.len()),
+        _ => (
+            family.title(stripped.len()),
+            family.short_title(stripped.len()),
+        ),
     };
     let fixed = family.fixed_title(&title, stripped.len());
     let mut msg = Message::new(tags::CONFIG, family.severity(), title)
         .action(Intent::OpenConfigEditor { line: None })
         .key(family.key());
+    if let Some(short) = short {
+        msg = msg.short_title(short);
+    }
     let record = family.hold() == Hold::LogOnly;
     if record {
         msg = msg.record();
@@ -1351,10 +1382,11 @@ pub(crate) const KEY_RESTORED_HELD: &str = "harness.restored-held";
 
 /// Builds the error message when `aterm.toml` fails to load at launch.
 pub(crate) fn launch_load_failure(notice: &str) -> Message {
-    let title = if notice.starts_with("aterm.toml could not be read") {
-        "Couldn't read your settings"
+    // The band's short title says what is wrong, whole at 22 columns (item 87).
+    let (title, short) = if notice.starts_with("aterm.toml could not be read") {
+        ("Couldn't read your settings", "Read error")
     } else {
-        "Couldn't load your settings"
+        ("Couldn't load your settings", "TOML error")
     };
     let rows = notice
         .split_once(" (")
@@ -1366,7 +1398,7 @@ pub(crate) fn launch_load_failure(notice: &str) -> Message {
     } else {
         rows.into_iter().next().filter(|row| !row.is_empty())
     };
-    let mut msg = Message::new(tags::CONFIG, Severity::Error, title);
+    let mut msg = Message::new(tags::CONFIG, Severity::Error, title).short_title(short);
     let painted = error.is_some();
     if let Some(error) = error {
         msg = msg.line(error);
@@ -1818,6 +1850,18 @@ fn lane_title(head: &str) -> (&'static str, bool) {
     }
 }
 
+/// A lane title's short form for the band: what did not happen, never a lone
+/// `Couldn't…` or a verb a cut would read as a command.
+fn lane_short_title(title: &str) -> &'static str {
+    match title {
+        "Couldn't read your settings" => "TOML error",
+        "Couldn't save settings changes" | "Couldn't save a settings change" => "Not saved",
+        "Couldn't apply saved settings" => "Not applied",
+        "Couldn't confirm settings saved" => "Unconfirmed",
+        _ => "Not changed",
+    }
+}
+
 /// Builds the error message when the native config observation lane fails.
 pub(crate) fn config_lane_error(words: &str) -> Message {
     let mut rows = diagnostic_lines(words).into_iter();
@@ -1840,7 +1884,8 @@ pub(crate) fn config_lane_error(words: &str) -> Message {
     let lost = head
         .strip_prefix("Config reconciliation failed; ")
         .filter(|lost| !lost.is_empty());
-    let msg = Message::new(tags::CONFIG, Severity::Warn, title);
+    let msg =
+        Message::new(tags::CONFIG, Severity::Warn, title).short_title(lane_short_title(title));
     let msg = match lost {
         Some(lost) => msg.line(lost),
         None => msg,
@@ -1979,6 +2024,30 @@ pub(crate) fn input_refused(cause: &str) -> Message {
         cause,
         Then::step("Send it again once the program reads input"),
     )
+}
+
+/// Builds the notice when a person types or clicks into a pane Rewind shows at `shown`, a past local time.
+pub(crate) fn rewind_read_only(shown: &str) -> Message {
+    gesture_failure(
+        tags::SESSION,
+        Severity::Info,
+        &format!("Rewind is showing {shown}"),
+        "the program did not get that input",
+        Then::step("Press Esc to type into the program"),
+    )
+    .no_excerpt()
+}
+
+/// Builds the message when Rewind cannot open or step the focused pane.
+pub(crate) fn rewind_failed(why: &str) -> Message {
+    gesture_failure(
+        tags::SESSION,
+        Severity::Warn,
+        "Couldn't rewind this pane",
+        why,
+        Then::step("Choose View > Rewind Pane again"),
+    )
+    .no_excerpt()
 }
 
 /// Builds the error message when session restore stops after failing to create a window.
@@ -4338,7 +4407,11 @@ const ACCOUNTS_LABELS_LEAD: &str = "Signed out: ";
 
 const ACCOUNTS_LABELS_FILL: usize = 200;
 
-/// Builds the exceptions digest entry listing signed-out Claude Code accounts.
+/// THE RECORDED ERROR OF THE SIGNED-OUT CLAUDE CODE ROWS THAT NAME NO EMAIL
+/// (`accounts::signed_out`), a fact for later: aterm's sign-in ladder signs a row in by its email,
+/// so no route exists for these, and it asks no one to sign them in. A signed-out row with an
+/// email is never on it: the ladder signs that row in by itself, and where no route can, the
+/// no-sign-in fact names each one tried ([`accounts_no_sign_in_entry`]).
 pub(crate) fn accounts_signed_out_entry(labels: &[String]) -> Option<Entry> {
     let first = labels.first()?;
     let what = match labels.len() {
@@ -4351,8 +4424,15 @@ pub(crate) fn accounts_signed_out_entry(labels: &[String]) -> Option<Entry> {
         "",
         "signed-out",
         &what,
-        Why::OnlyYou(Reason::new(&filled.happened)),
-        notice_then(&filled.todo, filled.short),
+        Why::Spent {
+            tried: Reason::new("signs in by itself every row that names an email"),
+            reason: Reason::new(if labels.len() == 1 {
+                "this row names none, so no sign-in route exists for it"
+            } else {
+                "these rows name none, so no sign-in route exists for them"
+            }),
+        },
+        fact_then(&filled),
     )
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)
@@ -4369,6 +4449,12 @@ fn accounts_signed_out_lines(labels: &[String]) -> Vec<String> {
 }
 
 const NOTICE_LABEL_LINES: usize = aterm_messages::exceptions::MORE_LINES - 2;
+
+/// The step of a roster fact built from its notice (`aterm harness accounts`, which reads what
+/// aterm tried), with the short form only where the notice put its command under Details.
+fn fact_then(filled: &notice::Filled) -> Then {
+    notice_then(&filled.todo, filled.command.as_ref().and(filled.short))
+}
 
 fn notice_tail(entry: Entry, filled: notice::Filled) -> Entry {
     match filled.command {
@@ -4403,7 +4489,8 @@ fn labels_lines(lead: &str, labels: &[String], room: usize) -> Vec<String> {
     lines
 }
 
-/// Extracts the first signed-out account label targeted by an [`accounts_signed_out_entry`] action.
+/// Extracts the first signed-out account label an [`accounts_signed_out_entry`] names: the head of
+/// its labels line, the first line of its Details.
 pub(crate) fn accounts_signed_out_first(detail: &[String]) -> Option<&str> {
     detail
         .get(2)?
@@ -4416,9 +4503,10 @@ pub(crate) fn accounts_signed_out_first(detail: &[String]) -> Option<&str> {
 pub(crate) const ACCOUNTS_NO_SIGN_IN_KEY: &str = "harness.accounts.no-sign-in";
 
 /// The exceptions digest entry, a fact for later, for the Claude Code rows whose automatic
-/// sign-in found no route (or ran one that failed) and that still have no login: each row with
-/// the routes it tried. It asks no one to sign in: aterm tries each row again by itself, as soon
-/// as anything a route reads changes and at the latest when its backoff ends.
+/// sign-in found no route (or ran one that failed) and that still need one (no login to run on,
+/// or one due for renewal: `accounts::needs_sign_in`): each row with the routes it tried. It asks
+/// no one to sign in: aterm tries each row again by itself, as soon as anything a route reads
+/// changes and at the latest when its backoff ends.
 pub(crate) fn accounts_no_sign_in_entry(rows: &[(String, String)]) -> Option<Entry> {
     rows.first()?;
     let mut entry = Entry::new(
@@ -4430,7 +4518,7 @@ pub(crate) fn accounts_no_sign_in_entry(rows: &[(String, String)]) -> Option<Ent
             tried: Reason::new("tried every sign-in route this machine has"),
             reason: Reason::new("none can make the login here, and each one tried is named"),
         },
-        Then::step("Run aterm harness accounts to read each route tried"),
+        Then::step(ACCOUNTS_READ_TRIED),
     )
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)
@@ -4517,14 +4605,22 @@ pub(crate) const ACCOUNTS_NONE_SOON_KEY: &str = "harness.accounts.none-soon";
 
 pub(crate) const ACCOUNTS_WRONG_KEY: &str = "harness.accounts.wrong-account";
 
-const ACCOUNTS_RENEW_DUE: &str = "Run aterm harness accounts renew --due";
+/// The read of another CLI's pool ([`accounts_due_entry_for`]), its `--cli` added.
+const ACCOUNTS_READ: &str = "Run aterm harness accounts";
 
 /// The reason of the Claude Code renewal entries: the upkeep renews each due login by itself
 /// (`accounts_sync`'s sign-in ladder), so a login on the line is one none of its routes renewed.
 const ACCOUNTS_RENEWS_ITSELF: &str =
     "renews each due login by every sign-in route this machine has";
 
-/// Builds the exceptions digest entry for Claude Code logins due for renewal.
+/// The step of the Claude Code renewal facts: the read of each row's last automatic sign-in and
+/// the routes it tried (`aterm harness accounts`), never a renewal by hand, which the upkeep
+/// already runs.
+const ACCOUNTS_READ_TRIED: &str = "Run aterm harness accounts to read each route tried";
+
+/// THE FACT FOR LATER OF THE CLAUDE CODE LOGINS DUE FOR RENEWAL: the upkeep renews each by
+/// itself (`accounts_sync`'s sign-in ladder), so it asks no one to; a due row whose renewal
+/// failed is named with the routes it tried in the no-sign-in fact ([`accounts_no_sign_in_entry`]).
 pub(crate) fn accounts_due_entry(labels: &[String]) -> Option<Entry> {
     labels.first()?;
     let what = match labels.len() {
@@ -4540,7 +4636,7 @@ pub(crate) fn accounts_due_entry(labels: &[String]) -> Option<Entry> {
             tried: Reason::new(ACCOUNTS_RENEWS_ITSELF),
             reason: Reason::new("none of them has renewed these logins"),
         },
-        Then::step(ACCOUNTS_RENEW_DUE),
+        Then::step(ACCOUNTS_READ_TRIED),
     )
     .severity(Severity::Info)
     .resurface(Resurface::WAIT);
@@ -4550,7 +4646,8 @@ pub(crate) fn accounts_due_entry(labels: &[String]) -> Option<Entry> {
     Some(entry.log_line(format!("accounts need=due n={}", labels.len())))
 }
 
-/// Builds the exceptions digest entry when no renewable login remains working within 24 hours.
+/// The fact for later, a warning, that no renewable Claude Code login remains working within 24
+/// hours: the upkeep renews each by itself, and it asks no one to.
 pub(crate) fn accounts_none_soon_entry() -> Entry {
     Entry::new(
         Family::Accounts,
@@ -4561,14 +4658,15 @@ pub(crate) fn accounts_none_soon_entry() -> Entry {
             tried: Reason::new(ACCOUNTS_RENEWS_ITSELF),
             reason: Reason::new("every login on this machine still ends within a day"),
         },
-        Then::step(ACCOUNTS_RENEW_DUE),
+        Then::step(ACCOUNTS_READ_TRIED),
     )
     .severity(Severity::Warn)
     .resurface(Resurface::WAIT)
     .log_line("accounts need=none-working-within-a-day")
 }
 
-/// Builds the exceptions digest entry when a login renewal authenticated the wrong account.
+/// The fact for later that a Claude Code renewal signed in an account other than its row's:
+/// aterm threw that sign-in away and signs the row in again by itself, so it asks no one to.
 pub(crate) fn accounts_wrong_entry(labels: &[String]) -> Option<Entry> {
     let first = labels.first()?;
     let filled = notice::RENEWAL_WRONG_ACCOUNT.fill(Some(first), None);
@@ -4577,8 +4675,11 @@ pub(crate) fn accounts_wrong_entry(labels: &[String]) -> Option<Entry> {
         "",
         "wrong-account",
         notice::RENEWAL_WRONG_ACCOUNT.title,
-        Why::OnlyYou(Reason::new(&filled.happened)),
-        notice_then(&filled.todo, filled.short),
+        Why::Spent {
+            tried: Reason::new("threw away a sign-in that named another account"),
+            reason: Reason::new("the row's login is unchanged until it signs in as its own"),
+        },
+        fact_then(&filled),
     )
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)
@@ -4588,17 +4689,6 @@ pub(crate) fn accounts_wrong_entry(labels: &[String]) -> Option<Entry> {
     }
     entry = notice_tail(entry, filled);
     Some(entry.log_line(format!("accounts need=wrong-account n={}", labels.len())))
-}
-
-/// The vendor whose sign-in ends a `cli` login, for the notices that say who sets its end.
-const fn login_vendor(cli: aterm_agent::harness::accounts::Cli) -> &'static str {
-    use aterm_agent::harness::accounts::Cli;
-    match cli {
-        Cli::Claude => "Anthropic",
-        Cli::Codex => "OpenAI",
-        Cli::Grok => "xAI",
-        Cli::Kimi => "Moonshot AI",
-    }
 }
 
 /// The one word a glass title names `cli` by (six words at most): `Claude`, as its notices
@@ -4613,9 +4703,12 @@ const fn title_word(cli: aterm_agent::harness::accounts::Cli) -> &'static str {
     }
 }
 
-/// The exceptions digest entry for `cli`'s logins due for renewal ([`accounts_due_entry`] for
-/// Claude Code's, word for word): another CLI's names its product and its `--cli` renewal, and
-/// keeps its own subject (the CLI's id), so each CLI's entry stands apart.
+/// The fact for later of `cli`'s logins due for renewal ([`accounts_due_entry`] for Claude
+/// Code's, word for word): the window's upkeep renews another CLI's due logins that name an email
+/// in the background too (`accounts_sync`'s `renew_pool_due`), so it asks no one to; it names its product and steps
+/// to the read of its pool (`--cli`), keeping its own subject (the CLI's id), so each CLI's entry
+/// stands apart. A renewal that stops for a person is its sign-in task's entry
+/// ([`accounts_sign_in_entry_for`]).
 pub(crate) fn accounts_due_entry_for(
     cli: aterm_agent::harness::accounts::Cli,
     labels: &[String],
@@ -4634,11 +4727,11 @@ pub(crate) fn accounts_due_entry_for(
         cli.id(),
         "due",
         &what,
-        Why::OnlyYou(Reason::new(format!(
-            "A login ends on a date {} sets, and only a sign-in renews it",
-            login_vendor(cli)
-        ))),
-        Then::step(format!("{ACCOUNTS_RENEW_DUE} --cli {}", cli.id())),
+        Why::Spent {
+            tried: Reason::new("renews each due login that names an email in the background"),
+            reason: Reason::new("none of them has renewed these logins yet"),
+        },
+        Then::step(format!("{ACCOUNTS_READ} --cli {}", cli.id())),
     )
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)

@@ -3098,6 +3098,7 @@ impl App {
             return;
         }
         let focus_live_viewport = exact_focus.live_viewport;
+        let focus_rewound = self.pool.is_rewound(focus);
         let focus_coordinate_space = Some((exact_focus.terminal_id, exact_focus.alternate_screen));
         let Some((rows, cols)) = self
             .windows
@@ -3224,7 +3225,7 @@ impl App {
                 flying_alpha: if kitty_enabled { cat_frame.alpha } else { 0 },
             },
             focused: capture_focused,
-            obscured: ws.overlay_open() || ws.tab_menu.is_some(),
+            obscured: ws.overlay_open() || ws.tab_menu.is_some() || focus_rewound,
             pane: Some((focus, pane_origin)),
             room: None,
         });
@@ -3385,6 +3386,7 @@ impl App {
         };
         let (rows, cols) = (ws.rows as usize, ws.cols as usize);
         let live_viewport = exact_focus.live_viewport;
+        let rewound = self.pool.is_rewound(exact_focus.session);
         let grid_cursor = (
             u16::try_from(ws.input_scratch.cursor_row).unwrap_or(u16::MAX),
             u16::try_from(ws.input_scratch.cursor_col).unwrap_or(u16::MAX),
@@ -3483,7 +3485,7 @@ impl App {
                 flying_alpha: if kitty_enabled { cat_frame.alpha } else { 0 },
             },
             focused: capture_focused,
-            obscured: ws.overlay_open() || ws.tab_menu.is_some(),
+            obscured: ws.overlay_open() || ws.tab_menu.is_some() || rewound,
             pane: None,
             room: None,
         });
@@ -3493,9 +3495,9 @@ impl App {
         // capture's sky never learns where the pet flies and draws its stars
         // on the fur.
         ws.fx.offer_pet_v2(&pet.pet, glow_geom, (0, 0), now);
-        let words_suspended = exact_focus.alternate_screen && suppress_alt;
+        let words_suspended = (exact_focus.alternate_screen && suppress_alt) || rewound;
         if load_shed || words_suspended || sparkle.is_none() {
-            // The word field freezes under load or alternate-screen suppression; an explicit feature disable resets it.
+            // The word field freezes under load, alternate-screen suppression or a Rewind view; an explicit feature disable resets it.
             if load_shed || words_suspended {
                 ws.fx.decos_mut().freeze(now);
             } else {
@@ -10018,9 +10020,25 @@ mod terminal_split_capture_tests {
 
     #[test]
     fn an_unfocused_pane_selection_paints_and_is_what_a_copy_resolves() {
+        use crate::menu::{MenuAction, menu_live, set_menu_live};
         use aterm_core::selection::{SelectionSide, SelectionType};
 
+        let before = menu_live();
+        let mut readiness_failures = Vec::new();
+        let mut check_readiness = |app: &App, label: &str, expected: bool| {
+            app.publish_menu_live();
+            let native = menu_live().has_selection;
+            let live = app.palette_live().has_selection;
+            let palette =
+                app.palette_snapshot(WindowId(0)).action_by_name("Copy") == Ok(MenuAction::Copy);
+            if native != expected || live != expected || palette != expected {
+                readiness_failures.push(format!(
+                    "{label}: expected={expected}, native={native}, live={live}, palette={palette}"
+                ));
+            }
+        };
         let (mut app, wid, right) = split_fixture();
+        check_readiness(&app, "no split selection", false);
         let (rows, cols) = {
             let window = &app.windows[&wid];
             (usize::from(window.rows), usize::from(window.cols))
@@ -10075,6 +10093,52 @@ mod terminal_split_capture_tests {
             Some("LEFT"),
             "⌘-C resolves the pane whose highlight is on screen"
         );
+        check_readiness(&app, "unfocused visible selection", true);
+
+        for prior in [true, false] {
+            set_menu_live(crate::menu::MenuLive {
+                has_selection: prior,
+                ..menu_live()
+            });
+            {
+                let _held = term_lock(&left_term);
+                app.publish_menu_live();
+                assert_eq!(
+                    menu_live().has_selection,
+                    prior,
+                    "an unread sibling keeps the prior menu bit without blocking"
+                );
+            }
+        }
+        check_readiness(&app, "unlocked visible sibling", true);
+
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .tab_set
+                .active_mut()
+                .unwrap()
+                .toggle_zoom()
+        );
+        assert_eq!(app.active_visible_leaf_plan(wid).unwrap().leaves.len(), 1);
+        assert_eq!(
+            app.window_selection_text(wid),
+            None,
+            "zoom hides the selected sibling from Copy"
+        );
+        check_readiness(&app, "selected sibling hidden by zoom", false);
+        assert!(
+            !app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .tab_set
+                .active_mut()
+                .unwrap()
+                .toggle_zoom()
+        );
+        assert_eq!(app.window_selection_text(wid).as_deref(), Some("LEFT"));
+        check_readiness(&app, "selected sibling visible after unzoom", true);
 
         let right_term = app.pool.get(right).expect("right pane").term.clone();
         {
@@ -10089,6 +10153,7 @@ mod terminal_split_capture_tests {
             Some("RIGHT"),
             "the focused pane wins whenever it has a selection at all"
         );
+        check_readiness(&app, "focused visible selection", true);
 
         {
             let mut terminal = term_lock(&right_term);
@@ -10110,6 +10175,58 @@ mod terminal_split_capture_tests {
             None,
             "a focused pane holding a whitespace-only selection copies NOTHING — it \
              must never fall through to a sibling's text"
+        );
+        check_readiness(&app, "focused blank selection still owns Copy", true);
+
+        let mut mixed = App::headless_for_test();
+        assert!(mixed.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (_, native_view) = mixed.active_native_view(wid).expect("Settings view");
+        let (session, _) =
+            mixed.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        let terminal = mixed.pool.get(session).unwrap().term.clone();
+        {
+            let mut terminal = term_lock(&terminal);
+            terminal.process(b"VISIBLE");
+            let selection = terminal.text_selection_mut();
+            selection.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+            selection.update_selection(0, 6, SelectionSide::Right);
+            selection.complete_selection();
+        }
+        assert_eq!(mixed.window_selection_text(wid).as_deref(), Some("VISIBLE"));
+        check_readiness(&mixed, "focused terminal in a mixed tab", true);
+        assert!(
+            mixed
+                .windows
+                .get_mut(&wid)
+                .unwrap()
+                .tab_set
+                .active_mut()
+                .unwrap()
+                .set_focus(native_view)
+        );
+        mixed.sync_window(wid);
+        assert!(mixed.active_native_view(wid).is_some());
+        assert_eq!(
+            mixed.window_selection_text(wid).as_deref(),
+            Some("VISIBLE"),
+            "the selected terminal sibling remains visible"
+        );
+        assert_eq!(mixed.native_selection_text(wid), None);
+        assert!(
+            !mixed.copy_selection_in(wid),
+            "native focus cannot borrow the terminal sibling's selection"
+        );
+        check_readiness(
+            &mixed,
+            "native focus above a selected terminal sibling",
+            false,
+        );
+
+        set_menu_live(before);
+        assert!(
+            readiness_failures.is_empty(),
+            "{}",
+            readiness_failures.join("\n")
         );
     }
 

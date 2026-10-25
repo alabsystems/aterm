@@ -118,7 +118,7 @@ impl JobsPass {
     pub(crate) fn tick(
         &mut self,
         at_ms: u64,
-        read_ms: impl FnOnce() -> u64,
+        read_ms: impl Fn() -> u64,
         sweep: Option<&[ProcessReading]>,
         tabs: &[TabRoot],
         ttys: &[(u64, TtyMode)],
@@ -148,6 +148,8 @@ impl JobsPass {
             .collect();
         let readers = self.held;
         let stand_in = (readers.stand_in)();
+        // Each age is the probe's as its reading starts.
+        let probe_ms = read_ms();
         let read = self.reader.read_all(&reqs);
         // A tab's root's pid version tells the engine it ran a program anew (`exec zsh`).
         let roots: BTreeSet<u32> = tabs.iter().map(|t| t.shell_pid).collect();
@@ -181,6 +183,7 @@ impl JobsPass {
         let tick = JobTick {
             at_ms,
             read_ms,
+            probe_ms,
             self_uid,
             sweep,
             procs,
@@ -629,6 +632,11 @@ pub(crate) struct TabFeed {
 }
 
 impl JobFeed {
+    /// The bytes the reader has read so far.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).bytes
+    }
+
     /// The reader read `bytes`, which it feeds next, chunk by chunk.
     pub(crate) fn read(&self, bytes: &[u8]) {
         let mut fed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -950,9 +958,10 @@ fn fd(f: &probe::FdReading) -> Fd {
             lf_tail: *lf_tail,
             fresh_dylib: *fresh_dylib,
         },
-        probe::FdKind::Device { tty, read } => FdKind::Device {
+        probe::FdKind::Device { tty, read, ctty } => FdKind::Device {
             tty: *tty,
             read: *read,
+            ctty: *ctty,
         },
         probe::FdKind::Pipe {
             handle,
@@ -1010,6 +1019,7 @@ fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
         name: p.name.clone(),
         exe: p.exe.clone(),
         state: state(p.state),
+        traced: p.traced,
         tty: p.tty,
         tpgid: p.tpgid,
         term: p.term.map(|t| TermWord {

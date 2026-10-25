@@ -1930,6 +1930,18 @@ type RowCells<'a> = Option<&'a dyn Fn(usize) -> aterm_core::terminal::RenderCell
 /// paper fire.
 fn fire_burst_on(
     pair: (u32, u32),
+    keys: (u16, u64),
+    rows: (RowCells<'_>, RowCells<'_>),
+    frame_text: bool,
+    setup: &dyn Fn(&mut CursorGlow),
+) -> (CursorGlow, Vec<GlowQuad>) {
+    style_burst_on(GlowStyle::Fire, pair, keys, rows, frame_text, setup)
+}
+
+/// [`fire_burst_on`] in any style.
+fn style_burst_on(
+    style: GlowStyle,
+    pair: (u32, u32),
     (keys, gap_ms): (u16, u64),
     (above, on_row): (RowCells<'_>, RowCells<'_>),
     frame_text: bool,
@@ -1937,7 +1949,7 @@ fn fire_burst_on(
 ) -> (CursorGlow, Vec<GlowQuad>) {
     let g = tall_geom();
     let (row, start) = (4u16, 2u16);
-    let mut c = cfg(GlowStyle::Fire, true);
+    let mut c = cfg(style, true);
     c.intensity = 1.0;
     c.dark_theme = aterm_render::theme_is_dark(pair.1);
     (c.theme_fg, c.theme_bg) = pair;
@@ -3233,20 +3245,134 @@ fn sparkle_typing_halo_on_paper_is_its_gold() {
     );
 }
 
+/// looks7 M5: the fire's tongues and embers stood over a word icon (the
+/// fox's chin on paper in `enter-bottom`'s `enter`, embers by its cheek on
+/// dark), the icons' shade lifting the ribbons' light alone. Typed under a
+/// face over the two rows above, once each frame's icons are named no fire
+/// light (a quad, a halo, a field patch) lies on the icon, on either page,
+/// and the embers keep off it whole. Negative control: unshaded, the
+/// frames lay fire on it.
+#[test]
+fn a_word_icon_wears_no_fire() {
+    let g = tall_geom();
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    // A face over columns 8..14 of rows 2 and 3, above the typed row 4.
+    let icon = (8 * cw, 14 * cw, 2 * ch, 4 * ch);
+    let hits = |(x0, x1, y0, y1): (i32, i32, i32, i32)| {
+        x0 < icon.1 && icon.0 < x1 && y0 < icon.3 && icon.2 < y1
+    };
+    let rect = |x: u16, y: u16, w: u16, h: u16| {
+        let (x, y) = (i32::from(x), i32::from(y));
+        (x, x + i32::from(w), y, y + i32::from(h))
+    };
+    let on_icon = |dark: bool, shade: bool| -> usize {
+        let mut c = cfg(GlowStyle::Fire, true);
+        c.intensity = 1.0;
+        if dark {
+            (c.theme_fg, c.theme_bg) = DARK_PAIR;
+        } else {
+            c.dark_theme = false;
+            c.theme_fg = 0x001F_2328;
+            c.theme_bg = 0x00FF_FFFF;
+        }
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let mut t = Instant::now();
+        glow.tick(Some((4, 2)), t, &c, g, &mut out);
+        let mut n = 0;
+        for col in 3..20u16 {
+            t += ms(60);
+            glow.note_typed_glyph(t, 1, false, rk::TypedClass::Glyph);
+            glow.tick(Some((4, col)), t + ms(3), &c, g, &mut out);
+            glow.note_word_icons([icon]);
+            // The streams as a host publishes them, before its word pass.
+            let mut under = glow.under_quads().to_vec();
+            let mut halos = glow.halos().to_vec();
+            let mut patches = glow.patches().to_vec();
+            if shade {
+                glow.shade_word_icons((&mut out, &mut under, &mut halos, &mut patches));
+            }
+            n += out
+                .iter()
+                .chain(&under)
+                .filter(|q| q.w > 0 && q.h > 0 && hits(rect(q.x, q.y, q.w, q.h)))
+                .count()
+                + halos
+                    .iter()
+                    .filter(|h| h.w > 0 && h.h > 0 && hits(rect(h.x, h.y, h.w, h.h)))
+                    .count()
+                + patches
+                    .iter()
+                    .filter(|p| p.w > 0 && p.h > 0 && hits(rect(p.x, p.y, p.w, p.h)))
+                    .count();
+        }
+        n
+    };
+    for dark in [true, false] {
+        assert!(
+            on_icon(dark, false) > 0,
+            "control (dark {dark}): unshaded, the fire lays no light on the icon"
+        );
+        let lit = on_icon(dark, true);
+        assert_eq!(
+            lit, 0,
+            "{lit} fire lights lie on the word icon (dark {dark})"
+        );
+    }
+}
+
+/// The kept flame's head burns its gold core in the blank cells at the
+/// caret (its own cell and the one ahead), with no olive round the row; its
+/// core burnt from its root (the negative control) lays clearly less.
 #[test]
 fn the_kept_flames_cores_burn_gold_in_the_gaps() {
     for gap_ms in [57u64, 90] {
-        let ((_, blank), olive) = kept_phrase_gold(gap_ms, false);
+        let gold = kept_phrase_gold(gap_ms, false, false);
         assert!(
-            blank >= 6,
-            "{gap_ms} ms apart: the word's gap shows {blank} gold pixels"
+            gold.lead >= 6,
+            "{gap_ms} ms apart: the caret's blank cells show {} gold pixels",
+            gold.lead
         );
-        assert_eq!(olive, 0, "{gap_ms} ms apart: {olive} pixels read olive");
-        let ((_, c_blank), _) = kept_phrase_gold(gap_ms, true);
+        assert_eq!(
+            gold.olive, 0,
+            "{gap_ms} ms apart: {} pixels read olive",
+            gold.olive
+        );
+        let base = kept_phrase_gold(gap_ms, true, false);
         assert!(
-            c_blank * 4 <= blank,
-            "control, {gap_ms} ms apart: cores burnt from their root lay {c_blank} gold pixels in the \
-             gap against {blank}"
+            base.lead + 6 <= gold.lead,
+            "control, {gap_ms} ms apart: cores burnt from their root lay {} gold pixels at the \
+             caret against {}",
+            base.lead,
+            gold.lead
+        );
+    }
+}
+
+/// looks7 M6: kept in its row under a line of text, the dark flame stood a
+/// short gold tongue in each word's gap between the burning letters, a
+/// brown flank round it, and in the gallery's `context` it read as a comma
+/// (`brown, fox`). Its word's gap lays no gold and next to no light; with
+/// the tongue stood there (the negative control) the gap burns gold.
+#[test]
+fn a_kept_word_gap_stands_no_comma() {
+    for gap_ms in [57u64, 90] {
+        let gold = kept_phrase_gold(gap_ms, false, false);
+        assert_eq!(
+            gold.gap, 0,
+            "{gap_ms} ms apart: the word's gap shows {} gold pixels",
+            gold.gap
+        );
+        assert!(
+            gold.gap_lift <= 12.0,
+            "{gap_ms} ms apart: the word's gap lays {:.1} of light",
+            gold.gap_lift
+        );
+        let stood = kept_phrase_gold(gap_ms, false, true);
+        assert!(
+            stood.gap >= 6,
+            "control, {gap_ms} ms apart: its tongue stood, the gap shows only {} gold pixels",
+            stood.gap
         );
     }
 }
@@ -3297,43 +3423,63 @@ fn kept_phrase(gap_ms: u64, setup: &dyn Fn(&mut CursorGlow)) -> (Glass, Vec<char
     (fire_dark_glass(&glow, &out, g, &ink), text, caret, rings)
 }
 
+/// [`kept_phrase_gold`]'s count.
+struct KeptGold {
+    /// Gold pixels in the word's gap among the last six cells.
+    gap: usize,
+    /// The word's gap's mean light ([`dark_lift`]).
+    gap_lift: f32,
+    /// Gold pixels in the caret's cell and the one ahead.
+    lead: usize,
+    /// Olive pixels round the row.
+    olive: usize,
+}
+
 /// [`kept_phrase`]'s gold pixels (hue 38°-58°, saturation over 0.4, value
-/// 0.6 or more) its last six cells show under their letters' baseline
-/// (`.0`) and in their blank cells (`.1`), and the olive ones round the row.
-fn kept_phrase_gold(gap_ms: u64, from_base: bool) -> ((usize, usize), usize) {
+/// 0.6 or more) in the word's gap among its last six cells and in the
+/// caret's blank cells, and the olive ones round the row.
+fn kept_phrase_gold(gap_ms: u64, from_base: bool, gap_tongues: bool) -> KeptGold {
     let g = tall_geom();
     let row = 4u16;
     let (glass, text, caret, _) = kept_phrase(gap_ms, &|glow| {
         glow.fire_kept_core_from_base = from_base;
+        glow.fire_gap_tongues = gap_tongues;
     });
     let (top, ch, cw) = (i32::from(row) * g.ch as i32, g.ch as i32, g.cw as i32);
     let gold = |p: u32| {
         let (h, s, v) = crate::color_math::rgb2hsv(p & 0x00FF_FFFF);
         (38.0..58.0).contains(&h) && s > 0.4 && v >= 0.6
     };
-    let (mut under, mut blank) = (0usize, 0usize);
-    for col in caret - 6..caret {
+    let mut out = KeptGold {
+        gap: 0,
+        gap_lift: 0.0,
+        lead: 0,
+        olive: olive_px(&glass, g, top - 3 * ch..top + ch),
+    };
+    for col in caret - 6..=caret + 1 {
+        if col < caret && text[usize::from(col)] != ' ' {
+            continue;
+        }
         let x0 = i32::from(col) * cw;
-        let is_blank = text[usize::from(col)] == ' ';
-        let ys = if is_blank {
-            top..top + ch
-        } else {
-            top + ch * 8 / 10..top + ch
-        };
-        for y in ys {
+        let (mut lit, mut n) = (0.0f32, 0usize);
+        for y in top..top + ch {
             for x in x0..x0 + cw {
-                if gold(glass.at(y, x)) {
-                    if is_blank {
-                        blank += 1;
-                    } else {
-                        under += 1;
-                    }
+                let p = glass.at(y, x);
+                let is_gold = usize::from(gold(p));
+                if col < caret {
+                    out.gap += is_gold;
+                    lit += dark_lift(p);
+                    n += 1;
+                } else {
+                    out.lead += is_gold;
                 }
             }
         }
+        if n > 0 {
+            out.gap_lift = out.gap_lift.max(lit / n as f32);
+        }
     }
-    let olive = olive_px(&glass, g, top - 3 * ch..top + ch);
-    ((under, blank), olive)
+    out
 }
 
 /// The light a frame lays over the dark page at `p`: its channels' lift over
@@ -3895,6 +4041,78 @@ fn a_dark_fire_keeps_its_forge_and_embers_off_a_filled_row_above() {
         lift(true) > 20,
         "control: unheld, the forge and the embers leave the bar bare"
     );
+}
+
+/// looks7 M7: in the gallery's `context` a sparkle's moon stood on the
+/// prompt's powerline bar above the typed row, past its segments' words.
+/// Typed under a filled row, on dark and on paper, no sparkle light lifts
+/// the bar; unheld (the negative control) the sparkles stand on it.
+#[test]
+fn a_sparkle_keeps_off_a_filled_row_above() {
+    let g = tall_geom();
+    let (row, ch) = (4u16, g.ch as i32);
+    let lift = |pair: (u32, u32), bar: u32, unheld: bool| -> usize {
+        let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+        let filled = |_: usize| aterm_core::terminal::RenderCell {
+            ch: ' ',
+            fg: rgb(pair.0),
+            bg: rgb(bar),
+            ..Default::default()
+        };
+        let mut lit = 0;
+        for (keys, gap) in [(8u16, 60u64), (16, 55), (28, 50)] {
+            let (glow, out) = style_burst_on(
+                GlowStyle::Sparkle,
+                pair,
+                (keys, gap),
+                (Some(&filled), None),
+                true,
+                &|glow| {
+                    glow.fire_filled_unheld = unheld;
+                },
+            );
+            let mut glass = Glass::new(g, pair.1);
+            let bar_rows = (i32::from(row) - 1) * ch..i32::from(row) * ch;
+            for y in bar_rows.clone() {
+                for x in 0..i32::from(g.win_w) {
+                    glass.px[y as usize * glass.w + x as usize] = bar;
+                }
+            }
+            glass.add_quads(glow.under_quads());
+            glass.add_quads(&out);
+            glass.add_halos(glow.halos());
+            // The caret's own bloom feathers a few pixels into the bar's
+            // foot; the bar's body stays bare.
+            for y in bar_rows.start..bar_rows.end - 8 {
+                for x in 0..i32::from(g.win_w) {
+                    let p = glass.at(y, x);
+                    let moved = [16u32, 8, 0]
+                        .iter()
+                        .map(|&sh| (((p >> sh) & 0xff) as i32 - ((bar >> sh) & 0xff) as i32).abs())
+                        .max()
+                        .unwrap_or(0);
+                    if moved > 12 {
+                        lit += 1;
+                    }
+                }
+            }
+        }
+        lit
+    };
+    for (pair, bar) in [
+        (DARK_PAIR, 0x0030_3030u32),
+        ((0x001F_2328, 0x00FF_FFFF), 0x0033_3333),
+    ] {
+        let held = lift(pair, bar, false);
+        assert_eq!(
+            held, 0,
+            "{held} pixels of the filled bar above lit by sparkles ({pair:06x?})"
+        );
+        assert!(
+            lift(pair, bar, true) > 0,
+            "control ({pair:06x?}): unheld, the sparkles leave the bar bare"
+        );
+    }
 }
 
 #[test]

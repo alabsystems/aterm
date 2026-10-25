@@ -18,6 +18,8 @@ pub enum SpinScene {
     ClaudeShaped,
     /// A bare `/bin/sh` prompt: the floor.
     Idle,
+    /// A recording `/bin/sh` prompt frozen in an open Rewind view.
+    Rewound,
 }
 
 /// One spin row.
@@ -99,11 +101,24 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     if std::env::var_os("ATERM_PAINT_KEEP").is_some() {
         scratch.keep();
     }
-    let world = World::prepare(scratch.path(), "# effect settings: the shipped defaults")
+    let head = match row.scene {
+        SpinScene::Rewound => "temporal_recording = true",
+        SpinScene::ClaudeShaped | SpinScene::Idle => "# effect settings: the shipped defaults",
+    };
+    let world = World::prepare(scratch.path(), head)
         .map_err(|e| CouldNotRun(format!("cannot lay out the scratch world: {e}")))?;
     let inst = Instance::launch(&rig.aterm, &world, budget)?;
     let ctl = &inst.ctl;
     ctl.ok(&["await", "idle", SETTLE_QUIET_MS, "timeout=60000"])?;
+    if row.scene == SpinScene::Rewound {
+        ctl.ok(&["send", "printf 'rewind spin\\n'"])?;
+        ctl.ok(&["key", "enter"])?;
+        ctl.ok(&["await", "idle", SETTLE_QUIET_MS, "timeout=60000"])?;
+        let open = ctl.ok(&["rewind", "open"])?;
+        if field(&open, "view") != Some("open") {
+            return could_not_run(format!("the Rewind view did not open ({open})"));
+        }
+    }
     ctl.ok(&["metrics", "reset"])?;
     let before = ctl
         .field(&["metrics"], "past_deadline_arms")?
@@ -131,6 +146,12 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
             ));
         }
         reasons = Some(why);
+    }
+    if row.scene == SpinScene::Rewound {
+        let status = ctl.ok(&["rewind", "status"])?;
+        if field(&status, "view") != Some("open") {
+            return could_not_run(format!("the Rewind view closed in the window ({status})"));
+        }
     }
     let metrics = ctl.ok(&["metrics"])?;
     let after = uint_field(&metrics, "past_deadline_arms")

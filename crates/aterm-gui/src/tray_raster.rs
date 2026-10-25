@@ -1082,6 +1082,23 @@ fn note_glyph_raster() {
     GLYPH_RASTERS.with(|rasters| rasters.set(rasters.get() + 1));
 }
 
+#[cfg(test)]
+thread_local! {
+    static GLYPH_BLITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The glyphs this thread has blended texel by texel so far (test-only): a raster's text work
+/// is the difference across it. A glyph whose box misses the canvas is not blended.
+#[cfg(test)]
+pub(crate) fn glyph_blits() -> u64 {
+    GLYPH_BLITS.with(std::cell::Cell::get)
+}
+
+fn note_glyph_blit() {
+    #[cfg(test)]
+    GLYPH_BLITS.with(|blits| blits.set(blits.get() + 1));
+}
+
 fn default_chrome_fonts() -> ChromeFonts {
     ChromeFonts {
         primary: None,
@@ -3205,6 +3222,9 @@ struct Canvas {
     clip: Vec<(i32, i32, i32, i32)>,
     glyph_remap: (u32, u32, [f32; 256]),
     fade: Vec<FadeLayer>,
+    /// How many [`DrawPrim::SubpixelPush`]es are open: while any is, panels and rims keep
+    /// their sub-pixel places instead of the device grid.
+    subpixel: u32,
 }
 
 struct FadeLayer {
@@ -3264,6 +3284,7 @@ impl Canvas {
             clip: Vec::new(),
             glyph_remap: (u32::MAX, u32::MAX, [f32::NAN; 256]),
             fade: Vec::new(),
+            subpixel: 0,
         }
     }
 
@@ -3601,6 +3622,15 @@ impl Canvas {
             }
         }
         self.px[i + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+
+    /// Whether a glyph whose texels land from pixel `first` to pixel `last` (inclusive) has any
+    /// on this canvas: one that has none blends nothing ([`Self::blend_glyph_texel`] drops a
+    /// texel off the canvas first), so a region raster ([`rasterize_tray_region`]) need not
+    /// visit the texels of the text outside its region.
+    fn texels_meet_canvas(&self, first: (i32, i32), last: (i32, i32)) -> bool {
+        let (x0, y0, x1, y1) = self.device_bounds();
+        last.0 >= x0 && last.1 >= y0 && first.0 < x1 && first.1 < y1
     }
 
     fn blend_glyph_texel(&mut self, x: i32, y: i32, c: [u8; 4], coverage: u8) {
@@ -4226,9 +4256,16 @@ impl Canvas {
                     },
                 };
                 let (m, bitmap) = glyph;
-                if m.width > 0 && m.height > 0 {
-                    let gx = q_round_to_px(pen_q) as i32 + m.xmin;
-                    let gy = baseline_px - (m.height as i32 + m.ymin);
+                let gx = q_round_to_px(pen_q) as i32 + m.xmin;
+                let gy = baseline_px - (m.height as i32 + m.ymin);
+                if m.width > 0
+                    && m.height > 0
+                    && self.texels_meet_canvas(
+                        (gx, gy),
+                        (gx + (m.width - 1) as i32, gy + (m.height - 1) as i32),
+                    )
+                {
+                    note_glyph_blit();
                     for gyy in 0..m.height {
                         for gxx in 0..m.width {
                             let coverage = bitmap[gyy * m.width + gxx];
@@ -4339,6 +4376,20 @@ impl Canvas {
     ) {
         let gx = pen + metrics.xmin as f32;
         let gy = baseline - (metrics.height as f32 + metrics.ymin as f32);
+        // The texels land at `(gx + x) as i32`, which never falls as `x` grows, so the first
+        // and the last texel bound the pixels they all land on.
+        let (Some(last_x), Some(last_y)) =
+            (metrics.width.checked_sub(1), metrics.height.checked_sub(1))
+        else {
+            return;
+        };
+        if !self.texels_meet_canvas(
+            (gx as i32, gy as i32),
+            ((gx + last_x as f32) as i32, (gy + last_y as f32) as i32),
+        ) {
+            return;
+        }
+        note_glyph_blit();
         for y in 0..metrics.height {
             for x in 0..metrics.width {
                 let coverage = bitmap[y * metrics.width + x];
@@ -4374,8 +4425,7 @@ impl Canvas {
     )]
     fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, width: f32, c: [u8; 4]) {
         let sw = width.max(1.0);
-        let rounded = r > 0.5 && w > sw * 2.0 + 1.0 && h > sw * 2.0 + 1.0;
-        if !rounded {
+        if !rounded_stroke(r, w, h, sw) {
             let t = sw.round().max(1.0);
             if w <= t || h <= t {
                 self.fill_px_rect(x, y, w.max(t), h.max(t), c);
@@ -4540,6 +4590,56 @@ fn dash_len(v: f32) -> i64 {
     v.max(1.0).round().min(DASH_REACH) as i64
 }
 
+/// A span `[at, at + len)` on one axis (device px) with both edges on the device-pixel
+/// grid, so a straight side fills whole pixels instead of two at part strength; a span
+/// that would round to nothing keeps its own extent.
+fn device_snapped(at: f32, len: f32) -> (f32, f32) {
+    let (start, end) = (at.round(), (at + len).round());
+    if end - start >= 1.0 {
+        (start, end - start)
+    } else {
+        (at, len)
+    }
+}
+
+/// A [`DrawPrim::Panel`]'s rect (points) in device px, its edges on the device grid
+/// unless a [`DrawPrim::SubpixelPush`] keeps it where it is (`grid` false).
+fn panel_in_device_px(
+    (x, y, w, h): (f32, f32, f32, f32),
+    s: f32,
+    grid: bool,
+) -> (f32, f32, f32, f32) {
+    if !grid {
+        return (x * s, y * s, w * s, h * s);
+    }
+    let (x, w) = device_snapped(x * s, w * s);
+    let (y, h) = device_snapped(y * s, h * s);
+    (x, y, w, h)
+}
+
+/// A rounded [`Canvas::stroke_rect`]'s rect and line (device px) with its outer edges on
+/// the device grid and its line whole pixels, so its straight sides are crisp at any
+/// layout x; a square one is returned as is, since its spans already snap.
+fn rim_on_grid(
+    (x, y, w, h): (f32, f32, f32, f32),
+    r: f32,
+    width: f32,
+) -> (f32, f32, f32, f32, f32) {
+    let sw = width.max(1.0);
+    if !rounded_stroke(r, w, h, sw) {
+        return (x, y, w, h, width);
+    }
+    let (ox, ow) = device_snapped(x - sw / 2.0, w + sw);
+    let (oy, oh) = device_snapped(y - sw / 2.0, h + sw);
+    let sw = sw.round().max(1.0);
+    (ox + sw / 2.0, oy + sw / 2.0, ow - sw, oh - sw, sw)
+}
+
+/// Whether [`Canvas::stroke_rect`] draws a stroke rounded (by its distance field).
+fn rounded_stroke(r: f32, w: f32, h: f32, sw: f32) -> bool {
+    r > 0.5 && w > sw * 2.0 + 1.0 && h > sw * 2.0 + 1.0
+}
+
 /// A half-open device-pixel rectangle in a retained tray raster.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RasterRect {
@@ -4668,6 +4768,7 @@ pub(crate) fn composite_rgba_surface(
         clip: Vec::new(),
         glyph_remap: (u32::MAX, u32::MAX, [f32::NAN; 256]),
         fade: Vec::new(),
+        subpixel: 0,
     };
     // Row by row over the source pixels that land on the destination, as `Canvas::blend` at full
     // cover takes each: a clear pixel leaves it, an opaque run is copied, the rest composite.
@@ -4736,7 +4837,7 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
         Some((cover, covered)) => {
             let tile = cv.device_bounds();
             for (x0, y0, x1, y1) in tile_around(tile, covered) {
-                let (clips, fades) = (cv.clip.len(), cv.fade.len());
+                let (clips, fades, subpixel) = (cv.clip.len(), cv.fade.len(), cv.subpixel);
                 cv.push_clip(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32);
                 let mut skipped = 0;
                 replay_tray(
@@ -4753,6 +4854,7 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
                     cv.pop_fade();
                 }
                 cv.clip.truncate(clips);
+                cv.subpixel = subpixel;
             }
             let mut skipped = 0;
             replay_tray(
@@ -4964,6 +5066,7 @@ fn covered_by_a_later_panel(
     at: usize,
     end: usize,
     s: f32,
+    grid: bool,
 ) -> Option<DeviceRect> {
     for p in prims.iter().take(end).skip(at + 1) {
         let DrawPrim::Panel {
@@ -4980,7 +5083,7 @@ fn covered_by_a_later_panel(
         if fill[3] < u8::MAX {
             continue;
         }
-        let (x, y, w, h) = (x * s, y * s, w * s, h * s);
+        let (x, y, w, h) = panel_in_device_px((*x, *y, *w, *h), s, grid);
         let m = (radius * s).min(w / 2.0).min(h / 2.0).max(0.0) + 2.0;
         let hole = (
             (x + m - 0.5).ceil() as i32,
@@ -5008,6 +5111,14 @@ fn replay_tray(
     let mut skipped_clip_depth = *skipped;
     for (index, p) in prims.iter().enumerate().take(range.end).skip(range.start) {
         match p {
+            DrawPrim::SubpixelPush => {
+                cv.subpixel = cv.subpixel.saturating_add(1);
+                continue;
+            }
+            DrawPrim::SubpixelPop => {
+                cv.subpixel = cv.subpixel.saturating_sub(1);
+                continue;
+            }
             DrawPrim::ClipPush { .. } if skipped_clip_depth > 0 => {
                 skipped_clip_depth = skipped_clip_depth.saturating_add(1);
                 continue;
@@ -5058,10 +5169,12 @@ fn replay_tray(
                 fill,
                 ..
             } => {
+                let grid = cv.subpixel == 0;
+                let (x, y, w, h) = panel_in_device_px((*x, *y, *w, *h), s, grid);
                 let hole = (fill[3] < u8::MAX)
-                    .then(|| covered_by_a_later_panel(prims, index, range.end, s))
+                    .then(|| covered_by_a_later_panel(prims, index, range.end, s, grid))
                     .flatten();
-                cv.round_rect_under(x * s, y * s, w * s, h * s, radius * s, *fill, hole);
+                cv.round_rect_under(x, y, w, h, radius * s, *fill, hole);
             }
             DrawPrim::Ring {
                 cx,
@@ -5133,7 +5246,15 @@ fn replay_tray(
                 radius,
                 width,
                 color,
-            } => cv.stroke_rect(x * s, y * s, w * s, h * s, radius * s, width * s, *color),
+            } => {
+                let (r, rect) = (radius * s, (x * s, y * s, w * s, h * s));
+                let (x, y, w, h, width) = if cv.subpixel == 0 {
+                    rim_on_grid(rect, r, width * s)
+                } else {
+                    (rect.0, rect.1, rect.2, rect.3, width * s)
+                };
+                cv.stroke_rect(x, y, w, h, r, width, *color);
+            }
             DrawPrim::Line {
                 x1,
                 y1,
@@ -5168,7 +5289,9 @@ fn replay_tray(
             DrawPrim::ClipPush { .. }
             | DrawPrim::ClipPop
             | DrawPrim::FadePush { .. }
-            | DrawPrim::FadePop => unreachable!("handled above"),
+            | DrawPrim::FadePop
+            | DrawPrim::SubpixelPush
+            | DrawPrim::SubpixelPop => unreachable!("handled above"),
         }
     }
     *skipped = skipped_clip_depth;
@@ -8283,6 +8406,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A chip's fill and 1pt rim at fractional x, at 1×, 1.5× and 2×, paint each side's rim
+    /// in whole pixels of the rim's own colour with the ground beyond it.
+    #[test]
+    fn a_rounded_rim_at_a_fractional_x_is_whole_pixels() {
+        let ground = [226, 226, 226, 255];
+        let fill = [240, 240, 240, 255];
+        let rim = [128, 129, 131, 255];
+        for scale in [1.0_f32, 1.5, 2.0] {
+            for offset in [0.0_f32, 0.25, 0.4, 0.5, 0.6, 0.9] {
+                let (x, y, w, h) = (10.0 + offset, 6.0 + offset, 41.3, 30.0);
+                let prims = vec![
+                    DrawPrim::Panel {
+                        x,
+                        y,
+                        w,
+                        h,
+                        radius: 7.0,
+                        fill,
+                    },
+                    DrawPrim::Stroke {
+                        x: x + 0.5,
+                        y: y + 0.5,
+                        w: w - 1.0,
+                        h: h - 1.0,
+                        radius: 7.0,
+                        width: 1.0,
+                        color: rim,
+                    },
+                ];
+                let (px, pw, _) = rasterize_tray(&prims, 64, 44, scale, ground);
+                let rgb = |x: i32, y: i32| {
+                    let i = ((y as u32 * pw + x as u32) * 4) as usize;
+                    [px[i], px[i + 1], px[i + 2]]
+                };
+                let at = format!("x={x} at {scale}\u{d7}");
+                let mid = ((y + h / 2.0) * scale) as i32;
+                let centre = ((x + w / 2.0) * scale) as i32;
+                let line = scale.round() as i32;
+                let (left, right) = ((x * scale).round() as i32, ((x + w) * scale).round() as i32);
+                let top = (y * scale).round() as i32;
+                for k in 0..line {
+                    assert_eq!(rgb(left + k, mid), rim[..3], "{at}: left rim");
+                    assert_eq!(rgb(right - 1 - k, mid), rim[..3], "{at}: right rim");
+                    assert_eq!(rgb(centre, top + k), rim[..3], "{at}: top rim");
+                }
+                assert_eq!(rgb(left - 1, mid), ground[..3], "{at}: beyond the left rim");
+                assert_eq!(rgb(right, mid), ground[..3], "{at}: beyond the right rim");
+                assert_eq!(
+                    rgb(left + line, mid),
+                    fill[..3],
+                    "{at}: inside the left rim"
+                );
+            }
+        }
+    }
+
+    /// Between [`DrawPrim::SubpixelPush`] and its pop a panel and a rim keep their sub-pixel
+    /// edges (a glide moves them by fractions of a pixel), and after the pop the grid holds
+    /// again. CONTROL: the same box outside the marker lands on whole pixels.
+    #[test]
+    fn a_subpixel_push_keeps_a_gliding_box_off_the_grid() {
+        let ground = [0, 0, 0, 255];
+        let ink = [200, 200, 200, 255];
+        let boxed = |x: f32| {
+            [
+                DrawPrim::Panel {
+                    x,
+                    y: 2.0,
+                    w: 20.0,
+                    h: 20.0,
+                    radius: 4.0,
+                    fill: ink,
+                },
+                DrawPrim::Stroke {
+                    x: x + 0.5,
+                    y: 30.5,
+                    w: 19.0,
+                    h: 19.0,
+                    radius: 4.0,
+                    width: 1.0,
+                    color: ink,
+                },
+            ]
+        };
+        let left_edge = |prims: &[DrawPrim]| {
+            let (px, pw, _) = rasterize_tray(prims, 40, 56, 1.0, ground);
+            let at = |x: u32, y: u32| px[((y * pw + x) * 4) as usize];
+            (at(10, 12), at(10, 40))
+        };
+        let gliding: Vec<DrawPrim> = std::iter::once(DrawPrim::SubpixelPush)
+            .chain(boxed(10.4))
+            .chain([DrawPrim::SubpixelPop])
+            .collect();
+        let (fill, rim) = left_edge(&gliding);
+        assert!(
+            fill > 0 && fill < 200 && rim > 0 && rim < 200,
+            "part strength off the grid: {fill} {rim}"
+        );
+        let after: Vec<DrawPrim> = gliding.iter().cloned().chain(boxed(10.4)).collect();
+        assert_eq!(left_edge(&after), (200, 200), "the pop gives the grid back");
+        assert_eq!(left_edge(&boxed(10.4)), (200, 200), "CONTROL: on the grid");
     }
 
     /// A rounded stroke inks exactly what the distance field over its whole box inks, though it

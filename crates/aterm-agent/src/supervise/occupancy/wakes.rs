@@ -907,6 +907,26 @@ pub trait Levels {
     fn sys(&self, wait: &SysWait) -> Option<bool>;
     /// Whether `agent` is still the process it was (its pid alive, born when it was).
     fn agent_alive(&self, agent: AgentId) -> bool;
+    /// Why `atom`'s path can no longer be read, where it cannot: a link met on the way
+    /// ([`ExpireWhy::Path`]), or the running rules no longer admitting it ([`ExpireWhy::Admit`]).
+    fn lost(&self, atom: &SourceAtom) -> Option<ExpireWhy> {
+        let _ = atom;
+        None
+    }
+}
+
+/// Why `wake`'s condition can no longer be judged: a path lost ([`Levels::lost`]) of a `when=`
+/// atom that has not held, or of an `unless=` atom.
+fn lost_path(wake: &DeclaredWake, levels: &dyn Levels) -> Option<ExpireWhy> {
+    wake.when
+        .iter()
+        .filter(|a| !a.held)
+        .filter_map(|a| match &a.atom {
+            Atom::Source(source) => Some(source),
+            Atom::Time(_) | Atom::Sys(_) => None,
+        })
+        .chain(wake.unless.iter())
+        .find_map(|atom| levels.lost(atom))
 }
 
 /// What a successor's rows make of a claim its predecessor held.
@@ -1117,6 +1137,8 @@ impl WakeBook {
                         Some(ExpireWhy::Due)
                     } else if !levels.agent_alive(wake.agent) {
                         Some(ExpireWhy::Agent)
+                    } else if let Some(why) = lost_path(wake, levels) {
+                        Some(why)
                     } else if wake.unless.iter().any(|a| levels.source(a) == Some(true)) {
                         Some(ExpireWhy::Unless)
                     } else {

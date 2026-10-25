@@ -13,9 +13,9 @@ use super::super::config::SupervisorConfig;
 use super::notice::{self, Notice, NoticeText};
 use super::outlook::ExceptionKind;
 use super::turn_end::{
-    Composer, ContextFill, RULE_LOGIN, RenewStep, RosterWord, SAME_REPLY, TurnEndAction,
-    TurnEndReading, TurnEndState, Unmade, bucket_model, decide_turn_end, decide_turn_end_traced,
-    login_wall_moves, login_wall_waits, renew_step, sign_in_how, waited_login,
+    Composer, ContextFill, RULE_LOGIN, RosterWord, SAME_REPLY, TurnEndAction, TurnEndReading,
+    TurnEndState, Unmade, bucket_model, decide_turn_end, decide_turn_end_traced, login_wall_moves,
+    login_wall_waits, renewed_draft_holds, sign_in_how, waited_login,
 };
 
 /// Whether the person is needed now or only when they next look.
@@ -661,16 +661,11 @@ fn limit_roster_step<'a>(
                 (text, Some(ready.label.as_str()), None)
             }),
         },
-        (Ok(()), None, Some(next)) => Some((
-            match (next.renew, held.is_none() && !unmovable) {
-                (true, true) => &notice::LIMIT_RENEW,
-                (false, true) => &notice::LIMIT_LOGIN,
-                (true, false) => &notice::LIMIT_RENEW_HELD,
-                (false, false) => &notice::LIMIT_LOGIN_HELD,
-            },
-            Some(next.label.as_str()),
-            None,
-        )),
+        // The next row to sign in asks no one: aterm's sign-in ladder signs a row with an email
+        // in first, as a walled session's successor (`crate::harness::accounts_sync`'s tier 0),
+        // and the tab is decided again at the accounts' news; where no route can, the routes it
+        // tried are on record, as a signed-out row with no email is.
+        (Ok(()), None, Some(_)) => None,
     })
 }
 
@@ -766,18 +761,13 @@ fn claude_login(
     if !walled {
         return Some(None);
     }
-    let label = reading.login_label.as_deref().filter(|_| cfg.logins);
-    match renew_step(reading, cfg) {
-        Some(RenewStep::Draft) => {
-            return Some(Some(Exception::of_notice(
-                &draft_notice_text(&notice::RENEWED_DRAFT, &reading.composer),
-                label,
-                None,
-                "the composer empty, or the agent working",
-            )));
-        }
-        Some(RenewStep::ByHand(why)) => return told(&notice::RENEWED_BY_HAND, label, Some(why)),
-        None => {}
+    if renewed_draft_holds(reading, cfg) {
+        return Some(Some(Exception::of_notice(
+            &draft_notice_text(&notice::RENEWED_DRAFT, &reading.composer),
+            reading.login_label.as_deref(),
+            None,
+            "the composer empty, or the agent working",
+        )));
     }
     match decide_turn_end(state, reading, cfg, now) {
         TurnEndAction::TypeCommand {

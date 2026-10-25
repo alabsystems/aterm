@@ -155,7 +155,7 @@ fn the_wallpaper_page_shows_the_picture() {
             compiled
                 .semantic(&UiKey::new("settings/wallpaper/current"))
                 .map(|status| status.label.as_str()),
-            Some("Wallpaper: /tmp/wall.png, 1074 by 686 pixels"),
+            Some("Wallpaper image \u{b7} Changed: /tmp/wall.png, 1074 by 686 pixels"),
             "{at}: the status says the image once"
         );
         let spec = wallpaper_preview_of(&compiled).unwrap_or_else(|| panic!("{at}: the preview"));

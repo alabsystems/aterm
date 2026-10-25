@@ -296,9 +296,73 @@ pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
     };
     if let Ready::Up { ctl: ctl_bin } = bring_up(ctx, r, &mut sb, bundle) {
         typing_burst(ctx, r, &mut sb, &ctl_bin);
+        aos_release_step(ctx, r, &mut sb, &ctl_bin);
         settings_hardware_key_step(ctx, r, &mut sb, &ctl_bin);
     }
     sb.teardown(r);
+}
+
+/// What a release build answers `aos bundle` with.
+pub const AOS_BUNDLE_REFUSAL: &str = "ERR aos bundle needs a debug build";
+
+/// What `aterm ctl` puts before a reply it writes to stderr.
+const CTL_STDERR: &str = "aterm-ctl: ";
+
+/// The bundle's `aos` verb attaches and detaches the front window's glow, and refuses only the debug forms (design §14.5 R0 exit item 8).
+fn aos_release_step(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
+    let tag = "gui smoke: release aos";
+    let Some(pid) = sb.child.as_ref().map(Child::id) else {
+        r.cannot_run(format!("{tag}: no child to drive"));
+        return;
+    };
+    if !crate::smoke::activate_macos_gui_pid(pid) {
+        r.skip(format!("{tag} (could not keep the test window frontmost)"));
+        return;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let status = ctl(ctx, sb, ctl_bin, &["aos", "status"]);
+        if ok_reply(&status) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline || child_exited(sb) {
+            r.fail(format!(
+                "{tag}: aos status never answered OK -> {}",
+                or_no_reply(&status)
+            ));
+            r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
+            return;
+        }
+        std::thread::sleep(POLL_GAP);
+    }
+    let attach = ctl(ctx, sb, ctl_bin, &["aos", "attach"]);
+    let detach = ctl(ctx, sb, ctl_bin, &["aos", "detach"]);
+    let bundle = ctl(ctx, sb, ctl_bin, &["aos", "bundle"]);
+    match aos_release_verdict(&attach, &detach, &bundle) {
+        Ok(line) => r.pass(line),
+        Err(bad) => r.fail(bad),
+    }
+}
+
+/// The release `aos` step's verdict on its `attach`, `detach` and `bundle` replies.
+/// # Errors
+/// An attach that is not `OK` hosting the shipped code, a detach that is not `OK`, or a bundle answer other than [`AOS_BUNDLE_REFUSAL`] (a debug build answers the form).
+/// `aterm ctl` writes an `ERR` reply to stderr after [`CTL_STDERR`], and the step reads both streams.
+pub fn aos_release_verdict(attach: &str, detach: &str, bundle: &str) -> Result<String, String> {
+    if !(ok_reply(attach) && attach.contains(" attached=true code=shipped ")) {
+        return Err(format!("gui smoke: aos attach -> {}", or_no_reply(attach)));
+    }
+    if !ok_reply(detach) {
+        return Err(format!("gui smoke: aos detach -> {}", or_no_reply(detach)));
+    }
+    let refusal = bundle.trim_end();
+    if refusal.strip_prefix(CTL_STDERR).unwrap_or(refusal) != AOS_BUNDLE_REFUSAL {
+        return Err(format!(
+            "gui smoke: aos bundle -> {} (a release build answers {AOS_BUNDLE_REFUSAL:?})",
+            or_no_reply(bundle)
+        ));
+    }
+    Ok("the release aos verb attached and detached the glow and refused bundle by name".into())
 }
 
 fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
@@ -842,6 +906,49 @@ mod tests {
         assert!(hv(&held).is_err());
         assert!(hv(&with_glass(31, "56.00")).is_ok());
         assert!(hv(&with_glass(0, "900.00")).is_ok());
+    }
+
+    #[test]
+    fn the_release_aos_step_passes_only_a_release_builds_answers() {
+        let attach = "OK window=0 attached=true code=shipped hot=false active=false settling=false \
+                      build=0.140.0 paused=false";
+        let detach =
+            "OK window=0 attached=false code=shipped hot=false active=false settling=false";
+        assert!(aos_release_verdict(attach, detach, AOS_BUNDLE_REFUSAL).is_ok());
+        assert!(
+            aos_release_verdict(
+                attach,
+                detach,
+                "aterm-ctl: ERR aos bundle needs a debug build\n"
+            )
+            .is_ok(),
+            "the reply as `aterm ctl` prints it"
+        );
+        let old_release = "ERR aos needs a debug build";
+        for (a, d, b) in [
+            (old_release, detach, AOS_BUNDLE_REFUSAL),
+            (attach, old_release, AOS_BUNDLE_REFUSAL),
+            (attach, detach, old_release),
+            (
+                attach,
+                detach,
+                "ERR aos bundle: no plan was published over the glow",
+            ),
+            (
+                "OK window=0 attached=false code=shipped hot=false",
+                detach,
+                AOS_BUNDLE_REFUSAL,
+            ),
+            (
+                "ERR aos attach refused: no window",
+                detach,
+                AOS_BUNDLE_REFUSAL,
+            ),
+            (attach, detach, "aterm-ctl: ERR aos needs a debug build"),
+            ("", "", ""),
+        ] {
+            assert!(aos_release_verdict(a, d, b).is_err(), "{a:?} {d:?} {b:?}");
+        }
     }
 
     #[test]

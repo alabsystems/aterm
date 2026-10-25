@@ -73,6 +73,21 @@ pub struct SetupStatus {
     /// launch, which widened the plan it had chosen before (§3.5): the page says so in one calm
     /// note while it goes. Filled by the worker, from the look that widened the plan.
     pub widened: bool,
+    /// The worker's read met a write of the saved setup under way (a pass saving its progress,
+    /// a Stop saving its request): it says nothing of the plan or its Permissions group, which
+    /// a read a moment later does. Filled by the worker.
+    pub changing: bool,
+    /// A person's press waits for another setup that holds this Mac's setup records (another
+    /// aterm, `aterm doctor` in a terminal): their choice, or Restore previous settings while
+    /// `operation` says so, which aterm applies when that setup finishes (§3.3, §3.4). The page
+    /// keeps the choice showing, marked waiting, and says why in one calm note: nothing failed,
+    /// so nothing is signalled, and no run goes, so there is no meter and no Stop. Filled by
+    /// the worker.
+    pub queued: bool,
+    /// The plan in force is the one aterm set up afresh after it set aside a saved setup it
+    /// could not read (§3.5): every Mac preference group left as is, aterm's own permissions
+    /// set up. The page says so in one calm note until a person chooses. Filled by the worker.
+    pub recovered: bool,
 }
 
 /// A read-only Check again or a Restore the window started: the worker is
@@ -107,19 +122,28 @@ pub struct SetupStatusRow {
     pub detail: String,
 }
 
-/// A step the last run or Restore could not finish (§3.6): the page's row it
-/// names, if one, and whether it is a row Restore could not put back
-/// ([`restore_rows`]).
+/// A step the last run, a Check or a Restore could not finish (§3.6): the page's row it
+/// names, if one, whether it is a row Restore could not put back ([`restore_rows`]), whether it
+/// is a Restore that failed as a whole, which names no row, whether a Check said it, and
+/// whether aterm tries it again by itself ([`SetupStatus::retries_by_itself`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Failure {
     pub(crate) row: Option<Subject>,
     pub(crate) restore: bool,
+    pub(crate) whole_restore: bool,
+    /// A Check's result: a read, whose remedy is pressing Check again, so the page's note alone
+    /// says it (§3.6), never the headline, the menu line or the tab's attention.
+    pub(crate) check: bool,
+    /// aterm tries it again by itself: the page counts it as waiting (§3.2) and nothing signals
+    /// it, since nobody needs to act.
+    pub(crate) retried: bool,
 }
 
 impl SetupStatus {
-    /// A setup run is going: busy with neither a Check nor a Restore.
+    /// A setup run is going: busy with neither a Check nor a Restore, and no press waiting for
+    /// another setup ([`Self::queued`]).
     pub(crate) fn running(&self) -> bool {
-        self.busy && self.operation.is_none()
+        self.busy && self.operation.is_none() && !self.queued
     }
 
     /// Readings valid for this vault source; the rest of the Mac is shared
@@ -180,13 +204,17 @@ impl SetupStatus {
         self.results(plan)
             .filter(|result| matches!(result.row.status.as_str(), "error" | "failed"))
             .map(|result| {
+                let whole_restore = result.name == RESTORE_FINISHED;
                 let (restore, name) = result
                     .name
                     .strip_prefix(RESTORE_ROW)
-                    .map_or((false, result.name), |name| (true, name));
+                    .map_or((whole_restore, result.name), |name| (true, name));
                 Failure {
                     row: subject_named(name),
                     restore,
+                    whole_restore,
+                    check: result.check,
+                    retried: !result.check && !restore && self.retries_by_itself(result.row),
                 }
             })
             .filter(move |failure| {
@@ -201,15 +229,21 @@ impl SetupStatus {
     /// vault refused, a change that did not land), each with the row it
     /// names, if one: failures, which the menu line and the tab's attention
     /// say as they say a row that failed (§3.6), besides the page's notes,
-    /// once the run no longer retries them ([`Self::failures_signal`]). A
-    /// step naming a row `plan` no longer manages is left out. A Check's
-    /// failures count only for that exact plan.
+    /// once the run no longer retries them ([`Self::failures_signal`]) and
+    /// nothing else tries them again by itself (a vault try on its own pause,
+    /// [`Failure::retried`]). A step naming a row `plan` no longer manages is
+    /// left out. A Check's results are never among them: a Check only reads,
+    /// and pressing it again is its remedy, which the page's note says. A Restore that failed
+    /// as a whole is the page's alone (§3.4): its headline and note say it beside the button
+    /// that tries it again.
     pub(crate) fn failed_steps<'a>(
         &'a self,
         plan: Option<&'a Plan>,
     ) -> impl Iterator<Item = Failure> + 'a {
         let signal = self.failures_signal();
-        self.result_failures(plan).filter(move |_| signal)
+        self.result_failures(plan).filter(move |failure| {
+            signal && !failure.check && !failure.retried && !failure.whole_restore
+        })
     }
 
     /// Whether the note for `row`, a failed result, says aterm tries it again by itself (§3.5):
@@ -231,6 +265,12 @@ impl SetupStatus {
     /// leave it out.
     fn notes(&self, plan: &Plan) -> Vec<String> {
         let mut notes = Vec::new();
+        if self.queued {
+            notes.push(self.queued_note().to_owned());
+        }
+        if self.recovered {
+            notes.push(RECOVERED_NOTE.to_owned());
+        }
         if self.widened && self.running() {
             notes.push(WIDENED_NOTE.to_owned());
         }
@@ -276,6 +316,42 @@ impl SetupStatus {
 /// vault, so the groups it had left as is are set up now.
 pub(crate) const WIDENED_NOTE: &str =
     "aterm found the ALab vault on this network, so it is setting up the rest of this Mac.";
+
+/// The calm note while a person's choice waits for another setup ([`SetupStatus::queued`]).
+pub(crate) const QUEUED_CHOICE_NOTE: &str =
+    "Another setup is running; aterm applies your choice when it finishes.";
+
+/// The calm note while Restore previous settings waits for another setup
+/// ([`SetupStatus::queued`]).
+pub(crate) const QUEUED_RESTORE_NOTE: &str =
+    "Another setup is running; aterm restores your settings when it finishes.";
+
+/// The calm note while the plan in force is the one aterm set up afresh after setting aside a
+/// saved setup it could not read ([`SetupStatus::recovered`]).
+pub(crate) const RECOVERED_NOTE: &str = "aterm could not read its saved setup, so it set the \
+                                         record aside and left your Mac settings as they are.";
+
+impl SetupStatus {
+    /// The worker could not read the plan in force just now and says so in a calm line
+    /// ([`STATE_UNREAD_NOTE`], [`calm_setup_row`]): it names no plan.
+    fn plan_unread(&self) -> bool {
+        self.plan.is_none()
+            && self
+                .rows
+                .iter()
+                .any(|row| row.name == SETUP_ROW && row.status == NOTED)
+    }
+
+    /// The note for the press waiting for another setup: a Restore's while `operation` says so,
+    /// else a choice's.
+    fn queued_note(&self) -> &'static str {
+        if self.operation == Some(SetupOperation::Restore) {
+            QUEUED_RESTORE_NOTE
+        } else {
+            QUEUED_CHOICE_NOTE
+        }
+    }
+}
 
 /// The row the page names `name`, if one.
 fn subject_named(name: &str) -> Option<Subject> {
@@ -451,6 +527,69 @@ pub fn note_journal_refused(detail: &str) {
     crate::message_inbox::queue_exception(journal_refused_entry(detail));
 }
 
+/// The exceptions digest's entry for a launch's setup that has not started for ten minutes,
+/// trying a step again by itself (§3.5): a fact for later, never an alert, the menu line or the
+/// tab's attention, which the page's calm line ([`STARTUP_RETRY_NOTE`]) leaves dark. `detail`
+/// is why the step failed last, which the log keeps.
+#[must_use]
+pub fn setup_not_started_entry(detail: &str) -> aterm_messages::exceptions::Entry {
+    use aterm_messages::need::{Reason, Then, Why};
+    aterm_messages::exceptions::Entry::new(
+        aterm_messages::exceptions::Family::Setup,
+        "",
+        "startup",
+        "Setup has not started",
+        Why::Spent {
+            tried: Reason::new("tried to start this Mac's setup for ten minutes"),
+            reason: Reason::new("a step keeps failing, and aterm tries it again by itself"),
+        },
+        Then::step("Read aterm.log for the step it names"),
+    )
+    .log_line(format!("System State: setup has not started: {detail}"))
+}
+
+/// Raise [`setup_not_started_entry`] in the exceptions digest.
+#[cfg(unix)]
+pub fn note_setup_not_started(detail: &str) {
+    crate::message_inbox::queue_exception(setup_not_started_entry(detail));
+}
+
+/// The launch's setup went on: [`setup_not_started_entry`] leaves the exceptions digest.
+#[cfg(unix)]
+pub fn clear_setup_not_started() {
+    crate::message_inbox::queue_exception_clear(setup_not_started_entry("").key());
+}
+
+/// The exceptions digest's entry for saved setup records aterm could not parse and set aside
+/// (§3.5): a fact for later, never an alert; the page says it in one calm line
+/// ([`RECOVERED_NOTE`]). `kept` names the records as they are kept now, which the log keeps.
+#[must_use]
+pub fn setup_set_aside_entry(kept: &str) -> aterm_messages::exceptions::Entry {
+    use aterm_messages::need::{Reason, Then, Why};
+    aterm_messages::exceptions::Entry::new(
+        aterm_messages::exceptions::Family::Setup,
+        "",
+        "set-aside",
+        "Unreadable setup records set aside",
+        Why::Spent {
+            tried: Reason::new("read the setup it saved for this Mac"),
+            reason: Reason::new(
+                "a record was unreadable, so aterm kept it aside and started afresh",
+            ),
+        },
+        Then::step("Read aterm.log for the records it names"),
+    )
+    .log_line(format!(
+        "System State: unreadable setup records kept as {kept}"
+    ))
+}
+
+/// Raise [`setup_set_aside_entry`] in the exceptions digest.
+#[cfg(unix)]
+pub fn note_setup_set_aside(kept: &str) {
+    crate::message_inbox::queue_exception(setup_set_aside_entry(kept));
+}
+
 /// The rows of `outcome` that came out `how`, in its order.
 fn outcome_rows(outcome: &RestoreOutcome, how: PutBack) -> Vec<Option<Setting>> {
     outcome
@@ -517,16 +656,12 @@ fn put_back_sentences(outcome: &RestoreOutcome, unknown: [&str; 3]) -> Vec<Strin
 }
 
 /// One sentence about `rows`, opening with their names: `words` is what follows for one row,
-/// for one row that is a plural thing (Widgets), and for several rows.
+/// for one row that is a plural thing (Widgets), and for several rows. Each row is named as
+/// the page names it, with no article, so every name in the line reads alike.
 fn about(rows: &[Option<Setting>], words: [&str; 3]) -> String {
-    // A row's name inside a sentence: the Dock and the Desktop are things, the rest settings.
     let names: Vec<String> = rows
         .iter()
-        .map(|row| match row {
-            Some(setting @ (Setting::Dock | Setting::Desktop)) => format!("the {}", setting.name()),
-            Some(setting) => setting.name().to_owned(),
-            None => "another Mac setting".to_owned(),
-        })
+        .map(|row| row.map_or("another Mac setting", Setting::name).to_owned())
         .collect();
     let list = crate::toolchain_words::and_list(&names);
     let mut first = list.chars();
@@ -554,15 +689,19 @@ const UNDONE: &str = "Undo";
 const RESTORE_ROW: &str = "Restore: ";
 
 impl Said<'_> {
-    /// A calm line ([`restore_rows`], [`pass_rows`]), a row Restore could not put back or a
-    /// setup error that carries its own words ([`STATE_UNREAD_NOTE`]), whose words are whole
-    /// sentences already, said alone: aterm could not read its saved setup, and no setup ran
-    /// to fail.
+    /// A calm line ([`restore_rows`], [`pass_rows`], [`calm_setup_row`]), a row Restore could
+    /// not put back, a Restore that failed as a whole (its headline says it failed, its note
+    /// why) or a setup error that carries its own words, whose words are whole sentences
+    /// already, said alone.
     fn whole(&self) -> bool {
         !self.row.detail.is_empty()
             && match self.row.status.as_str() {
                 "restored" | NOTED => true,
-                "error" | "failed" => self.name.starts_with(RESTORE_ROW) || self.name == SETUP_ROW,
+                "error" | "failed" => {
+                    self.name.starts_with(RESTORE_ROW)
+                        || self.name == SETUP_ROW
+                        || self.name == RESTORE_FINISHED
+                }
                 _ => false,
             }
     }
@@ -583,10 +722,11 @@ impl Said<'_> {
     /// repositories.`, `Check again did not start.`), then the words the result carries, which
     /// are the page's too: the worker gives the page no process, path or preference key, and
     /// `aterm doctor` and the log keep those. A failed step of the page's own rows that carries
-    /// none says what comes next: aterm tries it again by itself while the run retries
-    /// (`retrying`), and Set up now tries it again once it no longer does, where `managed` (the
-    /// page's plan still manages them), as it starts a setup run that could not go
-    /// ([`SETUP_ROW`]) again.
+    /// none says what comes next: Set up now tries it again, where `managed` (the page's plan
+    /// still manages them), as it starts a setup run that could not go ([`SETUP_ROW`]) again.
+    /// A step aterm tries again by itself (its words say so, or it carries none while the run
+    /// retries, `retrying`) is no failure: it did not finish this time, and aterm tries again by
+    /// itself (§3.5).
     fn words(&self, names: &[&str], retrying: bool, managed: bool) -> String {
         if self.whole() {
             return self.row.detail.clone();
@@ -605,7 +745,12 @@ impl Said<'_> {
                 .collect::<Vec<_>>(),
         );
         let status = self.row.status.as_str();
+        let step = managed || names == [SETUP_ROW];
+        let failed_step = step && !self.check && matches!(status, "error" | "failed");
+        let retried = failed_step
+            && (self.row.detail == RETRIES_NOTE || (self.row.detail.is_empty() && retrying));
         let what = match status {
+            _ if retried => format!("{list} did not finish this time."),
             "unverified" if self.check => format!("Check again could not confirm {list}."),
             "not started" => format!("{list} did not start."),
             "error" | "failed" => format!("{list} failed."),
@@ -613,15 +758,12 @@ impl Said<'_> {
             "restored" => format!("{list} finished."),
             other => format!("{list}: {other}."),
         };
-        let step = managed || names == [SETUP_ROW];
-        let then = if !self.row.detail.is_empty() {
+        let then = if retried {
+            Some(RETRIES_NOTE)
+        } else if !self.row.detail.is_empty() {
             Some(self.row.detail.as_str())
-        } else if step && !self.check && matches!(status, "error" | "failed") {
-            Some(if retrying {
-                RETRIES_NOTE
-            } else {
-                SET_UP_NOW_NOTE
-            })
+        } else if failed_step {
+            Some(SET_UP_NOW_NOTE)
         } else {
             None
         };
@@ -643,13 +785,38 @@ pub const SETUP_ROW: &str = "Setup";
 /// keep their last readings meanwhile. The log keeps why.
 pub const CHECK_FAILED_NOTE: &str = "The rows show what aterm read before.";
 
-/// What the page says after a Restore that failed as a whole (`Restore previous settings
-/// failed.`). The log keeps why.
+/// What the page says under a Restore that failed as a whole (headlined `Restore previous
+/// settings failed`) for a reason the page has no words of its own for. The log keeps why.
 pub const RESTORE_FAILED_NOTE: &str = "Press it again to try once more.";
 
-/// What the page says when aterm cannot read what it saved of this Mac's setup (its plan and
-/// last run). The log keeps why.
-pub const STATE_UNREAD_NOTE: &str = "aterm could not read what it saved about this Mac's setup.";
+/// What the page says under a Restore that failed as a whole because the settings aterm saved
+/// before setup changed them cannot be read: pressing it again reads the same record, so the
+/// note names where to learn why instead.
+pub const RESTORE_BACKUP_UNREAD_NOTE: &str =
+    "aterm cannot read the settings it saved before setup changed them; aterm doctor says why.";
+
+/// What the page says while aterm cannot read what it saved of this Mac's setup (its plan and
+/// last run) just now: it reads it again by itself, and sets aside a record that stays
+/// unreadable ([`SetupStatus::recovered`]). A calm line ([`calm_setup_row`]); the log keeps
+/// why.
+pub const STATE_UNREAD_NOTE: &str =
+    "aterm could not read its saved setup just now; it reads it again by itself.";
+
+/// What the page says while the launch's setup could not start and aterm tries again by itself
+/// (§3.5): a calm line ([`calm_setup_row`]); the log keeps why.
+pub const STARTUP_RETRY_NOTE: &str =
+    "aterm could not start setup just now; it tries again by itself.";
+
+/// A calm line about setup as a whole, in `words` that are whole sentences in the page's own
+/// terms: no failure, so no failure headline, menu line or tab attention (§3.6).
+#[must_use]
+pub fn calm_setup_row(words: &str) -> SetupStatusRow {
+    SetupStatusRow {
+        name: SETUP_ROW.to_owned(),
+        status: NOTED.to_owned(),
+        detail: words.to_owned(),
+    }
+}
 
 /// What a failed step's note says while the run still tries it again by itself (§3.5).
 pub(crate) const RETRIES_NOTE: &str = "aterm tries again by itself.";
@@ -923,8 +1090,14 @@ fn row_view_for_source(
         now: from.clone(),
         wanted: wanted.clone(),
     };
+    // While macOS's administrator dialog for debugger access is up, or about to be (the
+    // window's debugger step), a press of Turn On… can start nothing: the row says what it
+    // waits for in place of the button (§3.4), and still needs the person, whose dialog may
+    // be behind other windows.
+    let asking = subject == Subject::Access(Access::Debugger)
+        && status.access_step == Some(Access::Debugger);
     let open = match subject {
-        Subject::Access(access) if standing == Some(Standing::NeedsYou) => Some(access),
+        Subject::Access(access) if standing == Some(Standing::NeedsYou) && !asking => Some(access),
         _ => None,
     };
     // A setting read in place at a value other than aterm's is the person's
@@ -954,7 +1127,7 @@ fn row_view_for_source(
         Some(Standing::Untold) => (
             RowValue::One("—".to_owned()),
             None,
-            format!("{name}: not told"),
+            format!("{name}: unknown"),
         ),
         // A row read as wanted shows the value read, never the wanted one in
         // its place: with nothing read it is `—` beside the check.
@@ -1001,7 +1174,11 @@ fn row_view_for_source(
             )
         }
         Some(Standing::NeedsYou) => {
-            note = explained();
+            note = if asking {
+                Some(PASSWORD_NOTE.to_owned())
+            } else {
+                explained()
+            };
             (
                 change(),
                 Some(Chip::NeedsYou),
@@ -1042,6 +1219,12 @@ fn row_view_for_source(
 /// The note of a waiting row whose probe gave no reason: it is blocked on
 /// something, and nothing more can be said of it.
 pub(crate) const WAITING_NOTE: &str = "Can't be set up yet";
+
+/// The note of the Debugger access row while macOS's administrator dialog for it is up, which
+/// takes the place of its Turn On… button: nothing on the page moves it, and the dialog may be
+/// behind other windows.
+pub(crate) const PASSWORD_NOTE: &str =
+    "Waiting for your administrator password in the SamplingTools dialog";
 
 /// The note of a row a run set for macOS to take up in full at the next login
 /// (Trackpad scrolling): it reads in place, and says when it is all in effect.
@@ -1137,6 +1320,9 @@ impl Headline {
         if !status.busy {
             return None;
         }
+        if status.queued {
+            return Some(Self::queued(status));
+        }
         Some(Self::line(match status.operation {
             None => {
                 let managed = rows.iter().filter(|row| row.managed).count();
@@ -1148,9 +1334,21 @@ impl Headline {
         }))
     }
 
+    /// The headline while a person's press waits for another setup ([`SetupStatus::queued`]).
+    fn queued(status: &SetupStatus) -> Self {
+        Self::line(if status.operation == Some(SetupOperation::Restore) {
+            "Waiting to restore previous settings…"
+        } else {
+            "Waiting to apply your choice…"
+        })
+    }
+
     /// The headline while the page does not know the worker's plan yet: it
     /// cannot say which rows aterm manages, so it says only what is going.
     pub(crate) fn before_plan(status: &SetupStatus) -> Self {
+        if status.busy && status.queued {
+            return Self::queued(status);
+        }
         match (status.busy, status.operation) {
             (true, None) => Self::line("Setting up this Mac…"),
             (true, Some(SetupOperation::Restore)) => Self::line("Restoring previous settings…"),
@@ -1166,10 +1364,32 @@ impl Headline {
         }
     }
 
+    /// `1 step waiting: GitHub repositories`, with Show to the first of `waiting` (none: no
+    /// headline of its own).
+    fn waiting(waiting: &[Subject]) -> Self {
+        let count = if waiting.len() == 1 { "step" } else { "steps" };
+        let names: Vec<&str> = waiting.iter().map(|subject| subject.name()).collect();
+        Self {
+            show: waiting.first().copied(),
+            ..Self::line(format!(
+                "{} {count} waiting: {}",
+                waiting.len(),
+                names.join(", ")
+            ))
+        }
+    }
+
     /// The headline of a Restore that could not put a row back (§3.4): `Restore previous
-    /// settings failed: Widgets`, showing that row, whose reason is the page's note. `None`
-    /// when every row Restore reached came out as nobody can change.
+    /// settings failed: Widgets`, showing that row, whose reason is the page's note; or of a
+    /// Restore that failed as a whole, `Restore previous settings failed`, whose reason is its
+    /// note. `None` when every row Restore reached came out as nobody can change.
     fn restore_failed(status: &SetupStatus, plan: Option<&Plan>) -> Option<Self> {
+        if status
+            .result_failures(plan)
+            .any(|failure| failure.whole_restore)
+        {
+            return Some(Self::line(format!("{RESTORE_FINISHED} failed")));
+        }
         let rows: Vec<Option<Subject>> = status
             .result_failures(plan)
             .filter(|failure| failure.restore)
@@ -1220,40 +1440,21 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     if let Some(restore) = Headline::restore_failed(status, plan) {
         return restore;
     }
-    let result_failures: Vec<Subject> = status
-        .result_failures(plan)
-        .filter(|failure| !failure.restore)
-        .filter_map(|failure| failure.row)
-        .collect();
-    let failed: Vec<Subject> = rows
-        .iter()
-        .filter(|row| {
-            row.managed
-                && (row.standing == Some(Standing::Failed)
-                    || result_failures.contains(&row.subject))
-        })
-        .map(|row| row.subject)
-        .collect();
-    if let Some(first) = failed.first() {
-        let steps = if failed.len() == 1 { "step" } else { "steps" };
+    let steps = Steps::of(status, rows, plan);
+    if let Some(first) = steps.failed.first() {
+        let failed = &steps.failed;
+        let count = if failed.len() == 1 { "step" } else { "steps" };
         let names: Vec<&str> = failed.iter().map(|subject| subject.name()).collect();
         // Set up now is offered only where running the plan again can change the outcome: a
         // step the last run tried and could not finish (a change that did not take, a stage
         // that failed, a vault try held after two), whose note says Set up now tries it again.
-        // One aterm tries again by itself says so instead, and a reading that failed by itself
-        // names its own remedy in its note (sign in, then Check again), which Set up now cannot
-        // give: Show alone takes the person there.
-        let rerun: Vec<Subject> = status
-            .results(plan)
-            .filter(|result| matches!(result.row.status.as_str(), "error" | "failed"))
-            .filter(|result| !status.retries_by_itself(result.row))
-            .filter_map(|result| subject_named(result.name))
-            .collect();
+        // A reading that failed by itself names its own remedy in its note (sign in, then Check
+        // again), which Set up now cannot give: Show alone takes the person there.
         return Headline {
             show: Some(*first),
-            start: failed.iter().any(|subject| rerun.contains(subject)),
+            start: failed.iter().any(|subject| steps.rerun.contains(subject)),
             ..Headline::line(format!(
-                "{} {steps} failed: {}",
+                "{} {count} failed: {}",
                 failed.len(),
                 names.join(", ")
             ))
@@ -1261,7 +1462,7 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     }
     if status
         .result_failures(plan)
-        .any(|failure| !failure.restore && failure.row.is_none())
+        .any(|failure| !failure.restore && !failure.check && failure.row.is_none())
     {
         // A setup run that could not go (its worker did not start, a pass failed as a whole)
         // is one Set up now starts again, as its note says, unless the run tries it again by
@@ -1277,7 +1478,15 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
             ..Headline::line("Setup needs attention")
         };
     }
-    if status.observed.is_empty() {
+    // A step aterm tries again by itself is no failure (§3.5): it waits for that try, as a row
+    // that waits on something does, so the headline counts both as waiting, before any change
+    // to make, since a run is coming by itself.
+    if !steps.retried.is_empty() {
+        return Headline::waiting(&steps.waiting(rows));
+    }
+    // Readings still to come, or a saved setup aterm reads again by itself, whose calm line
+    // says so: nothing is claimed of a plan the worker could not read just now.
+    if status.observed.is_empty() || status.plan_unread() {
         return Headline::line(CHECKING);
     }
     // Past a person and a failure, a row not yet as wanted differs or waits.
@@ -1296,22 +1505,9 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
             ..Headline::line(format!("{to_change} {changes} to make"))
         };
     }
-    let waiting: Vec<Subject> = rows
-        .iter()
-        .filter(|row| row.managed && row.standing == Some(Standing::Waiting))
-        .map(|row| row.subject)
-        .collect();
-    if let Some(first) = waiting.first() {
-        let steps = if waiting.len() == 1 { "step" } else { "steps" };
-        let names: Vec<&str> = waiting.iter().map(|subject| subject.name()).collect();
-        return Headline {
-            show: Some(*first),
-            ..Headline::line(format!(
-                "{} {steps} waiting: {}",
-                waiting.len(),
-                names.join(", ")
-            ))
-        };
+    let waiting = steps.waiting(rows);
+    if !waiting.is_empty() {
+        return Headline::waiting(&waiting);
     }
     let managed = rows.iter().filter(|row| row.managed).count();
     if managed == 0 {
@@ -1347,41 +1543,172 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     {
         return Headline::line(CHECKING);
     }
+    // The headline claims no more than was confirmed: a row whose change, or whose Check, could
+    // not be confirmed is counted, and shown, where its note says so; a Check that failed as a
+    // whole leaves every row as aterm read it before, which the headline says.
+    if let Some(first) = steps.unconfirmed.first() {
+        let count = if steps.unconfirmed.len() == 1 {
+            "row"
+        } else {
+            "rows"
+        };
+        let names: Vec<&str> = steps
+            .unconfirmed
+            .iter()
+            .map(|subject| subject.name())
+            .collect();
+        return Headline {
+            show: Some(*first),
+            ..Headline::line(format!(
+                "{} {count} not confirmed: {}",
+                steps.unconfirmed.len(),
+                names.join(", ")
+            ))
+        };
+    }
     let only_permissions = rows
         .iter()
         .filter(|row| row.managed)
         .all(|row| row.subject.group() == Group::Access);
-    Headline::line(if only_permissions {
+    let set_up = if only_permissions {
         "Permissions are set up"
     } else {
         "This Mac is set up"
+    };
+    Headline::line(if steps.check_failed {
+        format!("{set_up}, {AS_LAST_READ}")
+    } else {
+        set_up.to_owned()
     })
+}
+
+/// What a set-up headline adds after a Check that failed as a whole: the rows show what aterm
+/// read before ([`CHECK_FAILED_NOTE`]).
+const AS_LAST_READ: &str = "as last read";
+
+/// Where the steps the last run and Check said stand, against the page's rows (§3.2, §3.6):
+/// what the headline names failed, counts as waiting or as not confirmed, and the village
+/// draws ([`village_spec`]).
+struct Steps {
+    /// Managed rows that failed: a reading that failed, or a step the run could not finish and
+    /// nothing tries again by itself. A Check's result is never one: a Check only reads.
+    failed: Vec<Subject>,
+    /// The failed rows Set up now can change: a step the last run tried and could not finish,
+    /// whose note says Set up now tries it again.
+    rerun: Vec<Subject>,
+    /// Managed rows, not failed, with a step aterm tries again by itself.
+    retried: Vec<Subject>,
+    /// Managed rows, not failed, whose change or Check could not be confirmed.
+    unconfirmed: Vec<Subject>,
+    /// A Check of this plan failed as a whole: the rows keep what aterm read before.
+    check_failed: bool,
+}
+
+impl Steps {
+    fn of(status: &SetupStatus, rows: &[RowView], plan: Option<&Plan>) -> Self {
+        let failures: Vec<Failure> = status
+            .result_failures(plan)
+            .filter(|failure| !failure.restore)
+            .collect();
+        let named = |keep: &dyn Fn(&Failure) -> bool| -> Vec<Subject> {
+            failures
+                .iter()
+                .filter(|failure| keep(failure))
+                .filter_map(|failure| failure.row)
+                .collect()
+        };
+        let stopped = named(&|failure| !failure.check && !failure.retried);
+        let retried = named(&|failure| failure.retried);
+        let checked = named(&|failure| failure.check);
+        let selection = plan.map_or_else(Selection::none, |plan| plan.selection);
+        let unverified: Vec<Subject> = status
+            .results(plan)
+            .filter(|result| result.row.status == "unverified")
+            .filter_map(|result| subject_named(result.name))
+            .filter(|subject| manages(selection, *subject))
+            .collect();
+        let managed = |keep: &dyn Fn(&RowView) -> bool| -> Vec<Subject> {
+            rows.iter()
+                .filter(|row| row.managed && keep(row))
+                .map(|row| row.subject)
+                .collect()
+        };
+        let failed = managed(&|row| {
+            row.standing == Some(Standing::Failed) || stopped.contains(&row.subject)
+        });
+        let rerun = status
+            .results(plan)
+            .filter(|result| !result.check)
+            .filter(|result| matches!(result.row.status.as_str(), "error" | "failed"))
+            .filter(|result| !status.retries_by_itself(result.row))
+            .filter_map(|result| subject_named(result.name))
+            .collect();
+        let retried =
+            managed(&|row| !failed.contains(&row.subject) && retried.contains(&row.subject));
+        let unconfirmed = managed(&|row| {
+            !failed.contains(&row.subject)
+                && !retried.contains(&row.subject)
+                && (unverified.contains(&row.subject) || checked.contains(&row.subject))
+        });
+        Self {
+            check_failed: failures
+                .iter()
+                .any(|failure| failure.check && failure.row.is_none()),
+            failed,
+            rerun,
+            retried,
+            unconfirmed,
+        }
+    }
+
+    /// The managed rows the headline counts as waiting, in page order: each that waits on
+    /// something, and each with a step aterm tries again by itself.
+    fn waiting(&self, rows: &[RowView]) -> Vec<Subject> {
+        rows.iter()
+            .filter(|row| {
+                row.managed
+                    && (row.standing == Some(Standing::Waiting)
+                        || self.retried.contains(&row.subject))
+                    && !self.failed.contains(&row.subject)
+            })
+            .map(|row| row.subject)
+            .collect()
+    }
 }
 
 /// THE VILLAGE RULE (pure): the scene
 /// [`crate::settings::paint_rainbow_kitty_village`] draws beside the lockup,
 /// one station per [`Setting`] in its order, in the painter's letters: `_`
-/// left as is, `E` a managed row needs a person or failed, `W` running now,
-/// `G` every managed row in place, `D` otherwise (it differs, waits or is not
-/// read yet). `done` and `total` are the meter's count of managed rows.
+/// left as is, `E` a managed row needs a person or failed (a reading, or a
+/// step the headline names failed), `W` running now, `D` a step aterm tries
+/// again by itself, which waits for that try, `G` every managed row in place,
+/// `D` otherwise (it differs, waits or is not read yet). `done` and `total`
+/// are the meter's count of managed rows. `plan` is the page's review, whose
+/// selection says what is left as is.
 pub(crate) fn village_spec(
     status: &SetupStatus,
     rows: &[RowView],
-    selection: Selection,
+    plan: &Plan,
     phase_ms: u64,
 ) -> String {
+    let steps = Steps::of(status, rows, Some(plan));
+    let of = |subjects: &[Subject], setting: Setting| {
+        subjects.iter().any(|subject| subject.setting() == setting)
+    };
     let states: String = Setting::ALL
         .iter()
         .map(|&setting| {
             let mut managed = rows
                 .iter()
                 .filter(|row| row.managed && row.subject.setting() == setting);
-            if !selection.contains(setting) {
+            if !plan.selection.contains(setting) {
                 '_'
-            } else if managed.clone().any(RowView::attention) {
+            } else if managed.clone().any(RowView::attention) || of(&steps.failed, setting) {
                 'E'
             } else if status.running.contains(&setting) {
                 'W'
+            } else if of(&steps.retried, setting) {
+                'D'
             } else if managed.all(RowView::settled) {
                 'G'
             } else {
@@ -2718,6 +3045,9 @@ impl<'a, 'b> Page<'a, 'b> {
     /// The brand lockup (§3.1), with its height and whether the village beside
     /// it walks (it shows, and motion is not reduced).
     fn brand(&self) -> (UiNode, f32, bool) {
+        // The words' middle dot marks the lockup for the eye; a screen reader hears the words
+        // alone, as it does a row's value.
+        let spoken = paint::BRAND_WORDS.replace(" · ", " ");
         let mut spec = BrandSpec {
             kitty: !self.cx.motion.serious
                 && !crate::native_appearance::current_preferences().high_contrast,
@@ -2740,7 +3070,7 @@ impl<'a, 'b> Page<'a, 'b> {
                 UiContent::Custom(AuditedCustomNode {
                     audit_id: crate::native_ui::SYSTEM_STATE_BRAND_AUDIT,
                     role: SemanticRole::Text,
-                    label: paint::BRAND_WORDS.to_owned(),
+                    label: spoken.clone(),
                     value: Some(spec.value()),
                     action: None,
                     focusable: false,
@@ -2760,7 +3090,7 @@ impl<'a, 'b> Page<'a, 'b> {
             UiNode::new(
                 "system-state/brand",
                 UiContent::Group(GroupSpec {
-                    label: Some(paint::BRAND_WORDS.to_owned()),
+                    label: Some(spoken),
                     role: SemanticRole::Text,
                     style: StyleRef::Plain,
                 }),
@@ -2800,7 +3130,7 @@ impl<'a, 'b> Page<'a, 'b> {
                     value: Some(village_spec(
                         &self.app.status,
                         &self.rows,
-                        self.app.plan.selection,
+                        &self.app.reviewed_plan(),
                         phase_ms,
                     )),
                     action: None,
@@ -4513,11 +4843,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
         "plan-unread" => {
             status.plan = None;
             status.observed_vault_url = None;
-            status.rows.push(SetupStatusRow {
-                name: SETUP_ROW.into(),
-                status: "failed".into(),
-                detail: STATE_UNREAD_NOTE.into(),
-            });
+            status.rows.push(calm_setup_row(STATE_UNREAD_NOTE));
         }
         "vault-source-mismatch" => {
             status.plan.as_mut()?.vault_url = "http://reviewed-vault.local:7484/v1/team".into();
@@ -4568,9 +4894,9 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.observed = with(
                 in_place(),
                 vec![
-                    // macOS tells an app nothing of its Local Network switch: unread until
-                    // something on this network answers.
-                    access(Access::LocalNetwork, Unknown, None),
+                    // Local Network as `access::observation` reads it where no LAN look has
+                    // answered aterm: macOS tells apps nothing of it.
+                    untold_lan(),
                     setting(Setting::Dock, Differs, Some("9 apps")),
                     setting(Setting::Messages, Differs, Some("Signed in")),
                     setting(Setting::FaceTime, Differs, Some("Signed in")),
@@ -4620,14 +4946,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.retrying = true;
             let mut vault = setting(Setting::Secrets, Waiting, Some("Not joined"));
             vault.note = Some("The ALab vault did not answer on this network".to_owned());
-            status.observed = with(
-                in_place(),
-                vec![
-                    access(Access::LocalNetwork, Unknown, None),
-                    vault,
-                    token_waiting(),
-                ],
-            );
+            status.observed = with(in_place(), vec![untold_lan(), vault, token_waiting()]);
         }
         "vault-not-syncing" => {
             let mut vault = setting(Setting::Secrets, Differs, Some("Not syncing"));
@@ -4892,7 +5211,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.observed = with(
                 in_place(),
                 vec![
-                    access(Access::LocalNetwork, Unknown, None),
+                    untold_lan(),
                     engine(
                         Setting::CapsLock,
                         Differs,

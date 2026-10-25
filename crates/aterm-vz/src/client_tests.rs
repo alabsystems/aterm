@@ -291,6 +291,127 @@ fn a_session_from_another_checkouts_helper_replaces_it() {
     rig.ended();
 }
 
+/// The running helper's record as an earlier build wrote it: no start time.
+fn strip_birth(paths: &Paths) -> Record {
+    let text = std::fs::read_to_string(paths.record()).unwrap();
+    let mut v = aterm_json::from_str::<aterm_json::Value>(&text).unwrap();
+    v.as_object_mut().unwrap().remove("birth_us");
+    std::fs::write(paths.record(), aterm_json::to_string(&v).unwrap()).unwrap();
+    Record::read(&paths.record()).expect("whole, with no start time")
+}
+
+/// `down` on a helper an earlier build started (its record names no start time) asks it to
+/// `Stop`, waits for its end and removes its run files, signalling nothing; `status` still
+/// reads it, and `join` names it. Negative control: read as no record, the rule before, `down`
+/// returned at once and left it running (the hang detector in `ended` fires).
+#[test]
+fn down_asks_an_earlier_builds_helper_to_stop_and_signals_nothing() {
+    let mut rig = Rig::new();
+    let up = rig.booted(true);
+    up.detach();
+    rig.state_until(|s| s.sessions == 0);
+    let earlier = strip_birth(&rig.paths());
+    assert_eq!(earlier.birth_us, 0);
+    assert!(rig.lab.status().unwrap().is_some(), "its state is read");
+    let why = match rig.lab.join(&attach(&helper_a(), AGENT, false)) {
+        Err(ClientError::NoHelper(why)) => why,
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("joined an unproven helper"),
+    };
+    assert!(
+        why.contains("earlier build") && why.contains(&earlier.pid.to_string()),
+        "{why}"
+    );
+    rig.lab.down().unwrap();
+    assert_eq!(
+        rig.ended(),
+        "the VM stopped: the VM was stopped by a Stop (down)"
+    );
+}
+
+/// A session that finds a helper an earlier build started asks it to `Stop`, names it as the
+/// one replaced, and starts its own, whose record names its start.
+#[test]
+fn a_session_replaces_an_earlier_builds_helper_without_a_signal() {
+    let mut rig = Rig::new();
+    let up = rig.booted(true);
+    up.detach();
+    rig.state_until(|s| s.sessions == 0);
+    let earlier = strip_birth(&rig.paths());
+    let s = rig.lab.session(&attach(&helper_a(), AGENT, false)).unwrap();
+    assert_eq!(s.phase, Phase::Absent, "a new helper, no VM yet");
+    assert_eq!(rig.lab.start.starts(), 2);
+    assert_eq!(
+        rig.lab.start.ended,
+        [Ok(
+            "the VM stopped: the VM was stopped by a Stop (down)".to_string()
+        )]
+    );
+    let replaced = rig.lab.replaced.clone().expect("the lab names it");
+    assert_eq!(replaced.record, earlier);
+    let record = Record::read(&rig.paths().record()).unwrap();
+    assert_ne!(
+        record.birth_us, 0,
+        "the new helper's record names its start"
+    );
+    s.detach();
+    rig.ended();
+}
+
+/// A lab's `Start` that starts nothing, signals nothing, and reads every pid as one that may
+/// still run, so any wait on a helper's end runs to its span.
+#[derive(Debug)]
+struct NeverStarts;
+
+impl Start for NeverStarts {
+    fn start(&mut self, _paths: &Paths) -> Result<u32, String> {
+        Err("this lab starts nothing".into())
+    }
+
+    fn exited(&mut self) -> Option<String> {
+        None
+    }
+
+    fn settled(&mut self) {}
+
+    fn alive(&self, _record: &Record) -> bool {
+        true
+    }
+
+    fn kill(&mut self, record: &Record) -> Result<(), String> {
+        Err(format!("pid {}: never signalled here", record.pid))
+    }
+
+    fn pids(&self) -> &dyn crate::record::Pids {
+        &crate::record::Kernel
+    }
+}
+
+/// A record with no start time whose socket nobody listens on (its helper gone, or the
+/// record an earlier boot's) is leftovers: `down` removes it at once, waits on no pid (every
+/// pid here may run, so a wait would end in its span's NOT RUN) and starts nothing.
+#[test]
+fn down_removes_an_earlier_builds_record_nobody_answers_for() {
+    let dir = scratch();
+    let paths = Paths::at(dir.path().join("vz.noindex"));
+    std::fs::create_dir_all(paths.run_dir()).unwrap();
+    let record = Record {
+        pid: 4242,
+        uniq: 77,
+        birth_us: 0,
+        helper_sha256: helper_a(),
+        proto: crate::proto::PROTO,
+        live_disk: paths.live_disk(),
+        started: 1,
+        boot_id: None,
+        agent_sha256: None,
+    };
+    record.write(&paths.record()).unwrap();
+    assert_eq!(strip_birth(&paths), record);
+    Lab::new(paths.clone(), NeverStarts).down().unwrap();
+    assert!(!paths.record().exists(), "its leftovers went");
+}
+
 #[test]
 fn the_entitlements_refusal_names_the_unsigned_helper_and_other_errors_keep_their_words() {
     let exe = Path::new("/src/target/debug/aterm-vz-host");
@@ -653,4 +774,42 @@ fn not_run_is_said_once_whatever_the_helpers_words_begin_with() {
     let words = failed_words(entitlement, exe, None);
     assert_eq!(words.matches("NOT RUN").count(), 1, "{words}");
     assert!(words.contains("(Error Domain=VZErrorDomain"), "{words}");
+}
+
+/// The real `Start` waits on an earlier build's helper (a record without a start time) by
+/// its unique id alone, read from this machine's kernel: this test process stands in for it.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn the_detached_start_waits_on_a_record_without_a_start_time_by_its_unique_id() {
+    let me = std::process::id();
+    let uniq = Kernel.uniq(me).expect("this process's unique id");
+    let birth_us = Kernel.birth_us(me).expect("this process's start");
+    let start = Detached::new(PathBuf::from("/vz/host/x/aterm-vz-host"));
+    let earlier = Record {
+        pid: me,
+        uniq,
+        birth_us: 0,
+        helper_sha256: helper_a(),
+        proto: crate::proto::PROTO,
+        live_disk: "/vz/live/aterm-linux.img".into(),
+        started: 1_792_000_000,
+        boot_id: None,
+        agent_sha256: None,
+    };
+    assert!(start.alive(&earlier), "unproven, but its pid holds its id");
+    assert!(
+        !crate::record::is_live(&earlier, start.pids()),
+        "never live"
+    );
+    let proven = Record {
+        birth_us,
+        ..earlier.clone()
+    };
+    assert!(start.alive(&proven), "with its start time");
+    // The negative control: another unique id on the same pid has ended.
+    let other = Record {
+        uniq: uniq.wrapping_add(1),
+        ..earlier
+    };
+    assert!(!start.alive(&other), "another process's id");
 }

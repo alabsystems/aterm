@@ -142,6 +142,7 @@ pub(super) fn restore(
 ) -> Result<Stored> {
     let envelope = session.envelope(scope, &wire)?;
     let header = envelope.header.clone();
+    super::operation_policy(scope, &header, envelope.body.len() - 16)?;
     let quarantine = if aterm_db_core::quarantine_eligible(
         acknowledged,
         receipt.offset,

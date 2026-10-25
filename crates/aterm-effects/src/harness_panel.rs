@@ -131,21 +131,6 @@ pub enum PanelMark {
 }
 
 #[inline]
-const fn hypot_f32(a: f32, b: f32) -> f32 {
-    let x = (a as f64) * (a as f64) + (b as f64) * (b as f64);
-    if x <= 0.0 {
-        return 0.0;
-    }
-    let mut y = f64::from_bits((x.to_bits() >> 1) + (1023_u64 << 51));
-    let mut i = 0;
-    while i < 6 {
-        y = 0.5 * (y + x / y);
-        i += 1;
-    }
-    y as f32
-}
-
-#[inline]
 const fn atan_unit_f64(t: f64) -> f64 {
     const TAN_PI_12: f64 = 0.267_949_192_431_122_7;
     const SQRT_3: f64 = 1.732_050_807_568_877_2;
@@ -212,7 +197,7 @@ const fn rem_euclid_360(x: f32) -> f32 {
 pub const fn chroma_hue(rgb: u32) -> (f32, f32) {
     let [_, a, b] = oklab(rgb);
     (
-        hypot_f32(a, b),
+        crate::color_math::hypot_f32(a, b),
         rem_euclid_360(atan2_f32(b, a).to_degrees()),
     )
 }
@@ -335,7 +320,7 @@ pub const fn bar_x(i: usize, cells: usize) -> f32 {
 /// Mascot ripple crest (`0..=1`) at `d_cells` cells from the bar start at `ms`.
 #[must_use]
 #[inline]
-pub fn crest(d_cells: f32, ms: u64) -> f32 {
+pub const fn crest(d_cells: f32, ms: u64) -> f32 {
     glint(d_cells, ms)
 }
 
@@ -349,16 +334,15 @@ const fn srgb(l: f32) -> u32 {
 #[must_use]
 #[inline]
 pub const fn match_luminance(ink: u32, target: u32) -> u32 {
-    let table = crate::color_math::relative_luminance_table();
-    let lc = crate::color_math::relative_luminance_with(table, ink);
+    let lc = relative_luminance(ink);
     if lc <= 1e-6 {
         return target & 0x00FF_FFFF;
     }
     at_luminance_with(
-        table,
+        crate::color_math::relative_luminance_table(),
         ink,
         lc,
-        crate::color_math::relative_luminance_with(table, target),
+        relative_luminance(target),
     )
 }
 
@@ -366,9 +350,8 @@ pub const fn match_luminance(ink: u32, target: u32) -> u32 {
 #[must_use]
 #[inline]
 pub const fn at_luminance(ink: u32, lt: f32) -> u32 {
-    let table = crate::color_math::relative_luminance_table();
-    let lc = crate::color_math::relative_luminance_with(table, ink);
-    at_luminance_with(table, ink, lc, lt)
+    let lc = relative_luminance(ink);
+    at_luminance_with(crate::color_math::relative_luminance_table(), ink, lc, lt)
 }
 
 #[inline]
@@ -429,10 +412,9 @@ pub const fn fade_chroma(ink: u32, keep: f32) -> u32 {
 #[inline]
 pub const fn at_luminance_hue(ink: u32, lt: f32) -> u32 {
     let lt = lt.clamp(0.0, 1.0);
-    let table = crate::color_math::relative_luminance_table();
-    let lc = crate::color_math::relative_luminance_with(table, ink);
+    let lc = relative_luminance(ink);
     if lt <= lc || lc <= 1e-6 {
-        return at_luminance_with(table, ink, lc, lt);
+        return at_luminance_with(crate::color_math::relative_luminance_table(), ink, lc, lt);
     }
     let [l0, a0, b0] = oklab(ink);
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -450,7 +432,7 @@ pub const fn at_luminance_hue(ink: u32, lt: f32) -> u32 {
             hi = mid;
             continue;
         }
-        if crate::color_math::relative_luminance_with(table, mid_rgb) < lt {
+        if relative_luminance(mid_rgb) < lt {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -474,26 +456,20 @@ pub const fn at_luminance_hue(ink: u32, lt: f32) -> u32 {
 const fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let g = over_rgb(ground, fresh, veil) & 0x00FF_FFFF;
-    let lg = crate::color_math::relative_luminance_with(table, g);
-    let lc = crate::color_math::relative_luminance_with(table, fresh);
+    let lg = relative_luminance(g);
+    let lc = relative_luminance(fresh);
     let r_lin = table.linear[((fresh >> 16) & 0xff) as usize];
     let g_lin = table.linear[((fresh >> 8) & 0xff) as usize];
     let b_lin = table.linear[(fresh & 0xff) as usize];
     #[inline]
-    const fn holds_rgb(
-        table: &crate::color_math::RelativeLuminanceTable,
-        fresh: u32,
-        veil: u8,
-        lg: f32,
-        ring_rgb: u32,
-    ) -> bool {
+    const fn holds_rgb(fresh: u32, veil: u8, lg: f32, ring_rgb: u32) -> bool {
         let r = over_rgb(ring_rgb, fresh, veil) & 0x00FF_FFFF;
-        let lr = crate::color_math::relative_luminance_with(table, r);
+        let lr = relative_luminance(r);
         (lr.max(lg) + 0.05) / (lr.min(lg) + 0.05) >= PRINT_RING_CONTRAST
     }
     let top = top.min(lc).max(0.0);
     let top_rgb = at_luminance_linear(r_lin, g_lin, b_lin, lc, top);
-    if holds_rgb(table, fresh, veil, lg, top_rgb) {
+    if holds_rgb(fresh, veil, lg, top_rgb) {
         return top_rgb;
     }
     let (mut lo, mut hi) = (0.0f32, top);
@@ -511,7 +487,7 @@ const fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
             hi = mid;
             continue;
         }
-        if holds_rgb(table, fresh, veil, lg, mid_rgb) {
+        if holds_rgb(fresh, veil, lg, mid_rgb) {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -604,13 +580,18 @@ pub struct DotLook {
 /// Breath factor (`BREATH_FLOOR..=1.0`) of a stuck dot `ms` after breathing started.
 #[must_use]
 #[inline]
-pub fn breath(ms: Option<u64>) -> f32 {
-    let Some(ms) = ms.filter(|&ms| ms < BREATH_FOR_MS) else {
+pub const fn breath(ms: Option<u64>) -> f32 {
+    const PHASE_SCALE: f32 = std::f32::consts::TAU / BREATH_PERIOD_MS as f32;
+    let Some(ms) = ms else {
         return BREATH_REST;
     };
+    if ms >= BREATH_FOR_MS {
+        return BREATH_REST;
+    }
     let t = (ms - ms % BREATH_STEP_MS) % BREATH_PERIOD_MS;
-    let phase = std::f32::consts::TAU * t as f32 / BREATH_PERIOD_MS as f32;
-    BREATH_FLOOR + (1.0 - BREATH_FLOOR) * (1.0 - phase.cos()) / 2.0
+    let phase = t as f32 * PHASE_SCALE;
+    let (_, cos_p) = crate::supernova::sin_cos_f32(phase);
+    BREATH_FLOOR + (1.0 - BREATH_FLOOR) * (1.0 - cos_p) * 0.5
 }
 
 /// Computes the ink and radial light for the dot on panel row `k`.
@@ -709,13 +690,14 @@ pub const fn dot_look(
             )
         }
         DotMood::Stuck => {
+            const INV_BREATH_SPAN: f32 = 1.0 / (1.0 - BREATH_FLOOR);
             let fresh = fade_chroma(hue, sat);
             let ink = if dark {
                 at_luminance_hue(fresh, DOT_LUMA_MIN * breath)
             } else {
                 let base = InkRole::OverText.ink(fresh);
                 let lb = relative_luminance(base);
-                let pale = (1.0 - breath) / (1.0 - BREATH_FLOOR);
+                let pale = (1.0 - breath) * INV_BREATH_SPAN;
                 at_luminance(base, lb + (STUCK_PALE_LUMA_LIGHT.max(lb) - lb) * pale)
             };
             (

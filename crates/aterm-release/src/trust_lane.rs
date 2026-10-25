@@ -3,6 +3,7 @@
 
 //! Trust verification lane (`targo --unverified ship trust run`).
 
+use aterm_toolchain::named_lock;
 use aterm_uds::spawnfd::{Stdio, command};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -75,7 +76,8 @@ pub struct Config {
     pub update_ratchet: bool,
     /// Whether to attempt libraries this host would otherwise refuse for memory.
     pub try_refused: bool,
-    /// Whether to write per-obligation records beside each check log ([`crate::trust_oblig`]).
+    /// Whether to write per-obligation records beside each check log ([`crate::trust_oblig`]):
+    /// on by default, since the judge names what a backstop stopped from them.
     pub obligations: bool,
     /// Whether to stop before running any check if memory guard narrows the run.
     pub stop_if_narrowed: bool,
@@ -84,6 +86,9 @@ pub struct Config {
     /// Directory for cost history and host memory records.
     pub state: Option<PathBuf>,
     pub trustd_wait: Duration,
+    /// Whether a target root another run holds is COULD NOT RUN at once (`--no-wait`) instead
+    /// of waited for.
+    pub no_wait: bool,
 }
 
 impl Config {
@@ -98,11 +103,12 @@ impl Config {
             budget: DEFAULT_BUDGET,
             update_ratchet: false,
             try_refused: false,
-            obligations: false,
+            obligations: true,
             stop_if_narrowed: false,
             prover: None,
             state: None,
             trustd_wait: TRUSTD_WAIT,
+            no_wait: false,
         }
     }
 }
@@ -191,7 +197,9 @@ pub fn parse<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<Config, Strin
             "--update-ratchet" => cfg.update_ratchet = true,
             "--try-refused" => cfg.try_refused = true,
             "--obligations" => cfg.obligations = true,
+            "--no-obligations" => cfg.obligations = false,
             "--stop-if-narrowed" => cfg.stop_if_narrowed = true,
+            "--no-wait" => cfg.no_wait = true,
             other => return Err(format!("trust run: unknown flag {other:?}")),
         }
     }
@@ -883,6 +891,8 @@ pub trait Checks {
     fn pause(&mut self);
     /// Whether slot `slot` is held, so no check may start in it ([`slot_held`]).
     fn held(&self, slot: usize) -> bool;
+    /// The host's one-minute load average now; `None` when it cannot be read.
+    fn load(&self) -> Option<f64>;
 }
 
 /// Completed check result reported by [`run_slots`].
@@ -893,6 +903,9 @@ pub struct Finished {
     pub wall: Duration,
     /// Whether the check was terminated for exceeding its wall-clock budget.
     pub over_budget: bool,
+    /// The host's mean one-minute load over the polls the check ran through ([`Checks::load`]);
+    /// `None` when none could be read.
+    pub load: Option<f64>,
 }
 
 /// Reason [`run_slots`] stopped before draining its queue.
@@ -922,6 +935,8 @@ pub fn run_slots(
         job: Job,
         check: Box<dyn Check>,
         since: Duration,
+        /// The load readings taken while it ran: their sum and count.
+        load: (f64, u32),
     }
     let mut queue: VecDeque<Job> = jobs.into();
     let slots = slots.max(1);
@@ -956,6 +971,7 @@ pub fn run_slots(
                     job,
                     check,
                     since: checks.now(),
+                    load: (0.0, 0),
                 }),
                 Err(e) => {
                     stop_all(&mut running);
@@ -968,6 +984,11 @@ pub fn run_slots(
         }
         if running.is_empty() && queue.is_empty() {
             return Ok(());
+        }
+        if let Some(l) = checks.load() {
+            for r in &mut running {
+                r.load = (r.load.0 + l, r.load.1 + 1);
+            }
         }
         let mut i = 0;
         while i < running.len() {
@@ -987,6 +1008,7 @@ pub fn run_slots(
                         job: r.job,
                         ended,
                         over_budget,
+                        load: (r.load.1 > 0).then(|| r.load.0 / f64::from(r.load.1)),
                     },
                     checks,
                 );
@@ -998,18 +1020,37 @@ pub fn run_slots(
     }
 }
 
-/// Writes sidecar status, budget, and `trustd` marks for the judge after a check ends.
+/// How `f` ran on a host of `cores` cores ([`trust_facts::Pace`]).
+#[must_use]
+pub fn pace_of(f: &Finished, cores: usize) -> trust_facts::Pace {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    trust_facts::Pace {
+        cpu_ms: ms(f.ended.cpu),
+        wall_ms: ms(f.wall),
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a load average is finite and non-negative, and hundredths of it fit"
+        )]
+        load: f.load.map(|l| (l * 100.0).round() as u64),
+        cores: cores as u64,
+    }
+}
+
+/// Writes sidecar status, pace, budget, and `trustd` marks for the judge after a check ends.
 ///
 /// # Errors
 /// Returns an error if any sidecar mark file cannot be written.
 pub fn record(
     f: &Finished,
     budget: Duration,
+    cores: usize,
     probe: &mut dyn FnMut() -> String,
 ) -> std::io::Result<()> {
     let log = &f.job.log;
     let beside = |ext: &str| PathBuf::from(format!("{}.{ext}", log.display()));
     fs::write(beside("rc"), format!("{}\n", f.ended.code))?;
+    fs::write(beside("pace"), format!("{}\n", pace_of(f, cores).text()))?;
     if f.over_budget {
         fs::write(beside("budget"), format!("{}\n", budget.as_secs()))?;
     }
@@ -1233,8 +1274,8 @@ fn run_on(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Outcome {
     }
 }
 
-fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<Prepared, Stop> {
-    let driver = bench.driver(cfg)?;
+/// `trust: prover <bin> (<its --version>)`.
+fn say_prover(out: &mut dyn Write, driver: &Driver) {
     let _ = writeln!(
         out,
         "trust: prover {} ({})",
@@ -1245,6 +1286,11 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
             &driver.id
         }
     );
+}
+
+fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<Prepared, Stop> {
+    let driver = bench.driver(cfg)?;
+    say_prover(out, &driver);
     let Root {
         path: root,
         mine,
@@ -1261,10 +1307,24 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
     if mine.as_ref() == Some(&root) {
         prepare_cache_lock(&root).map_err(|e| format!("{}: {e}", root.display()))?;
     }
-    let lock = RunLock::take(
-        &root.join(".run.lock"),
-        "give this one its own --target-root",
-    )?;
+    let me = named_lock::Holder::me(&run_verb(&cfg.scope), &canonical_repo(cfg));
+    let wait = if cfg.no_wait {
+        named_lock::Wait::No
+    } else {
+        named_lock::Wait::Block
+    };
+    let lock = RunLock::wait(&root.join(".run.lock"), &me, wait, out)?;
+    // A wait can outlast the prover resolved before it (a toolchain update, then a store GC
+    // that takes the old build): a run that waited resolves it again with the root its own.
+    let driver = if lock.0.waited().is_zero() {
+        driver
+    } else {
+        let now = bench.driver(cfg)?;
+        if (&now.bin, &now.id) != (&driver.bin, &driver.id) {
+            say_prover(out, &now);
+        }
+        now
+    };
     if let Some(mine) = &mine {
         if *mine == root {
             write_checkout_record(&root, &canonical_repo(cfg))
@@ -1284,7 +1344,7 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
                 return Err(format!("{}: fallback cache custody changed", root.display()).into());
             }
         } else if cleanup_checkout(mine).as_deref() == Some(canonical_repo(cfg).as_path())
-            && retire(mine)
+            && retire(mine, &me)
         {
             let _ = writeln!(
                 out,
@@ -1295,7 +1355,7 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         }
         let orphans = mine
             .parent()
-            .map(|cache| prune_orphans(cache, mine))
+            .map(|cache| prune_orphans(cache, mine, &me))
             .unwrap_or_default();
         for (dir, checkout) in orphans {
             let _ = writeln!(
@@ -1504,7 +1564,15 @@ fn check_and_conclude(
     }
     for s in &work {
         let log = prep.logdir.join(format!("{}.log", s.lib.spec));
-        for ext in ["", ".rc", ".trustd", ".budget", ".oblig.tsv", ".oblig.err"] {
+        for ext in [
+            "",
+            ".rc",
+            ".pace",
+            ".trustd",
+            ".budget",
+            ".oblig.tsv",
+            ".oblig.err",
+        ] {
             let _ = fs::remove_file(format!("{}{ext}", log.display()));
         }
         let _ = fs::remove_dir_all(format!("{}.report", log.display()));
@@ -1533,6 +1601,8 @@ fn check_and_conclude(
         .collect();
     let mut new_costs: BTreeMap<String, Cost> = BTreeMap::new();
     let mut credit = crate::trust_credit::Credit::default();
+    // Each check's mean load, for the run's provenance.
+    let mut loads: Vec<f64> = Vec::new();
     if !jobs.is_empty() {
         let slots = prep.jobs.min(jobs.len());
         let _ = writeln!(
@@ -1545,9 +1615,13 @@ fn check_and_conclude(
         );
         let reducer = cfg.obligations.then(|| Reducer::start(cfg.repo.clone()));
         let budget = cfg.budget;
+        let cores = prep.cores;
         let mut done = |f: Finished, checks: &mut dyn Checks| {
             let mut probe = || checks.probe_trustd();
-            let _ = record(&f, budget, &mut probe);
+            if let Some(l) = f.load {
+                loads.push(l);
+            }
+            let _ = record(&f, budget, cores, &mut probe);
             // Read before the slot runs another check: the package's graded record.
             credit.add(
                 &f.job.name,
@@ -1602,7 +1676,19 @@ fn check_and_conclude(
                 "host",
                 format!("{} cores, {} GiB", prep.cores, prep.mem >> 30),
             ),
-            ("load", "-".into()),
+            (
+                "load",
+                if loads.is_empty() {
+                    "-".into()
+                } else {
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "a count of checks is far below 2^52"
+                    )]
+                    let n = loads.len() as f64;
+                    format!("{:.2}", loads.iter().sum::<f64>() / n)
+                },
+            ),
             ("jobs", prep.jobs.to_string()),
             ("date", utc_now()),
         ] {
@@ -2626,16 +2712,17 @@ fn cleanup_checkout(dir: &Path) -> Option<PathBuf> {
     .then_some(checkout)
 }
 
-/// Retire an admitted fallback root under its own run lock, once its stale checks are reaped,
+/// Retire an admitted fallback root under its own run lock (taken as `me`, never waited for:
+/// a held one is in use), once its stale checks are reaped,
 /// unless a slot in it is still held ([`held_slots`]): a later run retires it then. Returns
 /// whether it is gone.
-fn retire(dir: &Path) -> bool {
+fn retire(dir: &Path, me: &named_lock::Holder) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let Some(checkout) = cleanup_checkout(dir) else {
         return false;
     };
     let lock_path = dir.join(".run.lock");
-    let Ok(lock) = RunLock::take(&lock_path, "a run holds it") else {
+    let Ok(lock) = RunLock::take(&lock_path, me, "a run holds it") else {
         return false;
     };
     let (Ok(held), Some(named)) = (lock.0.metadata(), owned_cache_file(&lock_path)) else {
@@ -2656,7 +2743,7 @@ fn retire(dir: &Path) -> bool {
 }
 
 /// Retires admitted cache subdirectories under `cache` whose recorded checkouts no longer exist.
-fn prune_orphans(cache: &Path, own: &Path) -> Vec<(PathBuf, PathBuf)> {
+fn prune_orphans(cache: &Path, own: &Path, me: &named_lock::Holder) -> Vec<(PathBuf, PathBuf)> {
     let mut gone = Vec::new();
     if !owned_cache_dir(cache) {
         return gone;
@@ -2674,7 +2761,7 @@ fn prune_orphans(cache: &Path, own: &Path) -> Vec<(PathBuf, PathBuf)> {
             continue;
         };
         if fs::symlink_metadata(&checkout).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-            && retire(&dir)
+            && retire(&dir, me)
         {
             gone.push((dir, checkout));
         }
@@ -2880,42 +2967,111 @@ fn plain_dirs_to(root: &Path, candidate: &Path) -> Result<bool, Refused> {
     Ok(true)
 }
 
-/// Exclusive file lock guarding a target root across concurrent lane runs.
-pub(crate) struct RunLock(fs::File);
+/// Exclusive file lock guarding a target root across concurrent lane runs: a [`named_lock`]
+/// whose file names the run that holds it.
+pub(crate) struct RunLock(named_lock::NamedLock);
 
 impl RunLock {
-    /// Acquires the target-root lock at `path`, or returns an error naming the holder.
-    pub(crate) fn take(path: &Path, busy: &str) -> Result<RunLock, String> {
-        let f = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "released by RunLock's Drop through File::unlock before the close"
-        )]
-        let taken = f.try_lock();
+    /// Takes the lock at `path` as `me` without waiting, or returns an error naming the run that
+    /// holds it and `busy`, what to do about that.
+    pub(crate) fn take(
+        path: &Path,
+        me: &named_lock::Holder,
+        busy: &str,
+    ) -> Result<RunLock, String> {
+        RunLock::taken(
+            path,
+            named_lock::take(path, me, named_lock::Wait::No, &mut |_, _| {}, &|| false),
+            busy,
+        )
+    }
+
+    /// Takes the lock at `path` as `me`. Held by another run: under [`named_lock::Wait::Block`]
+    /// the wait lasts while that run does, its holder named on `out` as it starts and once a
+    /// minute, and ends at once on an interrupt; under [`named_lock::Wait::No`] (`--no-wait`)
+    /// the error names the holder at once.
+    pub(crate) fn wait(
+        path: &Path,
+        me: &named_lock::Holder,
+        wait: named_lock::Wait,
+        out: &mut dyn Write,
+    ) -> Result<RunLock, String> {
+        let taken = named_lock::take(
+            path,
+            me,
+            wait,
+            &mut |holder, waited| {
+                let _ = if waited < named_lock::SAY_EVERY {
+                    writeln!(
+                        out,
+                        "trust: waiting for {}, which holds {}",
+                        holder_name(holder),
+                        path.display()
+                    )
+                } else {
+                    writeln!(
+                        out,
+                        "trust: still waiting for {} ({} min)",
+                        holder_name(holder),
+                        waited.as_secs() / 60
+                    )
+                };
+            },
+            &|| crate::interrupt::caught().is_some(),
+        );
+        RunLock::taken(
+            path,
+            taken,
+            "give this one its own --target-root, or leave out --no-wait to wait for it",
+        )
+    }
+
+    fn taken(
+        path: &Path,
+        taken: Result<named_lock::NamedLock, named_lock::Refused>,
+        busy: &str,
+    ) -> Result<RunLock, String> {
         match taken {
-            Ok(()) => {
-                let _ = f.set_len(0);
-                let _ = (&f).write_all(format!("{}\n", std::process::id()).as_bytes());
-                Ok(RunLock(f))
-            }
-            Err(fs::TryLockError::WouldBlock) => Err(format!(
-                "run {} holds {}: {busy}",
-                fs::read_to_string(path).unwrap_or_default().trim(),
+            Ok(held) => Ok(RunLock(held)),
+            Err(named_lock::Refused::Held(holder)) => Err(format!(
+                "{} holds {}: {busy}",
+                holder_name(holder.as_ref()),
                 path.display()
             )),
-            Err(fs::TryLockError::Error(e)) => Err(format!("cannot lock {}: {e}", path.display())),
+            Err(named_lock::Refused::Stopped(holder)) => Err(format!(
+                "interrupted while waiting for {}, which holds {}",
+                holder_name(holder.as_ref()),
+                path.display()
+            )),
+            Err(named_lock::Refused::Io(e)) => Err(format!("cannot lock {}: {e}", path.display())),
         }
     }
 }
 
-impl Drop for RunLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
+/// Whom a held run lock names: its record's run while that pid lives, its clock this Mac's.
+fn holder_name(holder: Option<&named_lock::Holder>) -> String {
+    named_lock::name(
+        holder,
+        |since| {
+            i64::try_from(since)
+                .ok()
+                .and_then(aterm_uds::zone::local_offset_at)
+                .unwrap_or(0)
+        },
+        aterm_uds::process::pid_alive,
+    )
+}
+
+/// This run as the run lock's record names it: `ship trust run` and its scope.
+fn run_verb(scope: &Scope) -> String {
+    match scope {
+        Scope::WholeTree => "ship trust run --whole-tree".to_string(),
+        Scope::Remeasure => "ship trust run --remeasure".to_string(),
+        Scope::Packages(packages) => packages
+            .iter()
+            .fold("ship trust run".to_string(), |verb, p| {
+                format!("{verb} -p {p}")
+            }),
     }
 }
 
@@ -3074,6 +3230,10 @@ impl Checks for RealChecks<'_> {
 
     fn held(&self, slot: usize) -> bool {
         slot_held(self.root, slot)
+    }
+
+    fn load(&self) -> Option<f64> {
+        aterm_sysprobe::load_average().map(|l| l[0])
     }
 }
 
@@ -4981,6 +5141,8 @@ mod tests {
         held_after: usize,
         interrupt_at: Option<Duration>,
         unstartable: Option<String>,
+        /// The host's load at a moment of the fake clock; `None` reads none.
+        load: Option<fn(Duration) -> f64>,
     }
 
     struct FakeCheck {
@@ -5065,6 +5227,9 @@ mod tests {
         }
         fn held(&self, slot: usize) -> bool {
             self.w.borrow().held.contains(&slot)
+        }
+        fn load(&self) -> Option<f64> {
+            self.load.map(|l| l(self.w.borrow().now))
         }
     }
 
@@ -5176,7 +5341,33 @@ mod tests {
             held_after: 0,
             interrupt_at: None,
             unstartable: None,
+            load: None,
         }
+    }
+
+    /// A check's load is the mean of the readings taken while it ran, not the last one; a
+    /// host whose load cannot be read leaves none.
+    #[test]
+    fn a_check_carries_the_mean_load_it_ran_under() {
+        let mut f = fake(&[("a", 4)]);
+        f.load = Some(|now| now.as_secs_f64());
+        let (r, done) = slots(&mut f, vec![job("a", false)], 1, 1, 100);
+        assert_eq!(r, Ok(()));
+        assert_eq!(done[0].load, Some(2.0), "read at 0, 1, 2, 3 and 4 s");
+        let mut f = fake(&[("a", 4)]);
+        let (_, done) = slots(&mut f, vec![job("a", false)], 1, 1, 100);
+        assert_eq!(done[0].load, None);
+    }
+
+    #[test]
+    fn a_run_keeps_its_obligation_records_unless_told_not_to() {
+        let kept = |args: &[&str]| parse(&mut args.iter().copied()).map(|c| c.obligations);
+        assert_eq!(kept(&["-p", "alpha"]), Ok(true));
+        assert_eq!(kept(&["-p", "alpha", "--no-obligations"]), Ok(false));
+        assert_eq!(
+            kept(&["--no-obligations", "--obligations", "-p", "alpha"]),
+            Ok(true)
+        );
     }
 
     fn slots(
@@ -5329,6 +5520,7 @@ mod tests {
             },
             wall: Duration::from_secs(5),
             over_budget: over,
+            load: Some(30.0),
         }
     }
 
@@ -5339,13 +5531,17 @@ mod tests {
         let d = tmp("trust-lane-record");
         let f = finished(d.path(), DONE, 0, false);
         let mut probed = 0;
-        record(&f, Duration::from_secs(60), &mut || {
+        record(&f, Duration::from_secs(60), 14, &mut || {
             probed += 1;
             "ours\tx".into()
         })
         .unwrap();
         let beside = |ext: &str| d.path().join(format!("alpha@1.0.0.log.{ext}"));
         assert_eq!(fs::read_to_string(beside("rc")).unwrap(), "0\n");
+        let pace = fs::read_to_string(beside("pace")).unwrap();
+        assert_eq!(pace, "4000 5000 3000 14\n");
+        let pace = trust_facts::Pace::parse(pace.trim()).unwrap();
+        assert!(pace.starved(), "load 30 on 14 cores: {}", pace.said());
         assert!(!beside("budget").exists());
         assert!(!beside("trustd").exists());
         assert_eq!(
@@ -5354,7 +5550,7 @@ mod tests {
         );
         let refused = format!("error: {}\n", trust_facts::TRUSTD_REFUSED);
         let f = finished(d.path(), &refused, 137, true);
-        record(&f, Duration::from_secs(60), &mut || {
+        record(&f, Duration::from_secs(60), 14, &mut || {
             "foreign\tanother build".into()
         })
         .unwrap();
@@ -5441,7 +5637,7 @@ mod tests {
                 path: path.clone(),
                 created,
             });
-            record(&f, Duration::from_secs(60), &mut String::new).unwrap();
+            record(&f, Duration::from_secs(60), 14, &mut String::new).unwrap();
             assert_eq!(path.exists(), !created, "created {created}");
         }
         assert!(!fork_lock(d.path(), &argv).unwrap().created);
@@ -5454,6 +5650,7 @@ mod tests {
         now: Duration,
         started: &'a mut Vec<String>,
         stamp: Option<SystemTime>,
+        load: Option<f64>,
     }
 
     struct Over;
@@ -5506,6 +5703,9 @@ mod tests {
         fn held(&self, slot: usize) -> bool {
             slot_held(&self.root, slot)
         }
+        fn load(&self) -> Option<f64> {
+            self.load
+        }
     }
 
     struct Site {
@@ -5524,11 +5724,21 @@ mod tests {
         meanwhile: Option<fn(&Path)>,
         /// The stamp each check's dep-info gets ([`Quick`]).
         stamp: Option<SystemTime>,
+        /// The host's load while the checks run ([`Checks::load`]).
+        load: Option<f64>,
+        /// The prover a second resolution finds (a toolchain updated meanwhile); `driver` when none.
+        updated: Option<Driver>,
+        /// How often the run resolved its prover.
+        drivers_asked: usize,
     }
 
     impl Bench for Site {
         fn driver(&mut self, _: &Config) -> Result<Driver, String> {
-            Ok(self.driver.clone())
+            self.drivers_asked += 1;
+            Ok(match &self.updated {
+                Some(now) if self.drivers_asked > 1 => now.clone(),
+                _ => self.driver.clone(),
+            })
         }
         fn metadata(&mut self, _: &Driver, repo: &Path) -> Result<Vec<u8>, String> {
             let pkg = |name: &str, dir: &str, member: bool| {
@@ -5582,6 +5792,7 @@ mod tests {
                 now: Duration::ZERO,
                 started: &mut self.started,
                 stamp: self.stamp,
+                load: self.load,
             };
             let ran = run_slots(jobs, slots, 1, cfg.budget, &mut quick, done);
             if let Some(edit) = self.meanwhile.take() {
@@ -5687,6 +5898,9 @@ mod tests {
             interrupt: false,
             meanwhile: None,
             stamp: None,
+            load: None,
+            updated: None,
+            drivers_asked: 0,
         }
     }
 
@@ -5982,6 +6196,8 @@ mod tests {
         git_in(&s.repo, &["add", "."]);
         git_in(&s.repo, &["commit", "-q", "-m", "another library"]);
         s.log = "timed_out=1\nSummary: 4 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+        // Starved: a lapse is the clock's only then.
+        s.load = Some(1000.0);
         s
     }
 
@@ -6585,7 +6801,8 @@ mod tests {
         let unrecorded = make("unrecorded", None);
         let relative = make("relative", Some(Path::new("relative/gone")));
         let held = make("held", Some(&d.path().join("also-gone")));
-        let lock = RunLock::take(&held.join(".run.lock"), "a test holds it").unwrap();
+        let me = named_lock::Holder::me("a test", d.path());
+        let lock = RunLock::take(&held.join(".run.lock"), &me, "a test holds it").unwrap();
         let wrong = make("wrong", Some(&d.path().join("wrong-gone")));
         let wrong_key = cache.join("not-the-recorded-checkout");
         fs::rename(wrong, &wrong_key).unwrap();
@@ -6621,7 +6838,7 @@ mod tests {
         let weak = make("weak", Some(&d.path().join("weak-gone")));
         fs::set_permissions(&weak, fs::Permissions::from_mode(0o775)).unwrap();
         fs::set_permissions(&cache, fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(prune_orphans(&cache, &own).is_empty());
+        assert!(prune_orphans(&cache, &own, &named_lock::Holder::me("a test", &own)).is_empty());
         assert!(orphan.exists());
         fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
         let mark = nonce();
@@ -6638,7 +6855,7 @@ mod tests {
         .unwrap();
         fs::set_permissions(orphan.join(".check.0"), fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
-            prune_orphans(&cache, &own),
+            prune_orphans(&cache, &own, &named_lock::Holder::me("a test", &own)),
             [(orphan.clone(), d.path().join("gone"))]
         );
         assert!(!orphan.exists());
@@ -6673,7 +6890,7 @@ mod tests {
         }
         drop(lock);
         assert_eq!(
-            prune_orphans(&cache, &own),
+            prune_orphans(&cache, &own, &named_lock::Holder::me("a test", &own)),
             [(held, d.path().join("also-gone"))],
             "once its run lets go"
         );
@@ -6683,7 +6900,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            prune_orphans(&cache, &own),
+            prune_orphans(&cache, &own, &named_lock::Holder::me("a test", &own)),
             [(slotted, d.path().join("slotted-gone"))],
             "once its slot's hold is spent"
         );
@@ -6819,13 +7036,217 @@ mod tests {
     fn one_run_holds_a_target_root() {
         let d = tmp("trust-lane-lock");
         let path = d.path().join(".run.lock");
-        let first = RunLock::take(&path, "wait").unwrap();
-        assert!(RunLock::take(&path, "wait").is_err());
+        let me = named_lock::Holder::me("ship trust run -p a", Path::new("/checkouts/a"));
+        let first = RunLock::take(&path, &me, "wait").unwrap();
+        let held = RunLock::take(&path, &me, "wait").err().expect("held");
+        assert!(
+            held.contains(&format!(
+                "pid {} (ship trust run -p a, /checkouts/a, since ",
+                me.pid
+            )),
+            "{held}"
+        );
         drop(first);
         assert!(
-            RunLock::take(&path, "wait").is_ok(),
+            RunLock::take(&path, &me, "wait").is_ok(),
             "released when the run ends"
         );
+    }
+
+    /// [`a_held_root_is_waited_for_until_its_holder_dies_by_its_own_hand`]'s holder.
+    const ROOT_HOLDER: &str = "trust_lane::tests::a_root_holder_stand_in";
+    /// The run lock the stand-in takes.
+    const ROOT_HOLDER_ENV: &str = "ATERM_RELEASE_TEST_ROOT_HOLDER";
+    /// What the stand-in says once it holds the root (libtest's own words share its line).
+    const ROOT_HOLDER_HOLDS: &str = "the stand-in holds the root";
+
+    /// Not a test alone: as [`ROOT_HOLDER`] it takes the run lock at [`ROOT_HOLDER_ENV`]'s path,
+    /// says [`ROOT_HOLDER_HOLDS`], and at its first line on stdin dies by its own `SIGKILL`.
+    #[test]
+    fn a_root_holder_stand_in() {
+        let Some(path) = std::env::var_os(ROOT_HOLDER_ENV) else {
+            return;
+        };
+        let me = named_lock::Holder::me("ship trust run -p a", Path::new("/checkouts/holder"));
+        let _held = RunLock::take(Path::new(&path), &me, "the root is free").unwrap();
+        println!("{ROOT_HOLDER_HOLDS}");
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stdin().read_line(&mut String::new());
+        aterm_uds::process::kill_self_now()
+    }
+
+    /// A second run on a held target root waits with its holder named, and has the root once
+    /// the holder is gone, though the holder died by its own `SIGKILL` and nobody signalled
+    /// anyone. Negative control: `--no-wait` refuses at once, naming the same holder.
+    #[test]
+    fn a_held_root_is_waited_for_until_its_holder_dies_by_its_own_hand() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::ExitStatusExt as _;
+        let d = tmp("trust-lane-lock-wait");
+        let path = d.path().join(".run.lock");
+        let mut holder = command(std::env::current_exe().unwrap())
+            .args(["--exact", ROOT_HOLDER, "--nocapture", "--test-threads=1"])
+            .env(ROOT_HOLDER_ENV, &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = holder.id();
+        let said = BufReader::new(holder.stdout.take().unwrap());
+        let (holds, held_now) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in said.lines().map_while(Result::ok) {
+                if line.contains(ROOT_HOLDER_HOLDS) {
+                    let _ = holds.send(());
+                }
+            }
+        });
+        // The one-minute hang detector: the stand-in takes a free root at once.
+        held_now
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the stand-in holds the root");
+        let named = format!("pid {pid} (ship trust run -p a, /checkouts/holder, since ");
+        let me = named_lock::Holder::me("ship trust run -p a", Path::new("/checkouts/waiter"));
+        let mut quiet = Vec::new();
+        let refused = RunLock::wait(&path, &me, named_lock::Wait::No, &mut quiet)
+            .err()
+            .expect("--no-wait does not wait");
+        assert!(refused.contains(&named), "{refused}");
+        assert!(quiet.is_empty(), "--no-wait says nothing of a wait");
+
+        /// The waiter's `out`: the first line it writes tells the stand-in to die.
+        struct Out {
+            heard: Vec<u8>,
+            die: Option<std::process::ChildStdin>,
+        }
+        impl Write for Out {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.heard.extend_from_slice(buf);
+                if let Some(mut stdin) = self.die.take() {
+                    stdin.write_all(b"die\n")?;
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let die = holder.stdin.take();
+        let (died, death) = std::sync::mpsc::channel();
+        let reaper = std::thread::spawn(move || {
+            let status = holder.wait().unwrap();
+            let _ = died.send(Instant::now());
+            status
+        });
+        let (took, taken) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let mut out = Out {
+                heard: Vec::new(),
+                die,
+            };
+            let held = RunLock::wait(&path, &me, named_lock::Wait::Block, &mut out).map(drop);
+            let _ = took.send(Instant::now());
+            (held, String::from_utf8_lossy(&out.heard).into_owned())
+        });
+        // The one-minute hang detector: the root frees itself as its holder dies.
+        let had = taken
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the waiter has the root once its holder is gone");
+        let (held, heard) = waiter.join().unwrap();
+        held.unwrap();
+        let status = reaper.join().unwrap();
+        assert_eq!(status.signal(), Some(9), "{status}");
+        let gone = death.recv().unwrap();
+        assert!(
+            heard.starts_with(&format!("trust: waiting for {named}")),
+            "{heard}"
+        );
+        eprintln!(
+            "root free {} ms after its holder died",
+            had.saturating_duration_since(gone).as_millis()
+        );
+    }
+
+    /// A run that waited for its root resolves its prover again, since a wait can outlast the
+    /// build it resolved first: it names the one it now has and files the run against it.
+    /// Negative control: a run that found the root free resolves it once.
+    #[test]
+    fn a_run_that_waited_resolves_its_prover_again() {
+        let mut s = site(Scope::WholeTree);
+        let (outcome, said, _) = run_site(&mut s);
+        assert_eq!((outcome, s.drivers_asked), (Outcome::Pass, 1), "{said}");
+
+        let mut s = site(Scope::WholeTree);
+        let bin = s.driver.bin.with_file_name("updated");
+        fs::create_dir_all(&bin).unwrap();
+        for tool in ["targo", "trustc", "trustd"] {
+            fs::write(bin.join(tool), tool).unwrap();
+        }
+        s.updated = Some(Driver {
+            targo: bin.join("targo"),
+            bin: bin.clone(),
+            id: s.driver.id.clone(),
+        });
+        let root = root_of(&s);
+        owner_dirs(&root).unwrap();
+        let holder = named_lock::Holder::me("ship trust run -p alpha", Path::new("/checkouts/h"));
+        let held = RunLock::take(&root.join(".run.lock"), &holder, "a test holds it").unwrap();
+        let (waits, waiting) = std::sync::mpsc::channel::<()>();
+        let letting_go = std::thread::spawn(move || {
+            // The one-minute hang detector: the run names its holder a tick into its wait.
+            waiting
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the run waits for the root");
+            drop(held);
+        });
+
+        /// The run's `out`: its first wait line lets the holder go.
+        struct Out {
+            said: Vec<u8>,
+            waits: Option<std::sync::mpsc::Sender<()>>,
+        }
+        impl Write for Out {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.said.extend_from_slice(buf);
+                if String::from_utf8_lossy(&self.said).contains("trust: waiting for ")
+                    && let Some(waits) = self.waits.take()
+                {
+                    let _ = waits.send(());
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let cfg = s.cfg.clone();
+        let mut out = Out {
+            said: Vec::new(),
+            waits: Some(waits),
+        };
+        let outcome = run_on(&cfg, &mut s, &mut out);
+        letting_go.join().unwrap();
+        let said = String::from_utf8(out.said).unwrap();
+        assert_eq!((outcome, s.drivers_asked), (Outcome::Pass, 2), "{said}");
+        assert!(
+            said.contains(&format!("trust: prover {} (", bin.display())),
+            "{said}"
+        );
+        let plan = fs::read_to_string(root.join("logs/.plan")).unwrap();
+        assert!(
+            plan.contains(&format!("prover-bin {}\n", bin.display())),
+            "{plan}"
+        );
+    }
+
+    #[test]
+    fn a_run_names_its_scope() {
+        assert_eq!(
+            run_verb(&Scope::Packages(vec!["a".into(), "b".into()])),
+            "ship trust run -p a -p b"
+        );
+        assert_eq!(run_verb(&Scope::WholeTree), "ship trust run --whole-tree");
     }
 
     #[test]

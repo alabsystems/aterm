@@ -13,23 +13,26 @@ pub(crate) const DEFAULT_REFILL_BYTES_PER_SEC: u64 = 100 * 1024;
 /// Default burst capacity in bytes, sized above [`super::MAX_OSC52_QUERY_RESPONSE_BYTES`] in base64.
 pub(crate) const DEFAULT_BURST_BYTES: u64 = 96 * 1024;
 
-/// Clock source for deterministic rate-limiter tests.
+/// The clock a debit reads: the batch's ([`BatchClock`]) or a test's.
 pub(crate) trait TimeSource {
     fn now(&self) -> Instant;
 }
 
-/// Production time source backed by [`Instant::now`].
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct SystemTime;
+/// The batch's injected clock (`process_now`), so a debit refills by the time the program's own output measured and a replay admits what the live parse did.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BatchClock(pub(crate) Instant);
 
-impl TimeSource for SystemTime {
+impl TimeSource for BatchClock {
     #[inline]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "response-rate gating only: throttles when reply bytes go out, never feeds grid, cursor or mode state"
-    )]
     fn now(&self) -> Instant {
-        Instant::now()
+        self.0
+    }
+}
+
+impl aterm_policy::limits::TimeSource for BatchClock {
+    #[inline]
+    fn now(&self) -> Instant {
+        self.0
     }
 }
 

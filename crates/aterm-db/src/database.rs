@@ -19,7 +19,8 @@ pub const MAX_RECORDS: usize = 20_000;
 /// Largest local atomic write set.
 pub const MAX_WRITES: usize = 64;
 
-/// One key change within a locally atomic transaction; `None` is a permanent stop.
+/// One key change within a locally atomic transaction. `None` is a permanent stop
+/// in the private database and reversible absence in Commons account proposals.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Change {
     /// Named application collection.
@@ -686,38 +687,8 @@ impl History {
                                     .insert(change.key.clone());
                             }
                         }
-                        let cell = view
-                            .cells
-                            .entry((change.collection.clone(), change.key.clone()))
-                            .or_default();
-                        match &change.value {
-                            None if !reverting => {
-                                cell.stopped = true;
-                                cell.candidates.clear();
-                            }
-                            Some(value) if !cell.stopped => {
-                                cell.candidates.retain(|candidate| {
-                                    !self.index.observes(id, &candidate.operation)
-                                });
-                                cell.candidates.push(Candidate {
-                                    operation: *id,
-                                    value: value.clone(),
-                                });
-                                cell.candidates.sort_by_key(|candidate| candidate.operation);
-                            }
-                            None if !cell.stopped => {
-                                cell.candidates.retain(|candidate| {
-                                    !self.index.observes(id, &candidate.operation)
-                                });
-                                cell.candidates.push(Candidate {
-                                    operation: *id,
-                                    value: Value::Null,
-                                });
-                                cell.candidates.sort_by_key(|candidate| candidate.operation);
-                            }
-                            _ => {}
-                        }
                     }
+                    crate::documents::apply(&self.index, &mut view.cells, *id, changes, reverting);
                 }
                 Command::Budget { .. } => {}
                 Command::Spend {

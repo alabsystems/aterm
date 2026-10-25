@@ -5,7 +5,555 @@
 #![cfg_attr(trust_verify, register_tool(trust))]
 use aterm_spec::derive::Model;
 
-/// Two authenticated peers repeatedly acquire and release independent inbound
+/// Recipient retirement survives a delayed binding and recovery of a concurrent
+/// enrollment branch; only a fresh covering epoch permits continued local use.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn recipient_retirement_model() -> Model {
+    aterm_spec::ty_model! {
+        DbRecipientRetirement {
+            const Buggy = 0;
+            var scenario = 0; var retired = 0; var allowed = 0; var old_ready = 0; var ready = 1;
+            action LateBinding when (scenario == 0) {
+                scenario = 1; retired = 1; allowed = if Buggy == 1 {1} else {0};
+            }
+            action ConcurrentRecovery when (scenario == 0) {
+                scenario = 2; retired = if Buggy == 2 {0} else {1};
+                old_ready = if Buggy == 3 {1} else {0}; ready = if Buggy == 4 {0} else {1};
+            }
+            action UnboundEpoch when (scenario == 0) {
+                scenario = 3; retired = 1; old_ready = if Buggy == 5 {1} else {0};
+                ready = if Buggy == 6 {0} else {1};
+            }
+            invariant RetirementPersists: scenario == 0 || retired == 1;
+            invariant NoFutureBinding: allowed == 0;
+            invariant OldKeyWithheld: old_ready == 0;
+            invariant FreshKeyProgress: ready == 1;
+        }
+    }
+}
+
+/// Vault removal follows retained Commons retirement; retries never mint an
+/// extra epoch and a failed publication cannot restore a retired device.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn retirement_publication_model() -> Model {
+    aterm_spec::ty_model! {
+        DbRetirementPublication {
+            const Buggy = 0;
+            var scenario = 0; var bound = 0; var retired = 0; var published = 0; var same = 1;
+            action Revoke when (scenario == 0) {
+                scenario = 1; bound = 1; retired = if Buggy == 1 {0} else {1}; published = if Buggy == 10 {0} else {1}; same = 0;
+            }
+            action PublishFailure when (scenario == 0) {
+                scenario = 2; bound = 1; retired = if Buggy == 2 {0} else {1}; published = 0; same = 0;
+            }
+            action Retry when (scenario == 0) {
+                scenario = 3; bound = 1; retired = 1; published = 1; same = if Buggy == 3 {0} else {1};
+            }
+            action NoBinding when (scenario == 0) {
+                scenario = 4; bound = 1; retired = if Buggy == 4 {0} else {1}; published = 1; same = 0;
+            }
+            action Legacy when (scenario == 0) {
+                scenario = 5; bound = 0; retired = if Buggy == 5 {1} else {0}; published = 1; same = 1;
+            }
+            action SelfRemoval when (scenario == 0) {
+                scenario = 6; bound = 1; retired = if Buggy == 6 {1} else {0}; published = 0; same = 1;
+            }
+            action Admin when (scenario == 0) {
+                scenario = 7; bound = 1; retired = if Buggy == 7 {1} else {0}; published = 0; same = 1;
+            }
+            action Fork when (scenario == 0) {
+                scenario = 8; bound = 1; retired = if Buggy == 8 {1} else {0}; published = 0; same = 1;
+            }
+            action MissingIdentity when (scenario == 0) {
+                scenario = 9; bound = 1; retired = if Buggy == 9 {1} else {0}; published = 0; same = 1;
+            }
+            action RepairRemoved when (scenario == 0) {
+                scenario = 10; bound = 1; retired = if Buggy == 11 {0} else {1}; published = 1; same = 0;
+            }
+            action BatchRemoved when (scenario == 0) {
+                scenario = 11; bound = 1; retired = if Buggy == 12 {0} else {1}; published = 1; same = 0;
+            }
+            action UnknownBatch when (scenario == 0) {
+                scenario = 12; bound = 1; retired = if Buggy == 13 {1} else {0}; published = 0; same = 1;
+            }
+            action GenericRemoval when (scenario == 0) {
+                scenario = 13; bound = 1; retired = 0; published = if Buggy == 14 {1} else {0}; same = 1;
+            }
+            invariant RetireBeforeRemoval: bound == 0 || published == 0 || retired == 1;
+            invariant FailedPublicationRetains: 2 > scenario || scenario > 2 || retired == 1;
+            invariant RetryKeepsEpoch: 3 > scenario || scenario > 3 || same == 1;
+            invariant NoInventedRetirement: bound == 1 || retired == 0;
+            invariant PreflightProtects: 6 > scenario || scenario > 9 || (retired == 0 && published == 0 && same == 1);
+            invariant UnknownBatchInert: 12 > scenario || (retired == 0 && published == 0 && same == 1);
+            invariant Progress: scenario == 0 || scenario == 2 || scenario > 5 || published == 1;
+        }
+    }
+}
+
+/// Enrollment publishes only after durable control ingestion; exact retries
+/// reuse the existing binding while current exclusions and faults refuse.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn enrollment_commit_model() -> Model {
+    aterm_spec::ty_model! {
+        DbEnrollmentCommit {
+            const Buggy = 0;
+            var scenario = 0; var granted = 0; var retained = 0; var same = 1;
+            action Enroll when (scenario == 0) {
+                scenario = 1; granted = if Buggy == 8 { 0 } else { 1 }; retained = if Buggy == 1 { 0 } else { 1 }; same = 0;
+            }
+            action LostReply when (scenario == 0) {
+                scenario = 2; granted = 1; retained = 1; same = if Buggy == 2 { 0 } else { 1 };
+            }
+            action Retry when (scenario == 0) {
+                scenario = 3; granted = 1; retained = 1; same = if Buggy == 3 { 0 } else { 1 };
+            }
+            action NoEvidence when (scenario == 0) {
+                scenario = 4; granted = if Buggy == 4 { 1 } else { 0 }; same = 1;
+            }
+            action Excluded when (scenario == 0) {
+                scenario = 5; granted = if Buggy == 5 { 1 } else { 0 }; same = 1;
+            }
+            action Retired when (scenario == 0) {
+                scenario = 6; granted = if Buggy == 6 { 1 } else { 0 }; same = 1;
+            }
+            action Fork when (scenario == 0) {
+                scenario = 7; granted = if Buggy == 7 { 1 } else { 0 }; same = 1;
+            }
+            invariant RetainBeforeGrant: granted == 0 || retained == 1;
+            invariant EligibleProgress: scenario == 0 || scenario > 3 || granted == 1;
+            invariant RefusalCannotGrant: 4 > scenario || granted == 0;
+            invariant RetryKeepsEpoch: 2 > scenario || same == 1;
+        }
+    }
+}
+
+/// Durable admission evidence is independent of editable machine lists and
+/// later join policy. It authorizes only through current membership checks.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn admission_evidence_model() -> Model {
+    aterm_spec::ty_model! {
+        DbAdmissionEvidence {
+            const Buggy = 0;
+            var scenario = 0; var evidence = 0; var allowed = 0;
+            action Password when (scenario == 0) {
+                scenario = 1; evidence = 2; allowed = if Buggy == 1 { 0 } else { 1 };
+            }
+            action Manual when (scenario == 0) {
+                scenario = 2; evidence = 2; allowed = if Buggy == 2 { 0 } else { 1 };
+            }
+            action OpenClosed when (scenario == 0) {
+                scenario = 3; evidence = 1; allowed = if Buggy == 3 { 1 } else { 0 };
+            }
+            action Removed when (scenario == 0) {
+                scenario = 4; evidence = if Buggy == 4 { 2 } else { 0 }; allowed = 0;
+            }
+            action Readded when (scenario == 0) {
+                scenario = 5; evidence = 0; allowed = if Buggy == 5 { 1 } else { 0 };
+            }
+            action GenericEdit when (scenario == 0) {
+                scenario = 6; evidence = 0; allowed = if Buggy == 6 { 1 } else { 0 };
+            }
+            action Rotate when (scenario == 0) {
+                scenario = 7; evidence = 2; allowed = if Buggy == 7 { 0 } else { 1 };
+            }
+            action Rename when (scenario == 0) {
+                scenario = 8; evidence = 2; allowed = if Buggy == 8 { 0 } else { 1 };
+            }
+            action Excluded when (scenario == 0) {
+                scenario = 9; evidence = 2; allowed = if Buggy == 9 { 1 } else { 0 };
+            }
+            action Legacy when (scenario == 0) {
+                scenario = 10; evidence = 0; allowed = if Buggy == 10 { 1 } else { 0 };
+            }
+            action Draft when (scenario == 0) {
+                scenario = 11; evidence = 0; allowed = if Buggy == 11 { 1 } else { 0 };
+            }
+            action InvalidProof when (scenario == 0) {
+                scenario = 12; evidence = 0; allowed = if Buggy == 12 { 1 } else { 0 };
+            }
+            action ForeignRoot when (scenario == 0) {
+                scenario = 13; evidence = 2; allowed = if Buggy == 13 { 1 } else { 0 };
+            }
+            action Founder when (scenario == 0) {
+                scenario = 14; evidence = 2; allowed = if Buggy == 14 { 0 } else { 1 };
+            }
+            invariant EvidenceRequired: allowed == 0 || evidence == 2;
+            invariant QualifiedWorks: scenario == 0 || (scenario > 2 && (7 > scenario || scenario > 8) && 14 > scenario) || allowed == 1;
+            invariant RemovalForgets: scenario == 0 || 4 > scenario || scenario > 5 || evidence == 0;
+            invariant CurrentMembershipRequired: scenario == 0 || 9 > scenario || scenario == 10 || scenario == 11 || scenario == 12 || scenario == 14 || allowed == 0;
+        }
+    }
+}
+
+/// Retained creation intents survive retries without minting new authority or
+/// replacing a newer local vault. Missing acknowledged history fails closed.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn creation_outbox_model() -> Model {
+    aterm_spec::ty_model! {
+        DbCreationOutbox {
+            const Buggy = 0;
+            var scenario = 0; var retained = 0; var published = 0;
+            var exact = 1; var refused = 0; var monotone = 1;
+            var device_reset = 0;
+            action Resume when (scenario == 0) {
+                scenario = 1; retained = if Buggy == 1 { 0 } else { 1 }; published = 1;
+                exact = if Buggy == 2 { 0 } else { 1 };
+            }
+            action ChangedImport when (scenario == 0) {
+                scenario = 2; retained = 1; published = 1; exact = if Buggy == 3 { 0 } else { 1 };
+            }
+            action LostJournal when (scenario == 0) {
+                scenario = 3; retained = 1; refused = if Buggy == 4 { 0 } else { 1 };
+            }
+            action ChangedIntent when (scenario == 0) {
+                scenario = 4; retained = 1; refused = if Buggy == 5 { 0 } else { 1 };
+            }
+            action CompletedRetry when (scenario == 0) {
+                scenario = 5; retained = 1; published = 1; monotone = if Buggy == 6 { 0 } else { 1 };
+            }
+            action NewerLocal when (scenario == 0) {
+                scenario = 6; retained = 1; monotone = if Buggy == 7 { 0 } else { 1 };
+            }
+            action ChangedConfig when (scenario == 0) {
+                scenario = 7; retained = 1; refused = if Buggy == 8 { 0 } else { 1 };
+            }
+            action BeforeReady when (scenario == 0) {
+                scenario = 8; retained = 1; published = 1; exact = if Buggy == 9 { 0 } else { 1 };
+            }
+            action LostDevice when (scenario == 0) {
+                scenario = 9; retained = 1; refused = if Buggy == 10 { 0 } else { 1 };
+                device_reset = if Buggy == 11 { 1 } else { 0 };
+            }
+            invariant RetainBeforePublish: published == 0 || retained == 1;
+            invariant ExactPublication: exact == 1;
+            invariant NeverRollBack: monotone == 1;
+            invariant DamagedOrForeignRefuses: 3 > scenario || (scenario > 4 && 7 > scenario) || scenario > 7 || refused == 1;
+            invariant LostDeviceRefuses: 9 > scenario || scenario > 9 || refused == 1;
+            invariant NoDeviceReset: device_reset == 0;
+        }
+    }
+}
+
+/// New vaults bind one Commons root and an explicitly authorized founder in
+/// their first signed envelope. Later edits cannot replace that root.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn foundation_birth_model() -> Model {
+    aterm_spec::ty_model! {
+        DbFoundationBirth {
+            const Buggy = 0;
+            var scenario = 0; var bound = 0; var stable = 1; var available = 0; var accepted = 0; var writer = 0;
+            action Create when (scenario == 0) {
+                scenario = 1; bound = if Buggy == 1 { 0 } else { 1 }; accepted = if Buggy == 10 { 0 } else { 1 };
+                available = if Buggy == 7 { 0 } else { 1 };
+                writer = if Buggy == 9 { 0 } else { 1 };
+            }
+            action Rotate when (scenario == 0) {
+                scenario = 2; bound = 1; accepted = 1; available = 1; writer = 1; stable = if Buggy == 2 { 0 } else { 1 };
+            }
+            action RemoveRoot when (scenario == 0) {
+                scenario = 3; bound = 1; available = 1; writer = 1; accepted = if Buggy == 3 { 1 } else { 0 };
+            }
+            action ReplaceRoot when (scenario == 0) {
+                scenario = 4; bound = 1; available = 1; writer = 1; accepted = if Buggy == 4 { 1 } else { 0 };
+            }
+            action Enroll when (scenario == 0) {
+                scenario = 5; bound = 1; accepted = 1; writer = 1; available = if Buggy == 5 { 0 } else { 1 };
+            }
+            action Legacy when (scenario == 0) {
+                scenario = 6; bound = if Buggy == 6 { 1 } else { 0 }; available = if Buggy == 8 { 1 } else { 0 }; accepted = 1;
+            }
+            invariant BoundAtBirth: scenario == 0 || scenario == 6 || bound == 1;
+            invariant StableRoot: stable == 1;
+            invariant FounderAccess: scenario == 0 || scenario == 6 || available == 1;
+            invariant FounderWriter: scenario == 0 || scenario == 6 || writer == 1;
+            invariant LegacyNoGrant: scenario <= 5 || available == 0;
+            invariant NoRootReplacement: scenario <= 2 || scenario > 4 || accepted == 0;
+            invariant EnrolledAccess: scenario <= 4 || scenario > 5 || available == 1;
+            invariant LegacyUnchanged: scenario <= 5 || scenario > 6 || bound == 0;
+            invariant Progress: scenario == 0 || scenario == 3 || scenario == 4 || accepted == 1;
+        }
+    }
+}
+
+/// Public default foundations have one encoding and confer no data authority.
+/// These finite codec scenarios assume the caller's independently trusted key.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn foundation_model() -> Model {
+    aterm_spec::ty_model! {
+        DbFoundation {
+            const Buggy = 0;
+            var scenario = 0; var accepted = 0; var canonical = 1; var grants = 0;
+            action Derive when (scenario == 0) { scenario = 1; accepted = 1; canonical = if Buggy == 1 { 0 } else { 1 }; }
+            action RoundTrip when (scenario == 0) { scenario = 2; accepted = if Buggy == 2 { 0 } else { 1 }; }
+            action Altered when (scenario == 0) { scenario = 3; accepted = if Buggy == 3 { 1 } else { 0 }; }
+            action ForeignRoot when (scenario == 0) { scenario = 4; accepted = if Buggy == 4 { 1 } else { 0 }; }
+            action ForeignNetwork when (scenario == 0) { scenario = 5; accepted = if Buggy == 5 { 1 } else { 0 }; }
+            action NoAccess when (scenario == 0) { scenario = 6; grants = if Buggy == 6 { 1 } else { 0 }; }
+            action NoHistorical when (scenario == 0) { scenario = 7; grants = if Buggy == 7 { 1 } else { 0 }; }
+            action NonCanonicalDefault when (scenario == 0) { scenario = 8; accepted = if Buggy == 8 { 1 } else { 0 }; }
+            invariant UniqueEncoding: canonical == 1;
+            invariant ValidFoundationWorks: scenario == 0 || scenario > 2 || accepted == 1;
+            invariant ForeignBytesRefused: scenario <= 2 || scenario == 6 || scenario == 7 || accepted == 0;
+            invariant NoPublicGrant: grants == 0;
+        }
+    }
+}
+
+/// Two first rosters share one root, withhold keys when exchanged, and require
+/// both explicit conflict recovery and a fresh key epoch to restore access.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn foundation_repair_model() -> Model {
+    aterm_spec::ty_model! {
+        DbFoundationRepair {
+            const Buggy = 0;
+            var a = 0; var b = 0; var merged = 0; var recovered = 0; var fresh = 0;
+            var available_a = 0; var available_b = 0; var root_same = 1;
+            action FirstA when (a == 0 && merged == 0) {
+                a = 1; available_a = if Buggy == 1 { 0 } else { 1 };
+                root_same = if Buggy == 6 { 0 } else { 1 };
+            }
+            action FirstB when (b == 0 && merged == 0) {
+                b = 1; available_b = if Buggy == 2 { 0 } else { 1 };
+            }
+            action Exchange when (a == 1 && b == 1 && merged == 0) {
+                merged = 1; available_a = if Buggy == 3 { 1 } else { 0 }; available_b = 0;
+            }
+            action Recover when (merged == 1 && recovered == 0) {
+                recovered = 1; available_b = if Buggy == 4 { 1 } else { 0 };
+            }
+            action Rotate when (recovered == 1 && fresh == 0) {
+                fresh = 1; available_a = if Buggy == 5 { 0 } else { 1 }; available_b = 1;
+            }
+            invariant CommonRoot: root_same == 1;
+            invariant FirstMemberA: merged == 1 || available_a == a;
+            invariant FirstMemberB: merged == 1 || available_b == b;
+            invariant ConflictWithholds: merged == 0 || fresh == 1 || available_a + available_b == 0;
+            invariant FreshEpochRestores: fresh == 0 || available_a + available_b == 2;
+        }
+    }
+}
+
+/// Admin custody retains the Commons key across vault signing-key rotations.
+/// These finite codec and signing scenarios do not prove crypto or key erasure.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn authority_custody_model() -> Model {
+    aterm_spec::ty_model! {
+        DbAuthorityCustody {
+            const Buggy = 0;
+            var scenario = 0; var usable = 0; var stable = 1; var separate = 0;
+            action NewVault when (scenario == 0) {
+                scenario = 1; usable = 1; separate = if Buggy == 1 { 0 } else { 1 };
+            }
+            action LegacyMigration when (scenario == 0) {
+                scenario = 2; usable = 1; stable = if Buggy == 2 { 0 } else { 1 };
+            }
+            action VaultRotation when (scenario == 0) {
+                scenario = 3; usable = if Buggy == 3 { 0 } else { 1 };
+                separate = 1; stable = 1;
+            }
+            action LegacyRotation when (scenario == 0) {
+                scenario = 4; usable = 1; separate = 1; stable = if Buggy == 4 { 0 } else { 1 };
+            }
+            action LostLegacyKey when (scenario == 0) {
+                scenario = 5; usable = if Buggy == 5 { 1 } else { 0 };
+            }
+            action MissingCustody when (scenario == 0) {
+                scenario = 6; usable = if Buggy == 6 { 1 } else { 0 };
+            }
+            action ChangedDescriptor when (scenario == 0) {
+                scenario = 7; usable = if Buggy == 7 { 1 } else { 0 };
+            }
+            action UnboundRotation when (scenario == 0) {
+                scenario = 8; usable = 1; separate = 1; stable = if Buggy == 8 { 1 } else { 0 };
+            }
+            action BoundDemotion when (scenario == 0) {
+                scenario = 9; usable = if Buggy == 9 { 1 } else { 0 };
+            }
+            action RemovedDescriptor when (scenario == 0) {
+                scenario = 10; usable = if Buggy == 10 { 1 } else { 0 };
+            }
+            action LegacyUnknown when (scenario == 0) {
+                scenario = 11; usable = if Buggy == 11 { 1 } else { 0 };
+            }
+            invariant RetainedAuthority: scenario == 8 || stable == 1;
+            invariant UnusedAuthorityRotates: 8 > scenario || scenario > 8 || stable == 0;
+            invariant UsableCustodyWorks: scenario == 0 || (scenario > 4 && 8 > scenario) || scenario > 8 || usable == 1;
+            invariant LostCustodyRefuses: scenario <= 4 || scenario == 8 || usable == 0;
+            invariant IndependentKeys: scenario == 0 || scenario == 2 || (scenario > 4 && 8 > scenario) || scenario > 8 || separate == 1;
+        }
+    }
+}
+
+/// A bounded source document is published atomically and retried exactly.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn import_atomic_model() -> Model {
+    aterm_spec::ty_model! {
+        DbImportAtomic {
+            const Buggy = 0;
+            var phase = 0; var published = 0; var effects = 0; var stable = 1;
+            action Reject when (phase == 0) {
+                phase = 1; published = if Buggy == 1 { 1 } else { 0 };
+            }
+            action Commit when (phase == 0) {
+                phase = 2; published = 1; effects = if Buggy == 2 { 0 } else { 1 };
+            }
+            action Retry when (phase == 2) {
+                phase = 3; effects = if Buggy == 3 { 2 } else { 1 };
+                stable = if Buggy == 4 { 0 } else { 1 };
+            }
+            invariant RejectBeforePublication: phase == 0 || phase > 1 || published == 0;
+            invariant AtomicSource: phase <= 1 || effects > 0;
+            invariant OneEffect: effects <= 1;
+            invariant OriginalReceipt: stable == 1;
+        }
+    }
+}
+
+/// A source reselected by control is no longer quarantined, but its negative
+/// receipt cannot admit positive data or let the author skip known history.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn source_reselection_model() -> Model {
+    aterm_spec::ty_model! {
+        DbSourceReselection {
+            const Buggy = 0;
+            var phase = 0; var stored = 1; var active = 1;
+            var positive = 0; var writable = 0; var liability = 0;
+            action Reselect when (phase == 0) {
+                phase = 1;
+                active = if Buggy == 1 { 1 } else { 0 };
+                positive = if Buggy == 2 { 1 } else { 0 };
+                stored = if Buggy == 3 { 0 } else { 1 };
+                writable = if Buggy == 4 { 1 } else { 0 };
+                liability = if Buggy == 6 { 1 } else { 0 };
+            }
+            action Admit when (phase == 1) {
+                phase = 2; positive = 1;
+                writable = if Buggy == 5 { 0 } else { 1 };
+                liability = if Buggy == 7 { 0 } else { 1 };
+            }
+            invariant CurrentSelection: phase == 0 || active == 0;
+            invariant RetainedEvidence: stored == 1;
+            invariant NoImplicitAdmission: phase > 1 || positive == 0;
+            invariant NoSequenceReuse: phase > 1 || writable == 0;
+            invariant RecoveredAuthorProgress: phase <= 1 || writable == 1;
+            invariant NoPrematureLiabilityRelease: phase > 1 || liability == 0;
+            invariant RecoveredLiabilityProgress: phase <= 1 || liability == 1;
+        }
+    }
+}
+
+/// A retained request collision remains restrictive after positive membership
+/// filtering or control-recovery quarantine. The latter fences only its author.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn proposal_evidence_model() -> Model {
+    aterm_spec::ty_model! {
+        DbProposalEvidence {
+            const Buggy = 0;
+            var scenario = 0; var retained = 0; var revived = 0;
+            var retry = 0; var peer = 0; var converged = 0;
+            action Withdraw when (scenario == 0) {
+                scenario = 1; retained = if Buggy == 3 { 1 } else { 2 };
+                revived = if Buggy == 1 { 1 } else { 0 };
+                retry = if Buggy == 2 { 1 } else { 0 };
+                converged = if Buggy == 5 { 0 } else { 1 };
+            }
+            action Quarantine when (scenario == 0) {
+                scenario = 2; retained = if Buggy == 3 { 1 } else { 2 };
+                revived = if Buggy == 1 { 1 } else { 0 };
+                retry = if Buggy == 2 { 1 } else { 0 };
+                peer = if Buggy == 4 { 0 } else { 1 };
+                converged = if Buggy == 5 { 0 } else { 1 };
+            }
+            invariant EvidenceRetained: scenario == 0 || retained == 2;
+            invariant NoRevival: revived == 0;
+            invariant NoFalseRetry: retry == 0;
+            invariant AuthorIsolation: scenario <= 1 || peer == 1;
+            invariant NegativeRepair: scenario == 0 || converged == 1;
+        }
+    }
+}
+
+/// Retrying a caller-held request preserves one durable effect; changing its
+/// contents is a refusal, never permission to reinterpret the receipt.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn proposal_retry_model() -> Model {
+    aterm_spec::ty_model! {
+        DbProposalRetry {
+            const Buggy = 0;
+            var written = 0; var count = 0; var retried = 0; var changed = 0;
+            action Write when (written == 0) {
+                written = 1; count = if Buggy == 3 { 0 } else { 1 };
+            }
+            action Retry when (written == 1 && retried == 0) {
+                retried = 1; count = if Buggy == 1 { 2 } else { count };
+            }
+            action Change when (written == 1 && changed == 0) {
+                changed = 1; count = if Buggy == 2 { 2 } else { count };
+            }
+            invariant OneEffect: count <= 1;
+            invariant DurableWrite: written == 0 || count == 1;
+        }
+    }
+}
+
+/// Default subscription gates under every ordering of discovery, conflict and
+/// local policy changes. TLS delivery and storage have separate bounded models.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn catalog_subscription_model() -> Model {
+    aterm_spec::ty_model! {
+        DbCatalogSubscription {
+            const Buggy = 0;
+            var known = 0; var conflict = 0; var excluded = 0;
+            var enabled = 1; var subscribed = 0;
+            var overflow = 0;
+            action Discover when (known == 0) {
+                known = 1;
+                subscribed = if Buggy == 7 { 0 } else { if Buggy == 1 || (excluded == 0 && enabled == 1) { 1 } else { 0 } };
+            }
+            action Conflict when (known == 1 && conflict == 0) {
+                conflict = 1; subscribed = if Buggy == 2 { 1 } else { 0 };
+            }
+            action Exclude when (excluded == 0) {
+                excluded = 1; subscribed = if Buggy == 3 { 1 } else { 0 };
+            }
+            action Include when (excluded == 1) {
+                excluded = 0;
+                subscribed = if known == 1 && conflict == 0 && (enabled == 1 || Buggy == 5) { 1 } else { 0 };
+            }
+            action Disable when (enabled == 1) {
+                enabled = 0; subscribed = if Buggy == 4 { 1 } else { 0 };
+            }
+            action Enable when (enabled == 0) {
+                enabled = 1;
+                subscribed = if known == 1 && excluded == 0 && (conflict == 0 || Buggy == 6) { 1 } else { 0 };
+            }
+            action Quota when (known == 1 && overflow == 0) {
+                overflow = 1; subscribed = if Buggy == 8 { 0 } else { subscribed };
+            }
+            invariant KnownBeforeSubscription: subscribed == 0 || known == 1;
+            invariant ConflictBlocks: conflict == 0 || subscribed == 0;
+            invariant ExclusionBlocks: excluded == 0 || subscribed == 0;
+            invariant DisabledBlocks: enabled == 1 || subscribed == 0;
+            invariant DefaultAvailable: known == 0 || conflict == 1 || excluded == 1 || enabled == 0 || subscribed == 1;
+        }
+    }
+}
+
+/// Two authenticated peers repeatedly acquire and release per-peer
 /// leases. Progress persists without eviction; duplicate leases are refused.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -367,8 +915,24 @@ pub fn bootstrap_history_model() -> Model {
             action VaultHandoff when (scenario == 0) { scenario = 3; opened = if Buggy == 3 { 0 } else { 1 }; }
             action LostHistory when (scenario == 0) { scenario = 4; opened = if Buggy == 4 { 1 } else { 0 }; }
             action ChangedTrust when (scenario == 0) { scenario = 5; opened = if Buggy == 5 { 1 } else { 0 }; }
-            invariant EstablishedHistoryNeverResets: opened == 0 || (scenario > 0 && scenario <= 3);
-            invariant ValidBootstrapWorks: scenario == 0 || scenario > 3 || opened == 1;
+            action MissingOuterPin when (scenario == 0) { scenario = 6; opened = if Buggy == 6 { 0 } else { 1 }; }
+            action MissingPinAndHistory when (scenario == 0) { scenario = 7; opened = if Buggy == 7 { 1 } else { 0 }; }
+            action MissingCommonsDirectory when (scenario == 0) { scenario = 8; opened = if Buggy == 8 { 1 } else { 0 }; }
+            action ChangedTrustMissingPin when (scenario == 0) { scenario = 9; opened = if Buggy == 9 { 1 } else { 0 }; }
+            action CorruptHistoryClaim when (scenario == 0) { scenario = 10; opened = if Buggy == 10 { 1 } else { 0 }; }
+            action LegacyBackfill when (scenario == 0) { scenario = 11; opened = if Buggy == 11 { 0 } else { 1 }; }
+            action MissingOuterClaims when (scenario == 0) { scenario = 12; opened = if Buggy == 12 { 0 } else { 1 }; }
+            action BusyBootstrap when (scenario == 0) { scenario = 13; opened = if Buggy == 13 { 1 } else { 0 }; }
+            action PreparingResume when (scenario == 0) { scenario = 14; opened = if Buggy == 14 { 0 } else { 1 }; }
+            action ForeignPreparing when (scenario == 0) { scenario = 15; opened = if Buggy == 15 { 1 } else { 0 }; }
+            action LegacyDamagedAnchor when (scenario == 0) { scenario = 16; opened = if Buggy == 16 { 1 } else { 0 }; }
+            action OrphanTables when (scenario == 0) { scenario = 17; opened = if Buggy == 17 { 1 } else { 0 }; }
+            action WrongIdentity when (scenario == 0) { scenario = 18; opened = if Buggy == 18 { 1 } else { 0 }; }
+            action UnclaimedPartial when (scenario == 0) { scenario = 19; opened = if Buggy == 19 { 1 } else { 0 }; }
+            action PreparingPinLostLog when (scenario == 0) { scenario = 20; opened = if Buggy == 20 { 1 } else { 0 }; }
+            action OrphanHistory when (scenario == 0) { scenario = 21; opened = if Buggy == 21 { 1 } else { 0 }; }
+            invariant EstablishedHistoryNeverResets: opened == 0 || (scenario > 0 && scenario <= 3) || scenario == 6 || scenario == 11 || scenario == 12 || scenario == 14;
+            invariant ValidBootstrapWorks: scenario == 0 || scenario == 4 || scenario == 5 || scenario == 7 || scenario == 8 || scenario == 9 || scenario == 10 || scenario == 13 || scenario > 14 || opened == 1;
         }
     }
 }
@@ -869,8 +1433,8 @@ pub fn table_conflict_model() -> Model {
                 restricted = if Buggy == 8 { 0 } else { 1 };
             }
             action Replicate when (scenario == 0) {
-                scenario = 9; usable = 1; acknowledged = 1;
-                restricted = if Buggy == 11 { 0 } else { 1 };
+                scenario = 9; usable = 1; acknowledged = 2;
+                restricted = if Buggy == 11 { 0 } else { 2 };
                 visible = if Buggy == 13 { 1 } else { 0 };
             }
             action KnownOperation when (scenario == 0) {
@@ -881,7 +1445,7 @@ pub fn table_conflict_model() -> Model {
                 scenario = 11; usable = 1; acknowledged = 1;
                 restricted = if Buggy == 14 { 0 } else { 1 };
             }
-            invariant RetainedRestriction: scenario == 0 || scenario == 4 || scenario == 6 || scenario == 7 || restricted == 1;
+            invariant RetainedRestriction: scenario == 0 || scenario == 4 || scenario == 6 || scenario == 7 || restricted > 0;
             invariant AuthenticateBeforeAck: 6 > scenario || scenario > 7 || acknowledged == 0;
             invariant LostWitnessRefuses: scenario <= 3 || scenario > 4 || usable == 0;
             invariant NoWriterReset: writable == 0;

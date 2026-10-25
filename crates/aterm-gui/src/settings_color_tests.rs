@@ -659,6 +659,62 @@ fn the_customize_sheet_keeps_its_caption_over_a_whole_row() {
     }
 }
 
+/// Whether `key` is painted whole inside the Customize sheet's list.
+fn whole_in_sheet(compiled: &crate::native_ui::CompiledUi, key: &str) -> bool {
+    let list = rect_of(compiled, "settings/showcase/sheet-list");
+    compiled
+        .semantic(&UiKey::new(key))
+        .is_some_and(|node| !node.offscreen)
+        && compiled
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == key)
+            .is_some_and(|node| {
+                let shown =
+                    node.rect.bottom().min(node.clip.bottom()) - node.rect.y.max(node.clip.y);
+                shown + 0.5 >= node.rect.height
+                    && node.rect.y >= list.y - 0.5
+                    && node.rect.bottom() <= list.bottom() + 0.5
+            })
+}
+
+/// OPENING A PALETTE SLOT SHOWS THE PICKER IT SETS: the slot's field, its wheel and Brightness
+/// are drawn whole on the screen the open lands on wherever they share one, as a colour row's
+/// picker is under its row. (The picker was a stop of its own under the palette-wide Reset
+/// palette, and opening a slot revealed only the field, so at 150x48 and 100x34 the wheel was off
+/// screen.) Negative control: at 80x24, where the editor and the picker cannot share a screen, the
+/// focused field is still whole, and the wheel waits a screen down.
+#[test]
+fn opening_a_palette_slot_shows_the_picker_it_sets() {
+    let field = "settings/showcase/palette-slot";
+    let wheel = "settings/color/palette-slot/wheel";
+    let brightness = "settings/color/palette-slot/brightness";
+    for (width, height, together) in [
+        (1_086.0, 695.0, true),
+        (724.0, 492.0, true),
+        (584.0, 348.0, false),
+    ] {
+        for slot in [1, 12] {
+            let mut lab = Lab::new("theme = \"Dracula\"\n");
+            lab.state_mut().navigate(SettingsRoute::Themes);
+            lab.dispatch(action("settings/showcase/customize", None));
+            let _ = lab.compile(width, height);
+            lab.dispatch(action(&format!("settings/showcase/palette/{slot}"), None));
+            let compiled = lab.compile(width, height);
+            let context = format!("{width}x{height}, slot {slot}");
+            assert!(
+                whole_in_sheet(&compiled, field),
+                "{context}: the focused field"
+            );
+            assert_eq!(
+                whole_in_sheet(&compiled, wheel) && whole_in_sheet(&compiled, brightness),
+                together,
+                "{context}: the wheel and Brightness"
+            );
+        }
+    }
+}
+
 #[test]
 fn the_palette_slot_editor_carries_the_picker() {
     let mut lab = Lab::new("theme = \"Dracula\"\n");
@@ -672,7 +728,6 @@ fn the_palette_slot_editor_carries_the_picker() {
         "no slot open, no slot picker"
     );
     lab.dispatch(action("settings/showcase/palette/1", None));
-    lab.state_mut().reveal_control(UiKey::new(wheel));
     let compiled = lab.compile(1_284.0, 934.0);
     let node = compiled
         .semantic(&UiKey::new(wheel))

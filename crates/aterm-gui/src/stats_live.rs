@@ -20,7 +20,8 @@
 //! Cost: the frames are scheduled at the glide's quantum ([`GLIDE_QUANTUM_PX`], at most
 //! [`GLIDE_STEP_MIN`] apart) and the beat's ([`BEAT_FRAME`] for [`BEAT`] after each reading), and
 //! such a frame re-rasters only the deck card's [`LiveLayer`] rects that changed
-//! (`App::splice_stats_deck`), never the whole card.
+//! (`App::splice_stats_deck`), never the whole card, from one layout that reads no words and
+//! plans no header line (`stats_deck::DeckStill`).
 
 use std::time::{Duration, Instant};
 

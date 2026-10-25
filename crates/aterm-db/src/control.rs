@@ -25,6 +25,7 @@ use std::{
     time::Duration,
 };
 
+pub(crate) mod enrollment;
 mod peers;
 
 /// At most 4.5 MiB of sealed nodes are buffered per direction. The durable
@@ -63,8 +64,17 @@ pub struct Repair {
     cursor: Option<Digest>,
     data: crate::replica::Repair,
     application: Option<crate::replica::Report>,
+    #[cfg(any(test, debug_assertions))]
+    application_error: Option<String>,
 }
 impl Repair {
+    fn clear_application(&mut self) {
+        self.application = None;
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.application_error = None;
+        }
+    }
     /// The most recently channel-authenticated peer; the round may have failed.
     pub fn actor(&self) -> Option<Actor> {
         self.peer.map(|(_, actor)| actor)
@@ -125,19 +135,37 @@ pub struct Endpoint {
     identity: NodeIdentity,
     hello: Vec<u8>,
     application: Option<crate::replica::Replica>,
-    inbound: peers::Cache,
-    /// The absolute deadline of one exchange ([`crate::network::WITHIN`]).
-    within: Duration,
+    peers: peers::Cache,
+    paths: Option<aterm_secrets::client::Paths>,
+    pending: bool,
 }
-impl Endpoint {
-    /// This endpoint's exchanges wait `within` before their deadline cuts them: a test that
-    /// needs every round to complete waits it out as a one-minute hang detector.
-    #[cfg(test)]
-    pub(crate) const fn within(mut self, within: Duration) -> Self {
-        self.within = within;
-        self
-    }
 
+/// One exchange's absolute deadline: the product's [`crate::network::WITHIN`]. A test needs each
+/// round to complete, and waits out a loaded machine's round as a one-minute hang detector: a
+/// round the deadline cuts reads as a missing application report.
+#[cfg(not(test))]
+const EXCHANGE: Duration = crate::network::WITHIN;
+#[cfg(test)]
+const EXCHANGE: Duration = Duration::from_secs(60);
+
+impl Endpoint {
+    /// Subscribe to the enrolled lab's catalog and its declared tables by
+    /// default, honoring local policy before every application batch.
+    pub fn with_commons(
+        mut self,
+        paths: aterm_secrets::client::Paths,
+        config: PathBuf,
+    ) -> Result<Self> {
+        let application = crate::replica::Replica::commons(paths.clone(), config)?;
+        if !application.matches(self.trust, self.actor) {
+            return Err(Error::new(
+                "Commons subscriptions have another control identity",
+            ));
+        }
+        self.application = Some(application);
+        self.paths = Some(paths);
+        Ok(self)
+    }
     /// Attach an explicit local table set. Discovery/subscription is a higher
     /// layer; no table path or admission can come from a peer's packet.
     pub fn with_tables(
@@ -180,6 +208,53 @@ impl Endpoint {
                 Ok(endpoint)
             })
             .map(Some)
+    }
+
+    /// An authenticated but not yet bound device may discover and dial an
+    /// approver. This endpoint must never advertise or accept connections.
+    pub fn pending_from_bootstrap(
+        bootstrap: &aterm_secrets::commons::bootstrap::Bootstrap,
+        paths: aterm_secrets::client::Paths,
+    ) -> Result<Self> {
+        if bootstrap.witness().map_err(failure)?.is_some() {
+            return Err(Error::new(
+                "an enrolled device cannot use pending enrollment",
+            ));
+        }
+        let request = bootstrap.request().map_err(failure)?;
+        bootstrap.device().with_seed(|seed| {
+            let identity = NodeIdentity::from_seed(
+                &aterm_codec::hex::encode_lower(request.binding().incarnation()),
+                seed,
+            )
+            .ok_or_else(|| Error::new("invalid pending device identity"))?;
+            if identity.key().bytes() != request.binding().writer() {
+                return Err(Error::new(
+                    "pending device identity does not match its request",
+                ));
+            }
+            let mut hello = b"ACE1".to_vec();
+            let trust = bootstrap.trust();
+            hello.extend_from_slice(&trust.network);
+            hello.extend_from_slice(&trust.authority);
+            hello.extend_from_slice(&trust.genesis);
+            hello.extend_from_slice(request.bytes());
+            Ok(Self {
+                dir: bootstrap.journal_dir().into(),
+                trust,
+                actor: request.binding().actor(),
+                identity,
+                hello,
+                application: None,
+                peers: peers::Cache::default(),
+                paths: Some(paths),
+                pending: true,
+            })
+        })
+    }
+
+    pub(crate) const fn pending(&self) -> bool {
+        self.pending
     }
 
     /// `witness` is a signed ACN3 node containing this request's exact Bind fact.
@@ -229,13 +304,14 @@ impl Endpoint {
             identity,
             hello,
             application: None,
-            inbound: peers::Cache::default(),
-            within: crate::network::WITHIN,
+            peers: peers::Cache::default(),
+            paths: None,
+            pending: false,
         })
     }
 
     /// Exchange over a connection admitted by the native LAN/loopback policy.
-    /// One absolute 30-second deadline covers TLS, authentication and repair.
+    /// One absolute deadline ([`EXCHANGE`]) covers TLS, authentication and repair.
     /// Route evidence is rechecked after TLS and after the bounded exchange.
     /// This does not start any automatic network service.
     pub fn exchange(
@@ -244,10 +320,10 @@ impl Endpoint {
         side: Side,
         repair: &mut Repair,
     ) -> Result<Report> {
-        repair.application = None;
+        repair.clear_application();
         let (tcp, locality) = connection.into_parts();
         locality.recheck()?;
-        let _deadline = crate::network::Deadline::arm_within(&tcp, self.within)?;
+        let _deadline = crate::network::Deadline::arm_within(&tcp, EXCHANGE)?;
         // This PUBLIC discriminator separates networks/protocols. It is not an
         // admission secret. Authority witness + exporter-bound identity below
         // are mandatory before any inventory or control repair is exposed.
@@ -307,6 +383,12 @@ impl Endpoint {
         side: Side,
         repair: &mut Repair,
     ) -> Result<Report> {
+        if self.pending {
+            if side != Side::Initiator {
+                return Err(Error::new("pending enrollment cannot accept connections"));
+            }
+            return enrollment::client(self, stream, proof, repair);
+        }
         if proof.is_none() {
             return Err(Error::new("Commons requires a channel-bound node proof"));
         }
@@ -314,18 +396,21 @@ impl Endpoint {
             send_frame(stream, &self.hello)?;
         }
         let hello = receive_frame(stream, MAX_HELLO)?;
+        if side == Side::Responder && hello.starts_with(b"ACE1") {
+            return enrollment::serve(self, stream, proof, &hello, repair);
+        }
         let actor = authenticate(self.trust, self.actor, proof, &hello)?;
         repair.prepare(self.trust, actor);
-        repair.application = None;
+        repair.clear_application();
+        // Opposite directions share local journals too. Lease either direction
+        // so two simultaneous channels with one actor cannot race every batch.
+        let mut lease = self.peers.acquire(actor, repair)?;
+        lease.prepare(self.trust, actor);
+        lease.clear_application();
         if side == Side::Responder {
-            let mut lease = self.inbound.acquire(actor, repair)?;
-            lease.prepare(self.trust, actor);
-            lease.application = None;
             send_frame(stream, &self.hello)?;
-            self.repair_connected(stream, actor, side, &mut lease)
-        } else {
-            self.repair_connected(stream, actor, side, repair)
         }
+        self.repair_connected(stream, actor, side, &mut lease)
     }
 
     fn repair_connected(
@@ -345,9 +430,12 @@ impl Endpoint {
             repair,
         )?;
         if let Some(application) = &self.application {
-            repair.application = application
-                .exchange(stream, actor, side, &mut repair.data)
-                .ok();
+            let result = application.exchange(stream, actor, side, &mut repair.data);
+            #[cfg(any(test, debug_assertions))]
+            {
+                repair.application_error = result.as_ref().err().map(ToString::to_string);
+            }
+            repair.application = result.ok();
         }
         Ok(report)
     }
@@ -448,6 +536,14 @@ fn authenticate(
     }
     let request = Request::decode(&hello[84..HELLO_FIXED]).map_err(failure)?;
     check_witness(trust, &request, &hello[HELLO_FIXED..])?;
+    authenticate_identity(own, proof, &request)
+}
+
+fn authenticate_identity(
+    own: Actor,
+    proof: Option<&NodeProof>,
+    request: &Request,
+) -> Result<Actor> {
     let peer = proof.ok_or_else(|| Error::new("Commons requires a channel-bound node proof"))?;
     let actor = request.binding().actor();
     if peer.key.bytes().as_slice() != &actor[..32]

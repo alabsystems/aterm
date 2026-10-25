@@ -28,6 +28,39 @@ pub struct TrailCell {
     pub alpha: u8,
 }
 
+/// Whether a frame's text can take the GPU's bloom ([`RenderInput::bloom_gate`]).
+///
+/// The cursor effects hold it where the theme's text (its default ink on its
+/// default ground) keeps only its own reading under the lights, its solid ink
+/// under the letter guard's floor on the bare page (a dim theme's). The bloom
+/// blurs the over-text light past every cut the guard made on a letter, and
+/// such a letter has no room for it: under Comet's bloom Solarized Dark's
+/// newest letter read 3.47:1 of its own 4.06, 4.10 without it (looks7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BloomGate {
+    /// The bloom draws over the frame's over-text light.
+    #[default]
+    Open,
+    /// The page's text holds the bloom: it draws none.
+    Held,
+}
+
+impl BloomGate {
+    /// [`Self::Held`] when `held`, else [`Self::Open`].
+    #[must_use]
+    #[inline]
+    pub const fn of(held: bool) -> Self {
+        if held { Self::Held } else { Self::Open }
+    }
+
+    /// Whether the bloom is held.
+    #[must_use]
+    #[inline]
+    pub const fn held(self) -> bool {
+        matches!(self, Self::Held)
+    }
+}
+
 /// One light quad of an effect stream (aurora comet, bloom crown, landing ring, sparks, nova, fire body).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GlowQuad {
@@ -1074,6 +1107,8 @@ pub struct RenderInput {
     pub fire_patch_damage: EffectStreamDamage,
     /// Host-resolved cursor fill override (`0x00RRGGBB`), or `None` for the theme/OSC-12 colour.
     pub cursor_fill_override: Option<u32>,
+    /// Whether the page's text can take the GPU's bloom ([`BloomGate`]).
+    pub bloom_gate: BloomGate,
     /// Sparkle-word decorations: small sprites over cells of matched words.
     pub word_decorations: Vec<WordDecoration>,
     /// Animated-ink per-cell fg overrides.
@@ -1364,6 +1399,7 @@ impl PartialEq for RenderInput {
             && self.glow_under == other.glow_under
             && self.fire_patch == other.fire_patch
             && self.cursor_fill_override == other.cursor_fill_override
+            && self.bloom_gate == other.bloom_gate
             && self.word_decorations == other.word_decorations
             && self.ink == other.ink
             && self.char_fg == other.char_fg
@@ -1516,6 +1552,7 @@ impl RenderInput {
         self.cursor_trail.clone_from(&source.cursor_trail);
         self.cursor_trail_color = source.cursor_trail_color;
         self.cursor_fill_override = source.cursor_fill_override;
+        self.bloom_gate = source.bloom_gate;
 
         macro_rules! copy_effect_stream {
             ($field:ident, $damage:ident) => {
@@ -1631,6 +1668,7 @@ impl RenderInput {
             glow_under_damage: EffectStreamDamage::default(),
             fire_patch_damage: EffectStreamDamage::default(),
             cursor_fill_override: None,
+            bloom_gate: BloomGate::Open,
             word_decorations: Vec::new(),
             ink: Vec::new(),
             char_fg: Vec::new(),
@@ -2062,6 +2100,7 @@ impl RenderInput {
         self.glow_under_damage = EffectStreamDamage::default();
         self.fire_patch_damage = EffectStreamDamage::default();
         self.cursor_fill_override = None;
+        self.bloom_gate = BloomGate::Open;
         self.word_decorations.clear();
         self.ink.clear();
         self.char_fg.clear();

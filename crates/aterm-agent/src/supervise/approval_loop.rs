@@ -148,6 +148,9 @@ pub(super) struct QuestionMemory {
     pub(super) by_text: bool,
     pub(super) fell_back: std::collections::BTreeSet<String>,
     pub(super) note_entered: Option<String>,
+    /// The content seq at which a key written to this dialog was last unread input, as written
+    /// or as `status` read it, and when ([`Session::question_key_undrawn`]).
+    pub(super) unread_at: Option<(u64, Instant)>,
 }
 
 /// THE DECISION ON A BOX READ WHOLE FROM THE HISTORY (`box_head`).
@@ -3198,6 +3201,19 @@ impl<C: Ctl> Session<'_, C> {
             .pending
             .clone()
             .filter(|p| p.identity == identity && p.focus == focus);
+        if unchanged.is_some()
+            && let Some((why, left)) = self.question_key_undrawn(seq)
+        {
+            self.note_question_wait(
+                review,
+                seq,
+                rule_id,
+                identity,
+                &format!("{why}: nothing sent again until the screen moves"),
+            );
+            self.wait(&["seq", &seq.to_string()], left.min(WAIT_STEP))?;
+            return Ok(Some(Hold::Again));
+        }
         let toggling = match &unchanged {
             Some(QuestionPending {
                 kind: PendingKind::Enter,
@@ -3271,6 +3287,7 @@ impl<C: Ctl> Session<'_, C> {
             }
             Some(_) => {}
             None => {
+                self.question.unread_at = None;
                 if let Some(p) = self.question.pending.take()
                     && self
                         .press_retry
@@ -3330,6 +3347,44 @@ impl<C: Ctl> Session<'_, C> {
             }
         }
         Ok(None)
+    }
+
+    /// A QUESTION KEY THE WORKER HAS NOT DRAWN IS NEVER SENT AGAIN ON THE SCREEN IT WAS WRITTEN
+    /// TO ([`super::turn_end_loop::UNDRAWN_INPUT_HANG`]). A key sent once more because the dialog
+    /// still looks as it was keyed is right for a dialog that dropped the key, and wrong for a
+    /// starved worker that has the key queued, or read it and has not painted it yet: the second
+    /// copy lands on the next screen (a tab's question answered unread, a focus moved twice). A
+    /// key is unread input as it is written ([`Session::question_written`]) and whenever `status`
+    /// reads the input unread (`input=pending|typeahead`); until the screen moves past the
+    /// content seq where it was last unread, nothing is sent again. A screen that has not moved
+    /// [`super::turn_end_loop::UNDRAWN_INPUT_HANG`] after that ends the hold, a hang detector,
+    /// and the dialog's re-send goes. Returns why the key is held, and how long the hold has
+    /// left.
+    pub(super) fn question_key_undrawn(&mut self, seq: u64) -> Option<(String, Duration)> {
+        let now = self.fx.mono();
+        let hang = super::turn_end_loop::UNDRAWN_INPUT_HANG;
+        if let Some(word) = self
+            .launch_status
+            .input
+            .as_deref()
+            .filter(|w| matches!(*w, "pending" | "typeahead"))
+        {
+            let why = format!("the worker has not read the last key written to it (input={word})");
+            self.question.unread_at = Some((seq, now));
+            return Some((why, hang));
+        }
+        match self.question.unread_at {
+            Some((at, since)) if at == seq && now.saturating_duration_since(since) < hang => Some((
+                "the worker has not drawn the last key written to it (the screen has not moved \
+                 since the key was written or seen unread)"
+                    .to_string(),
+                hang.saturating_sub(now.saturating_duration_since(since)),
+            )),
+            _ => {
+                self.question.unread_at = None;
+                None
+            }
+        }
     }
 
     fn answered(

@@ -108,6 +108,7 @@ pub(super) fn frame_key(
         system_dark: false,
         link_caption: None,
         claude_footer_fp: 0,
+        rewind_fp: 0,
     }
 }
 

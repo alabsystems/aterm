@@ -485,23 +485,15 @@ fn a_land_hold_is_copy_and_small() {
 
 #[test]
 fn every_word_the_strict_reading_names_has_an_index() {
-    let mut replies: Vec<String> = Vec::new();
-    for line in include_str!("fixtures/land-defense-table.txt").lines() {
-        if !line.starts_with('#') && !line.starts_with("==") && !line.trim().is_empty() {
-            replies.push(line.replace("\\n", "\n"));
-        }
-    }
+    let mut replies: Vec<String> = super::corpora::land_table()
+        .into_iter()
+        .map(|(_, reply)| reply)
+        .collect();
     replies.extend(needs::needs_table().into_iter().map(|(_, reply)| reply));
-    let mut excerpt = String::new();
-    for line in include_str!("fixtures/open-work-corpus.txt").lines() {
-        if line.starts_with("---") || line.starts_with("===") {
-            replies.push(std::mem::take(&mut excerpt));
-        } else if !line.starts_with('#') {
-            excerpt.push_str(line);
-            excerpt.push('\n');
-        }
-    }
-    replies.push(excerpt);
+    let excerpts = super::corpora::open_work_reports()
+        .into_iter()
+        .flat_map(|(_, excerpts)| excerpts);
+    replies.extend(excerpts.map(|(_, text)| text));
     let replies = &replies;
     let words: Vec<&'static str> = std::thread::scope(|scope| {
         let readers: Vec<_> = (0..4)

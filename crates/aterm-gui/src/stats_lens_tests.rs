@@ -909,6 +909,33 @@ fn why_now_says_what_sys_why_says() {
     );
 }
 
+/// Why now's sub-heading keeps its words while a live window wobbles about a
+/// second (995–1,004 ms from one split tick to the next, §7.2 item 3): the
+/// window is rounded to a tenth first and only then given its form. NEGATIVE
+/// CONTROL: a window that rounds under 1.0 s keeps its decimal.
+#[test]
+fn why_nows_window_keeps_its_words_about_a_second() {
+    for ms in [995, 1_000, 1_004] {
+        let mut snap = engine_1032();
+        let why = snap.why.as_mut().expect("the scene's split");
+        Arc::make_mut(why).window_ns = ms * 1_000_000;
+        let laid = cpu_for(&snap, &[1]);
+        let drawn: Vec<&str> = laid.boxes.iter().map(|b| b.text.as_str()).collect();
+        assert!(
+            drawn.contains(&"1 s window \u{b7} exact, 9 coalitions"),
+            "{ms} ms: {drawn:?}"
+        );
+    }
+    for (ms, words) in [
+        (949, "0.9 s window"),
+        (950, "1 s window"),
+        (4_995, "5 s window"),
+        (5_004, "5 s window"),
+    ] {
+        assert_eq!(window_words(ms * 1_000_000), words, "{ms} ms");
+    }
+}
+
 #[test]
 fn why_nows_split_adds_up_to_its_busy_figure() {
     assert_eq!(

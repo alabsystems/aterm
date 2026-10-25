@@ -9,7 +9,7 @@
 //! A grant the person opted out of (§4: a `[privacy]` switch, a debugger access turned off, or a
 //! Not now in this approval) is honored as the row's wanted state and never asks for a person.
 
-use super::{Row, WAITING};
+use super::{HeldLock, Row, WAITING};
 use aterm_json::{Value, json};
 use aterm_types::macos_setup::opt_out::OptOut;
 use aterm_types::macos_setup::{
@@ -28,6 +28,10 @@ pub(super) enum LanAnswer {
     /// macOS refused aterm a `.local` name (`aterm_secrets::client::refused_by_local_network`):
     /// the person answered Don't Allow, or turned aterm off since.
     Refused,
+    /// The window raised macOS's Local Network question (its trigger, an access step it recorded,
+    /// [`local_network_step`]): an answer heard before it no longer says how the switch stands,
+    /// and only a look after it does. An older aterm reads no answer from it.
+    Asked,
 }
 
 impl LanAnswer {
@@ -35,6 +39,7 @@ impl LanAnswer {
         match self {
             Self::Reached => "reached",
             Self::Refused => "refused",
+            Self::Asked => "asked",
         }
     }
 
@@ -42,6 +47,7 @@ impl LanAnswer {
         match word {
             "reached" => Some(Self::Reached),
             "refused" => Some(Self::Refused),
+            "asked" => Some(Self::Asked),
             _ => None,
         }
     }
@@ -55,24 +61,71 @@ static HEARD: Mutex<Option<(LanAnswer, u64)>> = Mutex::new(None);
 /// Mac with no ALab vault on its LAN hears no answer to a look.
 const KEPT: &str = "local-network.json";
 
+const KEPT_LOCK: &str = "local-network.lock";
+
 /// Note what a look at the LAN heard, now: for this process, and kept for later launches unless
 /// the record holds a later answer. A record that cannot be written leaves later launches what
-/// they read before; this process still reads its own answer.
+/// they read before; this process still reads its own answer. The newer answer always wins, so an
+/// old refusal never outlasts a later step or look.
 pub(super) fn lan_answered(answer: LanAnswer) {
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
-    if let Ok(mut heard) = HEARD.lock() {
+    hear_answer(&HEARD, answer, at);
+    let _kept = super::state_root().and_then(|root| keep_answer(&root, answer, at));
+}
+
+fn hear_answer(heard: &Mutex<Option<(LanAnswer, u64)>>, answer: LanAnswer, at: u64) {
+    if let Ok(mut heard) = heard.lock()
+        && heard.is_none_or(|(_, previous)| at >= previous)
+    {
         *heard = Some((answer, at));
     }
-    let _kept = super::state_root().and_then(|root| keep_answer(&root, answer, at));
+}
+
+/// What the window's access step for Local Network says of the switch, heard now
+/// ([`lan_answered`]): its trigger raised macOS's question ([`LanAnswer::Asked`]), or it read the
+/// grant on ([`LanAnswer::Reached`]). The access record keeps no time, so this is what lets a
+/// step outrank an older answer kept from an earlier launch. Any other step says nothing of it.
+pub(super) fn local_network_step(outcome: AccessOutcome) {
+    if let Some(answer) = step_answer(outcome) {
+        lan_answered(answer);
+    }
+}
+
+/// The answer an access step for Local Network gives ([`local_network_step`]).
+const fn step_answer(outcome: AccessOutcome) -> Option<LanAnswer> {
+    match outcome {
+        AccessOutcome::Triggered => Some(LanAnswer::Asked),
+        AccessOutcome::Granted => Some(LanAnswer::Reached),
+        AccessOutcome::Handed | AccessOutcome::Declined => None,
+    }
+}
+
+/// Whether a look at the LAN may run now without putting macOS's Local Network question on screen:
+/// an answer was heard before, in this process or an earlier launch, so macOS has asked aterm
+/// already. Check again looks again only then ([`super::probe_local_network_again`]); the first
+/// question is the window's to raise, at a quiet moment.
+pub(super) fn lan_asked_before() -> bool {
+    last_answer().is_some()
 }
 
 /// Keep `answer`, heard at `at`, in `root` unless the record there holds a later one.
 fn keep_answer(root: &Path, answer: LanAnswer, at: u64) -> Result<(), String> {
+    keep_answer_with(root, answer, at, || {})
+}
+
+fn keep_answer_with(
+    root: &Path,
+    answer: LanAnswer,
+    at: u64,
+    after_read: impl FnOnce(),
+) -> Result<(), String> {
+    let _lock = HeldLock::take_named(root, KEPT_LOCK)?;
     if kept_answer(root).is_some_and(|(_, kept)| kept > at) {
         return Ok(());
     }
+    after_read();
     super::write_json(
         &root.join(KEPT),
         &json!({"profile":super::PROFILE,"answer":answer.word(),"at":at}),
@@ -109,16 +162,15 @@ fn latest(answers: [Option<(LanAnswer, u64)>; 2]) -> Option<LanAnswer> {
         .map(|(answer, _)| answer)
 }
 
-/// Local Network as aterm knows it (§3.3), from the last answer a LAN look heard (`heard`) and
-/// this approval's step (`records`).
+/// Local Network as aterm knows it (§3.3), from the last answer a LAN look or the window's step
+/// heard (`heard`, the newer winning) and this approval's step (`records`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Lan {
     /// A look reached the LAN, or the window recorded the grant in this approval.
     On,
     /// macOS refused a look the LAN: the person's answer, which aterm leaves as it is.
     Off,
-    /// The window raised macOS's question in this approval, and no answer since says how it
-    /// went.
+    /// The window raised macOS's question, and no answer since says how it went.
     Asked,
     /// Nothing says.
     Untold,
@@ -133,8 +185,8 @@ impl Lan {
         match (recorded, heard) {
             (_, Some(LanAnswer::Reached)) => Self::On,
             (_, Some(LanAnswer::Refused)) => Self::Off,
-            (Some(AccessOutcome::Granted), None) => Self::On,
-            (Some(AccessOutcome::Triggered), None) => Self::Asked,
+            (Some(AccessOutcome::Granted), None | Some(LanAnswer::Asked)) => Self::On,
+            (Some(AccessOutcome::Triggered), None) | (_, Some(LanAnswer::Asked)) => Self::Asked,
             _ => Self::Untold,
         }
     }
@@ -874,7 +926,7 @@ mod tests {
     #[test]
     fn local_network_reads_the_last_answer_heard_else_this_approvals_step() {
         use AccessOutcome::{Granted, Triggered};
-        use LanAnswer::{Reached, Refused};
+        use LanAnswer::{Asked, Reached, Refused};
         for (heard, step, lan) in [
             (None, None, Lan::Untold),
             (None, Some(Triggered), Lan::Asked),
@@ -884,6 +936,9 @@ mod tests {
             (Some(Refused), None, Lan::Off),
             (Some(Refused), Some(Triggered), Lan::Off),
             (Some(Refused), Some(Granted), Lan::Off),
+            (Some(Asked), None, Lan::Asked),
+            (Some(Asked), Some(Triggered), Lan::Asked),
+            (Some(Asked), Some(Granted), Lan::On),
         ] {
             let records: Vec<_> = step
                 .into_iter()
@@ -925,6 +980,112 @@ mod tests {
         assert_eq!(latest([refused, reached]), Some(LanAnswer::Refused));
         assert_eq!(latest([None, reached]), Some(LanAnswer::Reached));
         assert_eq!(latest([None, None]), None);
+    }
+
+    /// A refusal kept long ago (heard at a launch, or carried over from an earlier install) gives
+    /// way to the window's later step, which is kept with its time ([`local_network_step`]): its
+    /// trigger raised macOS's question, so the row reads asked, never Off for good; the grant it
+    /// read on, or a later look that reached the LAN, reads On; and a later look macOS refused
+    /// reads Off, the person's new answer. No other step says anything of the switch.
+    #[test]
+    fn a_later_step_outranks_an_old_kept_refusal() {
+        use AccessOutcome::{Declined, Granted, Handed, Triggered};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let read = |step: AccessOutcome| {
+            Lan::of(
+                latest([None, kept_answer(root.path())]),
+                &[(Access::LocalNetwork, step)],
+            )
+        };
+        keep_answer(root.path(), LanAnswer::Refused, 1).unwrap();
+        assert_eq!(read(Triggered), Lan::Off, "the refusal, until a step");
+        keep_answer(root.path(), step_answer(Triggered).unwrap(), 2).unwrap();
+        assert_eq!(read(Triggered), Lan::Asked, "asked again, no nag");
+        keep_answer(root.path(), step_answer(Granted).unwrap(), 3).unwrap();
+        assert_eq!(read(Granted), Lan::On);
+        keep_answer(root.path(), LanAnswer::Refused, 4).unwrap();
+        assert_eq!(read(Granted), Lan::Off, "a later refusal is the person's");
+        keep_answer(root.path(), step_answer(Triggered).unwrap(), 3).unwrap();
+        assert_eq!(read(Triggered), Lan::Off, "an older step replaces nothing");
+        assert_eq!(step_answer(Handed), None);
+        assert_eq!(step_answer(Declined), None);
+    }
+
+    fn assert_lan_refused(answer: Option<LanAnswer>) {
+        let mut grants = Grants {
+            lan: Lan::of(answer, &[(Access::LocalNetwork, AccessOutcome::Granted)]),
+            ..grants()
+        };
+        grants.refused_lan();
+        let seen = observation(Access::LocalNetwork, &grants, managed());
+        assert_eq!(seen.now.as_deref(), Some("Off"));
+        assert_eq!(seen.wanted, "Off");
+        assert_eq!(seen.standing, Standing::InPlace);
+    }
+
+    #[test]
+    fn lan_answers_keep_the_latest_fact_across_overlapping_writers() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let path = root.path().to_owned();
+        let (go, begin) = mpsc::sync_channel(0);
+        let (entered, entering) = mpsc::sync_channel(1);
+        let newer = std::thread::spawn(move || {
+            begin
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the older writer read the kept answer");
+            let lock = HeldLock::try_take_named(&path, KEPT_LOCK).unwrap();
+            if lock.is_some() {
+                // No writer lock excludes this newer publication from the gap.
+                drop(lock);
+                keep_answer(&path, LanAnswer::Refused, 200).unwrap();
+                entered.send(()).unwrap();
+            } else {
+                // The guarded writer must finish first. Then the actual newer
+                // writer waits for that short record lock and publishes last.
+                entered.send(()).unwrap();
+                keep_answer(&path, LanAnswer::Refused, 200).unwrap();
+            }
+        });
+        keep_answer_with(root.path(), LanAnswer::Reached, 100, || {
+            go.send(()).unwrap();
+            entering
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the newer writer reached the record protocol");
+        })
+        .unwrap();
+        newer.join().expect("the newer answer was kept");
+        let kept = kept_answer(root.path());
+        assert_eq!(
+            kept,
+            Some((LanAnswer::Refused, 200)),
+            "a delayed older publication must not replace the newer answer"
+        );
+        assert_lan_refused(latest([Some((LanAnswer::Reached, 100)), kept]));
+    }
+
+    #[test]
+    fn lan_answers_keep_the_latest_memory_fact_when_persistence_fails() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        // A destination directory makes the actual atomic replacement fail.
+        std::fs::create_dir(root.path().join(KEPT)).unwrap();
+        let heard = Mutex::new(None);
+        hear_answer(&heard, LanAnswer::Refused, 200);
+        assert!(keep_answer(root.path(), LanAnswer::Refused, 200).is_err());
+        // This call captured its time earlier, but was delayed before taking
+        // the in-memory mutex. Its failed publication cannot supply a fallback.
+        hear_answer(&heard, LanAnswer::Reached, 100);
+        assert!(keep_answer(root.path(), LanAnswer::Reached, 100).is_err());
+        assert_eq!(kept_answer(root.path()), None);
+        assert_lan_refused(latest([*heard.lock().unwrap(), kept_answer(root.path())]));
+
+        hear_answer(&heard, LanAnswer::Reached, 300);
+        assert_eq!(
+            latest([*heard.lock().unwrap(), None]),
+            Some(LanAnswer::Reached)
+        );
     }
 
     /// macOS never tells an app its Local Network switch: the row reads what a look heard, or

@@ -416,6 +416,29 @@ pub fn publish(source: &Source, envelope: &[u8]) -> crate::Result<()> {
     }
 }
 
+/// Publish retained version-one bytes without replacing a path that appeared
+/// after the caller's absence check. The HTTP server enforces its signer and
+/// version rules; its response still cannot prove global uniqueness.
+#[cfg(unix)]
+pub(crate) fn publish_initial(source: &Source, bytes: &[u8]) -> crate::Result<()> {
+    if bytes.len() > MAX_ENVELOPE || crate::envelope::parse(bytes)?.seq != 1 {
+        return Err(Error::new(
+            "initial publication requires a bounded version-one envelope",
+        ));
+    }
+    match source {
+        Source::Url(_) => publish(source, bytes),
+        Source::Path(path) => {
+            let _held = PublishLock::take(path)?;
+            match read_path(path)? {
+                None => crate::fsx::write_atomic(path, bytes, 0o644),
+                Some(held) if held == bytes => Ok(()),
+                Some(_) => Err(Error::new("the creation path changed before publication")),
+            }
+        }
+    }
+}
+
 /// [`publish`] over `over`, the version the source served that the caller judged it must not keep.
 pub fn replace(source: &Source, envelope: &[u8], over: &[u8]) -> crate::Result<()> {
     match source {

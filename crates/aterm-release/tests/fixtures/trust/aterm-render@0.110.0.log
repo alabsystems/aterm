@@ -1,0 +1,109 @@
+      = note: native verifier status: Inconclusive; requested=19, proved=0, failed=0, unknown=0, timed_out=2, unsupported=19, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=22, proved=1, failed=0, unknown=10, timed_out=1, unsupported=11, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=47, proved=0, failed=0, unknown=0, timed_out=3, unsupported=47, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=142, proved=0, failed=0, unknown=0, timed_out=21, unsupported=142, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=33, proved=0, failed=0, unknown=0, timed_out=2, unsupported=33, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=8, proved=0, failed=0, unknown=5, timed_out=2, unsupported=3, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=28, proved=2, failed=0, unknown=16, timed_out=1, unsupported=10, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=131, proved=0, failed=0, unknown=0, timed_out=7, unsupported=131, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=18, proved=0, failed=0, unknown=0, timed_out=2, unsupported=18, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=15, proved=0, failed=0, unknown=8, timed_out=1, unsupported=7, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=60, proved=0, failed=0, unknown=0, timed_out=9, unsupported=60, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=40, proved=7, failed=0, unknown=17, timed_out=1, unsupported=16, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=33, proved=1, failed=0, unknown=16, timed_out=1, unsupported=16, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=41, proved=1, failed=0, unknown=18, timed_out=1, unsupported=22, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=33, proved=3, failed=0, unknown=16, timed_out=1, unsupported=14, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=18, proved=0, failed=0, unknown=12, timed_out=2, unsupported=6, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=64, proved=2, failed=0, unknown=23, timed_out=2, unsupported=39, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=82, proved=7, failed=0, unknown=41, timed_out=3, unsupported=34, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=20, proved=0, failed=0, unknown=12, timed_out=1, unsupported=8, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=56, proved=2, failed=0, unknown=27, timed_out=9, unsupported=27, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=74, proved=2, failed=0, unknown=19, timed_out=3, unsupported=53, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=21, proved=0, failed=0, unknown=0, timed_out=2, unsupported=21, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=23, proved=0, failed=0, unknown=0, timed_out=2, unsupported=23, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=53, proved=0, failed=0, unknown=0, timed_out=1, unsupported=53, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=12, proved=0, failed=0, unknown=6, timed_out=2, unsupported=6, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=81, proved=0, failed=0, unknown=0, timed_out=5, unsupported=81, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=45, proved=0, failed=0, unknown=0, timed_out=3, unsupported=45, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=36, proved=5, failed=0, unknown=16, timed_out=1, unsupported=15, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=9, proved=0, failed=0, unknown=4, timed_out=2, unsupported=5, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=19, proved=3, failed=0, unknown=8, timed_out=3, unsupported=8, skipped=0, insufficient_strength=0
+     = note: verifier clock stops: timed_out=1 published obligation(s) a wall clock left unproved
+     = note: native verifier status: Inconclusive; requested=11, proved=0, failed=0, unknown=6, timed_out=1, unsupported=5, skipped=0, insufficient_strength=0
+     = note: native verifier status: Inconclusive; requested=17, proved=0, failed=0, unknown=10, timed_out=2, unsupported=7, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=42, proved=4, failed=0, unknown=18, timed_out=1, unsupported=20, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=13, proved=1, failed=0, unknown=4, timed_out=1, unsupported=8, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=8, proved=0, failed=0, unknown=5, timed_out=2, unsupported=3, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=29, proved=1, failed=0, unknown=14, timed_out=1, unsupported=14, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=35, proved=0, failed=0, unknown=0, timed_out=3, unsupported=35, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=35, proved=0, failed=0, unknown=0, timed_out=4, unsupported=35, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=8, proved=0, failed=0, unknown=4, timed_out=2, unsupported=4, skipped=0, insufficient_strength=0
+     = note: native verifier status: Inconclusive; requested=8, proved=0, failed=0, unknown=5, timed_out=1, unsupported=3, skipped=0, insufficient_strength=0
+     = note: native verifier status: TimedOut; requested=71, proved=0, failed=0, unknown=0, timed_out=39, unsupported=32, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=38, proved=1, failed=0, unknown=16, timed_out=4, unsupported=21, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=84, proved=9, failed=0, unknown=36, timed_out=53, unsupported=39, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=80, proved=0, failed=0, unknown=0, timed_out=1, unsupported=80, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=61, proved=0, failed=0, unknown=0, timed_out=3, unsupported=61, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=23, proved=0, failed=0, unknown=0, timed_out=2, unsupported=23, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=20, proved=0, failed=0, unknown=0, timed_out=4, unsupported=20, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=97, proved=3, failed=0, unknown=24, timed_out=42, unsupported=70, skipped=0, insufficient_strength=0
+    = note: verifier clock stops: timed_out=1 published obligation(s) a wall clock left unproved
+      = note: verifier clock stops: timed_out=1 published obligation(s) a wall clock left unproved
+      = note: native verifier status: Inconclusive; requested=15, proved=0, failed=0, unknown=0, timed_out=2, unsupported=15, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=2, unsupported=2, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=37, proved=1, failed=0, unknown=17, timed_out=3, unsupported=19, skipped=0, insufficient_strength=0
+     = note: native verifier status: Inconclusive; requested=43, proved=0, failed=0, unknown=21, timed_out=7, unsupported=22, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=27, proved=0, failed=0, unknown=0, timed_out=4, unsupported=27, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=69, proved=0, failed=0, unknown=0, timed_out=2, unsupported=69, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=13, proved=0, failed=0, unknown=8, timed_out=1, unsupported=5, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=6, proved=0, failed=0, unknown=4, timed_out=1, unsupported=2, skipped=0, insufficient_strength=0
+      = note: native verifier status: TimedOut; requested=47, proved=0, failed=0, unknown=0, timed_out=27, unsupported=20, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=45, proved=1, failed=0, unknown=20, timed_out=11, unsupported=24, skipped=0, insufficient_strength=0
+      = note: native verifier status: TimedOut; requested=68, proved=0, failed=0, unknown=0, timed_out=41, unsupported=27, skipped=0, insufficient_strength=0
+      = note: native verifier status: TimedOut; requested=72, proved=0, failed=0, unknown=0, timed_out=42, unsupported=30, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=34, proved=0, failed=0, unknown=0, timed_out=2, unsupported=34, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=16, proved=0, failed=0, unknown=10, timed_out=1, unsupported=6, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=51, proved=1, failed=0, unknown=25, timed_out=25, unsupported=25, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=35, proved=0, failed=0, unknown=0, timed_out=5, unsupported=35, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=21, proved=2, failed=0, unknown=12, timed_out=3, unsupported=7, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=145, proved=0, failed=0, unknown=0, timed_out=6, unsupported=145, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=37, proved=0, failed=0, unknown=0, timed_out=3, unsupported=37, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=8, proved=0, failed=0, unknown=5, timed_out=2, unsupported=3, skipped=0, insufficient_strength=0
+    = note: native verifier status: TimedOut; requested=83, proved=0, failed=0, unknown=0, timed_out=39, unsupported=44, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=54, proved=7, failed=0, unknown=28, timed_out=35, unsupported=19, skipped=0, insufficient_strength=0
+     = note: verifier clock stops: timed_out=1 published obligation(s) a wall clock left unproved
+     = note: verifier clock stops: timed_out=1 published obligation(s) a wall clock left unproved
+    = note: native verifier status: Inconclusive; requested=14, proved=1, failed=0, unknown=7, timed_out=1, unsupported=6, skipped=0, insufficient_strength=0
+    = note: verifier clock stops: timed_out=1 published obligation(s) a wall clock left unproved
+    = note: native verifier status: Inconclusive; requested=21, proved=0, failed=0, unknown=0, timed_out=13, unsupported=21, skipped=0, insufficient_strength=0
+   = note: native verifier status: Inconclusive; requested=15, proved=1, failed=0, unknown=9, timed_out=1, unsupported=5, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=98, proved=0, failed=0, unknown=0, timed_out=13, unsupported=98, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=52, proved=6, failed=0, unknown=26, timed_out=3, unsupported=20, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=216, proved=0, failed=0, unknown=0, timed_out=16, unsupported=216, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=36, proved=7, failed=0, unknown=17, timed_out=3, unsupported=12, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=54, proved=10, failed=0, unknown=26, timed_out=3, unsupported=18, skipped=0, insufficient_strength=0
+      = note: native verifier status: TimedOut; requested=63, proved=0, failed=0, unknown=0, timed_out=41, unsupported=22, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=33, proved=0, failed=0, unknown=0, timed_out=1, unsupported=33, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=8, proved=0, failed=0, unknown=5, timed_out=2, unsupported=3, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=149, proved=0, failed=0, unknown=0, timed_out=10, unsupported=149, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=24, proved=1, failed=0, unknown=10, timed_out=1, unsupported=13, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=78, proved=9, failed=0, unknown=29, timed_out=3, unsupported=40, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=82, proved=0, failed=0, unknown=0, timed_out=10, unsupported=82, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=158, proved=0, failed=0, unknown=0, timed_out=22, unsupported=158, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=45, proved=3, failed=0, unknown=21, timed_out=2, unsupported=21, skipped=0, insufficient_strength=0
+    = note: native verifier status: TimedOut; requested=67, proved=0, failed=0, unknown=0, timed_out=41, unsupported=26, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=24, proved=2, failed=0, unknown=10, timed_out=1, unsupported=12, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=8, proved=0, failed=0, unknown=4, timed_out=2, unsupported=4, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=14, proved=1, failed=0, unknown=9, timed_out=5, unsupported=4, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=26, proved=1, failed=0, unknown=8, timed_out=1, unsupported=17, skipped=0, insufficient_strength=0
+     = note: native verifier status: Inconclusive; requested=9, proved=0, failed=0, unknown=5, timed_out=2, unsupported=4, skipped=0, insufficient_strength=0
+   = note: native verifier status: Inconclusive; requested=6, proved=0, failed=0, unknown=4, timed_out=2, unsupported=2, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=34, proved=3, failed=0, unknown=14, timed_out=8, unsupported=17, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=37, proved=0, failed=0, unknown=0, timed_out=2, unsupported=37, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=156, proved=0, failed=0, unknown=1, timed_out=6, unsupported=155, skipped=0, insufficient_strength=0
+=== Trust Verification Report ===
+Level: L2 | Duration: 7708852ms
+Summary: 1730 proved, 1495 failed, 2194 runtime-checked, 1167 assumed, 12 mandated, 0 contract-panic, 14258 inconclusive (20856 total); not-reproducible; profile c870797a6939; vector 37f0ef9a6c34
+Stop causes: not-dispatched=1158 rss-backstop=715 solved=3234 unclassified=15002 wall-backstop=747; backstops fired: in-process ay rss-backstop=1065, in-process ay wall-backstop=352, per-function budget clock wall-backstop=24; counted and named stops the lanes saw: in-process ay effort[proof-check-envelope]=2, in-process ay solver-incomplete[generic-theory-lemma]=95, in-process ay solver-incomplete[model-validation-violated]=1, in-process ay solver-incomplete[unverified-trust-rule]=151 — NOT REPRODUCIBLE: a clock, an RSS reading, a solver fault or an unexplained stop ended at least one obligation, or work the verdicts depend on, so these counts are not a floor measurement
+Coverage: 2737/2737 eligible function bodies verified (complete)
+  Gate: FAIL [advisory lane, exit 1] (1730 proved, 1495 failed, 2194 runtime-checked, 1167 assumed, 12 mandated, 0 contract-panic, 14258 unknown / 20856 total)

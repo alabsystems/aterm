@@ -71,6 +71,289 @@ fn file_uri(path: &std::path::Path) -> String {
 }
 
 #[test]
+fn command_scope_close_keys_keep_their_originating_window() {
+    use crate::keybinding::Keybindings;
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{
+        Key as WinitKey, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
+    };
+
+    fn tabs(app: &App, wid: WindowId) -> Vec<(crate::tab_model::TabId, crate::tab_model::ViewId)> {
+        app.windows[&wid]
+            .tab_set
+            .tabs()
+            .iter()
+            .map(|tab| (tab.id, tab.focus))
+            .collect()
+    }
+
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("close.txt");
+    fs::write(&path, "keep these bytes\n").unwrap();
+    let mut failures = Vec::new();
+    for configured in [true, false] {
+        if !configured && !crate::app_input::HARDCODED_SUPER_CHORDS {
+            continue;
+        }
+        for content in ["terminal", "editor", "last tab", "closed window"] {
+            let mut app = App::headless_for_test();
+            let (source, other) = (WindowId(0), WindowId(1));
+            match content {
+                "terminal" => {
+                    app.push_stub_tab(source, crate::stub_session(app.next_session_id));
+                    app.push_stub_tab(source, crate::stub_session(app.next_session_id));
+                    assert_eq!(app.windows[&source].tabs.active, 2);
+                }
+                "editor" => {
+                    app.open_document_tab(AppKind::Editor, &file_uri(&path))
+                        .unwrap();
+                    assert_eq!(app.windows[&source].tab_set.active_index(), Some(1));
+                }
+                _ => {}
+            }
+            let target = app.windows[&source].tab_set.active_id().unwrap();
+            let source_tabs = tabs(&app, source);
+            app.install_window_state(other, crate::stub_session(99), 38, 132);
+            assert_eq!(app.frontmost_window, Some(other));
+            assert_eq!(app.windows[&other].tabs.active, 0);
+            let other_tabs = tabs(&app, other);
+            let other_session = app.focused_session_id(other);
+            let other_active = app.windows[&other].tab_set.active_id();
+            if content == "closed window" {
+                app.close_window_logical(source);
+                assert!(!app.windows.contains_key(&source));
+            }
+            app.keybindings = Keybindings::resolved(Some(
+                &[("f4".to_string(), "close_tab".to_string())]
+                    .into_iter()
+                    .collect(),
+            ));
+            let (code, key, mods) = if configured {
+                (
+                    KeyCode::F4,
+                    WinitKey::Named(NamedKey::F4),
+                    ModifiersState::empty(),
+                )
+            } else {
+                (
+                    KeyCode::KeyW,
+                    WinitKey::Character(SmolStr::new("w")),
+                    ModifiersState::SUPER,
+                )
+            };
+            if let Some(window) = app.windows.get_mut(&source) {
+                window.mods = mods;
+            }
+            for state in [ElementState::Pressed, ElementState::Released] {
+                app.on_key(
+                    source,
+                    KeyEvent::synthetic_for_test(
+                        PhysicalKey::Code(code),
+                        key.clone(),
+                        None,
+                        KeyLocation::Standard,
+                        state,
+                        false,
+                    ),
+                );
+            }
+            let source_ok = match content {
+                "last tab" => app.windows.get(&source).is_some_and(|window| {
+                    window.pending_close && tabs(&app, source) == source_tabs
+                }),
+                "closed window" => !app.windows.contains_key(&source),
+                _ => app.windows.get(&source).is_some_and(|window| {
+                    !window.pending_close
+                        && window.tab_set.get(target).is_none()
+                        && window.tab_set.len() + 1 == source_tabs.len()
+                }),
+            };
+            let other_ok = tabs(&app, other) == other_tabs
+                && app.windows[&other].tab_set.active_id() == other_active
+                && app.focused_session_id(other) == other_session
+                && !app.windows[&other].pending_close;
+            let front_ok = app.frontmost_window == Some(other);
+            let structure_ok = app.structural_invariants_ok();
+            let file_ok = fs::read_to_string(&path).unwrap() == "keep these bytes\n";
+            if !(source_ok && other_ok && front_ok && structure_ok && file_ok) {
+                failures.push((
+                    configured,
+                    content,
+                    source_ok,
+                    other_ok,
+                    front_ok,
+                    structure_ok,
+                    file_ok,
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "(configured, content, source closed, other untouched, front kept, structure, file): {failures:?}"
+    );
+}
+
+#[test]
+fn command_scope_configured_tab_navigation_keys_keep_their_originating_window() {
+    check_tab_navigation_keyboard_window_scope(true);
+}
+
+#[test]
+fn command_scope_hardcoded_tab_navigation_keys_keep_their_originating_window() {
+    if crate::app_input::HARDCODED_SUPER_CHORDS {
+        check_tab_navigation_keyboard_window_scope(false);
+    }
+}
+
+fn check_tab_navigation_keyboard_window_scope(configured: bool) {
+    use crate::keybinding::Keybindings;
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{
+        Key as WinitKey, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
+    };
+
+    fn tabs(app: &App, wid: WindowId) -> Vec<(crate::tab_model::TabId, crate::tab_model::ViewId)> {
+        app.windows[&wid]
+            .tab_set
+            .tabs()
+            .iter()
+            .map(|tab| (tab.id, tab.focus))
+            .collect()
+    }
+
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("navigate.txt");
+    fs::write(&path, "keep these bytes\n").unwrap();
+    let mut failures = Vec::new();
+    for (action, start, expected, closed) in [
+        ("next_tab", 0, 1, false),
+        ("next_tab", 1, 2, false),
+        ("next_tab", 2, 0, false),
+        ("prev_tab", 0, 2, false),
+        ("prev_tab", 1, 0, false),
+        ("prev_tab", 2, 1, false),
+        ("switch_tab_2", 0, 1, false),
+        ("switch_tab_3", 1, 2, false),
+        ("switch_tab_1", 2, 0, false),
+        ("switch_tab_9", 1, 1, false),
+        ("next_tab", 1, 1, true),
+        ("prev_tab", 1, 1, true),
+        ("switch_tab_1", 1, 1, true),
+    ] {
+        let mut app = App::headless_for_test();
+        let (source, other) = (WindowId(0), WindowId(1));
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        app.push_stub_tab(source, crate::stub_session(app.next_session_id));
+        assert_eq!(app.windows[&source].tab_set.len(), 3);
+        assert_eq!(app.windows[&source].layouts.len(), 2);
+        app.switch_tab_in(source, start);
+        let source_tabs = tabs(&app, source);
+        let (expected_tab, expected_view) = source_tabs[expected];
+        let (expected_session, expected_native) = match app.view_store.get(expected_view) {
+            Some(crate::tab_model::View::Terminal(terminal)) => (Some(terminal.session), None),
+            Some(crate::tab_model::View::Native(_)) => (None, Some(expected_view)),
+            None => panic!("source tab has a live view"),
+        };
+
+        app.install_window_state(other, crate::stub_session(99), 38, 132);
+        app.push_stub_tab(other, crate::stub_session(app.next_session_id));
+        app.switch_tab_in(other, usize::from(action == "switch_tab_1"));
+        assert_eq!(app.frontmost_window, Some(other));
+        let other_tabs = tabs(&app, other);
+        let other_active = app.windows[&other].tab_set.active_id();
+        let other_projection = app.windows[&other].tabs.active;
+        let other_session = app.focused_session_id(other);
+        if closed {
+            app.close_window_logical(source);
+            assert!(!app.windows.contains_key(&source));
+        }
+
+        app.keybindings = Keybindings::resolved(Some(
+            &[("f6".to_string(), action.to_string())]
+                .into_iter()
+                .collect(),
+        ));
+        let (code, key, mods) = if configured {
+            (
+                KeyCode::F6,
+                WinitKey::Named(NamedKey::F6),
+                ModifiersState::empty(),
+            )
+        } else {
+            let (code, text, mods) = match action {
+                "next_tab" => (
+                    KeyCode::BracketRight,
+                    "]",
+                    ModifiersState::SUPER | ModifiersState::SHIFT,
+                ),
+                "prev_tab" => (
+                    KeyCode::BracketLeft,
+                    "[",
+                    ModifiersState::SUPER | ModifiersState::SHIFT,
+                ),
+                "switch_tab_1" => (KeyCode::Digit1, "1", ModifiersState::SUPER),
+                "switch_tab_2" => (KeyCode::Digit2, "2", ModifiersState::SUPER),
+                "switch_tab_3" => (KeyCode::Digit3, "3", ModifiersState::SUPER),
+                "switch_tab_9" => (KeyCode::Digit9, "9", ModifiersState::SUPER),
+                _ => unreachable!(),
+            };
+            (code, WinitKey::Character(SmolStr::new(text)), mods)
+        };
+        if let Some(window) = app.windows.get_mut(&source) {
+            window.mods = mods;
+        }
+        for state in [ElementState::Pressed, ElementState::Released] {
+            app.on_key(
+                source,
+                KeyEvent::synthetic_for_test(
+                    PhysicalKey::Code(code),
+                    key.clone(),
+                    None,
+                    KeyLocation::Standard,
+                    state,
+                    false,
+                ),
+            );
+        }
+
+        let source_ok = if closed {
+            !app.windows.contains_key(&source)
+        } else {
+            tabs(&app, source) == source_tabs
+                && app.windows[&source].tab_set.active_id() == Some(expected_tab)
+                && app.focused_session_id(source) == expected_session
+                && app.active_native_view(source).map(|(_, view)| view) == expected_native
+        };
+        let other_ok = tabs(&app, other) == other_tabs
+            && app.windows[&other].tab_set.active_id() == other_active
+            && app.windows[&other].tabs.active == other_projection
+            && app.focused_session_id(other) == other_session;
+        let front_ok = app.frontmost_window == Some(other);
+        let structure_ok = app.structural_invariants_ok();
+        let file_ok = fs::read_to_string(&path).unwrap() == "keep these bytes\n";
+        if !(source_ok && other_ok && front_ok && structure_ok && file_ok) {
+            failures.push((
+                action,
+                start,
+                expected,
+                closed,
+                source_ok,
+                other_ok,
+                front_ok,
+                structure_ok,
+                file_ok,
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "(action, start, expected, closed, source selected, other untouched, front kept, structure, file): {failures:?}"
+    );
+}
+
+#[test]
 fn configured_find_keys_navigate_the_editor_before_and_after_search_is_accepted() {
     use crate::keybinding::Keybindings;
     use crate::native_app::AppViewState;

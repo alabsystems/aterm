@@ -9581,11 +9581,11 @@ fn packages_toolset_pseudo_row_paints_its_product_name_without_asterisks() {
 fn the_packages_rail_entry_wears_the_badge_while_a_failure_is_named() {
     let (mut runtime, instance, view) = setup();
     let rail = |runtime: &NativeRuntime| {
-        let cx = view_cx();
+        // A window the rail lists every row in whole.
+        let cx = view_cx_at(1_200.0, 1_000.0);
         let compiled = compile_settings_view(runtime, instance, view, &cx);
         SettingsRoute::ALL
             .into_iter()
-            .filter(|route| route.on_rail())
             .map(|route| {
                 let key = UiKey::new(format!("settings/nav{}", route.path()));
                 let value = compiled
@@ -13613,20 +13613,38 @@ fn compact_update_rungs_never_call_a_page_current_while_checks_are_off() {
             "{context}: the rungs carry the RUNNING value"
         );
         at_each_text_scale(&[2.0], "short-landscape summary rungs", |_| {
-            let painted = update_route_pages(healthy(running, saved), 568.0, 320.0)
-                .iter()
-                .flat_map(painted_texts)
-                .collect::<Vec<_>>();
+            // Short landscape windows: the page lists the summary where it shows more of the
+            // switches than the full card, which depends on the state's words.
+            let mut summarized = 0;
+            for height in [320.0, 300.0] {
+                let pages = update_route_pages(healthy(running, saved), 568.0, height);
+                let painted = pages.iter().flat_map(painted_texts).collect::<Vec<_>>();
+                if pages.iter().any(|page| {
+                    page.paint
+                        .iter()
+                        .any(|n| n.key.as_str() == "updates/summary")
+                }) {
+                    summarized += 1;
+                    assert!(
+                        painted
+                            .iter()
+                            .any(|text| text == &current.0 || text == &off.0),
+                        "{context} 568x{height}: the summary paints its headline rung: \
+                         {painted:?}"
+                    );
+                    let claims_current = painted
+                        .iter()
+                        .any(|text| text == "Current" || text.starts_with("Up to date"));
+                    assert_eq!(
+                        claims_current, running,
+                        "{context} 568x{height}: {painted:?}"
+                    );
+                }
+            }
             assert!(
-                painted
-                    .iter()
-                    .any(|text| text == &current.0 || text == &off.0),
-                "{context}: the summary paints its headline rung: {painted:?}"
+                summarized > 0,
+                "{context}: CONTROL: some window lists the summary"
             );
-            let claims_current = painted
-                .iter()
-                .any(|text| text == "Current" || text.starts_with("Up to date"));
-            assert_eq!(claims_current, running, "{context}: {painted:?}");
         });
     }
 
@@ -13789,32 +13807,50 @@ fn software_update_names_itself_once() {
         );
         assert_eq!(title(&compiled), None, "{width}x{height}");
     }
-    let short = compile_settings_view(&runtime, instance, view, &view_cx_at(584.0, 210.0));
-    let toolbar = short
+    // A short window's toolbar names the page, beside a Search field or beside the Search
+    // button, so the card does not.
+    for width in [584.0, 320.0] {
+        let short = compile_settings_view(&runtime, instance, view, &view_cx_at(width, 210.0));
+        let toolbar = short
+            .semantic(&UiKey::new("settings/compact-toolbar"))
+            .expect("the toolbar")
+            .rect;
+        let heading = short
+            .semantic(&UiKey::new("settings/page-heading/software-update"))
+            .unwrap_or_else(|| panic!("{width}x210: the toolbar's title"));
+        assert!(
+            heading.rect.bottom() <= toolbar.bottom() + 0.5,
+            "{width}x210: the title is in the toolbar: {:?} in {toolbar:?}",
+            heading.rect
+        );
+        assert_eq!(title(&short), None, "{width}x210");
+    }
+    // One too narrow for the toolbar's title leads the page's list with its name.
+    let narrow = compile_settings_view(&runtime, instance, view, &view_cx_at(178.0, 210.0));
+    let toolbar = narrow
         .semantic(&UiKey::new("settings/compact-toolbar"))
         .expect("the toolbar")
         .rect;
-    let heading = short
+    let heading = narrow
         .semantic(&UiKey::new("settings/page-heading/software-update"))
-        .expect("584x210: the toolbar's title");
+        .expect("178x210: the list's name");
     assert!(
-        heading.rect.bottom() <= toolbar.bottom() + 0.5,
-        "584x210: the title is in the toolbar: {:?} in {toolbar:?}",
+        heading.rect.y >= toolbar.bottom() - 0.5,
+        "178x210: the name leads the list: {:?} under {toolbar:?}",
         heading.rect
     );
-    assert_eq!(title(&short), None, "584x210");
-    let narrow = view_cx_at(320.0, 210.0);
-    let compiled = compile_settings_view(&runtime, instance, view, &narrow);
+    assert_eq!(title(&narrow), None, "178x210");
+    // Beside the rail, a window too short for the heading row: the card names the page.
+    let wide = compile_settings_view(&runtime, instance, view, &view_cx_at(1_074.0, 200.0));
     assert!(
-        compiled
-            .semantic(&UiKey::new("settings/page-heading/software-update"))
+        wide.semantic(&UiKey::new("settings/page-heading/software-update"))
             .is_none(),
-        "a window too short for the heading row and too narrow for the toolbar's title"
+        "a window beside the rail too short for the heading row"
     );
     assert!(
-        title(&compiled).is_some_and(|text| text == text.to_uppercase() && !text.is_empty()),
+        title(&wide).is_some_and(|text| text == text.to_uppercase() && !text.is_empty()),
         "{:?}",
-        title(&compiled)
+        title(&wide)
     );
 }
 
@@ -15642,10 +15678,7 @@ fn settings_width_is_decided_by_width_alone() {
                 let scrolls = compiled
                     .semantic(&UiKey::new("settings/navigation/scroll"))
                     .is_some();
-                let every = SettingsRoute::ALL
-                    .into_iter()
-                    .filter(|route| route.on_rail())
-                    .count();
+                let every = SettingsRoute::rail_len();
                 assert_eq!(
                     scrolls,
                     rows.len() < every,
@@ -15874,70 +15907,27 @@ fn a_rail_too_short_for_a_row_gives_its_title_to_the_list() {
 
 #[test]
 fn every_sub_page_parent_is_a_rail_row() {
+    let rail: Vec<SettingsRoute> = navigation_groups()
+        .into_iter()
+        .flat_map(|(_, routes)| routes)
+        .collect();
+    assert_eq!(rail, SettingsRoute::ALL.to_vec(), "every route, in order");
     let mut sub_pages = 0;
     for route in SettingsRoute::ALL {
-        let rail: Vec<SettingsRoute> = navigation_groups(route)
-            .into_iter()
-            .flat_map(|(_, routes)| routes)
-            .collect();
-        match route.rail_parent() {
-            Some(parent) => {
-                sub_pages += 1;
-                assert!(parent.on_rail(), "{route:?} under {parent:?}");
-                let at = rail
-                    .iter()
-                    .position(|row| *row == parent)
-                    .unwrap_or_else(|| panic!("{parent:?} on the rail"));
-                assert_eq!(rail.get(at + 1), Some(&route), "{route:?}");
-                assert_eq!(rail.len(), SettingsRoute::rail_len() + 1);
-            }
-            None => assert_eq!(rail.len(), SettingsRoute::rail_len(), "{route:?}"),
-        }
+        let Some(parent) = route.rail_parent() else {
+            continue;
+        };
+        sub_pages += 1;
+        assert_eq!(parent.rail_parent(), None, "{route:?} under {parent:?}");
+        let at = rail.iter().position(|row| *row == route).expect("listed");
+        let before = rail[..at]
+            .iter()
+            .rev()
+            .find(|row| row.rail_parent() != Some(parent))
+            .copied();
+        assert_eq!(before, Some(parent), "{route:?} right under {parent:?}");
     }
     assert!(sub_pages > 0, "Themes at least is a sub-page");
-}
-
-#[test]
-fn opening_themes_never_changes_the_rail_fit() {
-    for (width, height) in [(849.0_f32, 460.0_f32), (1_200.0, 513.0), (1_200.0, 900.0)] {
-        let cx = view_cx_at(width, height);
-        let compile = |route: SettingsRoute| {
-            let (mut runtime, instance, view) = setup();
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                unreachable!()
-            };
-            state.navigate(route);
-            compile_settings_view(&runtime, instance, view, &cx)
-        };
-        let appearance = compile(SettingsRoute::Appearance);
-        let themes = compile(SettingsRoute::Themes);
-        let at = format!("{width}x{height}");
-        for key in [
-            "settings/navigation-title",
-            "settings/nav-label/look---feel",
-        ] {
-            let key = UiKey::new(key);
-            assert!(
-                appearance.semantic(&key).is_some(),
-                "{} at {at}",
-                key.as_str()
-            );
-            assert!(themes.semantic(&key).is_some(), "{} at {at}", key.as_str());
-        }
-        let rows = whole_rail_rows(&themes);
-        assert!(
-            rows.iter().any(|(key, _)| key == "settings/nav/themes"),
-            "the selected sub-page row is whole at {at}: {rows:?}"
-        );
-        for (key, rect) in &rows {
-            assert!(
-                (rect.height - navigation_row_height(1.0)).abs() < 0.5,
-                "{key} {rect:?} at {at}"
-            );
-        }
-        let failures = themes.fit_failures();
-        assert!(failures.is_empty(), "{at}: {failures:#?}");
-    }
 }
 
 #[test]
@@ -16010,9 +16000,9 @@ fn the_category_sheet_selects_themes_under_appearance() {
     let themes = sheet(SettingsRoute::Themes);
     assert_eq!(themes.get("settings/categories/themes"), Some(&true));
     assert_eq!(themes.get("settings/categories/appearance"), Some(&false));
-    assert_eq!(themes.len(), SettingsRoute::rail_len() + 1, "{themes:?}");
+    assert_eq!(themes.len(), SettingsRoute::rail_len(), "{themes:?}");
     let appearance = sheet(SettingsRoute::Appearance);
-    assert_eq!(appearance.get("settings/categories/themes"), None);
+    assert_eq!(appearance.get("settings/categories/themes"), Some(&false));
     assert_eq!(
         appearance.get("settings/categories/appearance"),
         Some(&true)
@@ -16392,10 +16382,7 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
             assert_short_landscape_geometry(compiled, scale, &context);
             categories.extend(keys_with_prefix(compiled, "settings/categories/"));
         });
-        for route in SettingsRoute::ALL
-            .into_iter()
-            .filter(|route| route.on_rail())
-        {
+        for route in SettingsRoute::ALL {
             assert!(
                 categories.contains(&format!("settings/categories{}", route.path())),
                 "categories at {scale}× {variant}: missing {}",
@@ -22802,6 +22789,29 @@ enabled = true
 }
 
 #[test]
+fn manual_offers_no_reset_of_the_fleet_level_beside_its_grants() {
+    let source = "[fleet]\nlisten = \"0.0.0.0:7100\"\nallow = \"drive\"\ndrive_from = [\"ab\"]\n";
+    let snapshot = VersionedConfigService::new(source.to_string())
+        .unwrap()
+        .snapshot();
+    let state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+    let overrides = authored_manual_overrides(&state);
+    let reset_safe = |key: &str| {
+        overrides
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| (entry.known, entry.reset_safe))
+    };
+    assert_eq!(
+        reset_safe("fleet.allow"),
+        Some((true, false)),
+        "{overrides:?}"
+    );
+    assert!(manual_override_reset_action("fleet.allow").is_none());
+    assert_eq!(reset_safe("fleet.drive_from"), Some((true, true)));
+}
+
+#[test]
 fn modified_and_reset_keep_literal_dotted_keys_distinct_from_nested_paths() {
     let source = r#""packages.exclude" = ["literal"]
 
@@ -27497,13 +27507,36 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
         column: f32,
         short: bool,
     }
+    let runtime = std::cell::RefCell::new(runtime);
     let byline_at = |width: f32, height: f32| {
         let cx = view_cx_at(width, height);
-        let compiled = runtime
-            .render(instance, view, &cx)
-            .unwrap()
-            .compile(cx.viewport)
-            .unwrap();
+        let render = || {
+            runtime
+                .borrow()
+                .render(instance, view, &cx)
+                .unwrap()
+                .compile(cx.viewport)
+                .unwrap()
+        };
+        let scroll_to = |top: usize| {
+            let mut runtime = runtime.borrow_mut();
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.scroll_page_to(top);
+        };
+        let mut compiled = render();
+        // Where nothing over the page names it, its list leads with its name and the hero is
+        // the list's second stop: the byline is measured on the screen the hero leads.
+        let leads_with_name = compiled
+            .semantic(&UiKey::new("about/list"))
+            .zip(compiled.semantic(&UiKey::new("settings/page-heading/about")))
+            .is_some_and(|(list, name)| name.rect.y >= list.rect.y - 0.5);
+        if leads_with_name {
+            scroll_to(1);
+            compiled = render();
+            scroll_to(0);
+        }
         let painted_rect = |key: &str| {
             compiled
                 .paint
@@ -30082,7 +30115,6 @@ fn page_keys_move_the_compact_category_list_by_the_page_it_shows() {
     let shown = |compiled: &crate::native_ui::CompiledUi| -> Vec<usize> {
         SettingsRoute::ALL
             .iter()
-            .filter(|route| route.on_rail())
             .enumerate()
             .filter(|(_, route)| {
                 compiled
@@ -30099,11 +30131,7 @@ fn page_keys_move_the_compact_category_list_by_the_page_it_shows() {
         let rows = shown(&compiled);
         assert!(!rows.is_empty());
         for &k in &rows {
-            let route = SettingsRoute::ALL
-                .into_iter()
-                .filter(|route| route.on_rail())
-                .nth(k)
-                .expect("a rail row");
+            let route = SettingsRoute::ALL[k];
             let key = UiKey::new(format!("settings/categories{}", route.path()));
             assert_eq!(
                 compiled
@@ -32057,8 +32085,9 @@ fn the_pinned_preview_keeps_a_specimen_row_and_yields_for_a_second_stop() {
 #[test]
 fn a_short_host_scrolls_the_preview_never_drops_it() {
     for (route, width, height, pinned) in [
-        (SettingsRoute::Appearance, 584.0, 270.0, false),
-        (SettingsRoute::Appearance, 664.0, 270.0, false),
+        (SettingsRoute::Appearance, 584.0, 230.0, false),
+        (SettingsRoute::Appearance, 664.0, 230.0, false),
+        (SettingsRoute::Appearance, 584.0, 270.0, true),
         (SettingsRoute::TextFonts, 584.0, 260.0, false),
         (SettingsRoute::TextFonts, 664.0, 260.0, false),
         (SettingsRoute::CursorMotion, 584.0, 220.0, false),
@@ -33215,6 +33244,112 @@ fn messages_filters_sit_on_a_card_and_chips_hold_3_to_1() {
                     step >= 3.0,
                     "{at}: a selected chip is {step:.2}:1 from a resting one"
                 );
+            }
+        }
+    }
+}
+
+/// A RESTING MESSAGES CHIP'S LEFT, RIGHT AND TOP RIM HOLD 3:1 AGAINST THE CARD IN THE
+/// RASTERIZED PIXELS (not only in the prim's colour), GitHub Light and Default, 1× and 2×.
+#[test]
+fn messages_chip_edges_hold_3_to_1_in_the_pixels() {
+    use crate::native_appearance::contrast_ratio;
+    let light = {
+        let parts = aterm_types::scheme::builtin("GitHub Light")
+            .expect("a builtin scheme")
+            .to_theme_parts();
+        aterm_render::Theme {
+            fg: parts.fg,
+            bg: parts.bg,
+            cursor: parts.cursor,
+            selection: parts.selection,
+        }
+    };
+    for (theme_name, theme) in [
+        ("GitHub Light", light),
+        ("Default", aterm_render::Theme::default()),
+    ] {
+        for (width, height) in [(1_200.0, 820.0), (1_074.0, 686.0), (738.0, 420.0)] {
+            let (runtime, instance, view) = setup_with_these_messages(sample_messages());
+            let compiled =
+                compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+            let prims = compiled.tray(theme, 13.0).prims;
+            let rect_of = |key: &str| {
+                compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == key)
+                    .map(|node| node.rect)
+            };
+            let card = rect_of("settings/messages/filters").expect("the filters card");
+            let resting: Vec<crate::native_ui::LogicalRect> = compiled
+                .paint
+                .iter()
+                .filter(|node| {
+                    node.key.as_str().starts_with("settings/messages/filter/")
+                        && matches!(&node.content, UiContent::Button(control)
+                            if control.style == StyleRef::Chip && !control.state.selected)
+                })
+                .map(|node| node.rect)
+                .collect();
+            assert!(!resting.is_empty(), "{theme_name} {width}: a resting chip");
+            for scale in [1.0_f32, 2.0] {
+                let at = format!("{theme_name} {width}x{height} at {scale}\u{d7}");
+                let region = crate::tray_raster::RasterRect::from_logical(
+                    card.x.floor() as u32,
+                    card.y.floor() as u32,
+                    card.width.ceil() as u32 + 1,
+                    card.height.ceil() as u32 + 1,
+                    scale,
+                    (width * scale) as u32,
+                    (height * scale) as u32,
+                )
+                .expect("the card's region");
+                let rgba = crate::tray_raster::rasterize_tray_region(
+                    &prims,
+                    scale,
+                    [0, 0, 0, 255],
+                    region,
+                );
+                let px = |x: i32, y: i32| -> [u8; 3] {
+                    let (lx, ly) = (x - region.x as i32, y - region.y as i32);
+                    let i = ((ly as u32 * region.width + lx as u32) * 4) as usize;
+                    [rgba[i], rgba[i + 1], rgba[i + 2]]
+                };
+                for chip in &resting {
+                    let (left, right) = (chip.x * scale, chip.right() * scale);
+                    let (top, mid_y) = (chip.y * scale, (chip.y + chip.height / 2.0) * scale);
+                    let mid_x = (chip.x + chip.width / 2.0) * scale;
+                    let ground = px(left.floor() as i32 - 3, mid_y as i32);
+                    let darkest = |cells: Vec<(i32, i32)>| {
+                        cells
+                            .into_iter()
+                            .map(|(x, y)| contrast_ratio(px(x, y), ground))
+                            .fold(0.0_f32, f32::max)
+                    };
+                    let row = mid_y as i32;
+                    let around = |edge: f32| (edge.floor() as i32 - 1)..=(edge.ceil() as i32 + 1);
+                    let sides = [
+                        ("left", darkest(around(left).map(|x| (x, row)).collect())),
+                        (
+                            "right",
+                            darkest(around(right - 1.0).map(|x| (x, row)).collect()),
+                        ),
+                        (
+                            "top",
+                            darkest(around(top).map(|y| (mid_x as i32, y)).collect()),
+                        ),
+                    ];
+                    for (side, edge) in sides {
+                        assert!(
+                            edge >= 3.0,
+                            "{at}: the chip at {:.1},{:.1} paints its {side} rim at {edge:.2}:1 \
+                             on the card {ground:?}",
+                            chip.x,
+                            chip.y
+                        );
+                    }
+                }
             }
         }
     }
@@ -35204,113 +35339,140 @@ fn a_compact_follow_system_row_is_laid_out_as_every_switch_row() {
 
 #[test]
 fn appearance_theme_pickers_share_one_choice_column() {
-    let pickers = [
-        theme_slot_action(aterm_types::Appearance::Dark),
-        theme_slot_action(aterm_types::Appearance::Light),
-        format!("settings/control/{}", prefs::EDIT_THEME),
-        format!("settings/control/{}", prefs::EDIT_WINDOW_THEME),
-    ];
-    for source in [
-        "theme = \"dark:Nord,light:Default Light\"\n",
-        "theme = \"Dracula\"\n",
-        "",
-    ] {
-        for (width, height) in [
-            (584.0, 350.0),
-            (738.0, 420.0),
-            (1_074.0, 684.0),
-            (1_193.0, 516.0),
-            (1_564.0, 854.0),
+    at_each_text_scale(&[1.0, 2.0], "theme pickers", |scale| {
+        let pickers = [
+            theme_slot_action(aterm_types::Appearance::Dark),
+            theme_slot_action(aterm_types::Appearance::Light),
+            format!("settings/control/{}", prefs::EDIT_THEME),
+            format!("settings/control/{}", prefs::EDIT_WINDOW_THEME),
+        ];
+        let mut forms = std::collections::BTreeSet::new();
+        for source in [
+            "theme = \"dark:Nord,light:Default Light\"\n",
+            "theme = \"Dracula\"\n",
+            "",
         ] {
-            let context = format!("{source:?} {width}×{height}");
-            let cx = view_cx_at(width, height);
-            let (mut runtime, instance, view) = theme_pair_runtime(source, true);
-            {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                    unreachable!();
-                };
-                state.navigate(SettingsRoute::Appearance);
-            }
-            let mut seen: std::collections::BTreeMap<String, LogicalRect> =
-                std::collections::BTreeMap::new();
-            let mut browse_row = false;
-            let mut segmented: std::collections::BTreeSet<String> =
-                std::collections::BTreeSet::new();
-            each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
-                let row = compiled
-                    .semantic(&UiKey::new("settings/row/theme-browse"))
-                    .map(|node| node.rect);
-                browse_row |= row.is_some();
-                for node in &compiled.semantics {
-                    let key = node.key.as_str();
-                    if let Some(rest) = key.strip_prefix("settings/segment/")
-                        && let Some((setting, _)) = rest.rsplit_once('/')
-                    {
-                        segmented.insert(format!("settings/control/{setting}"));
-                    }
-                    if pickers.iter().any(|picker| picker == key) || key == THEMES_BROWSE_ROW_KEY {
-                        seen.entry(key.to_string()).or_insert(node.rect);
-                        if let Some(row) = row
-                            && key != THEMES_BROWSE_ROW_KEY
+            for (width, height) in [
+                (584.0, 350.0),
+                (738.0, 420.0),
+                (1_074.0, 684.0),
+                (1_193.0, 516.0),
+                (1_564.0, 854.0),
+            ] {
+                let context = format!("{source:?} {width}×{height} at {scale}×");
+                let cx = view_cx_at(width, height);
+                let (mut runtime, instance, view) = theme_pair_runtime(source, true);
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!();
+                    };
+                    state.navigate(SettingsRoute::Appearance);
+                }
+                let mut seen: std::collections::BTreeMap<String, LogicalRect> =
+                    std::collections::BTreeMap::new();
+                let mut browse_row = None;
+                // A choice drawn as segments (Window appearance's Auto,
+                // Light, Dark) is as wide as its labels: it starts at the
+                // column, where a picker does, and ends where its labels do.
+                let mut segmented: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+                    let row = compiled
+                        .semantic(&UiKey::new("settings/row/theme-browse"))
+                        .map(|node| node.rect);
+                    browse_row = browse_row.or(row);
+                    for node in &compiled.semantics {
+                        let key = node.key.as_str();
+                        if let Some(rest) = key.strip_prefix("settings/segment/")
+                            && let Some((setting, _)) = rest.rsplit_once('/')
                         {
-                            assert!(
-                                node.rect.bottom() <= row.y + 0.5
-                                    || node.rect.y >= row.bottom() - 0.5,
-                                "{context} screen {top}: {key} shares Browse's row"
-                            );
+                            segmented.insert(format!("settings/control/{setting}"));
+                        }
+                        let tracked = pickers.iter().any(|picker| picker == key)
+                            || [
+                                THEMES_BROWSE_ROW_KEY,
+                                THEME_PREVIEW_SIDE_ACTION,
+                                THEME_MODE_ACTION,
+                            ]
+                            .contains(&key);
+                        if tracked {
+                            seen.entry(key.to_string()).or_insert(node.rect);
+                            // On one screen, no picker shares Browse's row.
+                            if let Some(row) = row
+                                && key != THEMES_BROWSE_ROW_KEY
+                            {
+                                assert!(
+                                    node.rect.bottom() <= row.y + 0.5
+                                        || node.rect.y >= row.bottom() - 0.5,
+                                    "{context} screen {top}: {key} shares Browse's row"
+                                );
+                            }
                         }
                     }
-                }
-            });
-            let shown: Vec<(&String, &LogicalRect)> = seen
-                .iter()
-                .filter(|(key, _)| key.as_str() != THEMES_BROWSE_ROW_KEY)
-                .collect();
-            assert!(
-                !shown.is_empty(),
-                "{context}: pickers on the page: {seen:?}"
-            );
-            let shown: Vec<(&String, &LogicalRect)> = shown
-                .into_iter()
-                .filter(|(key, _)| width >= 1_000.0 || key.starts_with(THEME_SLOT_ACTION_PREFIX))
-                .collect();
-            if shown.is_empty() {
-                assert!(seen.contains_key(THEMES_BROWSE_ROW_KEY), "{context}");
-                continue;
-            }
-            let pickers_shown: Vec<&(&String, &LogicalRect)> = shown
-                .iter()
-                .filter(|(key, _)| !segmented.contains(key.as_str()))
-                .collect();
-            let (first_key, first) = *pickers_shown[0];
-            for (key, rect) in &shown {
-                assert!(
-                    segmented.contains(key.as_str()) || (rect.right() - first.right()).abs() < 0.5,
-                    "{context}: {key} ends at {} where {first_key} ends at {}",
-                    rect.right(),
-                    first.right()
-                );
-                if width >= 1_000.0 {
+                });
+                let row =
+                    browse_row.unwrap_or_else(|| panic!("{context}: Browse has a row of its own"));
+                let shown: Vec<(&String, &LogicalRect)> = seen
+                    .iter()
+                    .filter(|(key, _)| pickers.iter().any(|picker| picker == key.as_str()))
+                    .collect();
+                let (first_key, first) = *shown
+                    .iter()
+                    .find(|(key, _)| !segmented.contains(key.as_str()))
+                    .unwrap_or_else(|| panic!("{context}: a theme picker on the page: {seen:?}"));
+                for (key, rect) in &shown {
                     assert!(
-                        (rect.x - first.x).abs() < 0.5,
-                        "{context}: {key} starts at {} where {first_key} starts at {}",
-                        rect.x,
-                        first.x
+                        segmented.contains(key.as_str())
+                            || (rect.right() - first.right()).abs() < 0.5,
+                        "{context}: {key} ends at {} where {first_key} ends at {}",
+                        rect.right(),
+                        first.right()
+                    );
+                    if width >= 1_000.0 {
+                        assert!(
+                            (rect.x - first.x).abs() < 0.5,
+                            "{context}: {key} starts at {} where {first_key} starts at {}",
+                            rect.x,
+                            first.x
+                        );
+                    }
+                }
+                // The pickers fill their lines where they end at the row's.
+                let fill = (first.right() - row.right()).abs() < 0.5;
+                forms.insert(fill);
+                let mut follow: Vec<&str> = vec![THEMES_BROWSE_ROW_KEY];
+                if source.contains("dark:") {
+                    follow.push(THEME_PREVIEW_SIDE_ACTION);
+                }
+                // On their names' lines, the pickers end where the Follow
+                // system switch ends, before Reset's place.
+                if !fill {
+                    follow.push(THEME_MODE_ACTION);
+                }
+                for key in follow {
+                    let rect = seen
+                        .get(key)
+                        .unwrap_or_else(|| panic!("{context}: {key} is on the page"));
+                    assert!(
+                        (rect.right() - first.right()).abs() < 0.5,
+                        "{context}: {key} ends at {} where the pickers end at {}",
+                        rect.right(),
+                        first.right()
                     );
                 }
             }
-            let browse = seen
-                .get(THEMES_BROWSE_ROW_KEY)
-                .unwrap_or_else(|| panic!("{context}: Browse themes is on the page"));
-            assert!(
-                (browse.right() - first.right()).abs() < 0.5,
-                "{context}: Browse ends at {} where the pickers end at {}",
-                browse.right(),
-                first.right()
-            );
-            assert!(browse_row, "{context}: Browse has a row of its own");
         }
-    }
+        if scale >= 2.0 {
+            assert!(
+                forms.contains(&true),
+                "premise: the pickers fill their lines at {scale}×"
+            );
+        }
+        assert!(
+            forms.contains(&false),
+            "premise: the pickers sit on their names' lines at {scale}×"
+        );
+    });
 }
 
 #[test]
@@ -35666,6 +35828,76 @@ fn an_automatic_window_sample_takes_the_terminal_themes_side_on_any_os() {
             );
         }
     }
+}
+
+/// AUTOMATIC WINDOW APPEARANCE SAYS ONE SOURCE EVERYWHERE: where the window
+/// sample under Auto paints Aterm Day's light title bar on a dark OS and
+/// Aterm Night's dark one on a light OS (the terminal theme's side), the
+/// note under the Window appearance segments, the picker's choice, Top
+/// Settings' sentence and the sample's spoken value all name the terminal
+/// theme as what Auto follows. ("Auto matches the macOS appearance, light or
+/// dark." sat under that light bar on a dark Mac, and the picker said "Match
+/// macOS".) Negative control: an explicit Dark window appearance names no
+/// terminal theme.
+#[test]
+fn automatic_window_appearance_names_one_source_everywhere() {
+    let terminal = "the terminal theme";
+    let note = prefs::footnote_of(prefs::EDIT_WINDOW_THEME).unwrap_or_default();
+    assert!(
+        note.starts_with("Auto ") && note.contains(terminal),
+        "the note: {note:?}"
+    );
+    let choice = setting_choice_label(prefs::EDIT_WINDOW_THEME, "auto");
+    assert!(choice.contains("terminal"), "the choice: {choice:?}");
+    for (source, system_dark, side) in [
+        ("theme = \"Aterm Day\"\n", true, "Light"),
+        ("theme = \"Aterm Night\"\n", false, "Dark"),
+    ] {
+        let state = settings_state_with_themes(source, crate::app_config::ThemeCatalog::empty());
+        let motion = crate::native_app::ViewMotionCx {
+            system_dark,
+            ..crate::native_app::ViewMotionCx::default()
+        };
+        let spec = renderer_preview_spec_for_key_with_font(
+            &state,
+            prefs::EDIT_THEME,
+            100,
+            motion,
+            13.0,
+            1.0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            spec.window_sample_is_light(aterm_render::Theme::default()),
+            side == "Light",
+            "{source:?}: the sample takes the terminal theme's side"
+        );
+        let spoken = spec.semantic_value();
+        assert!(
+            spoken.contains(&format!("matches {terminal}, currently {side}")),
+            "{source:?}: {spoken}"
+        );
+    }
+    let state = settings_state_with_themes(
+        "theme = \"Aterm Day\"\nwindow_theme = \"dark\"\n",
+        crate::app_config::ThemeCatalog::empty(),
+    );
+    let spec = renderer_preview_spec_for_key_with_font(
+        &state,
+        prefs::EDIT_THEME,
+        100,
+        crate::native_app::ViewMotionCx::default(),
+        13.0,
+        1.0,
+        None,
+    )
+    .unwrap();
+    let spoken = spec.semantic_value();
+    assert!(
+        spoken.contains("Dark window appearance") && !spoken.contains(terminal),
+        "{spoken}"
+    );
 }
 
 #[test]
@@ -37356,6 +37588,48 @@ fn askpass_settings_one_owner_answer_is_not_replaced_by_a_queued_direction() {
         None,
         "a queued press in another view cannot ask or replace the pending answer"
     );
+}
+
+/// A FACT SEPARATOR GOES AT THE BREAK, AND A WORD ITS LINE HOLDS IS NEVER BROKEN (item
+/// 101): "Problems" / "5", never "Prob-" / "lems · 5" nor "Problems ·" / "5".
+#[test]
+fn a_fact_separator_goes_at_the_break_and_a_word_its_line_holds_stays_whole() {
+    let cells = |line: &str| line.chars().count() as f32;
+    let wrap = |text: &str, width: f32| wrap_to_box(text, width, &cells);
+    // "Problems" is 8 cells, "Problems ·" 10, "Problems · 5" 12.
+    for width in [8.0, 9.0, 10.0, 11.0] {
+        assert_eq!(
+            wrap("Problems \u{b7} 5", width),
+            ["Problems", "5"],
+            "{width}"
+        );
+    }
+    assert_eq!(wrap("Problems \u{b7} 5", 12.0), ["Problems \u{b7} 5"]);
+    // Facts fill their lines; each break takes the separator before it.
+    assert_eq!(
+        wrap("Changed \u{b7} Not found \u{b7} Default", 12.0),
+        ["Changed", "Not found", "Default"]
+    );
+    assert_eq!(
+        wrap("Changed \u{b7} Not found \u{b7} Default", 19.0),
+        ["Changed \u{b7} Not found", "Default"]
+    );
+    // Only a word wider than the whole box is broken, at a syllable, and the
+    // separator still goes at a break.
+    let narrow = wrap("Problems \u{b7} 5", 6.0);
+    assert_eq!(narrow, ["Prob-", "lems", "5"]);
+    for (text, width) in [
+        ("Problems \u{b7} 5", 9.0),
+        ("All \u{b7} 12", 4.0),
+        ("Changed \u{b7} Not found \u{b7} Default", 9.0),
+    ] {
+        for line in wrap(text, width) {
+            assert!(
+                !line.starts_with('\u{b7}') && !line.ends_with('\u{b7}'),
+                "{text:?} at {width}: {line:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -39812,4 +40086,149 @@ fn a_font_not_found_is_said_everywhere_in_the_same_frame() {
     assert!(header.starts_with(&format!("Font: {family}")), "{header}");
     assert!(!header.contains("Not found"), "{header}");
     assert_eq!(pill.as_deref(), Some("Loading font"));
+}
+
+/// No page moves the rail's rows: the rail lists the same rows on every page, a sub-page's
+/// indented under its parent's, so a click on any row moves none of them under the pointer. In
+/// a window the rail fits, every row sits where it sits on Top Settings, on every page; in one
+/// it scrolls in, the rows keep their rhythm on every page and the selected row is whole.
+#[test]
+fn no_page_moves_the_rails_rows() {
+    let compile = |route: SettingsRoute, cx: &ViewCx<'_>| {
+        let (mut runtime, instance, view) = setup();
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.navigate(route);
+        compile_settings_view(&runtime, instance, view, cx)
+    };
+    let mut faults = Vec::new();
+    for (width, height) in [
+        (1_200.0_f32, 1_000.0_f32),
+        (1_200.0, 900.0),
+        (849.0, 460.0),
+        (1_200.0, 513.0),
+    ] {
+        let tall = compile(SettingsRoute::Home, &view_cx_at(width, 1_400.0));
+        let reference: BTreeMap<String, f32> = whole_rail_rows(&tall)
+            .into_iter()
+            .map(|(key, rect)| (key, rect.y))
+            .collect();
+        assert_eq!(
+            reference.len(),
+            SettingsRoute::rail_len(),
+            "CONTROL: the rail lists its rows whole in a {width}x1400 window: {reference:?}"
+        );
+        let cx = view_cx_at(width, height);
+        let mut place: Option<f32> = None;
+        for route in SettingsRoute::ALL {
+            let compiled = compile(route, &cx);
+            let context = format!("{route:?} at {width}x{height}");
+            for key in [
+                "settings/navigation-title",
+                "settings/nav-label/look---feel",
+            ] {
+                if compiled.semantic(&UiKey::new(key)).is_none() {
+                    faults.push(format!("{context}: no {key}"));
+                }
+            }
+            let failures = compiled.fit_failures();
+            if !failures.is_empty() {
+                faults.push(format!("{context}: {failures:#?}"));
+            }
+            let whole = whole_rail_rows(&compiled);
+            if let Some((key, rect)) = whole
+                .iter()
+                .find(|(_, rect)| (rect.height - navigation_row_height(1.0)).abs() > 0.5)
+            {
+                faults.push(format!("{context}: {key} {rect:?} breaks the rhythm"));
+            }
+            if !whole
+                .iter()
+                .any(|(key, _)| *key == format!("settings/nav{}", route.path()))
+            {
+                faults.push(format!(
+                    "{context}: the selected row is not whole: {whole:?}"
+                ));
+            }
+            let offsets: Vec<f32> = whole
+                .iter()
+                .filter_map(|(key, rect)| reference.get(key).map(|y| rect.y - y))
+                .collect();
+            if offsets.len() != whole.len() {
+                faults.push(format!(
+                    "{context}: rows Top Settings does not list: {whole:?}"
+                ));
+                continue;
+            }
+            let Some(&first) = offsets.first() else {
+                faults.push(format!("{context}: no whole row"));
+                continue;
+            };
+            if offsets.iter().any(|offset| (offset - first).abs() > 0.5) {
+                faults.push(format!("{context}: the rows moved apart: {whole:?}"));
+            }
+            let scrolls = compiled
+                .semantic(&UiKey::new("settings/navigation/scroll"))
+                .is_some();
+            if !scrolls {
+                match place {
+                    None => place = Some(first),
+                    Some(place) if (first - place).abs() > 0.5 => {
+                        faults.push(format!("{context}: the rows moved by {}", first - place));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    assert!(
+        faults.is_empty(),
+        "{} faults:\n{}",
+        faults.len(),
+        faults.join("\n")
+    );
+}
+
+/// The heading sits in one place on every page: the inset over a page beside the rail is the
+/// window's, from its height and the text size, and a page's chrome sheds only what is under
+/// its heading. At short and tall windows beside the rail, at 1× and 2× text, every route's
+/// heading is at one place.
+#[test]
+fn the_heading_sits_in_one_place_on_every_page() {
+    at_each_text_scale(&[1.0, 2.0], "the heading's place", |scale| {
+        let mut faults = Vec::new();
+        for (width, height) in [
+            (1_074.0, 292.0),
+            (1_074.0, 348.0),
+            (1_074.0, 404.0),
+            (1_074.0, 500.0),
+            (1_564.0, 640.0),
+        ] {
+            let cx = view_cx_at(width * scale, height * scale);
+            let mut places = BTreeMap::<String, Vec<SettingsRoute>>::new();
+            for route in SettingsRoute::ALL {
+                let (mut runtime, instance, view) = setup();
+                go_to_route(&mut runtime, instance, view, route);
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let y = compiled
+                    .semantics
+                    .iter()
+                    .find(|node| node.key.as_str().starts_with("settings/page-heading/"))
+                    .map_or_else(|| "none".to_string(), |node| format!("{:.1}", node.rect.y));
+                places.entry(y).or_default().push(route);
+            }
+            if places.len() != 1 {
+                faults.push(format!(
+                    "{scale}\u{d7} {width}x{height}: the heading at {places:?}"
+                ));
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
 }

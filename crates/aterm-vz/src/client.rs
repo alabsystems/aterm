@@ -486,7 +486,8 @@ pub trait Start {
     /// The helper last started wrote its record: it is on its own now.
     fn settled(&mut self);
 
-    /// Whether the helper `record` names still runs.
+    /// Whether the helper `record` names may still run, for a wait on its end
+    /// ([`crate::record::may_run`]), never for a signal.
     fn alive(&self, record: &Record) -> bool;
 
     /// `SIGKILL` the helper `record` names, its unique id read again and matched first.
@@ -563,7 +564,7 @@ impl Start for Detached {
     }
 
     fn alive(&self, record: &Record) -> bool {
-        crate::record::is_live(record, &Kernel)
+        crate::record::may_run(record, &Kernel)
     }
 
     fn kill(&mut self, record: &Record) -> Result<(), String> {
@@ -609,8 +610,9 @@ impl<S: Start> Lab<S> {
     }
 
     /// A session for `attach`, on the live helper, or on one this starts: a dead helper's
-    /// leftovers are removed first, and a helper that refuses the session (another
-    /// checkout's) is stopped as `down` would and replaced (§5.1).
+    /// leftovers are removed first, a helper an earlier build's record names is asked to
+    /// `Stop` and replaced ([`Self::stop_unproven`]), and a helper that refuses the session
+    /// (another checkout's) is stopped as `down` would and replaced (§5.1).
     ///
     /// # Errors
     /// No helper could be started, or one did not answer (NOT RUN, naming it, once it was
@@ -623,6 +625,14 @@ impl<S: Start> Lab<S> {
                 Holder::Live(r) => r,
                 Holder::Dead(r) => {
                     crate::record::remove_leftovers(&self.paths, &r);
+                    self.replaced = Some(Replaced {
+                        record: r,
+                        at: now_s(),
+                    });
+                    self.start_one()?
+                }
+                Holder::Unproven(r) => {
+                    self.stop_unproven(&r)?;
                     self.replaced = Some(Replaced {
                         record: r,
                         at: now_s(),
@@ -661,11 +671,22 @@ impl<S: Start> Lab<S> {
     /// No live helper, a refusal, a helper that did not answer (NOT RUN, naming it, once it
     /// was SIGKILLed), or the socket failed.
     pub fn join(&mut self, attach: &Attach) -> Result<Session, ClientError> {
-        let Holder::Live(record) = crate::record::holder(&self.paths, self.start.pids()) else {
-            return Err(ClientError::NoHelper(format!(
-                "no helper runs the VM at {}",
-                self.paths.root().display()
-            )));
+        let record = match crate::record::holder(&self.paths, self.start.pids()) {
+            Holder::Live(record) => record,
+            Holder::Unproven(r) => {
+                return Err(ClientError::NoHelper(format!(
+                    "the VM at {} is helper {}'s, which an earlier build started (its record \
+                     names no start time): `down` asks it to stop",
+                    self.paths.root().display(),
+                    r.pid
+                )));
+            }
+            Holder::Dead(_) | Holder::None => {
+                return Err(ClientError::NoHelper(format!(
+                    "no helper runs the VM at {}",
+                    self.paths.root().display()
+                )));
+            }
         };
         match self.attach_to(&record, attach) {
             Ok(session) => Ok(session),
@@ -769,6 +790,41 @@ impl<S: Start> Lab<S> {
         ))
     }
 
+    /// `Stop` the helper an earlier build's record names (no start time, so it is never
+    /// signalled: [`crate::record::Holder::Unproven`]) and wait for its unique id to leave its
+    /// pid; its run files go once it has. A socket nobody listens on means that helper is
+    /// gone, or the record is an earlier boot's: its run files go at once.
+    ///
+    /// # Errors
+    /// It did not answer `Stop`, or did not end within [`Self::end_span`] once it had (NOT
+    /// RUN, naming it: it was not signalled), or the socket failed.
+    fn stop_unproven(&mut self, record: &Record) -> Result<(), ClientError> {
+        let unsignalled = |what: &str| {
+            ClientError::Hung(format!(
+                "{NOT_RUN}{what}: helper {} (unique id {}, started {}), which an earlier build \
+                 started; its record names no start time, so it was not signalled",
+                record.pid, record.uniq, record.started
+            ))
+        };
+        match stop(&self.paths, STOP_GRACE_MS, self.span) {
+            Ok(()) => {}
+            Err(ClientError::Closed) => {
+                crate::record::remove_leftovers(&self.paths, record);
+                return Ok(());
+            }
+            Err(ClientError::Hung(what)) => return Err(unsignalled(&what)),
+            Err(e) => return Err(e),
+        }
+        match self.wait_gone(record, self.end_span) {
+            Ok(()) => {
+                crate::record::remove_leftovers(&self.paths, record);
+                Ok(())
+            }
+            Err(ClientError::Hung(what)) => Err(unsignalled(&what)),
+            Err(e) => Err(e),
+        }
+    }
+
     /// `Stop` the helper `record` names and wait for it to end, escalating as §5.1 says.
     fn stop_record(&mut self, record: &Record) -> Result<(), ClientError> {
         match stop(&self.paths, STOP_GRACE_MS, self.span) {
@@ -780,13 +836,15 @@ impl<S: Start> Lab<S> {
     }
 
     /// `down`: stop the live helper's VM and wait for the helper to end; a dead helper's
-    /// leftovers are removed. Nothing is started.
+    /// leftovers are removed, and a helper an earlier build's record names is asked to `Stop`
+    /// ([`Self::stop_unproven`]). Nothing is started.
     ///
     /// # Errors
     /// The helper did not answer (NOT RUN, naming it, once it was SIGKILLed).
     pub fn down(&mut self) -> Result<(), ClientError> {
         match crate::record::holder(&self.paths, self.start.pids()) {
             Holder::Live(r) => self.stop_record(&r),
+            Holder::Unproven(r) => self.stop_unproven(&r),
             Holder::Dead(r) => {
                 crate::record::remove_leftovers(&self.paths, &r);
                 Ok(())
@@ -802,7 +860,9 @@ impl<S: Start> Lab<S> {
     /// # Errors
     /// The helper did not answer (NOT RUN, naming it; it runs on).
     pub fn status(&mut self) -> Result<Option<StateReport>, ClientError> {
-        let Holder::Live(r) = crate::record::holder(&self.paths, self.start.pids()) else {
+        let (Holder::Live(r) | Holder::Unproven(r)) =
+            crate::record::holder(&self.paths, self.start.pids())
+        else {
             return Ok(None);
         };
         match state(&self.paths, self.span) {

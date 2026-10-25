@@ -48,7 +48,7 @@ pub struct ProcessReading {
     pub read_at: Option<std::time::Instant>,
     /// Its resource coalition's id (macOS), read only by a sweep asked for it ([`SweepOpts::coalitions`]); `None` otherwise, for a zombie, and off macOS.
     pub coalition: Option<u64>,
-    /// Its pid version (macOS `p_idversion`, [`pid_version`]), which a new process and each exec take anew, read with [`Self::coalition`]; `None` otherwise, for a zombie, and off macOS.
+    /// Its pid version (macOS `p_idversion`, [`pid_version`]), which a new process and each exec take anew, read with [`Self::coalition`], or where the sweep reads no [`Self::start`] and [`SweepOpts::versions`] asks; `None` otherwise, for a zombie, and off macOS.
     pub version: Option<i32>,
     /// When it started, unix ms: on Linux its boot-clock start against `/proc/uptime` and the wall clock read once a sweep ([`birth_of_boot_start`]), on Windows its creation `FILETIME` ([`birth_of_filetime`]). `None` on macOS, whose [`Self::start`] is Mach absolute time, which stops while the Mac sleeps (the kernel record, [`crate::kproc::record`], gives the wall birth there), and where unread.
     pub birth_ms: Option<i64>,
@@ -59,6 +59,8 @@ pub struct ProcessReading {
 pub struct SweepOpts {
     /// Each process's resource coalition and pid version ([`ProcessReading::coalition`], [`ProcessReading::version`]): one more `proc_pidinfo` a process on macOS, two more for one whose coalition [`processes_keeping`]'s ids do not hold under that version, nothing elsewhere.
     pub coalitions: bool,
+    /// The pid version of each process whose start the sweep cannot read (another user's, on macOS, whose usage the kernel refuses), which is what tells a new process at its pid (or an exec) from the one a reader kept something for: one more `proc_pidinfo` for each such process on macOS, nothing elsewhere. [`Self::coalitions`] reads every process's.
+    pub versions: bool,
 }
 
 /// One sweep of the process table.
@@ -332,6 +334,8 @@ pub(crate) mod imp {
                     || pid_version(pid),
                     || crate::coalitions::coalition_of(pid as u32),
                 )
+            } else if opts.versions && before.is_none() {
+                (None, pid_version(pid))
             } else {
                 (None, None)
             };
@@ -676,7 +680,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_sweep_reads_coalitions_only_when_asked() {
-        let sweep = processes_with(SweepOpts { coalitions: true }).expect("a sweep");
+        let sweep = processes_with(SweepOpts {
+            coalitions: true,
+            ..SweepOpts::default()
+        })
+        .expect("a sweep");
         for pid in [std::process::id(), 1] {
             let row = sweep.procs.iter().find(|p| p.pid == pid).expect("swept");
             let own = crate::coalitions::coalition_of(pid).expect("its coalition");
@@ -694,6 +702,39 @@ mod tests {
                 .procs
                 .iter()
                 .all(|p| p.coalition.is_none() && p.version.is_none())
+        );
+    }
+
+    /// A sweep asked for versions reads the pid version of each process whose start it cannot
+    /// read (launchd's, root's, to a user that is not root) and of no other (this process's,
+    /// whose start it reads), and no coalition. NEGATIVE CONTROL: a plain sweep reads no version.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sweep_asked_for_versions_reads_them_where_it_reads_no_start() {
+        let sweep = processes_with(SweepOpts {
+            versions: true,
+            ..SweepOpts::default()
+        })
+        .expect("a sweep");
+        let row = |pid: u32| sweep.procs.iter().find(|p| p.pid == pid).expect("swept");
+        let me = row(std::process::id());
+        assert!(me.start.is_some(), "this process's start: {me:?}");
+        assert_eq!(me.version, None, "read where the start is not");
+        let launchd = row(1);
+        let version = pid_version(1).expect("launchd's pid version");
+        assert_eq!(
+            launchd.version,
+            launchd.start.is_none().then_some(version),
+            "{launchd:?}"
+        );
+        assert!(sweep.procs.iter().all(|p| p.coalition.is_none()));
+        assert!(
+            processes()
+                .expect("a sweep")
+                .procs
+                .iter()
+                .all(|p| p.version.is_none()),
+            "NEGATIVE CONTROL: a plain sweep"
         );
     }
 
@@ -795,12 +836,18 @@ mod tests {
         let pid = child.id();
         let mut ids = crate::coalitions::CoalitionIds::default();
         let mut row = || {
-            processes_keeping(SweepOpts { coalitions: true }, &mut ids)
-                .expect("a sweep")
-                .procs
-                .into_iter()
-                .find(|p| p.pid == pid)
-                .expect("the stand-in swept")
+            processes_keeping(
+                SweepOpts {
+                    coalitions: true,
+                    ..SweepOpts::default()
+                },
+                &mut ids,
+            )
+            .expect("a sweep")
+            .procs
+            .into_iter()
+            .find(|p| p.pid == pid)
+            .expect("the stand-in swept")
         };
         let first = row();
         assert!(first.version.is_some(), "{first:?}");

@@ -17,6 +17,15 @@ const EXPIRES: Duration = Duration::from_secs(45);
 const VERIFIED_EXPIRES: Duration = Duration::from_secs(600);
 const WIRE_LEN: usize = 38;
 
+fn retry_delay(own: &[u8; 32], attempt: u64) -> Duration {
+    let mut seed = own.to_vec();
+    seed.extend_from_slice(&attempt.to_be_bytes());
+    let hash = aterm_digest::Sha256::digest(&seed);
+    let jitter = u64::from(u16::from_be_bytes([hash[0], hash[1]])) % 2000;
+    Duration::from_millis(3000 + jitter)
+}
+
+#[derive(Debug)]
 struct Peer {
     seen: Instant,
     next: Instant,
@@ -26,6 +35,7 @@ struct Peer {
     repair: Repair,
 }
 
+#[derive(Debug)]
 pub(super) struct Hints {
     own: [u8; 32],
     previous: Option<[u8; 32]>,
@@ -153,11 +163,7 @@ impl Hints {
         // Change jitter on every attempt: fixed per-owner jitter can keep two
         // peers with nearby deadlines colliding at the runtime's tick cadence.
         self.attempt = self.attempt.wrapping_add(1);
-        let mut seed = self.own.to_vec();
-        seed.extend_from_slice(&self.attempt.to_be_bytes());
-        let hash = aterm_digest::Sha256::digest(&seed);
-        let jitter = u64::from(u16::from_be_bytes([hash[0], hash[1]])) % 2000;
-        peer.next = now + Duration::from_millis(3000 + jitter);
+        peer.next = now + retry_delay(&self.own, self.attempt);
         self.cursor = Some(address);
         Some((address, std::mem::take(&mut peer.repair)))
     }
@@ -168,7 +174,12 @@ impl Hints {
         success: bool,
         now: Instant,
     ) {
+        // A slow exchange may have outlived the delay chosen at its start.
+        // Start the quiet interval at completion so paired owners cannot keep
+        // immediately redialing and colliding on their local custody locks.
+        let delay = retry_delay(&self.own, self.attempt);
         if let Some(peer) = self.peers.get_mut(&address) {
+            peer.next = now + delay;
             if success && repair.actor().is_some() {
                 peer.verified = true;
                 peer.seen = now;
@@ -230,6 +241,21 @@ mod tests {
             hints.observe(&wire(port), "10.1.1.2:1".parse().unwrap(), now);
         }
         assert_eq!(hints.count(), PER_IP);
+    }
+
+    #[test]
+    fn a_slow_round_still_has_a_quiet_interval_after_completion() {
+        let mut hints = hints();
+        let now = Instant::now();
+        let source = "10.1.1.2:1".parse().unwrap();
+        hints.observe(&wire(1234), source, now);
+        let (address, repair) = hints.next(now).unwrap();
+        let finished = now + Duration::from_secs(30);
+        hints.finish(address, repair, false, finished);
+        hints.observe(&wire(1234), source, finished);
+        assert!(hints.next(finished).is_none());
+        assert!(hints.next(finished + Duration::from_secs(2)).is_none());
+        assert!(hints.next(finished + Duration::from_secs(10)).is_some());
     }
     #[test]
     fn verified_and_busy_entries_survive_untrusted_floods() {

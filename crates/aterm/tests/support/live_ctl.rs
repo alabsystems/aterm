@@ -74,6 +74,16 @@ impl Ctl {
         (header, body.lines().map(str::to_owned).collect())
     }
 
+    /// `req`, whose `OK <nbytes>` reply carries a raw body: the header and the bytes. It must answer `OK`.
+    pub fn bytes(&mut self, req: &str) -> (String, Vec<u8>) {
+        let (header, body) = self
+            .client
+            .request_bytes(req)
+            .unwrap_or_else(|e| panic!("`{req}`: no reply ({e})"));
+        assert!(header.starts_with("OK "), "`{req}` answered {header:?}");
+        (header, body)
+    }
+
     /// `modes`: every terminal mode the instance reports, by name.
     pub fn modes(&mut self) -> BTreeMap<String, String> {
         self.counted("modes")

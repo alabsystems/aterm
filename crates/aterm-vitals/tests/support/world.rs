@@ -60,6 +60,8 @@ pub struct Proc {
     pub blocked_fd: Option<i32>,
     /// A thread in an uninterruptible wait.
     pub d_state: bool,
+    /// A debugger traces it.
+    pub traced: bool,
     /// Its one thread never ran past 20 s: `wait` says what keeps it.
     pub held: bool,
     /// What keeps a `held` process from starting: macOS's program check unless set.
@@ -111,6 +113,7 @@ impl Proc {
             wchan: None,
             blocked_fd: None,
             d_state: false,
+            traced: false,
             held: false,
             wait: aterm_vitals::jobs::StartWait::ProgramCheck,
             exec: 1,
@@ -152,6 +155,8 @@ pub struct World {
     pub vars: HashMap<&'static str, u32>,
     /// How long after its clock a tick reads its processes (the shells' terminal groups).
     pub read_lag_ms: u64,
+    /// How long after its clock a tick's probe starts reading its processes, their ages taken then.
+    pub probe_lag_ms: u64,
     /// Pids a tick's sweep lists that exit before it reads them: they have no reading.
     pub unread: BTreeSet<u32>,
     /// The group in front of each terminal session nested in a tab's, by its leader.
@@ -182,6 +187,7 @@ impl World {
             lanes: LanesSeen::default(),
             jobs: Jobs::new(),
             read_lag_ms: 0,
+            probe_lag_ms: 0,
             unread: BTreeSet::new(),
             fronts: HashMap::new(),
             terms: HashMap::new(),
@@ -504,6 +510,7 @@ impl World {
         let tick = JobTick {
             at_ms: self.at,
             read_ms: self.at + self.read_lag_ms,
+            probe_ms: self.at + self.probe_lag_ms,
             self_uid: Some(UID),
             sweep,
             procs: read,
@@ -567,7 +574,9 @@ impl World {
             pgid: p.pgid,
             sid: (!zombie).then_some(p.sid),
             start: Some(p.start),
-            age_ms: p.born.map(|b| self.at.saturating_sub(b)),
+            age_ms: p
+                .born
+                .map(|b| (self.at + self.probe_lag_ms).saturating_sub(b)),
             uid: Some(p.uid),
             name: p.name.clone(),
             exe: p.exe.clone().filter(|_| !zombie),
@@ -576,6 +585,7 @@ impl World {
             } else {
                 p.state
             },
+            traced: p.traced && !zombie,
             tty: (p.tty && !zombie).then_some(0x1000),
             tpgid,
             term: self

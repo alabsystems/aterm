@@ -70,12 +70,17 @@ aterm-types = { workspace = true }
 aterm-time = { workspace = true }
 # First-party bounded regex engine for abrew's `search /regex/` form. It
 # refuses constructs it cannot evaluate (look-around, backreferences,
-# \p{…}) instead of reinterpreting them, which is what lets admission
-# keep delegating those spellings to real Homebrew.
+# \p{…}) instead of reinterpreting them, so admission reports an unsupported
+# native pattern rather than returning an incorrect search result.
 aterm-regex = { workspace = true }
 # THE toolchain's discovery, rustup's home, the build-cache rule, the gone-checkout rule
 # and the lease core, std only; `toolchain`, `build_cache` and `lease` re-export them.
 aterm-toolchain = { workspace = true }
+# `aterm pkg capacity` (`src/capacity.rs`): the machine's capacity now and the claims
+# every session holds on it, read-only (docs/DESIGN-adaptive-build-2026-10-24.md
+# CAP-1). Workspace crate; it adds aterm-sysprobe to the macOS graph, which the
+# `aterm` binary links already through aterm-gui.
+aterm-capacity = { workspace = true }
 # `FileLock` (flock LOCK_EX, the primitive aterm-update's apply/stage uses) serializes the
 # high-water floor's read-compare-write, so concurrent atpkg processes cannot move it down
 # (anti-rollback, CWE-362). Also `pick_slug`/`is_valid_slug` for `resolve_account()`.

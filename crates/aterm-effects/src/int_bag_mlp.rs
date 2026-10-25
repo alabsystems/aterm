@@ -477,7 +477,15 @@ const fn word_at(bytes: &[u8], i: usize) -> u32 {
 }
 
 /// Refuse, by name, every params blob outside the profile's bounds (design §12.2), before any buffer exists.
-pub fn check(bytes: &[u8]) -> Result<ParamsView<'_>, ParamsError> {
+pub const fn check(bytes: &[u8]) -> Result<ParamsView<'_>, ParamsError> {
+    #[inline]
+    const fn tensor_slice(bytes: &[u8], span: (u64, u64, Tensor)) -> &[u8] {
+        bytes
+            .split_at(span.1 as usize)
+            .0
+            .split_at(span.0 as usize)
+            .1
+    }
     let blob = bytes.len() as u64;
     if blob > PARAMS_BYTES_MAX {
         return Err(ParamsError::TooLarge {
@@ -488,50 +496,51 @@ pub fn check(bytes: &[u8]) -> Result<ParamsView<'_>, ParamsError> {
     if bytes.len() < PARAMS_WORDS * 4 {
         return Err(ParamsError::Truncated { bytes: blob });
     }
-    let w = |i: usize| word_at(bytes, i);
-    if w(params::MAGIC) != PARAMS_MAGIC_VALUE {
-        return Err(ParamsError::BadMagic {
-            found: w(params::MAGIC),
-        });
+    let magic = word_at(bytes, params::MAGIC);
+    if magic != PARAMS_MAGIC_VALUE {
+        return Err(ParamsError::BadMagic { found: magic });
     }
-    if w(params::LAYOUT_VERSION) != LAYOUT_VERSION {
-        return Err(ParamsError::BadVersion {
-            found: w(params::LAYOUT_VERSION),
-        });
+    let version = word_at(bytes, params::LAYOUT_VERSION);
+    if version != LAYOUT_VERSION {
+        return Err(ParamsError::BadVersion { found: version });
     }
     let dims = Dims {
-        buckets: w(params::B),
-        embed: w(params::E),
-        hidden: w(params::H),
-        classes: w(params::C),
+        buckets: word_at(bytes, params::B),
+        embed: word_at(bytes, params::E),
+        hidden: word_at(bytes, params::H),
+        classes: word_at(bytes, params::C),
     };
-    for (dim, value, max) in [
+    let dim_bounds = [
         (Dim::Buckets, dims.buckets, B_MAX),
         (Dim::Embed, dims.embed, E_MAX),
         (Dim::Hidden, dims.hidden, H_MAX),
         (Dim::Classes, dims.classes, C_MAX),
-    ] {
-        if !(1..=max).contains(&value) {
+    ];
+    let mut di = 0;
+    while di < dim_bounds.len() {
+        let (dim, value, max) = dim_bounds[di];
+        if value < 1 || value > max {
             return Err(ParamsError::DimOutOfBounds { dim, value });
         }
+        di += 1;
     }
-    let min_ids = w(params::MIN_IDS);
+    let min_ids = word_at(bytes, params::MIN_IDS);
     if min_ids < 1 {
         return Err(ParamsError::MinIdsZero);
     }
-    let g = w(params::G);
-    if !(1..=31).contains(&g) {
+    let g = word_at(bytes, params::G);
+    if g < 1 || g > 31 {
         return Err(ParamsError::ShiftOutOfRange { g });
     }
-    let t = w(params::T) as i32;
+    let t = word_at(bytes, params::T) as i32;
     if t < 0 {
         return Err(ParamsError::NegativeT { t });
     }
-    let mult = w(params::MULT);
+    let mult = word_at(bytes, params::MULT);
     if mult < 1 || mult > i32::MAX as u32 {
         return Err(ParamsError::MultOutOfRange { mult });
     }
-    let stored = w(params::QMAX);
+    let stored = word_at(bytes, params::QMAX);
     if stored != qmax(mult) {
         return Err(ParamsError::QmaxMismatch {
             stored,
@@ -539,16 +548,18 @@ pub fn check(bytes: &[u8]) -> Result<ParamsView<'_>, ParamsError> {
         });
     }
     let (b, e, h, c) = (
-        u64::from(dims.buckets),
-        u64::from(dims.embed),
-        u64::from(dims.hidden),
-        u64::from(dims.classes),
+        dims.buckets as u64,
+        dims.embed as u64,
+        dims.hidden as u64,
+        dims.classes as u64,
     );
     let header_end = (PARAMS_WORDS * 4) as u64;
     let mut spans = [(0u64, 0u64, Tensor::Emb); 6];
-    for (slot, tensor) in spans.iter_mut().zip(Tensor::ALL) {
+    let mut ti = 0;
+    while ti < Tensor::ALL.len() {
+        let tensor = Tensor::ALL[ti];
         let (off_at, len_at) = tensor.fields();
-        let (offset, len) = (w(off_at), w(len_at));
+        let (offset, len) = (word_at(bytes, off_at), word_at(bytes, len_at));
         let want = match tensor {
             Tensor::Emb => b * e,
             Tensor::W1 => e * h,
@@ -557,10 +568,10 @@ pub fn check(bytes: &[u8]) -> Result<ParamsView<'_>, ParamsError> {
             Tensor::B1 => h,
             Tensor::B2 => c,
         };
-        if u64::from(len) != want {
+        if (len as u64) != want {
             return Err(ParamsError::BadLength { tensor, len, want });
         }
-        let end = u64::from(offset) + u64::from(len) * u64::from(tensor.elem_bytes());
+        let end = (offset as u64) + (len as u64) * (tensor.elem_bytes() as u64);
         if end > blob {
             return Err(ParamsError::OutsideBlob {
                 tensor,
@@ -571,67 +582,100 @@ pub fn check(bytes: &[u8]) -> Result<ParamsView<'_>, ParamsError> {
         if !offset.is_multiple_of(TENSOR_ALIGN) {
             return Err(ParamsError::Unaligned { tensor, offset });
         }
-        *slot = (u64::from(offset), end, tensor);
+        spans[ti] = (offset as u64, end, tensor);
+        ti += 1;
     }
     let mut ordered = spans;
-    ordered.sort_by_key(|s| s.0);
+    let mut oi = 1;
+    while oi < ordered.len() {
+        let mut oj = oi;
+        while oj > 0 && ordered[oj - 1].0 > ordered[oj].0 {
+            let tmp = ordered[oj - 1];
+            ordered[oj - 1] = ordered[oj];
+            ordered[oj] = tmp;
+            oj -= 1;
+        }
+        oi += 1;
+    }
     let mut covered = header_end;
-    for &(start, end, tensor) in &ordered {
+    let mut ci = 0;
+    while ci < ordered.len() {
+        let (start, end, tensor) = ordered[ci];
         if start < covered {
             return Err(ParamsError::Overlap { tensor });
         }
         covered = end;
+        ci += 1;
     }
     if blob > covered {
         return Err(ParamsError::Trailing {
             bytes: blob - covered,
         });
     }
-    let slice = |tensor: Tensor| -> &[u8] {
-        let (start, end, _) = spans[tensor as usize];
-        &bytes[start as usize..end as usize]
-    };
     let (emb, w1, w2, lut) = (
-        slice(Tensor::Emb),
-        slice(Tensor::W1),
-        slice(Tensor::W2),
-        slice(Tensor::Lut),
+        tensor_slice(bytes, spans[Tensor::Emb as usize]),
+        tensor_slice(bytes, spans[Tensor::W1 as usize]),
+        tensor_slice(bytes, spans[Tensor::W2 as usize]),
+        tensor_slice(bytes, spans[Tensor::Lut as usize]),
     );
-    for (tensor, data) in [
+    let i8_tensors = [
         (Tensor::Emb, emb),
         (Tensor::W1, w1),
         (Tensor::W2, w2),
         (Tensor::Lut, lut),
-    ] {
-        if let Some(index) = data.iter().position(|&x| x == 0x80) {
-            return Err(ParamsError::Int8Min {
-                tensor,
-                index: index as u32,
-            });
+    ];
+    let mut ii = 0;
+    while ii < i8_tensors.len() {
+        let (tensor, data) = i8_tensors[ii];
+        let mut k = 0;
+        while k < data.len() {
+            if data[k] == 0x80 {
+                return Err(ParamsError::Int8Min {
+                    tensor,
+                    index: k as u32,
+                });
+            }
+            k += 1;
         }
+        ii += 1;
     }
+    let b1_slice = tensor_slice(bytes, spans[Tensor::B1 as usize]);
     let mut b1 = [0i32; H_CAP];
-    for (slot, chunk) in b1.iter_mut().zip(slice(Tensor::B1).as_chunks::<4>().0) {
-        *slot = i32::from_le_bytes(*chunk);
+    let mut bi = 0;
+    while bi < dims.hidden as usize {
+        b1[bi] = word_at(b1_slice, bi) as i32;
+        bi += 1;
     }
+    let b2_slice = tensor_slice(bytes, spans[Tensor::B2 as usize]);
     let mut b2 = [0i32; C_CAP];
-    for (slot, chunk) in b2.iter_mut().zip(slice(Tensor::B2).as_chunks::<4>().0) {
-        *slot = i32::from_le_bytes(*chunk);
+    let mut ci2 = 0;
+    while ci2 < dims.classes as usize {
+        b2[ci2] = word_at(b2_slice, ci2) as i32;
+        ci2 += 1;
     }
-    let m = (i64::from(stored) * i64::from(mult)) >> g;
-    let max_b1 = b1.iter().map(|&x| i64::from(x).abs()).max().unwrap_or(0);
-    if m - max_b1 < i64::from(t) {
+    let m = ((stored as i64) * (mult as i64)) >> g;
+    let mut max_b1 = 0i64;
+    let mut k = 0;
+    while k < b1.len() {
+        let v = (b1[k] as i64).abs();
+        if v > max_b1 {
+            max_b1 = v;
+        }
+        k += 1;
+    }
+    if m - max_b1 < t as i64 {
         return Err(ParamsError::Lossy { m, max_b1, t });
     }
-    if let Some((class, &value)) = b2
-        .iter()
-        .enumerate()
-        .find(|&(_, &x)| i64::from(x).abs() >= i64::from(B2_LIMIT))
-    {
-        return Err(ParamsError::B2OutOfRange {
-            class: class as u32,
-            value,
-        });
+    let mut class = 0;
+    while class < b2.len() {
+        let value = b2[class];
+        if (value as i64).abs() >= B2_LIMIT as i64 {
+            return Err(ParamsError::B2OutOfRange {
+                class: class as u32,
+                value,
+            });
+        }
+        class += 1;
     }
     Ok(ParamsView {
         bytes,
@@ -1507,23 +1551,23 @@ pub fn interior_rows(dims: Dims, min_ids: u32) -> (Vec<u32>, Vec<u16>) {
 struct Rng(u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    const fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
-    fn below(&mut self, n: u64) -> u64 {
+    const fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
 
     /// Uniform in `-bound..=bound`.
-    fn signed(&mut self, bound: i64) -> i64 {
+    const fn signed(&mut self, bound: i64) -> i64 {
         self.below(2 * bound as u64 + 1) as i64 - bound
     }
 
-    fn weight(&mut self) -> i8 {
+    const fn weight(&mut self) -> i8 {
         self.signed(127) as i8
     }
 }

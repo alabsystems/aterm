@@ -22,7 +22,7 @@ pub(super) fn resolve<'c>(
     machine: &Machine,
 ) -> Result<std::borrow::Cow<'c, Cask>, InstallError> {
     if let Some(what) = cask.unsupported_constraints {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "cask {} has unsupported constraints ({what})",
             cask.token
         )));
@@ -31,7 +31,7 @@ pub(super) fn resolve<'c>(
         return Ok(std::borrow::Cow::Borrowed(cask));
     }
     if machine.macos_major().is_none() {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "cask {} needs Homebrew variation selection",
             cask.token
         )));
@@ -40,7 +40,7 @@ pub(super) fn resolve<'c>(
         return Ok(std::borrow::Cow::Borrowed(cask));
     };
     if variation.unsupported {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "cask {} needs Homebrew variation selection",
             cask.token
         )));
@@ -62,7 +62,7 @@ pub(super) fn resolve<'c>(
     Ok(std::borrow::Cow::Owned(resolved))
 }
 
-/// The pre-lock delegation check for one cask on `machine`.
+/// The pre-lock native admission check for one cask on `machine`.
 pub(super) fn preflight(
     prefix: &Prefix,
     cask: &Cask,
@@ -75,7 +75,7 @@ pub(super) fn preflight(
             .macos_version()
             .is_some_and(|v| version_cmp(v, floor) != std::cmp::Ordering::Less)
     {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "cask {} needs macOS >= {floor}",
             cask.token
         )));
@@ -87,7 +87,7 @@ pub(super) fn preflight(
             here.len() >= bound.len() && here[..bound.len()] == bound[..]
         });
         if !met {
-            return Err(InstallError::PassThrough(format!(
+            return Err(InstallError::Unsupported(format!(
                 "cask {} needs exactly macOS {exact}",
                 cask.token
             )));
@@ -96,7 +96,7 @@ pub(super) fn preflight(
     if let Some(arch) = &cask.arch {
         let here = machine.arch();
         if arch != here {
-            return Err(InstallError::PassThrough(format!(
+            return Err(InstallError::Unsupported(format!(
                 "cask {} needs {arch} (this machine is {here})",
                 cask.token
             )));
@@ -109,13 +109,13 @@ pub(super) fn preflight(
         )));
     }
     if cask.disabled {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "cask {} is disabled upstream",
             cask.token
         )));
     }
     if cask.artifacts.iter().any(|a| matches!(a, Artifact::Pkg(_))) {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "cask {} ships a pkg installer (root work abrew never does itself)",
             cask.token
         )));
@@ -125,7 +125,7 @@ pub(super) fn preflight(
         && !fetch::is_dmg(&download_name(cask)))
         || cask.artifacts.is_empty()
     {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "cask {} needs its Homebrew extraction recipe",
             cask.token
         )));
@@ -154,7 +154,7 @@ fn preflight_deps_inner(
     let resolved = resolve(cask, catalog.machine())?;
     let cask: &Cask = &resolved;
     if depth > 8 {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "cask {} dependency chain is too deep",
             cask.token
         )));
@@ -220,7 +220,7 @@ fn install_deps_inner(
     let resolved = resolve(cask, Machine::this())?;
     let cask: &Cask = &resolved;
     if depth > 8 {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "cask {} dependency chain is too deep",
             cask.token
         )));
@@ -279,7 +279,7 @@ fn install_inner(
     on_request: bool,
 ) -> Result<String, InstallError> {
     if cask.disabled {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "cask {} is disabled upstream",
             cask.token
         )));
@@ -291,7 +291,7 @@ fn install_inner(
         eprintln!("abrew: warning: cask {} is deprecated upstream", cask.token);
     }
     if !super::valid_component(&cask.token) || !super::valid_cask_version(&cask.version) {
-        return Err(InstallError::PassThrough(
+        return Err(InstallError::Unsupported(
             "unsupported cask token/version".to_string(),
         ));
     }
@@ -313,7 +313,7 @@ fn install_inner(
         } else if (upgrade || reinstall) && older {
             replacing = true;
         } else if force || reinstall {
-            return Err(InstallError::PassThrough(format!(
+            return Err(InstallError::Unsupported(format!(
                 "replacement of cask {} needs brew",
                 cask.token
             )));
@@ -329,7 +329,7 @@ fn install_inner(
     if (!cask.naked && !fetch::archive_supported(&file) && !fetch::is_dmg(&file))
         || cask.artifacts.is_empty()
     {
-        return Err(InstallError::PassThrough(format!(
+        return Err(InstallError::Unsupported(format!(
             "cask {} needs its Homebrew extraction recipe",
             cask.token
         )));
@@ -650,13 +650,13 @@ fn wrapper_program(
     executable: &str,
 ) -> Result<Option<PathBuf>, InstallError> {
     if prefix.root.to_str().is_none() {
-        return Err(InstallError::PassThrough(
+        return Err(InstallError::Unsupported(
             "command wrappers need a lossless prefix path".to_string(),
         ));
     }
     if !executable.contains('/') {
         if !super::valid_component(executable) || executable.starts_with('-') {
-            return Err(InstallError::PassThrough(
+            return Err(InstallError::Unsupported(
                 "unsupported wrapper program name".to_string(),
             ));
         }
@@ -670,7 +670,7 @@ fn wrapper_program(
 /// Unpack a single same-named nested tar if present.
 fn dmg_error(token: &str, e: fetch::DmgError) -> InstallError {
     match e {
-        fetch::DmgError::Attach(_) => InstallError::PassThrough(format!(
+        fetch::DmgError::Attach(_) => InstallError::Unsupported(format!(
             "cask {token} container format needs Homebrew extraction"
         )),
         #[cfg(any(target_os = "macos", test))]
@@ -681,7 +681,7 @@ fn dmg_error(token: &str, e: fetch::DmgError) -> InstallError {
 /// Extract a zip archive using the system `unzip` when the strict reader refuses it.
 fn extraction_error(token: &str, e: String) -> InstallError {
     if e.contains("unsupported archive") || e.contains("io: zip: ") {
-        InstallError::PassThrough(format!(
+        InstallError::Unsupported(format!(
             "cask {token} container format needs Homebrew extraction"
         ))
     } else {
@@ -874,7 +874,7 @@ fn payload_source(cask: &Cask, name: &str) -> Option<PathBuf> {
 
 /// The refusal for an artifact source [`payload_source`] cannot map.
 fn unmapped_source(cask: &Cask) -> InstallError {
-    InstallError::PassThrough(format!(
+    InstallError::Unsupported(format!(
         "cask {} artifact sources from outside its payload",
         cask.token
     ))
@@ -919,7 +919,7 @@ fn artifact_paths(
                     .and_then(|e| e.to_str())
                     .filter(|e| !e.is_empty() && e.bytes().all(|b| b.is_ascii_alphanumeric()));
                 let Some(section) = section else {
-                    return Err(InstallError::PassThrough(format!(
+                    return Err(InstallError::Unsupported(format!(
                         "cask {} manpage needs a Homebrew section mapping",
                         cask.token
                     )));
@@ -967,7 +967,7 @@ fn artifact_paths(
                         .components()
                         .any(|part| !matches!(part, Component::Normal(_)))
                 {
-                    return Err(InstallError::PassThrough(
+                    return Err(InstallError::Unsupported(
                         "invalid prefix-relative artifact directory".to_string(),
                     ));
                 }
@@ -976,7 +976,7 @@ fn artifact_paths(
             Artifact::Wrapper(name, executable, args, dest) => {
                 wrapper_program(prefix, cask, executable)?;
                 if args.iter().any(|argument| argument.contains('\0')) {
-                    return Err(InstallError::PassThrough(
+                    return Err(InstallError::Unsupported(
                         "wrapper arguments cannot contain NUL".to_string(),
                     ));
                 }
@@ -989,13 +989,13 @@ fn artifact_paths(
                     })
                     .filter(|f| super::valid_component(f));
                 let Some(file) = file else {
-                    return Err(InstallError::PassThrough(
+                    return Err(InstallError::Unsupported(
                         "cask command wrapper needs a Homebrew name mapping".to_string(),
                     ));
                 };
                 let dst = prefix.bin().join(&file);
                 if !destinations.insert(dst.clone()) {
-                    return Err(InstallError::PassThrough(
+                    return Err(InstallError::Unsupported(
                         "cask has overlapping artifact destinations".to_string(),
                     ));
                 }
@@ -1007,13 +1007,13 @@ fn artifact_paths(
                     .as_deref()
                     .and_then(|t| map_generic_target(prefix, t))
                 else {
-                    return Err(InstallError::PassThrough(format!(
+                    return Err(InstallError::Unsupported(format!(
                         "cask {} artifact target is outside abrew's prefix mapping",
                         cask.token
                     )));
                 };
                 if !destinations.insert(dst.clone()) {
-                    return Err(InstallError::PassThrough(
+                    return Err(InstallError::Unsupported(
                         "cask has overlapping artifact destinations".to_string(),
                     ));
                 }
@@ -1022,13 +1022,13 @@ fn artifact_paths(
                 continue;
             }
             Artifact::Other(kind) => {
-                return Err(InstallError::PassThrough(format!(
+                return Err(InstallError::Unsupported(format!(
                     "cask {} has an unsupported artifact recipe ({kind})",
                     cask.token
                 )));
             }
             _ => {
-                return Err(InstallError::PassThrough(format!(
+                return Err(InstallError::Unsupported(format!(
                     "cask {} has an unsupported artifact recipe",
                     cask.token
                 )));
@@ -1049,12 +1049,12 @@ fn artifact_paths(
                     .all(|part| matches!(part, Component::Normal(_)))
         });
         if relative.is_none() {
-            return Err(InstallError::PassThrough(
+            return Err(InstallError::Unsupported(
                 "artifact destination escapes the prefix".to_string(),
             ));
         }
         if !destinations.insert(dst.clone()) {
-            return Err(InstallError::PassThrough(
+            return Err(InstallError::Unsupported(
                 "cask has overlapping artifact destinations".to_string(),
             ));
         }
@@ -1581,7 +1581,7 @@ mod tests {
         assert_eq!(wrapped.stdout, b"wrapped --fixed user\n");
         assert!(matches!(
             install(&prefix, &cask, false, true, false, false),
-            Err(InstallError::PassThrough(_))
+            Err(InstallError::Unsupported(_))
         ));
         let unknown = prefix.cask_dir("demo", "personal");
         std::fs::create_dir_all(&unknown).unwrap();
@@ -1759,10 +1759,10 @@ mod tests {
     }
 
     #[test]
-    fn extraction_structural_refusals_delegate_vetting_refusals_fail() {
+    fn extraction_structural_refusals_are_unsupported_vetting_refusals_fail() {
         assert!(matches!(
             dmg_error("x", fetch::DmgError::Attach("unsupported image".into())),
-            InstallError::PassThrough(_)
+            InstallError::Unsupported(_)
         ));
         for name in ["dmg attach failed", "unsupported archive", "io: zip: "] {
             assert!(matches!(
@@ -1795,14 +1795,14 @@ mod tests {
                 "abrew: cannot extract /c/e.zip: io: zip: no end-of-central-directory record"
                     .to_string()
             ),
-            InstallError::PassThrough(_)
+            InstallError::Unsupported(_)
         ));
         assert!(matches!(
             extraction_error(
                 "x",
                 "abrew: unsupported archive; use brew for this format".to_string()
             ),
-            InstallError::PassThrough(_)
+            InstallError::Unsupported(_)
         ));
         assert!(matches!(
             extraction_error(
@@ -1841,7 +1841,7 @@ mod tests {
         ] {
             assert!(matches!(
                 wrapper_program(&prefix, &c, exe),
-                Err(InstallError::PassThrough(_))
+                Err(InstallError::Unsupported(_))
             ));
         }
     }
@@ -1921,7 +1921,7 @@ mod tests {
                 assert!(
                     matches!(
                         artifact_paths(&prefix, &c),
-                        Err(InstallError::PassThrough(_))
+                        Err(InstallError::Unsupported(_))
                     ),
                     "{:?}",
                     c.artifacts
@@ -2042,7 +2042,7 @@ mod tests {
                 assert!(
                     matches!(
                         preflight(&prefix, &elsewhere, &machine),
-                        Err(InstallError::PassThrough(why)) if why.contains("outside its payload")
+                        Err(InstallError::Unsupported(why)) if why.contains("outside its payload")
                     ),
                     "{installer} {artifact}"
                 );
@@ -2090,7 +2090,7 @@ mod tests {
         )];
         assert!(matches!(
             artifact_paths(&prefix, &c),
-            Err(InstallError::PassThrough(_))
+            Err(InstallError::Unsupported(_))
         ));
     }
 
@@ -2106,7 +2106,7 @@ mod tests {
             cask.artifacts.push(artifact);
             assert!(matches!(
                 install(&prefix, &cask, false, false, false, false),
-                Err(InstallError::PassThrough(_))
+                Err(InstallError::Unsupported(_))
             ));
             assert!(!prefix.root.exists());
         }
@@ -2114,10 +2114,10 @@ mod tests {
         named.artifacts.push(Artifact::Other(
             "generate_completions_from_executable".to_string(),
         ));
-        let Err(InstallError::PassThrough(msg)) =
+        let Err(InstallError::Unsupported(msg)) =
             install(&prefix, &named, false, false, false, false)
         else {
-            panic!("expected passthrough");
+            panic!("expected native refusal");
         };
         assert!(
             msg.contains("generate_completions_from_executable"),
@@ -2127,7 +2127,7 @@ mod tests {
         let cask = cask("unused.xar".to_string());
         assert!(matches!(
             install(&prefix, &cask, false, false, false, false),
-            Err(InstallError::PassThrough(_))
+            Err(InstallError::Unsupported(_))
         ));
         assert!(!prefix.root.exists());
         let with_deps = aterm_json::from_str(
@@ -2148,7 +2148,7 @@ mod tests {
             assert!(constrained.unsupported_constraints.is_some());
             assert!(matches!(
                 install(&prefix, &constrained, false, false, false, false),
-                Err(InstallError::PassThrough(_))
+                Err(InstallError::Unsupported(_))
             ));
             assert!(!prefix.root.exists());
         }

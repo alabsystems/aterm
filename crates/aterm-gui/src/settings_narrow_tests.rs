@@ -1600,6 +1600,62 @@ fn the_packages_service_line_paints_its_value_in_the_column_it_was_measured_for(
     });
 }
 
+/// A MESSAGES FILTER CHIP BREAKS A WORD ONLY WHERE ITS ROOM CANNOT HOLD IT (item 101),
+/// from 22 to 42 columns at 1×, 1.5× and 2×, and no line starts or ends in ` · `.
+#[test]
+fn a_messages_chip_breaks_a_word_only_where_its_room_cannot_hold_it() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "Messages chips", |scale| {
+        let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
+        let measure = |line: &str| {
+            crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, line, px).max(
+                crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, line, px),
+            )
+        };
+        for cols in 22..=42_u16 {
+            let width = 178.0 + 7.0 * f32::from(cols - 22);
+            let (runtime, instance, view) = super::setup_with_messages();
+            let compiled =
+                compile_settings_view(&runtime, instance, view, &view_cx_at(width, 516.0));
+            let mut chips = 0;
+            for node in &compiled.paint {
+                if !node.key.as_str().starts_with("settings/messages/filter/") {
+                    continue;
+                }
+                let UiContent::Button(control) = &node.content else {
+                    continue;
+                };
+                let Some(painted) = control.spec.visual_label.as_deref() else {
+                    continue;
+                };
+                chips += 1;
+                let at = format!("{scale}\u{d7} {cols} cols {}", node.key.as_str());
+                let room = crate::native_ui::centred_label_room(&control.spec, node.rect.width);
+                let lines: Vec<&str> = painted.split('\n').collect();
+                for line in &lines {
+                    assert!(
+                        !line.starts_with('\u{b7}') && !line.ends_with('\u{b7}'),
+                        "{at}: {painted:?}"
+                    );
+                }
+                for word in control
+                    .spec
+                    .label
+                    .split([' ', '\u{b7}'])
+                    .filter(|w| !w.is_empty())
+                {
+                    if measure(word) <= room {
+                        assert!(
+                            lines.iter().any(|line| line.split(' ').any(|w| w == word)),
+                            "{at}: {word:?} fits the {room}pt room but {painted:?}"
+                        );
+                    }
+                }
+            }
+            assert!(chips >= 2, "{scale}\u{d7} {cols} cols: chips");
+        }
+    });
+}
+
 #[test]
 fn messages_keeps_its_words_with_a_log() {
     let reach = [
@@ -3776,5 +3832,432 @@ fn a_cjk_message_title_is_painted_at_every_narrow_width() {
                 assert!(seen > 0, "{context}: the title is painted on some screen");
             }
         }
+    });
+}
+
+/// What a paint-text audit line says a node paints, its lines joined by `\n`.
+fn audit_painted(line: &str) -> Option<String> {
+    let (_, painted) = line.rsplit_once(" painted=")?;
+    Some(
+        painted
+            .trim_matches('"')
+            .replace("\\n", "\n")
+            .replace("\\\"", "\""),
+    )
+}
+
+/// Every screen of the compact category sheet, opened over `route` in a `width`×`height`
+/// window from a fresh runtime.
+fn sheet_screens(
+    route: SettingsRoute,
+    width: f32,
+    height: f32,
+) -> Vec<crate::native_ui::CompiledUi> {
+    let (mut runtime, instance, view) = setup();
+    go_to_route(&mut runtime, instance, view, route);
+    let cx = view_cx_at(width, height);
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new("settings/compact-navigation"),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let mut screens = Vec::new();
+    each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+        screens.push(compiled.clone());
+    });
+    screens
+}
+
+/// Every category's name is whole on the compact category sheet, and no two paint alike: a cell
+/// gives up its arrow, then its pictogram, before its name, and the name takes the lines it
+/// needs, a word broken only where it is wider than a line. At every compact width from the
+/// 164pt window floor, at 1×, 1.5× and 2× text, every category is on some screen.
+#[test]
+fn every_category_name_is_whole_and_its_own() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "category names", |scale| {
+        let mut faults = Vec::new();
+        for width in [164.0_f32, 178.0, 192.0, 234.0, 276.0, 318.0, 420.0, 584.0] {
+            let context = format!("{scale}\u{d7} {width}");
+            let mut painted = BTreeMap::<String, String>::new();
+            for compiled in sheet_screens(SettingsRoute::Home, width, 348.0) {
+                let cut = cut_words(&compiled, &["settings/categories/"]);
+                if !cut.is_empty() {
+                    faults.push(format!("{context}: {cut:#?}"));
+                }
+                for line in compiled.paint_audit_lines() {
+                    let Some(route) = line
+                        .strip_prefix("paint-text key=\"settings/categories")
+                        .and_then(|rest| rest.split_once('"'))
+                        .and_then(|(path, _)| SettingsRoute::from_path(path))
+                    else {
+                        continue;
+                    };
+                    let shown = audit_painted(&line).unwrap_or_default();
+                    let words = shown.replace("-\n", "").replace('\n', " ");
+                    if words != route.label() {
+                        faults.push(format!("{context}: {:?} paints {shown:?}", route.label()));
+                    }
+                    painted.insert(route.label().to_string(), shown);
+                }
+            }
+            if painted.len() != SettingsRoute::rail_len() {
+                faults.push(format!(
+                    "{context}: {} of {} categories on some screen: {painted:?}",
+                    painted.len(),
+                    SettingsRoute::rail_len()
+                ));
+            }
+            let distinct: BTreeSet<&String> = painted.values().collect();
+            if distinct.len() != painted.len() {
+                faults.push(format!("{context}: two names paint alike: {painted:?}"));
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
+/// The compact toolbar holds every control whole: at every compact width from the 164pt floor
+/// to 60 columns, at every text size, on a page and on the category sheet, the leading button,
+/// the title and Search are each whole inside the bar (the toolbar less its insets), each
+/// button a touch target, their words whole.
+#[test]
+fn the_compact_toolbar_holds_every_control_whole() {
+    at_each_text_scale(
+        &[0.85, 1.0, 1.2, 1.4, 1.7, 2.0],
+        "the toolbar's controls",
+        |scale| {
+            let mut faults = Vec::new();
+            for columns in (20..=60).step_by(2) {
+                let width = 164.0 + (columns - 20) as f32 * 7.0;
+                for sheet in [false, true] {
+                    let context = format!("{scale}\u{d7} {width} sheet:{sheet}");
+                    let (mut runtime, instance, view) = setup();
+                    go_to_route(&mut runtime, instance, view, SettingsRoute::KeyboardInput);
+                    if sheet {
+                        runtime
+                            .dispatch(
+                                instance,
+                                view,
+                                AppEvent::Action(ActionInvocation {
+                                    id: ActionId::new("settings/compact-navigation"),
+                                    value: None,
+                                }),
+                            )
+                            .unwrap();
+                    }
+                    let compiled =
+                        compile_settings_view(&runtime, instance, view, &view_cx_at(width, 348.0));
+                    let Some(toolbar) = compiled.semantic(&UiKey::new("settings/compact-toolbar"))
+                    else {
+                        continue;
+                    };
+                    let bar = (toolbar.rect.x + 10.0, toolbar.rect.right() - 10.0);
+                    let mut controls = 0;
+                    for node in &compiled.paint {
+                        let key = node.key.as_str();
+                        let control = key == "settings/compact-navigation"
+                            || key == "settings/compact-navigation-close"
+                            || key == SEARCH_OPEN
+                            || key == "settings/search-bar"
+                            || key.starts_with("settings/page-heading/");
+                        if !control || node.rect.bottom() > toolbar.rect.bottom() + 0.5 {
+                            continue;
+                        }
+                        controls += 1;
+                        if node.rect.x < bar.0 - 0.5 || node.rect.right() > bar.1 + 0.5 {
+                            faults.push(format!("{context}: {key} {:?} past {bar:?}", node.rect));
+                        }
+                        if node.clip != node.rect {
+                            faults.push(format!("{context}: {key} cut to {:?}", node.clip));
+                        }
+                        if matches!(node.content, UiContent::Button(_)) && node.rect.width < 43.5 {
+                            faults.push(format!("{context}: {key} {:?} narrow", node.rect));
+                        }
+                    }
+                    if controls < 2 {
+                        faults.push(format!("{context}: {controls} controls in the toolbar"));
+                    }
+                    let cut: Vec<String> = cut_words(
+                        &compiled,
+                        &[
+                            "settings/compact-navigation",
+                            "settings/page-heading/",
+                            "settings/search",
+                        ],
+                    )
+                    .into_iter()
+                    .filter(|line| !line.ends_with("painted=\"Search\u{2026}\""))
+                    .collect();
+                    if !cut.is_empty() {
+                        faults.push(format!("{context}: {cut:#?}"));
+                    }
+                }
+            }
+            assert!(
+                faults.is_empty(),
+                "{} faults:\n{}",
+                faults.len(),
+                faults.join("\n")
+            );
+        },
+    );
+}
+
+/// Every category is whole and live on some screen of a short category sheet at 2× text: a
+/// group's heading is let go where it and the row under it cannot both be whole in the room,
+/// as a field page's caption is, so no row is cut on every screen.
+#[test]
+fn every_category_is_whole_on_some_screen_of_a_short_sheet() {
+    at_each_text_scale(&[2.0], "a short sheet", |_| {
+        let mut faults = Vec::new();
+        for (width, height) in [
+            (738.0, 180.0),
+            (444.0, 180.0),
+            (584.0, 210.0),
+            (178.0, 210.0),
+        ] {
+            let screens = sheet_screens(SettingsRoute::Home, width, height);
+            let listed: BTreeSet<String> = screens
+                .iter()
+                .flat_map(|compiled| compiled.semantics.iter())
+                .filter_map(|node| {
+                    let path = node.key.as_str().strip_prefix("settings/categories")?;
+                    SettingsRoute::from_path(path).map(|_| node.key.as_str().to_string())
+                })
+                .collect();
+            if listed.len() != SettingsRoute::rail_len() {
+                faults.push(format!(
+                    "{width}x{height}: {} categories listed",
+                    listed.len()
+                ));
+            }
+            for key in listed {
+                let key = UiKey::new(key);
+                let whole = screens.iter().any(|compiled| {
+                    compiled.paint.iter().any(|node| {
+                        node.key == key
+                            && node.clip == node.rect
+                            && node.fade.is_none()
+                            && compiled.hits.iter().any(|hit| {
+                                hit.key == key && (hit.rect.height - node.rect.height).abs() < 0.5
+                            })
+                    })
+                });
+                if !whole {
+                    faults.push(format!(
+                        "{width}x{height}: {} is whole on no screen",
+                        key.as_str()
+                    ));
+                }
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
+/// Every page is named on screen, once: the compact toolbar titles the page beside the Search
+/// button as well as beside a field, and where it cannot, the page's list leads with its name.
+/// On every route and the category sheet, at short and narrow compact windows and a regular
+/// one, the page's name is one Heading on its top screen, whole.
+#[test]
+fn every_page_is_named_once_on_screen() {
+    let windows = [
+        (1.0, 318.0, 208.0),
+        (1.0, 178.0, 210.0),
+        (1.0, 584.0, 210.0),
+        (1.0, 849.0, 513.0),
+        (2.0, 584.0, 348.0),
+        (2.0, 444.0, 292.0),
+        (2.0, 318.0, 348.0),
+        (2.0, 234.0, 348.0),
+        (2.0, 178.0, 348.0),
+        (2.0, 234.0, 180.0),
+        (2.0, 178.0, 180.0),
+    ];
+    at_each_text_scale(&[1.0, 2.0], "page names", |scale| {
+        let mut faults = Vec::new();
+        for (_, width, height) in windows.iter().filter(|(at, ..)| *at == scale) {
+            let cx = view_cx_at(*width, *height);
+            for (route, sheet) in SettingsRoute::ALL
+                .into_iter()
+                .map(|route| (route, false))
+                .chain([(SettingsRoute::Home, true)])
+            {
+                let context = format!("{scale}\u{d7} {width}x{height} {route:?} sheet:{sheet}");
+                let (mut runtime, instance, view) = setup();
+                go_to_route(&mut runtime, instance, view, route);
+                if sheet {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!();
+                    };
+                    state.compact_navigation = true;
+                }
+                // The page's top screen: a page that opens on a row further down (Cursor
+                // Styles, on the saved style) is named where its list starts.
+                let compiled = walk_start(&mut runtime, instance, view, &cx).0;
+                // The category sheet is the compact window's; beside the rail it is not drawn.
+                let compact = compiled
+                    .semantic(&UiKey::new("settings/compact-toolbar"))
+                    .is_some();
+                if sheet && !compact {
+                    continue;
+                }
+                let names: Vec<&crate::native_ui::SemanticNode> = compiled
+                    .semantics
+                    .iter()
+                    .filter(|node| {
+                        node.role == SemanticRole::Heading
+                            && node.key.as_str().starts_with("settings/page-heading/")
+                            && !node.offscreen
+                            && node.rect.bottom() <= height + 0.5
+                    })
+                    .collect();
+                let want: Vec<&str> = if sheet {
+                    vec![ALL_SETTINGS]
+                } else if route == SettingsRoute::Harness {
+                    vec![route.label(), harness_page::HARNESS_PAGE_TITLE]
+                } else {
+                    vec![route.label()]
+                };
+                let [name] = names.as_slice() else {
+                    faults.push(format!(
+                        "{context}: {} names on screen: {:?}",
+                        names.len(),
+                        names.iter().map(|node| &node.label).collect::<Vec<_>>()
+                    ));
+                    continue;
+                };
+                if !want.contains(&name.label.as_str()) {
+                    faults.push(format!("{context}: named {:?}", name.label));
+                }
+                let cut = cut_words(&compiled, &["settings/page-heading/"]);
+                if !cut.is_empty() {
+                    faults.push(format!("{context}: {cut:#?}"));
+                }
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
+/// A summary taller than the page is on some screen: Modified's count and its Reset All are
+/// each whole on some screen of a short window at 2× text, the list taking the summary a part
+/// at a time where it is taller than a screen. CONTROL: at 444×194 the summary is pinned whole
+/// over the list.
+#[test]
+fn a_summary_taller_than_the_page_is_on_some_screen() {
+    let source = "agents_auto_prime = false\ncursor_blink = false\ntheme = \"Nord\"\n\
+                  cursor_trail_ms = 300\ncursor_trail_length = 30\nfuture_thing = 5\n";
+    let seen = |width: f32, height: f32| {
+        let (mut runtime, instance, view) = every_page_runtime_over(source);
+        go_to_route(&mut runtime, instance, view, SettingsRoute::Modified);
+        let (mut count, mut reset, mut cut) = (false, false, Vec::new());
+        each_screen(
+            &mut runtime,
+            instance,
+            view,
+            &view_cx_at(width, height),
+            |screen, _| {
+                for node in &screen.paint {
+                    let whole = node.clip == node.rect && node.fade.is_none();
+                    match node.key.as_str() {
+                        "settings/results-range" => count |= whole,
+                        "settings/modified/reset-all" => {
+                            reset |= whole
+                                && screen.hits.iter().any(|hit| {
+                                    hit.key == node.key
+                                        && (hit.rect.height - node.rect.height).abs() < 0.5
+                                });
+                        }
+                        _ => {}
+                    }
+                }
+                cut.extend(cut_words(screen, &["settings/results-range"]));
+            },
+        );
+        (count, reset, cut)
+    };
+    at_each_text_scale(&[2.0], "a tall summary", |_| {
+        assert_eq!(seen(444.0, 194.0), (true, true, Vec::new()), "CONTROL");
+        for (width, height) in [(444.0, 180.0), (584.0, 180.0), (178.0, 180.0)] {
+            let (count, reset, cut) = seen(width, height);
+            assert!(count, "{width}x{height}: the count is whole on some screen");
+            assert!(
+                reset,
+                "{width}x{height}: Reset All is whole and live on some screen"
+            );
+            assert!(cut.is_empty(), "{width}x{height}: {cut:#?}");
+        }
+    });
+}
+
+/// The Settings search field keeps a typed query readable: it shows the query's caret end,
+/// never an ellipsis over typed words, with the keyboard in it or not, and the toolbar gives it
+/// the room the query needs before the leading button's name. At every compact width, at 1×,
+/// 1.5× and 2× text, "board" is whole, and a query longer than the field shows its end.
+#[test]
+fn the_search_field_keeps_a_typed_query_readable() {
+    let long = "cursor trail length and colour";
+    at_each_text_scale(&[1.0, 1.5, 2.0], "the search field", |scale| {
+        let mut faults = Vec::new();
+        for columns in (20..=80).step_by(6) {
+            let width = 164.0 + (columns - 20) as f32 * 7.0;
+            for query in ["board", long] {
+                for focused in [true, false] {
+                    let context = format!("{scale}\u{d7} {width} {query:?} focused:{focused}");
+                    let cx = view_cx_at(width, 348.0);
+                    let (mut runtime, instance, view, _) = compile_search(query, &cx);
+                    {
+                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                        else {
+                            unreachable!();
+                        };
+                        state.common.last_focus = focused.then(|| UiKey::new("settings/search"));
+                    }
+                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                    let Some(shown) = compiled
+                        .paint_audit_lines()
+                        .into_iter()
+                        .find(|line| line.starts_with("paint-text key=\"settings/search\" "))
+                        .and_then(|line| audit_painted(&line))
+                    else {
+                        faults.push(format!("{context}: no field"));
+                        continue;
+                    };
+                    if shown.contains('\u{2026}') || (query == "board" && shown != query) {
+                        faults.push(format!("{context}: paints {shown:?}"));
+                    } else if !query.ends_with(shown.trim_start()) || shown.trim().is_empty() {
+                        faults.push(format!("{context}: paints {shown:?}, not its end"));
+                    }
+                }
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
     });
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Inbound scheduling hints, leased only after the channel's actor is verified.
+//! Per-peer scheduling hints, leased only after the channel's actor is verified.
 //! No mutex guard crosses network I/O. Durable inventories still decide delivery.
 
 use super::Repair;
@@ -55,7 +55,7 @@ impl Cache {
         let mut pool = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         if pool.active.contains(&actor) {
             return Err(Error::new(
-                "Commons peer already has an inbound repair round",
+                "Commons peer already has an active repair round",
             ));
         }
         if let Some(index) = pool.idle.iter().position(|(id, _)| *id == actor) {
@@ -63,7 +63,7 @@ impl Cache {
             *repair = saved;
         } else if pool.active.len() + pool.idle.len() == CAPACITY && pool.idle.pop_front().is_none()
         {
-            return Err(Error::new("Commons inbound repair capacity is busy"));
+            return Err(Error::new("Commons peer repair capacity is busy"));
         }
         pool.active.insert(actor);
         Ok(Lease {

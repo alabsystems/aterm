@@ -93,9 +93,7 @@ fn observe_subjects(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Obs
         );
     }
     if wants(Setting::Secrets) {
-        out.push(
-            vault(plan).unwrap_or_else(|why| unread(Subject::Setting(Setting::Secrets), &why)),
-        );
+        out.push(vault(plan).unwrap_or_else(|why| vault_unread(&why)));
     }
     if network && wants(Setting::Repositories) {
         out.push(
@@ -326,6 +324,24 @@ fn vault(plan: &Plan) -> Result<Observation, String> {
         plan.selection.contains(Setting::Secrets),
         here,
     ))
+}
+
+/// The Secrets vault row's note when aterm cannot read this Mac's vault settings (a
+/// root-owned `source.toml` from a `sudo aterm secrets …`, a newer format, a state file it
+/// cannot parse): calm, since the rest of setup goes ahead without them (System State design
+/// §3.3), and in the page's words, never the file or the error, which `aterm secrets status`
+/// prints.
+pub(super) const VAULT_UNREAD: &str =
+    "aterm cannot read this Mac's vault settings; aterm secrets status says why";
+
+/// The Secrets vault row aterm could not read (`why`, kept as its detail for `aterm doctor`'s
+/// eyes): not read, with [`VAULT_UNREAD`] as its one calm note.
+fn vault_unread(why: &str) -> Observation {
+    Observation {
+        note: Some(VAULT_UNREAD.to_owned()),
+        detail: Some(why.to_owned()),
+        ..Observation::unknown(Subject::Setting(Setting::Secrets))
+    }
 }
 
 /// The note of a member Mac whose subscriber runs and whose credentials are not
@@ -783,6 +799,22 @@ mod tests {
             let now = vault_observation(&read, true, None).now.unwrap();
             assert!(now.chars().count() <= 14, "{now}");
         }
+    }
+
+    /// A vault configuration aterm cannot read is no failure and no reading under way: the row
+    /// is not read, with one calm note in the page's words and the reason kept as its detail,
+    /// never on the page.
+    #[test]
+    fn an_unreadable_vault_config_reads_calmly_in_page_words() {
+        let why = "/Users//m/.config/aterm/secrets/source.toml: Permission denied (os error 13)";
+        let observation = vault_unread(why);
+        assert_eq!(observation.subject, Subject::Setting(Setting::Secrets));
+        assert_eq!(observation.standing, Standing::Unknown);
+        assert!(!observation.standing.attention());
+        assert_eq!(observation.now, None);
+        assert_eq!(observation.note.as_deref(), Some(VAULT_UNREAD));
+        assert!(!VAULT_UNREAD.contains('/') && !VAULT_UNREAD.contains("toml"));
+        assert_eq!(observation.detail.as_deref(), Some(why));
     }
 
     /// Every Secrets read, managed or not, with and without a vault this network

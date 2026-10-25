@@ -32,6 +32,35 @@ pub struct InitialSetupAdmissionStopTest<'a> {
 }
 
 impl<'a> InitialSetupAdmissionStopTest<'a> {
+    /// A real older Restore before any run, ready for the bring-forward path.
+    pub fn restored_before_run(root: &'a Path) -> Result<Self, String> {
+        {
+            let _lock = HeldLock::take(root)?;
+            write_json(
+                &root.join("first-run.json"),
+                &json!({"profile": PROFILE, "state": "restored"}),
+            )?;
+        }
+        Self::startup(root)
+    }
+
+    /// The actual bring-forward writer with a refused write, or a visible rename
+    /// whose namespace flush fails. No service or OS preference port is reached.
+    pub fn bring_forward_progress_error(
+        &self,
+        after_rename: bool,
+        published: impl FnMut(u64),
+    ) -> Result<BroughtForward, String> {
+        let _lock = HeldLock::take(self.root)?;
+        bring_forward_restored_observing_using(
+            self.root,
+            |_| Ok(()),
+            published,
+            |root, progress| progress_publication_error(root, progress, after_rename),
+        )
+        .map(|run| run.map_or(BroughtForward::Nothing, BroughtForward::Run))
+    }
+
     pub fn startup(root: &'a Path) -> Result<Self, String> {
         let mut ticket = InitialSetupAuthorization::capture_at(root)?;
         ticket.offer_reading(root, || Ok(None))?;

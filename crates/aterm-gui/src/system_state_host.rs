@@ -192,6 +192,15 @@ pub fn publish_initial_setup_status(status: SetupStatus) {
 /// setup worker (`crate::system_state::fixture_status`): its actions are inert.
 const FIXTURE_SEAM: &str = "ATERM_DEV_SYSTEM_STATE_FIXTURE";
 
+/// A read that met a write of the saved setup ([`SetupStatus::changing`]) is read again this
+/// soon: the write is a rename, over in a moment.
+const CHANGING_REREAD: Duration = Duration::from_millis(100);
+
+/// Reads in a row that may meet a write before the page shows the next as it is: records that
+/// keep changing show as its pending row. The window's own admission keeps the last read that
+/// named a plan all the same, since a read that met a write says nothing of one.
+const CHANGING_READS: u8 = 10;
+
 /// How a request to read the shown page's rows went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Observe {
@@ -218,6 +227,8 @@ pub(crate) struct Host {
     operation: Option<SetupOperation>,
     next_status: Option<Instant>,
     status_in_flight: bool,
+    /// Reads in a row that met a write of the saved setup ([`SetupStatus::changing`]).
+    changing_reads: u8,
     next_tick: Option<Instant>,
     generation: u64,
     offer_presented: bool,
@@ -230,6 +241,9 @@ pub(crate) struct Host {
     /// The plan in force when the shown page's rows were last read: a status
     /// that names another (a Restore in a terminal) has them read again.
     observed_plan: Option<Plan>,
+    /// The access approval whose Not now answers the last reading interpreted.
+    /// A new approval can keep the same plan and still needs fresh Access rows.
+    observed_access_revision: Option<u64>,
     action_refusal: Option<SetupStatusRow>,
     latest_status: SetupStatus,
     /// The access step last published with the status.
@@ -327,6 +341,15 @@ impl App {
         self.finish_system_state_shutdown_with(handlers);
     }
 
+    /// Queued setup has no durable successor yet; Restore also belongs to this worker
+    /// until a fresh status ends its reservation, even after its controller closes.
+    pub(crate) fn system_state_handoff_pending(&self) -> bool {
+        let host = &self.system_state_host;
+        host.pending_apply.is_some()
+            || host.operation == Some(SetupOperation::Restore)
+            || host.latest_status.queued
+    }
+
     /// An update's handoff is about to end this process: what a Stop still
     /// owes the records gets the same bounded wait a quit gives it
     /// ([`InitialSetupHandlers::settle`]); with nothing owed it returns at
@@ -374,13 +397,26 @@ impl App {
         if generation != self.system_state_host.generation {
             return;
         }
+        // A read that met a write under way says nothing of the saved setup: the window's own
+        // admission keeps the last read that did, and so does the page until records that keep
+        // changing show as such. The next read comes once the write is over.
+        let changing = status.changing;
+        if changing && self.system_state_host.changing_reads < CHANGING_READS {
+            self.system_state_host.changing_reads += 1;
+            self.system_state_host.status_in_flight = false;
+            self.system_state_host.next_status = Some(Instant::now() + CHANGING_REREAD);
+            return;
+        }
+        self.system_state_host.changing_reads = 0;
         // This read was asked for after any accepted plan's admission, so it
         // shows that run (or its end).
         self.system_state_host.awaiting_run = false;
         if !status.busy {
             self.system_state_host.operation = None;
         }
-        self.observe_initial_setup_permissions(status.permissions);
+        if !changing {
+            self.observe_initial_setup_permissions(status.permissions);
+        }
         self.publish_system_state(status);
     }
 
@@ -462,11 +498,7 @@ impl App {
     ) -> (SetupStatus, Option<Access>) {
         if self.system_state_host.operation.is_some()
             || self.system_state_host.awaiting_run
-            || self
-                .system_state_host
-                .pending_apply
-                .as_ref()
-                .is_some_and(|pending| self.system_state_instance_has_view(pending.instance))
+            || self.system_state_host.pending_apply.is_some()
         {
             status.busy = true;
         }
@@ -649,14 +681,18 @@ impl App {
             self.publish_system_state(self.system_state_host.latest_status.clone());
         }
         let shown = self.system_state_shown_views(instance);
-        // A plan changed outside the page (`aterm doctor --restore` in a terminal, another
-        // record's change) reaches it only as a status naming that plan: the rows it shows
-        // were read for another, so they are read again, as when the page is shown.
+        // A plan or access approval changed outside the page reaches it in the status.
+        // The same plan can have a new approval whose Not now answers differ, so both
+        // changes read the rows again, as when the page is shown.
         let host = &mut self.system_state_host;
         if host.shown
-            && host.latest_status.plan.is_some()
-            && host.observed_plan.is_some()
-            && host.observed_plan != host.latest_status.plan
+            && ((host.latest_status.plan.is_some()
+                && host.observed_plan.is_some()
+                && host.observed_plan != host.latest_status.plan)
+                || (!host.latest_status.changing
+                    && host.latest_status.permissions.is_some_and(|policy| {
+                        Some(policy.revision) != host.observed_access_revision
+                    })))
         {
             host.shown = false;
         }
@@ -678,6 +714,11 @@ impl App {
                 (observe == Observe::Refused).then_some(now + Duration::from_secs(1));
             if observe == Observe::Started {
                 host.observed_plan = host.latest_status.plan.clone();
+                if !host.latest_status.changing
+                    && let Some(policy) = host.latest_status.permissions
+                {
+                    host.observed_access_revision = Some(policy.revision);
+                }
             }
         }
         if self.system_state_access_step() != self.system_state_host.access_step {
@@ -1153,7 +1194,10 @@ impl App {
         } else {
             self.refuse_system_state_apply(pending);
         }
-        self.finish_system_state_action(accepted, "Setup");
+        // A plan the worker took and then let go says why in the worker's own rows (a step
+        // that failed, in the page's words), or says nothing, overtaken by a later choice: the
+        // host adds no row of its own beside them, so one press is said once.
+        self.finish_system_state_action(true, "Setup");
         if accepted {
             self.publish_system_state(self.system_state_host.latest_status.clone());
         }

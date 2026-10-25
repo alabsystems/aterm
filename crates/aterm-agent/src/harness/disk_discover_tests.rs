@@ -45,13 +45,22 @@ fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).expect("canonical")
 }
 
+/// Claude Code's session record for `pid` under `home`, started when the kernel says `pid`
+/// started (a fixed time for a pid no process has).
 fn register(home: &Path, pid: u32, session: &str) {
+    let started = crate::harness::upgrade_drive::kernel_start(pid)
+        .unwrap_or_else(|| "Thu Oct  1 00:10:35 2026".into());
+    register_started(home, pid, session, &started);
+}
+
+/// Claude Code's session record for `pid` under `home`, naming `started` as its process start.
+fn register_started(home: &Path, pid: u32, session: &str, started: &str) {
     let dir = mkdirs(&home.join(".claude/sessions"));
     std::fs::write(
         dir.join(format!("{pid}.json")),
         format!(
             "{{\"pid\":{pid},\"sessionId\":\"{session}\",\"cwd\":\"/x\",\"version\":\"2.1.0\",\
-             \"status\":\"idle\",\"statusUpdatedAt\":1,\"procStart\":\"Thu Oct  1 00:10:35 2026\",\
+             \"status\":\"idle\",\"statusUpdatedAt\":1,\"procStart\":\"{started}\",\
              \"kind\":\"interactive\",\"entrypoint\":\"cli\"}}"
         ),
     )
@@ -358,6 +367,31 @@ fn each_running_claude_code_names_the_home_it_runs_in() {
     assert_eq!(profile(run(None, store, Some("/w")), None), Some(None));
 }
 
+/// A whole session record names a live session only while its writer runs: its pid is this
+/// user's live process that started when the record says. Records naming launchd's pid (root's:
+/// `kill` answers `EPERM`), this process with another start (the number taken since), and a pid
+/// no process has name none. Negative control: this process's record with its own start names
+/// its session; judged by `alive` alone, the first two did too.
+#[test]
+fn a_session_record_is_live_only_while_its_writer_runs() {
+    let tmp = Tmp::new("discover-records");
+    let home = mkdirs(&tmp.path().join("home"));
+    let claude_dir = home.join(".claude");
+    let me = std::process::id();
+    register(&home, 1, DEAD);
+    register_started(&home, me, LIVE, "Thu Oct  1 00:10:35 2026");
+    register(&home, NO_PID, DEAD_TOO);
+    let records = live_records(&claude_dir).expect("every record whole");
+    assert!(records.is_empty(), "{records:?}");
+    register(&home, me, LIVE);
+    let sessions: Vec<String> = live_records(&claude_dir)
+        .expect("every record whole")
+        .into_iter()
+        .map(|r| r.session)
+        .collect();
+    assert_eq!(sessions, [LIVE]);
+}
+
 #[test]
 fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() {
     let tmp = Tmp::new("discover-owners");
@@ -497,6 +531,9 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
         Ok(vec![home.join(".claude")])
     );
     let node = "/usr/bin/node";
+    // The registry's record for this process names its real start ([`register`]).
+    let my_start = crate::harness::upgrade_drive::kernel_start(std::process::id())
+        .expect("this process's start");
     for (pid, run, argv, cwd, started, keeps) in [
         (4242, [store; 2], &[store][..], Some("/proj"), STARTED, true),
         (
@@ -554,7 +591,7 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
             [store; 2],
             &[store],
             Some("/proj"),
-            STARTED,
+            my_start.as_str(),
             false,
         ),
     ] {

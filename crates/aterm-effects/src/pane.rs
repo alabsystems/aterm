@@ -27,28 +27,38 @@ pub fn translate_rain_into_pane(
     let dy = u32::from(row_off) * cell_h;
     let x1 = (u32::from(col_off) + u32::from(pane_cols)) * cell_w;
     let y1 = (u32::from(row_off) + u32::from(pane_rows)) * cell_h;
-    let clip = move |x: u32, y: u32, w: u32, h: u32| -> Option<(u16, u16, u16, u16)> {
+    #[inline]
+    const fn clip_rect(
+        (x, y, w, h): (u32, u32, u32, u32),
+        (dx, dy, x1, y1): (u32, u32, u32, u32),
+    ) -> Option<(u16, u16, u16, u16)> {
         let (nx0, ny0) = (x + dx, y + dy);
-        let nx1 = nx0.saturating_add(w).min(x1);
-        let ny1 = ny0.saturating_add(h).min(y1);
-        (nx1 > nx0 && ny1 > ny0 && nx1 <= u32::from(u16::MAX) && ny1 <= u32::from(u16::MAX)).then(
-            || {
-                (
-                    nx0 as u16,
-                    ny0 as u16,
-                    (nx1 - nx0) as u16,
-                    (ny1 - ny0) as u16,
-                )
-            },
-        )
-    };
+        let nx1_raw = nx0.saturating_add(w);
+        let ny1_raw = ny0.saturating_add(h);
+        let nx1 = if nx1_raw < x1 { nx1_raw } else { x1 };
+        let ny1 = if ny1_raw < y1 { ny1_raw } else { y1 };
+        if nx1 > nx0 && ny1 > ny0 && nx1 <= u16::MAX as u32 && ny1 <= u16::MAX as u32 {
+            Some((
+                nx0 as u16,
+                ny0 as u16,
+                (nx1 - nx0) as u16,
+                (ny1 - ny0) as u16,
+            ))
+        } else {
+            None
+        }
+    }
+    let bounds = (dx, dy, x1, y1);
     if !quads.is_empty() {
         quads.retain_mut(|q| {
-            let Some((x, y, w, h)) = clip(
-                u32::from(q.x),
-                u32::from(q.y),
-                u32::from(q.w),
-                u32::from(q.h),
+            let Some((x, y, w, h)) = clip_rect(
+                (
+                    u32::from(q.x),
+                    u32::from(q.y),
+                    u32::from(q.w),
+                    u32::from(q.h),
+                ),
+                bounds,
             ) else {
                 return false;
             };
@@ -62,11 +72,14 @@ pub fn translate_rain_into_pane(
     }
     if !add.is_empty() {
         add.retain_mut(|q| {
-            let Some((x, y, w, h)) = clip(
-                u32::from(q.x),
-                u32::from(q.y),
-                u32::from(q.w),
-                u32::from(q.h),
+            let Some((x, y, w, h)) = clip_rect(
+                (
+                    u32::from(q.x),
+                    u32::from(q.y),
+                    u32::from(q.w),
+                    u32::from(q.h),
+                ),
+                bounds,
             ) else {
                 return false;
             };

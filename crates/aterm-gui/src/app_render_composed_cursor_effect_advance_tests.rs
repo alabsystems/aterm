@@ -2511,3 +2511,98 @@ fn duplicate_session_views_keep_focus_and_snapshot_provenance_by_leaf_slot() {
         "presented capture metadata preserves both exact per-view snapshots"
     );
 }
+
+/// looks7 round 3 review: the pet's veil is laid by the word publish after
+/// the pet's tick, which a split pane's cursor-only frame (`Advance`,
+/// `Retain`) does not run; those frames project the trail's under stream
+/// again and dropped the veil while the pet's sprite stayed published, so on
+/// a dim theme the letters under the pet lost their veil and got it back on
+/// the next full frame. Under a stand-in pet's body over dim letters, every
+/// composed frame after a full one lays the full frame's veil, kept to the
+/// focused pane. Fixture: with the veil off the full frame lays no under
+/// quad, so the quads compared are the veil's.
+#[test]
+fn a_composed_cursor_frame_keeps_the_pet_s_veil() {
+    let t0 = Instant::now();
+    let frames = |veil: bool| {
+        let (mut app, wid, term) = pure_fixture("laser");
+        term_lock(&term).process(b"\x1b[38;2;96;96;96mdim letters under the pet\r\n$ ");
+        {
+            let glow = &mut app
+                .windows
+                .get_mut(&wid)
+                .expect("test window")
+                .fx
+                .cursor_mut()
+                .glow;
+            glow.pin_pet_body(Some((0, 4000, 0, 4000)));
+            glow.set_pet_veil(veil);
+        }
+        assert!(redraw_pure(&mut app, wid, t0));
+        let under = |app: &App| app.windows[&wid].input_scratch.glow_under.clone();
+        let full = under(&app);
+        assert!(
+            app.windows[&wid].fx.cursor().glow.under_quads().is_empty(),
+            "fixture: the idle trail lays no under stream of its own"
+        );
+        assert!(app.composed_cursor_frame(
+            wid,
+            ComposedCursorFxClock::Retain {
+                observed_at: t0 + Duration::from_millis(17),
+            },
+        ));
+        let retained = under(&app);
+        assert!(app.composed_cursor_frame(
+            wid,
+            ComposedCursorFxClock::Advance(t0 + Duration::from_millis(33))
+        ));
+        let advanced = under(&app);
+        let clip = {
+            let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
+            let leaf = plan
+                .leaves
+                .iter()
+                .find(|leaf| leaf.focused)
+                .expect("focused leaf");
+            let (cw, ch) = app.win_cell_size(wid);
+            app.composed_cursor_effect_clip(
+                wid,
+                ComposedCursorEffectPane {
+                    row: leaf.rect.origin.y.round().max(0.0) as usize,
+                    col: leaf.rect.origin.x.round().max(0.0) as usize,
+                    pane_rows: (leaf.rect.size.height.round() as usize).max(1),
+                    pane_cols: (leaf.rect.size.width.round() as usize).max(1),
+                    cell_w: cw,
+                    cell_h: ch,
+                },
+            )
+            .expect("the focused pane's clip")
+        };
+        (full, retained, advanced, clip)
+    };
+    let (full, retained, advanced, clip) = frames(true);
+    assert!(
+        !full.is_empty(),
+        "fixture: the full frame veils the dim letters"
+    );
+    for q in &full {
+        assert!(
+            q.x >= clip.x0 && q.y >= clip.y0 && q.x + q.w <= clip.x1 && q.y + q.h <= clip.y1,
+            "the full frame's veil quad {q:?} leaves the focused pane"
+        );
+    }
+    assert_eq!(
+        retained, full,
+        "a Retain frame drops or changes the pet's veil"
+    );
+    assert_eq!(
+        advanced, full,
+        "an Advance frame drops or changes the pet's veil"
+    );
+    let (off, _, _, _) = frames(false);
+    assert!(
+        off.is_empty(),
+        "fixture: with the veil off the full frame lays {} quads",
+        off.len()
+    );
+}

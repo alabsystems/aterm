@@ -14,7 +14,7 @@ use crate::autopilot::AutopilotView;
 use crate::harness_glass::EndFace;
 use crate::task_record::{TaskMark, TaskRecord, TaskState};
 
-/// CODEX-ALAB'S LANDING (Autopilot Land): the act a proven self-claim's holder records with `meta set harness_act landed@v1` once all of its work is on the remote main branch — never typed, and the one act that makes the session's face `landed` ([`self_claim_act_face`]).
+/// CODEX-ALAB'S LANDING (Autopilot Land): the act a proven self-claim's holder records with `meta set harness_act landed@v1` once its own decider lands (a clean `Nothing left:` defense over a repository its own check, not aterm's, found no work left to land in or could not read: codex-alab's `repo.rs` lands past its limit) — never typed, and the one act that makes the session's face `landed` ([`self_claim_act_face`]).
 pub(crate) const SELF_CLAIM_LANDED: &str = aterm_agent::harness::acts::RULE_LANDED;
 
 /// THE FACE A PROVEN SELF-CLAIM'S ACT `act` TELLS (Autopilot Land): [`TaskFace::Landed`] for its landing ([`SELF_CLAIM_LANDED`]), [`TaskFace::Theirs`] for a point it left to a person's own exchange (`left-to-person@v1`, aterm's own loop's `LEFT` rule: recorded, never typed, as aterm's loop tells `theirs` there), none for its re-exec onto a new build (`upgrade@v1`: the same conversation resumed, a landing carried across, the one act it records at rest after a landing), and [`TaskFace::Open`] for any other act it records — a continuation, a land act, an answer, an approval, a resume after a wall: each types into a turn, and whoever acted after a landing reopened the work.
@@ -481,8 +481,7 @@ pub(crate) fn task_record(
     let (head, what) = match face {
         TaskFace::Landed => (
             "Autopilot landed",
-            "all of the work is on the remote main branch; the harness types nothing more until \
-             someone else's turn",
+            aterm_agent::supervise::mode_words::LANDED_WORDS,
         ),
         TaskFace::Open | TaskFace::Theirs => return None,
     };
@@ -512,7 +511,7 @@ fn placed(head: &str, place: &str) -> String {
     }
 }
 
-/// `{Place}: {text}` (`Tab 3: all of the work …`), or `text` alone for a
+/// `{Place}: {text}` (`Tab 3: it said nothing is left, …`), or `text` alone for a
 /// session no tab shows: the line leads with the tab it is about.
 fn tab_led(place: &str, text: &str) -> String {
     match place.strip_prefix("in ") {

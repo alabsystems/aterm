@@ -426,6 +426,97 @@ fn a_landing_under_cruise_is_not_counted_landed() {
     assert_eq!(app.status_glance().here.landed, 1, "back under Land");
 }
 
+/// §14.6: This Mac counts a Land tab that holds as `landing`, the page's word for it, and the
+/// same tab under Cruise, at rest, as `resting`.
+#[test]
+fn this_mac_counts_a_held_land_tab_landing_and_a_cruise_one_resting() {
+    use aterm_agent::harness::acts::{HoldLeg, LandHeld};
+    let (mut app, sid, _host) = desk("land");
+    idle(&app);
+    tell(&mut app, &sid, Some(TaskFace::Open));
+    let here = |app: &App| {
+        let g = app.status_glance();
+        (g.here.landing, g.here.resting)
+    };
+    assert_eq!(here(&app), (0, 1), "no hold before Land's instruction");
+    let held = LandHeld {
+        since_ms: Some(1_792_159_320_000),
+        nudges: 2,
+        read: true,
+        legs: HoldLeg::Repo.bit(),
+        unpushed: 1,
+        ..LandHeld::default()
+    };
+    if crate::harness_host::store_land_held(&app.store, &sid, Some(held)) {
+        app.apply_harness_fact(&sid, crate::HarnessFact::LandHeld);
+    }
+    assert!(app.shown_hold(0).is_some(), "PRECONDITION: the hold stands");
+    assert_eq!(here(&app), (1, 0), "a held Land is landing");
+    meta(&mut app, "set autopilot cruise");
+    assert_eq!(here(&app), (0, 1), "a Cruise tab at rest is resting");
+    meta(&mut app, "set autopilot land");
+    assert_eq!(here(&app), (1, 0), "back under Land, the hold kept");
+}
+
+/// §14.6: the Overview's row of a landed task says `landed` once, in its task words, and its
+/// driver says `land`; the tab's hover, which has no task words, keeps `land, landed`.
+#[test]
+fn the_overview_says_landed_once() {
+    let (mut app, sid, _host) = desk("land");
+    idle(&app);
+    tell(&mut app, &sid, Some(TaskFace::Open));
+    tell(&mut app, &sid, Some(TaskFace::Landed));
+    assert!(app.open_overview().is_ok());
+    let row = |app: &App| {
+        let lines = app.windows[&WindowId(0)]
+            .overview()
+            .expect("the Overview is open")
+            .line_texts();
+        lines
+            .iter()
+            .find(|l| l.contains("driven by aterm"))
+            .cloned()
+            .unwrap_or_else(|| panic!("the landed tab's row: {lines:#?}"))
+    };
+    let before = row(&app);
+    assert!(
+        before.ends_with("driven by aterm (land, landed)"),
+        "CONTROL: no task words, so the driver says it: {before}"
+    );
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    let mut mark = crate::task_record::TaskMark::new(TaskState::Done);
+    mark.why = Some(crate::task_record::WHY_LANDED);
+    mark.result_bytes = 128;
+    crate::task_record::mark_session_task(&ctx, 0, &mark).expect("marked");
+    app.overview_refresh_all();
+    let after = row(&app);
+    assert!(after.contains(" \u{b7} task landed "), "{after}");
+    assert!(
+        after.ends_with(" \u{b7} 128 B \u{b7} driven by aterm (land)"),
+        "{after}"
+    );
+    assert_eq!(after.matches("landed").count(), 1, "said once: {after}");
+    assert_eq!(
+        driven(&app).as_deref(),
+        Some("driven by aterm (land, landed)"),
+        "the hover keeps both"
+    );
+}
+
+fn idle(app: &App) {
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    ctx.timeline.lock().expect("timeline").publish_agent(
+        "idle",
+        None,
+        None,
+        Some(aterm_phase::Program::Claude),
+        crate::session_timeline::AgentStamp {
+            generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+            fp: 1,
+        },
+    );
+}
+
 #[test]
 fn a_timer_on_another_day_names_its_day() {
     use crate::claude_lights::{ChipFace, ChipGlass, Clock, LandAtGlass, Weekday};
@@ -437,7 +528,7 @@ fn a_timer_on_another_day_names_its_day() {
         ..ChipGlass::default()
     };
     let words = |other_day| {
-        crate::app_presence::driven_words(ChipFace::CruiseUntil, &glass(other_day), None)
+        crate::app_presence::driven_words(ChipFace::CruiseUntil, &glass(other_day), None, false)
     };
     assert_eq!(words(None).as_deref(), Some("cruise, lands at 18:00"));
     assert_eq!(

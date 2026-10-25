@@ -48,12 +48,7 @@ fn longest_reset() -> String {
         .words()
 }
 
-const LIMITS: [NoticeText; 14] = [
-    LIMIT_SIGN_IN,
-    LIMIT_RENEW,
-    LIMIT_RENEW_HELD,
-    LIMIT_LOGIN,
-    LIMIT_LOGIN_HELD,
+const LIMITS: [NoticeText; 9] = [
     LIMIT_USE,
     LIMIT_DRAFT,
     LIMIT_DRAFT_OWN,
@@ -295,18 +290,18 @@ fn what_aterm_did_is_aterms_and_the_expectation_asks_nothing() {
 
 #[test]
 fn a_label_is_named_whole_where_it_fits_and_never_cut_in_a_command() {
-    let short = RENEWAL_WRONG_ACCOUNT.fill(Some("main"), None);
+    let short = LIMIT_USE.fill(Some("main"), Some(WHY_USE_PIN));
     assert!(short.todo.ends_with(" main"), "{short:?}");
     assert!(short.did.contains("main"));
     assert_eq!(short.command, None, "a command that fits is the step's");
     let long = longest_label();
-    for n in [
-        RENEWAL_WRONG_ACCOUNT,
-        ACCOUNT_SIGNED_OUT,
-        LIMIT_RENEW,
-        LIMIT_LOGIN,
-    ] {
-        let f = n.fill(Some(&long), None);
+    let named: Vec<&NoticeText> = ALL
+        .iter()
+        .filter(|n| n.todo.contains(COMMAND) && n.todo.contains(LABEL))
+        .collect();
+    assert!(!named.is_empty(), "a step's command names its row");
+    for n in named {
+        let f = n.fill(Some(&long), longest_why(n));
         assert_eq!(f.todo, COMMAND_UNDER_DETAILS, "{}: {f:?}", n.id);
         let command = f.command.as_deref().expect("the command, whole");
         assert!(
@@ -358,7 +353,6 @@ fn a_sign_in_by_hand_on_a_roster_login_names_the_row() {
         LOGIN_LEFT,
         LOGIN_NOT_RUN,
         LOGIN_NOT_RUN_DRAFT,
-        RENEWED_BY_HAND,
     ];
     for n in &lost {
         let f = n.fill(Some("pool-7"), longest_why(n));
@@ -370,8 +364,8 @@ fn a_sign_in_by_hand_on_a_roster_login_names_the_row() {
         assert!(n.takes_label(), "{}", n.id);
         assert_eq!(n.fill(None, longest_why(n)).todo, n.todo, "{}", n.id);
     }
-    let other = LIMIT_SIGN_IN.fill(Some("pool-7"), None);
-    assert!(!LIMIT_SIGN_IN.takes_label());
+    let other = LOGIN_SIGN_IN.fill(Some("pool-7"), None);
+    assert!(!LOGIN_SIGN_IN.takes_label());
     assert!(
         [&other.did, &other.todo]
             .iter()
@@ -452,7 +446,7 @@ fn a_pin_names_how_it_ends() {
             assert!(!undo.contains(step), "{}: {undo:?}", n.id);
         }
     }
-    assert_eq!(LIMIT_RENEW.undo, None, "the control");
+    assert_eq!(LIMIT_DRAFT.undo, None, "the control");
 }
 
 fn short_title_fault(short: &str, title: &str) -> Option<&'static str> {
@@ -488,7 +482,7 @@ fn a_short_title_says_what_happened_in_two_or_three_words() {
             );
         }
     }
-    let title = LIMIT_SIGN_IN.title;
+    let title = LIMIT_USE.title;
     assert!(short_title_fault("Limit in tab 1", "Claude usage limit reached in tab 1").is_some());
     assert!(short_title_fault(title, title).is_some());
     assert!(short_title_fault("Limit", title).is_some());
@@ -543,4 +537,51 @@ fn a_notice_closes_in_words_true_of_how_it_ended() {
         );
     }
     assert_ne!(SWITCHED, BACK, "the control");
+}
+
+/// Whether a step asks a person to sign a roster row in by hand: `accounts renew` or
+/// `accounts login`, which aterm's sign-in ladder runs by itself for every row with an email.
+fn asks_a_sign_in(step: &str) -> bool {
+    step.contains("accounts renew") || step.contains("accounts login")
+}
+
+#[test]
+fn no_notice_asks_a_person_to_sign_a_roster_row_in() {
+    for n in ALL {
+        for label in [None, Some("pool-7")] {
+            let f = n.fill(label, longest_why(n));
+            for step in std::iter::once(&f.todo).chain(f.command.as_ref()) {
+                assert!(!asks_a_sign_in(step), "{}: {step:?}", n.id);
+            }
+        }
+    }
+    assert!(
+        asks_a_sign_in("Run aterm harness accounts renew pool-7"),
+        "the control: the step the wrong account's notice asked before"
+    );
+}
+
+#[test]
+fn the_rosters_facts_name_the_row_what_aterm_did_and_read_what_it_tried() {
+    for n in [ACCOUNT_SIGNED_OUT, RENEWAL_WRONG_ACCOUNT] {
+        let f = n.fill(Some("pool-7"), None);
+        assert!(
+            f.todo.contains(COMMAND) && !asks_a_sign_in(&f.todo),
+            "{}: the step reads what aterm tried: {f:?}",
+            n.id
+        );
+        assert!(!f.todo.contains("pool-7"), "{}: the step is a read", n.id);
+        assert!(f.did.contains("pool-7"), "{}: {f:?}", n.id);
+        assert!(f.did.starts_with("aterm "), "{}: {f:?}", n.id);
+        assert!(
+            f.expect.starts_with("aterm "),
+            "{}: what aterm does next",
+            n.id
+        );
+    }
+    let signed_out = ACCOUNT_SIGNED_OUT.fill(Some("pool-7"), None);
+    assert!(
+        signed_out.happened.contains("email"),
+        "the recorded error says why no route exists: {signed_out:?}"
+    );
 }

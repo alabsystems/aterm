@@ -12,12 +12,15 @@ use std::fmt;
 
 pub mod accounts;
 #[cfg(unix)]
+pub mod catalog;
+#[cfg(unix)]
 pub mod cli;
 pub mod contacts;
 #[cfg(unix)]
 pub mod control;
 pub mod crypto;
 pub mod database;
+mod documents;
 #[cfg(unix)]
 pub mod import;
 #[cfg(unix)]

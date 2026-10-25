@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Signed, recipient-encrypted control DAG nodes. A recovery joins explicit
-//! parents and selects an existing payload; it cannot silently write a new one.
+//! Control DAG nodes: a canonical public foundation and signed, encrypted
+//! changes. A recovery selects an existing payload; it cannot write a new one.
 
 use super::constraints::{Fact, Frontier, MAX_FACTS};
 #[cfg(unix)]
@@ -25,6 +25,8 @@ const RESTRICTION_DOMAIN: &[u8] = b"aterm/commons/control-node/2\0";
 const DOMAIN: &[u8] = b"aterm/commons/control-node/3\0";
 #[cfg(unix)]
 const MAGIC: &[u8] = b"ACN3";
+
+mod foundation;
 
 /// A control operation prepared by an authority. Persist the returned node and
 /// retry its exact bytes; preparing another encrypted node is another operation.
@@ -68,6 +70,7 @@ pub struct Node {
     ciphertext: Vec<u8>,
     wire: Vec<u8>,
     id: Digest,
+    foundation: bool,
     legacy: bool,
     #[cfg(unix)]
     binding_evidence: bool,
@@ -92,6 +95,9 @@ impl Node {
     /// Verify exact bytes against an independently trusted network and authority.
     /// This does not choose a current state or enroll an unknown signer.
     pub fn verify(bytes: &[u8], network: [u8; 16], authority: [u8; 32]) -> Result<Self> {
+        if bytes.get(..4) == Some(b"ACF1") {
+            return Self::verify_foundation(bytes, network, authority);
+        }
         if bytes.len() > MAX_NODE || bytes.len() < 4 + 16 + 32 + 2 + 32 + 8 + 4 + 64 {
             return Err(Error::new("control node exceeds its size bounds"));
         }
@@ -168,6 +174,9 @@ impl Node {
                             reader.take(super::binding::BINDING_LEN)?,
                         )?,
                     },
+                    5 if binding_facts => Fact::RetireRecipient {
+                        recipient: crate::age::Recipient(reader.array()?),
+                    },
                     _ => return Err(Error::new("unknown control restriction")),
                 };
                 fact.validate()?;
@@ -220,6 +229,7 @@ impl Node {
             ciphertext,
             wire: bytes.to_vec(),
             id,
+            foundation: false,
             legacy,
             #[cfg(unix)]
             binding_evidence: binding_facts,
@@ -313,7 +323,7 @@ impl Node {
         Self::verify(&wire, network, authority)
     }
 
-    /// Exact signed wire, with an encrypted payload, for append and peer repair.
+    /// Exact authenticated wire for append and peer repair.
     pub fn bytes(&self) -> &[u8] {
         &self.wire
     }
@@ -324,6 +334,16 @@ impl Node {
     /// Operation kind.
     pub const fn kind(&self) -> Kind {
         self.kind
+    }
+    /// Whether this is the canonical empty default-network anchor. Its public
+    /// bytes authenticate no authority or member by themselves.
+    pub const fn is_foundation(&self) -> bool {
+        self.foundation
+    }
+    /// Whether this node carries an encrypted application snapshot. Public
+    /// foundations and recovery choices have no payload or historical key.
+    pub const fn has_payload(&self) -> bool {
+        !self.foundation && matches!(self.kind, Kind::Genesis | Kind::Update)
     }
     /// Exact causal parents, sorted and unique.
     pub fn parents(&self) -> &[Digest] {
@@ -363,6 +383,9 @@ impl Node {
     /// Decrypt a data node for historical reading. A recovery's selected node
     /// must be resolved through its journal; it carries no replacement payload.
     pub fn open(&self, identity: &Identity) -> Result<SecretBytes> {
+        if self.is_foundation() {
+            return Err(Error::new("Commons foundation has no encrypted payload"));
+        }
         if self.kind == Kind::Recovery {
             return Err(Error::new("resolve a recovery through its selected parent"));
         }

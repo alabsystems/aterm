@@ -892,14 +892,13 @@ impl CardPalette {
 
 #[inline]
 const fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
-    let table = crate::color_math::relative_luminance_table();
-    let y_bg = crate::color_math::relative_luminance_with(table, ground & 0x00FF_FFFF);
+    let y_bg = relative_luminance(ground & 0x00FF_FFFF);
     #[inline]
-    const fn holds(table: &crate::color_math::RelativeLuminanceTable, y_bg: f32, c: u32) -> bool {
-        let y = crate::color_math::relative_luminance_with(table, c);
+    const fn holds(y_bg: f32, c: u32) -> bool {
+        let y = relative_luminance(c);
         (y.max(y_bg) + 0.05) / (y.min(y_bg) + 0.05) >= PAPER_MARK_CONTRAST
     }
-    if holds(table, y_bg, rgb) {
+    if holds(y_bg, rgb) {
         return rgb;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -913,7 +912,7 @@ const fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
         } else if mid_rgb == hi_rgb {
             false
         } else {
-            holds(table, y_bg, mid_rgb)
+            holds(y_bg, mid_rgb)
         };
         if passes {
             lo = mid;
@@ -1174,26 +1173,28 @@ impl Clock {
 
     #[inline]
     const fn u(self) -> f32 {
+        const INV_EPISODE_MS: f32 = 1.0 / EPISODE_MS as f32;
         match self.t_ms {
-            Some(t) => (t as f32 / EPISODE_MS as f32).min(1.0),
+            Some(t) => (t as f32 * INV_EPISODE_MS).min(1.0),
             None => 1.0,
         }
     }
 
     #[inline]
     const fn intro_rise(self) -> f32 {
-        smooth((self.u() - GLINT_INTRO_FROM) / (1.0 - GLINT_INTRO_FROM))
+        const INV_INTRO_SPAN: f32 = 1.0 / (1.0 - GLINT_INTRO_FROM);
+        smooth((self.u() - GLINT_INTRO_FROM) * INV_INTRO_SPAN)
     }
 
     #[inline]
     const fn phi(self) -> f32 {
-        let trip = FLOW_TRIP_MS as f32;
+        const INV_TRIP: f32 = 1.0 / FLOW_TRIP_MS as f32;
         match (self.t_ms, self.flow) {
             (Some(t), _) => {
                 let v = 1.0 - self.u();
-                PHI_SETTLED + PHI_INTRO * v * v - t as f32 / trip
+                PHI_SETTLED + PHI_INTRO * v * v - t as f32 * INV_TRIP
             }
-            (None, Some(f)) => PHI_SETTLED - (f.hue_ms % (2 * FLOW_TRIP_MS)) as f32 / trip,
+            (None, Some(f)) => PHI_SETTLED - (f.hue_ms % (2 * FLOW_TRIP_MS)) as f32 * INV_TRIP,
             (None, None) => PHI_SETTLED,
         }
     }
@@ -1209,11 +1210,13 @@ impl Clock {
 
     #[inline]
     const fn head_env(self) -> f32 {
+        const INV_HEAD_RISE: f32 = 1.0 / 0.04;
+        const INV_HEAD_FALL: f32 = 1.0 / 0.12;
         if self.t_ms.is_none() {
             return 0.0;
         }
         let u = self.u();
-        smooth(u / 0.04) * smooth((1.0 - u) / 0.12)
+        smooth(u * INV_HEAD_RISE) * smooth((1.0 - u) * INV_HEAD_FALL)
     }
 }
 
@@ -1401,10 +1404,10 @@ const fn clip_ramp(r: Rect, c: Rect, l: Paint, rt: Paint) -> (Paint, Paint) {
     if c.x0 == r.x0 && c.x1 == r.x1 {
         (l, rt)
     } else {
-        let span = (r.x1 - r.x0) as f32;
+        let inv_span = 1.0 / (r.x1 - r.x0) as f32;
         (
-            ramp(l, rt, (c.x0 - r.x0) as f32 / span),
-            ramp(l, rt, (c.x1 - r.x0) as f32 / span),
+            ramp(l, rt, (c.x0 - r.x0) as f32 * inv_span),
+            ramp(l, rt, (c.x1 - r.x0) as f32 * inv_span),
         )
     }
 }
@@ -1521,7 +1524,8 @@ const fn kitty_frame(clock: Clock) -> KittyPose {
 
 #[inline]
 const fn unit(seed: u64, salt: u64) -> f32 {
-    (mix(seed ^ mix(salt)) >> 40) as f32 / (1u64 << 24) as f32
+    const INV_2_24: f32 = 1.0 / (1u64 << 24) as f32;
+    (mix(seed ^ mix(salt)) >> 40) as f32 * INV_2_24
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1684,8 +1688,8 @@ const fn ride(clock: Clock) -> f32 {
 }
 
 #[inline]
-fn ride_at(f: f32) -> f32 {
-    RIDE_MS as f32 * (1.0 - (1.0 - f.clamp(0.0, 1.0)).cbrt())
+const fn ride_at(f: f32) -> f32 {
+    RIDE_MS as f32 * (1.0 - crate::color_math::cbrt_f32(1.0 - f.clamp(0.0, 1.0)))
 }
 
 #[inline]
@@ -2437,8 +2441,9 @@ impl HarnessCard {
 
     #[inline]
     fn fade_at(&self, at: Instant) -> f32 {
+        const INV_GLINT_FADE_MS: f32 = 1.0 / GLINT_FADE_MS as f32;
         self.fade0.map_or(1.0, |f| {
-            smooth(ms_between(f, at) as f32 / GLINT_FADE_MS as f32)
+            smooth(ms_between(f, at) as f32 * INV_GLINT_FADE_MS)
         })
     }
 
@@ -2524,6 +2529,7 @@ impl HarnessCard {
             }
             None => 0.0,
         };
+        const INV_LINE_SWEEP_SIGMA: f32 = 1.0 / LINE_SWEEP_SIGMA;
         let (palette, inks) = (self.palette, &self.inks);
         out.extend(
             (0..at.len)
@@ -2533,7 +2539,7 @@ impl HarnessCard {
                     let sweep = if env == 0.0 {
                         0.0
                     } else {
-                        let d = (x - pos) / LINE_SWEEP_SIGMA;
+                        let d = (x - pos) * INV_LINE_SWEEP_SIGMA;
                         env * (-d * d).exp()
                     };
                     let crest = sweep.max(glint_at(c));
@@ -2596,26 +2602,20 @@ const fn line_floor(rgb: u32, ground: u32) -> u32 {
 /// Mixes `rgb` toward white to reach WCAG relative luminance `floor` on a `2^-14` step grid.
 #[inline]
 pub(crate) const fn lift_to_luminance(rgb: u32, floor: f32) -> u32 {
-    let table = crate::color_math::relative_luminance_table();
-    if crate::color_math::relative_luminance_with(table, rgb) >= floor {
+    if relative_luminance(rgb) >= floor {
         return rgb;
     }
     #[inline]
-    const fn reaches(
-        table: &crate::color_math::RelativeLuminanceTable,
-        rgb: u32,
-        floor: f32,
-        t: f32,
-    ) -> bool {
-        crate::color_math::relative_luminance_with(table, mix_rgb(rgb, WHITE, t)) >= floor
+    const fn reaches(rgb: u32, floor: f32, t: f32) -> bool {
+        relative_luminance(mix_rgb(rgb, WHITE, t)) >= floor
     }
     let (mut short, mut step) = (0.0f32, 0.25f32);
     let mut i = 0;
     while i < 7 {
         let (a, b, c) = (
-            reaches(table, rgb, floor, short + step),
-            reaches(table, rgb, floor, short + 2.0 * step),
-            reaches(table, rgb, floor, short + 3.0 * step),
+            reaches(rgb, floor, short + step),
+            reaches(rgb, floor, short + 2.0 * step),
+            reaches(rgb, floor, short + 3.0 * step),
         );
         short += step * ((!a as u8) + (!b as u8) + (!c as u8)) as f32;
         step *= 0.25;
@@ -2751,6 +2751,7 @@ struct Emit<'a> {
 
 impl<'a> Emit<'a> {
     fn new(scene: &'a CardScene, geo: Geo, clock: Clock, seed: u64) -> Self {
+        const INV_SHIMMER_MS: f32 = 1.0 / SHIMMER_MS;
         let seat = kitty_rect(&geo, scene);
         let star_region = star_region(&geo, scene);
         Self {
@@ -2763,7 +2764,7 @@ impl<'a> Emit<'a> {
             head_pos: (clock.u() * HEAD_LAPS).fract(),
             shimmer_pos: clock
                 .t_ms
-                .map_or(0.0, |t| (t as f32 / SHIMMER_MS).fract() * 1.4 - 0.2),
+                .map_or(0.0, |t| (t as f32 * INV_SHIMMER_MS).fract() * 1.4 - 0.2),
             kitty: seat.map(|at| (ridden(&geo, scene, at, clock), kitty_frame(clock))),
             seat,
             star_region,
@@ -2793,10 +2794,13 @@ impl<'a> Emit<'a> {
     }
 
     #[inline]
-    fn ring_at(&self, x: f32, y: f32) -> f32 {
-        let Some((ms, up)) = self.clock.glint.filter(|&(_, up)| up > 0.0) else {
+    const fn ring_at(&self, x: f32, y: f32) -> f32 {
+        let Some((ms, up)) = self.clock.glint else {
             return 0.0;
         };
+        if up <= 0.0 {
+            return 0.0;
+        }
         let g = self.geo;
         let d = cell_distance((x - g.wand.0) / g.cw as f32, (y - g.wand.1) / g.ch as f32);
         up * glint(d, ms)
@@ -2804,6 +2808,7 @@ impl<'a> Emit<'a> {
 
     #[inline]
     fn border_paint(&self, s: f32, (x, y): (f32, f32)) -> Paint {
+        const INV_HEAD_SIGMA: f32 = 1.0 / HEAD_SIGMA;
         let base = self
             .scene
             .palette
@@ -2811,7 +2816,7 @@ impl<'a> Emit<'a> {
         let env = self.head_env;
         let w = if env > 0.0 {
             let d = (s - self.head_pos).rem_euclid(1.0);
-            let d = d.min(1.0 - d) / HEAD_SIGMA;
+            let d = d.min(1.0 - d) * INV_HEAD_SIGMA;
             env * (-d * d).exp()
         } else {
             0.0
@@ -2833,7 +2838,7 @@ impl<'a> Emit<'a> {
         let g = self.geo;
         let o = g.outer;
         let (w, h, t) = (o.x1 - o.x0, o.y1 - o.y0, g.t);
-        let per = (2 * (w + h)) as f32;
+        let inv_per = 1.0 / (2 * (w + h)) as f32;
         let all = g.clip;
         let n = ((w + g.cw - 1) / g.cw).clamp(1, MAX_EDGE_SEGMENTS);
         for bottom in [false, true] {
@@ -2846,7 +2851,7 @@ impl<'a> Emit<'a> {
                 }
             };
             let mid = (y0 + t / 2) as f32;
-            let mut pa = self.border_paint(arc(o.x0) / per, (o.x0 as f32, mid));
+            let mut pa = self.border_paint(arc(o.x0) * inv_per, (o.x0 as f32, mid));
             for k in 0..n {
                 let xa = o.x0 + w * k / n;
                 let xb = o.x0 + w * (k + 1) / n;
@@ -2856,7 +2861,7 @@ impl<'a> Emit<'a> {
                     x1: xb,
                     y1: y0 + t,
                 };
-                let pb = self.border_paint(arc(xb) / per, (xb as f32, mid));
+                let pb = self.border_paint(arc(xb) * inv_per, (xb as f32, mid));
                 out.ramp(all, r, pa, pb);
                 pa = pb;
             }
@@ -2880,7 +2885,7 @@ impl<'a> Emit<'a> {
                     continue;
                 }
                 let mid_y = (ya + yb) / 2;
-                let p = self.border_paint(arc(mid_y) / per, (mid_x, mid_y as f32));
+                let p = self.border_paint(arc(mid_y) * inv_per, (mid_x, mid_y as f32));
                 let slice = Rect {
                     x0,
                     y0: ya,
@@ -2911,12 +2916,13 @@ impl<'a> Emit<'a> {
     }
 
     #[inline]
-    fn shimmer(&self, x: f32, (px, py): (f32, f32)) -> (f32, f32) {
+    const fn shimmer(&self, x: f32, (px, py): (f32, f32)) -> (f32, f32) {
+        const INV_SHIMMER_SIGMA: f32 = 1.0 / SHIMMER_SIGMA;
         let sweep = if self.clock.t_ms.is_none() {
             0.0
         } else {
-            let d = (x - self.shimmer_pos) / SHIMMER_SIGMA;
-            self.head_env * (-d * d).exp() * SHIMMER_GAIN
+            let d = (x - self.shimmer_pos) * INV_SHIMMER_SIGMA;
+            self.head_env * crate::color_math::exp_f32(-d * d) * SHIMMER_GAIN
         };
         (sweep, self.ring_at(px, py))
     }
@@ -2957,13 +2963,14 @@ impl<'a> Emit<'a> {
         let mut k = 0;
         let mut xa = tx0;
         let mid = (ya + yb) as f32 * 0.5;
+        let inv_len = 1.0 / len as f32;
         let mut wa = self.shimmer(0.0, (tx0 as f32, mid));
         let mut ends: [Paint; TRAIL_STOPS.len()] =
             std::array::from_fn(|s| self.stripe_paint(s, wa));
         while xa < drawn {
             let xb = (xa + seg).min(drawn);
             let d = self.wave(&lay, k);
-            let wb = self.shimmer((xb - tx0) as f32 / len as f32, (xb as f32, mid));
+            let wb = self.shimmer((xb - tx0) as f32 * inv_len, (xb as f32, mid));
             let same_w = wb == wa;
             for (s, end) in ends.iter_mut().enumerate() {
                 let si = s as i64;
@@ -3048,7 +3055,8 @@ impl<'a> Emit<'a> {
 
     #[inline]
     fn rim_paint(&self, (x, y): (f32, f32), (cx, cy): (f32, f32)) -> Paint {
-        let s = ((x - cx).atan2(cy - y) / std::f32::consts::TAU).rem_euclid(1.0);
+        const INV_TAU: f32 = 1.0 / std::f32::consts::TAU;
+        let s = ((x - cx).atan2(cy - y) * INV_TAU).rem_euclid(1.0);
         let base = self
             .scene
             .palette
@@ -3103,6 +3111,9 @@ impl<'a> Emit<'a> {
     }
 
     fn glints(&self, lay: &mut impl FnMut(StarCall)) {
+        const INV_STAR_SETTLE_SPAN: f32 = 1.0 / STAR_SETTLE_SPAN;
+        const INV_STAR_REVEAL_MS: f32 = 1.0 / STAR_REVEAL_MS;
+        const INV_SHIMMER_GAIN: f32 = 1.0 / SHIMMER_GAIN;
         let Some(region) = self.star_region else {
             return;
         };
@@ -3112,17 +3123,18 @@ impl<'a> Emit<'a> {
         };
         let (rest, flare) = (glints.rest, glints.flare);
         let u = self.clock.u();
-        let settle = smooth((u - (1.0 - STAR_SETTLE_SPAN)) / STAR_SETTLE_SPAN);
+        let settle = smooth((u - (1.0 - STAR_SETTLE_SPAN)) * INV_STAR_SETTLE_SPAN);
         let riding = self
             .seat
             .and_then(|seat| ride_span(&self.geo, self.scene, &seat));
-        let t_sec = self.clock.t_ms.map(|t| t as f32 / 1000.0);
+        let t_sec = self.clock.t_ms.map(|t| t as f32 * 0.001);
         let rest_rgb = self.scene.palette.glint_rest();
+        let inv_trail_len = 1.0 / trail.len as f32;
         for (i, s) in glints.spots().iter().enumerate() {
             let up = match (self.clock.ride_ms, riding) {
                 (Some(t), Some((from, dist))) => {
                     let passed = ride_at((s.x + flare + 1 - from) as f32 / dist as f32);
-                    smooth((t as f32 - passed) / STAR_REVEAL_MS)
+                    smooth((t as f32 - passed) * INV_STAR_REVEAL_MS)
                 }
                 _ => 1.0,
             };
@@ -3130,10 +3142,10 @@ impl<'a> Emit<'a> {
                 continue;
             }
             let (sweep, ring) = self.shimmer(
-                (s.x - trail.tx0) as f32 / trail.len as f32,
+                (s.x - trail.tx0) as f32 * inv_trail_len,
                 (s.x as f32, s.y as f32),
             );
-            let w = (sweep / SHIMMER_GAIN).max(ring).clamp(0.0, 1.0);
+            let w = (sweep * INV_SHIMMER_GAIN).max(ring).clamp(0.0, 1.0);
             let env = match t_sec {
                 Some(t_sec) => {
                     let e = twinkle_env(t_sec, s.phase);
@@ -3156,6 +3168,8 @@ impl<'a> Emit<'a> {
     }
 
     fn field(&self, lay: &mut impl FnMut(StarCall)) {
+        const INV_STAR_SETTLE_SPAN: f32 = 1.0 / STAR_SETTLE_SPAN;
+        const INV_STAR_REVEAL_MS: f32 = 1.0 / STAR_REVEAL_MS;
         let Some(region) = self.star_region else {
             return;
         };
@@ -3170,11 +3184,11 @@ impl<'a> Emit<'a> {
             self.glint_spots(),
         );
         let u = self.clock.u();
-        let settle = smooth((u - (1.0 - STAR_SETTLE_SPAN)) / STAR_SETTLE_SPAN);
+        let settle = smooth((u - (1.0 - STAR_SETTLE_SPAN)) * INV_STAR_SETTLE_SPAN);
         let riding = self
             .seat
             .and_then(|seat| Some((seat, ride_span(&self.geo, self.scene, &seat)?)));
-        let t_sec = self.clock.t_ms.map(|t| t as f32 / 1000.0);
+        let t_sec = self.clock.t_ms.map(|t| t as f32 * 0.001);
         let chf = self.geo.ch as f32;
         let (even_rgb, odd_rgb) = match self.scene.palette {
             CardPalette::Cruise => (twinkle_rgb(true), twinkle_rgb(false)),
@@ -3186,7 +3200,7 @@ impl<'a> Emit<'a> {
             let up = match (self.clock.ride_ms, riding) {
                 (Some(t), Some((seat, (from, dist)))) if s.x < seat.rect.x0 => {
                     let passed = ride_at((s.x + arm + 1 - from) as f32 / dist as f32);
-                    smooth((t as f32 - passed) / STAR_REVEAL_MS)
+                    smooth((t as f32 - passed) * INV_STAR_REVEAL_MS)
                 }
                 _ => 1.0,
             };
@@ -3220,6 +3234,8 @@ impl<'a> Emit<'a> {
     }
 
     fn shed(&self, lay: &mut impl FnMut(StarCall)) {
+        const INV_SHED_MS: f32 = 1.0 / SHED_MS as f32;
+        const INV_SHED_STEP: f32 = 1.0 / (SHED_SPARKLES + 1) as f32;
         let (Some(t), Some(seat), Some(region)) = (self.clock.ride_ms, self.seat, self.star_region)
         else {
             return;
@@ -3251,12 +3267,12 @@ impl<'a> Emit<'a> {
         let tf = t as f32;
         let dist_f = dist as f32;
         for k in 0..SHED_SPARKLES {
-            let f = (k + 1) as f32 / (SHED_SPARKLES + 1) as f32;
+            let f = (k + 1) as f32 * INV_SHED_STEP;
             let age = tf - ride_at(f);
             if !(0.0..SHED_MS as f32).contains(&age) {
                 continue;
             }
-            let tau = age / SHED_MS as f32;
+            let tau = age * INV_SHED_MS;
             let ratio = STAR_ARM_FINE * (1.0 - 0.4 * tau) * tax;
             let arm = i64::from(star_arm_px(star_arm(chf, ratio)));
             let m = arm + 1;
@@ -3325,6 +3341,8 @@ impl<'a> Emit<'a> {
     }
 
     fn burst_ring(&self) -> Option<BurstRing> {
+        const INV_BURST_MS: f32 = 1.0 / BURST_MS as f32;
+        const STEP_THETA: f32 = std::f32::consts::TAU / BURST_STARS as f32;
         let age = match self.clock.ride_ms {
             Some(r) if self.rides() => r.checked_sub(RIDE_MS),
             _ => self.clock.t_ms,
@@ -3342,7 +3360,7 @@ impl<'a> Emit<'a> {
                 ((g.col(end).min(region.x1), g.band(g.top + 1)), 0)
             }
         };
-        let tau = t as f32 / BURST_MS as f32;
+        let tau = t as f32 * INV_BURST_MS;
         let fly = 1.0 - (1.0 - tau).powi(3);
         let rx = (half_w as f32 + 2.0 * g.cw as f32).max(3.0 * g.cw as f32);
         let ry = 0.85 * g.ch as f32;
@@ -3353,7 +3371,7 @@ impl<'a> Emit<'a> {
         Some(BurstRing {
             region,
             centres: std::array::from_fn(|k| {
-                let theta = turn + std::f32::consts::TAU * k as f32 / BURST_STARS as f32;
+                let theta = turn + k as f32 * STEP_THETA;
                 let (sin_t, cos_t) = theta.sin_cos();
                 (
                     cx + (cos_t * rx * reach).round() as i64,

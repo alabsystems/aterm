@@ -177,6 +177,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         ),
         M::ToggleStatsLens => spec("sys.stats_lens.toggle", S::Window, A::LocalUi, C::Any),
         M::ResetTerminal => spec("terminal.reset", S::View, A::LocalUi, C::Terminal),
+        M::RewindPane => spec("pane.rewind", S::View, A::LocalUi, C::Terminal),
         M::ChooseTabTheme => spec("palette.choose_tab_theme", S::View, A::LocalUi, C::Terminal),
         M::ClearTabTheme => spec("terminal.theme.clear", S::View, A::LocalUi, C::Terminal),
     }

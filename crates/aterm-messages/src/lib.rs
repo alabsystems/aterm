@@ -128,7 +128,8 @@ pub const STALE_ANNOUNCE: Duration = Duration::from_mins(20);
 pub const STALE_UPDATE: Duration = Duration::from_mins(15);
 /// A carried row's cap across the seamless handoff.
 pub const STALE_HANDOFF: Duration = Duration::from_secs(125);
-/// Band hysteresis: grow now, shrink after this much quiet.
+/// Band hysteresis: grow now, shrink after this much quiet — waived where
+/// what is on screen changed ([`MessageCenter::view_changed`]).
 pub const SHRINK_QUIET: Duration = Duration::from_millis(1500);
 /// A queued row folds unseen after `max(hold, this)`.
 pub(crate) const OVERFLOW_PATIENCE_MIN: Duration = Duration::from_mins(1);

@@ -61,7 +61,7 @@ pub const fn pet_rect_hit(rect: (i32, i32, i32, i32), x: f64, y: f64, slop: i32)
 /// Resolve the companion's local terminal palette from the grid cells its sprite intersects, capped at 64 samples so this stays allocation-free and O(1).
 #[inline]
 #[must_use]
-pub fn cursor_cat_color_key(
+pub const fn cursor_cat_color_key(
     cells: &[Vec<RenderCell>],
     geom: EffectGeom,
     footprint: CatFootprint,
@@ -74,19 +74,25 @@ pub fn cursor_cat_color_key(
         return CatColorKey::from_rgb(fallback_bg, fallback_fg, fallback_accent);
     };
 
-    let cw = i64::from(geom.cell_w);
-    let ch = i64::from(geom.cell_h);
-    let x0 = i64::from(footprint.x).max(0);
-    let y0 = i64::from(footprint.y).max(0);
-    let x1 = (i64::from(footprint.x) + i64::from(footprint.w)).min(i64::from(geom.cols) * cw);
-    let y1 = (i64::from(footprint.y) + i64::from(footprint.h)).min(i64::from(geom.rows) * ch);
+    let cw = geom.cell_w as i64;
+    let ch = geom.cell_h as i64;
+    let fx = footprint.x as i64;
+    let fy = footprint.y as i64;
+    let x0 = if fx > 0 { fx } else { 0 };
+    let y0 = if fy > 0 { fy } else { 0 };
+    let x1_max = (geom.cols as i64) * cw;
+    let x1_cand = fx + (footprint.w as i64);
+    let x1 = if x1_cand < x1_max { x1_cand } else { x1_max };
+    let y1_max = (geom.rows as i64) * ch;
+    let y1_cand = fy + (footprint.h as i64);
+    let y1 = if y1_cand < y1_max { y1_cand } else { y1_max };
     if x1 <= x0 || y1 <= y0 {
         return CatColorKey::from_rgb(fallback_bg, fallback_fg, fallback_accent);
     }
-    let c0 = usize::try_from(x0 / cw).unwrap_or(0);
-    let c1 = usize::try_from((x1 - 1) / cw).unwrap_or(usize::MAX);
-    let r0 = usize::try_from(y0 / ch).unwrap_or(0);
-    let r1 = usize::try_from((y1 - 1) / ch).unwrap_or(usize::MAX);
+    let c0 = (x0 / cw) as usize;
+    let c1 = ((x1 - 1) / cw) as usize;
+    let r0 = (y0 / ch) as usize;
+    let r1 = ((y1 - 1) / ch) as usize;
 
     let mut bg_sum = [0u32; 3];
     let mut fg_sum = [0u32; 3];
@@ -100,54 +106,83 @@ pub fn cursor_cat_color_key(
         (fallback_bg >> 8) as u8,
         fallback_bg as u8,
     ];
-    let pack =
-        |rgb: [u8; 3]| (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]);
     let mut last_bg_rgb = [0u8; 3];
-    'rows: for row in r0..=r1 {
-        let line = cells.get(row).map_or(&[][..], Vec::as_slice);
-        for col in c0..=c1 {
-            let cell = line.get(col);
-            let background_rgb = cell.map_or(fallback_bg_rgb, |cell| cell.bg);
-            if sampled == 0 || background_rgb != last_bg_rgb {
-                let band = CatColorKey::background_band(pack(background_rgb));
+    let mut row = r0;
+    'rows: while row <= r1 {
+        let line = if row < cells.len() {
+            cells[row].as_slice()
+        } else {
+            &[]
+        };
+        let mut col = c0;
+        while col <= c1 {
+            let cell = if col < line.len() {
+                Some(&line[col])
+            } else {
+                None
+            };
+            let background_rgb = match cell {
+                Some(cell) => cell.bg,
+                None => fallback_bg_rgb,
+            };
+            if sampled == 0
+                || background_rgb[0] != last_bg_rgb[0]
+                || background_rgb[1] != last_bg_rgb[1]
+                || background_rgb[2] != last_bg_rgb[2]
+            {
+                let band = CatColorKey::background_band(crate::word_decorations::rgb3_to_u32(
+                    background_rgb,
+                ));
                 last_bg_rgb = background_rgb;
-                min_background_band = min_background_band.min(band);
-                max_background_band = max_background_band.max(band);
+                if band < min_background_band {
+                    min_background_band = band;
+                }
+                if band > max_background_band {
+                    max_background_band = band;
+                }
             }
-            bg_sum[0] += u32::from(background_rgb[0]);
-            bg_sum[1] += u32::from(background_rgb[1]);
-            bg_sum[2] += u32::from(background_rgb[2]);
+            bg_sum[0] += background_rgb[0] as u32;
+            bg_sum[1] += background_rgb[1] as u32;
+            bg_sum[2] += background_rgb[2] as u32;
             sampled += 1;
             if let Some(cell) = cell
                 && !cell.wide
-                && cell.ch != ' '
-                && cell.ch != '\0'
-                && !if cell.ch.is_ascii() {
-                    cell.ch.is_ascii_whitespace()
-                } else {
-                    cell.ch.is_whitespace()
-                }
+                && crate::word_decorations::is_ink_char(cell.ch)
             {
-                principal_fg.get_or_insert(cell.fg);
-                fg_sum[0] += u32::from(cell.fg[0]);
-                fg_sum[1] += u32::from(cell.fg[1]);
-                fg_sum[2] += u32::from(cell.fg[2]);
+                if principal_fg.is_none() {
+                    principal_fg = Some(cell.fg);
+                }
+                fg_sum[0] += cell.fg[0] as u32;
+                fg_sum[1] += cell.fg[1] as u32;
+                fg_sum[2] += cell.fg[2] as u32;
                 visible += 1;
             }
             if sampled == MAX_SAMPLES {
                 break 'rows;
             }
+            if col == usize::MAX {
+                break;
+            }
+            col += 1;
         }
+        if row == usize::MAX {
+            break;
+        }
+        row += 1;
     }
     if sampled == 0 {
         return CatColorKey::from_rgb(fallback_bg, fallback_fg, fallback_accent);
     }
-    let background = pack(bg_sum.map(|channel| (channel / sampled) as u8));
-    let foreground = principal_fg.map_or(fallback_fg, pack);
+    let background =
+        crate::word_decorations::rgb3_to_u32(crate::word_decorations::avg_rgb(bg_sum, sampled));
+    let foreground = match principal_fg {
+        Some(fg) => crate::word_decorations::rgb3_to_u32(fg),
+        None => fallback_fg,
+    };
     let surrounding = if visible == 0 {
         fallback_accent
     } else {
-        pack(fg_sum.map(|channel| (channel / visible) as u8))
+        crate::word_decorations::rgb3_to_u32(crate::word_decorations::avg_rgb(fg_sum, visible))
     };
     CatColorKey::from_rgb_span(
         background,
@@ -1396,11 +1431,11 @@ impl CompanionOwner {
 
     /// A left press at `px` (frame px) inside this frame's drawn body (padded by [`PET_HIT_SLOP_PX`]) strokes the cat and is consumed, so it never starts a selection or reaches a mouse-tracking app.
     #[inline]
-    pub fn press(&mut self, now: Instant, px: (f32, f32)) -> PressOutcome {
+    pub const fn press(&mut self, now: Instant, px: (f32, f32)) -> PressOutcome {
         let Some(rect) = self.hit_rect else {
             return PressOutcome::Pass;
         };
-        if !pet_rect_hit(rect, f64::from(px.0), f64::from(px.1), PET_HIT_SLOP_PX) {
+        if !pet_rect_hit(rect, px.0 as f64, px.1 as f64, PET_HIT_SLOP_PX) {
             return PressOutcome::Pass;
         }
         self.pet.note_petted(now);

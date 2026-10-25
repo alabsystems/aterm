@@ -1140,6 +1140,19 @@ fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_fai
         ["work-2"],
         "a row whose login works says nothing of an old failure"
     );
+    let mut due = logins.clone();
+    due.labels
+        .get_mut("main")
+        .expect("main's binding")
+        .notice_end = Some(NOW + DAY);
+    assert_eq!(
+        failing_sign_ins(&r, &state(), &due, NOW)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>(),
+        ["main", "work-2"],
+        "a renewal of a login due for one that failed is still news"
+    );
 
     let mut state = signed_out;
     note_renewed(
@@ -1186,6 +1199,54 @@ fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_fai
             .map(|(label, _)| label)
             .collect::<Vec<_>>(),
         ["work-2"]
+    );
+}
+
+/// A LOGIN SIGNED BACK IN WHERE IT STANDS ENDS ITS ROW'S FAILED AUTOMATIC SIGN-IN, as a renewal
+/// does: once that login is due, the old failure is no news of it, and a failure of its own
+/// renewal is written afresh, since its own time. CONTROL: while the row is still signed out the
+/// failure stands.
+#[test]
+fn a_login_signed_back_in_ends_its_rows_old_sign_in_failure() {
+    let r = roster();
+    let routes = "profile(none) mailbox(none configured)";
+    let mut logins = Logins::default();
+    let mut state = state();
+    note_auth(&mut state, "main", Auth::SignedOut, NOW - HOUR);
+    note_sign_in_attempt(&mut logins, "main", AttemptOutcome::NoRoute, routes, NOW);
+    let failing = |state: &State, logins: &Logins, at: i64| {
+        failing_sign_ins(&r, state, logins, at)
+            .into_iter()
+            .filter(|(label, _)| label == "main")
+            .map(|(_, attempt)| attempt.since)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        failing(&state, &logins, NOW),
+        [NOW],
+        "the control: signed out"
+    );
+    assert!(!note_signed_back(&mut state, &mut logins, "main", NOW + HOUR).is_empty());
+    assert_eq!(logins.get("main").unwrap().sign_in_attempt, None);
+    let at = NOW + 2 * HOUR;
+    logins
+        .labels
+        .get_mut("main")
+        .expect("main's binding")
+        .notice_end = Some(at + DAY);
+    assert!(
+        needs_sign_in(r.row("main").unwrap(), &state, &logins, true, at),
+        "the login is due"
+    );
+    assert!(
+        failing(&state, &logins, at).is_empty(),
+        "no failure from before the login is told of it"
+    );
+    note_sign_in_attempt(&mut logins, "main", AttemptOutcome::NoRoute, routes, at);
+    assert_eq!(
+        failing(&state, &logins, at),
+        [at],
+        "its own renewal's failure, since its own time"
     );
 }
 

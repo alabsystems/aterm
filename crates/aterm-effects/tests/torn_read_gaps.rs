@@ -632,6 +632,271 @@ fn a_stalled_repaint_restores_the_suffix_when_typing_resumes() {
     }
 }
 
+fn pending_repaint(
+    stall_ms: u64,
+    keys: usize,
+    tick_pending: bool,
+    exact: bool,
+) -> (Host, Vec<aterm_effects::rainbow_kitty::ribbon::Cell>) {
+    let mut h = Host::new(false);
+    h.type_str("hello brave new world");
+    h.idle(200);
+    let original = h
+        .glow
+        .v2_ribbon()
+        .expect("ribbon")
+        .cells()
+        .iter()
+        .filter(|cell| cell.row == ROW)
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(original.len(), h.text.len(), "every seed glyph owns a cell");
+    let cut = COL0 + "hello ".len();
+    h.program(format!("\x1b[?2026h\x1b[?25l\x1b[{};{}H\x1b[K", ROW + 1, cut + 1).as_bytes());
+    h.idle(stall_ms);
+    let ribbon = h.glow.v2_ribbon().expect("ribbon");
+    for old in &original {
+        let resident = ribbon
+            .cells()
+            .iter()
+            .find(|cell| (cell.row, cell.col, cell.born) == (old.row, old.col, old.born))
+            .expect("the original identity remains resident during the blank");
+        let cohort = ribbon
+            .cohorts()
+            .iter()
+            .find(|cohort| cohort.id == resident.cohort)
+            .unwrap();
+        assert!(
+            !cohort.leaving_at(h.now),
+            "{stall_ms}ms fixture must precede natural retraction"
+        );
+        if usize::from(old.col) >= cut {
+            assert!(resident.released_at.is_some(), "the suffix is in custody");
+            if stall_ms >= 300 {
+                assert!(
+                    h.now
+                        .saturating_duration_since(resident.released_at.unwrap())
+                        .as_secs_f32()
+                        > RETRACT_FADE_S,
+                    "the blank outlasts visual retraction"
+                );
+                assert!(
+                    ribbon.field_at(ROW, old.col).is_none(),
+                    "custody is dark before new keys"
+                );
+            }
+        }
+    }
+    if stall_ms >= 300 {
+        assert!(
+            coverage(&h.glow, geom(), ROW)[cut + 1..COL0 + h.text.len()]
+                .iter()
+                .all(|&cov| cov == 0)
+        );
+    }
+    let waiting = h.glow.admission_tally();
+    for ch in "xyz".chars().take(keys) {
+        h.now += Duration::from_millis(1);
+        h.last_event = h.now;
+        let (shifted, class) = class_of(ch);
+        if exact {
+            h.glow.note_typed_expected(h.now, 1, shifted, class, ch);
+        } else {
+            h.glow.note_typed_glyph(h.now, 1, shifted, class);
+        }
+        h.text.insert(h.caret, ch);
+        h.caret += 1;
+        if tick_pending {
+            h.frame();
+            assert_eq!(
+                h.glow.admission_tally(),
+                waiting,
+                "pending keys have no visible echo to admit"
+            );
+            let ribbon = h.glow.v2_ribbon().unwrap();
+            assert!(
+                (cut..COL0 + original.len()).all(|col| ribbon.field_at(ROW, col as u16).is_none()),
+                "{stall_ms}ms/{keys} keys: pending key {ch} relit the blank suffix"
+            );
+            assert!(
+                coverage(&h.glow, geom(), ROW)[cut + 1..COL0 + original.len()]
+                    .iter()
+                    .all(|&cov| cov == 0)
+            );
+            assert!(
+                coverage(&h.glow, geom(), ROW + 2)
+                    .iter()
+                    .all(|&cov| cov == 0)
+            );
+        }
+    }
+    (h, original)
+}
+
+#[test]
+fn a_dark_partial_repaint_restores_on_the_first_frame_with_pending_keys() {
+    for (stall_ms, keys, tick_pending, exact) in [
+        (300, 0, false, true),
+        (300, 1, false, true),
+        (800, 3, false, true),
+        (300, 1, true, true),
+        (800, 3, true, true),
+        (300, 3, false, false),
+        (1, 1, false, true),
+    ] {
+        eprintln!(
+            "pending return: stall={stall_ms}, keys={keys}, ticks={tick_pending}, exact={exact}"
+        );
+        let (mut h, original) = pending_repaint(stall_ms, keys, tick_pending, exact);
+        let before = h.glow.admission_tally();
+        h.now += Duration::from_millis(1);
+        h.label = format!(
+            "return after {stall_ms}ms, {keys} pending, ticks={tick_pending}, exact={exact}"
+        );
+        h.repaint(Split::Whole);
+        let ribbon = h.glow.v2_ribbon().expect("ribbon");
+        for old in &original {
+            let cell = ribbon
+                .cells()
+                .iter()
+                .find(|cell| (cell.row, cell.col, cell.born) == (old.row, old.col, old.born))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: original cell {:?} disappeared; residents={:?}\n{}",
+                        h.label,
+                        (old.row, old.col, old.born),
+                        ribbon
+                            .cells()
+                            .iter()
+                            .map(|cell| (
+                                cell.row,
+                                cell.col,
+                                cell.born,
+                                cell.cohort,
+                                cell.released_at
+                            ))
+                            .collect::<Vec<_>>(),
+                        h.story()
+                    )
+                });
+            assert_eq!(
+                (cell.cohort, cell.t),
+                (old.cohort, old.t),
+                "{}: original cell {} keeps its hue walk",
+                h.label,
+                old.col
+            );
+            assert!(
+                !cell.leaving() && cell.released_at.is_none(),
+                "{}: cell {} restored",
+                h.label,
+                old.col
+            );
+            assert!(
+                ribbon.field_at(ROW, old.col).is_some(),
+                "{}: first-return field at {}",
+                h.label,
+                old.col
+            );
+        }
+        for col in COL0..COL0 + h.text.len() {
+            assert!(
+                ribbon
+                    .cells()
+                    .iter()
+                    .any(|cell| cell.row == ROW && usize::from(cell.col) == col && !cell.leaving()),
+                "{}: expected cell {col}",
+                h.label
+            );
+        }
+        let cut = COL0 + "hello ".len();
+        let y = i32::from(ROW) * CH as i32 + CH as i32 / 2;
+        for col in [cut + 3, cut + 6, COL0 + original.len() - 2] {
+            let x = (col * CW + CW / 2) as i32;
+            assert!(
+                h.glow.under_quads().iter().any(|q| q.alpha >= 50
+                    && i32::from(q.x) <= x
+                    && x < i32::from(q.x) + i32::from(q.w)
+                    && i32::from(q.y) <= y
+                    && y < i32::from(q.y) + i32::from(q.h)),
+                "{}: first-return old-suffix geometry at {col}",
+                h.label
+            );
+        }
+        let after = h.glow.admission_tally();
+        assert_eq!(
+            after.licensed - before.licensed,
+            u64::from(keys > 0),
+            "{}: one coalesced echo move",
+            h.label
+        );
+        assert_eq!(
+            after.declined, before.declined,
+            "{}: no refused echo",
+            h.label
+        );
+        assert!(
+            ribbon.cells().iter().all(|cell| cell.row == ROW),
+            "{}: no footer identity",
+            h.label
+        );
+        assert!((0..COLS).all(|col| ribbon.field_at(ROW + 2, col as u16).is_none()));
+        assert!(
+            coverage(&h.glow, geom(), ROW + 2)
+                .iter()
+                .all(|&cov| cov == 0)
+        );
+
+        let clocks = ribbon
+            .cohorts()
+            .iter()
+            .map(|cohort| (cohort.id, cohort.clock()))
+            .collect::<Vec<_>>();
+        let expires = ribbon
+            .cohorts()
+            .iter()
+            .map(|cohort| cohort.clock() + Duration::from_secs_f32(cohort.swoosh_total()))
+            .max()
+            .unwrap();
+        h.step();
+        h.repaint(Split::Whole);
+        assert_eq!(
+            h.glow.admission_tally(),
+            after,
+            "a repeated frame earns no new admission"
+        );
+        assert_eq!(
+            h.glow
+                .v2_ribbon()
+                .unwrap()
+                .cohorts()
+                .iter()
+                .map(|cohort| (cohort.id, cohort.clock()))
+                .collect::<Vec<_>>(),
+            clocks,
+            "repainting does not renew the genuine keys' clocks"
+        );
+        h.idle_to(expires + Duration::from_millis(3 * FRAME_MS));
+        assert!(
+            h.glow.v2_ribbon().unwrap().at_rest(),
+            "{}: natural retirement",
+            h.label
+        );
+        assert!(
+            h.glow
+                .v2_ribbon()
+                .unwrap()
+                .next_change_deadline(h.now)
+                .is_none()
+        );
+        h.repaint(Split::Whole);
+        assert!(
+            h.glow.v2_ribbon().unwrap().at_rest(),
+            "a late identical repaint earns no light"
+        );
+    }
+}
+
 #[test]
 fn stalled_repaint_custody_is_dark_and_expires_with_its_run() {
     for reduced_motion in [false, true] {

@@ -3737,6 +3737,7 @@ fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
         task: None,
         autopilot_end: None,
         wakes: None,
+        box_receipt: None,
     }
 }
 
@@ -7037,4 +7038,248 @@ fn a_restored_row_nobody_saw_through_comes_back_inside_the_next() {
         };
         assert_eq!(titles, [want], "{case}");
     }
+}
+
+/// The `site=` of each resize session `id`'s ledger booked, oldest first.
+pub(super) fn resize_sites(app: &App, id: u64) -> Vec<String> {
+    let reply = app
+        .pool
+        .get(id)
+        .expect("a live shell")
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .resizes()
+        .reply(0, None);
+    reply
+        .lines()
+        .filter(|l| l.starts_with("resize "))
+        .filter_map(|l| l.split(' ').find(|w| w.starts_with("site=")))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Session `id`'s grid.
+pub(super) fn grid_of(app: &App, id: u64) -> (u16, u16) {
+    let term = crate::term_lock(&app.pool.get(id).expect("a live shell").term);
+    (term.rows(), term.cols())
+}
+
+/// A successor whose window took a new grid at attach before the restore placed its other two
+/// tabs, each on a handed-over shell still at the grid its engine was parked at.
+fn handoff_into_moved_window(grid: (u16, u16)) -> (App, Vec<u64>) {
+    let wid = WindowId(0);
+    let mut new = App::headless_for_test();
+    new.handoff_successor = true;
+    adopt_as(&mut new, 0, 0);
+    assert!(
+        new.apply_term_resize(wid, grid.0, grid.1),
+        "PRECONDITION: the attach moved the window's grid"
+    );
+    let leaf = |n| {
+        restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                local_id: Some(n),
+                ..bare_leaf()
+            },
+        ))
+    };
+    new.seamless_adopt = vec![handed_off_shell(1), handed_off_shell(2)];
+    new.restore_into_window(wid, window_of(vec![leaf(0), leaf(1), leaf(2)]));
+    assert!(
+        new.seamless_adopt.is_empty(),
+        "PRECONDITION: the layout placed both handed-over shells"
+    );
+    let handed: Vec<u64> = new.windows[&wid].tab_set.tabs()[1..]
+        .iter()
+        .filter_map(|tab| {
+            new.view_store
+                .get(tab.focus)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+        })
+        .collect();
+    assert_eq!(handed.len(), 2, "PRECONDITION: two handed-over tabs");
+    for id in &handed {
+        assert_ne!(
+            grid_of(&new, *id),
+            grid,
+            "PRECONDITION: shell {id} lands at its parked grid"
+        );
+    }
+    (new, handed)
+}
+
+#[test]
+fn a_handoff_s_close_regrids_each_handed_over_tab_its_window_moved_under() {
+    let grid = (27, 80);
+    let (mut new, handed) = handoff_into_moved_window(grid);
+    let bootstrap = resize_sites(&new, 0);
+    new.close_restore_pass(&[]);
+    for id in &handed {
+        assert_eq!(
+            grid_of(&new, *id),
+            grid,
+            "shell {id} took its window's grid"
+        );
+        assert_eq!(resize_sites(&new, *id), ["site=restore"], "shell {id}");
+    }
+    assert_eq!(grid_of(&new, 0), grid);
+    assert_eq!(
+        resize_sites(&new, 0),
+        bootstrap,
+        "the tab the attach re-gridded books nothing more"
+    );
+}
+
+#[test]
+fn a_window_awaiting_its_maximize_leaves_its_handed_over_tabs_to_the_size_that_lands() {
+    let (mut new, handed) = handoff_into_moved_window((27, 80));
+    let wid = WindowId(0);
+    let parked = grid_of(&new, handed[0]);
+    // What `note_restored_show` records for a maximized row in a windowed app.
+    new.windows
+        .get_mut(&wid)
+        .expect("the window")
+        .restore_show_awaited = true;
+    new.close_restore_pass(&[]);
+    for id in &handed {
+        assert_eq!(
+            grid_of(&new, *id),
+            parked,
+            "shell {id} waits for the OS's size"
+        );
+        assert!(resize_sites(&new, *id).is_empty(), "shell {id}");
+    }
+    let ws = &new.windows[&wid];
+    assert!(ws.panes_stale, "the window's panes are left stale");
+    assert!(!ws.restore_show_awaited, "the close took the note");
+
+    // A show that keeps the grid: the tab brought on screen is re-gridded at its redraw.
+    let shown = new.windows[&wid].tab_set.tabs()[1].id;
+    new.switch_tab_in(wid, 1);
+    assert_eq!(
+        new.windows[&wid].tab_set.active_id(),
+        Some(shown),
+        "PRECONDITION: tab 1 came forward"
+    );
+    new.resize_panes_scoped(wid, true);
+    assert_eq!(grid_of(&new, handed[0]), (27, 80));
+    assert_eq!(
+        grid_of(&new, handed[1]),
+        parked,
+        "a tab off screen still waits"
+    );
+
+    // The size the maximize brings re-grids every tab once.
+    assert!(new.apply_term_resize(wid, 40, 120));
+    for id in [0, handed[0], handed[1]] {
+        assert_eq!(grid_of(&new, id), (40, 120), "shell {id}");
+    }
+    assert_eq!(
+        resize_sites(&new, handed[1]).len(),
+        1,
+        "one resize, to the landed size"
+    );
+    assert!(!new.windows[&wid].panes_stale);
+}
+
+#[test]
+fn a_headless_maximized_row_is_regridded_at_the_close() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    {
+        let ws = app.windows.get_mut(&wid).expect("the window");
+        (ws.rows, ws.cols) = (27, 80);
+    }
+    let mut layout = window_of(vec![
+        restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(bare_leaf())),
+        restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                local_id: Some(1),
+                ..bare_leaf()
+            },
+        )),
+    ]);
+    layout.maximized = Some(true);
+    layout.show.fullscreen = Some(true);
+    app.restore_into_window(wid, layout);
+    assert!(
+        !app.windows[&wid].restore_show_awaited,
+        "no OS will bring a headless window a size"
+    );
+    app.close_restore_pass(&[]);
+    for tab in app.windows[&wid].tab_set.tabs() {
+        let id = app
+            .view_store
+            .get(tab.focus)
+            .copied()
+            .and_then(crate::tab_model::View::terminal_session)
+            .expect("a shell");
+        assert_eq!(grid_of(&app, id), (27, 80), "shell {id}");
+    }
+}
+
+#[test]
+fn a_reopened_split_tab_fits_each_pane_to_its_share_of_the_window() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    // A fresh shell per leaf: a live id would show session 0 twice, and a shared session re-grids
+    // the window at every sync.
+    let leaf = || {
+        restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                local_id: None,
+                ..bare_leaf()
+            },
+        ))
+    };
+    let mut records = window_of(vec![leaf(), split_of(leaf(), leaf())]).restored_tabs;
+    // A second tab brings the tab strip, and the grid change that brings re-grids every tab.
+    app.restore_closed_tab_into_window(wid, &records[0], 1)
+        .expect("reopened");
+    let window = (app.windows[&wid].rows, app.windows[&wid].cols);
+    let tab = app
+        .restore_closed_tab_into_window(wid, &records.remove(1), 2)
+        .expect("reopened");
+    assert_eq!(
+        (app.windows[&wid].rows, app.windows[&wid].cols),
+        window,
+        "PRECONDITION: the third tab leaves the window's grid as it was"
+    );
+    let panes: Vec<u64> = app.windows[&wid]
+        .tab_set
+        .tabs()
+        .iter()
+        .find(|t| t.id == tab)
+        .expect("the reopened tab")
+        .root
+        .leaves()
+        .into_iter()
+        .filter_map(|view| {
+            app.view_store
+                .get(view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+        })
+        .collect();
+    assert_eq!(panes.len(), 2, "PRECONDITION: both panes are shells");
+    assert!(
+        panes[0] != panes[1] && !app.pool.any_shared(),
+        "PRECONDITION: each pane is its own shell"
+    );
+    let reopened: Vec<(u16, u16)> = panes.iter().map(|id| grid_of(&app, *id)).collect();
+    for (id, grid) in panes.iter().zip(&reopened) {
+        assert_ne!(
+            *grid, window,
+            "shell {id} holds a share, not the whole window"
+        );
+    }
+    app.resize_panes(wid);
+    let laid_out: Vec<(u16, u16)> = panes.iter().map(|id| grid_of(&app, *id)).collect();
+    assert_eq!(
+        reopened, laid_out,
+        "a layout pass finds every pane at its size"
+    );
 }

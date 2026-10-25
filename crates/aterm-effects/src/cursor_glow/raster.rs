@@ -235,7 +235,7 @@ pub(super) const fn rainbow_sweep_phase(phase: f32) -> f32 {
 #[inline]
 pub(crate) const fn rainbow_phase_from_unit_turn(turn: f32) -> f32 {
     rem_euclid_pos(
-        (rem_euclid_pos(turn, 1.0) * 2.0) / RAINBOW_LIGHT_RAIL_FLOW,
+        (rem_euclid_pos(turn, 1.0) * 2.0) * (1.0 / RAINBOW_LIGHT_RAIL_FLOW),
         RAINBOW_PHASE_RING,
     )
 }
@@ -311,7 +311,7 @@ pub(super) const fn rainbow_cycle_ink(p: f32) -> u32 {
         crate::effect_util::lerp_rgb(
             crate::spectrum::SPECTRUM_ANCHORS[SPECTRUM_STOPS - 1],
             crate::spectrum::SPECTRUM_ANCHORS[0],
-            ((phase - 1.0) / RAINBOW_WRAP_SHARE).clamp(0.0, 1.0),
+            ((phase - 1.0) * (1.0 / RAINBOW_WRAP_SHARE)).clamp(0.0, 1.0),
         )
     }
 }
@@ -466,10 +466,9 @@ pub(super) const fn glyph_ink_bound(fg: u32, bg: u32) -> Option<(GlyphInkSide, f
     if fg > 0x00FF_FFFF || bg > 0x00FF_FFFF || fg == bg {
         return None;
     }
-    let table = crate::color_math::relative_luminance_table();
     let (lfg, lbg) = (
-        crate::color_math::relative_luminance_with(table, fg),
-        crate::color_math::relative_luminance_with(table, bg),
+        crate::color_math::relative_luminance(fg),
+        crate::color_math::relative_luminance(bg),
     );
     let (hi, lo) = if lfg > lbg { (lfg, lbg) } else { (lbg, lfg) };
     let theme = (hi + 0.05) / (lo + 0.05);
@@ -744,7 +743,7 @@ pub(crate) fn push_halo_over(
     if peak < 96 {
         return;
     }
-    let scale = (peak as f32 / 255.0).max(0.55);
+    let scale = (peak as f32 * (1.0 / 255.0)).max(0.55);
     push_halo_rows(
         out,
         geom,
@@ -862,7 +861,7 @@ pub(crate) fn push_soft_veil(
     let layer_cap = LAYER_CAP[usize::from(cap)];
     let color = (ink & 0x00FF_FFFF) | (layer_cap << 24);
     for k in 0..SOFT_VEIL_LAYERS {
-        let shrink = 1.0 - k as f32 / SOFT_VEIL_LAYERS as f32;
+        let shrink = 1.0 - k as f32 * (1.0 / SOFT_VEIL_LAYERS as f32);
         push_halo_rows(
             halos,
             geom,
@@ -1027,6 +1026,99 @@ pub(super) const CRESCENT_SHADOW_OFFSET: (f32, f32) = (0.42, -0.30);
 /// The crescent's shadow disc radius, as a share of the moon's.
 pub(super) const CRESCENT_SHADOW_R: f32 = 0.84;
 
+/// How a crescent lays its light ([`push_crescent`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CrescentInk {
+    /// Added to what lies under it (a dark page).
+    Add,
+    /// Laid over what lies under it at its coverage (paper).
+    Over,
+    /// Laid over the tinted dark page `0x00RRGGBB` as it reads added to the
+    /// reference dark page ([`page_matched`]).
+    Page(u32),
+}
+
+/// The reference dark page a light's reading on a tinted page is matched to
+/// ([`page_matched`]).
+const REF_DARK_PAGE: u32 = 0x0011_1318;
+
+/// The tint (its brightest channel over its darkest) from which a dark page
+/// shifts the hue of a light added to it: a light laid there reads as it
+/// reads on the reference dark page ([`page_matched`]). The reference's own
+/// is 7; Solarized Dark's `#002b36` is 54.
+pub(crate) const PAGE_TINT_MATCHED: u32 = 16;
+
+/// The dark page `page` when its tint shifts a light added to it
+/// ([`PAGE_TINT_MATCHED`]).
+#[inline]
+#[must_use]
+pub(crate) const fn tinted_dark_page(page: u32) -> Option<u32> {
+    let page = page & 0x00FF_FFFF;
+    let (r, g, b) = ((page >> 16) & 0xff, (page >> 8) & 0xff, page & 0xff);
+    let hi_rg = if r > g { r } else { g };
+    let hi = if hi_rg > b { hi_rg } else { b };
+    let lo_rg = if r < g { r } else { g };
+    let lo = if lo_rg < b { lo_rg } else { b };
+    if hi - lo >= PAGE_TINT_MATCHED {
+        Some(page)
+    } else {
+        None
+    }
+}
+
+/// The premultiplied colour and source-over opacity that lay `rgb` at
+/// coverage `a` over the tinted dark page `page` as it reads added to the
+/// reference dark page ([`REF_DARK_PAGE`]): the hue and saturation of its
+/// reading there, at the brightness it lays added to `page`, reached from
+/// `page` at the least opacity that reaches it. Added to Solarized Dark's
+/// teal `#002b36`, the page's own green and blue turned Sparkle's gold
+/// moons olive and sage (looks7 round 3); laid this way a moon reads within
+/// a few degrees of its reference gold at every coverage from a quarter up,
+/// and a full one reads as on the reference.
+#[must_use]
+pub(crate) fn page_matched(rgb: u32, a: u8, page: u32) -> (u32, u8) {
+    if a == 0 {
+        return (0, 0);
+    }
+    let af = f32::from(a) * (1.0 / 255.0);
+    let ch = |c: u32, sh: u32| ((c >> sh) & 0xff) as f32;
+    let light = [ch(rgb, 16), ch(rgb, 8), ch(rgb, 0)];
+    let pg = [ch(page, 16), ch(page, 8), ch(page, 0)];
+    let rf = [
+        ch(REF_DARK_PAGE, 16),
+        ch(REF_DARK_PAGE, 8),
+        ch(REF_DARK_PAGE, 0),
+    ];
+    let pack = |c: [f32; 3]| {
+        let q = |v: f32| v.round().clamp(0.0, 255.0) as u32;
+        (q(c[0]) << 16) | (q(c[1]) << 8) | q(c[2])
+    };
+    let on_ref: [f32; 3] = std::array::from_fn(|i| (rf[i] + light[i] * af).min(255.0));
+    let on_page_v = (0..3)
+        .map(|i| (pg[i] + light[i] * af).min(255.0))
+        .fold(0.0f32, f32::max);
+    let (h, s, _) = crate::color_math::rgb2hsv(pack(on_ref));
+    let want = crate::color_math::hsv2rgb(h, s, on_page_v * (1.0 / 255.0));
+    let d = [ch(want, 16), ch(want, 8), ch(want, 0)];
+    let need = (0..3).fold(0.0f32, |m, i| {
+        let k = if d[i] > pg[i] {
+            (d[i] - pg[i]) / (255.0 - pg[i]).max(1.0)
+        } else if d[i] < pg[i] {
+            (pg[i] - d[i]) / pg[i].max(1.0)
+        } else {
+            0.0
+        };
+        m.max(k)
+    });
+    let alpha = (need.clamp(0.0, 1.0) * 255.0).ceil();
+    if alpha <= 0.0 {
+        return (0, 0);
+    }
+    let k = alpha / 255.0;
+    let c: [f32; 3] = std::array::from_fn(|i| (pg[i] + (d[i] - pg[i]) / k).clamp(0.0, 255.0) * k);
+    (pack(c), alpha as u8)
+}
+
 /// A crescent moon of radius `r` at `(cx, cy)`: the lit disc minus a shadow disc ([`CRESCENT_SHADOW_R`] of its radius, at [`CRESCENT_SHADOW_OFFSET`] from its centre), so a thick limb tapers into two horns.
 pub(super) fn push_crescent(
     out: &mut Vec<GlowQuad>,
@@ -1035,7 +1127,7 @@ pub(super) fn push_crescent(
     r: f32,
     rgb: u32,
     cov: u8,
-    over: bool,
+    ink: CrescentInk,
 ) {
     if cov == 0 || r < 1.0 {
         return;
@@ -1045,8 +1137,12 @@ pub(super) fn push_crescent(
         cy + CRESCENT_SHADOW_OFFSET.1 * r,
     );
     let sr = CRESCENT_SHADOW_R * r;
-    let full_premul = premul_rgb(rgb, cov);
-    let full_alpha = if over { cov } else { 0 };
+    let at = |a: u8| match ink {
+        CrescentInk::Add => (premul_rgb(rgb, a), 0),
+        CrescentInk::Over => (premul_rgb(rgb, a), a),
+        CrescentInk::Page(page) => page_matched(rgb, a, page),
+    };
+    let (full_premul, full_alpha) = at(cov);
     let mut span = |y: i32, xl: f32, xr: f32| {
         if xr - xl < 0.05 {
             return;
@@ -1054,8 +1150,10 @@ pub(super) fn push_crescent(
         let lay = |out: &mut Vec<GlowQuad>, x: i32, w: i32, f: f32| {
             let a = (f32::from(cov) * f.clamp(0.0, 1.0)) as u8;
             if a > 0 {
-                let alpha = if over { a } else { 0 };
-                push_fx_quad(out, geom, x, y, w, 1, premul_rgb(rgb, a), alpha);
+                let (premul, alpha) = at(a);
+                if premul != 0 || alpha != 0 {
+                    push_fx_quad(out, geom, x, y, w, 1, premul, alpha);
+                }
             }
         };
         let (pl, pr) = (xl.floor() as i32, (xr.ceil() as i32) - 1);

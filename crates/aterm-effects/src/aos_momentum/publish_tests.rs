@@ -285,6 +285,23 @@ fn publishing_over_an_unnamed_base_is_refused() {
 }
 
 #[test]
+fn publishing_over_the_safe_code_is_refused_base_not_in_policy() {
+    let t0 = Instant::now();
+    let live = Sched::Prebuilt(MomentumCode::Safe);
+    let (mut host, _, head) = typed_and_paused(t0, live);
+    assert_eq!(
+        host.aos_publish(winner()).err(),
+        Some(PlanPublishRefusal::BaseNotInPolicy { live: "safe" })
+    );
+    untouched(&host, &head, 0, live, (0, 0), "over the safe code");
+    let (mut shipped, _, _) = typed_and_paused(t0, Sched::Prebuilt(MomentumCode::Shipped));
+    assert!(
+        shipped.aos_publish(winner()).is_ok(),
+        "negative control: the same winner publishes over the shipped code"
+    );
+}
+
+#[test]
 fn each_refusal_before_the_boundary_is_named_and_changes_nothing() {
     let t0 = Instant::now();
     let mut direct = MomentumHost::default();

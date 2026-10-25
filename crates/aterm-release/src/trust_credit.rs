@@ -40,8 +40,12 @@ const ENCODINGS: [&str; 4] = [
     "e6-reflector",
     "not-encoded",
 ];
-/// The discharges a compiler may state (`GradeDischarge`).
-const DISCHARGES: [&str; 5] = [
+/// The discharges a compiler may state (`GradeDischarge`). `kernel-reference-checked` is
+/// Trust's KR0 switch: the Clean kernel checked the term AND its fenced Lean reference entry
+/// accepted the same judgment (the two `Certified` variants). It is a discharge, not an
+/// encoding, so it earns no calculus credit by itself.
+const DISCHARGES: [&str; 6] = [
+    "kernel-reference-checked",
     "kernel-reconstructed",
     "solver-self-checked",
     "solver-asserted",
@@ -491,6 +495,9 @@ mod tests {
         let text = record(&[
             &graded("proved", "unvalidated-encoder", "kernel-reconstructed"),
             &graded("proved", "e6-reflector", "kernel-reconstructed"),
+            // Trust's KR0 switch: the Certified rows' discharge, read as graded, not calculus.
+            &graded("proved", "unvalidated-encoder", "kernel-reference-checked"),
+            &graded("proved", "e6-reflector", "kernel-reference-checked"),
             &graded("unknown", "not-encoded", "assumed"),
             &old("failed"),
         ]);
@@ -498,11 +505,18 @@ mod tests {
         assert_eq!(
             t,
             Tally {
-                proved: 2,
+                proved: 4,
                 calculus: 0,
-                graded: 2
+                graded: 4
             }
         );
+        // Negative control: a discharge Trust does not state is still refused.
+        let text = record(&[&graded(
+            "proved",
+            "e6-reflector",
+            "kernel-reference-guessed",
+        )]);
+        assert!(tally(&text).unwrap_err().contains("unknown discharge"));
         // Negative control: one row graded proven-calculus is counted, and only when proved.
         let text = record(&[
             &graded("proved", CALCULUS, "kernel-reconstructed"),

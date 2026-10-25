@@ -5,9 +5,9 @@ use super::*;
 use std::path::PathBuf;
 
 /// `git <args>` in `dir`, hermetic: no system or global config, a fixed
-/// author.
+/// author; its output.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(crate) fn scratch_git(dir: &Path, args: &[&str]) {
+pub(crate) fn scratch_git(dir: &Path, args: &[&str]) -> String {
     let out = aterm_uds::deadline::output_until(
         aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
             .args([
@@ -34,6 +34,7 @@ pub(crate) fn scratch_git(dir: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// A repository at `<tmp>/work` with one commit, pushed to a bare remote at
@@ -65,7 +66,7 @@ fn found(dir: &Path) -> Option<RepoWork> {
 /// A probe that finished: its finding, `None` for a clean repository.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn finished(read: RepoRead) -> Option<RepoWork> {
-    assert!(!read.is_unread(), "the probe finished within its limit");
+    assert!(!read.is_unread(), "every read ended within its limit");
     read.into_found()
 }
 
@@ -208,6 +209,150 @@ fn a_probe_whose_reads_are_starved_still_finds_the_unpushed_commit() {
     );
 }
 
+/// A PROBE WHOSE EVERY READ IS SLOW STILL READS THE WHOLE REPOSITORY
+/// ([`PROBE_LIMIT`] is each read's hang detector, not the probe's budget):
+/// with every read starved 6 s (on the probe's clock, no sleep), so that its
+/// reads lose more than a minute together, the probe reads a pushed
+/// repository clean and finds the one commit no remote has in another (under a
+/// CPU clamp beside 56 busy loops, a read took up to 3.9 s and a probe's
+/// thirteen reads 24 s together), its clean reading naming the commit it read
+/// ([`RepoRead::Checked`], slice 9a). NEGATIVE CONTROL: one read starved past
+/// [`PROBE_LIMIT`] is unread, the first or any later one, whose limit runs
+/// from the end of the read before it, not from the reads before that.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_probe_whose_every_read_is_slow_still_reads_the_whole_repository() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let pushed = repo(&tmp.path().join("pushed"), true);
+    let ahead = repo(&tmp.path().join("ahead"), true);
+    std::fs::write(ahead.join("b.txt"), "two\n").expect("b.txt");
+    scratch_git(&ahead, &["add", "b.txt"]);
+    scratch_git(&ahead, &["commit", "-q", "-m", "two"]);
+    let slow = |work: &Path| {
+        read_stall::every(6_000);
+        let read = probe(work, Some(work), PROBE_LIMIT);
+        read_stall::set(0);
+        read
+    };
+    let clean = slow(&pushed);
+    assert!(
+        clean.checked().is_some(),
+        "the pushed repository, read whole: {clean:?}"
+    );
+    let w = slow(&ahead)
+        .into_found()
+        .expect("the unpushed commit, found by the slow probe");
+    assert_eq!((w.unpushed, w.unlanded, w.changed), (1, 1, 0), "{w:?}");
+    let hung = u64::try_from(PROBE_LIMIT.as_millis()).unwrap_or(u64::MAX) + 1_000;
+    read_stall::set(hung);
+    let first = probe(&ahead, Some(&ahead), PROBE_LIMIT);
+    read_stall::set(0);
+    assert_eq!(first, RepoRead::Unread, "the first read past its limit");
+    // A pushed repository's probe makes at least nine reads (the top level,
+    // two excludes, the status, the branch, the stash, the remotes, the
+    // unpushed count and the remote's HEAD); a cut at any of them reads
+    // nothing found.
+    for k in 1..9 {
+        read_stall::set_after(k, hung);
+        let later = probe(&pushed, Some(&pushed), PROBE_LIMIT);
+        read_stall::set(0);
+        assert_eq!(later, RepoRead::Unread, "read {k} past its limit");
+    }
+}
+
+/// A PROBE THAT READS ON IS ANSWERED AT A LATER ASK ([`Probing::ask`]): with
+/// the probe's reads held, an ask that waits nothing answers `None` and leaves
+/// the probe reading; the next ask, once the reads go on, answers what they
+/// found and begins no probe; and the ask after that begins a new one. A
+/// probe that panics reads unread, never clean. NEGATIVE CONTROL: a probe
+/// whose reads end at once is answered at its first ask.
+#[test]
+fn a_probe_that_reads_on_is_answered_at_a_later_ask() {
+    use std::sync::atomic::AtomicUsize;
+    let probing = Probing::default();
+    let stop = AtomicBool::new(false);
+    let begun = AtomicUsize::new(0);
+    let begin = |answer: RepoRead, held: Option<mpsc::Receiver<()>>| {
+        begun.fetch_add(1, Ordering::SeqCst);
+        move || {
+            if let Some(held) = held {
+                let _ = held.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+            }
+            answer
+        }
+    };
+    let found = RepoRead::Found(RepoWork {
+        repo: "/r".to_string(),
+        changed: 1,
+        ..RepoWork::default()
+    });
+    let (go, held) = mpsc::channel::<()>();
+    let first = probing.ask(|| begin(found.clone(), Some(held)), Duration::ZERO, &stop);
+    assert_eq!(first, None, "the reads are held");
+    go.send(()).expect("the probe waits on its reads");
+    let wait = aterm_spec::wait::MUST_HAPPEN;
+    let second = probing.ask(|| begin(RepoRead::Clean, None), wait, &stop);
+    assert_eq!(second, Some(found), "the held probe's finding");
+    assert_eq!(begun.load(Ordering::SeqCst), 1, "no probe begun beside it");
+    let third = probing.ask(|| begin(RepoRead::Clean, None), wait, &stop);
+    assert_eq!(
+        third,
+        Some(RepoRead::Clean),
+        "a new probe, answered at once"
+    );
+    assert_eq!(begun.load(Ordering::SeqCst), 2);
+    let panicked = probing.ask(
+        || || -> RepoRead { panic!("the probe's reads panicked") },
+        wait,
+        &stop,
+    );
+    assert_eq!(panicked, Some(RepoRead::Unread), "a probe that panicked");
+}
+
+/// A STOPPED ASKER IS NOT KEPT WAITING ([`Probing::ask`]): with the probe's
+/// reads held and the asker's stop raised, an ask that would wait ten minutes
+/// answers `None` within the one-minute hang detector, the probe left
+/// reading. NEGATIVE CONTROL: with no stop, the next ask answers the held
+/// probe's finding once its reads go on.
+#[test]
+fn a_stopped_asker_is_not_kept_waiting() {
+    let wait = aterm_spec::wait::MUST_HAPPEN;
+    let probing = std::sync::Arc::new(Probing::default());
+    let stop = std::sync::Arc::new(AtomicBool::new(true));
+    let (go, held) = mpsc::channel::<()>();
+    let (said, answer) = mpsc::channel();
+    {
+        let (probing, stop) = (
+            std::sync::Arc::clone(&probing),
+            std::sync::Arc::clone(&stop),
+        );
+        std::thread::spawn(move || {
+            let read = probing.ask(
+                move || {
+                    move || {
+                        let _ = held.recv_timeout(wait);
+                        RepoRead::Clean
+                    }
+                },
+                10 * wait,
+                &stop,
+            );
+            let _ = said.send(read);
+        });
+    }
+    let stopped = answer
+        .recv_timeout(wait)
+        .expect("the stopped ask answered within the hang detector");
+    assert_eq!(stopped, None, "the reads are held");
+    stop.store(false, Ordering::SeqCst);
+    go.send(()).expect("the probe waits on its reads");
+    assert_eq!(
+        probing.ask(|| || RepoRead::Unread, wait, &stop),
+        Some(RepoRead::Clean),
+        "the held probe's answer, once its reads went on"
+    );
+}
+
 /// A PROBE CUT AT ANY READ IS NEVER A CLEAN REPOSITORY ([`RepoRead::Unread`]):
 /// over a repository holding one unpushed commit and over one holding one
 /// changed file, a probe whose `k`-th read is starved past its limit (on the
@@ -234,7 +379,9 @@ fn a_probe_cut_at_any_read_is_never_a_clean_repository() {
             let read = probe(work, Some(work), Duration::from_secs(10));
             read_stall::set(0);
             match read {
-                RepoRead::Clean => panic!("read {k} cut: read as clean over {whole:?}"),
+                RepoRead::Clean | RepoRead::Checked(_) => {
+                    panic!("read {k} cut: read as clean over {whole:?}")
+                }
                 RepoRead::Unread => unread += 1,
                 RepoRead::Found(_) => {}
             }
@@ -245,6 +392,184 @@ fn a_probe_cut_at_any_read_is_never_a_clean_repository() {
             RepoRead::Found(whole),
             "the reads past the last one starve nothing"
         );
+    }
+}
+
+/// A CLEAN REPOSITORY READS ITS HEAD AND MAIN ([`RepoRead::Checked`],
+/// `docs/DESIGN-harness-autopilot-2026-10-15.md` §14.9, slice 9a): over a
+/// repository pushed to a bare origin, the probe that finds nothing names the
+/// repository, the commit `HEAD` names (the one `git rev-parse HEAD` prints,
+/// and the next one once that is pushed), `origin/main` and a remote; it is
+/// clean, finds nothing and is the same as a clean reading. CONTROLS: the
+/// same repository with no remote reads `remote=false` and no main; a
+/// repository with no commit yet, a plain folder and a deleted folder name
+/// nothing and read [`RepoRead::Clean`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_clean_repository_reads_its_head_and_main() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let head_of = |work: &Path| scratch_git(work, &["rev-parse", "HEAD"]).trim().to_string();
+    let checked = |work: &Path| {
+        let read = probe(work, Some(work), PROBE_LIMIT);
+        assert!(
+            read.is_clean() && read.found().is_none() && !read.is_unread(),
+            "{read:?}"
+        );
+        assert!(RepoRead::same(&read, &RepoRead::Clean), "{read:?}");
+        read.checked().cloned()
+    };
+    let pushed = repo(&tmp.path().join("pushed"), true);
+    let at = checked(&pushed).expect("a clean pushed repository names what it checked");
+    assert_eq!(
+        (at.head.as_str(), at.main_ref.as_str(), at.remote),
+        (head_of(&pushed).as_str(), "origin/main", true),
+        "{at:?}"
+    );
+    assert_eq!(at.head.len(), 40, "{at:?}");
+    assert!(at.repo.ends_with("/pushed/work"), "{at:?}");
+    std::fs::write(
+        pushed.join("b.txt"),
+        "two
+",
+    )
+    .expect("b.txt");
+    scratch_git(&pushed, &["add", "b.txt"]);
+    scratch_git(&pushed, &["commit", "-q", "-m", "two"]);
+    assert!(found(&pushed).is_some(), "the new commit, unpushed");
+    scratch_git(&pushed, &["push", "-q", "origin", "HEAD:main"]);
+    let next = checked(&pushed).expect("pushed again");
+    assert_eq!(next.head, head_of(&pushed), "{next:?}");
+    assert_ne!(next.head, at.head, "the probe reads HEAD each time");
+    let alone = repo(&tmp.path().join("alone"), false);
+    let at = checked(&alone).expect("a clean repository with no remote");
+    assert_eq!(
+        (at.head.as_str(), at.main_ref.as_str(), at.remote),
+        (head_of(&alone).as_str(), "", false),
+        "{at:?}"
+    );
+    let unborn = tmp.path().join("unborn");
+    std::fs::create_dir_all(&unborn).expect("unborn");
+    scratch_git(&unborn, &["init", "-q", "."]);
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir_all(&plain).expect("plain");
+    let gone = tmp.path().join("gone");
+    std::fs::create_dir_all(&gone).expect("gone");
+    std::fs::remove_dir(&gone).expect("deleted");
+    for (dir, what) in [
+        (&unborn, "no commit yet"),
+        (&plain, "a plain folder"),
+        (&gone, "a deleted folder"),
+    ] {
+        assert_eq!(
+            probe(dir, Some(tmp.path()), PROBE_LIMIT),
+            RepoRead::Clean,
+            "{what}"
+        );
+    }
+}
+
+/// A CLEAN PROBE CUT AT ITS HEAD READ READS AS IT DID BEFORE THE HEAD WAS READ
+/// (§14.9, slice 9a: no decision moves): over a clean pushed repository, a
+/// probe whose `k`-th read is starved past its limit reads unread for every
+/// read before the head read, as the probe read before it read `HEAD`; clean,
+/// naming nothing, where only the head read is cut, as that probe read with
+/// every read finished; and checked past it. NEGATIVE CONTROL: the same
+/// probes with no read starved read checked. The starved read alone is cut:
+/// the probe's own limit is the one-minute hang detector for the real reads.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_clean_probe_cut_at_its_head_read_reads_as_before_the_head_was_read() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), true);
+    let starved = u64::try_from(PROBE_LIMIT.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1_000);
+    let mut seen = String::new();
+    for k in 0..24 {
+        read_stall::set_after(k, starved);
+        let read = probe(&work, Some(&work), PROBE_LIMIT);
+        read_stall::set(0);
+        seen.push(match read {
+            RepoRead::Unread => 'u',
+            RepoRead::Clean => 'c',
+            RepoRead::Checked(_) => 'k',
+            RepoRead::Found(w) => panic!("read {k} cut: found {w:?} in a clean repository"),
+        });
+    }
+    let (unread, rest) = seen.split_at(seen.find('c').unwrap_or(seen.len()));
+    assert!(
+        !unread.is_empty()
+            && unread.chars().all(|c| c == 'u')
+            && rest.len() > 1
+            && rest.starts_with('c')
+            && rest[1..].chars().all(|c| c == 'k'),
+        "unread before the head read, clean at it, checked past it: {seen}"
+    );
+    assert!(
+        probe(&work, Some(&work), PROBE_LIMIT).checked().is_some(),
+        "the control: nothing starved"
+    );
+}
+
+/// A CLEAN READING OVER A COUNT GIT REFUSED NAMES NOTHING (§14.9, slice 9a;
+/// for 9b's receipt): over a clean pushed repository whose remote-tracking
+/// refs `for-each-ref` cannot print as text (a ref named in bytes that are no
+/// UTF-8, packed), that read answers nothing without a cut, so the probe
+/// counts no remote and reads [`RepoRead::Clean`], naming nothing, never
+/// `Checked` with `remote=false`, a remote it did not read as absent.
+/// CONTROL: the same repository before that ref reads `Checked` with
+/// `remote=true`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_clean_reading_over_a_count_git_refused_names_nothing() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), true);
+    let at = probe(&work, Some(&work), PROBE_LIMIT);
+    assert!(
+        at.checked().is_some_and(|at| at.remote),
+        "the control: {at:?}"
+    );
+    let head = scratch_git(&work, &["rev-parse", "HEAD"]);
+    let packed = work.join(".git/packed-refs");
+    let mut refs: Vec<u8> = std::fs::read(&packed)
+        .unwrap_or_default()
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty() && !line.starts_with(b"#"))
+        .flat_map(|line| line.iter().copied().chain(*b"\n"))
+        .collect();
+    refs.extend_from_slice(head.trim().as_bytes());
+    refs.extend_from_slice(b" refs/remotes/o/\xff\n");
+    std::fs::write(&packed, refs).expect("packed-refs");
+    assert_eq!(
+        probe(&work, Some(&work), PROBE_LIMIT),
+        RepoRead::Clean,
+        "a refused remote read names nothing"
+    );
+}
+
+/// A GUARDED REPOSITORY IS NEVER READ, AND ITS CLEAN READING NAMES NOTHING
+/// (§14.9, slice 9a: the leg a landing's words must be true on with nothing
+/// read): a repository with untracked work under the home's `Documents`
+/// reads [`RepoRead::Clean`] and names no check, as the probe never enters
+/// it. CONTROL: the same repository under `Developer` reads its work.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_guarded_repository_with_work_reads_clean_and_names_nothing() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let home = std::fs::canonicalize(tmp.path()).expect("owned tmp");
+    for (place, guarded) in [("Documents", true), ("Developer", false)] {
+        let work = repo(&home.join(place), false);
+        std::fs::write(work.join("draft.txt"), "draft\n").expect("draft");
+        let read = probe(&work, Some(&home), PROBE_LIMIT);
+        if guarded {
+            assert_eq!(read, RepoRead::Clean, "{place}");
+            assert!(read.checked().is_none(), "{place}");
+        } else {
+            assert!(
+                read.found().is_some_and(|w| w.untracked > 0),
+                "{place}: {read:?}"
+            );
+        }
     }
 }
 

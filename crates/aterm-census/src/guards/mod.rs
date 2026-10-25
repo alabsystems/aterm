@@ -32,6 +32,7 @@ mod machines;
 mod mint;
 mod mktemp;
 mod rules;
+mod shown_term;
 mod slog_inert;
 mod stock_label;
 mod term_write;
@@ -96,6 +97,7 @@ pub const GUARDS: &[Rule] = &[
     installer::INSTALLER_NETWORK,
     agent_gate::AGENT_GATE,
     term_write::TERM_WRITE,
+    shown_term::SHOWN_TERM,
     slog_inert::SLOG_INERT,
     eager_drop::EAGER_DROP,
     doc_sentence::DOC_SENTENCE,

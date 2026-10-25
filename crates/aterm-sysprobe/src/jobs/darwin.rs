@@ -431,6 +431,13 @@ impl VnodeFd {
     pub fn terminal(&self) -> bool {
         self.char_device() && super::terminal_path(&self.path)
     }
+
+    /// Opened as `/dev/tty`, the controlling terminal: never a terminal inherited or duplicated
+    /// from its own name (`/dev/ttys003`).
+    #[must_use]
+    pub fn controlling(&self) -> bool {
+        self.char_device() && self.path == b"/dev/tty"
+    }
 }
 
 /// Decode a `vnode_fdinfowithpath`; `None` when `b` is shorter than the struct.

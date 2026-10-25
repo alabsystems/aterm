@@ -64,14 +64,19 @@ impl Verdict {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Figures {
     n_present: Option<u64>,
-    present: [Option<f64>; 3],
+    /// Hundredths of a millisecond, the precision `metrics percentiles` reports.
+    present: [Option<u64>; 3],
     n_input: Option<u64>,
     now_rows: Vec<String>,
 }
 
 impl Figures {
     fn read(percentiles: &str) -> Figures {
-        let num = |k: &str| field(percentiles, k).and_then(|v| v.parse::<f64>().ok());
+        let num = |k: &str| {
+            field(percentiles, k)
+                .as_deref()
+                .and_then(reported_hundredths)
+        };
         let count = |k: &str| field(percentiles, k).and_then(|v| v.parse::<u64>().ok());
         Figures {
             n_present: count("n_present"),
@@ -86,7 +91,12 @@ impl Figures {
     }
 
     fn line(&self) -> String {
-        let ms = |v: Option<f64>| v.map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
+        let ms = |v: Option<u64>| {
+            v.map_or_else(
+                || "-".to_string(),
+                |v| format!("{}.{:02}", v / 100, v % 100),
+            )
+        };
         let n = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |v| v.to_string());
         format!(
             "n_present={} present_p50/p95/p99_ms={}/{}/{} n_input={} now_rows={}",
@@ -98,6 +108,27 @@ impl Figures {
             self.now_rows.len()
         )
     }
+}
+
+fn reported_hundredths(value: &str) -> Option<u64> {
+    let (whole, fraction) = value
+        .split_once('.')
+        .map_or((value, None), |(whole, fraction)| (whole, Some(fraction)));
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let fraction = match fraction {
+        None => 0,
+        Some(f) if (1..=2).contains(&f.len()) && f.bytes().all(|b| b.is_ascii_digit()) => {
+            f.parse::<u64>().ok()? * if f.len() == 1 { 10 } else { 1 }
+        }
+        Some(_) => return None,
+    };
+    whole
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(100)?
+        .checked_add(fraction)
 }
 
 fn events_gaps(lines: &[String], from: usize) -> Vec<(String, u64)> {
@@ -520,7 +551,7 @@ pub fn cmd_seamless(args: &[String]) -> Res {
             "seamless: unexpected '{extra}' ({LAB} help)"
         )));
     }
-    let Some(baseline) = baseline.map(PathBuf::from) else {
+    let Some(baseline) = baseline.map(|p| PathBuf::from(crate::paths::from_caller(&p))) else {
         return Err(Fail::usage(format!(
             "seamless: --baseline names an aterm built from 6B-6's tree, for the present leg's same-day runs ({LAB} help)"
         )));
@@ -1447,14 +1478,28 @@ fn press_refused(key: &str, refusal: &str, privacy: &str) -> Verdict {
     }
 }
 
-fn median(v: &[f64]) -> Option<f64> {
+fn median_twice(v: &[u64]) -> Option<u128> {
     let mut v = v.to_vec();
-    v.sort_by(f64::total_cmp);
+    v.sort_unstable();
     let n = v.len();
     match n {
         0 => None,
-        _ if n % 2 == 1 => Some(v[n / 2]),
-        _ => Some(f64::midpoint(v[n / 2 - 1], v[n / 2])),
+        _ => Some(u128::from(v[(n - 1) / 2]) + u128::from(v[n / 2])),
+    }
+}
+
+fn figure_text(twice: u128, milliseconds: bool) -> String {
+    let (whole, fraction, places) = if milliseconds {
+        (twice / 200, (twice % 200) * 5, 3)
+    } else {
+        (twice / 2, (twice % 2) * 5, 1)
+    };
+    if fraction == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction:0places$}")
+            .trim_end_matches('0')
+            .to_string()
     }
 }
 
@@ -1465,6 +1510,18 @@ fn judge_present(baseline: &[Figures], tested: &[Figures]) -> Verdict {
             baseline.len(),
             tested.len()
         ));
+    }
+    for (which, runs) in [("baseline", baseline), ("tested", tested)] {
+        for (i, run) in runs.iter().enumerate() {
+            for (key, count) in [("n_present", run.n_present), ("n_input", run.n_input)] {
+                if count.is_none_or(|n| n == 0) {
+                    return Verdict::Fail(format!(
+                        "{key} missing or zero in {which} run {}: no samples to judge",
+                        i + 1
+                    ));
+                }
+            }
+        }
     }
     let clause_off: Vec<String> = [("baseline", baseline), ("tested", tested)]
         .iter()
@@ -1481,33 +1538,39 @@ fn judge_present(baseline: &[Figures], tested: &[Figures]) -> Verdict {
             clause_off.join(", ")
         ));
     }
-    type Of = fn(&Figures) -> Option<f64>;
-    let figures: [(&str, Of); 4] = [
-        ("n_present", |f| f.n_present.map(|n| n as f64)),
-        ("present_p50_ms", |f| f.present[0]),
-        ("present_p95_ms", |f| f.present[1]),
-        ("present_p99_ms", |f| f.present[2]),
+    type Of = fn(&Figures) -> Option<u64>;
+    let figures: [(&str, bool, Of); 4] = [
+        ("n_present", false, |f| f.n_present),
+        ("present_p50_ms", true, |f| f.present[0]),
+        ("present_p95_ms", true, |f| f.present[1]),
+        ("present_p99_ms", true, |f| f.present[2]),
     ];
     let mut said = Vec::new();
     let mut ok = true;
-    for (key, of) in figures {
-        let base: Option<Vec<f64>> = baseline.iter().map(of).collect();
-        let test: Option<Vec<f64>> = tested.iter().map(of).collect();
+    for (key, milliseconds, of) in figures {
+        let base: Option<Vec<u64>> = baseline.iter().map(of).collect();
+        let test: Option<Vec<u64>> = tested.iter().map(of).collect();
         let (Some(base), Some(test)) = (base, test) else {
             said.push(format!("{key} missing from a run"));
             ok = false;
             continue;
         };
-        let lo = base.iter().copied().fold(f64::INFINITY, f64::min);
-        let hi = base.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let Some(mid) = median(&test) else { continue };
-        let runs = |v: &[f64]| {
+        let (Some(lo), Some(hi), Some(mid)) = (
+            base.iter().copied().min(),
+            base.iter().copied().max(),
+            median_twice(&test),
+        ) else {
+            continue;
+        };
+        let lo = u128::from(lo) * 2;
+        let hi = u128::from(hi) * 2;
+        let runs = |v: &[u64]| {
             v.iter()
-                .map(|x| format!("{x}"))
+                .map(|x| figure_text(u128::from(*x) * 2, milliseconds))
                 .collect::<Vec<_>>()
                 .join("/")
         };
-        let (word, fine) = if key == "n_present" {
+        let (word, fine) = if !milliseconds {
             if (lo..=hi).contains(&mid) {
                 ("within", true)
             } else {
@@ -1521,6 +1584,9 @@ fn judge_present(baseline: &[Figures], tested: &[Figures]) -> Verdict {
             ("within", true)
         };
         ok &= fine;
+        let mid = figure_text(mid, milliseconds);
+        let lo = figure_text(lo, milliseconds);
+        let hi = figure_text(hi, milliseconds);
         said.push(format!(
             "{key} tested median {mid} ({}) {word} baseline {lo}..{hi} ({})",
             runs(&test),
@@ -1635,12 +1701,14 @@ mod tests {
     }
 
     fn figures(n: u64, p: [f64; 3]) -> Figures {
-        Figures {
-            n_present: Some(n),
-            present: p.map(Some),
-            n_input: Some(2),
-            now_rows: vec!["tab-menu item text=\"now: approval\"".to_string()],
-        }
+        let mut figures = Figures::read(&format!(
+            "OK n_present={n} present_p50_ms={:.2} present_p95_ms={:.2} present_p99_ms={:.2} n_input=2",
+            p[0], p[1], p[2]
+        ));
+        figures
+            .now_rows
+            .push("tab-menu item text=\"now: approval\"".into());
+        figures
     }
 
     #[test]
@@ -1701,9 +1769,54 @@ mod tests {
         missing[0].present[2] = None;
         assert!(matches!(judge_present(&base, &missing), Verdict::Fail(_)));
         assert!(matches!(judge_present(&[], &same), Verdict::Fail(_)));
-        assert_eq!(median(&[3.0, 1.0, 2.0]), Some(2.0));
-        assert_eq!(median(&[4.0, 1.0, 2.0, 3.0]), Some(2.5));
-        assert_eq!(median(&[]), None);
+        assert_eq!(median_twice(&[3, 1, 2]), Some(4));
+        assert_eq!(median_twice(&[4, 1, 2, 3]), Some(5));
+        assert_eq!(median_twice(&[]), None);
+    }
+
+    #[test]
+    fn a_reported_even_median_at_the_baseline_boundary_is_not_over() {
+        let read = |n: u64, p: [&str; 3]| {
+            let mut figures = Figures::read(&format!(
+                "OK n_present={n} present_p50_ms={} present_p95_ms={} present_p99_ms={} n_input=3",
+                p[0], p[1], p[2]
+            ));
+            figures
+                .now_rows
+                .push("tab-menu item text=\"now: approval\"".into());
+            figures
+        };
+        let baseline = [
+            read(347, ["1.84", "4.72", "6.82"]),
+            read(349, ["1.97", "4.72", "6.29"]),
+            read(348, ["1.97", "5.77", "9.44"]),
+            read(348, ["1.84", "4.72", "7.34"]),
+        ];
+        let tested = [
+            read(349, ["1.97", "5.77", "10.49"]),
+            read(347, ["1.97", "5.77", "11.53"]),
+            read(347, ["1.97", "5.24", "6.29"]),
+            read(348, ["1.84", "4.72", "8.39"]),
+        ];
+        // The inputs are reported to 0.01 ms, so an even median can be halfway
+        // between those units. Neither a full unit nor a half-unit overshoot
+        // may be rounded back inside the baseline.
+        for upper_middle in ["10.51", "10.50"] {
+            let mut over = tested.clone();
+            over[0] = read(349, ["1.97", "5.77", upper_middle]);
+            let verdict = judge_present(&baseline, &over);
+            assert!(
+                matches!(&verdict, Verdict::Fail(_)),
+                "a genuine p99 median above 9.44 ms must fail ({upper_middle}): {verdict:?}"
+            );
+        }
+        // The retained live run reported middle p99 values 8.39 and 10.49:
+        // their exact reported median is 9.44, the baseline's upper bound.
+        let verdict = judge_present(&baseline, &tested);
+        assert!(
+            matches!(&verdict, Verdict::Pass(_)),
+            "an equal reported p99 boundary must pass without a binary-float overshoot: {verdict:?}"
+        );
     }
 
     #[test]
@@ -1857,9 +1970,110 @@ mod tests {
              n_input=2 input_p50_ms=3.00",
         );
         assert_eq!(f.n_present, Some(338));
-        assert_eq!(f.present, [Some(1.18), Some(1.44), Some(5.77)]);
+        assert_eq!(f.present, [Some(118), Some(144), Some(577)]);
         assert_eq!(f.n_input, Some(2));
         assert_eq!(Figures::read("OK n_input=2").n_present, None);
+    }
+
+    #[test]
+    fn every_present_run_has_present_and_input_samples_before_it_can_be_judged() {
+        let read = |counts: &str| {
+            let mut figures = Figures::read(&format!(
+                "OK {counts} present_p50_ms=0.00 present_p95_ms=0.00 present_p99_ms=0.00"
+            ));
+            figures
+                .now_rows
+                .push("tab-menu item text=\"now: approval\"".into());
+            figures
+        };
+        let populated = vec![read("n_present=1 n_input=1"); 3];
+        assert!(
+            matches!(judge_present(&populated, &populated), Verdict::Pass(_)),
+            "one sample is valid, even when its reported latency rounds to zero"
+        );
+
+        let mut accepted = Vec::new();
+        for cohort in ["baseline", "tested"] {
+            for run in 0..populated.len() {
+                for (missing, counts) in [
+                    ("missing n_present", "n_input=1"),
+                    ("zero n_present", "n_present=0 n_input=1"),
+                    ("missing n_input", "n_present=1"),
+                    ("zero n_input", "n_present=1 n_input=0"),
+                ] {
+                    let mut baseline = populated.clone();
+                    let mut tested = populated.clone();
+                    let runs = if cohort == "baseline" {
+                        &mut baseline
+                    } else {
+                        &mut tested
+                    };
+                    runs[run] = read(counts);
+                    let verdict = judge_present(&baseline, &tested);
+                    if !matches!(verdict, Verdict::Fail(_)) {
+                        accepted.push(format!("{cohort} run {} {missing}: {verdict:?}", run + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "an invalid run cannot hide among populated runs: {}",
+            accepted.join("; ")
+        );
+    }
+
+    #[test]
+    fn the_present_judge_rejects_invalid_wire_units_and_keeps_large_counts_exact() {
+        let read = |n: u64, p99: &str| {
+            let mut figures = Figures::read(&format!(
+                "OK n_present={n} present_p50_ms=1.00 present_p95_ms=1.00 present_p99_ms={p99} n_input=2"
+            ));
+            figures
+                .now_rows
+                .push("tab-menu item text=\"now: approval\"".into());
+            figures
+        };
+        for value in ["1", "1.2", "1.20", "0.00", "184467440737095516.15"] {
+            let f = read(342, value);
+            assert!(
+                matches!(
+                    judge_present(std::slice::from_ref(&f), std::slice::from_ref(&f)),
+                    Verdict::Pass(_)
+                ),
+                "valid reported value: {value}"
+            );
+        }
+        for value in [
+            "NaN",
+            "inf",
+            "-0.01",
+            "+1",
+            "1e0",
+            "1.234",
+            "1.",
+            ".5",
+            "",
+            "184467440737095516.16",
+            "184467440737095517",
+        ] {
+            let verdict = judge_present(&[read(342, "1.20")], &[read(342, value)]);
+            assert!(
+                matches!(&verdict, Verdict::Fail(s) if s.contains("present_p99_ms missing")),
+                "invalid reported value {value:?}: {verdict:?}"
+            );
+        }
+        let largest = u64::MAX;
+        let pair = [read(largest - 1, "1.20"), read(largest, "1.20")];
+        assert!(matches!(judge_present(&pair, &pair), Verdict::Pass(_)));
+        assert!(matches!(
+            judge_present(&[read(largest - 1, "1.20")], &pair),
+            Verdict::Fail(_)
+        ));
+        assert!(matches!(
+            judge_present(&[read(largest - 1, "1.20")], &[read(largest, "1.20")]),
+            Verdict::Fail(_)
+        ));
     }
 
     #[test]

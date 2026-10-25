@@ -479,6 +479,7 @@ fn cursor_color_button(state: &SettingsViewState, subject: &ColorSubject) -> Opt
                     swatches: Vec::new(),
                     chip: None,
                     chevron_row: None,
+                    icon_hidden: false,
                 },
                 ActionId::new(format!("settings/color-cursor/{key}")),
             )
@@ -790,6 +791,7 @@ fn link_wallpaper_row(state: &SettingsViewState, field: &EditField, row: &mut Ui
                 swatches: Vec::new(),
                 chip: None,
                 chevron_row: None,
+                icon_hidden: false,
             },
             ActionId::new(format!("settings/route{}", SettingsRoute::Wallpaper.path())),
         )
@@ -869,6 +871,7 @@ fn link_tab_color_row(state: &SettingsViewState, field: &EditField, row: &mut Ui
                 swatches: Vec::new(),
                 chip: color_now(state, field.key),
                 chevron_row: None,
+                icon_hidden: false,
             },
             ActionId::new(format!("settings/route{}", SettingsRoute::TabColor.path())),
         )

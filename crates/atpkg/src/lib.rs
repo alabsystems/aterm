@@ -45,6 +45,8 @@ pub mod builtin;
 pub mod cache;
 /// The shell that typed this command.
 pub mod caller_shell;
+/// `aterm pkg capacity`: the machine's capacity now and the claims every session holds on it.
+pub(crate) mod capacity;
 /// The `atpkg` CLI (all verbs), callable in-process by the `aterm` binary.
 pub mod cli;
 /// Copy-on-write clones of a build's files.

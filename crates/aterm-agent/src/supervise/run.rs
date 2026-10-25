@@ -323,10 +323,40 @@ pub struct HostStep {
 }
 
 /// Turn-end policy context offered to [`IdleHost::at_idle_on`] at an idle point.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct IdlePoint {
     /// Whether the task has landed and been defended under Autopilot Land (`Nothing left:`).
     pub done_under_land: bool,
+    /// What holds a fact the host would type at this point of its own (`HostTurn::Fact`: the ask
+    /// to free disk space), by the occupancy door's own guards
+    /// ([`crate::supervise::occupancy::Guards::held_host_fact`]): a person typed within
+    /// `[harness] human_grace_s` or another driver's hand is on the session ([`Guard::Person`]),
+    /// the turn was the person's own exchange ([`Guard::Exchange`]), or a manager awaits the
+    /// session ([`Guard::Managed`]). The host types no such fact here; its carry-on and its
+    /// upgrade keep their own gates.
+    pub held: Option<Guard>,
+    /// Of those, the first that holds the session for someone else for as long as they keep it
+    /// ([`crate::supervise::occupancy::Guards::theirs`]): the person's own exchange
+    /// ([`Guard::Exchange`]) or a manager's wait ([`Guard::Managed`]). A fact [`Self::held`] holds
+    /// for a person's grace alone stays owed for a later point; one for a session that is theirs
+    /// is given up, as no later point of theirs would take it.
+    pub theirs: Option<Guard>,
+}
+
+/// A tape spells a point as it did before [`IdlePoint::held`] and [`IdlePoint::theirs`] were
+/// there whenever nothing holds, so a tape recorded before them still replays.
+impl std::fmt::Debug for IdlePoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("IdlePoint");
+        d.field("done_under_land", &self.done_under_land);
+        if let Some(held) = &self.held {
+            d.field("held", held);
+        }
+        if let Some(theirs) = &self.theirs {
+            d.field("theirs", theirs);
+        }
+        d.finish()
+    }
 }
 
 /// Reason a busy break or idle point was withheld from [`IdleHost`].
@@ -3846,6 +3876,13 @@ impl<'a, C: Ctl> Session<'a, C> {
                 {
                     self.memory_warn(&screen, over, opts, review);
                 }
+                if phase == Phase::Busy
+                    && !writing
+                    && !signing_in
+                    && let Some(host) = opts.and_then(|o| o.idle_host.as_ref())
+                {
+                    host.busy_tap();
+                }
             }
             if self.fx.mono() >= deadline {
                 return Ok(Turn {
@@ -5771,12 +5808,14 @@ impl<C: Ctl> Session<'_, C> {
         self.sleep_unknown = since.unknown();
     }
 
-    /// Journals a fresh repository probe that did not finish ([`Self::repo_unread_unsaid`]).
+    /// Journals a fresh repository probe that could not read the repository
+    /// ([`Self::repo_unread_unsaid`]).
     fn say_repo_unread(&mut self, seq: u64, review: &mut dyn Review) {
         if std::mem::take(&mut self.repo_unread_unsaid) {
             review.note(&format!(
-                "REPO UNREAD seq={seq} the repository probe did not finish within {}s: what the \
-                 repository holds is unknown, and no landing is judged clean on it",
+                "REPO UNREAD seq={seq} a read of the repository did not end within {}s or could \
+                 not be made: what the repository holds is unknown, and no landing is judged \
+                 clean on it",
                 crate::harness::repo_work::PROBE_LIMIT.as_secs()
             ));
         }
@@ -6287,8 +6326,13 @@ impl<C: Ctl> Session<'_, C> {
             if self.host_passed.is_some() && self.host_passed == Some(self.review_key(point)) {
                 return Ok(false);
             }
+            // The status this step read first ([`Self::foreground_program`]) is the person's and
+            // the driver's word, as at a break's own write.
+            let guards = self.occupancy_guards(self.fx.mono(), &opts.policy, &point.screen.rows);
             let at = IdlePoint {
                 done_under_land: self.autopilot(opts) == Autopilot::Land && self.turn_end.landed(),
+                held: guards.held_host_fact(),
+                theirs: guards.theirs(),
             };
             let step = host.at_idle_on(at);
             if let Some(step) = &step {

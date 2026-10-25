@@ -703,10 +703,34 @@ pub(crate) struct Proof {
     api_clock: Instant,
     port: u16,
     fails: Vec<String>,
+    /// The checks that held.
+    oks: usize,
+    /// What the rollout leg expects of the package's build: `Some(true)` bound, `Some(false)`
+    /// unmeasured, `None` what the lab's compiled `CODEX_MEASURED_BUILDS` says
+    /// (`--expect-rollout`; `codex-measure` passes it, since the lab measuring a build was
+    /// compiled before the build was listed).
+    expect: Option<bool>,
+    /// Each rollout tab's fence as its check read it (`<leg> <asks>→<asks> <word>`).
+    fences: Vec<String>,
+    /// From the socket to the last check, when the legs ran to their end.
+    took: Option<Duration>,
     /// The bus the Autopilot Off step's mail rides.
     fabric: Fabric,
     /// The scratch world (kept), said when the rig is dropped.
     _world: World,
+    /// [`PROOF_LOCK`], released when the rig drops.
+    _lock: crate::aos_learn::Held,
+}
+
+/// One whole run of the proof's legs ([`run`]): its world (kept; the caller may
+/// [`World::release`] it), the checks that held and those that failed, each rollout tab's fence and
+/// the time from the socket to the last check.
+pub(crate) struct Run {
+    pub world: World,
+    pub oks: usize,
+    pub fails: Vec<String>,
+    pub fences: Vec<String>,
+    pub took: Option<Duration>,
 }
 
 fn sleep(d: Duration) -> Result<(), Stopped> {
@@ -717,6 +741,7 @@ impl Proof {
     fn check(&mut self, label: &str, held: bool) -> bool {
         if held {
             println!("  ok   {label}");
+            self.oks += 1;
         } else {
             println!("  FAIL {label}");
             self.fails.push(label.to_string());
@@ -1591,9 +1616,7 @@ impl Proof {
         use aterm_agent::harness::codex_steps::CODEX_MEASURED_BUILDS;
         for leg in legs {
             let build = Self::rollout_build(leg);
-            let measured = build
-                .as_deref()
-                .is_some_and(|b| CODEX_MEASURED_BUILDS.contains(&b));
+            let measured = expects_bound(self.expect, build.as_deref(), CODEX_MEASURED_BUILDS);
             let turns = || -> Vec<String> {
                 self.on(&leg.sid, &["log", "kinds=turn"])
                     .stdout
@@ -1624,6 +1647,8 @@ impl Proof {
                     for line in &got {
                         println!("    {line}");
                     }
+                    self.fences
+                        .push(format!("{name} {}→{} {}", from.asks, to.asks, to.word));
                     self.check(
                         &format!(
                             "{name}: past the tap's fence (rollout_asks {} to {}, rollout={}), {want}",
@@ -1633,6 +1658,7 @@ impl Proof {
                     );
                 }
                 Fenced::NoTap => {
+                    self.fences.push(format!("{name} no tap"));
                     self.check(
                         &format!(
                             "{name}: status names the rollout tap's answer (rollout=), {want}"
@@ -1641,6 +1667,10 @@ impl Proof {
                     );
                 }
                 Fenced::Stuck { from, to } => {
+                    self.fences.push(format!(
+                        "{name} {}→{} {} (stuck)",
+                        from.asks, to.asks, to.word
+                    ));
                     self.check(
                         &format!(
                             "{name}: the rollout tap answers two asks past a look within a minute (rollout_asks {} to {}, rollout={}), {want}",
@@ -3142,7 +3172,59 @@ fn codex_config(port: u16, proj: &Path, home: &Path, extra: &str) -> String {
     )
 }
 
-/// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--policy-only|--upgrade-only|--raw-upgrade-only]`.
+/// `--expect-rollout`'s word `given`: `Some(true)` bound, `Some(false)` unmeasured, `None` (no
+/// flag) what the lab's compiled list says ([`Proof::expect`]).
+/// # Errors
+/// Usage: another word.
+pub(crate) fn expect_rollout(given: Option<&str>) -> Result<Option<bool>, Fail> {
+    match given {
+        None => Ok(None),
+        Some("bound") => Ok(Some(true)),
+        Some("unmeasured") => Ok(Some(false)),
+        Some(other) => Err(Fail::usage(format!(
+            "codex-alab-proof: --expect-rollout bound|unmeasured, not '{other}'"
+        ))),
+    }
+}
+
+/// Whether the rollout leg expects a tab on `build` (its rollout's own, if any) bound: what
+/// `expect` says when it says anything, else whether `measured` (the lab's compiled
+/// `CODEX_MEASURED_BUILDS`) names `build` whole.
+#[must_use]
+pub(crate) fn expects_bound(expect: Option<bool>, build: Option<&str>, measured: &[&str]) -> bool {
+    expect.unwrap_or_else(|| build.is_some_and(|b| measured.contains(&b)))
+}
+
+/// The lock every proof run holds from its rig's start to its end, below the lab's state root:
+/// two proofs on one Mac at once trip each other's hang detectors and fences.
+const PROOF_LOCK: &str = "codex-alab-proof.lock";
+
+/// How long a proof waits for another to end: one whole proof (~11 min) and a margin.
+const PROOF_LOCK_WAIT: Duration = Duration::from_mins(20);
+
+/// Take the proof lock at `path` within `limit`, saying once that it waits.
+/// # Errors
+/// NOT RUN (exit 3): another proof held it past `limit`, or it could not be opened; or the
+/// interrupt that ended the wait.
+pub(crate) fn proof_lock(path: &Path, limit: Duration) -> Result<crate::aos_learn::Held, Fail> {
+    let said = std::cell::Cell::new(false);
+    let pause = |d: Duration| -> Result<(), String> {
+        if !said.replace(true) {
+            println!(
+                "codex-alab-proof: another proof holds {}; waiting up to {} min for it to end",
+                path.display(),
+                limit.as_secs() / 60
+            );
+        }
+        stop::sleep(d).map_err(|s| format!("interrupted by signal {}", s.0))
+    };
+    crate::aos_learn::lock_within(path, limit, &pause).map_err(|e| match stop::check() {
+        Err(s) => Fail::from(s),
+        Ok(()) => Fail::exit(3, format!("NOT RUN: another codex-alab proof runs: {e}")),
+    })
+}
+
+/// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--expect-rollout bound|unmeasured] [--policy-only|--upgrade-only|--raw-upgrade-only]`.
 /// # Errors
 /// Usage, a run that could not start, or an interrupt.
 pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
@@ -3155,6 +3237,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     let aterm = instance::take_value(&mut a, "--aterm")?;
     let given = instance::take_value(&mut a, "--package")?;
     let upgrade_given = instance::take_value(&mut a, "--upgrade-package")?;
+    let expect = expect_rollout(instance::take_value(&mut a, "--expect-rollout")?.as_deref())?;
     if policy_only && (upgrade_only || raw_upgrade_only || upgrade_given.is_some()) {
         return Err(Fail::usage(
             "codex-alab-proof: --policy-only cannot be combined with upgrade options",
@@ -3212,6 +3295,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
             "",
         ),
     )?;
+    proof.expect = expect;
     let (pkg_a, pkg_b) = (proof.s.join("pkg-a"), proof.s.join("pkg-b"));
     let outcome = if raw_upgrade_only {
         upgrade_proof::raw_legs(&mut proof, &pkg_a, &pkg_b)
@@ -3240,20 +3324,69 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     }
 }
 
+/// The whole proof ([`legs`]) of the package `pkg` by `aterm`, its rollout leg expecting
+/// `expect` ([`Proof::expect`]), for a caller that judges the run itself (`codex-measure`): what
+/// it found, its world kept.
+/// # Errors
+/// The rig could not start, an interrupt, or a leg ended in an error before any check failed.
+pub(crate) fn run(aterm: PathBuf, pkg: &Path, expect: Option<bool>) -> Result<Run, Fail> {
+    let mut proof = start(
+        aterm,
+        (pkg, None),
+        true,
+        (
+            ["--columns", "120", "--lines", "40"]
+                .map(str::to_string)
+                .to_vec(),
+            "",
+        ),
+    )?;
+    proof.expect = expect;
+    let (pkg_a, pkg_b) = (proof.s.join("pkg-a"), proof.s.join("pkg-b"));
+    let outcome = legs(&mut proof, &pkg_a, &pkg_b);
+    proof.end_all();
+    if let Err(f) = outcome
+        && (f.stopped.is_some() || proof.fails.is_empty())
+    {
+        return Err(f);
+    }
+    let Proof {
+        oks,
+        fails,
+        fences,
+        took,
+        _world: world,
+        ..
+    } = proof;
+    Ok(Run {
+        world,
+        oks,
+        fails,
+        fences,
+        took,
+    })
+}
+
 /// The proof's rig: its scratch world (always kept), the fake model on one loopback port, the
 /// lab's bus, the package (`pkg`, and `upgrade` for the handoff, else `pkg` again) copied in as
 /// `pkg-a` and `pkg-b`, and a headless sandboxed aterm started with `args` (its grid) and `top`
 /// at the head of its `aterm.toml` (`autopilot-captures`' theme; the proof's own is empty). No
 /// package is linked and no leg runs: [`legs`] does that, and so does `autopilot-captures`
-/// ([`Proof::captures_rig`]).
+/// ([`Proof::captures_rig`]). It first takes [`PROOF_LOCK`], held until the rig drops, so every
+/// proof run (this verb's, verify's stage's, `codex-measure`'s two) runs alone on this Mac.
 /// # Errors
-/// The world, the bus, a copy or the instance could not be made.
+/// Another proof held the lock past [`PROOF_LOCK_WAIT`]; the world, the bus, a copy or the
+/// instance could not be made.
 fn start(
     aterm: PathBuf,
     (pkg, upgrade): (&Path, Option<&Path>),
     keep: bool,
     (args, top): (Vec<String>, &str),
 ) -> Result<Proof, Fail> {
+    let lock = proof_lock(
+        &crate::paths::state_root(crate::sys::getuid()).join(PROOF_LOCK),
+        PROOF_LOCK_WAIT,
+    )?;
     let mut world = World::new(&format!(
         "{top}agents_auto_prime = false\n[update]\nenabled = false\nauto_apply = false\n\
          [packages]\nenabled = false\n[machine]\nuniversal_control = \"leave\"\n\
@@ -3363,8 +3496,13 @@ fn start(
         api_clock,
         port,
         fails: Vec::new(),
+        oks: 0,
+        expect: None,
+        fences: Vec::new(),
+        took: None,
         fabric,
         _world: world,
+        _lock: lock,
     })
 }
 
@@ -3570,6 +3708,7 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     let t = Instant::now();
     proof.landed_stand_past_upgrade(&landed_was)?;
     timed(proof, "landed (past the upgrade)", t);
+    proof.took = Some(began.elapsed());
     if !proof.fails.is_empty() {
         proof.diagnose(&all);
         proof.diagnose(&[&unanswered]);
@@ -4298,5 +4437,54 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
             verdict(true, &Script::new("unmeasured", Some(41))),
             Some(false)
         );
+    }
+
+    #[test]
+    fn the_rollout_leg_expects_what_it_is_told_over_the_compiled_list() {
+        let listed = ["0.165.0-dev.13594+g870dabaa6"];
+        let other = "0.165.0-dev.13586+g133286d36";
+        assert!(expects_bound(None, Some(listed[0]), &listed));
+        assert!(!expects_bound(None, Some(other), &listed));
+        assert!(
+            !expects_bound(None, Some("0.165.0-dev.13594"), &listed),
+            "matched whole"
+        );
+        assert!(!expects_bound(None, None, &listed));
+        for build in [Some(listed[0]), Some(other), None] {
+            assert!(expects_bound(Some(true), build, &listed), "{build:?}");
+            assert!(!expects_bound(Some(false), build, &listed), "{build:?}");
+        }
+        assert!(matches!(expect_rollout(None), Ok(None)));
+        assert!(matches!(expect_rollout(Some("bound")), Ok(Some(true))));
+        assert!(matches!(
+            expect_rollout(Some("unmeasured")),
+            Ok(Some(false))
+        ));
+        let f = expect_rollout(Some("measured")).expect_err("no such word");
+        assert_eq!(f.code, 2);
+        assert!(
+            f.msg
+                .as_deref()
+                .is_some_and(|m| m.contains("not 'measured'")),
+            "{:?}",
+            f.msg
+        );
+    }
+
+    #[test]
+    fn a_proof_takes_the_lock_another_holds_only_once_it_is_let_go() {
+        let tmp = aterm_tempfile::tempdir().expect("a scratch dir");
+        let path = tmp.path().join(PROOF_LOCK);
+        let first = proof_lock(&path, Duration::ZERO).expect("free");
+        let f = proof_lock(&path, Duration::ZERO).expect_err("held");
+        assert_eq!(f.code, 3);
+        let msg = f.msg.unwrap_or_default();
+        assert!(
+            msg.starts_with("NOT RUN: another codex-alab proof runs")
+                && msg.contains(&path.display().to_string()),
+            "{msg}"
+        );
+        drop(first);
+        proof_lock(&path, Duration::ZERO).expect("let go");
     }
 }

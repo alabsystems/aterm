@@ -91,10 +91,11 @@ pub const fn phase(t_ms: i64, d_ms: u32) -> NovaPhase {
 /// The Dip's ink envelope multiplier at `t`: `1 − 0.35·smoothstep(p)` inside the dip window, `1.0` outside (rides the ink channel, no quads).
 #[inline]
 pub const fn dip_envelope(t_ms: u64) -> f32 {
+    const INV_DIP_MS: f32 = 1.0 / DIP_MS as f32;
     if t_ms >= DIP_MS {
         return 1.0;
     }
-    1.0 - 0.35 * smoothstep(t_ms as f32 / DIP_MS as f32)
+    1.0 - 0.35 * smoothstep(t_ms as f32 * INV_DIP_MS)
 }
 
 /// Everything the pure emitters need for one nova, resolved by the host once per frame (geometry in px; colors already genome-hue-nudged).
@@ -219,10 +220,11 @@ const fn ease_out(q: f32) -> f32 {
 /// Ring radius + fade envelope at `t`, or `None` outside the ring window.
 #[inline]
 pub const fn ring_radius(t_ms: u64, r_max: f32, singularity: bool) -> Option<(f32, f32)> {
+    const INV_RING_SPAN_MS: f32 = 1.0 / (RING_END_MS - FLASH_END_MS) as f32;
     if t_ms < FLASH_END_MS || t_ms >= RING_END_MS {
         return None;
     }
-    let q = (t_ms - FLASH_END_MS) as f32 / (RING_END_MS - FLASH_END_MS) as f32;
+    let q = (t_ms - FLASH_END_MS) as f32 * INV_RING_SPAN_MS;
     let e = ease_out(q);
     let r = if singularity {
         r_max * (1.0 - e)
@@ -243,7 +245,7 @@ pub const fn vivid_fringe(core: u32, fringe: u32) -> u32 {
         if crate::color_math::relative_luminance_with(table, c) >= FLOOR {
             return c;
         }
-        c = mix_rgb(fringe, core, k as f32 / 8.0);
+        c = mix_rgb(fringe, core, k as f32 * 0.125);
         k += 1;
     }
     c
@@ -255,7 +257,7 @@ pub const fn ring_band_count(extent_px: f32) -> usize {
     if extent_px >= 2.0 * RING_BANDS as f32 {
         RING_BANDS
     } else {
-        let b = (extent_px / 2.0).floor() as usize;
+        let b = (extent_px * 0.5).floor() as usize;
         if b < 1 {
             1
         } else if b > RING_BANDS {
@@ -319,11 +321,11 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
         let ri = (rr - 0.5 * thick).max(0.0);
         (ro * ro, ri * ri, color, base_cov * scale)
     });
-    let bands_f = bands as f32;
+    let inv_bands = 1.0 / bands as f32;
     let mut prev_y1f = 0.0f32;
     for i in 0..bands {
         let y0f = prev_y1f;
-        let y1f = (extent * (i + 1) as f32 / bands_f).round();
+        let y1f = (extent * (i + 1) as f32 * inv_bands).round();
         prev_y1f = y1f;
         if y1f <= y0f {
             continue;
@@ -392,8 +394,9 @@ fn emit_rays(
     fade: f32,
     singularity: bool,
 ) -> usize {
+    const INV_RING_SPAN_MS: f32 = 1.0 / (RING_END_MS - FLASH_END_MS) as f32;
     let quasar = env.magic == Some(NovaMagic::Quasar);
-    let q = (t_ms - FLASH_END_MS) as f32 / (RING_END_MS - FLASH_END_MS) as f32;
+    let q = (t_ms - FLASH_END_MS) as f32 * INV_RING_SPAN_MS;
     let mut e = ease_out(q);
     if singularity {
         e = 1.0 - e;
@@ -409,8 +412,8 @@ fn emit_rays(
     }
     let (cxf, cyf) = (env.cx as f32, env.cy as f32);
     let core = env.core;
-    let samples_f = samples as f32;
-    let rot_turn = f32::from(env.feats.rot) / 16.0;
+    let inv_samples = 1.0 / samples as f32;
+    let rot_turn = f32::from(env.feats.rot) * 0.0625;
     let nrays_f = nrays as f32;
     let mut emitted_samples = 0usize;
     for k in 0..nrays {
@@ -426,17 +429,18 @@ fn emit_rays(
         let major_x = dx.abs() >= dy.abs();
         let maj = dx.abs().max(dy.abs());
         let lm = len * maj;
-        let (ux, uy) = (dx / maj, dy / maj);
+        let inv_maj = 1.0 / maj;
+        let (ux, uy) = (dx * inv_maj, dy * inv_maj);
         let mut prev_m1 = 0.0f32;
         for j in 0..samples {
             let m0 = prev_m1;
-            let m1 = (lm * (j + 1) as f32 / samples_f).round();
+            let m1 = (lm * (j + 1) as f32 * inv_samples).round();
             prev_m1 = m1;
             if m1 <= m0 {
                 continue;
             }
             let quads_before = sink.out.len();
-            let sf = (j as f32 + 0.5) / samples_f;
+            let sf = (j as f32 + 0.5) * inv_samples;
             let th = 2.5 - 1.5 * sf;
             let cov = (fade * (1.0 - 0.65 * sf) * env.intensity).clamp(0.0, 1.0);
             let mm = 0.5 * (m0 + m1);
@@ -482,7 +486,8 @@ fn emit_rays(
 }
 
 fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
-    let e = (t_ms.saturating_sub(DIP_MS)) as f32 / (FLASH_END_MS - DIP_MS) as f32;
+    const INV_FLASH_SPAN_MS: f32 = 1.0 / (FLASH_END_MS - DIP_MS) as f32;
+    let e = (t_ms.saturating_sub(DIP_MS)) as f32 * INV_FLASH_SPAN_MS;
     let envl = (std::f32::consts::PI * e.clamp(0.0, 1.0)).sin();
     let ch = env.cell_h as f32;
     let (cxf, cyf) = (env.cx as f32, env.cy as f32);
@@ -527,8 +532,9 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
         return;
     }
     let singularity = env.magic == Some(NovaMagic::Singularity);
-    let age = (t_ms - DEBRIS_START_MS) as f32 / 1000.0;
-    let qn = (t_ms - DEBRIS_START_MS) as f32 / (d - DEBRIS_START_MS) as f32;
+    let dt = (t_ms - DEBRIS_START_MS) as f32;
+    let age = dt * 0.001;
+    let qn = dt / (d - DEBRIS_START_MS) as f32;
     let fade = 1.0 - qn;
     let (rows, cols) = (
         env.grid_h / env.cell_h.max(1),
@@ -538,13 +544,10 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
         return;
     }
     let fringe = vivid_fringe(env.core, env.fringe);
+    const INV_2_TWINKLE_GRID_MS: f32 = 1.0 / (2.0 * TWINKLE_GRID_MS as f32);
+    let tw_base = t_ms as f32 * INV_2_TWINKLE_GRID_MS;
     let tw_pair = [0.0f32, 0.5].map(|grid_phase| {
-        0.35 + 0.65
-            * (0.5
-                + 0.5
-                    * (std::f32::consts::TAU
-                        * (t_ms as f32 / (2.0 * TWINKLE_GRID_MS as f32) + grid_phase))
-                        .sin())
+        0.35 + 0.65 * (0.5 + 0.5 * (std::f32::consts::TAU * (tw_base + grid_phase)).sin())
     });
     let alpha_pair = tw_pair.map(|tw| (env.intensity * fade * tw).clamp(0.0, 1.0));
     if alpha_pair[0] <= 0.01 && alpha_pair[1] <= 0.01 {
@@ -557,6 +560,8 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
     let (cxf, cyf) = (env.cx as f32, env.cy as f32);
     let (grid_wf, grid_hf) = (env.grid_w as f32, env.grid_h as f32);
     let (half_cw, half_ch) = (env.cell_w / 2, env.cell_h / 2);
+    const INV_65535: f32 = 1.0 / 65535.0;
+    const INV_255: f32 = 1.0 / 255.0;
     for m in 0..u32::from(env.feats.debris) {
         if out.len() >= cap {
             break;
@@ -566,9 +571,9 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
         if alpha_pair[phase_idx] <= 0.01 {
             continue;
         }
-        let r0 = (s & 0xffff) as f32 / 65535.0;
-        let r1 = ((s >> 16) & 0xffff) as f32 / 65535.0;
-        let r2 = ((s >> 32) & 0xff) as f32 / 255.0;
+        let r0 = (s & 0xffff) as f32 * INV_65535;
+        let r1 = ((s >> 16) & 0xffff) as f32 * INV_65535;
+        let r2 = ((s >> 32) & 0xff) as f32 * INV_255;
         let ang = std::f32::consts::TAU * r0;
         let (sin_a, cos_a) = ang.sin_cos();
         let (x, y) = if singularity {
@@ -666,28 +671,32 @@ pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, ca
 
 /// When the expanding (or contracting) ring first crosses `dist` px from the centre, in ms since ignition: the analytic inverse of [`ring_radius`]'s ease-out, so the pulse needs no stored state.
 #[inline]
-pub fn crossing_ms(dist: f32, r_max: f32, singularity: bool) -> Option<u64> {
-    if !(0.0..=r_max).contains(&dist) || r_max <= 0.0 {
+pub const fn crossing_ms(dist: f32, r_max: f32, singularity: bool) -> Option<u64> {
+    if !(dist >= 0.0 && dist <= r_max) || r_max <= 0.0 {
         return None;
     }
+    let u = dist / r_max;
     let q = if singularity {
-        1.0 - (dist / r_max).sqrt()
+        1.0 - crate::color_math::sqrt_f32(u)
     } else {
-        1.0 - (1.0 - dist / r_max).sqrt()
+        1.0 - crate::color_math::sqrt_f32(1.0 - u)
     };
-    Some(
-        (FLASH_END_MS + (q.clamp(0.0, 1.0) * (RING_END_MS - FLASH_END_MS) as f32) as u64)
-            .min(RING_END_MS - 1),
-    )
+    let crossed = FLASH_END_MS + (q.clamp(0.0, 1.0) * (RING_END_MS - FLASH_END_MS) as f32) as u64;
+    Some(if crossed < RING_END_MS - 1 {
+        crossed
+    } else {
+        RING_END_MS - 1
+    })
 }
 
 /// The ~150 ms smoothstep in/out pulse envelope at `t` for a crossing at `cross_ms`; `None` outside the window.
 #[inline]
 pub const fn pulse_env(t_ms: u64, cross_ms: u64) -> Option<f32> {
+    const INV_PULSE_MS: f32 = 1.0 / PULSE_MS as f32;
     if t_ms < cross_ms || t_ms >= cross_ms + PULSE_MS {
         return None;
     }
-    let e = (t_ms - cross_ms) as f32 / PULSE_MS as f32;
+    let e = (t_ms - cross_ms) as f32 * INV_PULSE_MS;
     Some(smoothstep((2.0 * e.min(1.0 - e)).clamp(0.0, 1.0)))
 }
 

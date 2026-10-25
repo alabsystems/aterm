@@ -89,15 +89,10 @@ impl Default for DropletFrame {
 /// The band of water-ramp positions whose colour keeps
 /// [`CARET_PAGE_MIN_CONTRAST`] against `ground`, as `(lo, hi)`.
 fn ramp_band_on(ground: u32) -> (f32, f32) {
-    let table = crate::color_math::relative_luminance_table();
-    let lum_g = crate::color_math::relative_luminance_with(table, ground);
+    let lum_g = crate::color_math::relative_luminance(ground);
     #[inline]
-    const fn meets_rgb(
-        table: &crate::color_math::RelativeLuminanceTable,
-        lum_g: f32,
-        rgb: u32,
-    ) -> bool {
-        let lum_w = crate::color_math::relative_luminance_with(table, rgb);
+    const fn meets_rgb(lum_g: f32, rgb: u32) -> bool {
+        let lum_w = crate::color_math::relative_luminance(rgb);
         let (hi, lo) = if lum_w > lum_g {
             (lum_w, lum_g)
         } else {
@@ -108,12 +103,12 @@ fn ramp_band_on(ground: u32) -> (f32, f32) {
     let dark = aterm_render::theme_is_dark(ground);
     let far = if dark { 1.0 } else { 0.0 };
     let far_rgb = water_ramp(far);
-    if !meets_rgb(table, lum_g, far_rgb) {
+    if !meets_rgb(lum_g, far_rgb) {
         return (far, far);
     }
     let near = 1.0 - far;
     let near_rgb = water_ramp(near);
-    if meets_rgb(table, lum_g, near_rgb) {
+    if meets_rgb(lum_g, near_rgb) {
         return (0.0, 1.0);
     }
     let (mut pass, mut fail) = (far, near);
@@ -127,7 +122,7 @@ fn ramp_band_on(ground: u32) -> (f32, f32) {
             pass = mid;
         } else if mid_rgb == fail_rgb {
             fail = mid;
-        } else if meets_rgb(table, lum_g, mid_rgb) {
+        } else if meets_rgb(lum_g, mid_rgb) {
             pass = mid;
             pass_rgb = mid_rgb;
         } else {
@@ -226,7 +221,7 @@ impl CursorDroplet {
         self.ripple = (self.ripple + dt * (RIPPLE_IDLE + RIPPLE_ACTIVE * e)).fract();
         self.drip = (self.drip + dt * (DRIP_IDLE + DRIP_ACTIVE * e)).fract();
         let phase = self.slosh * std::f32::consts::TAU;
-        let phase_sin = phase.sin();
+        let (phase_sin, phase_cos) = phase.sin_cos();
         let shimmer = 0.5 + 0.35 * phase_sin + 0.15 * (phase * 2.7 + 1.3).sin();
 
         let dark = cfg.ground.is_none_or(aterm_render::theme_is_dark);
@@ -257,7 +252,7 @@ impl CursorDroplet {
             && (cr as usize) < geom.rows
             && (cc as usize) < geom.cols
         {
-            self.emit_bead(cr, cc, e, shimmer, (phase, phase_sin), geom, cfg, out);
+            self.emit_bead(cr, cc, e, shimmer, (phase_sin, phase_cos), geom, cfg, out);
         }
 
         let fp = ((self.slosh * 512.0) as u64)
@@ -287,11 +282,32 @@ impl CursorDroplet {
         cc: u16,
         e: f32,
         shimmer: f32,
-        (phase, phase_sin): (f32, f32),
+        (phase_sin, phase_cos): (f32, f32),
         geom: Geom,
         cfg: &DropletConfig,
         out: &mut Vec<GlowQuad>,
     ) {
+        const DISC_PHASE_SIN_COS: [(f32, f32); 4] = {
+            let mut arr = [(0.0f32, 1.0f32); 4];
+            let mut k = 1;
+            while k < 4 {
+                arr[k] = crate::supernova::sin_cos_f32(k as f32 * 0.6);
+                k += 1;
+            }
+            arr
+        };
+        const DRIP_PHASE_SIN_COS: [(f32, f32); 3] = {
+            let mut arr = [(0.0f32, 1.0f32); 3];
+            let mut k = 0;
+            while k < 3 {
+                arr[k] = crate::supernova::sin_cos_f32(DRIP_LANES[k].1 * 7.0);
+                k += 1;
+            }
+            arr
+        };
+        const INV_DRIP_GROW: f32 = 1.0 / 0.30;
+        const INV_DRIP_FALL: f32 = 1.0 / 0.70;
+
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
         let cx = f32::from(geom.origin_x) + (cc as f32 + 0.5) * cw;
         let cy = f32::from(geom.origin_y) + (cr as f32 + 0.46) * ch;
@@ -312,11 +328,8 @@ impl CursorDroplet {
                 continue;
             }
             let cov = (cov_core * cov_x * DISC_SOFT_GAIN).min(COV_CAP);
-            let s = if k == 0 {
-                phase_sin
-            } else {
-                (phase + k as f32 * 0.6).sin()
-            };
+            let (sin_dk, cos_dk) = DISC_PHASE_SIN_COS[k];
+            let s = phase_sin * cos_dk + phase_cos * sin_dk;
             let shear = s * r * 0.10 * e_shear;
             push_soft_disc(
                 out,
@@ -383,16 +396,16 @@ impl CursorDroplet {
         let cov_drip = cov_core * 0.70;
         let r_grow = radius * 0.08;
         let r_fall = 1.2 + radius * 0.05;
-        for &(dx, off, wake) in &DRIP_LANES {
+        for (lane_idx, &(dx, off, wake)) in DRIP_LANES.iter().enumerate() {
             if e < wake && wake > 0.0 {
                 continue;
             }
             let u = (self.drip + off).fract();
             let (y, r, stretch, cov) = if u < 0.30 {
-                let s = u / 0.30;
+                let s = u * INV_DRIP_GROW;
                 (belly, 1.2 + r_grow * s, 1.0, cov_drip * s)
             } else {
-                let v = (u - 0.30) / 0.70;
+                let v = (u - 0.30) * INV_DRIP_FALL;
                 (
                     belly + v * v * DRIP_FALL * ch,
                     r_fall,
@@ -404,7 +417,8 @@ impl CursorDroplet {
             if cut_surface && (y - ry).floor() as i32 >= foot {
                 continue;
             }
-            let x = cx + dx * cw + (phase + off * 7.0).sin() * 1.5;
+            let (sin_do, cos_do) = DRIP_PHASE_SIN_COS[lane_idx];
+            let x = cx + dx * cw + (phase_sin * cos_do + phase_cos * sin_do) * 1.5;
             push_soft_disc(out, geom, (x, y), (r, ry), body, cov.min(COV_CAP));
         }
         if !cut_surface {

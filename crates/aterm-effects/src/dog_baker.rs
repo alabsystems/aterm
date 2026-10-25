@@ -137,8 +137,17 @@ impl DogBaker {
     #[inline]
     #[must_use]
     pub const fn aspect(breed: DogGlyphId) -> f32 {
-        let a = (DOG_GLYPHS[breed as usize].aspect_x1000 as f32) / 1000.0;
-        if a > 0.001 { a } else { 0.001 }
+        const BREED_ASPECTS: [f32; DOG_GLYPHS.len()] = {
+            let mut out = [0.0f32; DOG_GLYPHS.len()];
+            let mut i = 0;
+            while i < DOG_GLYPHS.len() {
+                let a = (DOG_GLYPHS[i].aspect_x1000 as f32) / 1000.0;
+                out[i] = if a > 0.001 { a } else { 0.001 };
+                i += 1;
+            }
+            out
+        };
+        BREED_ASPECTS[breed as usize]
     }
 }
 

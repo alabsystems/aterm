@@ -1,0 +1,24 @@
+    = note: native verifier status: Inconclusive; requested=12, proved=1, failed=0, unknown=8, timed_out=2, unsupported=3, skipped=0, insufficient_strength=0
+     = note: native verifier status: Inconclusive; requested=13, proved=1, failed=0, unknown=10, timed_out=1, unsupported=2, skipped=0, insufficient_strength=0
+     = note: native verifier status: Inconclusive; requested=6, proved=0, failed=0, unknown=6, timed_out=1, unsupported=0, skipped=0, insufficient_strength=0
+     = note: native verifier status: Inconclusive; requested=12, proved=0, failed=0, unknown=0, timed_out=1, unsupported=12, skipped=0, insufficient_strength=0
+     = note: native verifier status: Inconclusive; requested=12, proved=1, failed=0, unknown=7, timed_out=2, unsupported=4, skipped=0, insufficient_strength=0
+     = note: native verifier status: Inconclusive; requested=14, proved=1, failed=0, unknown=11, timed_out=1, unsupported=2, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=34, proved=0, failed=0, unknown=0, timed_out=14, unsupported=34, skipped=0, insufficient_strength=0
+      = note: native verifier status: TimedOut; requested=39, proved=0, failed=0, unknown=0, timed_out=37, unsupported=2, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=30, proved=5, failed=0, unknown=20, timed_out=7, unsupported=5, skipped=0, insufficient_strength=0
+     = note: native verifier status: Inconclusive; requested=11, proved=1, failed=0, unknown=9, timed_out=2, unsupported=1, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=7, proved=0, failed=0, unknown=6, timed_out=2, unsupported=1, skipped=0, insufficient_strength=0
+    = note: native verifier status: Inconclusive; requested=59, proved=0, failed=0, unknown=0, timed_out=3, unsupported=59, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=38, proved=0, failed=0, unknown=0, timed_out=1, unsupported=38, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=32, proved=3, failed=0, unknown=24, timed_out=8, unsupported=5, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=43, proved=0, failed=0, unknown=0, timed_out=1, unsupported=43, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=10, proved=0, failed=0, unknown=0, timed_out=3, unsupported=10, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=57, proved=0, failed=0, unknown=0, timed_out=2, unsupported=57, skipped=0, insufficient_strength=0
+      = note: native verifier status: Inconclusive; requested=29, proved=0, failed=0, unknown=0, timed_out=1, unsupported=29, skipped=0, insufficient_strength=0
+=== Trust Verification Report ===
+Level: L2 | Duration: 1866949ms
+Summary: 812 proved, 519 failed, 945 runtime-checked, 127 assumed, 125 mandated, 0 contract-panic, 2157 inconclusive (4685 total); not-reproducible; profile c870797a6939; vector bab62aa83d6c
+Stop causes: not-dispatched=124 solved=1334 unclassified=3117 unsupported=21 wall-backstop=89; backstops fired: in-process ay wall-backstop=67, per-function budget clock wall-backstop=1; counted and named stops the lanes saw: in-process ay effort[proof-check-envelope]=1, in-process ay solver-incomplete[generic-theory-lemma]=12, in-process ay solver-incomplete[unverified-trust-rule]=7 — NOT REPRODUCIBLE: a clock, an RSS reading, a solver fault or an unexplained stop ended at least one obligation, or work the verdicts depend on, so these counts are not a floor measurement
+Coverage: 1629/1629 eligible function bodies verified (complete)
+  Gate: FAIL [advisory lane, exit 1] (812 proved, 519 failed, 945 runtime-checked, 127 assumed, 125 mandated, 0 contract-panic, 2157 unknown / 4685 total)

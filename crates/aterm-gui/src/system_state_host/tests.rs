@@ -637,7 +637,8 @@ fn a_rejected_automatic_offer_restores_fresh_policy_unless_stopped() {
         drop(receipt);
         app.resolve_system_state_apply();
         assert!(app.system_state_host.pending_apply.is_none());
-        assert!(app.system_state_host.action_refusal.is_some());
+        // The worker that let the plan go says why in its own rows: the host adds none.
+        assert!(app.system_state_host.action_refusal.is_none());
         assert_ne!(app.system_state_host.generation, before_rejection);
         app.publish_system_state(policy());
         app.receive_system_state_status(Some(before_rejection), policy());
@@ -1333,6 +1334,11 @@ fn accepted_operation_survives_final_close(operation: SetupOperation) {
     };
     press(&mut app, wid, view, key);
     assert!(indicators(&app, original, view).busy);
+    assert_eq!(
+        app.system_state_handoff_pending(),
+        operation == SetupOperation::Restore,
+        "Restore owns undurable work before any worker status; Check alone is read-only"
+    );
     assert!(app.commit_glassless_native_frame(wid));
     let headline_key = UiKey::new("settings/page-subtitle/system-state");
     let headline = app.windows[&wid].leaf_render_cache[&view]
@@ -1352,6 +1358,11 @@ fn accepted_operation_survives_final_close(operation: SetupOperation) {
     app.system_state_host.status_in_flight = true;
     app.close_active_native_tab(wid).unwrap();
     assert!(app.native_runtime.app(original).is_none());
+    assert_eq!(
+        app.system_state_handoff_pending(),
+        operation == SetupOperation::Restore,
+        "closing the final controller preserves the worker's handoff custody"
+    );
     assert!(app.open_system_state_tab());
     let (reopened, view) = app.active_native_view(wid).unwrap();
     assert_ne!(reopened, original);
@@ -1416,6 +1427,11 @@ fn accepted_operation_survives_final_close(operation: SetupOperation) {
         indicators(&app, reopened, view).busy,
         "an old idle read cannot finish this operation"
     );
+    assert_eq!(
+        app.system_state_handoff_pending(),
+        operation == SetupOperation::Restore,
+        "an obsolete completion cannot release Restore custody"
+    );
     fresh(
         &mut app,
         SetupStatus {
@@ -1424,9 +1440,18 @@ fn accepted_operation_survives_final_close(operation: SetupOperation) {
         },
     );
     assert!(indicators(&app, reopened, view).busy);
+    assert_eq!(
+        app.system_state_handoff_pending(),
+        operation == SetupOperation::Restore,
+        "the current busy read retains Restore and permits read-only Check"
+    );
     fresh(&mut app, idle);
     assert!(!indicators(&app, reopened, view).busy);
     assert!(app.system_state_host.operation.is_none());
+    assert!(
+        !app.system_state_handoff_pending(),
+        "a fresh completion releases the worker's handoff custody"
+    );
     press(&mut app, wid, view, "system-state/group/0/leave");
     assert_eq!(
         calls(),
@@ -1549,6 +1574,103 @@ fn nonrun_operation_reopen_restore_is_disabled_before_the_first_tick() {
         "a current idle result enables one new Restore"
     );
     assert!(app.structural_invariants_ok());
+}
+
+fn detached_apply_reopen_waits_for_its_receipt(accepted: bool) {
+    use crate::app_control::{ActRequest, OpenRequest};
+
+    let mut app = App::headless_for_test();
+    let (wid, original, view) = page(&mut app);
+    app.set_system_state_handlers_for_test(handlers());
+    let allowed = Some(crate::InitialSetupPermissionPolicy {
+        revision: 4,
+        allowed: true,
+    });
+    let idle = SetupStatus {
+        plan: Some(Plan::default()),
+        permissions: allowed,
+        ..SetupStatus::default()
+    };
+    fresh(&mut app, idle.clone());
+    app.with_gesture_source(false, |app| {
+        press(app, wid, view, "system-state/group/2/leave");
+    });
+    let held = receipt();
+    let pending = app.system_state_host.pending_apply.as_ref().unwrap();
+    let chosen = pending.plan.clone();
+    assert!(!chosen.selection.contains(Setting::Dock));
+    assert_eq!(pending.instance, original);
+    assert_eq!(app.access_revision(), None);
+    assert!(!app.system_state_host.latest_status.busy);
+    let generation = app.system_state_host.generation;
+    app.system_state_host.status_in_flight = true;
+    calls();
+
+    app.close_active_native_tab(wid).unwrap();
+    assert!(app.native_runtime.app(original).is_none());
+    app.open_app(OpenRequest::SystemState).unwrap();
+    let (reopened, view) = app.active_native_view(wid).unwrap();
+    assert_ne!(reopened, original);
+    press(&mut app, wid, view, "system-state/row/secrets/disclose");
+    let action = |key: &str| ActRequest {
+        view,
+        ui_key: key.into(),
+        action: key.into(),
+        value: None,
+    };
+    // No event-loop park, tick or worker status has run since the old
+    // controller disappeared. Its admission still owns these controls.
+    for key in [
+        "system-state/restore",
+        "system-state/check",
+        "system-state/vault/join",
+    ] {
+        assert!(
+            app.act_app(action(key)).is_err(),
+            "a detached Apply must keep {key} disabled on the reopened page"
+        );
+    }
+    assert!(calls().is_empty(), "no second worker started");
+    assert!(app.system_state_host.pending_apply.is_some());
+    assert!(indicators(&app, reopened, view).busy);
+    fresh(&mut app, idle.clone());
+    assert!(indicators(&app, reopened, view).busy);
+    assert_eq!(app.access_revision(), None);
+
+    if accepted {
+        held.accept();
+    } else {
+        drop(held);
+    }
+    app.resolve_system_state_apply();
+    assert!(app.system_state_host.pending_apply.is_none());
+    app.receive_system_state_status(Some(generation), idle.clone());
+    assert!(
+        indicators(&app, reopened, view).busy,
+        "an idle read taken before the receipt resolved cannot release its reservation"
+    );
+    fresh(
+        &mut app,
+        SetupStatus {
+            plan: Some(if accepted { chosen } else { Plan::default() }),
+            ..idle
+        },
+    );
+    assert!(!indicators(&app, reopened, view).busy);
+    assert_eq!(app.access_revision(), accepted.then_some(4));
+    app.act_app(action("system-state/restore")).unwrap();
+    assert_eq!(calls(), ["restore"]);
+    assert!(app.structural_invariants_ok());
+}
+
+#[test]
+fn detached_apply_reopen_stays_busy_until_acceptance_and_a_fresh_status() {
+    detached_apply_reopen_waits_for_its_receipt(true);
+}
+
+#[test]
+fn detached_apply_reopen_can_recover_after_its_receipt_is_refused() {
+    detached_apply_reopen_waits_for_its_receipt(false);
 }
 
 fn queued_offer_respects_host_work(
@@ -1711,31 +1833,74 @@ fn intent_handoff_keeps_development_scenarios_inert() {
 
 #[test]
 fn a_choice_reaches_the_worker_even_when_the_page_closes_at_once() {
-    let mut app = App::headless_for_test();
-    let (wid, _, view) = page(&mut app);
-    fresh(&mut app, running());
-    app.set_system_state_handlers_for_test(InitialSetupHandlers {
-        apply: |plan, _, _, receipt| {
-            note(format!(
-                "apply messages={}",
-                plan.selection.contains(Setting::Messages)
-            ));
-            APPLY_RECEIPTS.with(|receipts| receipts.borrow_mut().push(receipt));
-            true
-        },
-        ..handlers()
-    });
-    press(&mut app, wid, view, "system-state/group/3/leave");
-    // The worker holds the choice before the view can go, and stops the run
-    // ahead of it itself: nothing waits on the page.
-    assert_eq!(calls(), ["apply messages=false"]);
-    app.close_active_native_tab(wid).unwrap();
-    app.finish_system_state_shutdown();
-    receipt().accept();
-    app.resolve_system_state_apply();
-    assert!(app.system_state_host.pending_apply.is_none());
-    assert!(app.native_runtime.take_system_state_action().is_none());
-    assert!(app.structural_invariants_ok());
+    for queued_read in [false, true] {
+        let mut app = App::headless_for_test();
+        let (wid, _, view) = page(&mut app);
+        fresh(&mut app, running());
+        app.set_system_state_handlers_for_test(InitialSetupHandlers {
+            apply: |plan, _, _, receipt| {
+                note(format!(
+                    "apply messages={}",
+                    plan.selection.contains(Setting::Messages)
+                ));
+                APPLY_RECEIPTS.with(|receipts| receipts.borrow_mut().push(receipt));
+                true
+            },
+            ..handlers()
+        });
+        press(&mut app, wid, view, "system-state/group/3/leave");
+        // The worker holds the choice before the view can go, and stops the run
+        // ahead of it itself: nothing waits on the page.
+        assert_eq!(calls(), ["apply messages=false"]);
+        assert!(!app.system_state_host.latest_status.queued);
+        assert!(
+            app.system_state_handoff_pending(),
+            "the actual pending receipt holds handoff before any queued-status publication"
+        );
+        if queued_read {
+            fresh(
+                &mut app,
+                SetupStatus {
+                    queued: true,
+                    ..running()
+                },
+            );
+        }
+        app.close_active_native_tab(wid).unwrap();
+        assert!(
+            app.system_state_handoff_pending(),
+            "closing the final view cannot drop the worker's pending receipt"
+        );
+        app.finish_system_state_shutdown();
+        receipt().accept();
+        app.resolve_system_state_apply();
+        assert!(app.system_state_host.pending_apply.is_none());
+        assert!(app.system_state_host.awaiting_run);
+        assert!(app.system_state_host.operation.is_none());
+        assert_eq!(
+            app.system_state_handoff_pending(),
+            queued_read,
+            "durable admission releases custody unless the worker's cached queue is still unconfirmed"
+        );
+        let plan = app.system_state_host.latest_status.plan.clone();
+        fresh(
+            &mut app,
+            SetupStatus {
+                busy: true,
+                plan,
+                ..SetupStatus::default()
+            },
+        );
+        assert!(app.system_state_host.latest_status.busy);
+        assert!(!app.system_state_host.latest_status.queued);
+        assert!(
+            !app.system_state_handoff_pending(),
+            "a fresh nonqueued running status releases custody without waiting for the durable run to finish"
+        );
+        assert!(app.native_runtime.take_system_state_action().is_none());
+        assert!(app.structural_invariants_ok());
+        assert_eq!(calls(), ["settle"], "this choice's shutdown settled once");
+    }
 }
 
 #[test]
@@ -1846,6 +2011,151 @@ mod observation_start {
         // Status polling is independent of this injected worker-start outcome.
         app.system_state_host.next_status = Some(now + Duration::from_secs(3600));
         app.tick_system_state(now);
+    }
+
+    fn permission_reading(
+        plan: &Plan,
+        revision: u64,
+        allowed: bool,
+        declined: bool,
+    ) -> SetupStatus {
+        use aterm_types::macos_setup::{Observation, Standing, Subject};
+
+        SetupStatus {
+            plan: Some(plan.clone()),
+            permissions: Some(crate::InitialSetupPermissionPolicy { revision, allowed }),
+            observed: Access::ALL
+                .into_iter()
+                .map(|access| Observation {
+                    subject: Subject::Access(access),
+                    standing: if access == Access::Accessibility {
+                        Standing::NotNeeded
+                    } else {
+                        Standing::InPlace
+                    },
+                    now: (access != Access::Accessibility).then(|| {
+                        if declined && access == Access::DeveloperTools {
+                            "Off"
+                        } else {
+                            "On"
+                        }
+                        .into()
+                    }),
+                    after_login: None,
+                    // The producer honors this approval's Not now by making
+                    // the unchanged physical Off reading the wanted value.
+                    wanted: if declined && access == Access::DeveloperTools {
+                        "Off".into()
+                    } else {
+                        access.wanted().into()
+                    },
+                    note: None,
+                    detail: (declined && access == Access::DeveloperTools).then(|| {
+                        "You chose Not now. Setting Permissions up again asks again.".into()
+                    }),
+                })
+                .collect(),
+            ..SetupStatus::default()
+        }
+    }
+
+    #[test]
+    fn observation_access_revision_refreshes_a_stopped_recoverys_permission_rows() {
+        use aterm_types::macos_setup::{Standing, Subject};
+
+        let (mut app, _, _, _, mut plan) = setup(true);
+        plan.selection = aterm_types::macos_setup::Selection::none();
+        plan.selection.set(Setting::Permissions, true);
+        fresh(&mut app, permission_reading(&plan, 7, true, true));
+        tick(&mut app, Instant::now());
+        assert_eq!(reads().as_slice(), std::slice::from_ref(&plan));
+        assert!(
+            !app.native_runtime
+                .system_state_mut()
+                .unwrap()
+                .can_open_access(Access::DeveloperTools),
+            "Not now belongs to the approval that supplied this reading"
+        );
+
+        // A different run can carry the same access approval. Neither that
+        // status nor its allowed bit changing creates another approval.
+        for allowed in [false, true] {
+            fresh(&mut app, permission_reading(&plan, 7, allowed, true));
+            let next = app.system_state_host.next_tick.unwrap();
+            tick(&mut app, next);
+            assert_eq!(reads().len(), 1, "the carried approval keeps its reading");
+        }
+
+        // Recovery published a fresh, unadmitted checkpoint, then Stop held
+        // it before any stage ran. Its plan is unchanged and the cached Mac
+        // readings remain, but approval 7's Not now cannot answer revision 8.
+        fresh(
+            &mut app,
+            SetupStatus {
+                recovered: true,
+                finished: true,
+                ..permission_reading(&plan, 8, false, true)
+            },
+        );
+        assert_eq!(app.access_revision(), None);
+        assert!(app.admitted_access().is_none());
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        assert_eq!(
+            reads(),
+            [plan.clone(), plan.clone()],
+            "a new access approval must reread its approval-specific row interpretation"
+        );
+        assert_eq!(app.access_revision(), None, "reading admits no access step");
+
+        // The actual reader keeps Off as the physical fact, but without a
+        // decline under revision 8 it now needs the person and wants On.
+        let mut current = permission_reading(&plan, 8, false, false);
+        let tools = current
+            .observed
+            .iter_mut()
+            .find(|row| row.subject == Subject::Access(Access::DeveloperTools))
+            .unwrap();
+        tools.now = Some("Off".into());
+        tools.standing = Standing::NeedsYou;
+        fresh(&mut app, current);
+        assert!(
+            app.native_runtime
+                .system_state_mut()
+                .unwrap()
+                .can_open_access(Access::DeveloperTools)
+        );
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        assert_eq!(reads().len(), 2, "the accepted refresh runs once");
+        assert_eq!(app.access_revision(), None);
+        assert!(app.admitted_access().is_none());
+    }
+
+    #[test]
+    fn observation_access_revision_preserves_independent_physical_grants() {
+        let (mut app, _, _, _, mut plan) = setup(true);
+        plan.selection = aterm_types::macos_setup::Selection::none();
+        plan.selection.set(Setting::Permissions, true);
+        fresh(&mut app, permission_reading(&plan, 7, true, false));
+        tick(&mut app, Instant::now());
+        let before = app.native_runtime.system_state_mut().unwrap().headline();
+
+        fresh(
+            &mut app,
+            SetupStatus {
+                recovered: true,
+                finished: true,
+                ..permission_reading(&plan, 8, false, false)
+            },
+        );
+        let next = app.system_state_host.next_tick.unwrap();
+        tick(&mut app, next);
+        let state = app.native_runtime.system_state_mut().unwrap();
+        assert_eq!(state.headline(), before, "known On readings remain facts");
+        assert!(!state.can_open_access(Access::DeveloperTools));
+        assert_eq!(app.access_revision(), None);
+        assert!(app.admitted_access().is_none());
     }
 
     #[test]
@@ -2385,17 +2695,12 @@ fn check_notes_follow_the_exact_dispatched_plan() {
                 has_detail(&app, wid),
                 "the requested Check's reason is visible"
             );
-            assert_eq!(
-                indicators(&app, instance, view).attention,
-                outcome == "failed"
-            );
+            // A Check only reads, and pressing it again is its remedy: its result is the page's
+            // note alone, never the tab's diamond or the menu line (design §3.6).
+            assert!(!indicators(&app, instance, view).attention);
             let tab = app.windows[&wid].tab_set.active().unwrap();
-            assert_eq!(tab.presentation.indicators.attention, outcome == "failed");
-            assert_eq!(
-                crate::system_state_access::menu_line(&matching, false).is_some(),
-                outcome == "failed" && !typed_url,
-                "without a review context, the menu matches only the saved plan"
-            );
+            assert!(!tab.presentation.indicators.attention);
+            assert!(crate::system_state_access::menu_line(&matching, false).is_none());
             // A later field edit hides the note, and a poll of the same status does not restore it.
             type_into(
                 &mut app,
@@ -3613,4 +3918,106 @@ fn a_plan_changed_outside_the_page_reads_the_rows_again() {
         1,
         "a plan changed outside the page is read again, once"
     );
+}
+
+/// What the worker publishes for a read that met a write of the saved setup under way
+/// (`InitialSetupSnapshotError::Updating`): the pending row, and no plan or Permissions group.
+fn changing() -> SetupStatus {
+    SetupStatus {
+        busy: true,
+        rows: vec![SetupStatusRow {
+            name: crate::system_state::SETUP_ROW.into(),
+            status: "pending".into(),
+            detail: String::new(),
+        }],
+        changing: true,
+        ..SetupStatus::default()
+    }
+}
+
+/// A run going for revision 5, which the window's own automatic answer admitted.
+fn admitted_here(app: &mut App) -> SetupStatus {
+    let admitted = SetupStatus {
+        permissions: Some(crate::InitialSetupPermissionPolicy {
+            revision: 5,
+            allowed: true,
+        }),
+        ..running()
+    };
+    app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+    app.hold_initial_setup_permissions();
+    app.note_system_state_apply(Admission::Automatic);
+    app.accepted_initial_setup_apply();
+    fresh(app, admitted.clone());
+    assert!(app.admitted_access().is_some(), "the standing yes");
+    admitted
+}
+
+/// A read that met a write (a pass saving its progress at a stage, a Stop saving its request)
+/// says nothing of the plan: the page and the window's own admission keep the last read that
+/// did, so the debugger's step still has its standing yes when the next read comes.
+#[test]
+fn a_read_that_met_a_write_keeps_the_page_and_the_windows_own_admission() {
+    let mut app = App::headless_for_test();
+    let admitted = admitted_here(&mut app);
+    // The poll's read is in flight, as the status thread's reply finds it.
+    app.system_state_host.status_in_flight = true;
+    app.system_state_host.next_status = None;
+    let asked = Instant::now();
+    fresh(&mut app, changing());
+    let replied = Instant::now();
+    assert_eq!(app.system_state_host.latest_status(), &admitted);
+    assert!(!app.workstation_setup.suppresses_permissions());
+    assert!(!app.system_state_host.status_in_flight, "the poll goes on");
+    let next = app
+        .system_state_host
+        .next_status
+        .expect("read again once the write is over");
+    assert!(asked + CHANGING_REREAD <= next && next <= replied + CHANGING_REREAD);
+    assert!(app.system_state_host.deadline(replied) <= Some(next));
+    fresh(&mut app, admitted);
+    let yes = app
+        .admitted_access()
+        .expect("still the window's own admission");
+    assert_eq!(yes.revision(), 5);
+}
+
+/// Records that keep changing show as such: after a run of reads that each met a write, the page
+/// shows the next as it is (its pending row), while the window's own admission keeps the last
+/// read that named a plan. A read that met none starts the run again. A read that failed is no
+/// read that met a write: it ends the admission, as the gate's own rule has it.
+#[test]
+fn records_that_keep_changing_show_on_the_page_alone() {
+    let mut app = App::headless_for_test();
+    let admitted = admitted_here(&mut app);
+    for _ in 0..CHANGING_READS {
+        fresh(&mut app, changing());
+    }
+    fresh(&mut app, admitted.clone());
+    for _ in 0..CHANGING_READS {
+        fresh(&mut app, changing());
+    }
+    assert!(
+        app.admitted_access().is_some(),
+        "each read of a run says nothing"
+    );
+    assert_eq!(app.system_state_host.latest_status(), &admitted);
+    fresh(&mut app, changing());
+    assert_eq!(app.system_state_host.latest_status(), &changing());
+    assert!(!app.workstation_setup.suppresses_permissions());
+    fresh(&mut app, admitted.clone());
+    assert_eq!(
+        app.admitted_access().map(|yes| yes.revision()),
+        Some(5),
+        "the records settled: still the window's own admission"
+    );
+    fresh(
+        &mut app,
+        SetupStatus {
+            changing: false,
+            ..changing()
+        },
+    );
+    assert!(app.workstation_setup.suppresses_permissions());
+    assert!(app.admitted_access().is_none());
 }

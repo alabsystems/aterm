@@ -411,6 +411,60 @@ mod tests {
         s
     }
 
+    #[test]
+    fn a_full_disk_a_passing_test_simulated_does_not_hide_a_failed_test() {
+        let run = |output: String| crate::exec::Run {
+            ok: false,
+            output,
+            code: Some(101),
+            spawn_error: None,
+        };
+        let simulated = format!(
+            "     Running link (target/debug/deps/link-abc)\n\nrunning 1 test\n\
+             aterm-link: post 1 reservation refused, left queued: {} (os error 28)\n\
+             test sim::full ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; \
+             0 filtered out; finished in 0.10s\n\n",
+            crate::exec::ENOSPC_SENTENCE
+        );
+        let red = failed_binary(
+            "db",
+            &[(
+                "round",
+                "thread 'round' panicked at src/a.rs:1:1:\nassertion failed",
+            )],
+        );
+        assert_eq!(
+            run(format!("{simulated}{red}")).environment_failure(),
+            None,
+            "a finding"
+        );
+        let full = failed_binary(
+            "db",
+            &[(
+                "round",
+                &format!(
+                    "thread 'round' panicked at src/a.rs:1:1:\n{}",
+                    crate::exec::ENOSPC_SENTENCE
+                ),
+            )],
+        );
+        assert!(
+            run(full)
+                .environment_failure()
+                .is_some_and(|why| why.contains("ran out of disk")),
+            "each failed test's own block names it"
+        );
+        assert!(
+            run(format!(
+                "error: failed to write target/x: {}",
+                crate::exec::ENOSPC_SENTENCE
+            ))
+            .environment_failure()
+            .is_some(),
+            "a build that died of it"
+        );
+    }
+
     fn refused(why: &str) -> String {
         format!(
             "\nthread 't' panicked at crates/x/tests/harness/mod.rs:177:5:\n\

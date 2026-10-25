@@ -614,13 +614,13 @@ const fn scale_head_spill(entropy: u64, upper: usize) -> usize {
 /// so coat, iris, age, motion and ink fields cannot change the head.
 #[inline]
 const fn cat_variant_index_v4(gkey: u64) -> usize {
-    let roster = HEADS.len();
+    const ROSTER: usize = HEADS.len();
+    const PRIMARY: usize = 64 - 64 % ROSTER;
     let ticket = field(gkey, 0, 6) as usize;
-    let primary = 64 - 64 % roster;
-    if ticket < primary {
-        ticket % roster
+    if ticket < PRIMARY {
+        ticket % ROSTER
     } else {
-        scale_head_spill(field(gkey, 34, 30), roster)
+        scale_head_spill(field(gkey, 34, 30), ROSTER)
     }
 }
 

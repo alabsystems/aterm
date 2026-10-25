@@ -191,8 +191,8 @@ const FLOW_ECHO_LEVEL: f32 = 0.25;
 const FLOW_KEY_HEADROOM: f32 = 0.954_992_6;
 
 #[inline]
-fn flow_key_headroom(flow: f32) -> f32 {
-    lerp(1.0, FLOW_KEY_HEADROOM, flow.sqrt())
+const fn flow_key_headroom(flow: f32) -> f32 {
+    lerp(1.0, FLOW_KEY_HEADROOM, crate::color_math::sqrt_f32(flow))
 }
 
 const CAP_RING_LEVEL: f32 = 0.501_187_2;
@@ -1731,13 +1731,15 @@ const fn tau_v_s(ioi_s: f32) -> f32 {
 }
 
 #[inline]
-fn g_ioi(ioi_s: f32) -> f32 {
-    (ioi_s / G_IOI_REF_S).sqrt().clamp(G_IOI_MIN, 1.0)
+const fn g_ioi(ioi_s: f32) -> f32 {
+    const INV_G_IOI_REF_S: f32 = 1.0 / G_IOI_REF_S;
+    crate::color_math::sqrt_f32(ioi_s * INV_G_IOI_REF_S).clamp(G_IOI_MIN, 1.0)
 }
 
 #[inline]
 const fn roof_hz(cps: f32, lit: bool, heat: f32, hue: f32, touch: Touch) -> f32 {
-    let u = ((cps - ROOF_CPS_LO) / ROOF_CPS_SPAN).clamp(0.0, 1.0);
+    const INV_ROOF_CPS_SPAN: f32 = 1.0 / ROOF_CPS_SPAN;
+    let u = ((cps - ROOF_CPS_LO) * INV_ROOF_CPS_SPAN).clamp(0.0, 1.0);
     let plain = ROOF_PLAIN_LO_HZ + (ROOF_PLAIN_HI_HZ - ROOF_PLAIN_LO_HZ) * u;
     let base = if lit {
         (plain + ROOF_LIT_ADD_HZ).min(ROOF_MAX_HZ)
@@ -1761,8 +1763,9 @@ const fn hue_arc(hue: f32) -> f32 {
 const HUE_AIR_FLOOR: f32 = 0.80;
 
 #[inline]
-fn hue_air(hue: f32) -> f32 {
-    HUE_AIR_FLOOR + (1.0 - HUE_AIR_FLOOR) * (0.5 - 0.5 * (core::f32::consts::TAU * hue).cos())
+const fn hue_air(hue: f32) -> f32 {
+    let (_, cos_h) = crate::supernova::sin_cos_f32(core::f32::consts::TAU * hue);
+    HUE_AIR_FLOOR + (1.0 - HUE_AIR_FLOOR) * (0.5 - 0.5 * cos_h)
 }
 
 #[inline]
@@ -2095,8 +2098,9 @@ const fn head_breath(root: f32) -> Voice {
 
 #[inline]
 const fn bloom(deg: i32, roof: f32, tau_v: f32) -> Voice {
+    const INV_TAU_V_MAX_S: f32 = 1.0 / TAU_V_MAX_S;
     let decay = (BLOOM_DECAY_TAU_MUL * tau_v).min(BLOOM_DECAY_S);
-    let head = (tau_v / TAU_V_MAX_S).clamp(BLOOM_HEAD_MIN_MUL, 1.0);
+    let head = (tau_v * INV_TAU_V_MAX_S).clamp(BLOOM_HEAD_MIN_MUL, 1.0);
     Voice {
         delay: BLOOM_DELAY_S * head,
         dur: (3.0 * decay + TINE_DUR_TAIL_S).min(BLOOM_DUR_S),
@@ -2149,12 +2153,13 @@ impl TrailSynth {
     #[inline]
     fn v2_velocity(&mut self, db: f32) -> f32 {
         let u = self.rnd_in(-1.0, 1.0);
-        (10.0f32).powf(u * db / 20.0)
+        (10.0f32).powf(u * db * 0.05)
     }
 
     #[inline]
     const fn v2_pan(&mut self, pan: f32) -> f32 {
-        pan + self.rnd_in(-PAN_JITTER, PAN_JITTER) / PAN_LAW_SCALE
+        const INV_PAN_LAW_SCALE: f32 = 1.0 / PAN_LAW_SCALE;
+        pan + self.rnd_in(-PAN_JITTER, PAN_JITTER) * INV_PAN_LAW_SCALE
     }
 
     #[inline]
@@ -2328,7 +2333,8 @@ impl TrailSynth {
         {
             let arc = hue_arc(ev.hue);
             if self.v2_latched {
-                let k = 1.0 - (-self.since_event / BED_HUE_TAU_S).exp();
+                const INV_BED_HUE_TAU_S: f32 = -1.0 / BED_HUE_TAU_S;
+                let k = 1.0 - (self.since_event * INV_BED_HUE_TAU_S).exp();
                 self.bed.hue_s += (arc - self.bed.hue_s) * k;
             } else {
                 self.bed.hue_s = arc;
@@ -2344,7 +2350,8 @@ impl TrailSynth {
         if ev.bed {
             self.kick_bed(kind, ev.gain);
         }
-        self.rate = self.rate * (-self.since_event / 0.6).exp() + 1.0;
+        const INV_RATE_TAU: f32 = -1.0 / 0.6;
+        self.rate = self.rate * (self.since_event * INV_RATE_TAU).exp() + 1.0;
         self.since_event = 0.0;
         let at = self.v2_at_ms(meta);
 
@@ -3353,21 +3360,24 @@ impl TrailSynth {
         let tgt = SKY_BED_TARGETS[usize::from(self.v2.text.chord) % SKY_BED_CHORDS];
         let b = &mut self.bed;
         if b.sky_glide_dt != dt {
+            const INV_BED_GLIDE_TAU_S: f32 = -1.0 / BED_GLIDE_TAU_S;
             b.sky_glide_dt = dt;
-            b.sky_glide = 1.0 - (-dt / BED_GLIDE_TAU_S).exp();
+            b.sky_glide = 1.0 - (dt * INV_BED_GLIDE_TAU_S).exp();
         }
         let glide = b.sky_glide;
         let arc = b.hue_s.clamp(0.0, 1.0);
         if b.sky_detune <= 0.0 || b.sky_detune_arc != arc {
+            const INV_1200: f32 = 1.0 / 1200.0;
             b.sky_detune_arc = arc;
             b.sky_detune =
-                (2.0f32).powf(lerp(BED_DETUNE_CENTS_LO, BED_DETUNE_CENTS_HI, arc) / 1200.0);
+                (2.0f32).powf(lerp(BED_DETUNE_CENTS_LO, BED_DETUNE_CENTS_HI, arc) * INV_1200);
         }
         let detune = b.sky_detune;
         let tone = |ph: f32| -> f32 {
+            const INV_3: f32 = 1.0 / 3.0;
             let x = super::sin01(ph)
                 + super::sin01(ph * 2.0) * 0.5
-                + super::sin01(ph * 3.0) / 3.0
+                + super::sin01(ph * 3.0) * INV_3
                 + super::sin01(ph * 4.0) * 0.25;
             x * BED_PARTIAL_NORM
         };

@@ -41,10 +41,17 @@ const _: () = assert!(
             <= crate::effect_util::TWINKLE_FLASH_BOUND_HZ,
     "the exit star wink must glint within the photosensitivity flash bound"
 );
+const fn dur_from_secs_f32(secs: f32) -> Duration {
+    Duration::from_nanos((secs as f64 * 1_000_000_000.0).round() as u64)
+}
+
 const DISCOVERY_HOLD: f32 = 2.8;
+const DISCOVERY_HOLD_DUR: Duration = dur_from_secs_f32(DISCOVERY_HOLD);
 const CELEBRATE_HOLD: f32 = 0.7;
+const CELEBRATE_HOLD_DUR: Duration = dur_from_secs_f32(CELEBRATE_HOLD);
 
 const OOPS_HOLD: f32 = 0.60;
+const OOPS_HOLD_DUR: Duration = dur_from_secs_f32(OOPS_HOLD);
 const OOPS_REARM: f32 = 0.30;
 const OOPS_RECOIL: f32 = 0.12;
 const OOPS_SQUASH: f32 = 0.07;
@@ -52,6 +59,7 @@ const OOPS_ATTACK: f32 = 0.07;
 const OOPS_SETTLE: f32 = 0.18;
 
 const WINCE_HOLD: f32 = 0.52;
+const WINCE_HOLD_DUR: Duration = dur_from_secs_f32(WINCE_HOLD);
 const WINCE_CHAIN_WINDOW: f32 = 0.85;
 const WINCE_ATTACK: f32 = 0.045;
 const WINCE_SETTLE: f32 = 0.16;
@@ -73,6 +81,7 @@ const WINCE_TUMBLE_OMEGA: [f32; MAX_WINCE_CHAIN as usize] = {
 };
 
 const DELIGHT_HOLD: f32 = 0.62;
+const DELIGHT_HOLD_DUR: Duration = dur_from_secs_f32(DELIGHT_HOLD);
 const DELIGHT_CHAIN_WINDOW: f32 = 0.9;
 const DELIGHT_ATTACK: f32 = 0.05;
 const DELIGHT_SETTLE: f32 = 0.2;
@@ -127,10 +136,17 @@ impl Default for SingSync {
     }
 }
 
-/// Smoothstep ramp of `x` across `[lo, hi]` → `0..=1` (eased at both ends).
+/// Smoothstep ramp of `x` across `[lo, lo + 1 / inv_span]` → `0..=1` (eased at both ends).
 #[inline]
-const fn smoothstep(lo: f32, hi: f32, x: f32) -> f32 {
-    let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
+const fn smoothstep(lo: f32, inv_span: f32, x: f32) -> f32 {
+    let t = ((x - lo) * inv_span).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Smoothstep ramp of `x` across `[0, 1 / inv_hi]` → `0..=1` (eased at both ends).
+#[inline]
+const fn smoothstep_0(inv_hi: f32, x: f32) -> f32 {
+    let t = (x * inv_hi).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
@@ -598,10 +614,11 @@ impl CursorCat {
     pub fn placement_frame(&self, now: Instant) -> CursorCatPlacementFrame {
         let fold_now = self.collection_sample_time(now);
         let fold = self.fold.and_then(|fold| {
+            const INV_CURSOR_FOLD_SECS: f32 = 1.0 / CURSOR_FOLD_DURATION.as_secs_f32();
             let progress = fold_now
                 .saturating_duration_since(fold.started)
                 .as_secs_f32()
-                / CURSOR_FOLD_DURATION.as_secs_f32();
+                * INV_CURSOR_FOLD_SECS;
             (progress < 1.0).then_some(CatFoldFrame {
                 started: fold.started,
                 direction: fold.direction,
@@ -644,9 +661,10 @@ impl CursorCat {
                 self.sustain += dt.min(SUSTAIN_CREDIT_MAX);
                 self.run_keys = self.run_keys.saturating_add(1);
             } else {
+                const INV_SUSTAIN_CREDIT_MAX: f32 = 1.0 / SUSTAIN_CREDIT_MAX;
                 let drain = dt * SUSTAIN_LEAK;
                 self.sustain = (self.sustain - drain).max(0.0);
-                let lost = (drain / SUSTAIN_CREDIT_MAX) as u32;
+                let lost = (drain * INV_SUSTAIN_CREDIT_MAX) as u32;
                 self.run_keys = self.run_keys.saturating_sub(lost);
             }
             self.stride_advance(now);
@@ -662,7 +680,9 @@ impl CursorCat {
                 && (ordinary_flight_owned || self.sing > 0.0)
                 && self.momentum.value(now) >= REVIVE_GATE
             {
-                let faded = (now.saturating_duration_since(t0).as_secs_f32() / FADE_OUT).min(1.0);
+                const INV_FADE_OUT: f32 = 1.0 / FADE_OUT;
+                let faded =
+                    (now.saturating_duration_since(t0).as_secs_f32() * INV_FADE_OUT).min(1.0);
                 let alpha = 1.0 - faded;
                 let back = Duration::from_secs_f32(FADE_IN * alpha);
                 self.state = State::FadeIn(now.checked_sub(back).unwrap_or(now));
@@ -716,7 +736,7 @@ impl CursorCat {
                 .oops_last
                 .is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() < OOPS_REARM);
         self.reaction = CatReaction::Startled;
-        self.reaction_until = Some(now + Duration::from_secs_f32(OOPS_HOLD));
+        self.reaction_until = Some(now + OOPS_HOLD_DUR);
         self.oops_last = Some(now);
         if !same_burst {
             self.oops_at = Some(now);
@@ -741,7 +761,7 @@ impl CursorCat {
         self.wince_at = Some(now);
         self.wince_last = Some(now);
         self.reaction = CatReaction::Wince;
-        self.reaction_until = Some(now + Duration::from_secs_f32(WINCE_HOLD));
+        self.reaction_until = Some(now + WINCE_HOLD_DUR);
         self.land_at = Some(now);
         true
     }
@@ -805,7 +825,7 @@ impl CursorCat {
         self.delight_at = Some(now);
         self.delight_last = Some(now);
         self.reaction = CatReaction::Delight;
-        self.reaction_until = Some(now + Duration::from_secs_f32(DELIGHT_HOLD));
+        self.reaction_until = Some(now + DELIGHT_HOLD_DUR);
         true
     }
 
@@ -824,7 +844,7 @@ impl CursorCat {
     pub fn on_enter(&mut self, now: Instant) {
         if self.is_active() {
             self.reaction = CatReaction::Celebrate;
-            self.reaction_until = Some(now + Duration::from_secs_f32(CELEBRATE_HOLD));
+            self.reaction_until = Some(now + CELEBRATE_HOLD_DUR);
             self.land_at = Some(now);
         }
     }
@@ -877,7 +897,7 @@ impl CursorCat {
         self.sustain = 0.0;
         self.run_keys = 0;
         self.exit = CatExit::Plain;
-        let until = now + Duration::from_secs_f32(DISCOVERY_HOLD);
+        let until = now + DISCOVERY_HOLD_DUR;
         self.discovery_until = Some(until);
         self.collection_hello = true;
         self.collection_paused_at = None;
@@ -995,7 +1015,8 @@ impl CursorCat {
                 gap = gap.fract();
             }
             if gap != 0.0 {
-                let k = 1.0 - (-dt / STRIDE_TAU).exp();
+                const INV_STRIDE_TAU: f32 = 1.0 / STRIDE_TAU;
+                let k = 1.0 - (-dt * INV_STRIDE_TAU).exp();
                 let step = (gap * k).clamp(-STRIDE_RATE_MAX * dt, STRIDE_RATE_MAX * dt);
                 self.stride_shown = wrap(self.stride_shown + step);
             }
@@ -1004,9 +1025,11 @@ impl CursorCat {
 
     /// The airborne hover-bob (fraction of cell height), a pure read of the stride pump.
     #[inline]
-    fn bob(&self) -> f32 {
+    const fn bob(&self) -> f32 {
         match self.flight {
-            Some(_) => (std::f32::consts::TAU * self.stride_shown).sin() * BOB_AMP,
+            Some(_) => {
+                crate::supernova::sin_cos_f32(std::f32::consts::TAU * self.stride_shown).0 * BOB_AMP
+            }
             None => 0.0,
         }
     }
@@ -1021,7 +1044,7 @@ impl CursorCat {
             return 0.0;
         };
         let elapsed = now.saturating_duration_since(t0).as_secs_f32();
-        (elapsed / DELIGHT_HOLD).clamp(0.0, 1.0)
+        (elapsed * (1.0 / DELIGHT_HOLD)).clamp(0.0, 1.0)
     }
 
     /// Advance the eased display-momentum spine toward `target` (the live
@@ -1034,7 +1057,8 @@ impl CursorCat {
             Some(prev) => {
                 let dt = now.saturating_duration_since(prev).as_secs_f32().min(0.1);
                 if dt > 0.0 && self.disp != target {
-                    let alpha = 1.0 - (-dt / DISP_TAU).exp();
+                    const INV_DISP_TAU: f32 = 1.0 / DISP_TAU;
+                    let alpha = 1.0 - (-dt * INV_DISP_TAU).exp();
                     self.disp += (target - self.disp) * alpha;
                 }
             }
@@ -1048,9 +1072,11 @@ impl CursorCat {
     fn blink_active(&self, now: Instant) -> bool {
         match self.flight {
             Some(t0) => {
+                const INV_BLINK_PERIOD: f32 = 1.0 / BLINK_PERIOD;
+                const BLINK_DUTY: f32 = BLINK_DUR / BLINK_PERIOD;
                 let t = now.saturating_duration_since(t0).as_secs_f32();
-                let phase = (t + BLINK_PERIOD - BLINK_DUR).rem_euclid(BLINK_PERIOD);
-                phase < BLINK_DUR
+                let u = (t + (BLINK_PERIOD - BLINK_DUR)) * INV_BLINK_PERIOD;
+                (u - u.floor()) < BLINK_DUTY
             }
             None => false,
         }
@@ -1063,8 +1089,9 @@ impl CursorCat {
         reaction: CatReaction,
         exit: CatExit,
     ) -> CatPose {
+        const INV_BANK_SPAN: f32 = 1.0 / (BANK_HI - BANK_LO);
         self.advance_spine(now, target);
-        let bank = smoothstep(BANK_LO, BANK_HI, self.disp);
+        let bank = smoothstep(BANK_LO, INV_BANK_SPAN, self.disp);
         let mut scale_x = 1.0 + STRETCH_X * bank;
         let mut scale_y = 1.0 - THIN_Y * bank;
         let mut lead = LEAD_MAX * bank;
@@ -1082,7 +1109,8 @@ impl CursorCat {
             scale_x *= 1.0 + STRIDE_SQUASH * 0.7 * foot;
         }
         if let Some(t0) = self.land_at.filter(|&t0| now >= t0) {
-            let u = now.saturating_duration_since(t0).as_secs_f32() / LAND_DUR;
+            const INV_LAND_DUR: f32 = 1.0 / LAND_DUR;
+            let u = now.saturating_duration_since(t0).as_secs_f32() * INV_LAND_DUR;
             if u >= 1.0 {
                 self.land_at = None;
             } else {
@@ -1095,17 +1123,17 @@ impl CursorCat {
         }
         match reaction {
             CatReaction::Startled => {
+                const INV_OOPS_ATTACK: f32 = 1.0 / OOPS_ATTACK;
+                const INV_OOPS_SETTLE: f32 = 1.0 / OOPS_SETTLE;
                 let attack = self.oops_at.map_or(1.0, |t0| {
-                    smoothstep(
-                        0.0,
-                        OOPS_ATTACK,
+                    smoothstep_0(
+                        INV_OOPS_ATTACK,
                         now.saturating_duration_since(t0).as_secs_f32(),
                     )
                 });
                 let settle = self.reaction_until.map_or(1.0, |until| {
-                    smoothstep(
-                        0.0,
-                        OOPS_SETTLE,
+                    smoothstep_0(
+                        INV_OOPS_SETTLE,
                         until.saturating_duration_since(now).as_secs_f32(),
                     )
                 });
@@ -1115,19 +1143,21 @@ impl CursorCat {
                 scale_x *= 1.0 + OOPS_SQUASH * 0.6 * env;
             }
             CatReaction::Wince => {
+                const INV_WINCE_HOLD: f32 = 1.0 / WINCE_HOLD;
+                const INV_WINCE_ATTACK: f32 = 1.0 / WINCE_ATTACK;
+                const INV_WINCE_SETTLE: f32 = 1.0 / WINCE_SETTLE;
                 let elapsed = self
                     .wince_at
                     .map_or(0.0, |t0| now.saturating_duration_since(t0).as_secs_f32());
-                let attack = smoothstep(0.0, WINCE_ATTACK, elapsed);
+                let attack = smoothstep_0(INV_WINCE_ATTACK, elapsed);
                 let settle = self.reaction_until.map_or(1.0, |until| {
-                    smoothstep(
-                        0.0,
-                        WINCE_SETTLE,
+                    smoothstep_0(
+                        INV_WINCE_SETTLE,
                         until.saturating_duration_since(now).as_secs_f32(),
                     )
                 });
                 let chain = self.wince_chain.max(1);
-                let phase = elapsed / WINCE_HOLD * f32::from(chain);
+                let phase = elapsed * INV_WINCE_HOLD * f32::from(chain);
                 let pulse = 0.78 + 0.22 * (std::f32::consts::TAU * phase).cos().abs();
                 let strength = 1.0 + 0.18 * f32::from(chain.saturating_sub(1));
                 let env = attack * settle * pulse * strength;
@@ -1144,18 +1174,20 @@ impl CursorCat {
                 scale_y *= 1.0 - wobble;
             }
             CatReaction::Delight => {
+                const INV_DELIGHT_HOLD: f32 = 1.0 / DELIGHT_HOLD;
+                const INV_DELIGHT_ATTACK: f32 = 1.0 / DELIGHT_ATTACK;
+                const INV_DELIGHT_SETTLE: f32 = 1.0 / DELIGHT_SETTLE;
                 let elapsed = self
                     .delight_at
                     .map_or(0.0, |t0| now.saturating_duration_since(t0).as_secs_f32());
-                let attack = smoothstep(0.0, DELIGHT_ATTACK, elapsed);
+                let attack = smoothstep_0(INV_DELIGHT_ATTACK, elapsed);
                 let settle = self.reaction_until.map_or(1.0, |until| {
-                    smoothstep(
-                        0.0,
-                        DELIGHT_SETTLE,
+                    smoothstep_0(
+                        INV_DELIGHT_SETTLE,
                         until.saturating_duration_since(now).as_secs_f32(),
                     )
                 });
-                let arc = (elapsed / DELIGHT_HOLD).clamp(0.0, 1.0);
+                let arc = (elapsed * INV_DELIGHT_HOLD).clamp(0.0, 1.0);
                 let env = attack * settle;
                 let chain = self.delight_chain.max(1);
                 let strength = 1.0 + 0.16 * f32::from(chain.saturating_sub(1));
@@ -1397,7 +1429,9 @@ impl CursorCat {
                 if !discovery && grounded {
                     return self.grounded_exit(discovery_until, now);
                 }
-                let t = (now.saturating_duration_since(t0).as_secs_f32() / FADE_IN).clamp(0.0, 1.0);
+                const INV_FADE_IN: f32 = 1.0 / FADE_IN;
+                let t =
+                    (now.saturating_duration_since(t0).as_secs_f32() * INV_FADE_IN).clamp(0.0, 1.0);
                 if t >= 1.0 {
                     self.state = State::Shown;
                 }
@@ -1436,8 +1470,9 @@ impl CursorCat {
                 }
             }
             State::FadeOut(t0) => {
-                let t =
-                    (now.saturating_duration_since(t0).as_secs_f32() / FADE_OUT).clamp(0.0, 1.0);
+                const INV_FADE_OUT: f32 = 1.0 / FADE_OUT;
+                let t = (now.saturating_duration_since(t0).as_secs_f32() * INV_FADE_OUT)
+                    .clamp(0.0, 1.0);
                 if t >= 1.0 {
                     self.settle_hidden();
                     return hidden_frame(self.look);
@@ -1461,11 +1496,12 @@ impl CursorCat {
     }
 
     #[inline]
-    fn frame_bob(&self) -> f32 {
+    const fn frame_bob(&self) -> f32 {
         if self.sing <= 0.0 {
             self.bob()
         } else {
-            let dance = (std::f32::consts::TAU * self.sing_beat).sin() * BOB_AMP;
+            let dance =
+                crate::supernova::sin_cos_f32(std::f32::consts::TAU * self.sing_beat).0 * BOB_AMP;
             if self.sing >= 1.0 {
                 dance
             } else {
@@ -1584,7 +1620,8 @@ pub fn emit_exit_fx(
     match exit {
         CatExit::Plain => {}
         CatExit::HeartMeow => {
-            let u = (ch as f32 / 14.0).max(1.0) as i32;
+            const INV_14: f32 = 1.0 / 14.0;
+            let u = (ch as f32 * INV_14).max(1.0) as i32;
             let hx = ax;
             let hy = ay - (fade_out * ch as f32 * 1.4) as i32;
             if dark_theme {

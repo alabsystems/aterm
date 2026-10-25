@@ -35,6 +35,7 @@ const AWAIT_AHEAD: f32 = 12.0;
 const SPEED_TAU: f32 = 0.11;
 const LAUNCH_TAU: f32 = 0.05;
 const SETTLE_TICK: f32 = 0.016;
+const SETTLE_STEP_FACTOR: f32 = 1.0 - crate::color_math::exp_f32(-SETTLE_TICK / SPEED_TAU);
 const ARRIVED: f32 = 0.85;
 const RUN_SPEED: f32 = 6.5;
 const GAIT_HYST: f32 = 1.6;
@@ -324,6 +325,7 @@ const WATCH_MAX: f32 = 8.0;
 
 const GAZE_FOLLOW_MIN: f32 = 2.0;
 const GAZE_FOLLOW_WINDOW: f32 = 0.3;
+const GAZE_FOLLOW_SPEED_MIN: f32 = GAZE_FOLLOW_MIN / GAZE_FOLLOW_WINDOW;
 const POINTER_RISE: f32 = 3.0;
 const POINTER_FALL: f32 = 1.5;
 const DASH_SPEED: f32 = 40.0;
@@ -852,7 +854,7 @@ impl Departure {
         let fade = if t <= fade_start {
             1.0
         } else {
-            (1.0 - (t - fade_start) / EDGE_FADE).clamp(0.0, 1.0)
+            (1.0 - (t - fade_start) * (1.0 / EDGE_FADE)).clamp(0.0, 1.0)
         };
         fade * self.peak.clamp(0.0, 1.0)
     }
@@ -866,7 +868,7 @@ impl Departure {
         if self.still {
             return (col, self.pose0, self.facing_left, self.stance0);
         }
-        let stride = self.stride0 + run / RUN_STRIDE_CELLS;
+        let stride = self.stride0 + run * (1.0 / RUN_STRIDE_CELLS);
         let cycle = PetBrain::CYCLE_RUN;
         let phase = if stride >= 0.0 && stride < 1.0 {
             stride
@@ -2017,7 +2019,7 @@ impl PetBrain {
             let p = self.pace();
             (p, p)
         };
-        rate * ((pace - LAT_SPEED) / (RUN_SPEED - LAT_SPEED)).clamp(0.0, 1.0)
+        rate * ((pace - LAT_SPEED) * (1.0 / (RUN_SPEED - LAT_SPEED))).clamp(0.0, 1.0)
     }
 
     #[inline]
@@ -2036,7 +2038,7 @@ impl PetBrain {
 
     #[inline]
     const fn run_stride_cells(speed: f32) -> f32 {
-        RUN_STRIDE_CELLS * (speed.abs() / MAX_SPEED).max(1.0)
+        RUN_STRIDE_CELLS * (speed.abs() * (1.0 / MAX_SPEED)).max(1.0)
     }
 
     #[inline]
@@ -2048,7 +2050,7 @@ impl PetBrain {
     const fn station_velocity(&self) -> f32 {
         if self.run_dir < 0 && self.rhythm_open() {
             let p = self.run_pace;
-            return -p * ((p - LAT_SPEED) / (RUN_SPEED - LAT_SPEED)).clamp(0.0, 1.0);
+            return -p * ((p - LAT_SPEED) * (1.0 / (RUN_SPEED - LAT_SPEED))).clamp(0.0, 1.0);
         }
         self.station_speed()
     }
@@ -3101,7 +3103,7 @@ impl PetBrain {
                 && col <= end + INK_PAD
             {
                 let edge = (band - k + 1) as f32;
-                return ((row - edge) / ZEE_INK_FADE_BAND).clamp(0.0, 1.0);
+                return ((row - edge) * (1.0 / ZEE_INK_FADE_BAND)).clamp(0.0, 1.0);
             }
             k += 1;
         }
@@ -3546,9 +3548,12 @@ impl PetBrain {
         self.arrive_t = (self.arrive_t - dt).max(0.0);
 
         let width = art_cols(sense.cell_w, sense.cell_h);
-        let resight = self.resight.take().filter(|pending| {
-            sense.now.saturating_duration_since(pending.at) <= Duration::from_secs_f32(EDGE_FADE)
-        });
+        const EDGE_FADE_DUR: Duration =
+            Duration::from_nanos((EDGE_FADE as f64 * 1_000_000_000.0).round() as u64);
+        let resight = self
+            .resight
+            .take()
+            .filter(|pending| sense.now.saturating_duration_since(pending.at) <= EDGE_FADE_DUR);
         let carried = core::mem::take(&mut self.carried);
         if self.console_observation_incoherent() {
             return self.emit(sense, width);
@@ -3585,7 +3590,7 @@ impl PetBrain {
             if let Some(flight) = self.flight.take() {
                 let u = (flight.t / flight.dur).clamp(0.0, 1.0);
                 let lift = Self::flight_lift(flight.arc, u, flight.big);
-                self.retired_flight_lift = (lift > 0.0).then_some((lift, lift / FADE_IN));
+                self.retired_flight_lift = (lift > 0.0).then_some((lift, lift * (1.0 / FADE_IN)));
                 self.deferred_hidden_landing = Some((flight.to_col, flight.to_row));
             }
             if self.alpha == 0.0
@@ -3643,7 +3648,7 @@ impl PetBrain {
                     departures: [None; PET_DEPARTURES_MAX],
                 };
             }
-            self.alpha = (self.alpha - dt / FADE_OUT).max(0.0);
+            self.alpha = (self.alpha - dt * (1.0 / FADE_OUT)).max(0.0);
             if self.alpha == 0.0 {
                 self.colors = None;
                 self.quiet_leap = false;
@@ -3686,7 +3691,7 @@ impl PetBrain {
             self.colors = None;
         }
         if self.room_cheer && self.room_cheer_leaving {
-            self.alpha = (self.alpha - dt / FADE_OUT).max(0.0);
+            self.alpha = (self.alpha - dt * (1.0 / FADE_OUT)).max(0.0);
             if self.alpha == 0.0 {
                 let (col, row) = self.station_safe((cr, cc), sense.cols, sense.rows, width);
                 self.col = col;
@@ -3696,7 +3701,7 @@ impl PetBrain {
                 self.drop_room_cheer();
             }
         } else {
-            self.alpha = (self.alpha + dt / FADE_IN).min(1.0);
+            self.alpha = (self.alpha + dt * (1.0 / FADE_IN)).min(1.0);
         }
 
         let prev = self.last_caret;
@@ -4052,9 +4057,10 @@ impl PetBrain {
                         || self.pointer_vy != 0.0
                         || self.pointer_speed != 0.0)
                 {
-                    let k = 1.0 - (-dt / DASH_WINDOW).exp();
-                    let vx_inst = (px - lx) / dt;
-                    let vy_inst = (py - ly) / dt;
+                    let k = 1.0 - (-dt * (1.0 / DASH_WINDOW)).exp();
+                    let inv_dt = 1.0 / dt;
+                    let vx_inst = (px - lx) * inv_dt;
+                    let vy_inst = (py - ly) * inv_dt;
                     self.pointer_vx += (vx_inst - self.pointer_vx) * k;
                     self.pointer_vy += (vy_inst - self.pointer_vy) * k;
                     let inst = if vx_inst == 0.0 && vy_inst == 0.0 {
@@ -4071,7 +4077,7 @@ impl PetBrain {
                 }
                 self.last_pointer = Some((px, py));
                 let speed = self.pointer_speed;
-                self.pointer_heat = if speed >= GAZE_FOLLOW_MIN / GAZE_FOLLOW_WINDOW {
+                self.pointer_heat = if speed >= GAZE_FOLLOW_SPEED_MIN {
                     (self.pointer_heat + dt * POINTER_RISE).min(1.0)
                 } else {
                     (self.pointer_heat - dt * POINTER_FALL).max(0.0)
@@ -5045,10 +5051,9 @@ impl PetBrain {
                 // Landing recovery. A big landing also skids the 0.8 cells the
                 // flight aimed short by, ending on the station.
                 if self.land_span > 0.0 && self.skid_dir != 0.0 {
-                    const SKID_NORM: f32 = f32::from_bits(0x3f7b_4f8f); // 1.0 - (-4.0f32).exp()
-                    let denom = SKID_NORM;
-                    let u = (1.0 - self.land_t / BIG_LAND_DUR).clamp(0.0, 1.0);
-                    let s = (1.0 - (-4.0 * u).exp()) / denom;
+                    const INV_SKID_NORM: f32 = 1.0 / (1.0 - crate::color_math::exp_f32(-4.0));
+                    let u = (1.0 - self.land_t * (1.0 / BIG_LAND_DUR)).clamp(0.0, 1.0);
+                    let s = (1.0 - (-4.0 * u).exp()) * INV_SKID_NORM;
                     self.col = (self.skid_from + self.skid_dir * SKID_CELLS * s)
                         .clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
                 }
@@ -5201,7 +5206,7 @@ impl PetBrain {
         }
         self.pending_pounce = false;
 
-        let sched = ((self.vhat.abs() - RUN_SPEED) / RUN_SPEED).clamp(0.0, 1.0);
+        let sched = ((self.vhat.abs() - RUN_SPEED) * (1.0 / RUN_SPEED)).clamp(0.0, 1.0);
         let gain = CHASE_GAIN + (CHASE_GAIN_FAST - CHASE_GAIN) * sched;
         let on_station = (target - self.station_now(cc, sense.cols, width)).abs() <= 1e-3;
         let limit = f32::from(sense.cols) - width;
@@ -5273,7 +5278,7 @@ impl PetBrain {
             if gap == 0.0 {
                 self.speed = 0.0;
             } else {
-                let rate = gain * (1.0 - (-SETTLE_TICK / SPEED_TAU).exp());
+                let rate = gain * SETTLE_STEP_FACTOR;
                 self.speed = gap * (1.0 - (-rate * dt).exp()) / dt;
             }
         } else if want != self.speed && dt > 0.0 {
@@ -5311,14 +5316,14 @@ impl PetBrain {
         let step = self.speed * dt;
         self.col += step;
         let travelled = step.abs();
-        let stride_cells = if self.action == PetAction::Run {
-            Self::run_stride_cells(self.speed)
+        let inv_stride_cells = if self.action == PetAction::Run {
+            1.0 / Self::run_stride_cells(self.speed)
         } else if self.lateral {
-            LAT_STRIDE_CELLS
+            1.0 / LAT_STRIDE_CELLS
         } else {
-            STRIDE_CELLS
+            1.0 / STRIDE_CELLS
         };
-        let next_stride = self.stride + travelled / stride_cells;
+        let next_stride = self.stride + travelled * inv_stride_cells;
         self.stride = if (0.0..1024.0).contains(&next_stride) {
             next_stride
         } else {
@@ -5448,7 +5453,7 @@ impl PetBrain {
                         let span = (edge - self.col).abs();
                         (
                             edge,
-                            DEPART_SPEED.max(span / (DEPART_MAX - EDGE_FADE)),
+                            DEPART_SPEED.max(span * (1.0 / (DEPART_MAX - EDGE_FADE))),
                             ARRIVE_IN,
                         )
                     };
@@ -5615,7 +5620,7 @@ impl PetBrain {
             }
         } else if stand_held {
             if self.gait_pace != 0.0 && dt > 0.0 {
-                self.gait_pace *= (-dt / GAIT_REST_TAU).exp();
+                self.gait_pace *= (-dt * (1.0 / GAIT_REST_TAU)).exp();
             }
             self.gait_rest += dt;
             if matches!(
@@ -5640,7 +5645,7 @@ impl PetBrain {
                 self.gait_pace = v;
                 self.gait_t = GAIT_DWELL - GAIT_TURN_SETTLE;
             } else if dt > 0.0 {
-                self.gait_pace += (v - self.gait_pace) * (1.0 - (-dt / GAIT_TAU).exp());
+                self.gait_pace += (v - self.gait_pace) * (1.0 - (-dt * (1.0 / GAIT_TAU)).exp());
             }
             if v > FLIP_SPEED {
                 self.gait_dir = self.speed.signum();
@@ -5675,7 +5680,7 @@ impl PetBrain {
             if fast
                 && self.speed.abs() > STUMBLE_SPEED
                 && self.stumble_t <= 0.0
-                && self.stride.fract() < travelled / RUN_STRIDE_CELLS
+                && self.stride.fract() < travelled * (1.0 / RUN_STRIDE_CELLS)
                 && (self.stride as u32).wrapping_add(u32::from(self.mote_serial)) % 5 == 0
             {
                 self.stumble_t = STUMBLE_DUR;
@@ -5778,7 +5783,7 @@ impl PetBrain {
         if dc > 0.0 || line_change {
             self.retreat_bottled = false;
         }
-        self.vhat = (self.vhat + dc / VEL_TAU).clamp(-VEL_MAX, VEL_MAX);
+        self.vhat = (self.vhat + dc * (1.0 / VEL_TAU)).clamp(-VEL_MAX, VEL_MAX);
         self.vrun = if self.run_gap > 0.0 && dc > 0.0 {
             (dc / self.run_gap).clamp(0.0, VEL_MAX).max(self.vrun)
         } else {
@@ -5931,8 +5936,8 @@ impl PetBrain {
         if (target - self.stride).abs() < STRIDE_PLANT {
             self.stride = target;
         } else if dt > 0.0 {
-            self.stride +=
-                (target - self.stride) * (1.0 - crate::color_math::exp_f32(-dt / STRIDE_EASE));
+            self.stride += (target - self.stride)
+                * (1.0 - crate::color_math::exp_f32(-dt * (1.0 / STRIDE_EASE)));
         }
     }
 
@@ -5945,7 +5950,7 @@ impl PetBrain {
         }
         self.speed = 0.0;
         if self.gait_pace != 0.0 && dt > 0.0 {
-            self.gait_pace *= crate::color_math::exp_f32(-dt / GAIT_REST_TAU);
+            self.gait_pace *= crate::color_math::exp_f32(-dt * (1.0 / GAIT_REST_TAU));
         }
         self.gait_rest += dt;
         self.plant_stride(dt);
@@ -6088,7 +6093,7 @@ impl PetBrain {
                     None
                 }
             }
-            2 => match (p / TAIL_SWING).floor() as i64 {
+            2 => match (p * (1.0 / TAIL_SWING)).floor() as i64 {
                 0 | 6 => Some(PetGlyphId::PetSitFlick),
                 1 | 2 | 5 => Some(PetGlyphId::PetSitTailBack),
                 3 | 4 => Some(PetGlyphId::PetSitTailLow),
@@ -6248,13 +6253,13 @@ impl PetBrain {
 
     #[inline]
     const fn coil_envelope(t: f32, dur: f32) -> (f32, f32) {
-        let q_full = COIL_SQUASH * (dur / COIL_MAX).min(1.0);
+        let q_full = COIL_SQUASH * (dur * (1.0 / COIL_MAX)).min(1.0);
         let release0 = (dur - COIL_RELEASE).max(f32::EPSILON);
         if t < release0 {
             let q = q_full * (t / release0).min(1.0);
             (1.0 - q, 1.0 / (1.0 - q))
         } else {
-            let r = ((t - release0) / COIL_RELEASE).clamp(0.0, 1.0);
+            let r = ((t - release0) * (1.0 / COIL_RELEASE)).clamp(0.0, 1.0);
             let (y0, x0) = (1.0 - q_full, 1.0 / (1.0 - q_full));
             let (y1, x1) = (1.0 - 0.6 * LAUNCH_STRETCH, 1.0 + LAUNCH_STRETCH);
             (y0 + (y1 - y0) * r, x0 + (x1 - x0) * r)
@@ -6279,7 +6284,7 @@ impl PetBrain {
     const fn pose_schedule(dur: f32) -> (f32, f32) {
         let (rise, desc) = (LEAP_RISE_T, LEAP_DESC_T);
         if rise + desc + MIN_HERO > dur {
-            let k = (dur - MIN_HERO) / (rise + desc);
+            let k = (dur - MIN_HERO) * (1.0 / (LEAP_RISE_T + LEAP_DESC_T));
             (rise * k, desc * k)
         } else {
             (rise, desc)
@@ -6350,7 +6355,7 @@ impl PetBrain {
         if !self.aims_ahead() {
             return 0.0;
         }
-        let k = 1.0 - crate::color_math::exp_f32(-t / VEL_TAU);
+        let k = 1.0 - crate::color_math::exp_f32(-t * (1.0 / VEL_TAU));
         let keep_ahead = self.keep_ahead();
         let stand = keep_ahead.max(self.held_lead);
         let lead = stand + self.carry(stand, self.run_t);
@@ -6416,7 +6421,7 @@ impl PetBrain {
             )
     }
 
-    fn leave_ground(
+    const fn leave_ground(
         &mut self,
         to_col: f32,
         to_row: f32,
@@ -6428,11 +6433,11 @@ impl PetBrain {
         // The aim does not read the quiet-leap latch (its prediction is the
         // decay-gated [`Self::station_drift`]); the latch only rules the show,
         // and is spent at the end of this function.
-        if policy != LeapPolicy::Play {
+        if !matches!(policy, LeapPolicy::Play) {
             self.pending_wall_transit = false;
             self.pending_pounce = false;
         }
-        self.launch_running = policy == LeapPolicy::Quiet && self.rhythm_open();
+        self.launch_running = matches!(policy, LeapPolicy::Quiet) && self.rhythm_open();
         let (aim, span, tier) = match policy {
             LeapPolicy::Show => (to_col, 0.0, Tier::Bound),
             LeapPolicy::Play => {
@@ -6471,18 +6476,24 @@ impl PetBrain {
                 );
             }
             Tier::Bound => {
-                self.launch_big(to_col, to_row, cols, width, policy == LeapPolicy::Show);
+                self.launch_big(
+                    to_col,
+                    to_row,
+                    cols,
+                    width,
+                    matches!(policy, LeapPolicy::Show),
+                );
             }
         }
         self.quiet_leap = false;
         self.drop_stare = false;
         self.launch_running = false;
-        if policy != LeapPolicy::Play {
+        if !matches!(policy, LeapPolicy::Play) {
             self.wrap_back = false;
         }
     }
 
-    fn begin_arc(&mut self, to_col: f32, to_row: f32, dur: f32, arc: f32, kind: FlightKind) {
+    const fn begin_arc(&mut self, to_col: f32, to_row: f32, dur: f32, arc: f32, kind: FlightKind) {
         // NO STILL POSE IS A ONE-FRAME FLASH BEFORE A FLIGHT. A still pose
         // just put on glass (a wake's last beat, a landing's seat, a play
         // bow, a notice) stays on it [`STILL_SECS`] before the cat leaves the
@@ -6510,10 +6521,7 @@ impl PetBrain {
         let rate = span / dur.max(0.05);
         debug_assert!(
             rate <= bound + 1e-3,
-            "no flight may outrun the animal that flies it: {rate:.1} c/s over \
-             the {bound:.0} c/s launch bound ({from:.2} -> {to_col:.2} in \
-             {dur:.3}s, big={big})",
-            from = self.col
+            "no flight may outrun the animal that flies it",
         );
         debug_assert!(
             !show || big,
@@ -6525,6 +6533,7 @@ impl PetBrain {
         } else if to_col < self.col {
             self.facing_left = true;
         }
+        let awaits_wrap = matches!(self.wrap_ahead, Some(WrapAhead::Due));
         self.flight = Some(Flight {
             from_col: self.col,
             from_row: self.row,
@@ -6537,17 +6546,17 @@ impl PetBrain {
             big,
             show,
             hop,
-            coiled: self.action == PetAction::Crouch
+            coiled: matches!(self.action, PetAction::Crouch)
                 && !self.hiding
                 && !self.vigil
                 && !self.stakeout,
             drop,
             late_move: false,
             running: self.launch_running,
-            awaits_wrap: self.wrap_ahead == Some(WrapAhead::Due),
+            awaits_wrap,
             dur0: dur.max(0.05),
         });
-        if self.wrap_ahead == Some(WrapAhead::Due) {
+        if awaits_wrap {
             self.wrap_ahead = Some(WrapAhead::Launched(to_col, to_row));
         }
         self.set_action(PetAction::Leap);
@@ -6572,7 +6581,7 @@ impl PetBrain {
         )
     }
 
-    fn begin_big_arc(&mut self, to_col: f32, to_row: f32, cols: u16, show: bool) {
+    const fn begin_big_arc(&mut self, to_col: f32, to_row: f32, cols: u16, show: bool) {
         let span = span_eq(to_col - self.col, to_row - self.row);
         let (dur, arc) = Self::big_shape(span);
         let dur = dur.max(span / quiet_speed_max(cols));
@@ -6591,7 +6600,7 @@ impl PetBrain {
         );
     }
 
-    fn launch_big(&mut self, to_col: f32, to_row: f32, cols: u16, width: f32, show: bool) {
+    const fn launch_big(&mut self, to_col: f32, to_row: f32, cols: u16, width: f32, show: bool) {
         let span0 = span_eq(to_col - self.col, to_row - self.row);
         let (dur0, _) = Self::big_shape(span0);
         let dur0 = dur0.max(span0 / quiet_speed_max(cols));
@@ -6600,8 +6609,9 @@ impl PetBrain {
         } else {
             0.0
         };
+        let cols_f = cols as f32;
         let mut aim = to_col + drift;
-        aim = aim.clamp(0.0, (f32::from(cols) - width).max(0.0));
+        aim = aim.clamp(0.0, (cols_f - width).max(0.0));
         let delta = aim - self.col;
         let dir = if delta > 0.0 {
             1.0
@@ -6616,7 +6626,7 @@ impl PetBrain {
             aim
         };
         let split = if show {
-            delta.abs() >= TWO_BOUND_FRAC * f32::from(cols)
+            delta.abs() >= TWO_BOUND_FRAC * cols_f
         } else {
             delta.abs() / quiet_speed_max(cols) > QUIET_ONE_BOUND_SECS
         };
@@ -6772,7 +6782,7 @@ impl PetBrain {
                 if self.quiet > SLEEP_AFTER + BREATH_WINDOW - ZEE_LIFE {
                     return;
                 }
-                let beat = ((self.quiet - SLEEP_AFTER) / ZEE_EVERY).floor() as i64;
+                let beat = ((self.quiet - SLEEP_AFTER) * (1.0 / ZEE_EVERY)).floor() as i64;
                 if beat >= 1 && beat != self.mote_mark {
                     let mut zee_alive = 0usize;
                     let mut i = 0;
@@ -6789,7 +6799,8 @@ impl PetBrain {
                 }
             }
             PetAction::Purr | PetAction::Sit | PetAction::Loaf if self.purring() => {
-                let beat = ((self.quiet - SIT_AFTER).max(0.0) / PURR_MOTE_EVERY).floor() as i64;
+                let beat =
+                    ((self.quiet - SIT_AFTER).max(0.0) * (1.0 / PURR_MOTE_EVERY)).floor() as i64;
                 if beat >= 1 && beat != self.mote_mark {
                     self.mote_mark = beat;
                     self.spawn_chest_mote(None, width);
@@ -7295,7 +7306,7 @@ impl PetBrain {
             || self.run_pace != 0.0
             || self.lead_room != 0.0
         {
-            let d = crate::color_math::exp_f32(-secs / VEL_TAU);
+            let d = crate::color_math::exp_f32(-secs * (1.0 / VEL_TAU));
             self.vhat *= d;
             self.vrun *= d;
             self.run_pace *= d;
@@ -7742,8 +7753,9 @@ impl PetBrain {
             let mut meets = false;
             let mut inside = true;
             let mut k = 0u32;
+            const INV_60: f64 = 1.0 / 60.0;
             while k < ticks {
-                let clock = self.clock + (k as f64) / 60.0;
+                let clock = self.clock + (k as f64) * INV_60;
                 k += 1;
                 if safe_inside && clock >= max_live_end {
                     break;
@@ -7855,7 +7867,7 @@ impl PetBrain {
 
     #[inline]
     const fn mote_fade_env(u: f32) -> f32 {
-        (u / 0.15).min(1.0) * ((1.0 - u) / 0.35).clamp(0.0, 1.0)
+        (u * (1.0 / 0.15)).min(1.0) * ((1.0 - u) * (1.0 / 0.35)).clamp(0.0, 1.0)
     }
 
     const fn resolve_motes(&mut self) -> [Option<PetMoteSprite>; PET_MOTES_MAX] {
@@ -8080,7 +8092,7 @@ impl PetBrain {
                 // [`STRETCH_LEAD`] and eases back, then the hind leg reaches
                 // back.
                 if self.action_t < STRETCH_SPLIT * WAKE_DUR {
-                    let k = (self.action_t / STRETCH_LEAD).min(1.0);
+                    let k = (self.action_t * (1.0 / STRETCH_LEAD)).min(1.0);
                     scale_x *= 1.0 + STRETCH_AMP * (core::f32::consts::PI * k).sin();
                     PetGlyphId::PetStretch
                 } else {
@@ -8145,7 +8157,7 @@ impl PetBrain {
                 }
             }
             PetAction::Loaf if self.wriggle_t > 0.0 => {
-                let beat = ((WRIGGLE_DUR - self.wriggle_t) / WRIGGLE_BEAT) as u32;
+                let beat = ((WRIGGLE_DUR - self.wriggle_t) * (1.0 / WRIGGLE_BEAT)) as u32;
                 let u = (WRIGGLE_DUR - self.wriggle_t) * 9.0;
                 scale_y *= 1.0 + 0.04 * u.sin();
                 match beat % 4 {
@@ -8171,7 +8183,7 @@ impl PetBrain {
                 }
             }
             PetAction::Purr if self.pet_hold_t > 0.0 => {
-                let u = (1.0 - self.pet_hold_t / PET_HOLD).clamp(0.0, 1.0);
+                let u = (1.0 - self.pet_hold_t * (1.0 / PET_HOLD)).clamp(0.0, 1.0);
                 let warm = self.content >= PURR_GATE;
                 let waves = if warm { 2.0 } else { 1.0 };
                 let lean = (core::f32::consts::PI * waves * u).sin().powi(2);
@@ -8204,7 +8216,7 @@ impl PetBrain {
                     let cycle = groom_after + GROOM_DUR;
                     let into = (since_sit - groom_after).max(0.0);
                     let k = (into / cycle).floor();
-                    let u = (into - k * cycle) / GROOM_DUR;
+                    let u = (into - k * cycle) * (1.0 / GROOM_DUR);
                     if (u < 0.6) != ((k as i64).rem_euclid(2) == 1) {
                         PetGlyphId::PetGroom
                     } else {
@@ -8226,7 +8238,7 @@ impl PetBrain {
                 PetGlyphId::PetBat
             }
             PetAction::Frolic => {
-                if ((self.action_t / (FROLIC_HOLD * 0.5)) as u32).is_multiple_of(2) {
+                if ((self.action_t * (1.0 / (FROLIC_HOLD * 0.5))) as u32).is_multiple_of(2) {
                     PetGlyphId::PetPlaybow
                 } else {
                     PetGlyphId::PetBat
@@ -8332,14 +8344,14 @@ impl PetBrain {
                         LAND_SQUASH
                             * (BIG_SQUASH_NEAR
                                 + (1.0 - BIG_SQUASH_NEAR)
-                                    * (self.land_span / BIG_SQUASH_SPAN).min(1.0)),
+                                    * (self.land_span * (1.0 / BIG_SQUASH_SPAN)).min(1.0)),
                         PetGlyphId::PetLand,
                     )
                 } else {
                     (LAND_DUR, LAND_SQUASH, PetGlyphId::PetLand)
                 };
                 let u = 1.0 - (self.land_t / dur).clamp(0.0, 1.0);
-                let a = ((dur - self.land_t) / LAND_ATTACK).clamp(0.0, 1.0);
+                let a = ((dur - self.land_t) * (1.0 / LAND_ATTACK)).clamp(0.0, 1.0);
                 let q = q0 * a * (-3.0 * u).exp() * (TAU * 1.35 * u).cos();
                 scale_y *= 1.0 - q;
                 scale_x *= 1.0 + q * 0.6;
@@ -8351,7 +8363,7 @@ impl PetBrain {
                     .is_some_and(|over| (over - self.col) * self.speed >= 0.0) =>
             {
                 let over = self.brake_over.expect("checked by the guard");
-                let w = ((over - self.col).abs() / BRAKE_OVERSHOOT).clamp(0.0, 1.0);
+                let w = ((over - self.col).abs() * (1.0 / BRAKE_OVERSHOOT)).clamp(0.0, 1.0);
                 scale_x *= 1.0 + SKID_LEAN * w;
                 scale_y *= 1.0 - 0.4 * SKID_LEAN * w;
                 PetGlyphId::PetSkid
@@ -8370,12 +8382,12 @@ impl PetBrain {
             scale_x -= s * PURR_DEPTH * 0.6;
         }
         if self.flinch_t > 0.0 {
-            let q = FLINCH_SQUASH * (self.flinch_t / FLINCH_DUR).clamp(0.0, 1.0);
+            let q = FLINCH_SQUASH * (self.flinch_t * (1.0 / FLINCH_DUR)).clamp(0.0, 1.0);
             scale_y *= 1.0 - q;
             scale_x *= 1.0 + q * 0.6;
         }
         if self.stumble_t > 0.0 {
-            let q = 0.18 * (self.stumble_t / STUMBLE_DUR).clamp(0.0, 1.0);
+            let q = 0.18 * (self.stumble_t * (1.0 / STUMBLE_DUR)).clamp(0.0, 1.0);
             scale_y *= 1.0 - q;
             scale_x *= 1.0 + q * 0.7;
         }
@@ -8391,7 +8403,7 @@ impl PetBrain {
         }
 
         if self.twitch_t > 0.0 && !ear_frame {
-            let q = TWITCH_BOB * (self.twitch_t / TWITCH_DUR).clamp(0.0, 1.0);
+            let q = TWITCH_BOB * (self.twitch_t * (1.0 / TWITCH_DUR)).clamp(0.0, 1.0);
             scale_y *= if self.twitch_up { 1.0 + q } else { 1.0 - q };
         }
 
@@ -8468,11 +8480,12 @@ impl PetBrain {
         self.finish_console_frame(&mut frame, sense);
         self.hold_still_pose(&mut frame);
         self.veil_over_letters(&mut frame, sense);
-        self.last_presence = f32::from(frame.alpha) / 255.0;
+        const INV_255: f32 = 1.0 / 255.0;
+        self.last_presence = f32::from(frame.alpha) * INV_255;
         self.last_stance = Stance::of(&frame);
-        let lane_alpha_norm = f32::from(frame.lane_alpha) / 255.0;
+        let lane_alpha_norm = f32::from(frame.lane_alpha) * INV_255;
         self.last_drawn = core::array::from_fn(|i| {
-            frame.departures[i].map_or(0.0, |d| f32::from(d.alpha) / 255.0 * lane_alpha_norm)
+            frame.departures[i].map_or(0.0, |d| f32::from(d.alpha) * INV_255 * lane_alpha_norm)
         });
         frame
     }
@@ -8564,7 +8577,7 @@ impl PetBrain {
             self.letter_cover_since = None;
             0.0
         };
-        let k = (cover / LETTER_VEIL_FULL).clamp(0.0, 1.0);
+        let k = (cover * (1.0 / LETTER_VEIL_FULL)).clamp(0.0, 1.0);
         let walk_target = 1.0 - (1.0 - LETTER_VEIL_FLOOR) * k * k * (3.0 - 2.0 * k);
         let (level, at, _) = self.letter_veil;
         let veiled = level < 1.0;
@@ -8700,14 +8713,14 @@ impl PetBrain {
             // 384 ms (352 on paper; the trail gallery's `enter-bottom`).
             target
         } else if target < level {
-            let on = if resting {
-                LETTER_VEIL_REST_ON_S
+            let inv_on = if resting {
+                1.0 / LETTER_VEIL_REST_ON_S
             } else {
-                LETTER_VEIL_ON_S
+                1.0 / LETTER_VEIL_ON_S
             };
-            (level - dt.min(LETTER_VEIL_REST_ON_S) / on).max(target)
+            (level - dt.min(LETTER_VEIL_REST_ON_S) * inv_on).max(target)
         } else {
-            (level + dt / LETTER_VEIL_OFF_S).min(target)
+            (level + dt * (1.0 / LETTER_VEIL_OFF_S)).min(target)
         };
         self.letter_veil = (level, Some(sense.now), target);
         self.veil_gather = gather_on_letters && level > LETTER_VEIL_FLOOR;
@@ -8770,8 +8783,8 @@ impl PetBrain {
         if cell_w == 0 || cell_h == 0 || y1 <= y0 || x1 <= x0 {
             return Some(false);
         }
-        let (cw, ch) = (cell_w as f32, cell_h as i32);
-        let (a, b) = (x0 as f32 / cw + INK_PAD, x1 as f32 / cw - INK_PAD);
+        let (inv_cw, ch) = (1.0 / (cell_w as f32), cell_h as i32);
+        let (a, b) = (x0 as f32 * inv_cw + INK_PAD, x1 as f32 * inv_cw - INK_PAD);
         let y1_row = (y1 - 1).div_euclid(ch);
         let cr = caret_row as i32;
         let below = if y1_row < cr { y1_row } else { cr };
@@ -8818,9 +8831,10 @@ impl PetBrain {
             return 0.0;
         }
         let (cw, ch) = (cell_w as i32, cell_h as i32);
-        let col = x0 as f32 / cw as f32;
-        let width = (x1 - x0) as f32 / cw as f32;
-        let h = (y1 - y0) as f32;
+        let inv_cw = 1.0 / (cw as f32);
+        let col = x0 as f32 * inv_cw;
+        let width = (x1 - x0) as f32 * inv_cw;
+        let inv_h = 1.0 / ((y1 - y0) as f32);
         let mut cover = 0.0;
         let mut row = y0.div_euclid(ch);
         let last_row = (y1 - 1).div_euclid(ch);
@@ -8830,7 +8844,7 @@ impl PetBrain {
             let r_bot = (row + 1) * ch;
             let bottom = if r_bot < y1 { r_bot } else { y1 };
             if (bottom - top) * 4 >= ch && self.ink_overlaps(col, row as f32, width) {
-                cover += (bottom - top) as f32 / h;
+                cover += (bottom - top) as f32 * inv_h;
             }
             row += 1;
         }
@@ -9267,30 +9281,52 @@ impl PetBrain {
         Some(console.map_or(at.max(now + ARM_MIN), |c| c.min(at.max(now + ARM_MIN))))
     }
 
-    fn mote_edges(&self, soon: &mut Soonest) {
-        let cw = f32::from(self.last_cell_w.max(1));
-        let ch = f32::from(self.last_cell_h.max(1));
-        for m in self.motes.iter().flatten().filter(|m| m.kind.rides_offer()) {
-            let life = m.life.max(0.01);
-            let u0 = m.age(self.clock);
-            if !(0.0..1.0).contains(&u0) {
-                continue;
+    const fn mote_edges(&self, soon: &mut Soonest) {
+        let cw = (if self.last_cell_w > 1 {
+            self.last_cell_w
+        } else {
+            1
+        }) as f32;
+        let ch = (if self.last_cell_h > 1 {
+            self.last_cell_h
+        } else {
+            1
+        }) as f32;
+        let mut i = 0;
+        while i < self.motes.len() {
+            if let Some(m) = self.motes[i]
+                && m.kind.rides_offer()
+            {
+                let life = m.life.max(0.01);
+                let u0 = m.age(self.clock);
+                if u0 >= 0.0 && u0 < 1.0 {
+                    let inv_life = 1.0 / life;
+                    let remain = (1.0 - u0) * life;
+                    soon.at(remain);
+                    let steps = m.look_steps();
+                    soon.at(((look_slice(u0, steps) + 1.0) / steps - u0) * life);
+                    let horizon = match soon.0 {
+                        Some(s) if s < remain => s,
+                        _ => remain,
+                    };
+                    let (sx, sy) = m.drift_slope();
+                    let slope = (sx * inv_life * cw, sy * inv_life * ch);
+                    let step = first_px_step(
+                        (cw, ch),
+                        horizon,
+                        slope,
+                        PxStepSampler::Mote { m, u0, life },
+                    );
+                    if let Some(t) = step {
+                        soon.at(t);
+                    }
+                }
             }
-            let remain = (1.0 - u0) * life;
-            soon.at(remain);
-            let steps = m.look_steps();
-            soon.at(((look_slice(u0, steps) + 1.0) / steps - u0) * life);
-            let horizon = soon.0.map_or(remain, |s| s.min(remain));
-            let (sx, sy) = m.drift_slope();
-            let slope = (sx / life * cw, sy / life * ch);
-            let step = first_px_step((cw, ch), horizon, slope, |t| m.drift(u0 + t / life));
-            if let Some(t) = step {
-                soon.at(t);
-            }
+            i += 1;
         }
     }
 
-    fn next_change_secs(&self) -> Option<f32> {
+    const fn next_change_secs(&self) -> Option<f32> {
         if self.alpha < 1.0 || self.last_caret.is_none() {
             return None;
         }
@@ -9304,11 +9340,11 @@ impl PetBrain {
         if self.vigil
             && self.vigil_armed
             && self.exec_since.is_some()
-            && self.action == PetAction::Crouch
+            && matches!(self.action, PetAction::Crouch)
         {
             return soon.0;
         }
-        if self.hiding && self.action == PetAction::Crouch {
+        if self.hiding && matches!(self.action, PetAction::Crouch) {
             soon.at(self.hide_t);
             return soon.0;
         }
@@ -9321,50 +9357,61 @@ impl PetBrain {
         if self.last_reduced {
             // Reduced motion draws one still per pose; the only edge left is
             // the ladder's sleep (the reduced arm of `tick` verdicts it).
-            if self.action != PetAction::Sleep {
+            if !matches!(self.action, PetAction::Sleep) {
                 soon.at(SLEEP_AFTER - q);
             }
             return soon.0;
         }
-        if self.action == PetAction::Sleep && q >= SLEEP_AFTER + BREATH_WINDOW {
+        if matches!(self.action, PetAction::Sleep) && q >= SLEEP_AFTER + BREATH_WINDOW {
             // Deep sleep: byte-stable until an input, by law.
             return soon.0;
         }
-        let h = (ART_ROWS * f32::from(self.last_cell_h.max(1))).round();
+        let ch1 = if self.last_cell_h > 1 {
+            self.last_cell_h
+        } else {
+            1
+        };
+        let h = (ART_ROWS * (ch1 as f32)).round();
         let w = (h * ART_ASPECT).round();
         let c0 = self.clock;
         if q < SETTLE_TURN {
             soon.at(SETTLE_TURN - q);
         }
         if self.gaze_dwell > 0.0 {
-            let dwell = if self.action == PetAction::Sleep {
+            let dwell = if matches!(self.action, PetAction::Sleep) {
                 SLEEP_FLIP_DWELL
             } else {
                 SETTLE_FLIP_DWELL
             };
             soon.at(dwell - self.gaze_dwell);
         }
-        if self.action == PetAction::Sleep {
+        if matches!(self.action, PetAction::Sleep) {
             soon.at(SLEEP_AFTER + BREATH_WINDOW - q);
-            let half = f64::from(BREATH_PERIOD) / 2.0;
-            soon.at((half - c0 % half) as f32);
-            let zee = ((q - SLEEP_AFTER) / ZEE_EVERY).floor().max(0.0) + 1.0;
+            const HALF_BREATH_PERIOD: f64 = (BREATH_PERIOD as f64) * 0.5;
+            soon.at((HALF_BREATH_PERIOD - c0 % HALF_BREATH_PERIOD) as f32);
+            let zee = ((q - SLEEP_AFTER) * (1.0 / ZEE_EVERY)).floor().max(0.0) + 1.0;
             let zee_q = SLEEP_AFTER + zee * ZEE_EVERY;
             if zee_q <= SLEEP_AFTER + BREATH_WINDOW - ZEE_LIFE {
                 soon.at(zee_q - q);
             }
-            let horizon = soon.0.unwrap_or(BREATH_WINDOW);
+            let horizon = match soon.0 {
+                Some(s) => s,
+                None => BREATH_WINDOW,
+            };
             let breath = TAU / BREATH_PERIOD * BREATH_DEPTH;
-            let step = first_px_step((w, h), horizon, (0.5 * breath * w, breath * h), |t| {
-                let s = Self::breath_sample(c0 + f64::from(t));
-                (1.0 - s * BREATH_DEPTH * 0.5, 1.0 + s * BREATH_DEPTH)
-            });
+            let step = first_px_step(
+                (w, h),
+                horizon,
+                (0.5 * breath * w, breath * h),
+                PxStepSampler::Sleep { c0 },
+            );
             if let Some(t) = step {
                 soon.at(t);
             }
             return soon.0;
         }
-        let seat_held = self.trick_settle.is_some() && self.trick_settle != Some(Trick::Sleep);
+        let seat_held =
+            self.trick_settle.is_some() && !matches!(self.trick_settle, Some(Trick::Sleep));
         if seat_held {
             soon.at(self.hold_end_q - q);
         }
@@ -9372,11 +9419,11 @@ impl PetBrain {
             soon.at(SLEEP_AFTER - q);
         }
         let tell = self.purring();
-        if tell && self.action != PetAction::Purr {
-            soon.at((self.content - PURR_GATE) / CONTENT_DECAY);
+        if tell && !matches!(self.action, PetAction::Purr) {
+            soon.at((self.content - PURR_GATE) * (1.0 / CONTENT_DECAY));
         }
         if tell {
-            let beat = ((q - SIT_AFTER).max(0.0) / PURR_MOTE_EVERY).floor() + 1.0;
+            let beat = ((q - SIT_AFTER).max(0.0) * (1.0 / PURR_MOTE_EVERY)).floor() + 1.0;
             soon.at(SIT_AFTER + beat * PURR_MOTE_EVERY - q);
         }
         if self.content >= PLAY_CONTENT && !self.room_lease && !self.room_hold {
@@ -9418,7 +9465,7 @@ impl PetBrain {
                 } else {
                     let slope = (0.03 * w / SIT_FOLD, 0.05 * h / SIT_FOLD);
                     let step =
-                        first_px_step((w, h), SIT_AFTER - q, slope, |t| Self::stand_scale(q + t));
+                        first_px_step((w, h), SIT_AFTER - q, slope, PxStepSampler::Stand { q });
                     if let Some(t) = step {
                         soon.at(t);
                     }
@@ -9444,14 +9491,16 @@ impl PetBrain {
                         (0.0, 0.0)
                     };
                     let horizon = if tell {
-                        soon.0.unwrap_or(SLEEP_AFTER)
+                        match soon.0 {
+                            Some(s) => s,
+                            None => SLEEP_AFTER,
+                        }
                     } else {
                         SIT_FOLD - since + PX_MARCH_MIN
                     };
                     let slope = (fx + swell_slope.0, fy + swell_slope.1);
-                    let step = first_px_step((w, h), horizon, slope, |t| {
-                        Self::seat_scale(q + t, c0 + f64::from(t), tell)
-                    });
+                    let step =
+                        first_px_step((w, h), horizon, slope, PxStepSampler::Seat { q, c0, tell });
                     if let Some(t) = step {
                         soon.at(t);
                     }
@@ -9469,15 +9518,18 @@ impl PetBrain {
             PetAction::Loaf => {
                 let loaf_after = self.loaf_after();
                 let since = (q - loaf_after).max(0.0);
-                let beat = (since / FLICK_EVERY).floor();
+                let beat = (since * (1.0 / FLICK_EVERY)).floor();
                 let phase = since - beat * FLICK_EVERY;
                 soon.at(loaf_after + (beat + 1.0).max(1.0) * FLICK_EVERY - q);
-                for k in [beat, beat + 1.0] {
+                let mut bi = 0;
+                while bi < 2 {
+                    let k = beat + (bi as f32);
                     if k >= 1.0 && self.beat_deal(k as i64, 3) == 1 {
                         let open = loaf_after + k * FLICK_EVERY;
                         soon.at(open - q);
                         soon.at(open + LOAF_PEEK_DUR - q);
                     }
+                    bi += 1;
                 }
                 let melt_live = since < SIT_FOLD;
                 let thump_live = beat >= 1.0 && phase < FLICK_DUR;
@@ -9493,16 +9545,27 @@ impl PetBrain {
                         0.0
                     };
                     let horizon = if tell {
-                        soon.0.unwrap_or(SLEEP_AFTER)
+                        match soon.0 {
+                            Some(s) => s,
+                            None => SLEEP_AFTER,
+                        }
                     } else {
                         let melt_end = if melt_live { SIT_FOLD - since } else { 0.0 };
                         let thump_end = if thump_live { FLICK_DUR - phase } else { 0.0 };
                         melt_end.max(thump_end) + PX_MARCH_MIN
                     };
                     let slope = (mx + swell_slope.0, my + ty + swell_slope.1);
-                    let step = first_px_step((w, h), horizon, slope, |t| {
-                        self.loaf_scale(q + t, c0 + f64::from(t), tell)
-                    });
+                    let step = first_px_step(
+                        (w, h),
+                        horizon,
+                        slope,
+                        PxStepSampler::Loaf {
+                            brain: self,
+                            q,
+                            c0,
+                            tell,
+                        },
+                    );
                     if let Some(t) = step {
                         soon.at(t);
                     }
@@ -9511,11 +9574,17 @@ impl PetBrain {
             PetAction::Purr => {
                 let owed =
                     CONTENT_DECAY * (q - SIT_AFTER).clamp(0.0, self.loaf_after() - SIT_AFTER);
-                soon.at((self.content + owed - PURR_GATE) / CONTENT_DECAY);
-                let horizon = soon.0.unwrap_or(SLEEP_AFTER);
-                let step = first_px_step((w, h), horizon, swell_slope, |t| {
-                    Self::seat_scale(q + t, c0 + f64::from(t), tell)
-                });
+                soon.at((self.content + owed - PURR_GATE) * (1.0 / CONTENT_DECAY));
+                let horizon = match soon.0 {
+                    Some(s) => s,
+                    None => SLEEP_AFTER,
+                };
+                let step = first_px_step(
+                    (w, h),
+                    horizon,
+                    swell_slope,
+                    PxStepSampler::Seat { q, c0, tell },
+                );
                 if let Some(t) = step {
                     soon.at(t);
                 }
@@ -9538,62 +9607,77 @@ impl PetBrain {
         }
     }
 
-    fn sit_beat_edges(&self, soon: &mut Soonest) {
+    const fn sit_beat_edges(&self, soon: &mut Soonest) {
         let since = self.quiet - SIT_AFTER;
         let (period, at) = self.tail_clock();
         let swing_fits = !self.sit_front || self.look_dur() >= 7.0 * TAIL_SWING;
-        Self::offer_beats(soon, since, period, at, |beat| {
-            self.sit_tail_edges(beat, swing_fits)
-        });
-        let blink_period = BLINK_PERIOD + BLINK_PERIOD_STEP * f32::from((self.settle_seed / 2) % 3);
-        Self::offer_beats(soon, since, blink_period, BLINK_AT, |beat| {
-            if self.beat_deal(beat, 3) == 2 {
+        let tail_beat = if since < 0.0 {
+            0
+        } else {
+            (since / period).floor() as i64
+        };
+        let mut bi = 0;
+        while bi < 2 {
+            let b = tail_beat + bi;
+            let open = b as f32 * period + at;
+            Self::offer_edge_slice(soon, since, open, self.sit_tail_edges(b, swing_fits));
+            bi += 1;
+        }
+        let blink_period = BLINK_PERIOD + BLINK_PERIOD_STEP * (((self.settle_seed / 2) % 3) as f32);
+        let blink_beat = if since < 0.0 {
+            0
+        } else {
+            (since / blink_period).floor() as i64
+        };
+        let mut bi = 0;
+        while bi < 2 {
+            let b = blink_beat + bi;
+            let open = b as f32 * blink_period + BLINK_AT;
+            let edges: &[f32] = if self.beat_deal(b, 3) == 2 {
                 &BLINK_EDGES_TWO
             } else {
                 &BLINK_EDGES_ONE
-            }
-        });
+            };
+            Self::offer_edge_slice(soon, since, open, edges);
+            bi += 1;
+        }
         if self.sit_front {
             let look: &[f32] = if self.look_dur() >= LOOK_DUR_LONG {
                 &GLANCE_EDGES_LONG
             } else {
                 &GLANCE_EDGES_SHORT
             };
-            Self::offer_beats(soon, since, self.glance_period(), GLANCE_AT, |beat| {
-                if self.beat_deal(beat, 3) == 0 {
-                    &[]
-                } else {
-                    look
+            let glance_period = self.glance_period();
+            let glance_beat = if since < 0.0 {
+                0
+            } else {
+                (since / glance_period).floor() as i64
+            };
+            let mut bi = 0;
+            while bi < 2 {
+                let b = glance_beat + bi;
+                if self.beat_deal(b, 3) != 0 {
+                    let open = b as f32 * glance_period + GLANCE_AT;
+                    Self::offer_edge_slice(soon, since, open, look);
                 }
-            });
+                bi += 1;
+            }
         }
     }
 
     #[inline]
-    fn offer_beats<'a>(
-        soon: &mut Soonest,
-        since: f32,
-        period: f32,
-        at: f32,
-        edges: impl Fn(i64) -> &'a [f32],
-    ) {
-        let beat = if since < 0.0 {
-            0
-        } else {
-            (since / period).floor() as i64
-        };
-        for b in [beat, beat + 1] {
-            let open = b as f32 * period + at;
-            for &edge in edges(b) {
-                soon.at(open + edge - since);
-            }
+    const fn offer_edge_slice(soon: &mut Soonest, since: f32, open: f32, edges: &[f32]) {
+        let mut i = 0;
+        while i < edges.len() {
+            soon.at(open + edges[i] - since);
+            i += 1;
         }
     }
 
     #[inline]
     const fn breath_sample(clock: f64) -> f32 {
         let t = (clock % (BREATH_PERIOD as f64)) as f32;
-        crate::supernova::sin_cos_f32(TAU * t / BREATH_PERIOD).0
+        crate::supernova::sin_cos_f32((TAU / BREATH_PERIOD) * t).0
     }
 
     #[inline]
@@ -9604,13 +9688,13 @@ impl PetBrain {
 
     #[inline]
     const fn stand_scale(quiet: f32) -> (f32, f32) {
-        let pre = ((quiet - (SIT_AFTER - SIT_FOLD)) / SIT_FOLD).clamp(0.0, 1.0);
+        let pre = ((quiet - (SIT_AFTER - SIT_FOLD)) * (1.0 / SIT_FOLD)).clamp(0.0, 1.0);
         (1.0 + 0.03 * pre, 1.0 - 0.05 * pre)
     }
 
     #[inline]
     const fn seat_scale(quiet: f32, clock: f64, tell: bool) -> (f32, f32) {
-        let fold = (1.0 - (quiet - SIT_AFTER) / SIT_FOLD).clamp(0.0, 1.0);
+        let fold = (1.0 - (quiet - SIT_AFTER) * (1.0 / SIT_FOLD)).clamp(0.0, 1.0);
         let mut scale_x = 1.0 + 0.03 * fold;
         let mut scale_y = 1.0 - 0.05 * fold;
         if tell {
@@ -9634,15 +9718,15 @@ impl PetBrain {
         tell: bool,
     ) -> ((f32, f32), f32, f32) {
         let loaf_after = self.loaf_after();
-        let fold = (1.0 - (quiet - loaf_after) / SIT_FOLD).clamp(0.0, 1.0);
+        let fold = (1.0 - (quiet - loaf_after) * (1.0 / SIT_FOLD)).clamp(0.0, 1.0);
         let mut scale_y = 1.0 + 0.05 * fold;
         let mut scale_x = 1.0 - 0.02 * fold;
         let since = (quiet - loaf_after).max(0.0);
-        let beat = (since / FLICK_EVERY).floor();
+        let beat = (since * (1.0 / FLICK_EVERY)).floor();
         let phase = since - beat * FLICK_EVERY;
         if beat >= 1.0 && phase < FLICK_DUR {
             let amp = TWITCH_BOB
-                * crate::supernova::sin_cos_f32(core::f32::consts::PI * phase / FLICK_DUR).0;
+                * crate::supernova::sin_cos_f32((core::f32::consts::PI / FLICK_DUR) * phase).0;
             let dir = if (beat as i64) % 2 == 0 { 1.0 } else { -1.0 };
             scale_y += amp * dir;
         }
@@ -9678,38 +9762,81 @@ impl Soonest {
     }
 }
 
-fn first_px_step(
+enum PxStepSampler<'a> {
+    Mote {
+        m: Mote,
+        u0: f32,
+        life: f32,
+    },
+    Sleep {
+        c0: f64,
+    },
+    Stand {
+        q: f32,
+    },
+    Seat {
+        q: f32,
+        c0: f64,
+        tell: bool,
+    },
+    Loaf {
+        brain: &'a PetBrain,
+        q: f32,
+        c0: f64,
+        tell: bool,
+    },
+}
+
+impl PxStepSampler<'_> {
+    #[inline]
+    const fn at(&self, t: f32) -> (f32, f32) {
+        match *self {
+            Self::Mote { m, u0, life } => m.drift(u0 + t / life),
+            Self::Sleep { c0 } => {
+                let s = PetBrain::breath_sample(c0 + (t as f64));
+                (1.0 - s * BREATH_DEPTH * 0.5, 1.0 + s * BREATH_DEPTH)
+            }
+            Self::Stand { q } => PetBrain::stand_scale(q + t),
+            Self::Seat { q, c0, tell } => PetBrain::seat_scale(q + t, c0 + (t as f64), tell),
+            Self::Loaf { brain, q, c0, tell } => brain.loaf_scale(q + t, c0 + (t as f64), tell),
+        }
+    }
+}
+
+const fn first_px_step(
     box_px: (f32, f32),
     horizon: f32,
     slope: (f32, f32),
-    scale_at: impl Fn(f32) -> (f32, f32),
+    sampler: PxStepSampler<'_>,
 ) -> Option<f32> {
     if horizon <= 0.0 || (slope.0 <= 0.0 && slope.1 <= 0.0) {
         return None;
     }
     let (w, h) = box_px;
-    let key = |t: f32| {
-        let (sx, sy) = scale_at(t);
-        ((sx * w).round(), (sy * h).round())
-    };
-    let (sx0, sy0) = scale_at(0.0);
+    let inv_slope_x = if slope.0 > 0.0 { 1.0 / slope.0 } else { 0.0 };
+    let inv_slope_y = if slope.1 > 0.0 { 1.0 / slope.1 } else { 0.0 };
+    let (sx0, sy0) = sampler.at(0.0);
     let (mut vx, mut vy) = (sx0 * w, sy0 * h);
     let rest = (vx.round(), vy.round());
     let mut prev = 0.0f32;
     let mut t = 0.0f32;
-    for i in 0..PX_MARCH_MAX {
+    let mut i = 0u32;
+    while i < PX_MARCH_MAX {
         if i > 0 {
-            let (sx, sy) = scale_at(t);
+            let (sx, sy) = sampler.at(t);
             (vx, vy) = (sx * w, sy * h);
-            if (vx.round(), vy.round()) != rest {
+            if vx.round() != rest.0 || vy.round() != rest.1 {
                 let (mut lo, mut hi) = (prev, t);
-                for _ in 0..PX_BISECT {
+                let mut b = 0u32;
+                while b < PX_BISECT {
                     let mid = 0.5 * (lo + hi);
-                    if key(mid) == rest {
+                    let (msx, msy) = sampler.at(mid);
+                    if (msx * w).round() == rest.0 && (msy * h).round() == rest.1 {
                         lo = mid;
                     } else {
                         hi = mid;
                     }
+                    b += 1;
                 }
                 return Some(hi);
             }
@@ -9717,16 +9844,20 @@ fn first_px_step(
         if t >= horizon {
             return None;
         }
-        let stride = |v: f32, k: f32, slope: f32| {
-            if slope > 0.0 {
-                (0.5 - (v - k).abs()).max(0.0) / slope
-            } else {
-                f32::INFINITY
-            }
+        let step_x = if inv_slope_x > 0.0 {
+            (0.5 - (vx - rest.0).abs()).max(0.0) * inv_slope_x
+        } else {
+            f32::INFINITY
         };
-        let step = stride(vx, rest.0, slope.0).min(stride(vy, rest.1, slope.1));
+        let step_y = if inv_slope_y > 0.0 {
+            (0.5 - (vy - rest.1).abs()).max(0.0) * inv_slope_y
+        } else {
+            f32::INFINITY
+        };
+        let step = step_x.min(step_y);
         prev = t;
         t = (t + step.max(PX_MARCH_MIN)).min(horizon);
+        i += 1;
     }
     Some(t)
 }

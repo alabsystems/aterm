@@ -269,8 +269,9 @@ pub(crate) struct Board {
     /// last read elected it (`crate::harness_host`'s ask).
     pub(crate) asks: BTreeMap<String, AskOwed>,
     /// Why a session of this process may not be asked to free space (`sid -> why`: its task
-    /// finished or landed, or it has none), as its worker read at its last turn break: the ask
-    /// seats none of these.
+    /// finished or landed, it has none, its Autopilot is Off, or it is the person's own exchange
+    /// or a manager's worker), as its worker read at its last turn break: the ask seats none of
+    /// these.
     pub(crate) unfit: BTreeMap<String, &'static str>,
     /// The next demand's id.
     next_demand: u64,

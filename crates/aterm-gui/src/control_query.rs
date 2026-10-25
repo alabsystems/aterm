@@ -2248,6 +2248,7 @@ const fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::
         glow_under_damage: _, // OMITTED: producer-side dirty-row revision for host-owned flame-body quads, not engine cell content
         fire_patch_damage: _, // OMITTED: producer-side dirty-row revision for host-owned fire patches, not engine cell content
         cursor_fill_override: _, // OMITTED: host-owned rainbow-cursor block fill, not engine cell content
+        bloom_gate: _, // OMITTED: host-owned bloom hold of the cursor effects, not engine cell content
         word_decorations: _, // OMITTED: host-owned sparkle-word decorations, not engine cell content
         ink: _, // OMITTED: host-owned animated-ink fg overrides (render bling), not engine cell content
         char_fg: _, // OMITTED: host-owned EMBERFORGE charred glyph-ink fg overrides (render bling), not engine cell content

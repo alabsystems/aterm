@@ -20,6 +20,11 @@
 //! a hard notch out of the wash over the box's transparent margin. An icon
 //! with no art behind it is cut as its whole visible box.
 //!
+//! Every style's light goes: a fire's tongues and embers stood over the
+//! fox's chin on paper and beside its cheek on dark (looks7 M5), its
+//! flames' field patches cut as the quads are, the field anchored to the
+//! window so a piece keeps its pixels.
+//!
 //! It shades the streams the host draws, not the glow's own: a capture, a
 //! split frame and the web host hand the host the trail's streams before
 //! their word pass runs, so a shade of the glow's buffers reached only the
@@ -70,31 +75,61 @@ impl CursorGlow {
         self.word_icons_unshaded = true;
     }
 
+    /// The word icons the last word pass named, grid pixels `(x0, x1, y0, y1)`
+    /// ([`Self::note_word_icon_sprites`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub const fn word_icon_boxes(&self) -> &[(i32, i32, i32, i32)] {
+        self.word_icons.as_slice()
+    }
+
+    /// Whether a speck centred at window pixel `(x, y)` reaching `reach` px
+    /// touches a word icon the last word pass drew: a fire's ember keeps off
+    /// it whole, as the sky's stars keep off it ([`rk::companion::KeepOut`]),
+    /// where the shade would leave a crescent of it.
+    pub(super) fn near_word_icon(&self, (x, y): (f32, f32), reach: f32) -> bool {
+        let Some((ox, oy, _)) = self.keep_geom else {
+            return false;
+        };
+        let (x, y) = (x - ox as f32, y - oy as f32);
+        self.word_icons.iter().any(|&(x0, x1, y0, y1)| {
+            x + reach >= x0 as f32
+                && x - reach < x1 as f32
+                && y + reach >= y0 as f32
+                && y - reach < y1 as f32
+        })
+    }
+
     /// Lift this frame's light off the word icons the word pass just drew
     /// ([`Self::note_word_icon_sprites`]), in the streams the host draws:
-    /// `over` the over-text quads, `under` the under-text quads and `halos`
-    /// the halos; an icon noted with no art ([`Self::note_word_icons`]) is
-    /// cut as its box. Each word pass's icons shade once. Returns whether
-    /// anything was lifted.
+    /// `over` the over-text quads, `under` the under-text quads, `halos` the
+    /// halos and `patches` a fire's field patches; an icon noted with no art
+    /// ([`Self::note_word_icons`]) is cut as its box. Each word pass's icons
+    /// shade once. Returns whether anything was lifted.
     pub fn shade_word_icons(
         &mut self,
-        (over, under, halos): (&mut Vec<GlowQuad>, &mut Vec<GlowQuad>, &mut Vec<RainHalo>),
+        (over, under, halos, patches): (
+            &mut Vec<GlowQuad>,
+            &mut Vec<GlowQuad>,
+            &mut Vec<RainHalo>,
+            &mut Vec<FirePatch>,
+        ),
     ) -> bool {
-        if !std::mem::take(&mut self.word_icons_unshaded)
-            || !self.v2.engaged()
-            || self.word_icons.is_empty()
-        {
+        if !std::mem::take(&mut self.word_icons_unshaded) || self.word_icons.is_empty() {
             return false;
         }
         let Some((ox, oy, _)) = self.keep_geom else {
             return false;
         };
-        let mut lifted = lift_stars(
-            (self.v2.sky_marks(), self.v2.sky_mark_lights()),
-            &self.word_icons,
-            (ox, oy),
-            (&mut *over, &mut *under, &mut *halos),
-        );
+        let mut lifted = self.v2.engaged()
+            && lift_stars(
+                (self.v2.sky_marks(), self.v2.sky_mark_lights()),
+                &self.word_icons,
+                (ox, oy),
+                (&mut *over, &mut *under, &mut *halos),
+            );
+        let mut patch_pieces = std::mem::take(&mut self.icon_patches);
         let mut bands = std::mem::take(&mut self.icon_scratch);
         let mut pieces = std::mem::take(&mut self.icon_quads);
         let mut halo_pieces = std::mem::take(&mut self.icon_halos);
@@ -108,10 +143,12 @@ impl CursorGlow {
             lifted |= shade_quads(over, &bands, (&mut pieces, &mut cut));
             lifted |= shade_quads(under, &bands, (&mut pieces, &mut cut));
             lifted |= shade_halos(halos, &bands, (&mut halo_pieces, &mut cut));
+            lifted |= shade_patches(patches, &bands, (&mut patch_pieces, &mut cut));
         }
         self.icon_scratch = bands;
         self.icon_quads = pieces;
         self.icon_halos = halo_pieces;
+        self.icon_patches = patch_pieces;
         self.icon_cut = cut;
         lifted
     }
@@ -179,33 +216,65 @@ const fn halo_box(h: &RainHalo) -> PxBox {
     (x, x + h.w as i32, y, y + h.h as i32)
 }
 
+/// The art index the stamp shows at offset `l` of a `dest`-pixel box over
+/// `art` texels, mirrored for `flip`: `⌊l·art/dest⌋` (fx_raster's column
+/// table and row walk, the GPU sprite fragment's `l·w/dw`), mirrored as
+/// texel `art − 1 −` that. Read at the texel centres instead, a scaled
+/// sprite's silhouette sat a texel off what it drew: the companion's paw
+/// and chin, drawn from the art row above the one read, peeked through the
+/// page veil as specks between the letters (looks7 round 2).
+const fn stamp_texel(l: i32, art: i32, dest: i32, flip: bool) -> i32 {
+    let t = l * art / dest;
+    if flip { art - 1 - t } else { t }
+}
+
 /// The icon's drawn rows as bands `(x0, x1, y0, y1)` in window pixels, top
 /// to bottom, rows of one span merged, inside `icon` (its visible box in
 /// window pixels): each row spans its first to its last texel at least
-/// [`ICON_ALPHA_EDGE`] opaque (an Index8 texel: any ink), sampled as the
-/// stamp samples (nearest over the whole art's box, `origin` the grid's in
-/// the window, mirrored for `flip_x`). With no art, the box.
-fn drawn_rows(icon: PxBox, src: Option<&IconSrc>, (ox, oy): (i32, i32), out: &mut Vec<PxBox>) {
+/// [`ICON_ALPHA_EDGE`] opaque (an Index8 texel: any ink), each pixel's the
+/// texel the stamp shows there ([`stamp_texel`] over the whole art's box,
+/// `origin` the grid's in the window). With no art, the box.
+fn drawn_rows(icon: PxBox, src: Option<&IconSrc>, origin: (i32, i32), out: &mut Vec<PxBox>) {
+    drawn_rows_by(icon, src, origin, out, (stamp_texel, ICON_ALPHA_EDGE));
+}
+
+/// [`drawn_rows`], each pixel's texel read by `texel` and counted drawn
+/// from `edge` alpha up.
+fn drawn_rows_by(
+    icon: PxBox,
+    src: Option<&IconSrc>,
+    origin: (i32, i32),
+    out: &mut Vec<PxBox>,
+    (texel, edge): (impl Fn(i32, i32, i32, bool) -> i32, u8),
+) {
+    let borrowed = src.map(|s| (&*s.art, s.dest, s.flip_x));
+    drawn_rows_ref(icon, borrowed, origin, out, (texel, edge));
+}
+
+fn drawn_rows_ref(
+    icon: PxBox,
+    src: Option<(&FxArt, PxBox, bool)>,
+    (ox, oy): (i32, i32),
+    out: &mut Vec<PxBox>,
+    (texel, edge): (impl Fn(i32, i32, i32, bool) -> i32, u8),
+) {
     out.clear();
-    let Some(s) = src.filter(|s| !s.art.is_empty()) else {
+    let Some((art, dest, flip_x)) = src.filter(|(art, _, _)| !art.is_empty()) else {
         out.push(icon);
         return;
     };
-    let (bx0, by0) = (s.dest.0 + ox, s.dest.2 + oy);
-    let (w, h) = (s.dest.1 - s.dest.0, s.dest.3 - s.dest.2);
+    let (bx0, by0) = (dest.0 + ox, dest.2 + oy);
+    let (w, h) = (dest.1 - dest.0, dest.3 - dest.2);
     if w <= 0 || h <= 0 {
         out.push(icon);
         return;
     }
-    let (aw, ah) = (i32::from(s.art.w()), i32::from(s.art.h()));
+    let (aw, ah) = (i32::from(art.w()), i32::from(art.h()));
     let (aw_max, ah_max) = (aw - 1, ah - 1);
-    let (two_w, two_h) = (2 * w, 2 * h);
-    let w_max = w - 1;
-    let flip_x = s.flip_x;
-    let kind = s.art.texels();
+    let kind = art.texels();
     let drawn = |v: u32| match kind {
         FxTexels::Index8 => v != 0,
-        FxTexels::Rgba8Premul | FxTexels::Rgba8Straight => v >> 24 >= u32::from(ICON_ALPHA_EDGE),
+        FxTexels::Rgba8Premul | FxTexels::Rgba8Straight => v >> 24 >= u32::from(edge),
     };
     let (lo, hi) = (icon.0.max(bx0), icon.1.min(bx0 + w));
     let (y_lo, y_hi) = (icon.2.max(by0), icon.3.min(by0 + h));
@@ -215,15 +284,13 @@ fn drawn_rows(icon: PxBox, src: Option<&IconSrc>, (ox, oy): (i32, i32), out: &mu
     let mut prev_sy: Option<(usize, Option<(i32, i32)>)> = None;
     for y in y_lo..y_hi {
         let dy = y - by0;
-        let sy = ((2 * dy + 1) * ah / two_h).min(ah_max) as usize;
+        let sy = texel(dy, ah, h, false).clamp(0, ah_max) as usize;
         let span = match prev_sy {
             Some((ps, span)) if ps == sy => span,
             _ => {
                 let opaque = |x: i32| {
-                    let dx = x - bx0;
-                    let mx = if flip_x { w_max - dx } else { dx };
-                    let sx = ((2 * mx + 1) * aw / two_w).min(aw_max) as usize;
-                    drawn(s.art.texel(sx, sy))
+                    let sx = texel(x - bx0, aw, w, flip_x).clamp(0, aw_max) as usize;
+                    drawn(art.texel(sx, sy))
                 };
                 let span = (lo..hi).find(|&x| opaque(x)).map(|first| {
                     let last = (first + 1..hi).rev().find(|&x| opaque(x)).unwrap_or(first);
@@ -241,6 +308,31 @@ fn drawn_rows(icon: PxBox, src: Option<&IconSrc>, (ox, oy): (i32, i32), out: &mu
             _ => out.push((x0, x1, y, y + 1)),
         }
     }
+}
+
+/// The rows `sprite` (grid pixels, the grid at `origin` in the window) draws
+/// within `clip` (window pixels), each its drawn texels' span, into `out`,
+/// top to bottom: the silhouette the pet's page veil keeps to
+/// ([`CursorGlow::veil_pet_letters`]). Every texel the stamp draws counts,
+/// its anti-aliased edge with it: counted from the icon's half-opaque edge,
+/// a chin's sloping edge (texels a quarter to a half opaque, five pixels
+/// past the row's opaque span) lay outside the veil and lit specks between
+/// the letters (looks7 round 2). An empty art yields `clip` whole.
+pub(super) fn sprite_rows(
+    sprite: &FreeSprite,
+    clip: PxBox,
+    origin: (i32, i32),
+    out: &mut Vec<PxBox>,
+) {
+    let (x, y) = (sprite.x, sprite.y);
+    let dest = (x, x + i32::from(sprite.w), y, y + i32::from(sprite.h));
+    drawn_rows_ref(
+        clip,
+        Some((&sprite.art, dest, sprite.flip_x)),
+        origin,
+        out,
+        (stamp_texel, 1),
+    );
 }
 
 /// The pieces of `rect` outside `bands` (top to bottom, disjoint rows) into
@@ -461,6 +553,49 @@ fn shade_halos(
     any
 }
 
+/// Cut every fire patch of `patches` the icon's drawn rows reach
+/// ([`cut_rect`]); each piece samples the same window-anchored field (its
+/// root, height and phase kept), so what stays lit is unchanged.
+fn shade_patches(
+    patches: &mut Vec<FirePatch>,
+    bands: &[PxBox],
+    (pieces, cut): (&mut Vec<FirePatch>, &mut Vec<PxBox>),
+) -> bool {
+    if patches.is_empty() || bands.is_empty() {
+        return false;
+    }
+    let (bx0, bx1, by0, by1) = bands_bounds(bands);
+    let mut any = false;
+    for (i, p) in patches.iter().enumerate() {
+        let (x, y) = (i32::from(p.x), i32::from(p.y));
+        let b = (x, x + i32::from(p.w), y, y + i32::from(p.h));
+        if b.1 <= bx0 || b.0 >= bx1 || b.3 <= by0 || b.2 >= by1 || !cut_rect(b, bands, cut) {
+            if any {
+                pieces.push(*p);
+            }
+            continue;
+        }
+        if !any {
+            pieces.clear();
+            pieces.extend_from_slice(&patches[..i]);
+            any = true;
+        }
+        for &(xa, xb, ya, yb) in cut.iter() {
+            pieces.push(FirePatch {
+                x: xa as u16,
+                y: ya as u16,
+                w: (xb - xa) as u16,
+                h: (yb - ya) as u16,
+                ..*p
+            });
+        }
+    }
+    if any {
+        std::mem::swap(patches, pieces);
+    }
+    any
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +731,146 @@ mod tests {
         assert!(
             whole.iter().map(|b| b.3).max() > bands.iter().map(|b| b.3).max(),
             "control: shown whole, the face's lower rows are drawn too"
+        );
+    }
+
+    /// The pixels a sprite's stamp draws, `(x, y)` in window pixels (the
+    /// grid at the window's origin): the CPU engine's own spans, read
+    /// through its bloom source ([`aterm_render::fx_bloom_quads`]).
+    fn stamped(sprite: &FreeSprite) -> std::collections::HashSet<(i32, i32)> {
+        let mut layers = Vec::new();
+        aterm_render::sprites::SpriteLayers::new(7)
+            .publish(std::slice::from_ref(sprite), &mut layers);
+        for l in &mut layers {
+            l.bloom = true;
+        }
+        let f = aterm_render::FxFrame {
+            w: 256,
+            h: 256,
+            pad: 0,
+            grid_top: 0,
+            cell_h: 16,
+            rows: 16,
+        };
+        let mut quads = Vec::new();
+        aterm_render::fx_bloom_quads(
+            &f,
+            &layers,
+            &[],
+            &mut aterm_render::FxSlicer::default(),
+            &mut aterm_render::SpriteCols::default(),
+            &mut quads,
+        );
+        let mut px = std::collections::HashSet::new();
+        for q in quads.iter().filter(|q| q.alpha > 0) {
+            let (x, y) = (i32::from(q.x), i32::from(q.y));
+            for yy in y..y + i32::from(q.h) {
+                for xx in x..x + i32::from(q.w) {
+                    px.insert((xx, yy));
+                }
+            }
+        }
+        px
+    }
+
+    /// A SCALED SPRITE'S DRAWN ROWS ARE THE PIXELS ITS STAMP DRAWS (looks7
+    /// round 2): the companion's art drawn at half its size, the page veil
+    /// keeps to these rows, and read a texel off them, or from the icon's
+    /// half-opaque edge, it missed the paw and the chin's anti-aliased edge
+    /// the stamp drew (specks between the letters on Solarized Dark). Over
+    /// arts scaled down, up and unevenly, plain and mirrored, with
+    /// translucent texels among the opaque, every pixel the CPU engine
+    /// stamps lies in a drawn row, and every row's span starts and ends on a
+    /// stamped pixel. Negative controls: read at the texel centres, or
+    /// counted from the icon's edge, a stamped pixel lies outside the rows.
+    #[test]
+    fn a_scaled_sprite_s_drawn_rows_are_the_pixels_its_stamp_draws() {
+        use aterm_core::render::PxRect;
+        use aterm_render::sprites::FreeZ;
+        // A speckled art: about a third of its texels opaque, the rest clear.
+        let art = |w: u16, h: u16| {
+            let mut rgba = vec![0u8; usize::from(w) * usize::from(h) * 4];
+            let mut seed = 0x9E37_79B9u32;
+            for t in rgba.as_chunks_mut::<4>().0 {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if seed >> 30 == 0 || (seed >> 28) & 3 == 1 {
+                    *t = [0xE0, 0xD8, 0xC8, 0xFF];
+                } else if (seed >> 26) & 7 == 5 {
+                    *t = [0xE0, 0xD8, 0xC8, 0x40];
+                }
+            }
+            Arc::new(FxArt::new(w, h, FxTexels::Rgba8Straight, rgba).expect("an art"))
+        };
+        let centred = |l: i32, a: i32, d: i32, flip: bool| {
+            let m = if flip { d - 1 - l } else { l };
+            (2 * m + 1) * a / (2 * d)
+        };
+        let (mut missed_centred, mut missed_edge) = (0usize, 0usize);
+        for (aw, ah, dw, dh) in [
+            (40, 20, 20, 10),
+            (34, 26, 21, 13),
+            (12, 10, 30, 23),
+            (9, 7, 9, 7),
+        ] {
+            for flip_x in [false, true] {
+                let sprite = FreeSprite {
+                    x: 17,
+                    y: 11,
+                    w: dw,
+                    h: dh,
+                    art: art(aw, ah),
+                    clip: PxRect::EVERYWHERE,
+                    tint: 0x00FF_FFFF,
+                    alpha: 255,
+                    flip_x,
+                    z: FreeZ::UnderText,
+                };
+                let drawn = stamped(&sprite);
+                assert!(!drawn.is_empty(), "{aw}x{ah} at {dw}x{dh}: the stamp draws");
+                let clip = (0, 256, 0, 256);
+                let mut bands = Vec::new();
+                sprite_rows(&sprite, clip, (0, 0), &mut bands);
+                let held = lit(&bands);
+                for &px in &drawn {
+                    assert!(
+                        held.contains_key(&px),
+                        "{aw}x{ah} at {dw}x{dh}, flip {flip_x}: stamped {px:?} lies in no drawn row: {bands:?}"
+                    );
+                }
+                for &(x0, x1, y0, y1) in &bands {
+                    for y in y0..y1 {
+                        assert!(
+                            drawn.contains(&(x0, y)) && drawn.contains(&(x1 - 1, y)),
+                            "{aw}x{ah} at {dw}x{dh}, flip {flip_x}: row {y} spans {x0}..{x1} past what the stamp drew"
+                        );
+                    }
+                }
+                let src = IconSrc {
+                    art: Arc::clone(&sprite.art),
+                    dest: (17, 17 + i32::from(dw), 11, 11 + i32::from(dh)),
+                    flip_x,
+                };
+                drawn_rows_by(clip, Some(&src), (0, 0), &mut bands, (centred, 1));
+                let held = lit(&bands);
+                missed_centred += drawn.iter().filter(|px| !held.contains_key(px)).count();
+                drawn_rows_by(
+                    clip,
+                    Some(&src),
+                    (0, 0),
+                    &mut bands,
+                    (stamp_texel, ICON_ALPHA_EDGE),
+                );
+                let held = lit(&bands);
+                missed_edge += drawn.iter().filter(|px| !held.contains_key(px)).count();
+            }
+        }
+        assert!(
+            missed_centred > 0,
+            "control: read at the texel centres, a stamped pixel lies outside the rows"
+        );
+        assert!(
+            missed_edge > 0,
+            "control: counted from the icon's edge, a stamped pixel lies outside the rows"
         );
     }
 

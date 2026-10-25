@@ -195,12 +195,12 @@ fn at(rows: &[(String, String)], label: &str) -> Option<usize> {
     rows.iter().position(|(l, _)| l == label)
 }
 
-/// THE LANDED ROW STANDS WITH THE LAND PROMPTS (§12.4.6): `Landed  1 today ·
-/// 3 in 7 days` right over `Land prompts`, counted from the reading's
-/// landings ([`HarnessStats::landed`], never its prompts), wherever the
-/// week had a land prompt or a landing — so it stands at `0` while a Land
-/// is still landing, and a landing moves a count, never a row — the
-/// week's, so a day with none yet keeps it.
+/// THE LANDED ROW STANDS WITH THE LAND PROMPTS (§12.4.6, §14.6): `Landed  1
+/// today · 3 in 7 days` right over `Land prompts`, counted from the
+/// reading's landings ([`HarnessStats::landed`], never its prompts),
+/// wherever the week had a landing — the week's, so a day with none yet
+/// keeps it. A week with prompts and no landing yet names `landed` in
+/// `None in 7 days` (§14.6), as every count whose week is 0 is named.
 #[test]
 fn the_landed_row_stands_with_the_land_prompts() {
     let mut today = HarnessStats::new(0);
@@ -228,13 +228,18 @@ fn the_landed_row_stands_with_the_land_prompts() {
         at(&rows, LAND_PROMPTS.label),
         "right over the prompts: {rows:?}"
     );
+    let none_names_landed = |rows: &[(String, String)]| {
+        super::counts::none_named(rows)
+            .iter()
+            .any(|w| w == LANDED.many)
+    };
+    assert!(!none_names_landed(&rows), "a week that landed: {rows:?}");
     let (mut prompts_today, mut prompts_week) = (today.clone(), week.clone());
     prompts_today.landed = 0;
     prompts_week.landed = 0;
-    assert_eq!(
-        words_of(&did(&read(&prompts_today, &prompts_week)), LANDED.label).as_deref(),
-        Some("0 today \u{b7} 0 in 7 days")
-    );
+    let rows = did(&read(&prompts_today, &prompts_week));
+    assert_eq!(at(&rows, LANDED.label), None, "{rows:?}");
+    assert!(none_names_landed(&rows), "{rows:?}");
     let (mut landed_today, mut landed_week) = (today.clone(), week.clone());
     landed_today.land_prompts = 0;
     landed_week.land_prompts = 0;
@@ -247,10 +252,9 @@ fn the_landed_row_stands_with_the_land_prompts() {
         words_of(&did(&read(&quiet_day, &week)), LANDED.label).as_deref(),
         Some("0 today \u{b7} 3 in 7 days")
     );
-    assert_eq!(
-        words_of(&did(&read(&quiet_day, &prompts_week)), LANDED.label).as_deref(),
-        Some("0 today \u{b7} 0 in 7 days")
-    );
+    let rows = did(&read(&quiet_day, &prompts_week));
+    assert_eq!(at(&rows, LANDED.label), None, "{rows:?}");
+    assert!(none_names_landed(&rows), "{rows:?}");
     let (mut none_today, mut none_week) = (today, week);
     none_today.land_prompts = 0;
     none_today.landed = 0;
@@ -258,14 +262,14 @@ fn the_landed_row_stands_with_the_land_prompts() {
     none_week.landed = 0;
     let rows = did(&read(&none_today, &none_week));
     assert_eq!(at(&rows, LANDED.label), None, "{rows:?}");
-    assert!(at(&rows, LAND_PROMPTS.label).is_some(), "{rows:?}");
+    assert!(none_names_landed(&rows), "{rows:?}");
 }
 
-/// THE DONE-CHECK ROW STANDS UNDER KEPT GOING (§12.4.6): `of them  a done
-/// claim checked 4 today · 12 in 7 days`, both windows, right under `Kept
-/// going` and labelled as a part of it, read from the reading's acts by
-/// rule — Cruise's done check, and the challenges older builds typed at a
-/// done report instead, which the week still reads — never an ordinary
+/// THE DONE-CHECK ROW STANDS UNDER KEPT GOING (§12.4.6, §14.6): `past
+/// “done”  4 today · 12 in 7 days`, both windows, right under `Kept going`
+/// and labelled as a part of it, read from the reading's acts by rule —
+/// Cruise's done check, and the challenges older builds typed at a done
+/// report instead, which the week still reads — never an ordinary
 /// continuation.
 #[test]
 fn the_done_check_row_stands_under_kept_going() {
@@ -292,7 +296,7 @@ fn the_done_check_row_stands_under_kept_going() {
     let rows = did(&read(&today, &week));
     assert_eq!(
         words_of(&rows, DONE_CHECKED_OF_KEPT_GOING).as_deref(),
-        Some("a done claim checked 4 today \u{b7} 12 in 7 days")
+        Some("4 today \u{b7} 12 in 7 days")
     );
     assert_eq!(
         at(&rows, DONE_CHECKED_OF_KEPT_GOING),
@@ -311,13 +315,13 @@ fn the_done_check_row_stands_under_kept_going() {
     rule(&mut week, RULE_UNCOMMITTED, 1);
     assert_eq!(
         words_of(&did(&read(&today, &week)), DONE_CHECKED_OF_KEPT_GOING).as_deref(),
-        Some("a done claim checked 4 today \u{b7} 15 in 7 days")
+        Some("4 today \u{b7} 15 in 7 days")
     );
     let mut quiet_today = today.clone();
     quiet_today.by_rule.remove(RULE_DONE_CHECK);
     assert_eq!(
         words_of(&did(&read(&quiet_today, &week)), DONE_CHECKED_OF_KEPT_GOING).as_deref(),
-        Some("a done claim checked 0 today \u{b7} 15 in 7 days")
+        Some("0 today \u{b7} 15 in 7 days")
     );
     let mut plain = week.clone();
     for gone in [RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED] {
@@ -325,10 +329,6 @@ fn the_done_check_row_stands_under_kept_going() {
     }
     let rows = did(&read(&quiet_today, &plain));
     assert_eq!(at(&rows, DONE_CHECKED_OF_KEPT_GOING), None, "{rows:?}");
-    assert!(
-        rows.iter().all(|(_, w)| !w.contains(DONE_CLAIM_CHECKED)),
-        "{rows:?}"
-    );
 }
 
 /// A day's line's parts, in its order (` · `-separated).
@@ -366,7 +366,10 @@ fn the_today_line_leads_with_landings() {
         ..tally.clone()
     };
     let line = day_line(&needed, Some(0)).expect("a day");
-    assert!(parts(&line)[0].starts_with("today: needed you"), "{line}");
+    assert!(
+        parts(&line)[0].starts_with(&format!("today: {}", NEEDED_YOU.one)),
+        "{line}"
+    );
     assert_eq!(parts(&line)[1], "1 landed", "{line}");
     let mut shares = HarnessStats::per_session(0);
     shares.landed = 1;

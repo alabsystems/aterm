@@ -985,9 +985,11 @@ fn rainbow_decays_to_empty_when_idle() {
     let mut out = Vec::new();
     glow.tick(Some((2, 2)), t, &c, g, &mut out);
     glow.note_synthetic_move(t);
-    glow.tick(Some((2, 8)), t, &c, g, &mut out);
+    // A jump's meteor: a short hop's mini-fan stands on the caret's cell,
+    // which no dark star stands on (looks7 M3).
+    glow.tick(Some((2, 20)), t, &c, g, &mut out);
     assert!(!out.is_empty(), "ribbon present right after a move");
-    let fp = glow.tick(Some((2, 8)), t + Duration::from_secs(2), &c, g, &mut out);
+    let fp = glow.tick(Some((2, 20)), t + Duration::from_secs(2), &c, g, &mut out);
     assert!(out.is_empty(), "ribbon fully decayed when idle");
     assert_eq!(
         fp, 0,
@@ -1017,8 +1019,9 @@ fn a_dim_theme_s_letters_read_over_the_pet_through_a_page_veil() {
         glow.observe_frame_text(Some(caret), &cells, now);
         // The body over columns 2..12 of row 3 and the row above.
         glow.note_pet_body(Some((16, 96, 24, 64)));
-        glow.veil_letters_on_pet(Some(caret), g);
-        std::mem::take(&mut glow.under_out)
+        let mut out = Vec::new();
+        glow.veil_letters_on_pet(&mut out, Some(caret), g, None);
+        out
     };
     let veil_of = |fg: [u8; 3], page: [u8; 3], on: bool| veil_at(fg, page, on, (3, 20));
     let rgb = |c: [u8; 3]| (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
@@ -1078,9 +1081,10 @@ fn a_dim_theme_s_letters_read_over_the_pet_through_a_page_veil() {
             x0 >= 16 - 3 && x1 <= 96 + 3,
             "the veil keeps to the body's box ({x0}..{x1})"
         );
+        let rise = (g.ch as f32 * 0.25).round() as i32;
         assert!(
-            i32::from(q.y) >= 48 && i32::from(q.y + q.h) <= 64,
-            "the veil keeps to the letters' row"
+            i32::from(q.y) >= 48 - rise && i32::from(q.y + q.h) <= 64 + rise,
+            "the veil keeps to the letters' row and its rise"
         );
     }
     assert!(
@@ -1092,6 +1096,295 @@ fn a_dim_theme_s_letters_read_over_the_pet_through_a_page_veil() {
     assert!(
         read(&off, 2 * g.cw as i32 + g.cw as i32 / 2) < bar,
         "control: the coat unveiled reads under the bar"
+    );
+}
+
+/// THE PET'S VEIL RISES OFF ITS ROW (looks7 round 2): cut at its lettered
+/// row's top and foot, the page veil sliced the coat across at the row's
+/// edge (the burst on Solarized Dark, the body gone under `flies` below a
+/// straight line). Read down one coat column, where the rows beside the
+/// lettered one hold no letter under the body, the veil's opacity climbs
+/// from nothing to the row's over an eighth of a cell above it and falls
+/// the same way below, no pixel row stepping by more than half the row's;
+/// the lettered row keeps it whole. Negative control: sliced, it jumps from
+/// nothing to its whole at the row's top.
+#[test]
+fn the_pet_s_veil_rises_off_its_row() {
+    use aterm_core::terminal::RenderCell;
+    let g = geom();
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let (fg, page) = ([0x85u8, 0x85, 0x85], [0x11u8, 0x13, 0x18]);
+    let steps = |risen: bool| -> (f32, u32, Vec<u32>) {
+        let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+        for (c, cell) in cells[3].iter_mut().enumerate() {
+            cell.ch = if c < 20 { 'o' } else { ' ' };
+            cell.fg = fg;
+            cell.bg = page;
+        }
+        let mut glow = CursorGlow::default();
+        glow.set_pet_veil_risen(risen);
+        glow.observe_frame_text(Some((3, 20)), &cells, Instant::now());
+        // The body over columns 2..12 of rows 2 to 4.
+        glow.note_pet_body(Some((2 * cw, 12 * cw, 2 * ch, 5 * ch)));
+        let mut out = Vec::new();
+        glow.veil_letters_on_pet(&mut out, Some((3, 20)), g, None);
+        // The veil's opacity at each pixel row of one coat column, as the
+        // renderer stacks it.
+        let x = 7 * cw + cw / 2;
+        let column: Vec<u32> = (0..g.win_h as i32)
+            .map(|y| {
+                out.iter()
+                    .filter(|q| {
+                        (i32::from(q.x)..i32::from(q.x) + i32::from(q.w)).contains(&x)
+                            && (i32::from(q.y)..i32::from(q.y) + i32::from(q.h)).contains(&y)
+                    })
+                    .fold(0u32, |held, q| {
+                        let a = aterm_render::glow_lerp(
+                            u32::from(q.alpha),
+                            u32::from(q.alpha2),
+                            (x - i32::from(q.x)) as u32,
+                            u32::from(q.w),
+                        );
+                        held + a * (255 - held) / 255
+                    })
+            })
+            .collect();
+        let whole = column[(3 * ch + ch / 2) as usize];
+        let step = column
+            .windows(2)
+            .map(|w| w[0].abs_diff(w[1]))
+            .max()
+            .unwrap_or(0);
+        (step as f32 / whole.max(1) as f32, whole, column)
+    };
+    let (step, whole, column) = steps(true);
+    assert!(
+        whole > 128,
+        "fixture: the dim row takes a heavy veil ({whole})"
+    );
+    assert!(
+        (3 * ch..4 * ch).all(|y| column[y as usize] == whole),
+        "the lettered row keeps the whole veil: {:?}",
+        &column[(3 * ch) as usize..(4 * ch) as usize]
+    );
+    let rise = (ch as f32 * 0.12).round() as i32;
+    for y in [3 * ch - rise, 4 * ch + rise - 1] {
+        let a = column[y as usize];
+        assert!(
+            a > 0 && a < whole,
+            "the veil eases at pixel row {y}: {a} of {whole}"
+        );
+    }
+    assert!(
+        step <= 0.5,
+        "a pixel row steps the veil by {step:.2} of its whole: {:?}",
+        &column[(3 * ch - rise - 1) as usize..(4 * ch + rise + 1) as usize]
+    );
+    let (sliced, ..) = steps(false);
+    assert!(
+        sliced > 0.9,
+        "control: sliced, the veil steps by only {sliced:.2} of its whole"
+    );
+}
+
+/// THE VEIL'S FEATHER IS NO DEEPER THAN THE COAT'S CUT (looks7 round 2): a
+/// paw grazing a lettered row's top by a pixel is cut by that pixel, and
+/// the rise above the row feathers it over one pixel row, not the whole
+/// rise: feathered over a quarter of a cell over the burst on Solarized
+/// Dark, the paw above the cut wore a dark block. Negative control:
+/// feathered its whole height, the rows above the paw's tip take the page.
+#[test]
+fn the_pet_s_veil_feathers_no_deeper_than_the_coat_s_cut() {
+    use aterm_core::render::{FxArt, FxTexels, PxRect};
+    use aterm_core::terminal::RenderCell;
+    use aterm_render::sprites::{FreeSprite, FreeZ};
+    let g = geom();
+    let ch = g.ch as i32;
+    let (fg, page) = ([0x85u8, 0x85, 0x85], [0x11u8, 0x13, 0x18]);
+    // The body over rows 1 and 2, its coat (the art's columns 10..50,
+    // window x 26..66) reaching one pixel into row 3, which is lettered.
+    let (w, h) = (80u32, 40u32);
+    let top = 3 * ch;
+    let mut texels = vec![0u8; (w * h * 4) as usize];
+    for r in 0..(top + 1 - 24) as u32 {
+        for c in 10..50 {
+            texels[((r * w + c) * 4 + 3) as usize] = 255;
+        }
+    }
+    let sprite = FreeSprite {
+        x: 16,
+        y: 24,
+        w: w as u16,
+        h: h as u16,
+        art: std::sync::Arc::new(
+            FxArt::new(w as u16, h as u16, FxTexels::Rgba8Straight, texels).expect("an 80x40 art"),
+        ),
+        clip: PxRect::EVERYWHERE,
+        tint: 0x00FF_FFFF,
+        alpha: 255,
+        flip_x: false,
+        z: FreeZ::UnderText,
+    };
+    // The veil's opacity down the coat column at x = 40, as stacked.
+    let column = |deep: bool| -> Vec<u32> {
+        let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+        for (c, cell) in cells[3].iter_mut().enumerate() {
+            cell.ch = if c < 20 { 'o' } else { ' ' };
+            cell.fg = fg;
+            cell.bg = page;
+        }
+        let mut glow = CursorGlow::default();
+        glow.set_pet_veil_feather_deep(deep);
+        glow.observe_frame_text(Some((3, 20)), &cells, Instant::now());
+        glow.note_pet_body(Some((16, 96, 24, 64)));
+        glow.note_veil_frame(Some((3, 20)), g);
+        let mut out = Vec::new();
+        glow.veil_pet_letters(&mut out, std::slice::from_ref(&sprite));
+        (0..g.win_h as i32)
+            .map(|y| {
+                out.iter()
+                    .filter(|q| {
+                        (i32::from(q.x)..i32::from(q.x) + i32::from(q.w)).contains(&40)
+                            && (i32::from(q.y)..i32::from(q.y) + i32::from(q.h)).contains(&y)
+                    })
+                    .fold(0u32, |held, q| {
+                        held + u32::from(q.alpha) * (255 - held) / 255
+                    })
+            })
+            .collect()
+    };
+    let rise = (ch as f32 * 0.12).round() as i32;
+    assert!(
+        rise >= 2,
+        "fixture: the rise is deeper than the cut ({rise})"
+    );
+    let kept = column(false);
+    assert!(
+        kept[top as usize] > 128,
+        "the cut pixel row takes the veil: {kept:?}"
+    );
+    assert!(
+        kept[(top - 1) as usize] > 0,
+        "one pixel row above the cut feathers: {:?}",
+        &kept[(top - rise - 1) as usize..=top as usize]
+    );
+    assert!(
+        (top - rise..top - 1).all(|y| kept[y as usize] == 0),
+        "no row above the feather takes the page: {:?}",
+        &kept[(top - rise - 1) as usize..=top as usize]
+    );
+    let deep = column(true);
+    assert!(
+        deep[(top - 2) as usize] > 0,
+        "control: feathered its whole height, a row above the paw's tip takes the page: {:?}",
+        &deep[(top - rise - 1) as usize..=top as usize]
+    );
+}
+
+/// THE PET'S VEIL KEEPS TO ITS SILHOUETTE (looks7 M10): given the body's
+/// sprite, each veil run keeps to the rows its art draws, each to that row's
+/// drawn span padded 3 px, so the box's transparent margin takes no page (on
+/// a translucent window a box of opaque page around the coat, on any window
+/// a cut in the trail's light under the letters beside it), and every
+/// lettered pixel over the coat still holds the bar. Negative control:
+/// boxed, the page lies off the coat.
+#[test]
+fn the_pet_s_veil_keeps_to_its_silhouette() {
+    use aterm_core::render::{FxArt, FxTexels, PxRect};
+    use aterm_core::terminal::RenderCell;
+    use aterm_render::sprites::{FreeSprite, FreeZ};
+    let g = geom();
+    let (fg, page) = ([0x85u8, 0x85, 0x85], [0x11u8, 0x13, 0x18]);
+    let rgb = |c: [u8; 3]| (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+    // The body over columns 2..12 of row 3 and the row above, its coat the
+    // art's columns 10..50 (window x 26..66), the rest of its box clear.
+    let (w, h) = (80u32, 40u32);
+    let mut texels = vec![0u8; (w * h * 4) as usize];
+    for r in 0..h {
+        for c in 10..50 {
+            texels[((r * w + c) * 4 + 3) as usize] = 255;
+        }
+    }
+    let sprite = FreeSprite {
+        x: 16,
+        y: 24,
+        w: w as u16,
+        h: h as u16,
+        art: std::sync::Arc::new(
+            FxArt::new(w as u16, h as u16, FxTexels::Rgba8Straight, texels).expect("an 80x40 art"),
+        ),
+        clip: PxRect::EVERYWHERE,
+        tint: 0x00FF_FFFF,
+        alpha: 255,
+        flip_x: false,
+        z: FreeZ::UnderText,
+    };
+    let veil = |boxed: bool| {
+        let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+        for (c, cell) in cells[3].iter_mut().enumerate() {
+            cell.ch = if c < 20 && c % 5 != 4 { 'o' } else { ' ' };
+            cell.fg = fg;
+            cell.bg = page;
+        }
+        let mut glow = CursorGlow::default();
+        glow.set_pet_veil_boxed(boxed);
+        glow.observe_frame_text(Some((3, 20)), &cells, Instant::now());
+        glow.note_pet_body(Some((16, 96, 24, 64)));
+        glow.note_veil_frame(Some((3, 20)), g);
+        let mut out = Vec::new();
+        glow.veil_pet_letters(&mut out, std::slice::from_ref(&sprite));
+        out
+    };
+    // The coat (the ink's own colour) under the veil at window pixel (x, 56).
+    let read = |quads: &[GlowQuad], x: i32| {
+        let mut px = rgb(fg);
+        for q in quads {
+            let (qx, qy) = (i32::from(q.x), i32::from(q.y));
+            if (qx..qx + i32::from(q.w)).contains(&x) && (qy..qy + i32::from(q.h)).contains(&56) {
+                let a = aterm_render::glow_lerp(
+                    u32::from(q.alpha),
+                    u32::from(q.alpha2),
+                    (x - qx) as u32,
+                    u32::from(q.w),
+                ) as u8;
+                px = aterm_render::over_premul(px, aterm_render::premul_rgb(rgb(page), a), a)
+                    & 0x00FF_FFFF;
+            }
+        }
+        crate::color_math::contrast_ratio(rgb(fg), px)
+    };
+    let bare = crate::color_math::contrast_ratio(rgb(fg), rgb(page));
+    let bar = 4.6f32.min(bare * 0.97);
+    let off_coat = |quads: &[GlowQuad]| {
+        quads
+            .iter()
+            .map(|q| {
+                let (x0, x1) = (i32::from(q.x), i32::from(q.x) + i32::from(q.w));
+                (x0.max(16)..x1.min(96))
+                    .filter(|&x| !(26 - 3..66 + 3).contains(&x))
+                    .count()
+                    * usize::from(q.h)
+            })
+            .sum::<usize>()
+    };
+    let kept = veil(false);
+    assert!(!kept.is_empty(), "the pet on dim text draws a veil");
+    assert_eq!(off_coat(&kept), 0, "the veil lays page off the coat");
+    for x in 26..66i32 {
+        let col = x / g.cw as i32;
+        if col % 5 == 4 {
+            continue;
+        }
+        let r = read(&kept, x);
+        assert!(
+            r >= bar,
+            "column {col}'s pixel {} reads {r:.2}:1 over the coat",
+            x - col * g.cw as i32
+        );
+    }
+    assert!(
+        off_coat(&veil(true)) > 0,
+        "control: boxed, the veil lays no page off the coat"
     );
 }
 
@@ -1121,7 +1414,7 @@ fn a_word_icon_new_to_the_frame_wears_no_trail_light() {
         // The streams as a host publishes them, before its word pass.
         let (mut under, mut halos) = (glow.under_quads().to_vec(), glow.halos().to_vec());
         if shade {
-            glow.shade_word_icons((&mut out, &mut under, &mut halos));
+            glow.shade_word_icons((&mut out, &mut under, &mut halos, &mut Vec::new()));
         }
         let hits = |(x0, x1, y0, y1): (i32, i32, i32, i32)| {
             x0 < icon.1 && icon.0 < x1 && y0 < icon.3 && icon.2 < y1

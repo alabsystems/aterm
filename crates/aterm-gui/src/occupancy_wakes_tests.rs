@@ -2,14 +2,18 @@
 // Copyright 2026 Andrew Yates
 
 //! Tests of the GUI's wake book on a scripted rig (virtual time, a fake process tree, a
-//! scripted machine snapshot), each guard with its negative control; one pid atom reads a real
-//! stand-in.
+//! scripted machine snapshot, a file world in the test's own scratch folder), each guard with its
+//! negative control; one pid atom reads a real stand-in; the file atoms' tests are in
+//! [`files_tests`].
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use aterm_agent::supervise::occupancy::fault::{self as agent_fault, Fault as AgentFault};
+use aterm_agent::supervise::occupancy::wake_atoms::{ContainmentWord, Probed};
 use aterm_agent::supervise::occupancy::wakes_seen::WakeDoor;
+use aterm_sysprobe::volumes::{Mount, Table};
 use aterm_vitals::model::SlotsView;
 
 use super::*;
@@ -94,6 +98,294 @@ fn link(pid: u32, birth_s: i64, ppid: u32) -> ProcLink {
     }
 }
 
+/// A local volume mounted at `on` (`local`), or a network share there.
+fn mount(on: &Path, local: bool, automounted: bool) -> Mount {
+    Mount {
+        on: on.to_path_buf(),
+        from: if local {
+            "/dev/disk-test"
+        } else {
+            "//server/share"
+        }
+        .to_string(),
+        fstype: if local { "apfs" } else { "smbfs" }.to_string(),
+        local,
+        automounted,
+        removable: false,
+        read_only: false,
+        container: None,
+    }
+}
+
+/// What the next path asked about runs, on the asking thread with the files' lock held: a
+/// switch or a close that lands mid-read.
+type OnAsk = Box<dyn FnOnce() + Send>;
+
+/// Which ask runs an [`OnAsk`]: any, a watch's open alone, or a reader's open alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    Path,
+    Watch,
+    Read,
+}
+
+/// A FILE WORLD THE TEST OWNS: a home in the test's own scratch folder (spelled without a link),
+/// that home's guarded roots as the product reckons them ([`files::guarded_roots`]), a
+/// containment, the working directories the kernel names for pids, a mount table, a watch budget
+/// and a kqueue of its own. Its reads are the product's no-follow reads. Every path it is asked
+/// about is recorded with its folders resolved, where a call that followed a link in a folder
+/// would land, and every file a reader opens where its descriptor is (`F_GETPATH`), where a read
+/// that followed a link at the path itself would land ([`Self::under_tcc`]).
+struct TestFs {
+    _dir: Option<aterm_tempfile::TempDir>,
+    home: Option<PathBuf>,
+    containment: Mutex<ContainmentWord>,
+    cwds: Mutex<BTreeMap<u32, PathBuf>>,
+    mounts: Mutex<Table>,
+    cap: Option<usize>,
+    #[cfg(unix)]
+    watcher: Option<aterm_uds::nofollow::Watcher>,
+    touched: Mutex<Vec<PathBuf>>,
+    on_ask: Mutex<Option<(Ask, OnAsk)>>,
+}
+
+impl TestFs {
+    /// No home: every file atom is refused before any path is read.
+    fn none() -> Self {
+        Self {
+            _dir: None,
+            home: None,
+            containment: Mutex::new(ContainmentWord::User),
+            cwds: Mutex::new(BTreeMap::new()),
+            mounts: Mutex::new(Table {
+                mounts: vec![mount(Path::new("/"), true, false)],
+                complete: true,
+                firmlinks: Vec::new(),
+            }),
+            cap: None,
+            #[cfg(unix)]
+            watcher: None,
+            touched: Mutex::new(Vec::new()),
+            on_ask: Mutex::new(None),
+        }
+    }
+
+    /// A home `<scratch>/Users//u` holding `scratch.noindex` and `Documents`, on one local volume,
+    /// under the user containment, its watch budget the process's own. The scratch folder's name
+    /// has no leading dot (a root under a dotted folder is no root).
+    fn at_home() -> Self {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("wakes")
+            .tempdir()
+            .expect("a scratch folder");
+        let root = std::fs::canonicalize(dir.path()).expect("its own spelling");
+        let home = root.join("Users/u");
+        std::fs::create_dir_all(home.join(files::SCRATCH)).expect("the scratch root");
+        std::fs::create_dir_all(home.join("Documents")).expect("a guarded folder");
+        Self {
+            _dir: Some(dir),
+            home: Some(home),
+            #[cfg(unix)]
+            watcher: aterm_uds::nofollow::Watcher::new().ok(),
+            ..Self::none()
+        }
+    }
+
+    fn capped(self, cap: usize) -> Self {
+        Self {
+            cap: Some(cap),
+            ..self
+        }
+    }
+
+    fn home_dir(&self) -> PathBuf {
+        self.home.clone().expect("a home")
+    }
+
+    /// `~/scratch.noindex/<rel>`.
+    fn scratch(&self, rel: &str) -> PathBuf {
+        self.home_dir().join(files::SCRATCH).join(rel)
+    }
+
+    fn set_containment(&self, word: ContainmentWord) {
+        *self.containment.lock().unwrap() = word;
+    }
+
+    fn set_cwd(&self, pid: u32, cwd: PathBuf) {
+        self.cwds.lock().unwrap().insert(pid, cwd);
+    }
+
+    fn mount(&self, at: Mount) {
+        self.mounts.lock().unwrap().mounts.push(at);
+    }
+
+    /// The mount table reads as cut short (`complete` false) or whole.
+    fn set_table_complete(&self, complete: bool) {
+        self.mounts.lock().unwrap().complete = complete;
+    }
+
+    /// Where the open `file` is (`F_GETPATH`), recorded as asked about: a reader that followed a
+    /// link at its path is recorded at the link's target.
+    fn record_opened(&self, file: &std::fs::File) {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::ffi::OsStrExt as _;
+            let mut at = [0_i8; libc::PATH_MAX as usize];
+            // SAFETY: `file` is open for the call and `at` is writable storage large enough for
+            // Darwin's F_GETPATH contract.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, at.as_mut_ptr()) } < 0 {
+                return;
+            }
+            // SAFETY: a successful F_GETPATH writes a NUL-terminated path.
+            let at = unsafe { std::ffi::CStr::from_ptr(at.as_ptr()) };
+            let at = PathBuf::from(std::ffi::OsStr::from_bytes(at.to_bytes()));
+            self.touched.lock().unwrap().push(at);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = file;
+    }
+
+    fn touch(&self, path: &Path, ask: Ask) {
+        let landed = path
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .zip(path.file_name())
+            .map_or_else(|| path.to_path_buf(), |(parent, name)| parent.join(name));
+        self.touched.lock().unwrap().push(landed);
+        let on_ask = {
+            let mut slot = self.on_ask.lock().unwrap();
+            match slot.take() {
+                Some((want, on_ask)) if want == Ask::Path || want == ask => Some(on_ask),
+                held => {
+                    *slot = held;
+                    None
+                }
+            }
+        };
+        if let Some(on_ask) = on_ask {
+            on_ask();
+        }
+    }
+
+    /// The next `ask` (any path asked about, a watch's open or a reader's) runs `on_ask` once it
+    /// is recorded, before the open.
+    fn on_next_ask(&self, ask: Ask, on_ask: OnAsk) {
+        *self.on_ask.lock().unwrap() = Some((ask, on_ask));
+    }
+
+    fn forget_touched(&self) {
+        self.touched.lock().unwrap().clear();
+    }
+
+    /// Every path asked about that lands under a root whose `stat` can raise a privacy dialog.
+    fn under_tcc(&self) -> Vec<PathBuf> {
+        let guarded = aterm_containment::consent::tcc_prompting_roots(&self.home_dir(), &[]);
+        self.touched
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| guarded.iter().any(|root| p.starts_with(root)))
+            .cloned()
+            .collect()
+    }
+
+    /// Every path asked about under `dir`.
+    fn touched_under(&self, dir: &Path) -> Vec<PathBuf> {
+        self.touched
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with(dir))
+            .cloned()
+            .collect()
+    }
+
+    fn touched_any(&self) -> bool {
+        !self.touched.lock().unwrap().is_empty()
+    }
+}
+
+impl WakeFs for TestFs {
+    fn served(&self) -> bool {
+        cfg!(target_os = "macos")
+    }
+
+    fn home(&self) -> Option<PathBuf> {
+        self.home.clone()
+    }
+
+    fn protected(&self, home: &Path) -> Option<Vec<PathBuf>> {
+        Some(files::guarded_roots(&[home.to_path_buf()], &[]))
+    }
+
+    fn containment(&self) -> ContainmentWord {
+        *self.containment.lock().unwrap()
+    }
+
+    fn cwd(&self, pid: u32) -> Option<PathBuf> {
+        self.cwds.lock().unwrap().get(&pid).cloned()
+    }
+
+    fn mounts(&self) -> Option<Table> {
+        Some(self.mounts.lock().unwrap().clone())
+    }
+
+    fn kind(&self, path: &Path) -> Probed {
+        self.touch(path, Ask::Path);
+        files::Disk.kind(path)
+    }
+
+    fn watch(&self, path: &Path, what: files::Watched, id: u64) -> std::io::Result<files::WatchFd> {
+        self.touch(path, Ask::Watch);
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd as _;
+            let watcher = self
+                .watcher
+                .as_ref()
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::Unsupported))?;
+            let fd = aterm_uds::nofollow::open_evtonly(path, what.kind())?;
+            watcher.add(fd.as_fd(), id)?;
+            Ok(files::WatchFd(fd))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (what, id);
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+    }
+
+    fn wait(&self, timeout: Duration) -> Vec<files::Fired> {
+        #[cfg(unix)]
+        if let Some(watcher) = &self.watcher {
+            return watcher
+                .wait(timeout)
+                .expect("a wait")
+                .into_iter()
+                .map(|f| files::Fired {
+                    id: f.id,
+                    gone: f.gone,
+                })
+                .collect();
+        }
+        let _ = timeout;
+        Vec::new()
+    }
+
+    fn reader(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        self.touch(path, Ask::Read);
+        let file = files::Disk.reader(path)?;
+        self.record_opened(&file);
+        Ok(file)
+    }
+
+    fn watch_cap(&self) -> usize {
+        self.cap
+            .unwrap_or_else(|| files::watch_cap(crate::control::soft_descriptor_limit()))
+    }
+}
+
 /// The rig: a scripted clock, mode, tree, machine snapshot, pace and loop words.
 struct Rig {
     now: AtomicI64,
@@ -107,10 +399,15 @@ struct Rig {
     at_ns: AtomicU64,
     pace: Mutex<Pace>,
     said: Mutex<BTreeMap<String, Said>>,
+    fs: TestFs,
 }
 
 impl Rig {
     fn new(mode: Occupancy) -> Self {
+        Self::with_fs(mode, TestFs::none())
+    }
+
+    fn with_fs(mode: Occupancy, fs: TestFs) -> Self {
         Self {
             now: AtomicI64::new(T0),
             mode: Mutex::new(mode),
@@ -121,6 +418,7 @@ impl Rig {
             at_ns: AtomicU64::new(1),
             pace: Mutex::new(Pace::default()),
             said: Mutex::new(BTreeMap::new()),
+            fs,
         }
     }
 
@@ -212,6 +510,10 @@ impl Env for Rig {
 
     fn hosted(&self, _sid: &str) -> bool {
         false
+    }
+
+    fn fs(&self) -> &dyn WakeFs {
+        &self.fs
     }
 }
 
@@ -746,9 +1048,9 @@ fn a_book_rides_the_session_record_and_its_restore_reads_levels_at_once() {
     );
 }
 
-/// A restore re-admits under the current rules: a carried file atom ends `Expired why=admit`,
-/// an unreadable wake is dropped, a row that is no book restores nothing, and a record whose
-/// `wakes` is no row reads as the empty row.
+/// A restore re-admits under the current rules: a carried file atom where no home is named ends
+/// `Expired why=admit`, an unreadable wake is dropped, a row that is no book restores nothing, and
+/// a record whose `wakes` is no row reads as the empty row.
 #[test]
 fn a_restore_re_admits_under_the_current_rules_and_reads_leniently() {
     let rig = Rig::new(Occupancy::Observe);
@@ -1149,20 +1451,28 @@ fn off_disarms_every_book_and_a_parked_wait_hears_its_end() {
     assert_eq!(host.wake(&rig, &a, Some(400), "rm 2"), RM_USAGE);
 }
 
-/// File atoms are refused before any path is touched, in `when=` and in `unless=`.
+/// A file atom where no home is named is refused before any path is touched, in `when=` and in
+/// `unless=` (`path relative`; off macOS, where none is served, `file atoms are served on macOS
+/// alone`), and books nothing.
 #[test]
-fn a_file_atom_is_refused_until_it_is_served() {
+fn a_file_atom_with_no_home_is_refused_before_any_path_is_read() {
     let rig = Rig::new(Occupancy::Observe);
     let host = WakeHost::default();
     let a = seat_a();
+    let refusal = if cfg!(target_os = "macos") {
+        "ERR denied wake: path relative\n"
+    } else {
+        files::NOT_SERVED
+    };
     for decl in [
-        "label=f when=file:~/done",
-        "label=f when=in:1m unless=gone:~/lock",
-        "label=f when=file:~/log~/ok/",
+        "label=f when=file:~/scratch.noindex/done",
+        "label=f when=in:1m unless=gone:~/scratch.noindex/lock",
+        "label=f when=file:~/scratch.noindex/log~/ok/",
     ] {
-        assert_eq!(host.wake(&rig, &a, Some(400), decl), FILE_ATOMS, "{decl}");
+        assert_eq!(host.wake(&rig, &a, Some(400), decl), refusal, "{decl}");
     }
     assert_eq!(host.counts(A), (0, 0));
+    assert!(!rig.fs.touched_any(), "no path was asked about");
 }
 
 /// The parked wait's loop: an answer ready at once returns at once; a hang-up and a time run
@@ -1608,3 +1918,7 @@ fn a_seat_names_its_shell_before_any_machine_snapshot_names_the_tab() {
     let seat = seat_of(&store, 0x5ea9).expect("a registered session's seat");
     assert_eq!(seat.pty_child, None, "a bare pid pins nothing");
 }
+
+#[cfg(target_os = "macos")]
+#[path = "occupancy_wake_files_tests.rs"]
+mod files_tests;

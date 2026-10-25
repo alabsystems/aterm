@@ -207,72 +207,81 @@ const STEM_DUST: u32 = 0x00B0_8D74;
 const SKIRT_TONE: u32 = 0x00C8_B49C;
 const CORE_HOT: u32 = 0x00FF_E9B0;
 
+const INV_COOL_SPAN_MS: f32 = 1.0 / 1600.0;
+const INV_STEM_RISE_SPAN_MS: f32 = 1.0 / (STEM_RISE_END_MS - FLASH_END_MS) as f32;
+const INV_TAIL_SPAN_MS: f32 = 1.0 / 1700.0;
+const INV_CAP_BLOOM_SPAN_MS: f32 = 1.0 / (CAP_BLOOM_END_MS - CAP_BLOOM_START_MS) as f32;
+const INV_SKIRT_SPAN_MS: f32 = 1.0 / (SKIRT_END_MS - SKIRT_START_MS) as f32;
+const INV_FADE_SPAN_MS: f32 = 1.0 / (NUKE_TOTAL_MS - SKIRT_END_MS) as f32;
+
 /// Heat -> dust, on one clock for the whole cloud. Cooling starts once the bloom is well
 /// underway, so the cap first appears fire-lit.
 #[inline]
 const fn cool(t_ms: u64) -> f32 {
-    aterm_scene::smoothstep((t_ms.saturating_sub(1500) as f32 / 1600.0).clamp(0.0, 1.0))
+    aterm_scene::smoothstep((t_ms.saturating_sub(1500) as f32 * INV_COOL_SPAN_MS).clamp(0.0, 1.0))
+}
+
+#[inline]
+const fn fade_after_skirt(t_ms: u64) -> f32 {
+    if t_ms <= SKIRT_END_MS {
+        1.0
+    } else {
+        1.0 - ((t_ms - SKIRT_END_MS) as f32 * INV_FADE_SPAN_MS).clamp(0.0, 1.0)
+    }
 }
 
 /// Resolve `part`'s draw state at `t_ms`, or `None` outside its active window.
 #[inline]
 #[must_use]
-pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
-    let fade = |from: u64, span: u64| -> f32 {
-        if t_ms <= from || span == 0 {
-            1.0
-        } else {
-            1.0 - ((t_ms - from) as f32 / span as f32).clamp(0.0, 1.0)
-        }
-    };
+pub const fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
     match part {
         NukePart::Stem => {
-            if !(FLASH_END_MS..NUKE_TOTAL_MS).contains(&t_ms) {
+            if t_ms < FLASH_END_MS || t_ms >= NUKE_TOTAL_MS {
                 return None;
             }
             let c = cool(t_ms);
-            let q = ((t_ms - FLASH_END_MS) as f32 / (STEM_RISE_END_MS - FLASH_END_MS) as f32)
-                .clamp(0.0, 1.0);
-            let rise = 1.0 - (1.0 - q) * (1.0 - q) * (1.0 - q);
+            let q = ((t_ms - FLASH_END_MS) as f32 * INV_STEM_RISE_SPAN_MS).clamp(0.0, 1.0);
+            let omq = 1.0 - q;
+            let rise = 1.0 - omq * omq * omq;
             Some(NukeDraw {
                 sx: 0.85 + 0.35 * rise,
                 sy: 0.15 + 0.85 * rise,
-                dy_cells: -0.35 * (t_ms.saturating_sub(CAP_BLOOM_END_MS) as f32 / 1700.0),
-                alpha: (q * 3.0).min(1.0) * fade(SKIRT_END_MS, NUKE_TOTAL_MS - SKIRT_END_MS),
+                dy_cells: -0.35 * (t_ms.saturating_sub(CAP_BLOOM_END_MS) as f32 * INV_TAIL_SPAN_MS),
+                alpha: (q * 3.0).min(1.0) * fade_after_skirt(t_ms),
                 tint: crate::effect_util::lerp_rgb(STEM_HOT, STEM_DUST, c),
             })
         }
         NukePart::Cap => {
-            if !(CAP_BLOOM_START_MS..NUKE_TOTAL_MS).contains(&t_ms) {
+            if t_ms < CAP_BLOOM_START_MS || t_ms >= NUKE_TOTAL_MS {
                 return None;
             }
             let c = cool(t_ms);
-            let q = ((t_ms - CAP_BLOOM_START_MS) as f32
-                / (CAP_BLOOM_END_MS - CAP_BLOOM_START_MS) as f32)
-                .clamp(0.0, 1.0);
-            let bloom = (1.0 - (1.0 - q) * (1.0 - q) * (1.0 - q))
-                + 0.06 * (core::f32::consts::PI * q).sin();
-            let tail = (t_ms.saturating_sub(CAP_BLOOM_END_MS) as f32 / 1700.0).clamp(0.0, 1.0);
+            let q = ((t_ms - CAP_BLOOM_START_MS) as f32 * INV_CAP_BLOOM_SPAN_MS).clamp(0.0, 1.0);
+            let omq = 1.0 - q;
+            let (sin_q, _) = crate::supernova::sin_cos_f32(core::f32::consts::PI * q);
+            let bloom = (1.0 - omq * omq * omq) + 0.06 * sin_q;
+            let tail =
+                (t_ms.saturating_sub(CAP_BLOOM_END_MS) as f32 * INV_TAIL_SPAN_MS).clamp(0.0, 1.0);
             let spread = 1.0 + 0.55 * tail;
             Some(NukeDraw {
                 sx: (0.45 + 0.75 * bloom) * spread,
                 sy: (0.50 + 0.62 * bloom) * (1.0 + 0.15 * (spread - 1.0)),
                 dy_cells: -(0.90 + 0.60 * q) - 0.70 * tail,
-                alpha: (q * 4.0).min(1.0) * fade(SKIRT_END_MS, NUKE_TOTAL_MS - SKIRT_END_MS),
+                alpha: (q * 4.0).min(1.0) * fade_after_skirt(t_ms),
                 tint: crate::effect_util::lerp_rgb(CAP_HOT, CAP_DUST, c),
             })
         }
         NukePart::Skirt => {
-            if !(SKIRT_START_MS..SKIRT_END_MS).contains(&t_ms) {
+            if t_ms < SKIRT_START_MS || t_ms >= SKIRT_END_MS {
                 return None;
             }
-            let q = ((t_ms - SKIRT_START_MS) as f32 / (SKIRT_END_MS - SKIRT_START_MS) as f32)
-                .clamp(0.0, 1.0);
+            let q = ((t_ms - SKIRT_START_MS) as f32 * INV_SKIRT_SPAN_MS).clamp(0.0, 1.0);
+            let (sin_q, _) = crate::supernova::sin_cos_f32(core::f32::consts::PI * q);
             Some(NukeDraw {
                 sx: 0.60 + 2.60 * q,
                 sy: 1.0,
                 dy_cells: 0.10 * q,
-                alpha: 0.70 * (core::f32::consts::PI * q).sin().max(0.0),
+                alpha: 0.70 * sin_q.max(0.0),
                 tint: SKIRT_TONE,
             })
         }
@@ -282,18 +291,18 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
 /// Molten core sprite drawn over the cap tile at `t_ms`.
 #[inline]
 #[must_use]
-pub fn nuke_core_draw(t_ms: u64) -> Option<NukeDraw> {
+pub const fn nuke_core_draw(t_ms: u64) -> Option<NukeDraw> {
     const CORE_END_MS: u64 = 2_900;
-    if !(CAP_BLOOM_START_MS..CORE_END_MS).contains(&t_ms) {
+    const INV_CORE_DIE_SPAN_MS: f32 = 1.0 / (CORE_END_MS - CAP_BLOOM_END_MS) as f32;
+    if t_ms < CAP_BLOOM_START_MS || t_ms >= CORE_END_MS {
         return None;
     }
-    let cap = nuke_draw(t_ms, NukePart::Cap)?;
-    let q = ((t_ms - CAP_BLOOM_START_MS) as f32 / (CAP_BLOOM_END_MS - CAP_BLOOM_START_MS) as f32)
-        .clamp(0.0, 1.0);
+    let Some(cap) = nuke_draw(t_ms, NukePart::Cap) else {
+        return None;
+    };
+    let q = ((t_ms - CAP_BLOOM_START_MS) as f32 * INV_CAP_BLOOM_SPAN_MS).clamp(0.0, 1.0);
     let die = 1.0
-        - ((t_ms.saturating_sub(CAP_BLOOM_END_MS)) as f32
-            / (CORE_END_MS - CAP_BLOOM_END_MS) as f32)
-            .clamp(0.0, 1.0);
+        - ((t_ms.saturating_sub(CAP_BLOOM_END_MS)) as f32 * INV_CORE_DIE_SPAN_MS).clamp(0.0, 1.0);
     Some(NukeDraw {
         sx: cap.sx * 0.58,
         sy: cap.sy * 0.52,

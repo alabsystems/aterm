@@ -1283,7 +1283,7 @@ impl ConsentState {
     }
 
     /// Seed a synthetic cached FDA verdict for tests.
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn with_cached_probe_for_test(probe: FdaProbe) -> Self {
         let mut state = Self::inert();
         state.probes.live = true;
@@ -1516,6 +1516,7 @@ impl App {
     pub(crate) fn reconcile_consent_config(&self) {
         self.consent
             .publish_policy(ConsentPolicy::from_config(&self.config));
+        crate::occupancy_wakes::set_privacy(self.config.privacy_protected_roots());
     }
 
     /// Set `config.privacy` and republish its mirror for tests.
@@ -2533,6 +2534,38 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains("=denied")),
             "a switched-off lane never reads as a denial: {lines:?}"
+        );
+    }
+
+    /// A config reload's `[privacy] protected_roots` reach the wake files' admission too
+    /// (`reconcile_consent_config`), which guards them beside its fixed set. NEGATIVE CONTROL:
+    /// before the reload the root is not among them.
+    #[test]
+    fn a_config_reload_sets_the_wake_files_guarded_roots() {
+        use crate::app_colorscheme::install_resolved_colors::apply_config_text;
+        let root = PathBuf::from(if cfg!(windows) {
+            "C:/opt/aterm-wake-privacy"
+        } else {
+            "/opt/aterm-wake-privacy"
+        });
+        let privacy = format!(
+            "[privacy]\ncheck = false\nprotected_roots = [\"{}\"]\n",
+            root.display()
+        );
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("wake-privacy")
+            .tempdir()
+            .expect("a scratch folder");
+        let mut app = crate::App::headless_for_test();
+        assert!(
+            crate::occupancy_wakes::privacy().is_none_or(|roots| !roots.contains(&root)),
+            "NEGATIVE CONTROL: not before the reload"
+        );
+        apply_config_text(&mut app, dir.path(), &privacy);
+        assert!(
+            crate::occupancy_wakes::privacy().is_some_and(|roots| roots.contains(&root)),
+            "{:?}",
+            crate::occupancy_wakes::privacy()
         );
     }
 

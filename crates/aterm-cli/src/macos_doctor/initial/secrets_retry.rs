@@ -23,17 +23,85 @@ pub(super) const TRIES: u32 = 2;
 
 const BUILDS: usize = 16;
 
+/// Independently readable facts: an unknown component does not hide another's change.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Inputs {
+    pub(super) routes: Option<String>,
+    pub(super) vault: Option<String>,
+    pub(super) execution: Option<String>,
+    pub(super) subscriber: Option<bool>,
+}
+
+impl Inputs {
+    /// Every known current fact agrees with an earlier known reading.
+    fn known_matches(&self, previous: &Self) -> bool {
+        self.routes
+            .as_ref()
+            .is_none_or(|value| previous.routes.as_ref() == Some(value))
+            && self
+                .vault
+                .as_ref()
+                .is_none_or(|value| previous.vault.as_ref() == Some(value))
+            && self
+                .execution
+                .as_ref()
+                .is_none_or(|value| previous.execution.as_ref() == Some(value))
+            && self
+                .subscriber
+                .is_none_or(|value| previous.subscriber == Some(value))
+    }
+
+    /// A failed read leaves only its own last known fact in place.
+    fn retain_known_from(&mut self, previous: &Self) {
+        if self.routes.is_none() {
+            self.routes.clone_from(&previous.routes);
+        }
+        if self.vault.is_none() {
+            self.vault.clone_from(&previous.vault);
+        }
+        if self.execution.is_none() {
+            self.execution.clone_from(&previous.execution);
+        }
+        if self.subscriber.is_none() {
+            self.subscriber = previous.subscriber;
+        }
+    }
+}
+
 /// What can change a Secrets try's answer without the person, read before and after it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Pace {
     /// This aterm build ([`aterm_types::version::build_id`]).
     pub(super) build: String,
-    /// A digest of the network this Mac is on and of its vault state ([`marks`]).
-    pub(super) marks: String,
+    /// A digest of known network/vault/service facts ([`marks`]); a failed
+    /// local read supplies no new fact against an earlier hold.
+    pub(super) marks: Option<String>,
+    /// Named facts for modern attempts; absent only for a legacy opaque reading.
+    pub(super) inputs: Option<Inputs>,
     /// A coherent local materialization reading; unknown never erases a known one.
     pub(super) materialization: Option<MaterializationMark>,
     /// Now, in seconds since the epoch.
     pub(super) now: u64,
+}
+
+impl Pace {
+    /// Keep each input independently when its post-stage read is unknown.
+    /// Materialization includes its source identity and supplies only change evidence.
+    pub(super) fn retain_known_from(&mut self, before: &Self) {
+        let compatible = match (&self.inputs, &before.inputs) {
+            (Some(current), Some(previous)) => current.known_matches(previous),
+            _ => self.marks.is_none() || self.marks == before.marks,
+        };
+        if let (Some(current), Some(previous)) = (&mut self.inputs, &before.inputs) {
+            current.retain_known_from(previous);
+        }
+        if self.marks.is_none() && compatible {
+            self.marks.clone_from(&before.marks);
+        }
+        if self.materialization.is_none() {
+            self.materialization = before.materialization;
+        }
+    }
 }
 
 /// Where a [`Pace`] is read from: [`Live`], or a test's network and vault.
@@ -43,7 +111,7 @@ pub(super) trait Reads {
     /// Now, in seconds since the epoch.
     fn now(&self) -> u64;
     /// Stable local interface facts as text.
-    fn routes(&self) -> String;
+    fn routes(&self) -> Option<String>;
     /// Vault handle for the single console account, if any.
     fn vault(&self) -> Option<Arc<dyn SecretsOps>>;
     /// Local vault files, when this reader can observe materialization.
@@ -54,9 +122,11 @@ pub(super) trait Reads {
 
 /// The pace `reads` reads now.
 pub(super) fn pace(reads: &dyn Reads) -> Pace {
+    let (marks, inputs) = marks(reads);
     Pace {
         build: reads.build(),
-        marks: marks(reads),
+        marks,
+        inputs: Some(inputs),
         materialization: reads.paths().and_then(|paths| {
             aterm_secrets::client::materialization_mark(&paths)
                 .ok()
@@ -66,28 +136,54 @@ pub(super) fn pace(reads: &dyn Reads) -> Pace {
     }
 }
 
-fn marks(reads: &dyn Reads) -> String {
+fn marks(reads: &dyn Reads) -> (Option<String>, Inputs) {
     use aterm_secrets::client::Membership;
-    let mut marks = reads.routes();
-    match reads.vault() {
-        None => marks.push_str("; no single console account"),
-        Some(vault) => {
-            match vault.status() {
-                Ok(mut status) => {
-                    if let Membership::In { heard, .. } = &mut status.membership {
-                        *heard = 0;
-                    }
-                    marks.push_str(&format!("; {status:?}"));
-                }
-                Err(error) => marks.push_str(&format!("; status: {error}")),
+    let routes = reads.routes();
+    let vault = reads.vault();
+    // Read independently: a service error must not conceal a changed network or vault.
+    let status = vault
+        .as_ref()
+        .and_then(|vault| vault.status().ok())
+        .map(|mut status| {
+            if let Membership::In { heard, .. } = &mut status.membership {
+                *heard = 0;
             }
-            let running = vault.subscriber().map(subscriber_running);
-            marks.push_str(&format!("; subscriber running: {running:?}"));
-            marks.push_str(&format!("; runs from: {:?}", vault.fleeting()));
-        }
-    }
-    let digest = aterm_digest::Sha256::digest(marks.as_bytes());
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+            format!("{status:?}")
+        });
+    let running = vault
+        .as_ref()
+        .and_then(|vault| vault.subscriber().ok())
+        .map(subscriber_running);
+    let execution = vault
+        .as_ref()
+        .map(|vault| format!("{:?}", vault.fleeting()));
+    let inputs = Inputs {
+        routes: routes.as_ref().map(|value| fingerprint("routes", value)),
+        vault: status.as_ref().map(|value| fingerprint("vault", value)),
+        execution: execution
+            .as_ref()
+            .map(|value| fingerprint("execution", value)),
+        subscriber: running,
+    };
+    let marks = match (routes, status, running, execution) {
+        // Preserve the complete known digest's encoding for legacy holds.
+        (Some(routes), Some(status), Some(running), Some(execution)) => Some(digest(&format!(
+            "{routes}; {status}; subscriber running: Ok({running:?}); runs from: {execution}"
+        ))),
+        _ => None,
+    };
+    (marks, inputs)
+}
+
+fn fingerprint(component: &str, value: &str) -> String {
+    digest(&format!("aterm-initial-secrets-{component}\0{value}"))
+}
+
+fn digest(value: &str) -> String {
+    aterm_digest::Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub(super) fn subscriber_running(state: aterm_secrets::service::State) -> bool {
@@ -111,8 +207,9 @@ impl Reads for Live {
             .map_or(0, |since| since.as_secs())
     }
 
-    fn routes(&self) -> String {
-        format!("{:?}", aterm_secrets::network::interfaces().ok())
+    fn routes(&self) -> Option<String> {
+        let interfaces = aterm_secrets::network::interfaces().ok()?;
+        Some(format!("{:?}", Some(interfaces)))
     }
 
     fn vault(&self) -> Option<Arc<dyn SecretsOps>> {
@@ -145,7 +242,8 @@ struct Attempt {
     revision: u64,
     /// The builds that tried in this row, the latest last.
     builds: Vec<String>,
-    marks: String,
+    marks: Option<String>,
+    inputs: Option<Inputs>,
     materialization: Option<MaterializationMark>,
     tries: u32,
     /// How many of the last tries in a row failed (an error row: a change not made).
@@ -161,7 +259,6 @@ impl Attempt {
         if record["profile"].as_str() != Some(PROFILE) {
             return None;
         }
-        let text = |key: &str| record[key].as_str().map(str::to_owned);
         let count = |key: &str| u32::try_from(record[key].as_u64()?).ok();
         let rows = record["rows"]
             .as_array()?
@@ -182,7 +279,14 @@ impl Attempt {
         Some(Self {
             revision: record["revision"].as_u64()?,
             builds,
-            marks: text("marks")?,
+            marks: match record.get("marks")? {
+                Value::Null => None,
+                marks => Some(marks.as_str()?.to_owned()),
+            },
+            inputs: match record.get("inputs") {
+                None => None,
+                Some(inputs) => Some(Inputs::from_record(inputs)?),
+            },
             materialization: record["materialization"]
                 .as_str()
                 .and_then(MaterializationMark::from_cache_key),
@@ -199,20 +303,34 @@ impl Attempt {
             .iter()
             .map(|(name, status, detail)| json!({"name": name, "status": status, "detail": detail}))
             .collect();
-        write_json(
-            &root.join(RECORD),
-            &json!({
-                "profile": PROFILE, "revision": self.revision, "builds": self.builds,
-                "marks": self.marks, "tries": self.tries, "failures": self.failures,
-                "materialization": self.materialization.map(|mark| mark.cache_key()),
-                "at": self.at, "rows": rows,
-            }),
-        )
+        let mut record = json!({
+            "profile": PROFILE, "revision": self.revision, "builds": self.builds,
+            "marks": self.marks, "tries": self.tries, "failures": self.failures,
+            "materialization": self.materialization.map(|mark| mark.cache_key()),
+            "at": self.at, "rows": rows,
+        });
+        if let Some(inputs) = &self.inputs {
+            record
+                .as_object_mut()
+                .unwrap()
+                .insert("inputs".into(), inputs.to_record());
+        }
+        write_json(&root.join(RECORD), &record)
+    }
+
+    fn same_inputs(&self, pace: &Pace) -> bool {
+        match (&pace.inputs, &self.inputs) {
+            (Some(current), Some(previous)) => current.known_matches(previous),
+            _ => pace
+                .marks
+                .as_ref()
+                .is_none_or(|marks| self.marks.as_ref() == Some(marks)),
+        }
     }
 
     fn same_row(&self, revision: u64, pace: &Pace) -> bool {
         self.revision == revision
-            && self.marks == pace.marks
+            && self.same_inputs(pace)
             && pace
                 .materialization
                 .is_none_or(|mark| self.materialization == Some(mark))
@@ -227,9 +345,55 @@ impl Attempt {
     }
 }
 
+impl Inputs {
+    fn from_record(record: &Value) -> Option<Self> {
+        fn text(record: &Value, field: &str) -> Option<Option<String>> {
+            match record.get(field)? {
+                Value::Null => Some(None),
+                value => Some(Some(value.as_str()?.to_owned())),
+            }
+        }
+        Some(Self {
+            routes: text(record, "routes")?,
+            vault: text(record, "vault")?,
+            execution: text(record, "execution")?,
+            subscriber: match record.get("subscriber")? {
+                Value::Null => None,
+                value => Some(value.as_bool()?),
+            },
+        })
+    }
+
+    fn to_record(&self) -> Value {
+        json!({
+            "routes": self.routes, "vault": self.vault,
+            "execution": self.execution, "subscriber": self.subscriber,
+        })
+    }
+
+    fn fully_known(&self) -> bool {
+        self.routes.is_some()
+            && self.vault.is_some()
+            && self.execution.is_some()
+            && self.subscriber.is_some()
+    }
+}
+
 /// Returns the cached rows while the last unfinished attempt of `revision` is paused or held.
+/// The caller holds the profile writer lock. A legacy hold with an exactly
+/// matching complete reading can gain component fingerprints without spending
+/// or resetting an attempt; a failed cache update leaves that hold unchanged.
 pub(super) fn paused(root: &Path, revision: u64, pace: &Pace) -> Option<Vec<Row>> {
-    let last = Attempt::load(root)?;
+    let mut last = Attempt::load(root)?;
+    if last.revision == revision
+        && last.inputs.is_none()
+        && pace.marks.is_some()
+        && pace.marks == last.marks
+        && let Some(inputs) = pace.inputs.as_ref().filter(|inputs| inputs.fully_known())
+    {
+        last.inputs = Some(inputs.clone());
+        let _ = last.save(root);
+    }
     let due = last.at.saturating_add(pause(last.tries).as_secs());
     (last.unchanged(revision, pace) && (last.held() || (last.at..due).contains(&pace.now))).then(
         || {
@@ -284,10 +448,35 @@ pub(super) fn record(
     }
     let failed = rows.iter().any(|row| row.status == "error");
     let previous = Attempt::load(root);
+    let marks = pace.marks.clone().or_else(|| {
+        previous
+            .as_ref()
+            .filter(|last| last.revision == revision && last.same_inputs(pace))
+            .and_then(|last| last.marks.clone())
+    });
+    let inputs = match &pace.inputs {
+        Some(current) => {
+            let mut current = current.clone();
+            if let Some(before) = previous
+                .as_ref()
+                .filter(|last| last.revision == revision)
+                .and_then(|last| last.inputs.as_ref())
+            {
+                current.retain_known_from(before);
+            }
+            Some(current)
+        }
+        None => previous
+            .as_ref()
+            .filter(|last| last.revision == revision && last.same_inputs(pace))
+            .and_then(|last| last.inputs.clone()),
+    };
     let materialization = pace.materialization.or_else(|| {
         previous
             .as_ref()
-            .filter(|last| last.revision == revision && last.marks == pace.marks)
+            // The mark already binds source and version. Other changed facts
+            // do not turn an unreadable materialization into new evidence.
+            .filter(|last| last.revision == revision)
             .and_then(|last| last.materialization)
     });
     let (tries, failures, builds) = match previous.filter(|l| l.same_row(revision, pace)) {
@@ -327,7 +516,8 @@ pub(super) fn record(
     Attempt {
         revision,
         builds,
-        marks: pace.marks.clone(),
+        marks,
+        inputs,
         materialization,
         tries,
         failures,
@@ -396,13 +586,17 @@ fn note(pause: Duration) -> String {
 }
 
 #[cfg(test)]
+mod unknown_inputs_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn pace(marks: &str, now: u64) -> Pace {
         Pace {
             build: "1.0.0+gabc".into(),
-            marks: marks.into(),
+            marks: Some(marks.into()),
+            inputs: None,
             materialization: None,
             now,
         }

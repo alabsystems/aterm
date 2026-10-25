@@ -760,7 +760,7 @@ impl HarnessState {
         ]
     }
 
-    /// TODAY'S NUMBERS under STATUS's facts (§10.3.1): the first three nonzero families (`37 approved today · 12 kept going · 4 answered`, drawn in Hero type where it fits; landings lead where there are any, `2 landed today · 31 approved · 4 kept going`, §12.4.1, by [`Families`]' order), then the rest and the person's wait (`2 resumed · 1 land prompt · waited on you 4m`, plain; empty where there is none).
+    /// TODAY'S NUMBERS under STATUS's facts (§10.3.1): the first three nonzero families (`37 approved today · 12 kept going · 4 answered`, drawn in Hero type where it fits; landings lead where there are any, `2 landed today · 31 approved · 4 kept going`, §12.4.1, by [`Families`]' order), then the rest and the person's wait (`2 resumed · 1 land prompt · waited for you 4m`, plain, in [`NEEDED_YOU`]'s words; empty where there is none).
     #[must_use]
     pub(crate) fn today_lines(&self) -> Option<(String, String)> {
         if !self.observed {
@@ -776,10 +776,7 @@ impl HarnessState {
         let mut lead = families(Families::of_stats(today));
         let mut rest = lead.split_off(lead.len().min(3));
         if today.human_wait_ms > 0 {
-            rest.push(format!(
-                "waited on you {}",
-                duration_words(today.human_wait_ms)
-            ));
+            rest.push(waited_for_you_words(today.human_wait_ms));
         }
         match self.decided_total() {
             0 => {}
@@ -913,6 +910,7 @@ impl HarnessState {
         })
     }
 
+    /// WHAT THE HARNESS DID's rows (§10.3, §12.4.6, §14.6): each count with a week, today's and the week's (`Approved  31 today · 212 in 7 days`), with its part under it where the part's week has one (`no safe rule`, `past “done”`); [`NEEDED_YOU`]'s count and wait in one row ([`waited_for_you`]); every count whose week is 0 named in one last count row ([`NONE_IN_7_DAYS`]); then the waits at limits, the occupancy door's rows and the reading's own.
     fn did_rows(&self) -> Vec<(String, String)> {
         let row = |label: &str, value: String| (label.to_string(), value);
         let Some(report) = self.stats.report.as_deref() else {
@@ -938,66 +936,78 @@ impl HarnessState {
                 "nothing yet: no supervised session has acted".to_string(),
             ));
         } else {
-            let both = |t: u64, w: u64| format!("{t} today \u{b7} {w} in 7 days");
+            let both = |t: u64, w: u64| in_windows(|d| format!("{t} {d}"), |d| format!("{w} {d}"));
             let waited = |t: u64, w: u64| {
-                format!(
-                    "{} today \u{b7} {} in 7 days",
-                    duration_words(t),
-                    duration_words(w)
+                in_windows(
+                    |d| format!("{} {d}", duration_words(t)),
+                    |d| format!("{} {d}", duration_words(w)),
                 )
             };
-            rows.push(row(APPROVED.label, both(today.approved, week.approved)));
+            // A count whose week is 0 is named once, in NONE_IN_7_DAYS' row, in the order the
+            // rows stand. A part of the row over it (`no safe rule`, `past “done”`) stands only
+            // where its week has one, and is never named there.
+            let mut none = Vec::new();
+            let mut count = |rows: &mut Vec<(String, String)>, words: CountWords, value| match value
+            {
+                Some(value) => rows.push(row(words.label, value)),
+                None => none.push(words.many),
+            };
+            let counts = |t: u64, w: u64| (w > 0).then(|| both(t, w));
+            count(&mut rows, APPROVED, counts(today.approved, week.approved));
             if week.unproven > 0 {
                 rows.push(row(
                     UNPROVEN_OF_APPROVED,
-                    format!(
-                        "{NO_SAFE_RULE_PROVED} {}",
-                        both(today.unproven, week.unproven)
-                    ),
+                    both(today.unproven, week.unproven),
                 ));
             }
-            rows.extend([
-                row(DECLINED.label, both(today.declined, week.declined)),
-                row(ANSWERED.label, both(today.answered, week.answered)),
-                row(KEPT_GOING.label, both(today.continued, week.continued)),
-            ]);
+            count(&mut rows, DECLINED, counts(today.declined, week.declined));
+            count(&mut rows, ANSWERED, counts(today.answered, week.answered));
+            count(
+                &mut rows,
+                KEPT_GOING,
+                counts(today.continued, week.continued),
+            );
             let (checked_today, checked_week) =
                 (done_claims_checked(today), done_claims_checked(week));
             if checked_week > 0 {
                 rows.push(row(
                     DONE_CHECKED_OF_KEPT_GOING,
-                    format!("{DONE_CLAIM_CHECKED} {}", both(checked_today, checked_week)),
+                    both(checked_today, checked_week),
                 ));
             }
-            if week.landed > 0 || week.land_prompts > 0 {
-                rows.push(row(LANDED.label, both(today.landed, week.landed)));
-            }
-            rows.extend([
-                row(
-                    LAND_PROMPTS.label,
-                    both(today.land_prompts, week.land_prompts),
-                ),
-                row(RESUMED.label, both(today.resumed, week.resumed)),
-                row(RELAUNCHED.label, both(today.relaunched, week.relaunched)),
-                row(UPGRADED.label, both(today.upgraded, week.upgraded)),
-                row(NEEDED_YOU.label, both(today.escalated, week.escalated)),
-            ]);
-            if week.needs_told > 0 {
+            count(&mut rows, LANDED, counts(today.landed, week.landed));
+            count(
+                &mut rows,
+                LAND_PROMPTS,
+                counts(today.land_prompts, week.land_prompts),
+            );
+            count(&mut rows, RESUMED, counts(today.resumed, week.resumed));
+            count(
+                &mut rows,
+                RELAUNCHED,
+                counts(today.relaunched, week.relaunched),
+            );
+            count(&mut rows, UPGRADED, counts(today.upgraded, week.upgraded));
+            count(
+                &mut rows,
+                NEEDED_YOU,
+                (week.escalated > 0 || week.human_wait_ms > 0).then(|| waited_for_you(today, week)),
+            );
+            count(
+                &mut rows,
+                NEEDS_TOLD,
+                counts(today.needs_told, week.needs_told),
+            );
+            if !none.is_empty() {
                 rows.push(row(
-                    NEEDS_TOLD.label,
-                    both(today.needs_told, week.needs_told),
+                    NONE_IN_7_DAYS,
+                    none.join(crate::native_ui::FACT_SEPARATOR),
                 ));
             }
-            rows.extend([
-                row(
-                    "Waited on you",
-                    waited(today.human_wait_ms, week.human_wait_ms),
-                ),
-                row(
-                    "Waited at limits",
-                    waited(today.limit_wait_ms, week.limit_wait_ms),
-                ),
-            ]);
+            rows.push(row(
+                "Waited at limits",
+                waited(today.limit_wait_ms, week.limit_wait_ms),
+            ));
             // The occupancy door's fact lines, by kind: typed under `prompt`, would-be under
             // `observe`. Shown once a week holds any.
             let kinds: std::collections::BTreeSet<&String> = week
@@ -1151,15 +1161,13 @@ pub(crate) const APPROVED: CountWords =
     CountWords::act("Approved", aterm_agent::harness::acts::Act::Approved);
 /// THE PRESSES NO SAFE RULE PROVED (the ledger's `unproven:` approvals): of the approved, those full power made where no safe rule proved the box.
 pub(crate) const NO_SAFE_RULE_PROVED: &str = "no safe rule proved";
-/// WHAT THE HARNESS DID's label for [`NO_SAFE_RULE_PROVED`]'s row: a part of the Approved row over it.
-pub(crate) const UNPROVEN_OF_APPROVED: &str = "of those";
+/// WHAT THE HARNESS DID's label for [`NO_SAFE_RULE_PROVED`]'s row, a part of the Approved row over it, its value the counts alone (§14.6): `no safe rule  2 today · 5 in 7 days`.
+pub(crate) const UNPROVEN_OF_APPROVED: &str = "no safe rule";
 /// Turns the harness continued (`Counter::Continued`).
 pub(crate) const KEPT_GOING: CountWords =
     CountWords::act("Kept going", aterm_agent::harness::acts::Act::Continued);
-/// THE DONE CLAIMS THE HARNESS CHECKED (§12.4.1): of the turns it kept going, those that claimed done and were answered with Cruise's defend-and-find-more prompt.
-pub(crate) const DONE_CLAIM_CHECKED: &str = "a done claim checked";
-/// WHAT THE HARNESS DID's label for [`DONE_CLAIM_CHECKED`]'s row: a part of the Kept going row over it.
-pub(crate) const DONE_CHECKED_OF_KEPT_GOING: &str = "of them";
+/// WHAT THE HARNESS DID's label for THE DONE CLAIMS THE HARNESS CHECKED (§12.4.1, §14.6), a part of the Kept going row over it, its value the counts alone: of the turns it kept going, those that claimed done and were answered with Cruise's defend-and-find-more prompt, so `past “done”  3 today · 3 in 7 days` says the harness kept going past the agent's "done" three times.
+pub(crate) const DONE_CHECKED_OF_KEPT_GOING: &str = "past \u{201c}done\u{201d}";
 const DONE_CLAIM_RULES: [&str; 3] = {
     use aterm_agent::supervise::policy::turn_end::{
         RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED,
@@ -1186,7 +1194,7 @@ pub(crate) const LAND_PROMPTS: CountWords = CountWords {
     one: "land prompt",
     many: "land prompts",
 };
-/// Land's landings: all of the work on the remote main branch, defended clean at a land act's yield, each counted once at its first note ([`HarnessStats::landed`], §12.4.3 item 2) — the word the chip's `✓ landed` says.
+/// Land's landings: a clean `Nothing left:` defense at a land act's yield, and no repository check found work left to land, each counted once at its first note ([`HarnessStats::landed`], §12.4.3 item 2) — the word the chip's `✓ landed` says.
 pub(crate) const LANDED: CountWords = CountWords {
     label: "Landed",
     one: "landed",
@@ -1207,19 +1215,61 @@ pub(crate) const UPGRADED: CountWords = CountWords {
     one: "upgraded",
     many: "upgraded",
 };
-/// Times the harness stopped and asked the person (its escalations): a day line says how often (`needed you once`).
+/// Times the harness stopped and asked the person (its escalations), and how long it waited on them: one row of WHAT THE HARNESS DID ([`waited_for_you`]), a day line's `waited for you once, 1m at 18:29`, STATUS's `waited for you 4m` (§14.6). Not `stopped`: §14.3's `stopped typing` is the hold, which is no escalation.
 pub(crate) const NEEDED_YOU: CountWords = CountWords {
-    label: "Needed you",
-    one: "needed you",
-    many: "needed you",
+    label: "Waited for you",
+    one: "waited for you",
+    many: "waited for you",
 };
 
 /// Times a worker's `NEEDS YOU:` line went on the person's screen as an `owner=needs` ask while the work went on (Autopilot Cruise / Land): never a stop, so never one of [`NEEDED_YOU`]'s.
 pub(crate) const NEEDS_TOLD: CountWords = CountWords {
-    label: "Needs told",
-    one: "need told",
-    many: "needs told",
+    label: "Needs, carried on",
+    one: "need, carried on",
+    many: "needs, carried on",
 };
+
+/// WHAT THE HARNESS DID's last count row (§14.6): every count whose week is 0, each in its words, in the order the rows stand (`None in 7 days  declined · answered · resumed · relaunched · upgraded · waited for you`), so a week of nothing is one row, not a row of `0 today · 0 in 7 days` each.
+pub(crate) const NONE_IN_7_DAYS: &str = "None in 7 days";
+
+/// A WHAT THE HARNESS DID row's words over its two windows, today's then the week's, each window's part made from the window's name (`31 today · 212 in 7 days`, `2 today, 14m · 5 in 7 days, 1h 2m`).
+#[must_use]
+fn in_windows(today: impl FnOnce(&str) -> String, week: impl FnOnce(&str) -> String) -> String {
+    [today("today"), week("in 7 days")].join(crate::native_ui::FACT_SEPARATOR)
+}
+
+/// [`NEEDED_YOU`]'s row: each window's count, then how long it waited where it waited (`2 today, 14m · 5 in 7 days, 1h 2m`). A wait inside a window on an ask raised before it counts too, so a window can read `0 today, 3m`.
+#[must_use]
+fn waited_for_you(today: &HarnessStats, week: &HarnessStats) -> String {
+    let one = |s: &HarnessStats, window: &str| {
+        if s.human_wait_ms > 0 {
+            format!(
+                "{} {window}, {}",
+                s.escalated,
+                duration_words(s.human_wait_ms)
+            )
+        } else {
+            format!("{} {window}", s.escalated)
+        }
+    };
+    in_windows(|d| one(today, d), |d| one(week, d))
+}
+
+/// How long the harness waited on the person, in [`NEEDED_YOU`]'s words: `waited for you 4m` (STATUS's today line, and a row's day where the wait stands on an ask raised before the day).
+#[must_use]
+fn waited_for_you_words(wait_ms: u64) -> String {
+    format!("{} {}", NEEDED_YOU.one, duration_words(wait_ms))
+}
+
+/// How many times, in a day line's words: `once`, `twice`, `3 times`.
+#[must_use]
+fn times_words(n: u64) -> String {
+    match n {
+        1 => "once".to_string(),
+        2 => "twice".to_string(),
+        n => format!("{n} times"),
+    }
+}
 
 /// [`Families`]' words, in its order.
 pub(crate) const FAMILY_WORDS: [CountWords; 9] = [
@@ -1256,7 +1306,7 @@ fn day_line_at(
     day_line(tally, offset)
 }
 
-/// A SESSIONS ROW'S DAY (§10.3.1) from its share of today's reading: `today:`, then `needed you N times, <wait> at <the last escalation's clock>` where it needed the person, then `N needs told` where its worker's NEEDS YOU went on screen, then at most three nonzero counts, its landings first ([`Families`]' order, §12.4.1), then `partial` where its own ledgers' cut may have shortened the day — `today: needed you once, 1m at 18:29 · 31 approved · 1 kept going`, `today: 1 landed · 31 approved · 3 land prompts`.
+/// A SESSIONS ROW'S DAY (§10.3.1) from its share of today's reading: `today:`, then `waited for you N times, <wait> at <the last escalation's clock>` where it stopped and asked the person ([`NEEDED_YOU`]), or `waited for you <wait>` where the day's wait stands on an ask raised before the day, then `N needs, carried on` where its worker's NEEDS YOU went on screen ([`NEEDS_TOLD`]), then at most three nonzero counts, its landings first ([`Families`]' order, §12.4.1), then `partial` where its own ledgers' cut may have shortened the day — `today: waited for you once, 1m at 18:29 · 2 needs, carried on · 1 landed · 31 approved` (§14.6), `today: 1 landed · 31 approved · 3 land prompts`.
 #[must_use]
 pub(crate) fn day_line(
     tally: &aterm_agent::harness::stats::Tally,
@@ -1264,12 +1314,7 @@ pub(crate) fn day_line(
 ) -> Option<String> {
     let mut parts = Vec::new();
     if tally.escalated > 0 {
-        let times = match tally.escalated {
-            1 => "once".to_string(),
-            2 => "twice".to_string(),
-            n => format!("{n} times"),
-        };
-        let mut need = format!("{} {times}", NEEDED_YOU.one);
+        let mut need = format!("{} {}", NEEDED_YOU.one, times_words(tally.escalated));
         if tally.human_wait_ms > 0 {
             need.push_str(&format!(", {}", duration_words(tally.human_wait_ms)));
         }
@@ -1277,6 +1322,10 @@ pub(crate) fn day_line(
             need.push_str(&format!(" at {}", clock_words(at, offset_s)));
         }
         parts.push(need);
+    } else if tally.human_wait_ms > 0 {
+        // A wait today on an ask raised before the day: the time is still the person's, as the
+        // page's Waited for you row and STATUS's today line say it (§14.6.1 departure 3).
+        parts.push(waited_for_you_words(tally.human_wait_ms));
     }
     if tally.needs_told > 0 {
         parts.push(NEEDS_TOLD.count(tally.needs_told));

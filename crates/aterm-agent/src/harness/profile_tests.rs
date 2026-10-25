@@ -1654,6 +1654,50 @@ fn a_muse_login_store_names_its_account_alone() {
     );
 }
 
+/// agy's usage fetch is bounded whole: an agy that prints its doc and exits while a child of
+/// its own still holds stdout open ends the read at `LAUNCH_READ_BUDGET` with no doc and that
+/// child gone, never a read that waits on the child.
+#[cfg(unix)]
+#[test]
+fn an_agy_usage_fetch_is_bounded_whole() {
+    use crate::harness::stand_in::proven;
+    let mut tmp = aterm_uds::deadline::KeptUntilRan::new(tmp_dir("agy-usage-whole").keep());
+    let agy = tmp.path().join("agy");
+    let parked = aterm_spec::wait::PARKED_SECS;
+    proven(
+        &agy,
+        &format!(
+            "/bin/sleep {parked} &\nprintf '%s\\n' \"$!\" > \"$0.child\"\nprintf '%s\\n' '{{\"status\":\"SUCCESS\"}}'\nexit 0"
+        ),
+    );
+    tmp.ran();
+    let (exe, home) = (agy.clone(), tmp.path().to_path_buf());
+    let (tx, fetched) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(fetch_agy_usage_doc(&exe, &[], None, &home));
+    });
+    let got = fetched.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    // A stand-in the budget cut before it wrote its receipt left no child to look for.
+    let child = std::fs::read_to_string(tmp.path().join("agy.child"))
+        .ok()
+        .and_then(|text| text.strip_suffix('\n')?.parse::<u32>().ok());
+    assert!(
+        got.is_ok(),
+        "the fetch still waits on agy's child {child:?} holding its stdout"
+    );
+    assert_eq!(got.ok(), Some(None), "a read cut at its budget has no doc");
+    let gone = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        std::time::Duration::from_millis(20),
+        || {
+            child
+                .is_none_or(|pid| !crate::harness::upgrade_drive::alive(pid))
+                .then_some(())
+        },
+    );
+    assert!(gone.is_some(), "agy's child {child:?} outlived the read");
+}
+
 #[test]
 fn agy_subscription_reads_auth_log_and_usage_json() {
     let log_bytes = br"I1022 09:30:56.342240 375 main.go:1084] Starting CLI v1.4.5
@@ -1673,7 +1717,10 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
         Some("weekly 100% left")
     );
 
-    let tmp = tmp_dir("agy-auth");
+    // The stand-ins the fetches below run live here: it is removed only once each showed it ran.
+    let mut tmp = aterm_uds::deadline::KeptUntilRan::new(tmp_dir("agy-auth").keep());
+    #[cfg(not(unix))]
+    tmp.ran();
     let home = tmp.path().join("home");
     let cfg = home.join(".gemini/antigravity-cli");
     std::fs::create_dir_all(&cfg).expect("cfg");
@@ -1693,21 +1740,16 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
         let usage_file = tmp.path().join("usage.json");
         std::fs::write(&usage_file, usage_json).expect("write usage.json");
         let fake_agy = tmp.path().join("fake-agy.sh");
-        std::fs::write(
+        crate::harness::stand_in::proven(
             &fake_agy,
-            format!(
-                "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --config-dir*|-config-dir*) exit 2 ;;\n  esac\ndone\ncat '{}'\n",
+            &format!(
+                "for arg in \"$@\"; do\n  case \"$arg\" in\n    --config-dir*|-config-dir*) exit 2 ;;\n  esac\ndone\ncat '{}'\n",
                 usage_file.display()
             ),
-        )
-        .expect("write fake-agy.sh");
-        let mut perms = std::fs::metadata(&fake_agy).expect("stat").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&fake_agy, perms.clone()).expect("chmod");
+        );
         let exe_argv = vec![fake_agy.to_string_lossy().into_owned()];
         let store = super::super::agy_quota_store::Store::new(tmp.path(), "home");
         let fetched_sub = agy_subscription_with_store(
@@ -1767,12 +1809,11 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
         )
         .expect("write switched usage");
         let local_agy = local_bin.join("agy");
-        std::fs::write(
+        crate::harness::stand_in::proven(
             &local_agy,
-            format!("#!/bin/sh\ncat '{}'\n", switched_usage.display()),
-        )
-        .expect("write local agy");
-        std::fs::set_permissions(&local_agy, perms).expect("chmod local agy");
+            &format!("cat '{}'\n", switched_usage.display()),
+        );
+        tmp.ran();
         std::fs::write(
             cfg.join("cli.log"),
             br"I1022 09:35:00.000000 375 server_oauth.go:224] applyAuthResult: email=second@example.com, authMethod=consumer, quotaProject=

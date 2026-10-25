@@ -751,7 +751,7 @@ mod tests {
     #[test]
     fn rate_limit_passthrough_reports_absence_of_an_engine() {
         let mut state = PolicyState::new();
-        let clock = aterm_policy::limits::SystemClock;
+        let clock = crate::terminal::response_rate_limiter::BatchClock(aterm_time::Instant::now());
         assert_eq!(
             state.rate_limit_try_consume("response", 1, &clock),
             None,
@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn response_slot_answers_exactly_as_the_id_does() {
-        let clock = aterm_policy::limits::SystemClock;
+        let clock = crate::terminal::response_rate_limiter::BatchClock(aterm_time::Instant::now());
         let mut by_id = PolicyState::new();
         let mut by_slot = PolicyState::new();
         by_id.install(PolicyEngine::new(profiles::standard()));
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn response_slot_allows_when_the_policy_declares_no_response_bucket() {
         let mut state = PolicyState::new();
-        let clock = aterm_policy::limits::SystemClock;
+        let clock = crate::terminal::response_rate_limiter::BatchClock(aterm_time::Instant::now());
         state.install(PolicyEngine::new(policy_with_limits(&[("palette", 0)])));
         assert_eq!(
             state.response_rate_limit_try_consume(u64::MAX, &clock),
@@ -822,7 +822,7 @@ mod tests {
 
     #[test]
     fn response_slot_follows_the_id_not_the_declaration_order() {
-        let clock = aterm_policy::limits::SystemClock;
+        let clock = crate::terminal::response_rate_limiter::BatchClock(aterm_time::Instant::now());
         let mut state = PolicyState::new();
         state.install(PolicyEngine::new(policy_with_limits(&[
             ("palette", 0),

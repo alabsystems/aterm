@@ -4,7 +4,8 @@
 //! Tier-1 conformance tests for `TrustFactsReuse` (`trust_facts_reuse_model`).
 
 use crate::trust_facts::{
-    self, Crate, Decision, Facts, Measured, Prover, RATCHET, TrustCmd, Update, facts_for, testing,
+    self, Crate, Decision, Facts, Measured, Pace, Prover, RATCHET, TrustCmd, Update, facts_for,
+    testing,
 };
 
 use std::collections::BTreeMap;
@@ -21,6 +22,22 @@ const DRV: &str = "targo 1.99.0-dev (321aaeda7 2026-09-17) (targo 0.1.0)";
 const OTHER: &str = "targo 1.99.0-dev (bbbbbbbbb 2026-09-24) (targo 0.1.0)";
 const TRUSTC: &str = "321aaeda75478038420d97830f14724c33c8dc39";
 const REASON: &str = "the new prover proves one fewer (trust change, owner-approved)";
+
+/// A starved run: CPU/wall 0.4 at load 30 on 14 cores.
+const STARVED: Pace = Pace {
+    cpu_ms: 4,
+    wall_ms: 10,
+    load: Some(3000),
+    cores: 14,
+};
+
+/// A loaded run that was not starved: CPU/wall 0.9 at load 10 on 14 cores.
+const UNSTARVED: Pace = Pace {
+    cpu_ms: 9,
+    wall_ms: 10,
+    load: Some(1000),
+    cores: 14,
+};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = crate::ledger::testing::git()
@@ -45,6 +62,8 @@ struct Harness {
     state: State,
     src_of: BTreeMap<String, i64>,
     steps: usize,
+    /// The word the judge gave the last run.
+    word: &'static str,
 }
 
 impl Drop for Harness {
@@ -88,6 +107,7 @@ impl Harness {
             state,
             src_of: BTreeMap::new(),
             steps: 0,
+            word: "",
         };
         let head = h.commit(&[
             ("crates/alpha/src/lib.rs", "v0"),
@@ -243,28 +263,30 @@ impl Harness {
         self.step("SwapProver", next);
     }
 
-    fn alpha(proved: i64, lapsed: u64) -> Crate {
+    fn alpha(proved: i64, lapsed: u64, pace: Option<Pace>) -> Crate {
         Crate::new(
             "alpha",
             Decision::Gate(Measured {
                 rc: "0".into(),
                 summary: format!("Summary: {proved} proved (9 total)"),
                 lapsed,
+                pace,
                 ..Measured::default()
             }),
         )
     }
 
-    fn run_as(&mut self, action: &str, loaded: bool) {
+    /// A loaded run (`Some` pace) lapses one obligation: in a starved run its shortfall is the
+    /// clock's and undecided, in one that was not it is the code's. Neither is a PASS.
+    fn run_as(&mut self, action: &str, loaded: Option<Pace>) {
         let head = self.head();
         let src = self.src_of[&head];
         for e in fs::read_dir(self.store()).into_iter().flatten().flatten() {
             let _ = fs::remove_file(e.path());
         }
-        let alpha = if loaded {
-            Harness::alpha(src - 1, 1)
-        } else {
-            Harness::alpha(src, 0)
+        let alpha = match loaded {
+            Some(pace) => Harness::alpha(src - 1, 1, Some(pace)),
+            None => Harness::alpha(src, 0, None),
         };
         let filed = testing::file(
             &self.cli(),
@@ -277,15 +299,16 @@ impl Harness {
         let record = Facts::parse(&fs::read_to_string(&filed).unwrap()).unwrap();
         let f = self.project_record(&record);
         let ratchet = trust_facts::ratchet_at(&self.cli(), &head).unwrap();
-        let pass = trust_facts::judge(
+        self.word = trust_facts::judge(
             &record,
             ratchet.as_deref(),
+            None,
             RATCHET,
             trust_facts::MEMORY,
             Update::NONE,
         )
-        .word
-            == "PASS";
+        .word;
+        let pass = self.word == "PASS";
         let (f_floor, f_other, f_why) = self.floor_at(&record.provenance.clone().unwrap().head);
         let next = self.cleared(&[
             ("filed", 1),
@@ -304,11 +327,15 @@ impl Harness {
     }
 
     fn run(&mut self) {
-        self.run_as("Run", false);
+        self.run_as("Run", None);
     }
 
     fn run_under_load(&mut self) {
-        self.run_as("RunUnderLoad", true);
+        self.run_as("RunUnderLoad", Some(STARVED));
+    }
+
+    fn run_under_load_unstarved(&mut self) {
+        self.run_as("RunUnderLoad", Some(UNSTARVED));
     }
 
     fn remeasure(&mut self) {
@@ -339,7 +366,7 @@ impl Harness {
             prover,
             commit,
             DRV,
-            vec![Harness::alpha(src, 0)],
+            vec![Harness::alpha(src, 0, None)],
         );
         let facts = Facts::parse(&fs::read_to_string(path).unwrap()).unwrap();
         let _ = fs::remove_dir_all(&dir);
@@ -573,6 +600,7 @@ fn the_unchecked_reuse_reader_is_refused() {
     let judged = trust_facts::judge(
         &facts,
         ratchet.as_deref(),
+        None,
         RATCHET,
         trust_facts::MEMORY,
         Update::NONE,
@@ -598,13 +626,24 @@ fn the_retired_floor_excuses_are_refused() {
     h.assemble();
     assert_eq!(h.answer(), (1, 2));
 
-    let mut h = Harness::new("timed-out");
-    h.edit_source();
-    h.raise();
-    h.run_under_load();
-    h.refuses_a_pass("the lane's BELOW-FLOOR-TIMED-OUT");
-    h.assemble();
-    assert_eq!(h.answer(), (1, 2));
+    for (label, starved) in [("timed-out", true), ("timed-out-unstarved", false)] {
+        let mut h = Harness::new(label);
+        h.edit_source();
+        h.raise();
+        if starved {
+            h.run_under_load();
+        } else {
+            h.run_under_load_unstarved();
+        }
+        assert_eq!(
+            h.word,
+            if starved { "COULD-NOT-RUN" } else { "FAIL" },
+            "{label}: the clock's only in a starved run"
+        );
+        h.refuses_a_pass("the lane's BELOW-FLOOR-TIMED-OUT");
+        h.assemble();
+        assert_eq!(h.answer(), (1, 2), "{label}");
+    }
 
     let mut h = Harness::new("rebase");
     h.raise();
@@ -618,6 +657,7 @@ fn the_retired_floor_excuses_are_refused() {
     let judged = trust_facts::judge(
         &facts,
         trust_facts::ratchet_at(&h.cli(), &head).unwrap().as_deref(),
+        None,
         RATCHET,
         trust_facts::MEMORY,
         Update::NONE,

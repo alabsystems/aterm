@@ -66,6 +66,7 @@ fn reply(host: usize, rows: Vec<String>) -> HostReply {
         label: format!("pid {}", 1000 + host),
         remote: false,
         unproven: false,
+        node: None,
         answer: parse_reply(&lines),
     }
 }
@@ -356,6 +357,7 @@ fn thirty_lab_macs_keep_each_machines_most_pressing_words() {
                 label: format!("Lab-Mac-{h:02}.local"),
                 remote: true,
                 unproven: false,
+                node: None,
                 answer: parse_reply(&lines),
             }
         })
@@ -452,6 +454,7 @@ fn a_hostile_title_and_excerpt_render_escaped() {
         label: "lab".into(),
         remote: false,
         unproven: false,
+        node: None,
         answer: parse_reply(&lines),
     }];
     let full = render_sid(&hostile, "s-00000000000000000002", None).expect("found");
@@ -510,6 +513,7 @@ fn the_json_form_with_a_sid_is_that_session_alone() {
             label: "pid 77".into(),
             remote: false,
             unproven: false,
+            node: None,
             answer: Err("server replied: ERR unknown verb 'survey'".into()),
         },
     ];
@@ -529,6 +533,7 @@ fn the_json_form_is_every_record() {
             label: "pid 77".into(),
             remote: false,
             unproven: false,
+            node: None,
             answer: Err("server replied: ERR unknown verb 'survey'".into()),
         },
     ];
@@ -669,6 +674,7 @@ fn peer(host: usize, level: &str, busy: usize, shells: usize) -> HostReply {
         label: format!("lab-{host:02}"),
         remote: true,
         unproven: false,
+        node: None,
         answer: parse_reply(&peer_lines(host, level, busy, shells)),
     }
 }
@@ -690,6 +696,7 @@ fn unanswered(label: &str, why: &str) -> HostReply {
         label: label.to_owned(),
         remote: true,
         unproven: false,
+        node: None,
         answer: Err(why.to_owned()),
     }
 }
@@ -769,6 +776,7 @@ fn a_peer_header_keeps_its_counts_and_its_reply_cap() {
             label: label.to_owned(),
             remote: true,
             unproven: false,
+            node: None,
             answer: parse_reply(&lines),
         };
         render_text(&[reply], DEFAULT_BUDGET, None)
@@ -846,6 +854,7 @@ fn a_peer_cannot_pass_for_this_machine() {
         .to_owned(),
         remote,
         unproven: false,
+        node: None,
         answer: parse_reply(&lines),
     };
     let peer = [from(true)];
@@ -883,6 +892,7 @@ fn a_cut_reply_says_what_it_left_out() {
             label: "lab".into(),
             remote: false,
             unproven: false,
+            node: None,
             answer: parse_reply(&lines),
         };
         render_text(&[reply], DEFAULT_BUDGET, None)
@@ -921,6 +931,7 @@ fn a_sid_the_reply_cap_may_have_hidden_says_so() {
             label: label.into(),
             remote: true,
             unproven: false,
+            node: None,
             answer: parse_reply(&lines),
         }
     };
@@ -1545,6 +1556,7 @@ fn a_raised_attention_line_is_shown() {
             label: "m7".into(),
             remote: true,
             unproven: false,
+            node: None,
             answer: facts,
         }],
         DEFAULT_BUDGET,
@@ -1677,6 +1689,7 @@ fn one_cause_that_refused_every_peer_is_said_once() {
         answer: Err("no route to 10.0.0.7".to_owned()),
         fault,
         unproven: false,
+        node: None,
     };
     use PeerFault::{NoNetwork, NoRoute, NotDialled, NotPermitted, Other};
     let note =
@@ -1771,6 +1784,7 @@ fn a_peer_row_cannot_forge_a_header_or_the_you_mark() {
         label: "lab-07".to_owned(),
         remote,
         unproven: false,
+        node: None,
         answer: parse_reply(&lines),
     };
     let peer = render_text(&[from(true)], DEFAULT_BUDGET, Some("s-1"));
@@ -1807,6 +1821,7 @@ fn stub_fleet(_: &FleetAsk<'_>) -> Result<FleetRead, String> {
             answer: Ok(peer_lines(1, "content", 12, 4)),
             fault: PeerFault::Other,
             unproven: false,
+            node: None,
         }],
         note: Some(STUB_NOTE.to_owned()),
     })
@@ -1868,6 +1883,7 @@ fn a_peer_with_more_instances_than_one_read_says_so() {
             label: "lab".to_owned(),
             remote,
             unproven: false,
+            node: None,
             answer: parse_reply(&lines),
         };
         render_text(&[reply], DEFAULT_BUDGET, None)
@@ -1887,6 +1903,7 @@ fn a_peer_whose_node_is_unproven_says_so() {
         label: label.to_owned(),
         remote,
         unproven,
+        node: None,
         answer: parse_reply(&[
             "instance pid=7 host=lab version=0.105.0 sessions=0 level=content at_ms=1".to_owned(),
         ]),
@@ -1907,6 +1924,26 @@ fn a_peer_whose_node_is_unproven_says_so() {
     assert!(!header(reply(false, true, "lab")).contains("unproven"));
     assert!(render_json(&[reply(true, true, "lab")]).contains(r#""fleet":true,"unproven":true"#));
     assert!(!render_json(&[reply(true, false, "lab")]).contains("unproven"));
+}
+
+#[test]
+fn an_unanswered_peer_row_names_the_node_it_was_asked_for() {
+    let node = "17df7cfa".repeat(4);
+    let unanswered = |node: Option<String>| HostReply {
+        label: "127.0.0.1:58733".to_owned(),
+        remote: true,
+        unproven: false,
+        node,
+        answer: Err("nothing listens on 127.0.0.1:58733".to_owned()),
+    };
+    assert_eq!(
+        render_json(&[unanswered(Some(node.clone()))]),
+        format!(
+            "[{{\"label\":\"127.0.0.1:58733\",\"fleet\":true,\"node\":\"{node}\",\"error\":\
+             \"nothing listens on 127.0.0.1:58733\"}}]\n"
+        )
+    );
+    assert!(!render_json(&[unanswered(None)]).contains("\"node\""));
 }
 
 #[test]

@@ -256,7 +256,7 @@ impl Driver {
         match self {
             Self::Lima(l) => {
                 if stops_vm(booted_here, keep) {
-                    let out = l.run(&["stop".into(), crate::linux::VM.into()]);
+                    let out = l.stop();
                     if out.ok() {
                         println!("linux: VM stopped (this run booted it)");
                     } else {

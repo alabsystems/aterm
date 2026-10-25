@@ -1132,6 +1132,11 @@ pub const WANTS: &[Want] = &[
     },
     Want {
         under: Under::Scenario(Scenario::L7),
+        name: "This Mac counts every held Land tab as landing, less those whose need it counts",
+        judge: l7_here,
+    },
+    Want {
+        under: Under::Scenario(Scenario::L7),
         name: "the page counts every landing: today N landed, Every session N landed beside the landing",
         judge: l7_page,
     },
@@ -1717,6 +1722,67 @@ fn l7_rows(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     told(said, &bad, &unread)
 }
 
+/// Whether a Land tab's `status` says its hold stands: `land_nudges=` a count, where `-` is no
+/// hold (the line's `land_fields`) — Land's instruction typed, the tab not landed. `None` where
+/// the line has no `land_nudges=` at all: a hold this read cannot see either way.
+#[must_use]
+pub fn held_at_rest(status: &str) -> Option<bool> {
+    word(status, "land_nudges").map(|n| n != "-")
+}
+
+/// L7 widened (§14.6): at rest, This Mac counts every Land tab that holds as `landing`, less
+/// those whose need it counts first (`need you`): `held_landing` less `held_needs` of the rest
+/// read, exactly, and a build whose This Mac calls a held tab `resting` fails. It never passes on
+/// `-` (§14.0 limit 7): UNOBSERVED where an open Land tab's `status` names no hold either way
+/// (`held_unread`), where no Land tab holds at rest, and where This Mac counts a wait, which
+/// counts first and which no `status` attributes to a tab.
+fn l7_here(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
+    let Some(rest) = seen.window.rest.as_deref() else {
+        return Verdict::Unobserved(UNREST.into());
+    };
+    let n = |key: &str| word(rest, key).and_then(|v| v.parse::<usize>().ok());
+    let (Some(held), Some(needs), Some(unread)) =
+        (n("held_landing"), n("held_needs"), n("held_unread"))
+    else {
+        return Verdict::Unobserved(format!("the rest read lacks its counts: {rest}"));
+    };
+    let Some(counts) = quoted(rest, "here")
+        .as_deref()
+        .and_then(|h| h.strip_prefix("This Mac \u{2014} "))
+        .map(str::to_string)
+    else {
+        return Verdict::Unobserved("the menu's This Mac row was never read at rest".into());
+    };
+    let here = format!("This Mac \u{2014} {counts}");
+    if unread > 0 {
+        return Verdict::Unobserved(format!(
+            "{unread} open Land tab(s) whose status names no land_nudges=, so no hold of theirs was read; This Mac \"{here}\""
+        ));
+    }
+    if held == 0 {
+        return Verdict::Unobserved(format!(
+            "no Land tab held at rest, so nothing for This Mac to count landing; This Mac \"{here}\""
+        ));
+    }
+    let waits = count_in(&counts, "waiting");
+    if waits > 0 {
+        return Verdict::Unobserved(format!(
+            "This Mac counts {waits} waiting, which count before landing and which no status names by tab; This Mac \"{here}\""
+        ));
+    }
+    let want = held.saturating_sub(needs);
+    let landing = count_in(&counts, "landing");
+    let said = format!(
+        "This Mac \"{here}\"; {held} Land tab(s) held at rest, {needs} of them with a need it counts first"
+    );
+    let bad = if landing == want {
+        Vec::new()
+    } else {
+        vec![format!("{landing} landing, not {want}")]
+    };
+    told(said, &bad, &[])
+}
+
 /// What one title read says of its chain's mode ([`title_says`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TitleSays {
@@ -1725,7 +1791,8 @@ pub enum TitleSays {
     /// Under Land, a READ hold's words in the sentence's place (`not landed yet: …`, §12.4.12).
     Held,
     /// A face past Land's own (`land, landed`, `land, quiet`): no mode sentence to say. It holds
-    /// the `face=` that says it (`landed`, `theirs`).
+    /// the `face=` that says it (`landed`, `theirs`). A landed title says
+    /// [`LANDED_WORDS`](aterm_agent::supervise::mode_words::LANDED_WORDS) whole (§14.9, 9a).
     Past(&'static str),
     /// Anything else, and why.
     Wrong(String),
@@ -1733,16 +1800,27 @@ pub enum TitleSays {
 
 /// What title `t` says of chain mode `mode` (`cruise`, `land`, `off`): its phrase, ` — `, and the
 /// mode's sentence from [`MODE_WORDS`](aterm_agent::supervise::mode_words::MODE_WORDS) whole, then
-/// the title's end or its next part (` · `).
+/// the title's end or its next part (` · `). A landed title says
+/// [`LANDED_WORDS`](aterm_agent::supervise::mode_words::LANDED_WORDS) so, never "remote main"
+/// (§14.9, 9a).
 #[must_use]
 pub fn title_says(t: &str, mode: &str) -> TitleSays {
     use aterm_agent::supervise::Autopilot;
-    use aterm_agent::supervise::mode_words::mode_words;
+    use aterm_agent::supervise::mode_words::{LANDED_WORDS, mode_words};
     let Some(m) = Autopilot::ALL.into_iter().find(|m| m.word() == mode) else {
         return TitleSays::Wrong(format!("no mode {mode:?}"));
     };
     let sentence = mode_words(m).chip;
     if m == Autopilot::Land && t.starts_with("autopilot: land, landed") {
+        let landed = t
+            .split_once(" \u{2014} ")
+            .and_then(|(_, rest)| rest.strip_prefix(LANDED_WORDS))
+            .is_some_and(|after| after.is_empty() || after.starts_with(" \u{b7} "));
+        if !landed || t.contains("remote main") {
+            return TitleSays::Wrong(format!(
+                "a landed title whose sentence is not {LANDED_WORDS:?}"
+            ));
+        }
         return TitleSays::Past("landed");
     }
     if m == Autopilot::Land && t.starts_with("autopilot: land, quiet") {
@@ -1900,24 +1978,44 @@ fn title_words(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 /// The page's key of WHAT THE HARNESS DID's Landed row (4c).
 const DID_LANDED: &str = "harness/did/row/landed";
 
+/// The page's key of WHAT THE HARNESS DID's last count row (6a), which names each count whose week
+/// is 0 in place of its row (`None in 7 days: declined · landed · upgraded`).
+const DID_NONE: &str = "harness/did/row/none-in-7-days";
+
+/// What the None row's label starts with, and the word it names a Landed row of none by.
+const DID_NONE_HEAD: &str = "None in 7 days: ";
+const DID_NONE_LANDED: &str = "landed";
+
+/// Whether `label`, the None row's, names the Landed count: a whole ` · ` part, so `landed` never
+/// matches inside another count's words.
+fn none_names_landed(label: &str) -> bool {
+    label
+        .strip_prefix(DID_NONE_HEAD)
+        .is_some_and(|names| names.split(" \u{b7} ").any(|n| n == DID_NONE_LANDED))
+}
+
 /// The page's HARNESS UPDATES card, which stands below WHAT THE HARNESS DID and its settings.
 const UPDATES: &str = "harness/updates";
 
 /// The most wheel steps END's read of WHAT THE HARNESS DID takes down the page.
 const DID_WHEELS: usize = 60;
 
-/// Extracts WHAT THE HARNESS DID's Landed row from Harness page `rows`.
+/// Extracts WHAT THE HARNESS DID's Landed row from Harness page `rows`, or, where no Landed row
+/// stands, the None row in its place (6a), which names `landed` in a week with no landing. The
+/// None row is the last of the counts, under the Landed row's place, so a None row that does not
+/// name `landed` is a page that dropped the count: it is read, and [`l7_did`] fails it.
 #[must_use]
 pub fn did_landed_of(rows: &[(String, String)]) -> Option<String> {
     rows.iter()
         .find(|(k, _)| k == DID_LANDED)
+        .or_else(|| rows.iter().find(|(k, _)| k == DID_NONE))
         .map(|(_, l)| l.clone())
 }
 
 /// What a screen of the page, read from its top down, says of WHAT THE HARNESS DID's Landed row.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DidStep {
-    /// The row, on this screen.
+    /// The row (or the None row in its place, [`did_landed_of`]), on this screen.
     Read(String),
     /// HARNESS UPDATES is on the screen and the row is not: the row passed no screen, since a step
     /// never moves more than the screen shows.
@@ -2064,7 +2162,9 @@ fn read_did(door: &Door<'_>, desk: &Desk) -> Result<(Option<String>, String), Fa
 }
 
 /// L7 on the page's WHAT THE HARNESS DID (4c), at rest: `Landed: N today · M in 7 days`, N the
-/// run's landings this local day (as the today line counts them), M at least N.
+/// run's landings this local day (as the today line counts them), M at least N; a week with none
+/// names `landed` in `None in 7 days` (6a), read as `0 today · 0 in 7 days`, and a None row that
+/// does not name it, with no Landed row, fails.
 fn l7_did(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
     let Some(rest) = seen.window.rest.as_deref() else {
         return Verdict::Unobserved(UNREST.into());
@@ -2077,14 +2177,21 @@ fn l7_did(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
             "WHAT THE HARNESS DID's Landed row was never on the page's screen".into(),
         );
     };
-    let counts = did.strip_prefix("Landed: ").and_then(|r| {
-        let (t, w) = r.split_once(" \u{b7} ")?;
-        let t = t.strip_suffix(" today")?.parse::<usize>().ok()?;
-        let w = w.strip_suffix(" in 7 days")?.parse::<usize>().ok()?;
-        Some((t, w))
-    });
+    let counts = if none_names_landed(&did) {
+        Some((0, 0))
+    } else {
+        did.strip_prefix("Landed: ").and_then(|r| {
+            let (t, w) = r.split_once(" \u{b7} ")?;
+            let t = t.strip_suffix(" today")?.parse::<usize>().ok()?;
+            let w = w.strip_suffix(" in 7 days")?.parse::<usize>().ok()?;
+            Some((t, w))
+        })
+    };
     let said = format!("the Landed row \"{did}\"; {landings} landing(s) in the run today");
     let bad = match counts {
+        None if did.starts_with(DID_NONE_HEAD) => {
+            vec!["`landed` is neither its own row nor named in `None in 7 days`".to_string()]
+        }
         None => vec!["not `Landed: N today · M in 7 days`".to_string()],
         Some((t, _)) if t != landings => vec![format!("{t} today, not {landings}")],
         Some((t, w)) if w < t => vec![format!("{w} in 7 days, fewer than {t} today")],
@@ -3417,6 +3524,7 @@ pub(super) fn end_steps(
         .find(|r| r.section == "here")
         .map_or_else(String::new, |r| r.label.clone());
     let (mut landed_tabs, mut landing_tabs) = (0, 0);
+    let (mut held_landing, mut held_needs, mut held_unread) = (0, 0, 0);
     for t in tabs.iter() {
         let s = on(door, &t.sid, &["status"]);
         if word(&s, "autopilot").as_deref() != Some("land") {
@@ -3425,7 +3533,19 @@ pub(super) fn end_steps(
         match word(&s, "task").as_deref() {
             Some("landed") => landed_tabs += 1,
             Some("theirs") => {}
-            _ => landing_tabs += 1,
+            _ => {
+                landing_tabs += 1;
+                match held_at_rest(&s) {
+                    Some(true) => {
+                        held_landing += 1;
+                        if word(&s, "needs").is_some_and(|n| n != "-") {
+                            held_needs += 1;
+                        }
+                    }
+                    Some(false) => {}
+                    None => held_unread += 1,
+                }
+            }
         }
     }
     let day = local_day(now_ms());
@@ -3467,7 +3587,7 @@ pub(super) fn end_steps(
         did
     };
     let rest = format!(
-        "here={} landed_tabs={landed_tabs} landing_tabs={landing_tabs} landings={landings} today={} every={} did={}",
+        "here={} landed_tabs={landed_tabs} landing_tabs={landing_tabs} held_landing={held_landing} held_needs={held_needs} held_unread={held_unread} landings={landings} today={} every={} did={}",
         q(&here),
         q(today.as_deref().unwrap_or("-")),
         q(every.as_deref().unwrap_or("-")),

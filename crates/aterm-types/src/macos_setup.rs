@@ -898,7 +898,8 @@ impl Drop for MacosDialog {
 }
 
 /// The per-revision record of access steps, a text file in aterm's state
-/// directory: one `<revision> <row> <outcome>` line per step. Unknown lines are
+/// directory: one `<revision> <row> <outcome>` line per step that changed its row's outcome
+/// (a repeat of the row's latest is not written again). Unknown lines are
 /// skipped, so an older or newer aterm can share the file. [`access_record::append`] tells the
 /// registered watcher ([`access_record::on_append`]) once each line is on disk; System State's
 /// Access rows and a run parked on the Permissions stage wait for that.
@@ -916,7 +917,7 @@ pub mod access_record {
     /// Lines kept when the file is rewritten: a few revisions of every row.
     const KEEP: usize = 64;
 
-    /// Called after each line [`append`] wrote: the setup worker registers its
+    /// Called once each outcome [`append`] was given is on disk: the setup worker registers its
     /// re-reading of the Access rows and its wake.
     static APPENDED: std::sync::OnceLock<fn(u64, Access, AccessOutcome)> =
         std::sync::OnceLock::new();
@@ -928,8 +929,9 @@ pub mod access_record {
         let _ = APPENDED.set(appended);
     }
 
-    /// Append one step's outcome for `revision`, keeping the file short; once it
-    /// is on disk, the registered watcher ([`on_append`]) is told.
+    /// Append one step's outcome for `revision`, keeping the file short: an outcome that is
+    /// already its row's latest in `revision` is not written again. Once it is on disk, the
+    /// registered watcher ([`on_append`]) is told.
     ///
     /// # Errors
     /// The existing record cannot be read, or the state directory cannot be written.
@@ -973,6 +975,15 @@ pub mod access_record {
         };
         let mut lines: Vec<String> = previous.lines().map(str::to_owned).collect();
         after_read();
+        // Every reader takes the latest line per row, so a repeat (each new process that judges
+        // the same step again) adds nothing it reads, and would only push older steps out of
+        // the kept lines: a revision's Local Network step, its first, would be asked again.
+        let latest = outcomes(&previous, revision)
+            .rev()
+            .find_map(|(row, was)| (row == access).then_some(was));
+        if latest == Some(outcome) {
+            return Ok(());
+        }
         lines.push(format!("{revision} {} {}", access.word(), outcome.word()));
         let start = lines.len().saturating_sub(KEEP);
         let staging = aterm_tempfile::Builder::new()
@@ -1039,17 +1050,25 @@ pub mod access_record {
     /// Every outcome recorded for `revision`, oldest first.
     #[must_use]
     pub fn read(dir: &Path, revision: u64) -> Vec<(Access, AccessOutcome)> {
-        std::fs::read_to_string(dir.join(FILE))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| {
-                let mut words = line.split_whitespace();
-                let at = words.next()?.parse::<u64>().ok()?;
-                let access = Access::parse(words.next()?)?;
-                let outcome = AccessOutcome::parse(words.next()?)?;
-                (at == revision && words.next().is_none()).then_some((access, outcome))
-            })
-            .collect()
+        outcomes(
+            &std::fs::read_to_string(dir.join(FILE)).unwrap_or_default(),
+            revision,
+        )
+        .collect()
+    }
+
+    /// The outcomes the record's `text` holds for `revision`, oldest first.
+    fn outcomes(
+        text: &str,
+        revision: u64,
+    ) -> impl DoubleEndedIterator<Item = (Access, AccessOutcome)> + '_ {
+        text.lines().filter_map(move |line| {
+            let mut words = line.split_whitespace();
+            let at = words.next()?.parse::<u64>().ok()?;
+            let access = Access::parse(words.next()?)?;
+            let outcome = AccessOutcome::parse(words.next()?)?;
+            (at == revision && words.next().is_none()).then_some((access, outcome))
+        })
     }
 
     /// The latest outcome recorded for `access` in `revision`.
@@ -1478,17 +1497,57 @@ mod tests {
             access_record::latest(root, 8, Access::Debugger),
             Some(AccessOutcome::Declined)
         );
+        let lines = || {
+            std::fs::read_to_string(root.join(access_record::FILE))
+                .unwrap()
+                .lines()
+                .count()
+        };
         for n in 0..100 {
-            access_record::append(root, 9, Access::LocalNetwork, AccessOutcome::Triggered).unwrap();
-            assert!(
-                std::fs::read_to_string(root.join(access_record::FILE))
-                    .unwrap()
-                    .lines()
-                    .count()
-                    <= 64,
-                "{n}"
-            );
+            let outcome = [AccessOutcome::Triggered, AccessOutcome::Granted][n % 2];
+            access_record::append(root, 9, Access::LocalNetwork, outcome).unwrap();
+            assert!(lines() <= 64, "{n}");
         }
+        assert_eq!(lines(), 64, "the file is kept to its last lines");
+    }
+
+    /// A step judged again in each new process (a Not now that still holds) repeats its row's
+    /// latest outcome: the record keeps it once, so it never pushes the revision's earlier steps,
+    /// Local Network's first, out of the kept lines. A changed outcome is written, a repeat of an
+    /// earlier one included, and so is the same outcome in another revision.
+    #[test]
+    fn the_access_record_does_not_repeat_a_rows_latest_outcome() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let lines = || {
+            std::fs::read_to_string(root.join(access_record::FILE))
+                .unwrap()
+                .lines()
+                .count()
+        };
+        access_record::append(root, 9, Access::LocalNetwork, AccessOutcome::Triggered).unwrap();
+        for _ in 0..100 {
+            access_record::append(root, 9, Access::FullDiskAccess, AccessOutcome::Declined)
+                .unwrap();
+        }
+        assert_eq!(lines(), 2);
+        assert_eq!(
+            access_record::latest(root, 9, Access::LocalNetwork),
+            Some(AccessOutcome::Triggered)
+        );
+        access_record::append(root, 9, Access::FullDiskAccess, AccessOutcome::Handed).unwrap();
+        access_record::append(root, 9, Access::FullDiskAccess, AccessOutcome::Declined).unwrap();
+        access_record::append(root, 10, Access::FullDiskAccess, AccessOutcome::Declined).unwrap();
+        assert_eq!(lines(), 5);
+        assert_eq!(
+            access_record::read(root, 9),
+            vec![
+                (Access::LocalNetwork, AccessOutcome::Triggered),
+                (Access::FullDiskAccess, AccessOutcome::Declined),
+                (Access::FullDiskAccess, AccessOutcome::Handed),
+                (Access::FullDiskAccess, AccessOutcome::Declined),
+            ]
+        );
     }
 
     /// The watcher reads the line back from disk; a failed write tells it nothing.

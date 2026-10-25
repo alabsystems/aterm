@@ -777,15 +777,51 @@ pub fn client_handshake_as(
     op: FleetOp,
     within: Duration,
 ) -> Result<Dialed, FleetError> {
-    let watchdog = arm(&tcp, within)?;
+    client_handshake_by(tcp, secret, me, op, within).map_err(|undialed| undialed.error)
+}
+
+/// A dialer's handshake that did not complete ([`client_handshake_by`]).
+#[derive(Debug)]
+pub struct Undialed {
+    /// What failed.
+    pub error: FleetError,
+    /// The node the listener proved beside its refusal of this end's op or share, past both
+    /// proofs of the secret (a listener from this build on, under [`ALPN_NODES`]).
+    pub refused_by: Option<NodeProof>,
+}
+
+/// [`client_handshake_as`], with the node that refused this end, when the listener proved one.
+/// # Errors
+/// As [`client_handshake_as`].
+pub fn client_handshake_by(
+    tcp: TcpStream,
+    secret: &FleetSecret,
+    me: Option<&NodeIdentity>,
+    op: FleetOp,
+    within: Duration,
+) -> Result<Dialed, Undialed> {
+    let mut refused_by = None;
+    let undialed = |error: FleetError, refused_by: Option<NodeProof>| Undialed {
+        refused_by: refused_by
+            .filter(|_| matches!(error, FleetError::UnknownOp(_) | FleetError::AddressBusy)),
+        error,
+    };
+    let watchdog = arm(&tcp, within).map_err(|e| undialed(e, None))?;
     let (mut transport, (scope, peer)) = bounded(tcp, watchdog, within, |tcp| {
         let (mut transport, nodes) = connect_tls(tcp, client_config())?;
         let exporter = transport.exporter().to_vec();
         let me = me.filter(|_| nodes);
-        let proved = dialer_proves(transport.stream(), &exporter, (secret, me, nodes), op)?;
+        let proved = dialer_proves(
+            transport.stream(),
+            &exporter,
+            (secret, me, nodes),
+            op,
+            &mut refused_by,
+        )?;
         Ok((transport, proved))
-    })?;
-    release_deadlines(transport.stream().get_ref())?;
+    })
+    .map_err(|e| undialed(e, refused_by.take()))?;
+    release_deadlines(transport.stream().get_ref()).map_err(|e| undialed(e, None))?;
     Ok(Dialed {
         transport,
         scope,
@@ -798,6 +834,10 @@ pub const HANDSHAKE_WITHIN: Duration = Duration::from_secs(3);
 
 /// Maximum lifetime (30 s) [`serve`] allows a proved connection before cutting it.
 pub const SERVED_WITHIN: Duration = Duration::from_secs(30);
+
+/// How often a running aterm's fleet listener reads its key again, so a join's new key is
+/// served within it (`aterm-gui`'s `fleet_listen::RETRY`).
+pub const KEY_READ_EVERY: Duration = Duration::from_secs(2);
 
 /// Default maximum concurrent connections (handshaking or proved) on a fleet listener.
 pub const MAX_SLOTS: usize = 16;
@@ -1619,23 +1659,32 @@ fn listener_proves<S: Read + Write>(
     } else {
         None
     };
+    // Past both proofs of the secret, a refusal names this node as `OK` does, so the dialer knows
+    // which node refused it.
+    let node = nodes.then(|| node_line(me, Signer::Listener, exporter));
     let Some(op) = FleetOp::from_word(word).filter(|op| serves.contains(op)) else {
-        return refuse(stream, "op", FleetError::UnknownOp(word.to_owned()));
+        return refuse_as(stream, "op", FleetError::UnknownOp(word.to_owned()), node);
     };
     if !admit(op) {
-        return refuse(stream, "capacity", FleetError::AddressBusy);
+        return refuse_as(stream, "capacity", FleetError::AddressBusy, node);
     }
-    let mut verdict = String::from("OK\n");
-    if nodes {
-        verdict.push_str(&node_line(me, Signer::Listener, exporter));
-    }
-    send(stream, &verdict)?;
+    send(stream, &format!("OK\n{}", node.unwrap_or_default()))?;
     Ok((op, peer))
 }
 
 fn refuse<S: Write, T>(stream: &mut S, why: &str, error: FleetError) -> Result<T, FleetError> {
+    refuse_as(stream, why, error, None)
+}
+
+/// [`refuse`], with this end's node line after the refusal where it is one.
+fn refuse_as<S: Write, T>(
+    stream: &mut S,
+    why: &str,
+    error: FleetError,
+    node: Option<String>,
+) -> Result<T, FleetError> {
     let _ = stream
-        .write_all(format!("NO {why}\n").as_bytes())
+        .write_all(format!("NO {why}\n{}", node.unwrap_or_default()).as_bytes())
         .and_then(|()| stream.flush());
     Err(error)
 }
@@ -1645,6 +1694,7 @@ fn dialer_proves<S: Read + Write>(
     exporter: &[u8],
     (secret, me, nodes): (&FleetSecret, Option<&NodeIdentity>, bool),
     op: FleetOp,
+    refused_by: &mut Option<NodeProof>,
 ) -> Result<(FleetScope, Option<NodeProof>), FleetError> {
     let Some(line) = read_line(stream)? else {
         return Err(FleetError::Io(io::Error::new(
@@ -1675,10 +1725,10 @@ fn dialer_proves<S: Read + Write>(
         proof.push_str(&node_line(me, Signer::Dialer, exporter));
     }
     send(stream, &proof)?;
-    match read_line(stream)?.as_deref() {
-        Some("OK") => {}
-        Some("NO op") => return Err(FleetError::UnknownOp(word.to_owned())),
-        Some("NO capacity") => return Err(FleetError::AddressBusy),
+    let refusal = match read_line(stream)?.as_deref() {
+        Some("OK") => None,
+        Some("NO op") => Some(FleetError::UnknownOp(word.to_owned())),
+        Some("NO capacity") => Some(FleetError::AddressBusy),
         Some("NO node") => return Err(FleetError::NodeProof),
         Some(verdict) if verdict.strip_prefix("NO ").is_some_and(is_word) => {
             return Err(FleetError::Refused);
@@ -1694,6 +1744,15 @@ fn dialer_proves<S: Read + Write>(
                 "the listener hung up without answering this machine's proof",
             )));
         }
+    };
+    if let Some(refusal) = refusal {
+        // A listener from this build on proves its node after the refusal; an older one hangs up.
+        if nodes {
+            *refused_by = read_node_proof(stream, Signer::Listener, exporter)
+                .ok()
+                .flatten();
+        }
+        return Err(refusal);
     }
     let peer = if nodes {
         read_node_proof(stream, Signer::Listener, exporter)?
@@ -1996,6 +2055,7 @@ mod tests {
                     &exporter,
                     (&secret(7), Some(&node(2)), nodes),
                     FleetOp::Book,
+                    &mut None,
                 )
             },
         );
@@ -2107,6 +2167,7 @@ mod tests {
                     E,
                     (&secret(7), Some(&node(9)), true),
                     FleetOp::Survey,
+                    &mut None,
                 )
             });
             let hello = proof_line("facts", &tag(&keys.server, E, "facts"));
@@ -2319,8 +2380,14 @@ mod tests {
             listener.set_read_timeout(Some(HANG)).unwrap();
             let dialing = std::thread::spawn(move || {
                 dialer.set_read_timeout(Some(HANG)).unwrap();
-                dialer_proves(&mut dialer, E, (&secret(7), None, false), FleetOp::Survey)
-                    .map(|(scope, _)| scope)
+                dialer_proves(
+                    &mut dialer,
+                    E,
+                    (&secret(7), None, false),
+                    FleetOp::Survey,
+                    &mut None,
+                )
+                .map(|(scope, _)| scope)
             });
             listener.write_all(hello.as_bytes()).unwrap();
             let sent = read_line(&mut listener).unwrap();
@@ -2485,6 +2552,47 @@ mod tests {
                 matches!(&dialed, Some(FleetError::UnknownOp(word)) if word == op.word()),
                 "{dialed:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_refusal_proves_the_node_that_refused() {
+        const READ_ONLY: &[FleetOp] = &[FleetOp::Survey, FleetOp::Book, FleetOp::Join];
+        for (listener, full) in [(Some(node(1)), false), (Some(node(1)), true), (None, false)] {
+            let want = listener.as_ref().map(|me| NodeProof {
+                node: me.node().to_owned(),
+                key: me.key(),
+            });
+            let ((), dialed) = over_loopback(
+                move |tcp| {
+                    let watchdog = arm(&tcp, HANG).unwrap();
+                    let me = (&secret(7), listener.as_ref());
+                    let scope = FleetScope::Facts;
+                    let _ =
+                        server_handshake_armed(tcp, watchdog, HANG, me, scope, READ_ONLY, |_| {
+                            !full
+                        });
+                },
+                |tcp| {
+                    let op = if full {
+                        FleetOp::Survey
+                    } else {
+                        FleetOp::Drive
+                    };
+                    client_handshake_by(tcp, &secret(7), Some(&node(2)), op, HANG).err()
+                },
+            );
+            let Some(Undialed { error, refused_by }) = dialed else {
+                panic!("the listener served it");
+            };
+            assert!(
+                matches!(
+                    (&error, full),
+                    (FleetError::UnknownOp(_), false) | (FleetError::AddressBusy, true)
+                ),
+                "{error:?}"
+            );
+            assert_eq!(refused_by, want, "{error:?}");
         }
     }
 

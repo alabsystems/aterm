@@ -222,6 +222,7 @@ pub(crate) const MENU_CMD_CHORDS: &[(&str, &str)] = &[
     ("cmd+ctrl+o", "Overview…"),
     ("cmd+shift+j", "Next That Needs You"),
     ("cmd+shift+p", "Command Palette…"),
+    ("cmd+shift+r", "Rewind Pane"),
     ("cmd+m", "Minimize"),
 ];
 

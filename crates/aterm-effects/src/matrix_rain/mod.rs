@@ -2085,6 +2085,8 @@ const fn quantize_density(v: i32) -> u8 {
 const THEME_HUE_MIN_CHROMA: f32 = 0.03;
 
 const THEME_HUE_FALLBACK: u32 = 0x003B_8EEA;
+const THEME_HUE_FALLBACK_DEG: f32 = rgb2hsv(THEME_HUE_FALLBACK).0;
+const DIFF_GREEN_HUE_DEG: f32 = rgb2hsv(DIFF_GREEN).0;
 
 const fn theme_hue(cfg: &RainConfig) -> f32 {
     let (h0, s0, v0) = rgb2hsv(cfg.theme_fg);
@@ -2095,7 +2097,7 @@ const fn theme_hue(cfg: &RainConfig) -> f32 {
     if s1 * v1 >= THEME_HUE_MIN_CHROMA {
         return h1;
     }
-    rgb2hsv(THEME_HUE_FALLBACK).0
+    THEME_HUE_FALLBACK_DEG
 }
 
 #[inline]
@@ -2115,7 +2117,7 @@ const fn ramp_hue(cfg: &RainConfig) -> f32 {
         RainHue::Theme => theme_hue(cfg),
         RainHue::Custom(c) => rgb2hsv(c).0,
     };
-    let diff = rgb2hsv(DIFF_GREEN).0;
+    let diff = DIFF_GREEN_HUE_DEG;
     let mut d = rem_euclid_360(hue - diff);
     if d > 180.0 {
         d -= 360.0;
@@ -2131,11 +2133,12 @@ const fn ramp_hue(cfg: &RainConfig) -> f32 {
 }
 
 const fn build_ramp(hue: f32, cfg: &RainConfig) -> [u32; 16] {
+    const INV_15: f32 = 1.0 / 15.0;
     let light_bg = relative_luminance(cfg.default_bg) > 0.5;
     let mut ramp = [0u32; 16];
     let mut i = 0;
     while i < 16 {
-        let t = i as f32 / 15.0;
+        let t = i as f32 * INV_15;
         let (s, v) = if light_bg {
             (0.85 - 0.25 * t, 0.62 - 0.42 * t)
         } else {
@@ -2148,15 +2151,14 @@ const fn build_ramp(hue: f32, cfg: &RainConfig) -> [u32; 16] {
 }
 
 const fn luminance_match(mut ramp: [u32; 16], reference: [u32; 16]) -> [u32; 16] {
-    let table = crate::color_math::relative_luminance_table();
     let mut i = 0;
     while i < 16 {
-        let lt = crate::color_math::relative_luminance_with(table, reference[i]);
+        let lt = relative_luminance(reference[i]);
         let (h, s, mut v) = rgb2hsv(ramp[i]);
         let mut step = 0;
         while step < 8 {
             step += 1;
-            let l = crate::color_math::relative_luminance_with(table, ramp[i]);
+            let l = relative_luminance(ramp[i]);
             if (l - lt).abs() < 0.01 {
                 break;
             }
@@ -2192,44 +2194,60 @@ fn faint_ink(fg: u32, bg: u32) -> u32 {
 }
 
 fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
-    let table = crate::color_math::relative_luminance_table();
+    #[inline]
+    const fn head_ok(tint15: u32, bg: u32, lb: f32, bound: f32, a: u8) -> bool {
+        (relative_luminance(srgb_over(tint15, a, bg)) - lb).abs() < bound
+    }
+    #[inline]
+    const fn level_ok(ramp: &[u32; 16], bg: u32, lb: f32, bound: f32, body: u8) -> bool {
+        let mut lvl = 16u32;
+        while lvl > 0 {
+            lvl -= 1;
+            let raw_a = (body as u32 * (lvl + 1)) / 16;
+            let a = (if raw_a > 1 { raw_a } else { 1 }) as u8;
+            if (relative_luminance(srgb_over(ramp[lvl as usize], a, bg)) - lb).abs() >= bound {
+                return false;
+            }
+        }
+        true
+    }
     let bg = cfg.default_bg;
-    let lb = crate::color_math::relative_luminance_with(table, bg);
-    let plain =
-        (0.5 * (crate::color_math::relative_luminance_with(table, cfg.theme_fg) - lb)).abs();
-    let faint =
-        (crate::color_math::relative_luminance_with(table, faint_ink(cfg.theme_fg, bg)) - lb).abs();
+    let lb = relative_luminance(bg);
+    let plain = (0.5 * (relative_luminance(cfg.theme_fg) - lb)).abs();
+    let faint = (relative_luminance(faint_ink(cfg.theme_fg, bg)) - lb).abs();
     let bound = plain.min(faint);
-    let level_ok = |body: u8| {
-        (0..=15u32).rev().all(|lvl| {
-            let a = ((u32::from(body) * (lvl + 1)) / 16).max(1) as u8;
-            (crate::color_math::relative_luminance_with(
-                table,
-                srgb_over(ramp[lvl as usize], a, bg),
-            ) - lb)
-                .abs()
-                < bound
-        })
+    let derived_head = if cfg.head_alpha_override.is_none() || cfg.alpha_override.is_none() {
+        let mut h = RAIN_ALPHA_CAP;
+        loop {
+            if head_ok(ramp[15], bg, lb, bound, h) || h == RAIN_ALPHA_FLOOR {
+                break h;
+            }
+            h -= 1;
+        }
+    } else {
+        RAIN_ALPHA_CAP
     };
-    let head_ok = |a: u8| {
-        (crate::color_math::relative_luminance_with(table, srgb_over(ramp[15], a, bg)) - lb).abs()
-            < bound
+    let mut body = match cfg.alpha_override {
+        Some(b) => b,
+        None => {
+            // `level_ok(body)` checks `lvl == 15` (`a == body`) first, which is `head_ok`,
+            // so no `body > derived_head` can satisfy `level_ok`.
+            let mut b = derived_head;
+            loop {
+                if level_ok(ramp, bg, lb, bound, b) || b == RAIN_ALPHA_FLOOR {
+                    break b;
+                }
+                b -= 1;
+            }
+        }
     };
-    let derive = |ok: &dyn Fn(u8) -> bool| {
-        (RAIN_ALPHA_FLOOR..=RAIN_ALPHA_CAP)
-            .rev()
-            .find(|&a| ok(a))
-            .unwrap_or(RAIN_ALPHA_FLOOR)
-    };
-    let mut body = cfg.alpha_override.unwrap_or_else(|| derive(&level_ok));
     let head = match cfg.head_alpha_override {
         Some(h) => h.clamp(body, RAIN_ALPHA_CAP),
         None => {
-            let h = derive(&head_ok);
-            if h < body {
-                body = h;
+            if derived_head < body {
+                body = derived_head;
             }
-            h.max(body)
+            derived_head.max(body)
         }
     };
     (body, head)

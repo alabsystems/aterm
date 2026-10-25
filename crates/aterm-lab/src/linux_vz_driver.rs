@@ -805,7 +805,7 @@ pub fn wait_ended(paths: &Paths, record: &Record) -> Result<(), String> {
             .sum::<u64>()
     };
     let (mut last, mut since) = (size(), Instant::now());
-    while aterm_vz::record::is_live(record, &Kernel) {
+    while aterm_vz::record::may_run(record, &Kernel) {
         let now = size();
         if now != last {
             (last, since) = (now, Instant::now());
@@ -1205,6 +1205,18 @@ pub fn down(
             );
             return Ok(0);
         }
+        aterm_vz::record::Holder::Unproven(r) => {
+            println!(
+                "linux: helper {} was started by an earlier build (its record names no start \
+                 time): it is asked to stop, and never signalled",
+                r.pid
+            );
+            let exe = helper_exe(&root, &r);
+            return Lab::new(paths.clone(), Detached::new(exe.clone()))
+                .down()
+                .map(|()| 0)
+                .map_err(|e| client_fail(e, &exe, None));
+        }
         aterm_vz::record::Holder::None => {
             println!("linux: no helper runs {VM} at {}", root.display());
             return Ok(0);
@@ -1363,7 +1375,7 @@ pub fn destroy() -> Result<i32, Fail> {
     let stopped = lab.down();
     let runs = matches!(
         aterm_vz::record::holder(&paths, &Kernel),
-        aterm_vz::record::Holder::Live(_)
+        aterm_vz::record::Holder::Live(_) | aterm_vz::record::Holder::Unproven(_)
     );
     let layers = Layers::at(&root);
     let mut doomed = vec![layers.live_disk(), layers.record_path()];
@@ -1884,8 +1896,8 @@ pub fn cmd_vz_smoke(rest: &[String]) -> crate::Res {
         }
     };
     crate::linux_driver::choose("vz")?;
-    let t0 = Instant::now();
     let _lock = crate::linux::LaneLock::take()?;
+    let t0 = Instant::now();
     let up = crate::linux::bring_up()?;
     for step in &up.timings {
         println!("vz-smoke: bring-up: {} {:.1} s", step.name, step.secs);

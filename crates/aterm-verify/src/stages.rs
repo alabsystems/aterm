@@ -94,9 +94,9 @@ pub fn test_run_args(scope: &Scope) -> Vec<String> {
 /// The targets both test children select: every target with `test = true` (the libs, the bins and the integration tests that keep the default) and no example ([`test_compile_args`]).
 pub const TEST_TARGETS: [&str; 1] = ["--tests"];
 
-const MEASURING_TARGETS: [&str; 2] = ["paint", "spin"];
+const MEASURING_TARGETS: [&str; 3] = ["paint", "spin", "aos"];
 
-/// `targo --unverified bench --profile test -p aterm-conformance --no-fail-fast --bench paint --bench spin`: the measuring stage's one child, the paint and spin matrices ([`MEASURING_TARGETS`]) that judge the release bundle's frames and idle wakes on a live instance.
+/// `targo --unverified bench --profile test -p aterm-conformance --no-fail-fast --bench paint --bench spin --bench aos`: the measuring stage's one child, the paint, spin and aos matrices ([`MEASURING_TARGETS`]) that judge the release bundle's frames, idle wakes and repair main-thread time on a live instance.
 #[must_use]
 pub fn measuring_args() -> Vec<String> {
     measuring_targets_args()
@@ -407,7 +407,7 @@ pub const OBJC_DRIVES: [ObjcDrive; 5] = [
         example: "objc_toolbar_drive",
         code3: Code3::Hung,
         no_status: Severity::CouldNotRun,
-        pass: "the real tab strip answered every question — every state its drawing matrix names, and all four declared classes read off live objects against the runtime's own authority",
+        pass: "the real tab strip answered every question — every state its drawing matrix names, and all four declared classes read off live objects against the runtime's own authority — and the menu bar's real status item held This Mac as its glance counts it",
     },
     ObjcDrive {
         package: "aterm-gui",
@@ -1634,7 +1634,7 @@ fn not_run_reason(transcript: &str) -> Option<&str> {
 pub enum NotRun {
     /// A prerequisite this machine may lack and still be whole (the codex-alab proof: no codex-alab package): a named skip, which only `release` refuses.
     Skip,
-    /// The lane itself did not come up (the Linux lane: no lima, a VM, display or provision that failed, x86_64 without Rosetta, another run holding it): COULD NOT RUN, exit 3, in every set.
+    /// The lane itself did not come up (the Linux lane: no lima, a VM, display or provision that failed, x86_64 without Rosetta, an interrupt while it waited for the run that holds it): COULD NOT RUN, exit 3, in every set.
     CouldNotRun,
 }
 
@@ -2684,7 +2684,7 @@ mod tests {
             let (_, measuring) = measuring_cmd(&c, &artifact, measuring_args());
             assert!(
                 !measuring.demoted,
-                "the measuring benches run the paint and spin guards"
+                "the measuring benches run the paint, spin and aos guards"
             );
         }
         assert!(
@@ -3084,7 +3084,7 @@ mod tests {
             )
         };
         let paint = result("paint", 23, 23, 0, 0);
-        let spin = result("spin", 2, 2, 0, 0);
+        let spin = result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0);
         let decide = |ok: bool, output: String| {
             let run = exec::Run {
                 ok,
@@ -3109,6 +3109,7 @@ mod tests {
             paint.clone() + &paint + &spin,
             paint.replace("passed=23", "passed=unknown") + &spin,
             paint.clone() + &spin + "measure result: spin planned=2\n",
+            paint.clone() + &result("spin", 2, 2, 0, 0),
             result("paint", usize::MAX, usize::MAX, 0, 1) + &spin,
         ] {
             assert_eq!(decide(true, output.clone()).0, could_not_run, "{output}");
@@ -3128,7 +3129,9 @@ mod tests {
         assert_eq!(
             decide(
                 false,
-                result("paint", 23, 0, 0, 23) + &result("spin", 2, 0, 0, 2)
+                result("paint", 23, 0, 0, 23)
+                    + &result("spin", 2, 0, 0, 2)
+                    + &result("aos", 1, 0, 0, 1)
             )
             .0,
             could_not_run,
@@ -3137,7 +3140,9 @@ mod tests {
         assert_eq!(
             decide(
                 false,
-                result("paint", 23, 22, 1, 0) + &result("spin", 2, 0, 0, 2)
+                result("paint", 23, 22, 1, 0)
+                    + &result("spin", 2, 0, 0, 2)
+                    + &result("aos", 1, 0, 0, 1)
             )
             .0,
             Outcome::Fail(Severity::GateFailed),

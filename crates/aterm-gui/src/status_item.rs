@@ -188,7 +188,7 @@ pub(crate) struct SessionRow {
     pub held_by_host: Option<String>,
     /// Its supervised agent's task end, while one stands on the harness's glass (`harness_glass::EndGlass`).
     pub end: Option<EndRow>,
-    /// Its Autopilot chip's face is LANDED (`ChipFace::Landed`: under Land, all of the work on the remote main branch), seen or not, whether or not an end was told: This Mac counts it `landed`, a worker or a plain Land tab.
+    /// Its Autopilot chip's face is LANDED (`ChipFace::Landed`: under Land, a clean `Nothing left:` defense, and no repository check found work left to land), seen or not, whether or not an end was told: This Mac counts it `landed`, a worker or a plain Land tab.
     pub landed: bool,
     /// It is LANDING (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.3 item 1): its Autopilot is Land, its chip wears `⤓ land` (the task open or unknown), and a hold stands — Land's instruction has been typed to it (`App::shown_hold`).
     pub landing: bool,
@@ -522,10 +522,14 @@ pub(crate) struct StatusCarry {
     pub held: Option<(HoldWord, i64)>,
     /// The done the owner looked at: its task's `since_unix_ms`, the wall-clock instant the record entered it (carried exactly, unlike its entry rev).
     pub done: Option<u64>,
+    /// An actual queued box banner, independent of `told`'s looking/settings cases.
+    pub box_receipt: Option<crate::box_banner::Receipt>,
 }
 
 impl StatusCarry {
-    /// The row: `need=<word>@<unix s>`, `told=1`, `hold=<word>@<unix s>` and `done=<unix ms>`, each only when it holds; `None` for nothing known.
+    /// The row: `need=<word>@<unix s>`, `told=1`, `hold=<word>@<unix s>`, `done=<unix ms>`
+    /// and an actual queued banner's `box=<kind>@<source episode>`, each only when it holds;
+    /// `None` for nothing known.
     #[cfg(any(unix, test))]
     pub(crate) fn row(&self) -> Option<String> {
         let mut parts = Vec::new();
@@ -541,6 +545,9 @@ impl StatusCarry {
         if let Some(ms) = self.done {
             parts.push(format!("done={ms}"));
         }
+        if let Some(receipt) = self.box_receipt {
+            parts.push(format!("box={}", receipt.row()));
+        }
         (!parts.is_empty()).then(|| parts.join(" "))
     }
 
@@ -551,6 +558,7 @@ impl StatusCarry {
             Some((word.to_string(), at.parse::<i64>().ok()?))
         };
         let mut carry = Self::default();
+        let mut box_seen = false;
         for (key, value) in row.split_whitespace().filter_map(|t| t.split_once('=')) {
             match key {
                 "need" => {
@@ -563,6 +571,12 @@ impl StatusCarry {
                         stamped(value).and_then(|(w, at)| Some((HoldWord::parse(&w)?, at)));
                 }
                 "done" => carry.done = value.parse().ok(),
+                "box" => {
+                    carry.box_receipt = (!box_seen)
+                        .then(|| crate::box_banner::Receipt::parse(value))
+                        .flatten();
+                    box_seen = true;
+                }
                 _ => {}
             }
         }
@@ -690,6 +704,7 @@ impl Herald {
             told,
             held: since.held,
             done: None,
+            box_receipt: None,
         }
     }
 
@@ -1132,6 +1147,8 @@ pub(crate) struct Here {
     pub need_you: usize,
     /// Sessions aterm is waiting something out for (a limit, the API, a writer's `kind=wait`): never counted as working.
     pub waiting: usize,
+    /// Land sessions that hold ([`SessionRow::landing`]: Land's instruction typed, a hold standing), whatever their agent is doing, past a need or a wait, which count first: `docs/DESIGN-harness-autopilot-2026-10-15.md` §14.6. A Cruise session at rest is resting.
+    pub landing: usize,
     /// Agents at rest.
     pub resting: usize,
     /// Sessions that LANDED: every session whose chip's face is landed (a plain Land tab included), and every worker whose record reads `done why=landed`.
@@ -1521,6 +1538,7 @@ impl Glance {
                 (Some(t), _) if t.state == TaskState::Exited => g.here.exited += 1,
                 _ if row.need.is_some() => g.here.need_you += 1,
                 _ if row.waiting.is_some() => g.here.waiting += 1,
+                _ if row.landing => g.here.landing += 1,
                 (_, "" | "-") => g.here.shells += 1,
                 (_, "idle") => g.here.resting += 1,
                 _ => g.here.working += 1,
@@ -2122,15 +2140,17 @@ fn harness_need_line(
     format!("{lead}{SEP}{}{end}", fold_clip(&ask.first, room))
 }
 
+/// This Mac's row: `This Mac — ` and each nonzero count of `here` in its order, `·` between.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
 )]
-fn here_line(here: &Here) -> String {
+pub(crate) fn here_line(here: &Here) -> String {
     let parts: Vec<String> = [
         (here.working, "working"),
         (here.need_you, "need you"),
         (here.waiting, "waiting"),
+        (here.landing, "landing"),
         (here.resting, "resting"),
         (here.landed, "landed"),
         (here.done, "done"),
@@ -2150,6 +2170,55 @@ fn here_line(here: &Here) -> String {
         line.push_str(&format!(" (+{} in another aterm)", here.elsewhere));
     }
     line
+}
+
+/// A Land desk at rest like the forever lab's (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.6): six Land sessions that hold, one more holding with a need, one Off session at rest, five landed and three shells. `objc_toolbar_drive` puts it on a real status item and reads This Mac back off AppKit; the unit tests read the same rows.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn a_land_desk_at_rest() -> Vec<SessionRow> {
+    let idle = |id: u64, title: &str| SessionRow {
+        id,
+        sid: format!("s-{id:020}"),
+        title: title.to_string(),
+        agent: "idle",
+        ..SessionRow::default()
+    };
+    let held = |id: u64, title: &str| SessionRow {
+        landing: true,
+        landing_tip: Some("not landed yet: 1 changed file \u{b7} 2 nudges".to_string()),
+        ..idle(id, title)
+    };
+    let ask = crate::needs::NeedFacts {
+        attention: vec![crate::needs::AttentionFact {
+            owner: "-".to_string(),
+            text: "rotate the deploy key".to_string(),
+            kind: Some(aterm_types::needs::AttentionKind::Ask),
+        }],
+        ..crate::needs::NeedFacts::default()
+    };
+    let mut rows: Vec<SessionRow> = ["land-b", "land-c", "land-f", "land-g", "land-h", "land-i"]
+        .into_iter()
+        .zip(1..)
+        .map(|(title, id)| held(id, title))
+        .collect();
+    rows.push(SessionRow {
+        need: crate::needs::of(&ask).need,
+        ..held(7, "land-d")
+    });
+    rows.push(idle(8, "off"));
+    rows.extend(
+        ["land-a", "land-e", "instant-land", "land-j", "land-k"]
+            .into_iter()
+            .zip(9..)
+            .map(|(title, id)| SessionRow {
+                landed: true,
+                ..idle(id, title)
+            }),
+    );
+    rows.extend((14..17).map(|id| SessionRow {
+        agent: "-",
+        ..idle(id, "zsh")
+    }));
+    rows
 }
 
 #[cfg_attr(
@@ -3160,7 +3229,7 @@ pub(crate) fn button_face_change(
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) use macos::{StatusItemHandle, attach_fleet, install, update};
+pub(crate) use macos::{StatusItemHandle, attach_fleet, install, items_on_the_bar, update};
 
 /// Non-macOS no-op handle: there is no menu-bar status item off macOS.
 #[cfg(not(target_os = "macos"))]
@@ -3614,6 +3683,53 @@ mod macos {
         unsafe {
             appkit::send_v_bool(item.id(), sel!(setEnabled:), false);
             appkit::send_v_id(menu, sel!(addItem:), item.id());
+        }
+    }
+
+    /// What the menu bar's real item holds as a person opens it: the live `NSStatusItem`'s `-menu`,
+    /// repainted by its own delegate's `menuNeedsUpdate:` (what AppKit sends on that open) from the
+    /// item's glance, each item's `-title` and `-isEnabled` in order. `objc_toolbar_drive` reads
+    /// This Mac off it; empty off the main thread.
+    pub(crate) fn items_on_the_bar(handle: &StatusItemHandle) -> Vec<(String, bool)> {
+        if MainThread::new().is_none() {
+            return Vec::new();
+        }
+        autoreleasepool(|_| {
+            // SAFETY: on the main thread (checked above); `-menu` and `-delegate` are `-(id)`
+            // accessors on the live item and its menu, and `menuNeedsUpdate:` is `-(void)(id)` on the
+            // retained target the handle owns, sent with the menu it delegates for, as AppKit sends it.
+            unsafe {
+                let menu = appkit::send_id(handle.item.id(), sel!(menu));
+                if menu.is_null() {
+                    return Vec::new();
+                }
+                let delegate = appkit::send_id(menu, sel!(delegate));
+                if !delegate.is_null() {
+                    appkit::send_v_id(delegate, sel!(menuNeedsUpdate:), menu);
+                }
+                items_of(menu)
+            }
+        })
+    }
+
+    /// Each item of the live `menu`, in order: its `-title` and `-isEnabled`.
+    fn items_of(menu: Id) -> Vec<(String, bool)> {
+        // SAFETY: `menu` is a live NSMenu; `-numberOfItems` is `-(NSInteger)`, `-itemAtIndex:`
+        // `-(NSMenuItem *)(NSInteger)` within its count, `-title` `-(NSString *)` and `-isEnabled`
+        // `-(BOOL)`, all without side effects on the menu and its items.
+        unsafe {
+            let count = appkit::send_isize(menu, sel!(numberOfItems));
+            let item_at: unsafe extern "C-unwind" fn(Id, Sel, isize) -> Id =
+                aterm_objc::checked_msg();
+            (0..count)
+                .map(|i| {
+                    let item = item_at(menu, sel!(itemAtIndex:), i);
+                    (
+                        appkit::nsstring_to_rust(appkit::send_id(item, sel!(title))),
+                        appkit::send_bool(item, sel!(isEnabled)),
+                    )
+                })
+                .collect()
         }
     }
 
@@ -5195,6 +5311,78 @@ mod tests {
         );
     }
 
+    /// §14.6: a Land session that holds counts as `landing` on This Mac, the word the page's Every
+    /// session row says for it, and a need it carries counts first; the Off session at rest stays
+    /// `resting`. The row reaches the menu as composed (AppKit's own item is `verify appkit`'s
+    /// stage 11, on the main thread AppKit's menus need).
+    #[test]
+    fn a_held_landing_counts_as_landing_on_this_mac() {
+        let rows = a_land_desk_at_rest();
+        let g = local_glance(&rows, &[], 2000, None);
+        assert_eq!(
+            (
+                g.here.need_you,
+                g.here.landing,
+                g.here.resting,
+                g.here.landed
+            ),
+            (1, 6, 1, 5),
+            "{:?}",
+            g.here
+        );
+        let line = here_line(&g.here);
+        assert_eq!(
+            line,
+            "This Mac \u{2014} 1 need you \u{b7} 6 landing \u{b7} 1 resting \u{b7} 5 landed \u{b7} 3 shells"
+        );
+        let menu = compose_status_menu(&g, 2000);
+        let lines = menu_lines(&menu, &[]);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with(&format!("statusmenu {line:?} enabled=no")))
+                .count(),
+            1,
+            "{lines:#?}"
+        );
+    }
+
+    /// §14.6: the landing arm comes after the waiting arm, as after the need arm, so a held Land
+    /// that aterm waits out a limit for counts `waiting`, never `landing` as well.
+    #[test]
+    fn a_held_land_that_waits_counts_waiting_not_landing() {
+        let mut rows = a_land_desk_at_rest();
+        let held = rows
+            .iter()
+            .find(|r| r.landing && r.need.is_none())
+            .cloned()
+            .expect("a held Land row");
+        rows.push(SessionRow {
+            id: 40,
+            sid: format!("s-{:020}", 40),
+            title: "land-w".to_string(),
+            waiting: Some(crate::needs::Waiting {
+                word: WaitWord::Limit,
+                wall: Some("usage-session"),
+                reset: Some("7pm".to_string()),
+                entry: None,
+            }),
+            ..held
+        });
+        let g = local_glance(&rows, &[], 2000, None);
+        assert_eq!(
+            (
+                g.here.need_you,
+                g.here.waiting,
+                g.here.landing,
+                g.here.resting
+            ),
+            (1, 1, 6, 1),
+            "{:?}",
+            g.here
+        );
+    }
+
     #[test]
     fn the_you_hold_row_counts_the_refused_writes_and_names_who_waits() {
         let manager = SessionRow {
@@ -5823,6 +6011,7 @@ mod tests {
             told: true,
             held: Some((HoldWord::Local, 90)),
             done: Some(1_000_000),
+            box_receipt: crate::box_banner::Receipt::parse("permission@7"),
         };
         assert_eq!(StatusCarry::parse(&full.row().expect("a row")), full);
         let untold = StatusCarry {
@@ -5832,6 +6021,20 @@ mod tests {
         };
         assert_eq!(StatusCarry::parse(&untold.row().expect("a row")), untold);
         assert_eq!(StatusCarry::default().row(), None);
+        for row in [
+            "box=permission@0",
+            "box=permission@wrong",
+            "box=later@7",
+            "box=permission@7 box=permission@7",
+            "box=permission@7 box=later@7",
+            "box=later@7 box=permission@7",
+        ] {
+            assert_eq!(
+                StatusCarry::parse(row).box_receipt,
+                None,
+                "{row}: malformed or duplicate receipts keep fallback"
+            );
+        }
         assert_eq!(
             StatusCarry::parse("told=1 done=5"),
             StatusCarry {

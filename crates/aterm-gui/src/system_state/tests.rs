@@ -409,11 +409,13 @@ fn a_row_that_will_change_shows_no_engine_line_under_it() {
 
     // On the page: the fresh Mac's scenario carries an engine line on every
     // row that will change, and no node a person sees or hears says any. The
-    // one note is the repositories', in the words of what they wait for.
+    // notes are the repositories', in the words of what they wait for, and
+    // Local Network's calm one: macOS tells apps nothing of it.
     let mut app = SystemStateApp::new(Plan::default());
     app.publish(status_of("fresh"));
     let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
     let repositories = Subject::Setting(Setting::Repositories);
+    let lan = Subject::Access(Access::LocalNetwork);
     for subject in Subject::all() {
         let key = format!("system-state/row/{}/note", row_slug(subject));
         let node = compiled.semantic(&UiKey::new(key.clone()));
@@ -421,6 +423,12 @@ fn a_row_that_will_change_shows_no_engine_line_under_it() {
             assert_eq!(
                 node.map(|node| node.label.as_str()),
                 Some("Waits for your GitHub token from the Secrets vault"),
+                "{key}"
+            );
+        } else if subject == lan {
+            assert_eq!(
+                node.map(|node| node.label.as_str()),
+                Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD),
                 "{key}"
             );
         } else {
@@ -584,9 +592,8 @@ fn a_restore_failure_is_visible_even_when_its_group_is_left_as_is() {
     assert_eq!(
         status.notes(&plan),
         [
-            "Natural scrolling and the Dock are as they were. Caps Lock key and Trackpad \
-             scrolling come back at your next login. The Desktop stayed as it is: macOS hid its \
-             earlier value.",
+            "Natural scrolling and Dock are as they were. Caps Lock key and Trackpad scrolling \
+             come back at your next login. Desktop stayed as it is: macOS hid its earlier value.",
             "Widgets could not be put back as they were.",
         ]
     );
@@ -605,8 +612,8 @@ fn a_restore_failure_is_visible_even_when_its_group_is_left_as_is() {
 fn a_restore_is_one_calm_line_in_row_names_and_no_failure() {
     let status = status_of("restore-at-login");
     let plan = status.plan.clone().unwrap();
-    const LINE: &str = "Restore previous settings finished. The Desktop, Widgets and the Dock are \
-                        as they were. Caps Lock key, Natural scrolling and Trackpad scrolling come \
+    const LINE: &str = "Restore previous settings finished. Desktop, Widgets and Dock are as \
+                        they were. Caps Lock key, Natural scrolling and Trackpad scrolling come \
                         back at your next login.";
     assert_eq!(status.notes(&plan), [LINE]);
     let mut app = SystemStateApp::new(plan.clone());
@@ -688,7 +695,7 @@ fn a_restore_names_its_rows_and_each_setting_it_could_not_put_back() {
     assert_eq!(
         words(of(&[(Some(Setting::Dock), PutBack::Back)])),
         [calm(
-            "Restore previous settings finished. The Dock is as it was."
+            "Restore previous settings finished. Dock is as it was."
         )]
     );
     assert_eq!(
@@ -710,7 +717,7 @@ fn a_restore_names_its_rows_and_each_setting_it_could_not_put_back() {
         ])),
         [calm(
             "Restore previous settings finished. Widgets stayed as they are: macOS hid their \
-             earlier value. The Dock is put back once aterm has Full Disk Access."
+             earlier value. Dock is put back once aterm has Full Disk Access."
         )]
     );
     assert_eq!(
@@ -719,8 +726,8 @@ fn a_restore_names_its_rows_and_each_setting_it_could_not_put_back() {
             (Some(Setting::Widgets), PutBack::Unknown),
         ])),
         [calm(
-            "Restore previous settings finished. The Desktop and Widgets stayed as they are: \
-             macOS hid their earlier values."
+            "Restore previous settings finished. Desktop and Widgets stayed as they are: macOS \
+             hid their earlier values."
         )]
     );
     // Each key of a row counts once, and its worst outcome speaks for it.
@@ -732,11 +739,11 @@ fn a_restore_names_its_rows_and_each_setting_it_could_not_put_back() {
             (None, PutBack::Failed),
         ])),
         [
-            calm("The Dock is as it was."),
+            calm("Dock is as it was."),
             row(
                 "Restore: Desktop",
                 "failed",
-                "The Desktop could not be put back as it was."
+                "Desktop could not be put back as it was."
             ),
             row(
                 "Restore: another Mac setting",
@@ -776,9 +783,8 @@ fn a_value_restore_could_not_reach_is_part_of_the_calm_line_and_no_failure() {
     assert_eq!(
         status.notes(&plan),
         [
-            "Restore previous settings finished. The Dock is as it was. Widgets stayed as they \
-             are: macOS hid their earlier value. The Desktop is put back once aterm has Full \
-             Disk Access."
+            "Restore previous settings finished. Dock is as it was. Widgets stayed as they are: \
+             macOS hid their earlier value. Desktop is put back once aterm has Full Disk Access."
         ]
     );
     let line = headline(&status, &rows(&status, plan.selection), Some(&plan)).text;
@@ -823,8 +829,8 @@ fn a_pass_says_each_unfinished_row_and_its_rollback_in_row_names() {
              from before.",
             "Dock failed. The change did not take.",
             "Rust in Spotlight could not be confirmed.",
-            "aterm put back what it could not finish. The Dock is as it was. Natural scrolling \
-             comes back at your next login.",
+            "aterm put back what it could not finish. Dock is as it was. Natural scrolling comes \
+             back at your next login.",
             JOURNAL_NOTE,
         ]
     );
@@ -1132,7 +1138,7 @@ fn headlines_say_the_state_in_the_designs_words() {
     assert_eq!(line(&status_of("checking")).text, "Checking this Mac…");
     assert_eq!(
         line(&status_of("running")).text,
-        "Setting up this Mac… 10 of 16"
+        "Setting up this Mac… 11 of 16"
     );
     assert_eq!(
         line(&status_of("debugger")).text,
@@ -1478,12 +1484,13 @@ fn check_result_subject_is_counted_once_with_its_observed_failure() {
         line.label, baseline.label,
         "one failure, however it was read"
     );
+    // The reading carries the failure; the Check's own result is its note (§3.6).
+    assert!(status.failed_steps(status.plan.as_ref()).next().is_none());
+    let plan = status.plan.clone().unwrap();
+    let line = headline(&status, &rows(&status, plan.selection), Some(&plan));
     assert_eq!(
-        status
-            .failed_steps(status.plan.as_ref())
-            .map(|failure| failure.row)
-            .collect::<Vec<_>>(),
-        [Some(repository)]
+        (line.text.as_str(), line.show),
+        ("1 step failed: GitHub repositories", Some(repository))
     );
     let mut app = SystemStateApp::opened();
     app.publish(status);
@@ -1507,21 +1514,41 @@ fn check_result_subject_left_unmanaged_is_a_note_without_attention() {
     }));
 }
 
+/// A Check again that failed as a whole is the page's note alone (§3.6): it only read, and
+/// pressing it again is its remedy, so neither the menu line nor the tab's diamond says it, and
+/// the headline, which names no failure, says the rows are as aterm last read them.
 #[test]
-fn check_result_without_a_subject_still_signals_its_failure() {
-    let mut status = failed_repository_check(false);
-    status.check.as_mut().unwrap().rows[0].name = "Check".into();
-    assert_eq!(
-        status
-            .failed_steps(status.plan.as_ref())
-            .map(|failure| failure.row)
-            .collect::<Vec<_>>(),
-        [None]
-    );
-    assert!(crate::system_state_access::menu_line(&status, false).is_some());
-    let mut app = SystemStateApp::opened();
-    app.publish(status);
-    assert!(app.needs_attention());
+fn a_failed_check_again_is_a_page_note_only() {
+    let mut permissions_only = status_of("check-failed");
+    let mut selection = Selection::none();
+    selection.set(Setting::Permissions, true);
+    permissions_only.plan = Some(Plan::from(selection));
+    permissions_only.check.as_mut().unwrap().plan = Plan::from(selection);
+    for (status, words) in [
+        (
+            status_of("check-failed"),
+            "This Mac is set up, as last read",
+        ),
+        (permissions_only, "Permissions are set up, as last read"),
+    ] {
+        let plan = status.plan.clone().unwrap();
+        assert_eq!(
+            status.notes(&plan),
+            [format!("Check again failed. {CHECK_FAILED_NOTE}")]
+        );
+        assert!(status.failed_steps(Some(&plan)).next().is_none());
+        assert!(crate::system_state_access::menu_line(&status, false).is_none());
+        let mut app = SystemStateApp::new(plan.clone());
+        app.publish(status.clone());
+        assert!(!app.needs_attention(), "{words}");
+        let line = app.headline();
+        assert_eq!(
+            (line.text.as_str(), line.show, line.start),
+            (words, None, false)
+        );
+        let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
+        assert_eq!(label(&compiled, HEADLINE), words);
+    }
 }
 
 /// A stage's error or a failed row the worker still retries leaves the tab's diamond dark, and
@@ -1894,9 +1921,12 @@ fn unknown_plan_join_keeps_its_draft_until_the_saved_plan_is_known() {
     }
 }
 
+/// A saved setup aterm cannot read just now (a transient read error, or a record it has not set
+/// aside yet) is no failure (§3.6): aterm reads it again by itself, so the page says so in one
+/// calm line, with no failure headline, tab attention or menu line, across a reopen and while
+/// the readings it cached stay, until a read succeeds.
 #[test]
-fn a_plan_read_failure_headline_survives_reopen_until_recovery() {
-    // As the worker says a saved plan it cannot read, in the page's words.
+fn a_saved_setup_unread_just_now_is_said_calmly_until_a_read_succeeds() {
     const WHY: &str = STATE_UNREAD_NOTE;
     let mut app = crate::App::headless_for_test();
     let wid = crate::WindowId(0);
@@ -1909,39 +1939,32 @@ fn a_plan_read_failure_headline_survives_reopen_until_recovery() {
         let (page, state) = page_in(&app.native_runtime, view);
         compile(page, state, 999.0, 740.0)
     };
+    let says_why = |app: &crate::App| {
+        compiled(app)
+            .semantics
+            .iter()
+            .any(|node| node.label.contains(WHY))
+    };
+    let calm = |app: &crate::App| {
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let page = page_in(&app.native_runtime, view).0;
+        !page.needs_attention()
+            && crate::system_state_access::menu_line(&page.status, false).is_none()
+    };
     let loading = label(&compiled(&app), HEADLINE);
-    let failure = SetupStatus {
-        rows: vec![SetupStatusRow {
-            name: SETUP_ROW.into(),
-            status: "failed".into(),
-            detail: WHY.into(),
-        }],
+    let unread = SetupStatus {
+        rows: vec![calm_setup_row(WHY)],
         ..SetupStatus::default()
     };
-    app.publish_system_state(SetupStatus {
-        rows: vec![SetupStatusRow {
-            status: "pending".into(),
-            ..failure.rows[0].clone()
-        }],
-        ..SetupStatus::default()
-    });
-    assert_eq!(label(&compiled(&app), HEADLINE), loading);
     for retrying in [true, false] {
         app.publish_system_state(SetupStatus {
             retrying,
-            ..failure.clone()
+            ..unread.clone()
         });
-        assert_ne!(label(&compiled(&app), HEADLINE), loading);
-        let (_, view) = app.active_native_view(wid).unwrap();
-        let page = page_in(&app.native_runtime, view).0;
-        assert!(!page.plan_known());
-        assert_eq!(page.needs_attention(), !retrying);
-        assert_eq!(
-            crate::system_state_access::menu_line(&page.status, false).is_some(),
-            !retrying
-        );
+        assert_eq!(label(&compiled(&app), HEADLINE), loading);
+        assert!(says_why(&app));
+        assert!(calm(&app), "retrying {retrying}");
     }
-    let failed = label(&compiled(&app), HEADLINE);
     for operation in [
         None,
         Some(SetupOperation::Check),
@@ -1951,7 +1974,7 @@ fn a_plan_read_failure_headline_survives_reopen_until_recovery() {
         busy_page.publish(SetupStatus {
             busy: true,
             operation,
-            ..failure.clone()
+            ..unread.clone()
         });
         assert_eq!(
             label(
@@ -1966,27 +1989,13 @@ fn a_plan_read_failure_headline_survives_reopen_until_recovery() {
             .text
         );
     }
-    let (instance, view) = app.active_native_view(wid).unwrap();
-    app.dispatch_native_view_event(wid, view, AppEvent::ScrollLines(10_000))
-        .unwrap();
-    let scrolled = compiled(&app);
-    assert!(
-        scrolled
-            .semantics
-            .iter()
-            .any(|node| node.label.contains(WHY) && node.offscreen)
-    );
-    assert!(
-        scrolled
-            .semantic(&UiKey::new(HEADLINE))
-            .is_some_and(|node| !node.offscreen)
-    );
-    assert_eq!(label(&scrolled, HEADLINE), failed);
+    let (instance, _) = app.active_native_view(wid).unwrap();
     app.close_active_native_tab(wid).unwrap();
     assert!(app.native_runtime.app(instance).is_none());
     assert!(app.open_system_state_tab());
-    app.publish_system_state(failure.clone());
-    assert_eq!(label(&compiled(&app), HEADLINE), failed);
+    app.publish_system_state(unread.clone());
+    assert!(says_why(&app));
+    assert!(calm(&app));
 
     let mut selection = Selection::none();
     selection.set(Setting::Dock, true);
@@ -2001,73 +2010,25 @@ fn a_plan_read_failure_headline_survives_reopen_until_recovery() {
     };
     app.publish_system_state(success.clone());
     let settled = label(&compiled(&app), HEADLINE);
-    assert_ne!(settled, failed);
-    assert!(
-        !compiled(&app)
-            .semantics
-            .iter()
-            .any(|node| node.label.contains(WHY))
-    );
+    assert!(!says_why(&app));
     let (_, view) = app.active_native_view(wid).unwrap();
     assert_eq!(page_in(&app.native_runtime, view).0.reviewed_plan(), plan);
-    for retrying in [true, false] {
-        // A later snapshot read failed, but the observer's settled rows remain cached.
-        app.publish_system_state(SetupStatus {
-            observed: success.observed.clone(),
-            observed_vault_url: success.observed_vault_url.clone(),
-            retrying,
-            ..failure.clone()
-        });
-        assert_eq!(label(&compiled(&app), HEADLINE), failed);
-        let page = page_in(&app.native_runtime, view).0;
-        assert!(page.plan_known());
-        assert_eq!(page.needs_attention(), !retrying);
-    }
-    app.publish_system_state(success);
-    assert_eq!(label(&compiled(&app), HEADLINE), settled);
-    assert!(!page_in(&app.native_runtime, view).0.needs_attention());
-    assert!(app.structural_invariants_ok());
-}
-
-#[test]
-fn a_cached_success_failure_headline_waits_for_a_successful_plan_read() {
-    let mut selection = Selection::none();
-    selection.set(Setting::Dock, true);
-    let plan = Plan {
-        selection,
-        vault_url: "http://saved.local:7484/v1/team".into(),
-    };
-    let success = SetupStatus {
-        plan: Some(plan.clone()),
-        observed_vault_url: Some(plan.vault_url.clone()),
-        ..status_of("set-up")
-    };
-    let mut app = SystemStateApp::new(plan);
-    let view = SystemStateViewState::default();
-    app.publish(success.clone());
-    let settled = label(&compile(&app, &view, 999.0, 740.0), HEADLINE);
-    app.publish(SetupStatus {
-        rows: vec![SetupStatusRow {
-            name: SETUP_ROW.into(),
-            status: "failed".into(),
-            detail: STATE_UNREAD_NOTE.into(),
-        }],
+    // A later read failed while the readings stay cached: the page keeps the plan it knew and
+    // claims nothing of it until a read succeeds.
+    app.publish_system_state(SetupStatus {
         observed: success.observed.clone(),
         observed_vault_url: success.observed_vault_url.clone(),
-        retrying: true,
-        ..SetupStatus::default()
+        ..unread.clone()
     });
-    assert!(app.plan_known());
-    assert_ne!(
-        label(&compile(&app, &view, 999.0, 740.0), HEADLINE),
-        settled
-    );
-    assert!(!app.needs_attention());
-    app.publish(success);
-    assert_eq!(
-        label(&compile(&app, &view, 999.0, 740.0), HEADLINE),
-        settled
-    );
+    assert_eq!(label(&compiled(&app), HEADLINE), CHECKING);
+    assert_ne!(CHECKING, settled);
+    assert!(page_in(&app.native_runtime, view).0.plan_known());
+    assert!(says_why(&app));
+    assert!(calm(&app));
+    app.publish_system_state(success);
+    assert_eq!(label(&compiled(&app), HEADLINE), settled);
+    assert!(calm(&app));
+    assert!(app.structural_invariants_ok());
 }
 
 #[test]
@@ -2497,7 +2458,7 @@ fn every_scenario_lays_out_at_every_width_with_the_designs_labels() {
             app.publish(status_of(scenario));
             let view = SystemStateViewState::default();
             let compiled = compile(&app, &view, width, height);
-            assert_eq!(label(&compiled, "system-state/brand"), "aterm · ALab");
+            assert_eq!(label(&compiled, "system-state/brand"), "aterm ALab");
             assert!(
                 compiled
                     .semantic(&UiKey::new("system-state/check"))
@@ -3413,7 +3374,7 @@ fn the_village_has_one_station_per_setting_in_the_rows_words() {
     status.busy = true;
     status.running = vec![Setting::Dock];
     let rows = rows(&status, selection);
-    let spec = village_spec(&status, &rows, selection, 480);
+    let spec = village_spec(&status, &rows, &Plan::from(selection), 480);
     // Caps Lock, Natural scrolling, Trackpad, Desktop, Widgets, Dock,
     // Messages, FaceTime, Spotlight, Permissions, Secrets, Repositories.
     let managed = rows.iter().filter(|row| row.managed).count();
@@ -3440,7 +3401,7 @@ fn the_headline_and_the_brand_publish_their_words_as_a_labels_value() {
     use aterm_a11y::model::Role;
     let mut app = SystemStateApp::new(Plan::default());
     app.publish(status_of("running"));
-    let running = "Setting up this Mac… 10 of 16";
+    let running = "Setting up this Mac… 11 of 16";
     for width in [999.0, 220.0] {
         let compiled = compile(&app, &SystemStateViewState::default(), width, 900.0);
         let projection =
@@ -3454,10 +3415,7 @@ fn the_headline_and_the_brand_publish_their_words_as_a_labels_value() {
             width < 999.0,
             "{width}: the headline wraps only when narrow"
         );
-        for (key, words) in [
-            (HEADLINE, running),
-            ("system-state/brand", paint::BRAND_WORDS),
-        ] {
+        for (key, words) in [(HEADLINE, running), ("system-state/brand", "aterm ALab")] {
             let id = projection
                 .id_for_key(&UiKey::new(key))
                 .unwrap_or_else(|| panic!("{width}: {key} is published"));
@@ -3508,7 +3466,7 @@ fn the_village_walks_beside_the_lockup_while_a_run_goes() {
         "the running Dock works: {spec0}"
     );
     // Only the lockup is the mark: the village names nothing aloud.
-    assert_eq!(label(&first, "system-state/brand"), "aterm · ALab");
+    assert_eq!(label(&first, "system-state/brand"), "aterm ALab");
     assert!(
         first
             .semantic(&UiKey::new("system-state/village"))
@@ -4391,7 +4349,9 @@ fn a_stage_that_failed_as_a_whole_is_said_under_its_rows() {
     status.retrying = true;
     assert_eq!(
         status.notes(&plan),
-        ["Rust in Spotlight failed. aterm tries again by itself."]
+        [format!(
+            "Rust in Spotlight did not finish this time. {RETRIES_NOTE}"
+        )]
     );
     status.retrying = false;
     status.rows = vec![step(Setting::CapsLock), step(Setting::Dock)];
@@ -4462,11 +4422,13 @@ fn every_scenarios_notes_are_sentences_in_the_pages_words() {
             }
         }
     }
-    // The vault's failed try, as the worker's page says it.
+    // The vault's try that did not take, as the worker's page says it while aterm tries again.
     let status = status_of("vault-failed");
     assert_eq!(
         status.notes(&status.plan.clone().unwrap()),
-        ["Secrets vault failed. aterm tries again by itself."]
+        [format!(
+            "Secrets vault did not finish this time. {RETRIES_NOTE}"
+        )]
     );
 }
 
@@ -4502,6 +4464,28 @@ const SCENARIOS: [&str; 25] = [
 /// Changes aterm made and could not log are a fact for later, never a signal (design §3.6):
 /// one calm note on the page, no menu line, no attention, no failure headline; the exceptions
 /// digest's entry carries it.
+/// The setup's facts for later are entries the exceptions digest can show: a launch's setup
+/// that has not started for ten minutes, and records aterm set aside; each keeps its detail
+/// for the log alone, and the one about the startup clears by its key.
+#[test]
+fn the_setups_facts_for_later_are_digest_entries() {
+    for entry in [
+        setup_not_started_entry("initial-setup.json: Permission denied"),
+        setup_set_aside_entry("initial-setup.json.unreadable"),
+    ] {
+        assert_eq!(entry.family(), aterm_messages::exceptions::Family::Setup);
+        assert!(entry.message().is_ok(), "{:?}", entry.message().err());
+    }
+    assert_eq!(
+        setup_not_started_entry("").key(),
+        setup_not_started_entry("another").key()
+    );
+    assert_ne!(
+        setup_not_started_entry("").key(),
+        setup_set_aside_entry("").key()
+    );
+}
+
 #[test]
 fn a_journal_refusal_is_no_signal() {
     let mut restored = RestoreOutcome::of([(Some(Setting::Dock), PutBack::Back)]);
@@ -4588,14 +4572,17 @@ fn the_failed_headline_offers_the_action_its_note_names() {
         notes,
         ["Check again could not confirm GitHub repositories."]
     );
-    // A failure aterm tries again by itself says so, and the headline offers Show alone
-    // meanwhile: the vault's try as the worker's page says it, a step whose run retries, and
-    // a setup run that could not go while the run retries.
+    // A step aterm tries again by itself is no failure: its note says it did not finish this
+    // time and aterm tries again, and the headline offers Show alone meanwhile: the vault's try
+    // as the worker's page says it, a step whose run retries, and a setup run that could not go
+    // while the run retries.
     let (vault, notes) = line(&status_of("vault-failed"));
     assert!(!vault.start && vault.show.is_some());
     assert_eq!(
         notes,
-        ["Secrets vault failed. aterm tries again by itself."]
+        [format!(
+            "Secrets vault did not finish this time. {RETRIES_NOTE}"
+        )]
     );
     let mut retried = status_of("named-result-failed");
     retried.retrying = true;
@@ -4603,12 +4590,17 @@ fn the_failed_headline_offers_the_action_its_note_names() {
     assert!(!step.start && step.show.is_some());
     assert_eq!(
         notes,
-        ["GitHub repositories failed. aterm tries again by itself."]
+        [format!(
+            "GitHub repositories did not finish this time. {RETRIES_NOTE}"
+        )]
     );
     setup.retrying = true;
     let (could_not_go, notes) = line(&setup);
     assert!(!could_not_go.start);
-    assert_eq!(notes, ["Setup failed. aterm tries again by itself."]);
+    assert_eq!(
+        notes,
+        [format!("Setup did not finish this time. {RETRIES_NOTE}")]
+    );
     // A vault try held after two names Set up now, which the headline offers.
     let mut held = status_of("vault-failed");
     held.retrying = false;
@@ -4655,4 +4647,378 @@ fn a_vault_draft_does_not_claim_a_check() {
             assert_eq!(after, before, "{scenario}");
         }
     }
+}
+
+/// Every row of this Mac as wanted, in the plan with every group set up.
+fn all_in_place() -> SetupStatus {
+    let in_place: Vec<Observation> = Subject::all()
+        .into_iter()
+        .map(|subject| reading(subject, Standing::InPlace, Some(subject.wanted())))
+        .collect();
+    with_readings(Selection::all(), in_place)
+}
+
+/// A saved setup aterm cannot read is no failure (§3.6): aterm reads it again by itself, and
+/// sets aside a record that stays unreadable, so nothing a person could press would change the
+/// outcome. The tab's attention and the menu line stay dark however few buttons are live.
+#[test]
+fn an_unread_saved_setup_signals_nothing() {
+    let mut app = SystemStateApp::opened();
+    app.publish(status_of("plan-unread"));
+    assert!(!app.needs_attention());
+    assert!(crate::system_state_access::menu_line(&app.status, false).is_none());
+    assert_eq!(app.headline().text, CHECKING);
+    assert_eq!(app.status.notes(&Plan::default()), [STATE_UNREAD_NOTE]);
+    // A page that knew the plan claims nothing of it while aterm cannot read it.
+    let mut known = SystemStateApp::new(Plan::default());
+    known.publish(all_in_place());
+    known.publish(SetupStatus {
+        plan: None,
+        rows: vec![calm_setup_row(STATE_UNREAD_NOTE)],
+        ..all_in_place()
+    });
+    assert_eq!(known.headline().text, CHECKING);
+    assert!(!known.needs_attention());
+}
+
+/// The menu line never counts a saved setup aterm cannot read as a failed step: no setup ran
+/// to fail.
+#[test]
+fn an_unread_saved_setup_is_no_failed_step_on_the_menu_line() {
+    let status = status_of("plan-unread");
+    assert!(status.failed_steps(None).next().is_none());
+    assert!(status.failed_steps(Some(&Plan::default())).next().is_none());
+    assert!(crate::system_state_access::menu_line(&status, false).is_none());
+}
+
+/// A choice made while another setup holds this Mac's setup records (another aterm, `aterm
+/// doctor` in a terminal) waits for it (§3.3): the page keeps the choice showing, headlined as
+/// waiting, says why once in a calm note, and shows no Stop, meter, failure, tab attention or
+/// menu line. A later press goes at once as the person's latest intent, the earlier group with
+/// it; a waiting Restore says so in its own words.
+#[test]
+fn a_choice_waiting_for_another_setup_says_why_once_and_calmly() {
+    let in_force = all_in_place();
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(in_force.clone());
+    app.gesture(true);
+    act(&mut app, "system-state/group/2/leave");
+    let (plan, _, _) = submitted(app.take_action());
+    assert!(!plan.selection.contains(Setting::Dock));
+    // The worker's status while the choice waits: the plan in force, unchanged, and the press
+    // queued; the host shows the page busy while the choice is pending.
+    let waiting = SetupStatus {
+        busy: true,
+        queued: true,
+        ..in_force
+    };
+    app.publish(waiting.clone());
+    assert!(
+        !app.reviewed_plan().selection.contains(Setting::Dock),
+        "the choice stays showing"
+    );
+    let headline = app.headline();
+    assert_eq!(headline.text, "Waiting to apply your choice…");
+    assert!(!headline.start);
+    assert_eq!(waiting.notes(&app.reviewed_plan()), [QUEUED_CHOICE_NOTE]);
+    assert!(!app.needs_attention());
+    assert!(crate::system_state_access::menu_line(&waiting, false).is_none());
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
+    for key in ["system-state/stop", "system-state/meter"] {
+        assert!(compiled.semantic(&UiKey::new(key)).is_none(), "{key}");
+    }
+    assert!(
+        compiled
+            .semantics
+            .iter()
+            .filter(|node| node.label.contains(QUEUED_CHOICE_NOTE))
+            .count()
+            == 1,
+        "said once"
+    );
+
+    act(&mut app, "system-state/group/3/leave");
+    let (plan, _, _) = submitted(app.take_action());
+    assert!(!plan.selection.contains(Setting::Dock));
+    assert!(!plan.selection.contains(Setting::Messages));
+
+    let restore = SetupStatus {
+        operation: Some(SetupOperation::Restore),
+        ..waiting
+    };
+    assert_eq!(restore.notes(&Plan::default()), [QUEUED_RESTORE_NOTE]);
+    assert_eq!(
+        Headline::before_plan(&restore).text,
+        "Waiting to restore previous settings…"
+    );
+    assert!(!restore.running());
+}
+
+/// After aterm set aside a saved setup it could not read (§3.5), the page says so in one calm
+/// note under the plan it went on with: no failure, tab attention or menu line, and every
+/// group's buttons stay live.
+#[test]
+fn a_set_aside_setup_is_one_calm_note_with_every_group_live() {
+    let status = SetupStatus {
+        recovered: true,
+        ..all_in_place()
+    };
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status.clone());
+    assert_eq!(status.notes(&app.reviewed_plan()), [RECOVERED_NOTE]);
+    assert!(!app.needs_attention());
+    assert!(crate::system_state_access::menu_line(&status, false).is_none());
+    app.gesture(true);
+    act(&mut app, "system-state/group/2/leave");
+    let (plan, _, _) = submitted(app.take_action());
+    assert!(!plan.selection.contains(Setting::Dock));
+}
+
+/// A Restore that failed as a whole is headlined as the Restore it is (§3.4), never as a setup
+/// that needs attention, with its reason as the page's note; the button that tries it again is
+/// beside it, so the tab's attention and the menu line stay dark.
+#[test]
+fn a_whole_restore_failure_is_headlined_as_restore() {
+    for reason in [RESTORE_FAILED_NOTE, RESTORE_BACKUP_UNREAD_NOTE] {
+        let status = SetupStatus {
+            rows: vec![SetupStatusRow {
+                name: RESTORE_FINISHED.into(),
+                status: "failed".into(),
+                detail: reason.into(),
+            }],
+            ..all_in_place()
+        };
+        let mut app = SystemStateApp::new(Plan::default());
+        app.publish(status.clone());
+        assert_eq!(app.headline().text, "Restore previous settings failed");
+        assert_eq!(status.notes(&Plan::default()), [reason]);
+        assert!(!app.needs_attention());
+        assert!(crate::system_state_access::menu_line(&status, false).is_none());
+        let mut unknown = SystemStateApp::opened();
+        unknown.publish(SetupStatus {
+            plan: None,
+            ..status
+        });
+        assert_eq!(unknown.headline().text, "Restore previous settings failed");
+    }
+}
+
+/// A step aterm tries again by itself is no failure (design §3.2, §3.5): the headline counts it
+/// as waiting, as it does a row that waits on something, so `vault-failed` and
+/// `vault-unreached` (the same wait, another cause) read alike; its note says, in the page's
+/// words, that it did not finish this time and aterm tries again; and nothing signals it, even
+/// once the run itself parks, since the vault's own pause tries it again. The headline says
+/// `failed` only once the tries stop.
+#[test]
+fn a_step_aterm_retries_by_itself_waits_and_is_no_failure() {
+    let secrets = Subject::Setting(Setting::Secrets);
+    let line = |status: &SetupStatus| {
+        let plan = status.plan.clone().unwrap();
+        headline(status, &rows(status, plan.selection), Some(&plan))
+    };
+    let unreached = line(&status_of("vault-unreached"));
+    for retrying in [true, false] {
+        let status = SetupStatus {
+            retrying,
+            ..status_of("vault-failed")
+        };
+        let waits = line(&status);
+        assert_eq!(
+            (waits.text.as_str(), waits.show, waits.start),
+            (
+                "2 steps waiting: Secrets vault, GitHub repositories",
+                Some(secrets),
+                false
+            ),
+            "retrying {retrying}"
+        );
+        assert_eq!(waits.text, unreached.text);
+        let plan = status.plan.clone().unwrap();
+        let notes = status.notes(&plan);
+        assert_eq!(
+            notes,
+            [format!(
+                "Secrets vault did not finish this time. {RETRIES_NOTE}"
+            )]
+        );
+        assert!(notes.iter().all(|note| !note.contains("fail")), "{notes:?}");
+        assert!(status.failed_steps(Some(&plan)).next().is_none());
+        assert!(crate::system_state_access::menu_line(&status, false).is_none());
+        let mut app = SystemStateApp::new(plan);
+        app.publish(status);
+        assert!(!app.needs_attention(), "retrying {retrying}");
+    }
+    // A step the run tries again, with no words of its own, waits too while the run retries.
+    let mut step = status_of("named-result-failed");
+    step.retrying = true;
+    assert_eq!(line(&step).text, "1 step waiting: GitHub repositories");
+    // Once the tries stop (a vault try held after two, a run that no longer retries), the step
+    // failed, and the headline, the menu line and the diamond say so.
+    let mut held = status_of("vault-failed");
+    held.retrying = false;
+    held.rows[0].detail = "aterm tried twice, so it tries again once this Mac's network or \
+                           vault changes, or on Set up now."
+        .into();
+    assert_eq!(line(&held).text, "1 step failed: Secrets vault");
+    assert_eq!(
+        crate::system_state_access::menu_line(&held, false).map(|line| line.label),
+        Some("System State: Secrets vault failed".to_owned())
+    );
+    step.retrying = false;
+    assert_eq!(line(&step).text, "1 step failed: GitHub repositories");
+}
+
+/// The village draws each station as the headline says its rows (design §3.1): a step the
+/// headline names failed takes the error look, though its row reads in place, and a step aterm
+/// tries again by itself the waiting look, never the settled one.
+#[test]
+fn the_village_draws_a_failed_step_as_failed_and_a_retried_one_as_waiting() {
+    let station = |status: &SetupStatus, setting: Setting| {
+        let mut app = SystemStateApp::new(Plan::default());
+        app.publish(status.clone());
+        let spec = village_spec(&app.status, &app.reviewed_rows(), &app.reviewed_plan(), 0);
+        let at = Setting::ALL.iter().position(|s| *s == setting).unwrap();
+        spec.rsplit("states=")
+            .next()
+            .and_then(|states| states.chars().nth(at))
+            .unwrap()
+    };
+    let failed = status_of("named-result-failed");
+    assert_eq!(station(&failed, Setting::Repositories), 'E');
+    let mut retried = failed.clone();
+    retried.retrying = true;
+    assert_eq!(station(&retried, Setting::Repositories), 'D');
+    assert_eq!(station(&status_of("vault-failed"), Setting::Secrets), 'D');
+    assert_eq!(station(&status_of("set-up"), Setting::Repositories), 'G');
+}
+
+/// While macOS's administrator dialog for debugger access is up, Turn On… can start nothing
+/// (design §3.4): the row says what it waits for in its place, with no button, and still needs
+/// the person, whose dialog may be behind other windows, so the menu line and the diamond
+/// stay. Once the step ends, Turn On… is back.
+#[test]
+fn the_debugger_row_waits_for_the_password_without_a_button() {
+    let open = "system-state/row/debugger/open";
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status_of("debugger"));
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
+    assert!(
+        compiled.semantic(&UiKey::new(open)).is_none(),
+        "no Turn On… while the dialog is up"
+    );
+    assert!(
+        compiled
+            .semantics
+            .iter()
+            .any(|node| !node.offscreen && node.label == PASSWORD_NOTE)
+    );
+    app.gesture(true);
+    act(&mut app, open);
+    assert!(app.take_action().is_none(), "a press starts nothing");
+    assert!(app.needs_attention());
+    assert_eq!(
+        crate::system_state_access::menu_line(&app.status, false).map(|line| line.label),
+        Some("System State: Debugger access needs you".to_owned())
+    );
+    let mut ended = status_of("debugger");
+    ended.access_step = None;
+    app.publish(ended);
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
+    assert!(
+        compiled
+            .semantic(&UiKey::new(open))
+            .is_some_and(|node| node.state.is_some_and(|state| state.enabled))
+    );
+    assert!(
+        compiled
+            .semantics
+            .iter()
+            .all(|node| node.label != PASSWORD_NOTE)
+    );
+}
+
+/// Where no look at the local network answered aterm, Local Network reads as macOS leaves it
+/// (design §3.2): `—` beside the calm note that macOS does not tell apps whether it is on, which
+/// a screen reader hears right after `Local Network: unknown`, in every scenario that reads so.
+#[test]
+fn local_network_reads_unknown_with_its_note_where_no_look_answered() {
+    let lan = Subject::Access(Access::LocalNetwork);
+    for scenario in ["running", "vault-unreached", "fresh", "set-up"] {
+        let mut app = SystemStateApp::new(Plan::default());
+        app.publish(status_of(scenario));
+        let row = app.reviewed_row(lan);
+        assert_eq!(
+            (row.value.clone(), row.label.as_str(), row.note.as_deref()),
+            (
+                RowValue::One("—".into()),
+                "Local Network: unknown",
+                Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD)
+            ),
+            "{scenario}"
+        );
+        let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 4000.0);
+        let heard: Vec<&str> = compiled
+            .semantics
+            .iter()
+            .map(|node| node.label.as_str())
+            .filter(|label| !label.is_empty())
+            .collect();
+        let at = heard
+            .iter()
+            .position(|label| *label == "Local Network: unknown")
+            .unwrap_or_else(|| panic!("{scenario}: {heard:?}"));
+        assert_eq!(
+            heard.get(at + 1).copied(),
+            Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD),
+            "{scenario}"
+        );
+    }
+}
+
+/// The brand's spoken label drops its middle dot, as a row's value does: the dot marks the
+/// lockup for the eye, and a screen reader hears the words alone (design §3.1).
+#[test]
+fn the_brand_label_reads_without_its_middle_dot() {
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status_of("set-up"));
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
+    assert_eq!(label(&compiled, "system-state/brand"), "aterm ALab");
+    assert!(paint::BRAND_WORDS.contains('·'), "the eye still sees it");
+}
+
+/// The headline claims no more than was confirmed (design §3.2): a row a Check, or a run,
+/// could not confirm is counted and shown, as a row that could not be read is, beside the
+/// note that says so, never `This Mac is set up`.
+#[test]
+fn a_headline_claims_no_more_than_was_confirmed() {
+    let repositories = Subject::Setting(Setting::Repositories);
+    let line = |status: &SetupStatus| {
+        let plan = status.plan.clone().unwrap();
+        headline(status, &rows(status, plan.selection), Some(&plan))
+    };
+    let checked = line(&status_of("check-unconfirmed"));
+    assert_eq!(
+        (checked.text.as_str(), checked.show, checked.start),
+        (
+            "1 row not confirmed: GitHub repositories",
+            Some(repositories),
+            false
+        )
+    );
+    let mut ran = status_of("set-up");
+    ran.rows = pass_rows(&PassOutcome {
+        rolled_back: None,
+        unfinished: vec![
+            (Setting::Dock, Unfinished::Unconfirmed),
+            (Setting::Spotlight, Unfinished::Unconfirmed),
+        ],
+    });
+    assert_eq!(
+        line(&ran).text,
+        "2 rows not confirmed: Dock, Rust in Spotlight"
+    );
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status_of("check-unconfirmed"));
+    assert!(!app.needs_attention());
+    assert!(crate::system_state_access::menu_line(&app.status, false).is_none());
 }

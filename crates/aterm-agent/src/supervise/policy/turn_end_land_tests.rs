@@ -1,23 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-fn land_table() -> Vec<(bool, String)> {
-    let table = include_str!("fixtures/land-defense-table.txt");
-    let mut rows = Vec::new();
-    let mut open = None;
-    for line in table.lines() {
-        match line {
-            "== open" => open = Some(true),
-            "== clean" => open = Some(false),
-            _ if line.starts_with('#') || line.trim().is_empty() => {}
-            _ => rows.push((
-                open.unwrap_or_else(|| panic!("a row before its section: {line:?}")),
-                line.replace("\\n", "\n"),
-            )),
-        }
-    }
-    rows
-}
+use super::corpora::land_table;
 
 fn reads_as_labelled(open: bool, reply: &str) -> bool {
     if open {
@@ -182,20 +166,12 @@ fn a_need_however_headed_holds_the_landing() {
 #[ignore = "a measurement: run with --ignored --nocapture; ATERM_LAND_HOLDOUT names another holdout"]
 fn land_reads_a_holdout() {
     let text = std::env::var_os("ATERM_LAND_HOLDOUT").map_or_else(
-        || include_str!("fixtures/land-holdout-2026-10-20.tsv").to_string(),
+        || super::corpora::HOLDOUT.to_string(),
         |path| std::fs::read_to_string(&path).expect("the holdout reads"),
     );
     let (mut opens, mut cleans, mut debatable) = (0, 0, 0);
     let (mut landed, mut nudged) = (Vec::new(), Vec::new());
-    for line in text
-        .lines()
-        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-    {
-        let cols: Vec<&str> = line.splitn(5, '\t').collect();
-        let [label, id, prov, _, reply] = cols[..] else {
-            panic!("a case needs five columns: {line:?}");
-        };
-        let reply = reply.replace("\\n", "\n");
+    for (label, id, prov, reply) in super::corpora::holdout_cases(&text) {
         let clean = clean_defense(Some(&reply));
         let words = land_open_words(Some(&reply));
         let needs = needs::needs_you(&reply);

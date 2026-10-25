@@ -227,9 +227,7 @@ fn parse_args(args: &[String], verb: &str) -> Result<ProofArgs, Fail> {
             }
         }
     }
-    if p.arches.is_empty() {
-        p.arches = Arch::ALL.to_vec();
-    }
+    p.arches = crate::linux_gpu::arches(std::mem::take(&mut p.arches), verb)?;
     Ok(p)
 }
 
@@ -683,6 +681,18 @@ pub fn renderer(journal: &str) -> Option<&str> {
         .find_map(|l| l.split_once("GPU rendering on ").map(|(_, r)| r.trim()))
 }
 
+/// What the GL arm's windows draw on, where aterm-gpu named it (`aterm-gpu (gl arm): <platform>
+/// windows draw on …`): a window system's driver can be another than the headless probe's that
+/// [`renderer`] reads (on krunkit, Mesa's EGL on Wayland falls back to software where its DRM screen
+/// fails).
+#[must_use]
+pub fn window_renderer(journal: &str) -> Option<&str> {
+    journal.lines().find_map(|l| {
+        let note = l.split_once("aterm-gpu (gl arm): ")?.1;
+        note.split_once(" windows draw on ").map(|(_, r)| r.trim())
+    })
+}
+
 /// What aterm-gui prints when a window's GPU surface did not attach although its device did (`crates/aterm-gui/src/app_window.rs`, the `Err` arm of the window attach's GPU surface).
 pub const SURFACE_FAILED: &str = "GPU surface creation failed";
 
@@ -1040,6 +1050,7 @@ impl Gui<'_> {
             Some(client) => env.extend(client.iter().cloned()),
             None => argv.push("--headless".into()),
         }
+        env.extend(crate::linux_gpu::client_env());
         env.extend(extra.iter().cloned());
         if let Some(path) = stderr {
             env.push(("ATERM_LANE_STDERR".into(), path.into()));
@@ -2904,6 +2915,18 @@ error: 1 target failed:
         assert_eq!(
             renderer("x\naterm-gui: GPU rendering on llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan)\n"),
             Some("llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan)")
+        );
+        let windows = "aterm-gui: GPU rendering on zink Vulkan 1.3(Venus) (Gl)\n\
+                       aterm-gpu (gl arm): the window's presenter cannot attach (x); posting it\n\
+                       aterm-gpu (gl arm): Wayland windows draw on llvmpipe (LLVM 20.1.2, 128 bits)\n";
+        assert_eq!(
+            window_renderer(windows),
+            Some("llvmpipe (LLVM 20.1.2, 128 bits)"),
+            "the windows' renderer, not the probe's nor another GL-arm note"
+        );
+        assert_eq!(
+            window_renderer("aterm-gui: GPU rendering on x (Gl)\n"),
+            None
         );
         assert!(
             !TYPED.contains(ECHO),

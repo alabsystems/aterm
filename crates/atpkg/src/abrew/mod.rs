@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! abrew — aterm's Homebrew, an atpkg extension (`docs/DESIGN-abrew-2026-10-19.md`).
+//! Native brew compatibility in atpkg (`docs/DESIGN-abrew-2026-10-19.md`).
 
 mod commands;
 use commands::*;
@@ -51,35 +51,14 @@ pub(crate) fn valid_name(name: &str) -> bool {
 
 /// `abrew` / `atpkg-abrew` argv0 and the dev binary.
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
-    if escape_requested_os(&args) {
-        let rest: Vec<&OsString> = if args
-            .first()
-            .is_some_and(|a| a.as_os_str() == stub::REAL_FLAG)
-        {
-            args.iter().skip(1).collect()
-        } else {
-            args.iter().collect()
-        };
-        return passthrough_os(&Prefix::resolve(), &rest, None);
-    }
-    let argv: Vec<String> = args
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
+    let Ok(argv) = args
+        .into_iter()
+        .map(OsString::into_string)
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return failed("abrew: native brew arguments must be valid UTF-8");
+    };
     run(&argv, false)
-}
-
-fn escape_requested_os(args: &[OsString]) -> bool {
-    let first = args
-        .first()
-        .map(|a| a.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if first == "on" {
-        return false;
-    }
-    first == stub::REAL_FLAG
-        || stub::engaged(std::env::var(stub::REAL_ENV).ok().as_deref())
-        || stub::engaged(std::env::var(reroute_passthrough_env()).ok().as_deref())
 }
 
 const fn reroute_passthrough_env() -> &'static str {
@@ -106,21 +85,25 @@ pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
     if let Some(w) = prefix::prefix_env_warning() {
         eprintln!("abrew: warning: {w}");
     }
+    let args = command_args(args);
     let first = args.first().map(String::as_str).unwrap_or("");
     if first == stub::REAL_FLAG {
-        return passthrough(&prefix, args.get(1..).unwrap_or(&[]), None);
+        return unsupported(
+            "--real is no longer supported; brew uses atpkg's native implementation",
+        );
     }
-    if stub::engaged(std::env::var(stub::REAL_ENV).ok().as_deref()) && first != "on" {
-        return passthrough(&prefix, args, None);
+    let recovery = matches!(first, "on" | "status");
+    if stub::engaged(std::env::var(stub::REAL_ENV).ok().as_deref()) && !recovery {
+        return unsupported("unset ABREW_REAL to use native brew compatibility");
     }
-    if stub::engaged(std::env::var(reroute_passthrough_env()).ok().as_deref()) && first != "on" {
-        return passthrough(&prefix, args, Some("this session is --no-reroute"));
+    if stub::engaged(std::env::var(reroute_passthrough_env()).ok().as_deref()) && !recovery {
+        return failed("abrew: native brew routing is disabled for this --no-reroute session");
     }
-    if !crate::config::cached_abrew().enabled() && !matches!(first, "on" | "status") {
-        return passthrough(&prefix, args, Some("[abrew] enabled=false in aterm.toml"));
+    if !crate::config::cached_abrew().enabled() && !recovery {
+        return failed("abrew: native brew is disabled; set [abrew] enabled=true in aterm.toml");
     }
-    if prefix.is_disabled() && !matches!(first, "on" | "status") {
-        return passthrough(&prefix, args, Some("abrew is off (abrew on re-enables)"));
+    if prefix.is_disabled() && !recovery {
+        return failed("abrew: native brew is off; run abrew on to re-enable it");
     }
     if prefix::overlaps_real_brew_prefix(&prefix.root) {
         return failed(&format!(
@@ -129,59 +112,17 @@ pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
         ));
     }
     if via_reroute && crate::config::cached_reroute().announce() {
-        eprintln!("brew → abrew (aterm) — `brew --real …` runs real Homebrew");
+        eprintln!("brew → atpkg (native brew compatibility)");
     }
-    dispatch(&prefix, args, via_reroute)
+    dispatch(&prefix, args)
 }
 
-fn passthrough(prefix: &Prefix, args: &[String], notice: Option<&str>) -> ExitCode {
-    let Some(brew) = stub::resolve_real_brew(prefix) else {
-        eprintln!(
-            "abrew: no real Homebrew found{}\n  {}lay the bundled one with: abrew bundle",
-            notice.map_or(String::new(), |n| format!(" ({n})")),
-            steps_before_bundle(prefix)
-        );
-        return ExitCode::from(127);
-    };
-    if let Some(n) = notice {
-        eprintln!("abrew: {n}; running real brew ({})", brew.display());
-    }
-    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let refs: Vec<&OsString> = os_args.iter().collect();
-    run_real_brew(&brew, &refs)
+fn unsupported(reason: &str) -> ExitCode {
+    failed(&format!("abrew: unsupported native operation: {reason}"))
 }
 
-fn run_real_brew(brew: &std::path::Path, args: &[&OsString]) -> ExitCode {
-    let status = aterm_uds::spawnfd::command(brew)
-        .args(args.iter().copied())
-        .env(stub::REROUTED_ENV, "1")
-        .status();
-    match status {
-        Ok(s) => ExitCode::from(u8::try_from(s.code().unwrap_or(2)).unwrap_or(2)),
-        Err(e) => {
-            eprintln!("abrew: cannot run {}: {e}", brew.display());
-            ExitCode::from(127)
-        }
-    }
-}
-
-fn passthrough_os(prefix: &Prefix, args: &[&OsString], notice: Option<&str>) -> ExitCode {
-    let Some(brew) = stub::resolve_real_brew(prefix) else {
-        eprintln!(
-            "abrew: no real Homebrew found{}\n  {}lay the bundled one with: abrew bundle",
-            notice.map_or(String::new(), |n| format!(" ({n})")),
-            steps_before_bundle(prefix)
-        );
-        return ExitCode::from(127);
-    };
-    if let Some(n) = notice {
-        eprintln!("abrew: {n}; running real brew ({})", brew.display());
-    }
-    run_real_brew(&brew, args)
-}
-
-fn not_native(prefix: &Prefix, args: &[String], cmd: &str) -> ExitCode {
-    passthrough(prefix, args, Some(&format!("'{cmd}' is not native")))
+fn not_native(_prefix: &Prefix, _args: &[String], cmd: &str) -> ExitCode {
+    unsupported(&format!("'{cmd}' is not native"))
 }
 
 fn failed(msg: &str) -> ExitCode {
@@ -224,25 +165,25 @@ pub(super) fn no_env_hints() -> bool {
     env_set("HOMEBREW_NO_ENV_HINTS")
 }
 
-fn from_install(prefix: &Prefix, args: &[String], r: Result<(), InstallError>) -> ExitCode {
+fn from_install(_prefix: &Prefix, _args: &[String], r: Result<(), InstallError>) -> ExitCode {
     match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(InstallError::Failed(m)) => failed(&m),
-        Err(InstallError::PassThrough(reason)) => passthrough(prefix, args, Some(&reason)),
+        Err(InstallError::Unsupported(reason)) => unsupported(&reason),
     }
 }
 
 fn after_native_progress(error: InstallError, completed: bool) -> InstallError {
     match error {
-        InstallError::PassThrough(reason) if completed => InstallError::Failed(format!(
-            "abrew: {reason}; earlier native steps may already have changed the prefix, so the whole command does not go to real brew"
+        InstallError::Unsupported(reason) if completed => InstallError::Failed(format!(
+            "abrew: {reason}; earlier native steps may already have changed the prefix"
         )),
         error => error,
     }
 }
 
 const fn native_attempt_may_have_progress<T>(result: &Result<T, InstallError>) -> bool {
-    !matches!(result, Err(InstallError::PassThrough(_)))
+    !matches!(result, Err(InstallError::Unsupported(_)))
 }
 
 fn after_native_attempt<T>(
@@ -297,9 +238,9 @@ fn native_args(
     let canonical = canonical_kind_switches(rest);
     let rest: &[String] = &canonical;
     let unsupported =
-        || InstallError::PassThrough(format!("'{cmd}' with these arguments is not native"));
+        || InstallError::Unsupported(format!("'{cmd}' with these arguments is not native"));
     let unknown = || {
-        const DELEGATED_KNOWN: &[&str] = &[
+        const UNSUPPORTED_KNOWN: &[&str] = &[
             "audit",
             "bottle",
             "bump",
@@ -319,10 +260,10 @@ fn native_args(
             "unpack",
             "zap",
         ];
-        if COMMANDS.contains(&cmd) || DELEGATED_KNOWN.contains(&cmd) {
-            InstallError::PassThrough(format!("'{cmd}' is not native"))
+        if COMMANDS.contains(&cmd) || UNSUPPORTED_KNOWN.contains(&cmd) {
+            InstallError::Unsupported(format!("'{cmd}' is not native"))
         } else {
-            InstallError::PassThrough(format!("'{cmd}' is not a command abrew knows natively"))
+            InstallError::Unsupported(format!("'{cmd}' is not a command abrew knows natively"))
         }
     };
     if cmd == "bundle" {
@@ -666,7 +607,7 @@ fn native_args(
 
 fn bundle_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
     let unsupported =
-        || InstallError::PassThrough("bundle arguments or Brewfile rows are not native".to_owned());
+        || InstallError::Unsupported("bundle arguments or Brewfile rows are not native".to_owned());
     match rest.first().map(String::as_str) {
         Some("status" | "remove") if rest.len() == 1 => Ok(None),
         Some("dump") => {
@@ -689,60 +630,41 @@ fn bundle_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, In
             }
             Ok(None)
         }
-        Some("check" | "install") => {
-            let mut file = None;
-            let mut it = rest[1..].iter();
-            while let Some(arg) = it.next() {
-                if arg == "--file" && file.is_none() {
-                    file = Some(std::path::PathBuf::from(
-                        it.next()
-                            .filter(|s| !s.is_empty())
-                            .ok_or_else(unsupported)?,
-                    ));
-                } else if let Some(path) = arg.strip_prefix("--file=").filter(|s| !s.is_empty())
-                    && file.is_none()
-                {
-                    file = Some(std::path::PathBuf::from(path));
-                } else {
-                    return Err(unsupported());
-                }
-            }
-            let text = bundle::read_brewfile(file.as_deref()).map_err(InstallError::Failed)?;
-            let (entries, skipped) = bundle::parse_brewfile(&text);
-            if !skipped.is_empty() {
-                return Err(unsupported());
-            }
-            Ok(Some(entries))
-        }
-        _ => {
-            let mut it = rest.iter();
-            let (mut version, mut sha, mut force) = (false, false, false);
-            while let Some(arg) = it.next() {
-                match arg.as_str() {
-                    "--version" if !version => {
-                        version = true;
-                        if !it.next().is_some_and(|s| valid_component(s)) {
-                            return Err(unsupported());
-                        }
-                    }
-                    "--sha256" if !sha => {
-                        sha = true;
-                        if !it.next().is_some_and(|s| {
-                            s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())
-                        }) {
-                            return Err(unsupported());
-                        }
-                    }
-                    "--force" | "-f" if !force => force = true,
-                    _ => return Err(unsupported()),
-                }
-            }
-            Ok(None)
-        }
+        Some("check" | "install") | None => brewfile_args(rest.get(1..).unwrap_or(&[])),
+        Some(flag) if flag.starts_with("--file") => brewfile_args(rest),
+        _ => Err(unsupported()),
     }
 }
 
-fn prelock_delegation(
+fn brewfile_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
+    let unsupported =
+        || InstallError::Unsupported("bundle arguments or Brewfile rows are not native".to_owned());
+    let mut file = None;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--file" && file.is_none() {
+            file = Some(std::path::PathBuf::from(
+                it.next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(unsupported)?,
+            ));
+        } else if let Some(path) = arg.strip_prefix("--file=").filter(|s| !s.is_empty())
+            && file.is_none()
+        {
+            file = Some(std::path::PathBuf::from(path));
+        } else {
+            return Err(unsupported());
+        }
+    }
+    let text = bundle::read_brewfile(file.as_deref()).map_err(InstallError::Failed)?;
+    let (entries, skipped) = bundle::parse_brewfile(&text);
+    if !skipped.is_empty() {
+        return Err(unsupported());
+    }
+    Ok(Some(entries))
+}
+
+fn prelock_admission(
     prefix: &Prefix,
     api: &api::Api,
     args: &[String],
@@ -781,43 +703,25 @@ fn prelock_delegation(
     }
     match result {
         Ok(()) => None,
-        Err(e @ InstallError::PassThrough(_)) => Some(from_install(prefix, args, Err(e))),
+        Err(e @ InstallError::Unsupported(_)) => Some(from_install(prefix, args, Err(e))),
         Err(_) => None,
     }
 }
 
-fn dispatch(prefix: &Prefix, args_in: &[String], via_reroute: bool) -> ExitCode {
-    let stripped: Vec<String>;
-    let args: &[String] = if args_in.len() > 1
-        && matches!(args_in[0].as_str(), "--verbose" | "-v" | "--debug" | "-d")
-        && !args_in[1].starts_with('-')
+/// The single supported leading verbosity flag does not change the command's identity.
+fn command_args(args: &[String]) -> &[String] {
+    if args.len() > 1
+        && matches!(args[0].as_str(), "--verbose" | "-v" | "--debug" | "-d")
+        && !args[1].starts_with('-')
     {
-        stripped = args_in[1..].to_vec();
-        &stripped
+        &args[1..]
     } else {
-        args_in
-    };
-    if via_reroute && args.len() == 1 && args.first().is_some_and(|a| a == "bundle") {
-        return passthrough(
-            prefix,
-            args,
-            Some("bare `brew bundle` is Homebrew's Brewfile install"),
-        );
+        args
     }
-    if via_reroute
-        && args
-            .first()
-            .is_some_and(|a| matches!(a.as_str(), "--version" | "-v"))
-    {
-        return passthrough(prefix, args, None);
-    }
-    if via_reroute
-        && args
-            .first()
-            .is_some_and(|a| matches!(a.as_str(), "--env" | "env"))
-    {
-        return passthrough(prefix, args, None);
-    }
+}
+
+fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
+    let args = command_args(args);
     if args.is_empty() {
         print!("{HELP_MAIN}");
         return ExitCode::SUCCESS;
@@ -883,8 +787,9 @@ fn dispatch(prefix: &Prefix, args_in: &[String], via_reroute: bool) -> ExitCode 
                 );
                 return ExitCode::SUCCESS;
             }
-            println!("{}", prefix.homebrew_bundle().display());
-            return ExitCode::SUCCESS;
+            return unsupported(
+                "--repository without a tap: atpkg has no Homebrew source repository",
+            );
         }
         "--env" | "env" => {
             println!("ABREW_PREFIX={}", prefix.root.display());
@@ -904,12 +809,14 @@ fn dispatch(prefix: &Prefix, args_in: &[String], via_reroute: bool) -> ExitCode 
         || dry_run;
     if matches!(cmd, "install" | "upgrade" | "reinstall" | "fetch") && !dry_run {
         let api0 = api::Api::new(prefix.clone());
-        if let Some(code) = prelock_delegation(prefix, &api0, args, rest) {
+        if let Some(code) = prelock_admission(prefix, &api0, args, rest) {
             return code;
         }
     }
     if cmd == "bundle"
-        && rest.first().is_some_and(|s| s == "install")
+        && !rest
+            .first()
+            .is_some_and(|s| matches!(s.as_str(), "check" | "status" | "remove" | "dump"))
         && let Some(entries) = &prepared
     {
         let api0 = api::Api::new(prefix.clone());
@@ -950,7 +857,7 @@ fn dispatch(prefix: &Prefix, args_in: &[String], via_reroute: bool) -> ExitCode 
                 break;
             }
         }
-        if let Err(e @ InstallError::PassThrough(_)) = plan {
+        if let Err(e @ InstallError::Unsupported(_)) = plan {
             return from_install(prefix, args, Err(e));
         }
     }
@@ -1077,7 +984,7 @@ fn completions(shell: &str) -> String {
             "complete -c abrew -n '__fish_use_subcommand' -a '{words}'\ncomplete -c brew -n '__fish_use_subcommand' -a '{words}'\n"
         ),
         _ => format!(
-            "_abrew() {{\n  COMPREPLY=( $(compgen -W \"{words} --real --version --help\" -- \"${{COMP_WORDS[COMP_CWORD]}}\") )\n}}\ncomplete -F _abrew abrew brew atpkg-abrew\n"
+            "_abrew() {{\n  COMPREPLY=( $(compgen -W \"{words} --version --help\" -- \"${{COMP_WORDS[COMP_CWORD]}}\") )\n}}\ncomplete -F _abrew abrew brew atpkg-abrew\n"
         ),
     }
 }
@@ -1155,7 +1062,7 @@ fn command_names(include_aliases: bool) -> Vec<&'static str> {
 }
 
 const HELP_MAIN: &str = "\
-abrew — aterm's Homebrew
+abrew — native brew compatibility in atpkg
 
 Usage: abrew <command> [args]
 
@@ -1170,17 +1077,18 @@ Common commands:
   deps, uses, leaves, missing     the dependency graph
   pin, unpin, link, unlink        manage kegs
   tap, untap                      manage taps
-  bundle                          Brewfiles, and the pinned real Homebrew
+  bundle                          native Brewfile install, check and dump
   cleanup, autoremove, fetch      housekeeping
   completions bash|zsh|fish       print a shell completion script
-  on, off, status                 the brew reroute switch
+  on, off, status                 enable, disable or inspect native brew
 
-Real Homebrew, unchanged:  brew --real <command>…   ABREW_REAL=1   abrew off
 abrew pours bottles that need no relocation (or, on macOS with the developer
 tools, `:any` relocation) and installs tar, zip, DMG and single-file casks
-whose artifacts and constraints are plain data. Everything else (source
-builds, post-install recipes, pkg casks, services, unsupported flags) runs
-real brew, with a notice, in its own prefix.
+whose artifacts and constraints are plain data. Unsupported source builds,
+post-install recipes, pkg casks, services and flags fail with their missing
+native capability. atpkg never installs or invokes real Homebrew as a fallback;
+--real and ABREW_REAL are unsupported. Existing legacy bundles are unused and
+can be inspected or explicitly removed with bundle status / bundle remove.
 
 Further help: abrew help <command>; abrew commands; aterm help abrew
 ";
@@ -1188,7 +1096,7 @@ Further help: abrew help <command>; abrew commands; aterm help abrew
 fn help_for(cmd: &str) -> &'static str {
     match cmd {
         "install" => {
-            "Usage: abrew install [--formula|--cask] [--ignore-dependencies] [--force|-f] [--dry-run|-n] [--quiet|-q] <name>…\n  --ignore-dependencies and --quiet stay native only with --formula; -s, --HEAD\n  and flags abrew does not take run real Homebrew (--no-quarantine, --verbose and\n  --debug are accepted and change nothing). Every name is planned first; one the\n  plan shows needs real Homebrew sends the whole command there. A need found\n  later, once abrew has changed the prefix, fails that name instead (exit 1).\n"
+            "Usage: abrew install [--formula|--cask] [--ignore-dependencies] [--force|-f] [--dry-run|-n] [--quiet|-q] <name>…\n  --ignore-dependencies and --quiet are supported only with --formula. Source\n  builds (-s, --HEAD), unsupported flags and recipes fail natively; Homebrew\n  is never a fallback. --no-quarantine, --verbose and --debug are accepted\n  and change nothing. Names are planned before installation; a later failure\n  reports that earlier native steps may already have changed the prefix.\n"
         }
         "reinstall" => {
             "Usage: abrew reinstall [--formula|--cask] [--ignore-dependencies] [--dry-run|-n] [--quiet|-q] <name>…\n  --ignore-dependencies and --quiet stay native only with --formula.\n"
@@ -1209,7 +1117,7 @@ fn help_for(cmd: &str) -> &'static str {
             "Usage: abrew outdated [--formula|--cask] [--greedy] [--verbose|-v|--quiet|-q] [--json[=v2]] [name…]\n"
         }
         "options" => {
-            "Usage: abrew options [--compact] [--installed] [name…]\n  No names: every formula, as in brew; with names, --installed lists the\n  installed ones in their place. Tapped formulae run real Homebrew, and so does\n  the no-name listing once a tap exists.\n"
+            "Usage: abrew options [--compact] [--installed] [name…]\n  No names: every formula, as in brew; with names, --installed lists the\n  installed ones in their place. Tapped formulae, and the no-name listing\n  once a tap exists, are not supported natively and fail.\n"
         }
         "cleanup" => {
             "Usage: abrew cleanup [--dry-run|-n] [--prune=<days>|--prune=all|--scrub|-s] [name…]\n  Removes old versions (only the named packages', when names are given). With no\n  names, --prune=<days> also deletes cached downloads at least that old, and\n  --prune=all or --scrub every cached download.\n"
@@ -1229,7 +1137,7 @@ fn help_for(cmd: &str) -> &'static str {
         }
         "link" | "ln" | "unlink" => "Usage: abrew link|unlink [--dry-run|-n] <formula>\n",
         "doctor" | "dr" => {
-            "Usage: abrew doctor [--quiet|-q]\n  Warns about the prefix (unwritable, broken links, missing receipts, extra\n  versions, unlinked kegs, bad pins, bin not on PATH, no real brew) and exits 1\n  on any; --quiet drops the all-clear line. `aterm pkg doctor` checks the `brew`\n  stub.\n"
+            "Usage: abrew doctor [--quiet|-q]\n  Warns about the native prefix (unwritable, broken links, missing receipts,\n  extra versions, unlinked kegs, bad pins, bin not on PATH) and exits 1 on any;\n  --quiet drops the all-clear line. Homebrew is not a dependency.\n  `aterm pkg doctor` checks the managed `brew` stub.\n"
         }
         "tap" => {
             "Usage: abrew tap [--list-official] [<user/repo> [<URL>]]\n  No name: lists the taps abrew manages.\n"
@@ -1244,13 +1152,13 @@ fn help_for(cmd: &str) -> &'static str {
             "Usage: abrew desc [--formula|--cask] <name>…\n       abrew desc [--formula|--cask] (--search|-s|--name|-n|--description|-d) <text>|/<regex>/\n"
         }
         "search" => {
-            "Usage: abrew search [--formula|--cask] [--desc] <text>|/<regex>/\n  Text ignores case and all but ASCII letters, digits, @ and +; a /regex/ is\n  case-sensitive, as in brew. Shows at most 200 matches. A pattern the native\n  engine cannot compile runs real brew; one that outruns its work budget fails\n  (exit 1) and names `brew --real search`.\n"
+            "Usage: abrew search [--formula|--cask] [--desc] <text>|/<regex>/\n  Text ignores case and all but ASCII letters, digits, @ and +; a /regex/ is\n  case-sensitive, as in brew. Shows at most 200 matches. Unsupported patterns\n  or patterns that outrun the native work budget fail (exit 1); simplify them.\n"
         }
         "bundle" => {
-            "Usage: abrew bundle [--version V --sha256 H] [--force]\n       abrew bundle status | remove\n       abrew bundle dump [--file F] [--force]\n       abrew bundle install | check [--file F]\n  With no subcommand, lays the pinned real Homebrew under the abrew prefix;\n  delegated commands prefer it. Bare `brew bundle` is Homebrew's Brewfile\n  install and runs real Homebrew, as do other subcommands and Brewfiles with\n  rows abrew cannot read.\n"
+            "Usage: abrew bundle [install|check] [--file F]\n       abrew bundle dump [--file F] [--force]\n       abrew bundle status | remove\n  No subcommand means native Brewfile install. Unsupported rows fail before\n  installation; no Homebrew is installed or invoked. status/remove inspect\n  or explicitly remove an owned legacy Homebrew bundle, which is never used.\n"
         }
         "services" => {
-            "Usage: abrew services <args>…\n  Runs real Homebrew's `brew services` unchanged; abrew has no service manager.\n"
+            "Usage: abrew services <args>…\n  Not supported: atpkg's brew compatibility has no native service manager.\n"
         }
         _ => HELP_MAIN,
     }
@@ -1294,7 +1202,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn unsupported_arguments_delegate_before_native_effects() {
+    fn unsupported_arguments_are_refused_before_native_effects() {
         for (cmd, args) in [
             ("install", vec!["--HEAD", "wget"]),
             ("install", vec!["-s", "wget"]),
@@ -1385,7 +1293,7 @@ mod admission_tests {
             assert!(
                 matches!(
                     native_args(cmd, &argv(&args)),
-                    Err(InstallError::PassThrough(_))
+                    Err(InstallError::Unsupported(_))
                 ),
                 "{cmd} {args:?}"
             );
@@ -1598,7 +1506,7 @@ mod admission_tests {
             assert!(cleanup_max_age(&argv(&[bad])).is_err(), "{bad}");
         }
 
-        let later = InstallError::PassThrough("later recipe needs brew".to_string());
+        let later = InstallError::Unsupported("later recipe needs brew".to_string());
         assert_eq!(after_native_progress(later.clone(), false), later);
         let refused = after_native_progress(later, true);
         assert!(matches!(
@@ -1610,7 +1518,7 @@ mod admission_tests {
             assert_eq!(after_native_progress(native.clone(), completed), native);
         }
 
-        let fallback = || InstallError::PassThrough("later recipe needs brew".to_string());
+        let fallback = || InstallError::Unsupported("later recipe needs brew".to_string());
         let initial: Result<(), _> = Err(fallback());
         assert!(!native_attempt_may_have_progress(&initial));
         assert_eq!(
@@ -1673,7 +1581,7 @@ mod admission_tests {
             "multi-entry bundle install must admit"
         );
         assert_eq!(
-            dispatch(&prefix, &argv(&["bundle", "check", "--file", path]), false),
+            dispatch(&prefix, &argv(&["bundle", "check", "--file", path])),
             ExitCode::from(1)
         );
         assert!(
@@ -1683,20 +1591,30 @@ mod admission_tests {
         std::fs::write(&file, "brew \"wget\", args: [\"HEAD\"]\n").unwrap();
         assert!(matches!(
             bundle_args(&argv(&["install", "--file", path])),
-            Err(InstallError::PassThrough(_))
+            Err(InstallError::Unsupported(_))
         ));
         assert!(!prefix.root.exists());
         std::fs::write(&file, "brew \"other/tap/wget\"\n").unwrap();
         assert!(matches!(
             bundle_args(&argv(&["install", "--file", path])),
-            Err(InstallError::PassThrough(_))
+            Err(InstallError::Unsupported(_))
         ));
         std::fs::write(&file, "# empty Brewfile\n").unwrap();
         assert_eq!(
-            dispatch(&prefix, &argv(&["bundle", "check", "--file", path]), false),
+            dispatch(&prefix, &argv(&["bundle", "check", "--file", path])),
             ExitCode::SUCCESS
         );
         assert!(!prefix.root.exists());
+        for args in [
+            argv(&["bundle", "--file", path]),
+            argv(&["bundle", "install", "--file", path]),
+        ] {
+            assert_eq!(dispatch(&prefix, &args), ExitCode::SUCCESS, "{args:?}");
+            assert!(
+                !prefix.homebrew_bundle().exists(),
+                "native Brewfiles never lay Homebrew"
+            );
+        }
     }
 
     #[test]
@@ -1709,27 +1627,21 @@ mod admission_tests {
         assert_eq!(canonical_kind_switches(&once), once);
         assert!(matches!(
             native_args("tap", &argv(&["--formulae"])),
-            Err(InstallError::PassThrough(_))
+            Err(InstallError::Unsupported(_))
         ));
         assert!(matches!(
             native_args("doctor", &argv(&["--casks"])),
-            Err(InstallError::PassThrough(_))
+            Err(InstallError::Unsupported(_))
         ));
     }
 
     #[test]
-    fn escape_and_admission_messages_are_precise() {
-        use std::ffi::OsString;
-        let os = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
-        assert!(escape_requested_os(&os(&["--real", "install"])));
-        assert!(!escape_requested_os(&os(&["on"])));
-        assert!(!escape_requested_os(&os(&["install", "--real"])));
-        assert!(!escape_requested_os(&os(&[])));
+    fn native_admission_messages_are_precise() {
         let msg = |args: &[&str]| {
             let args = argv(args);
             match native_args(&args[0], &args[1..]) {
-                Err(InstallError::PassThrough(m)) => m,
-                other => panic!("expected passthrough, got {other:?}"),
+                Err(InstallError::Unsupported(m)) => m,
+                other => panic!("expected native refusal, got {other:?}"),
             }
         };
         assert!(msg(&["services", "list"]).contains("'services' is not native"));
@@ -1740,28 +1652,65 @@ mod admission_tests {
         assert!(!valid_cask_version(""));
         let temp = aterm_tempfile::tempdir().unwrap();
         let fresh = Prefix::at(&temp.path().join("never-created"));
-        assert_eq!(dispatch(&fresh, &argv(&["list"]), false), ExitCode::SUCCESS);
+        assert_eq!(dispatch(&fresh, &argv(&["list"])), ExitCode::SUCCESS);
         assert!(!fresh.root.exists());
-        assert_eq!(
-            dispatch(&fresh, &argv(&["--version"]), false),
-            ExitCode::SUCCESS
-        );
+        assert_eq!(dispatch(&fresh, &argv(&["--version"])), ExitCode::SUCCESS);
         assert!(!fresh.root.exists());
         for q in [
-            &["--repository"][..],
             &["--repository", "homebrew/core"][..],
             &["--repo", "me/tools"][..],
             &["--cache"][..],
         ] {
-            assert_eq!(
-                dispatch(&fresh, &argv(q), false),
-                ExitCode::SUCCESS,
-                "{q:?}"
-            );
+            assert_eq!(dispatch(&fresh, &argv(q)), ExitCode::SUCCESS, "{q:?}");
             assert!(!fresh.root.exists(), "{q:?}");
         }
         assert!(msg(&["frobnicate"]).contains("not a command abrew knows"));
         assert!(msg(&["zap"]).contains("'zap' is not native"));
         assert!(msg(&["audit"]).contains("'audit' is not native"));
+    }
+
+    #[test]
+    fn native_dispatch_refuses_unsupported_work_without_creating_a_prefix() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let fresh = Prefix::at(&temp.path().join("never-created"));
+        for args in [
+            &["--real", "list"][..],
+            &["services", "list"][..],
+            &["install", "--HEAD", "wget"][..],
+            &[
+                "bundle",
+                "--version",
+                "4.5.8",
+                "--sha256",
+                "6a5a18e6c5bea214983ec102dea3126cbc2d162540f8d93387fa9730d1f03be3",
+            ][..],
+            &["bundle", "--force"][..],
+            &["--repository"][..],
+        ] {
+            assert_eq!(dispatch(&fresh, &argv(args)), ExitCode::from(1), "{args:?}");
+            assert!(
+                !fresh.root.exists(),
+                "{args:?}: unsupported work created a prefix"
+            );
+        }
+        for args in [
+            &["--version"][..],
+            &["-v"][..],
+            &["env"][..],
+            &["--env"][..],
+        ] {
+            assert_eq!(dispatch(&fresh, &argv(args)), ExitCode::SUCCESS, "{args:?}");
+            assert!(!fresh.root.exists(), "{args:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alias_refuses_non_utf8_arguments_without_replacing_the_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+        assert_eq!(
+            main_entry(vec![OsString::from_vec(b"not-utf8-\xff".to_vec())]),
+            ExitCode::from(1)
+        );
     }
 }

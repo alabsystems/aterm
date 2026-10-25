@@ -55,10 +55,22 @@ pub(crate) struct InkLedger {
     /// Test-only: admit a masked light as one ([`CursorGlow::over_ink_uniform`]).
     #[cfg(test)]
     uniform: bool,
+    /// A test's negative control: the letter guard's cut pieces rounded to
+    /// the nearest byte, not truncated as the guard weighed them
+    /// (`InkLedger::guard_mask_quads`).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) round_cuts: bool,
     /// A print of every cut this frame's masked lights took (each dimmed
     /// cell and the share it kept), so a frame whose cuts differ prints
     /// differently ([`CursorGlow::over_ink_print`]).
     print: u64,
+    /// The frame's rails laid clear of their row's ring, as `[from, to)`
+    /// spans of the under stream's quads, ascending ([`Self::note_rail`]).
+    rails: Vec<(u32, u32)>,
+    /// A test's negative control: the letter guard feathers its cuts into a
+    /// rail laid clear of the ring as into any light (looks7 round 3).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) rails_feathered: bool,
 }
 
 impl Default for InkLedger {
@@ -100,7 +112,12 @@ impl InkLedger {
         knots_y: Vec::new(),
         #[cfg(test)]
         uniform: false,
+        #[cfg(any(test, debug_assertions))]
+        round_cuts: false,
         print: 0,
+        rails: Vec::new(),
+        #[cfg(any(test, debug_assertions))]
+        rails_feathered: false,
     };
     /// Minimum contrast floor for the reference stroke ([`CursorGlow::STREAK_INK_FLOOR`]).
     pub(super) const FLOOR: f32 = CursorGlow::STREAK_INK_FLOOR;
@@ -174,6 +191,32 @@ impl InkLedger {
         self.print = 0;
     }
 
+    /// Note the under stream's quads `[from, to)` as a rail laid clear of
+    /// its row's ring: a stroke of its own below the row's last pixel row
+    /// and the judge's ring round a descender's foot, whose top edge is its
+    /// own. The letter guard weighs no such light for the row above (none
+    /// of it reaches a letter's ring), and cuts one only where it meets a
+    /// dimmed cell's box ([`Self::guard_mask_quads`]): feathered off the
+    /// row's cuts as a light crossing the row's edge is, a rail under a dim
+    /// theme's cut letters kept a sliver of its light and its warm stops
+    /// read olive and brown (the underline cat's `#514925` under `lazy dog`),
+    /// and Classic's chosen colour broke into a dash, a gap and the caret's
+    /// foot (looks7 round 3).
+    #[inline]
+    pub(crate) fn note_rail(&mut self, from: usize, to: usize) {
+        if to > from
+            && let (Ok(from), Ok(to)) = (u32::try_from(from), u32::try_from(to))
+        {
+            self.rails.push((from, to));
+        }
+    }
+
+    /// Forget the frame's rails ([`Self::note_rail`]).
+    #[inline]
+    pub(crate) fn clear_rails(&mut self) {
+        self.rails.clear();
+    }
+
     /// Fold one cut into the frame's print.
     #[inline]
     const fn note_cut(&mut self, cell: usize, share: f32) {
@@ -191,10 +234,9 @@ impl InkLedger {
         let Some(cell) = self.cell(row, col) else {
             return;
         };
-        let table = crate::color_math::relative_luminance_table();
         let under = self.under.as_mut_slice();
-        if crate::color_math::relative_luminance_with(table, rgb)
-            > crate::color_math::relative_luminance_with(table, under[cell])
+        if crate::color_math::relative_luminance(rgb)
+            > crate::color_math::relative_luminance(under[cell])
         {
             under[cell] = rgb;
         }
@@ -246,7 +288,7 @@ impl InkLedger {
     /// row of pixels (a streak sample's axis), at its nearest point.
     #[inline]
     pub(super) const fn band_reach(ch: f32, band: usize) -> f32 {
-        let h = ch / Self::BANDS as f32;
+        let h = ch * (1.0 / Self::BANDS as f32);
         let (y0, y1) = (band as f32 * h, (band + 1) as f32 * h);
         let mid = 0.5 * ch;
         (y0 - mid).max(mid - y1).max(0.0)
@@ -256,25 +298,16 @@ impl InkLedger {
     /// with ink and ground lifted together and clipped at 255 as `add_sat`
     /// does.
     #[inline]
-    const fn reads_with(
-        table: &crate::color_math::RelativeLuminanceTable,
-        ink: [f32; 3],
-        ground: [f32; 3],
-        lift: [f32; 3],
-        floor: f32,
-    ) -> bool {
+    const fn reads_with(ink: [f32; 3], ground: [f32; 3], lift: [f32; 3], floor: f32) -> bool {
         #[inline]
-        const fn lum(
-            table: &crate::color_math::RelativeLuminanceTable,
-            base: [f32; 3],
-            lift: [f32; 3],
-        ) -> f32 {
+        const fn lum(base: [f32; 3], lift: [f32; 3]) -> f32 {
             let r = (base[0] + lift[0]).min(255.0) as usize;
             let g = (base[1] + lift[1]).min(255.0) as usize;
             let b = (base[2] + lift[2]).min(255.0) as usize;
+            let table = crate::color_math::relative_luminance_table();
             crate::color_math::relative_luminance_rgb(table, r, g, b)
         }
-        let (ink, ground) = (lum(table, ink, lift), lum(table, ground, lift));
+        let (ink, ground) = (lum(ink, lift), lum(ground, lift));
         ink.max(ground) + 0.05 >= floor * (ink.min(ground) + 0.05)
     }
 
@@ -309,7 +342,6 @@ impl InkLedger {
     #[inline]
     const fn room_with(
         &self,
-        table: &crate::color_math::RelativeLuminanceTable,
         at: usize,
         add: [f32; 3],
         (ink, ground, floor): ([f32; 3], [f32; 3], f32),
@@ -326,17 +358,17 @@ impl InkLedger {
                 laid[2] + s * add[2],
             ]
         }
-        if Self::reads_with(table, ink, ground, with(laid, add, 1.0), floor) {
+        if Self::reads_with(ink, ground, with(laid, add, 1.0), floor) {
             return 1.0;
         }
-        if !Self::reads_with(table, ink, ground, with(laid, add, 0.0), floor) {
+        if !Self::reads_with(ink, ground, with(laid, add, 0.0), floor) {
             return 0.0;
         }
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
         let mut i = 0;
         while i < 8 {
             let mid = 0.5 * (lo + hi);
-            if Self::reads_with(table, ink, ground, with(laid, add, mid), floor) {
+            if Self::reads_with(ink, ground, with(laid, add, mid), floor) {
                 lo = mid;
             } else {
                 hi = mid;
@@ -359,12 +391,11 @@ impl InkLedger {
         let Some(base) = self.slot(i32::from(row), i32::from(col)) else {
             return cov;
         };
-        let table = crate::color_math::relative_luminance_table();
         let ctx = self.cell_room_ctx(base / Self::BANDS, Self::STEADY_FLOOR);
         let mut share = 1.0f32;
         for (b, lift) in lifts.iter().enumerate() {
             if *lift != [0.0; 3] {
-                share = share.min(self.room_with(table, base + b, lift.map(|l| l * cov), ctx));
+                share = share.min(self.room_with(base + b, lift.map(|l| l * cov), ctx));
                 if share <= 0.0 {
                     return 0.0;
                 }
@@ -392,21 +423,21 @@ impl InkLedger {
         if !self.on || rx <= 0.0 || ry <= 0.0 || (premul & 0x00FF_FFFF) == 0 {
             return 1.0;
         }
-        let table = crate::color_math::relative_luminance_table();
         let peak = [16u32, 8, 0].map(|sh| ((premul >> sh) & 0xff) as f32);
         let (ox, oy, cw, ch) = self.grid;
-        let bh = ch / Self::BANDS as f32;
+        let bh = ch * (1.0 / Self::BANDS as f32);
+        let (inv_cw, inv_rx, inv_ry) = (1.0 / cw, 1.0 / rx, 1.0 / ry);
         let row_dy2 = |row: i32| -> [f32; Self::BANDS] {
             let ry0 = oy + row as f32 * ch;
             std::array::from_fn(|band| {
                 let y0 = ry0 + band as f32 * bh;
-                let dy = (cy.clamp(y0, y0 + bh) - cy) / ry;
+                let dy = (cy.clamp(y0, y0 + bh) - cy) * inv_ry;
                 dy * dy
             })
         };
         let weights = |col: i32, dy2: &[f32; Self::BANDS]| -> [Option<f32>; Self::BANDS] {
             let x0 = ox + col as f32 * cw;
-            let dx = (cx.clamp(x0, x0 + cw) - cx) / rx;
+            let dx = (cx.clamp(x0, x0 + cw) - cx) * inv_rx;
             let dx2 = dx * dx;
             if dx2 >= 1.0 {
                 return [None; Self::BANDS];
@@ -418,8 +449,8 @@ impl InkLedger {
         };
         let reached = |(row, first, end): (i32, i32, i32)| {
             let (y0, y1) = (oy + row as f32 * ch, oy + (row + 1) as f32 * ch);
-            let lo = (((cx - rx - ox) / cw).floor() as i32).max(first);
-            let hi = (((cx + rx - ox) / cw).floor() as i32 + 1).min(end);
+            let lo = (((cx - rx - ox) * inv_cw).floor() as i32).max(first);
+            let hi = (((cx + rx - ox) * inv_cw).floor() as i32 + 1).min(end);
             let cols = if cy + ry > y0 && cy - ry < y1 {
                 lo..hi
             } else {
@@ -453,8 +484,7 @@ impl InkLedger {
                 let ctx = self.cell_room_ctx(base / Self::BANDS, floor);
                 for (band, w) in w_bands.into_iter().enumerate() {
                     if let Some(w) = w {
-                        share =
-                            share.min(self.room_with(table, base + band, peak.map(|p| p * w), ctx));
+                        share = share.min(self.room_with(base + band, peak.map(|p| p * w), ctx));
                         if share <= 0.0 {
                             break 'probe;
                         }
@@ -493,15 +523,16 @@ impl InkLedger {
         }
         let lit = |q: &&GlowQuad| q.alpha == 0 && (q.color | q.color2) & 0x00FF_FFFF != 0;
         let mut reached = std::mem::take(&mut self.reached);
-        let span = |lo: f32, len: u16, o: f32, size: i32| {
-            let first = ((lo - o) / size as f32).floor() as i32;
-            let last = ((lo + f32::from(len) - 1.0 - o) / size as f32).floor() as i32;
+        let (inv_cw, inv_ch) = (1.0 / cwi as f32, 1.0 / chi as f32);
+        let span = |lo: f32, len: u16, o: f32, inv_size: f32| {
+            let first = ((lo - o) * inv_size).floor() as i32;
+            let last = ((lo + f32::from(len) - 1.0 - o) * inv_size).floor() as i32;
             first..=last
         };
         let stride_limit = i32::try_from(self.stride).unwrap_or(i32::MAX);
         for q in quads.iter().filter(lit) {
-            let cols = span(f32::from(q.x), q.w.max(1), ox, cwi);
-            for row in span(f32::from(q.y), q.h.max(1), oy, chi) {
+            let cols = span(f32::from(q.x), q.w.max(1), ox, inv_cw);
+            for row in span(f32::from(q.y), q.h.max(1), oy, inv_ch) {
                 let Some((slot_i, (_, first, end))) = self
                     .lines
                     .iter()
@@ -536,7 +567,7 @@ impl InkLedger {
             let (qx0, qy0) = (i32::from(q.x), i32::from(q.y));
             let (qx1, qy1) = (qx0 + i32::from(q.w), qy0 + i32::from(q.h));
             let w = i32::from(q.w).max(1);
-            let denom = (2 * w) as f32;
+            let inv_denom = 1.0 / (2 * w) as f32;
             let flat = q.color == q.color2;
             let ends = [16u32, 8, 0].map(|sh| {
                 let a = ((q.color >> sh) & 0xff) as f32;
@@ -566,7 +597,7 @@ impl InkLedger {
                 } else {
                     for x in x0..x1 {
                         let m = (2 * (x - qx0) + 1) as f32;
-                        let t = m / denom;
+                        let t = m * inv_denom;
                         let c = ends.map(|(a, da)| a + da * t);
                         let mut at = k_base + (x - cx0) as usize;
                         for _ in 0..y_span {
@@ -620,14 +651,13 @@ impl InkLedger {
         if !self.on || !self.quad_peaks(quads) {
             return 1.0;
         }
-        let table = crate::color_math::relative_luminance_table();
         let mut share = 1.0f32;
         'probe: for (k, &cell) in self.reached.iter().enumerate() {
             let ctx = self.cell_room_ctx(cell, floor);
             for band in 0..Self::BANDS {
                 let add = self.peaks[k * Self::BANDS + band];
                 if add != [0.0; 3] {
-                    share = share.min(self.room_with(table, cell * Self::BANDS + band, add, ctx));
+                    share = share.min(self.room_with(cell * Self::BANDS + band, add, ctx));
                     if share <= 0.0 {
                         break 'probe;
                     }
@@ -664,7 +694,6 @@ impl InkLedger {
             scale_additive(&mut quads[range], share);
             return share;
         }
-        let table = crate::color_math::relative_luminance_table();
         self.dims.clear();
         let mut least = 1.0f32;
         for k in 0..self.reached.len() {
@@ -674,7 +703,7 @@ impl InkLedger {
             for band in 0..Self::BANDS {
                 let add = self.peaks[k * Self::BANDS + band];
                 if add != [0.0; 3] {
-                    share = share.min(self.room_with(table, cell * Self::BANDS + band, add, ctx));
+                    share = share.min(self.room_with(cell * Self::BANDS + band, add, ctx));
                     if share <= 0.0 {
                         break;
                     }
@@ -751,31 +780,38 @@ impl InkLedger {
     /// reach off its box (a smoothstep of the normalised distance), the
     /// least of every dimmed cell's.
     #[inline]
-    pub(super) fn mask_at_with(&self, x: f32, y: f32, (fx, fy): (f32, f32)) -> f32 {
-        self.dims.iter().fold(1.0f32, |m, d| {
+    pub(super) const fn mask_at_with(&self, x: f32, y: f32, (fx, fy): (f32, f32)) -> f32 {
+        let dims = self.dims.as_slice();
+        let mut m = 1.0f32;
+        let mut i = 0;
+        while i < dims.len() {
+            let d = &dims[i];
+            i += 1;
             if d.share >= m {
-                return m;
+                continue;
             }
             let dy = (d.y0 - y).max(y - d.y1).max(0.0);
             if dy >= fy {
-                return m;
+                continue;
             }
             let dx = (d.x0 - x).max(x - d.x1).max(0.0);
             if dx >= fx {
-                return m;
+                continue;
             }
             if dx == 0.0 && dy == 0.0 {
-                return d.share;
+                m = d.share;
+                continue;
             }
             let (dx, dy) = (dx / fx, dy / fy);
             let d2 = dx * dx + dy * dy;
             if d2 >= 1.0 {
-                return m;
+                continue;
             }
-            let e = d2.sqrt();
+            let e = crate::color_math::sqrt_f32(d2);
             let rise = e * e * (3.0 - 2.0 * e);
-            m.min(d.share + (1.0 - d.share) * rise)
-        })
+            m = m.min(d.share + (1.0 - d.share) * rise);
+        }
+        m
     }
 
     const fn dims_bounds(&self) -> (i32, i32, i32, i32) {
@@ -1005,24 +1041,24 @@ impl InkLedger {
         if rx <= 0.0 || ry <= 0.0 {
             return;
         }
-        let table = crate::color_math::relative_luminance_table();
         let peak = [16u32, 8, 0].map(|sh| ((premul >> sh) & 0xff) as f32);
         let (ox, oy, cw, ch) = self.grid;
-        let bh = ch / Self::BANDS as f32;
+        let bh = ch * (1.0 / Self::BANDS as f32);
+        let (inv_cw, inv_rx, inv_ry) = (1.0 / cw, 1.0 / rx, 1.0 / ry);
         for line in self.lines.into_iter().flatten() {
             let (row, first, end) = line;
             let (y0, y1) = (oy + row as f32 * ch, oy + (row + 1) as f32 * ch);
             if !(cy + ry > y0 && cy - ry < y1) {
                 continue;
             }
-            let lo = (((cx - rx - ox) / cw).floor() as i32).max(first);
-            let hi = (((cx + rx - ox) / cw).floor() as i32 + 1).min(end);
+            let lo = (((cx - rx - ox) * inv_cw).floor() as i32).max(first);
+            let hi = (((cx + rx - ox) * inv_cw).floor() as i32 + 1).min(end);
             if lo >= hi {
                 continue;
             }
             let dy2: [f32; Self::BANDS] = std::array::from_fn(|band| {
                 let by0 = y0 + band as f32 * bh;
-                let dy = (cy.clamp(by0, by0 + bh) - cy) / ry;
+                let dy = (cy.clamp(by0, by0 + bh) - cy) * inv_ry;
                 dy * dy
             });
             for col in lo..hi {
@@ -1030,7 +1066,7 @@ impl InkLedger {
                     continue;
                 };
                 let x0 = ox + col as f32 * cw;
-                let dx = (cx.clamp(x0, x0 + cw) - cx) / rx;
+                let dx = (cx.clamp(x0, x0 + cw) - cx) * inv_rx;
                 let dx2 = dx * dx;
                 if dx2 >= 1.0 {
                     continue;
@@ -1047,8 +1083,7 @@ impl InkLedger {
                 let mut share = 1.0f32;
                 for (band, w) in weights.into_iter().enumerate() {
                     if let Some(w) = w {
-                        share =
-                            share.min(self.room_with(table, base + band, peak.map(|p| p * w), ctx));
+                        share = share.min(self.room_with(base + band, peak.map(|p| p * w), ctx));
                         if share <= 0.0 {
                             break;
                         }
@@ -1422,6 +1457,7 @@ impl CursorGlow {
         let mid_y = 0.5 * (top + bot);
         let inv_ease = 1.0 / (fi + fy);
         let inv_fx = 1.0 / fx;
+        let (inv_cw, inv_ch) = (1.0 / cw, 1.0 / ch);
         let mut print = 0u64;
         for q in quads.iter_mut().filter(|q| q.alpha == 0 && q.h > 0) {
             let ym = f32::from(q.y) + 0.5 * f32::from(q.h);
@@ -1431,7 +1467,7 @@ impl CursorGlow {
                 (bot - ym, cr + 1)
             };
             let row = if inside < 0.0 {
-                ((ym - oy) / ch).floor() as i32
+                ((ym - oy) * inv_ch).floor() as i32
             } else {
                 across
             };
@@ -1441,8 +1477,8 @@ impl CursorGlow {
             }
             let (x0, x1) = (f32::from(q.x), f32::from(q.x) + f32::from(q.w));
             let (c_lo, c_hi) = (
-                ((x0 - fx - ox) / cw).floor() as i32,
-                ((x1 + fx - ox) / cw).floor() as i32,
+                ((x0 - fx - ox) * inv_cw).floor() as i32,
+                ((x1 + fx - ox) * inv_cw).floor() as i32,
             );
             let mut near = f32::INFINITY;
             for c in c_lo.max(0)..=c_hi {

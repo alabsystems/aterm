@@ -780,7 +780,7 @@ const HOLLOW_ALPHA: u8 = 210;
 
 /// Remove each quad of `taken` from `stream` once, wherever it still is (a
 /// producer that refilled the stream since holds none of it).
-fn remove_each_once(stream: &mut Vec<GlowQuad>, taken: &[GlowQuad]) {
+pub(crate) fn remove_each_once(stream: &mut Vec<GlowQuad>, taken: &[GlowQuad]) {
     for q in taken {
         if let Some(at) = stream.iter().rposition(|s| s == q) {
             stream.remove(at);
@@ -901,8 +901,8 @@ impl App {
                 continue;
             };
             let rect = CellBox::of(leaf.rect);
-            let facts = self.pool.get(session).and_then(|s| {
-                crate::term_try_lock(&s.term)
+            let facts = self.pool.shown_term(session).and_then(|term| {
+                crate::term_try_lock(&term)
                     .map(|term| PaneFacts::read(session, rect, leaf.focused, &term))
             });
             read.push((session, facts));
@@ -1110,7 +1110,7 @@ impl App {
     /// and wake the fade. The facts take the new offset at once, so the next
     /// pointer event in the same frame hit-tests the thumb where it now is.
     fn scroll_pane(&mut self, wid: WindowId, session: u64, to: impl FnOnce(usize) -> usize) {
-        let Some(term) = self.pool.get(session).map(|s| s.term.clone()) else {
+        let Some(term) = self.pool.get(session).map(|s| s.live_term().clone()) else {
             return;
         };
         let Some(ws) = self.windows.get_mut(&wid) else {

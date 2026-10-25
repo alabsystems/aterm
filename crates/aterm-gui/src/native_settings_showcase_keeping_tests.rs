@@ -4393,13 +4393,13 @@ fn work_walks() -> Vec<WorkWalk> {
                 (None, [7, 7, 0, 4]),
                 (step(Wheel(3)), [2, 1, 0, 3]),
                 (redraw, [1, 0, 0, 3]),
-                (step(Down), [1, 6, 0, 5]),
+                (step(Down), [1, 7, 0, 5]),
                 (redraw, [1, 0, 0, 3]),
                 (step(Type), [2, 1, 0, 3]),
                 (redraw, [1, 0, 0, 3]),
                 (step(Again), [2, 1, 0, 3]),
-                (step(Window((243, 440))), [7, 4, 0, 5]),
-                (step(Window((242, 440))), [7, 4, 0, 5]),
+                (step(Window((243, 440))), [7, 5, 0, 5]),
+                (step(Window((242, 440))), [7, 5, 0, 5]),
             ],
         ),
         (
@@ -4459,7 +4459,7 @@ fn work_walks() -> Vec<WorkWalk> {
                 (step(Status), [1, 8, 6, 4]),
                 (redraw, [1, 0, 4, 3]),
                 (redraw, [1, 0, 4, 3]),
-                (step(Status), [1, 2, 0, 0]),
+                (step(Status), [1, 7, 0, 0]),
             ],
         ),
         (
@@ -4501,13 +4501,16 @@ fn work_walks() -> Vec<WorkWalk> {
         (
             nord(Keyboard::On(IMPORT)),
             Drawn::bare((244, 440), 1),
-            vec![(None, [6, 0, 0, 0]), (step(Status), [1, 6, 0, 5])],
+            vec![(None, [6, 0, 0, 0]), (step(Status), [1, 7, 0, 5])],
         ),
     ]
 }
 
 /// THESE FRAMES BUILD THE THEMES PAGE, AND LAY OUT ITS DOCKS AND BARS, NO MORE THAN 006cded90b
 /// DID AT THE SAME INPUTS: each frame at most this branch's work, a redraw measuring no list.
+/// (At 244x440 the strip keeps a tried theme's whole name beside its buttons on two lines where
+/// 006cded90b stacked it under a first word cut short, so five frames there measure the list for
+/// that strip one to five times more.)
 #[test]
 fn these_frames_build_the_themes_page_and_its_bars_no_more_than_006cded90b() {
     let mut over = Vec::new();

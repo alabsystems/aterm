@@ -40,8 +40,19 @@ pub struct DriveRefused {
     pub why: String,
     /// Whether the same dial a moment later may be served.
     pub again: bool,
-    /// This machine's node, kept by a leave, when the dial found no fleet's key here.
-    pub left: Option<String>,
+    /// Why the dial reached no Mac this machine may hold a tab on, with this machine's node.
+    pub left: Option<Left>,
+}
+
+/// Why a drive's dial reaches no Mac a hold was taken on ([`DriveRefused::left`]), with this
+/// machine's node, which that Mac's `peers rm` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Left {
+    /// No fleet's key here: a leave kept the node.
+    Fleet(String),
+    /// A fleet's key, and no Mac of its book the word names: a typo, or a Mac it records no
+    /// more (a join of another fleet since, or a `peers rm`), which the book keeps no trace of.
+    Book(String),
 }
 
 impl DriveRefused {
@@ -173,30 +184,41 @@ pub(crate) fn run(
     validate_request_line_len(&request, Some(verb))?;
     request.push('\n');
     let link = drive(host, DRIVE_WITHIN).map_err(|refused| match (&refused.left, args) {
-        (Some(node), [sid, off, ..]) if verb == "hold" && off == "off" => {
-            io::Error::other(left_holding(host, sid, node))
+        (Some(left), [sid, off, ..]) if verb == "hold" && off == "off" => {
+            io::Error::other(left_holding(host, sid, left, &refused.why))
         }
         _ => io::Error::other(refused),
     })?;
     exchange(link, &request, verb)
 }
 
-/// Why a `hold <sid> off` cannot be sent by this machine, node `node`, out of the fleet now, and
-/// what lifts a hold it took on `host` before it left: a join again only where it left as a
-/// member, since an issuer's fleet went with its leave.
-fn left_holding(host: &str, sid: &str, node: &str) -> String {
+/// Why a `hold <sid> off` cannot be sent to `host` by this machine, out of the fleet now or
+/// holding a book that names no such Mac ([`Left`]), and what lifts a hold it took there before:
+/// a join again of that fleet only where it left as a member, since an issuer's fleet went with
+/// its leave; and, after the dial's own refusal `why`, if that Mac is one the book records no
+/// more, the book's record of it again.
+fn left_holding(host: &str, sid: &str, left: &Left, why: &str) -> String {
     let (host, sid) = (
         aterm_codec::tty::one_line(host, 80),
         aterm_codec::tty::one_line(sid, 40),
     );
-    format!(
-        "this machine is in no fleet now, so it reaches {host} no more to hand {sid} back: a \
-         hold it took there before it left stands until that Mac's person takes the tab (Take \
-         Over) or runs `aterm fleet peers rm {}` there; if this machine left a fleet it joined, \
-         `aterm ctl --host {host} hold {sid} off` hands it back once it joins that fleet again \
-         (a fleet it issued went with its leave)",
-        node.get(..8).unwrap_or(node)
-    )
+    match left {
+        Left::Fleet(node) => format!(
+            "this machine is in no fleet now, so it reaches {host} no more to hand {sid} back: \
+             a hold it took there before it left stands until that Mac's person takes the tab \
+             (Take Over) or runs `aterm fleet peers rm {}` there; if this machine left a fleet \
+             it joined, `aterm ctl --host {host} hold {sid} off` hands it back once it joins \
+             that fleet again (a fleet it issued went with its leave)",
+            node.get(..8).unwrap_or(node)
+        ),
+        Left::Book(node) => format!(
+            "{why}; if this machine took {sid} on a Mac its book records no more (it joined \
+             another fleet since, or a `peers rm` took that Mac out), that Mac's person lifts \
+             the hold (Take Over, or `aterm fleet peers rm {}` there), and so does `aterm ctl \
+             --host {host} hold {sid} off` once this machine's book records that Mac again",
+            node.get(..8).unwrap_or(node)
+        ),
+    }
 }
 
 /// Refuse a leading selector that names a session of THIS Mac, or none by
@@ -321,32 +343,53 @@ fn spawn_exchange(link: DriveLink, head: &str, task: &[u8]) -> io::Result<ExitCo
     let DriveLink { mut stream, label } = link;
     let go = aterm_types::control_verbs::task_frame_go(task.len());
     let go = go.trim_end_matches('\n');
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
+    let cut = |e| closed(&label, head, DRIVE_WITHIN, e);
+    stream
+        .write_all(format!("{head}\n").as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(cut)?;
     let mut reader = BufReader::new(stream);
-    let mut answer = read_frame_answer(&mut reader).map_err(|e| closed(&label, head, e))?;
+    let mut answer = read_frame_answer(&mut reader).map_err(cut)?;
     if answer != go {
         return print_frame_answer(&answer);
     }
-    reader.get_mut().write_all(task)?;
-    reader.get_mut().flush()?;
+    let sent = reader.get_mut();
+    sent.write_all(task)
+        .and_then(|()| sent.flush())
+        .map_err(cut)?;
     while answer == go {
-        answer = read_frame_answer(&mut reader).map_err(|e| closed(&label, head, e))?;
+        answer = read_frame_answer(&mut reader).map_err(cut)?;
     }
     print_frame_answer(&answer)
 }
 
-/// A connection the peer closed or cut before it answered `request`, said as the peer's: what
-/// cuts one, and how to learn whether what it sent landed.
-fn closed(label: &str, request: &str, e: io::Error) -> io::Error {
-    use io::ErrorKind::{ConnectionAborted, ConnectionReset, UnexpectedEof};
-    if !matches!(
-        e.kind(),
-        UnexpectedEof | ConnectionReset | ConnectionAborted
-    ) {
+/// A connection the peer closed, cut or left unanswered past `within` before it answered
+/// `request`, said as the peer's: what does that, and how to learn whether what it sent landed.
+pub(crate) fn closed(label: &str, request: &str, within: Duration, e: io::Error) -> io::Error {
+    use io::ErrorKind::{
+        BrokenPipe, ConnectionAborted, ConnectionReset, TimedOut, UnexpectedEof, WouldBlock,
+    };
+    if super::is_stdout_closed(&e) {
         return e;
     }
+    let (cause, read_again) = match e.kind() {
+        UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe => (
+            format!(
+                "{label} cut the drive connection before it answered (its person took back \
+                 this Mac's grant, or its aterm stopped or restarted)"
+            ),
+            "again says which",
+        ),
+        WouldBlock | TimedOut => (
+            format!(
+                "{label} did not answer within {} s (its aterm is stopped, frozen or too busy \
+                 to answer, or the network between is down)",
+                within.as_secs()
+            ),
+            "again is safe: it changes nothing there",
+        ),
+        _ => return e,
+    };
     let mut words = request.split_whitespace();
     let (verb, session) = match (words.next(), words.next()) {
         (Some(sel), Some(verb)) if sel.starts_with('@') => (verb, Some(sel.to_owned())),
@@ -365,16 +408,10 @@ fn closed(label: &str, request: &str, e: io::Error) -> io::Error {
         ),
         (_, session) => {
             let at = session.map_or_else(String::new, |session| format!("{session} "));
-            format!(": `aterm ctl --host {label} {at}{verb} …` again says which")
+            format!(": `aterm ctl --host {label} {at}{verb} …` {read_again}")
         }
     };
-    io::Error::new(
-        e.kind(),
-        format!(
-            "{label} cut the drive connection before it answered (its person took back this \
-             Mac's grant, or its aterm stopped or restarted){landed}"
-        ),
-    )
+    io::Error::new(e.kind(), format!("{cause}{landed}"))
 }
 
 /// One request over `link` and its answer, framed as on one Mac: an `ERR`
@@ -383,18 +420,15 @@ fn closed(label: &str, request: &str, e: io::Error) -> io::Error {
 /// reported timeout exits 124.
 fn exchange(link: DriveLink, request: &str, verb: &str) -> io::Result<ExitCode> {
     let DriveLink { mut stream, label } = link;
-    stream.write_all(request.as_bytes())?;
-    stream.flush()?;
+    let cut = |e| closed(&label, request, DRIVE_WITHIN, e);
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(cut)?;
     let mut reader = BufReader::new(stream);
     let mut status = String::new();
-    let read =
-        read_status_line(&mut reader, &mut status).map_err(|e| closed(&label, request, e))?;
-    if read == 0 {
-        return Err(closed(
-            &label,
-            request,
-            io::Error::from(io::ErrorKind::UnexpectedEof),
-        ));
+    if read_status_line(&mut reader, &mut status).map_err(cut)? == 0 {
+        return Err(cut(io::Error::from(io::ErrorKind::UnexpectedEof)));
     }
     let status = status.trim_end_matches(['\r', '\n']);
     let (head, tail) = status.split_once(' ').unwrap_or((status, ""));
@@ -412,7 +446,7 @@ fn exchange(link: DriveLink, request: &str, verb: &str) -> io::Result<ExitCode> 
         } else if count == 0 {
             stderr_line(&format!("{status} ({verb}: no results)"))?;
         }
-        print_payload(&mut reader, count).map_err(|e| closed(&label, request, e))?;
+        print_payload(&mut reader, count).map_err(cut)?;
     } else if bytes_payload(verb, request) {
         return Err(io::Error::other(format!(
             "{label} answered `{verb}` with a body no drive carries"

@@ -64,13 +64,15 @@ const _: () = {
 /// A ring's profile at `x = T − d` cells: its tail behind the front, its
 /// rise ahead of it, `1` at the front.
 #[inline]
-fn profile(x: f32) -> f32 {
+const fn profile(x: f32) -> f32 {
+    const INV_TAIL: f32 = -1.0 / GLINT_TAIL_CELLS;
+    const INV_RISE: f32 = 1.0 / GLINT_RISE_CELLS;
     if x >= 5.0 || x <= -2.5 {
         0.0
     } else if x >= 0.0 {
-        (-x / GLINT_TAIL_CELLS).exp()
+        crate::color_math::exp_f32(x * INV_TAIL)
     } else {
-        (x / GLINT_RISE_CELLS).exp()
+        crate::color_math::exp_f32(x * INV_RISE)
     }
 }
 
@@ -78,19 +80,21 @@ fn profile(x: f32) -> f32 {
 /// each cycle's start, under [`GLINT_LAP`].
 #[inline]
 const fn front(ms: u64) -> f32 {
-    GLINT_CELLS_PER_S * (ms % GLINT_PERIOD_MS) as f32 / 1000.0
+    const CELLS_PER_MS: f32 = GLINT_CELLS_PER_S / 1000.0;
+    (ms % GLINT_PERIOD_MS) as f32 * CELLS_PER_MS
 }
 
 /// `v` on the field's levels.
 #[inline]
 const fn quantise(v: f32) -> f32 {
-    (v * GLINT_LEVELS).round() / GLINT_LEVELS
+    const INV_LEVELS: f32 = 1.0 / GLINT_LEVELS;
+    (v * GLINT_LEVELS).round() * INV_LEVELS
 }
 
 /// Claude's own field, literally.
 #[must_use]
 #[inline]
-pub fn claude_glint(d_cells: f32, ms: u64) -> f32 {
+pub const fn claude_glint(d_cells: f32, ms: u64) -> f32 {
     let x = front(ms) - d_cells;
     let main = profile(x);
     let level = if main >= GLINT_ECHO_GAIN {
@@ -108,11 +112,12 @@ pub fn claude_glint(d_cells: f32, ms: u64) -> f32 {
 /// current ring itself, `x` exactly, within a lap of its front) and the one
 /// outside it by its tail.
 #[inline]
-fn train(x: f32) -> f32 {
+const fn train(x: f32) -> f32 {
+    const INV_LAP: f32 = -1.0 / GLINT_LAP;
     if x >= 0.0 {
         return profile(x);
     }
-    let k = (-x / GLINT_LAP).ceil();
+    let k = (x * INV_LAP).ceil();
     let inner = x + (k - 1.0) * GLINT_LAP;
     profile(inner).max(profile(inner + GLINT_LAP))
 }
@@ -120,7 +125,7 @@ fn train(x: f32) -> f32 {
 /// The harness's field: the glint (`0..=1`, in eighths) at `d` cells from the wand at `ms`.
 #[must_use]
 #[inline]
-pub fn glint(d_cells: f32, ms: u64) -> f32 {
+pub const fn glint(d_cells: f32, ms: u64) -> f32 {
     let x = front(ms) - d_cells;
     let main = train(x);
     let level = if main >= GLINT_ECHO_GAIN {
@@ -134,8 +139,8 @@ pub fn glint(d_cells: f32, ms: u64) -> f32 {
 /// The field's distance, in cells, of a point `dx_cells` columns and `dy_rows` rows from the wand.
 #[must_use]
 #[inline]
-pub fn cell_distance(dx_cells: f32, dy_rows: f32) -> f32 {
-    dx_cells.hypot(GLINT_ROW_ASPECT * dy_rows)
+pub const fn cell_distance(dx_cells: f32, dy_rows: f32) -> f32 {
+    crate::color_math::hypot_f32(dx_cells, GLINT_ROW_ASPECT * dy_rows)
 }
 
 #[cfg(test)]

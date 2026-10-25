@@ -68,6 +68,67 @@ fn constraints(nodes: &[&Node], head: Digest) -> Constraints {
 }
 
 #[test]
+fn recipient_retirement_wire_rejects_future_bindings_without_inventing_an_actor() {
+    let identity = Identity::from_secret_bytes([19; 32]);
+    let pending = binding(&identity, 21, 1, 1);
+    let genesis = node(None, &[]);
+    let retired = node(
+        Some(genesis.id()),
+        &[Fact::RetireRecipient {
+            recipient: identity.recipient(),
+        }],
+    );
+    let decoded = Node::verify(retired.bytes(), NETWORK, authority()).unwrap();
+    assert_eq!(decoded.facts(), retired.facts());
+    for end in 0..retired.bytes().len() {
+        assert!(Node::verify(&retired.bytes()[..end], NETWORK, authority()).is_err());
+    }
+    let before = constraints(&[&genesis, &retired], retired.id());
+    assert!(before.recipient_retired(&identity.recipient()).unwrap());
+    assert!(before.check_device_candidate(&pending).is_err());
+    assert!(before.check_known_actor(&pending.actor()).is_err());
+    let late = node(Some(retired.id()), &[fact(&pending)]);
+    let after = constraints(&[&late, &retired, &genesis], late.id());
+    assert!(after.check_known_actor(&pending.actor()).is_ok());
+    assert!(after.check_actor(&pending.actor()).is_err());
+    assert!(after.check_device_candidate(&pending).is_err());
+    assert!(
+        Node::seal_restricted(
+            &ROOT,
+            NETWORK,
+            Edit::Create {
+                hosts: &[],
+                payload: b"invalid"
+            },
+            &[identity.recipient()],
+            1,
+            &[Fact::RetireRecipient {
+                recipient: crate::age::Recipient([0; 32])
+            }]
+        )
+        .is_err()
+    );
+    let mut alias = identity.recipient().0;
+    alias[31] |= 0x80;
+    assert!(
+        Node::seal_restricted(
+            &ROOT,
+            NETWORK,
+            Edit::Create {
+                hosts: &[],
+                payload: b"invalid alias"
+            },
+            &[identity.recipient()],
+            1,
+            &[Fact::RetireRecipient {
+                recipient: crate::age::Recipient(alias)
+            }]
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn recorded_binding_is_exact_and_repetition_is_inert() {
     let identity = Identity::from_secret_bytes([19; 32]);
     let original = binding(&identity, 21, 1, 1);

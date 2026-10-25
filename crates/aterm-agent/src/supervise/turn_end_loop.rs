@@ -1490,10 +1490,10 @@ impl<C: Ctl> Session<'_, C> {
             && self.stall_host.as_ref().and_then(|h| h.finished()) == Some(true)
         {
             self.turn_end.took_quiet();
-            if let Some(host) = &self.stall_host
+            if let Some(host) = self.stall_host.clone()
                 && self.turn_end.wake_start_owed()
+                && let Some(found) = self.repo_asked(host.as_ref())
             {
-                let found = host.repo_work();
                 self.turn_end.wake_began_over(found);
             }
         } else {
@@ -1658,10 +1658,32 @@ impl<C: Ctl> Session<'_, C> {
         }) {
             return found.clone();
         }
-        let found = host.repo_work();
+        let Some(found) = self.repo_asked(host.as_ref()) else {
+            // Stopped while the probe read: nothing it found is known or journaled.
+            return RepoRead::Unread;
+        };
         self.repo_unread_unsaid |= found.is_unread();
         self.repo_seen = Some((mark, now, found.clone()));
         found
+    }
+
+    /// THE PROBE ASKED UNTIL IT ANSWERS ([`IdleHost::repo_work`]): while its
+    /// reads go on the host answers `None`, and between asks the loop renews its
+    /// claim when due, so a probe however long lets no lease lapse; `None` once
+    /// the loop is stopped, what the repository holds unknown.
+    fn repo_asked(&mut self, host: &dyn IdleHost) -> Option<crate::harness::repo_work::RepoRead> {
+        loop {
+            if let Some(found) = host.repo_work() {
+                return Some(found);
+            }
+            if self.stopped() {
+                return None;
+            }
+            // As before a request ([`Self::call`]): a metadata attempt renews nothing.
+            if self.metadata_context == claim::MetadataContext::Normal {
+                self.renew_claim_if_due();
+            }
+        }
     }
 
     /// Short-turn streak and API-error retry state persisted for subsequent loops

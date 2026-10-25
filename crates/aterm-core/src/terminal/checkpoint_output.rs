@@ -121,6 +121,36 @@ pub struct OutputStateRepr {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub program_state: Option<String>,
+    /// The source episode of `program_state`, for matching a carried box receipt.
+    /// Restore still assigns its own local report sequence.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_program_began"
+        )
+    )]
+    pub program_state_began: Option<u64>,
+}
+
+#[cfg(feature = "serde")]
+fn lenient_program_began<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        Began(u64),
+        Unreadable(serde::de::IgnoredAny),
+    }
+    Ok(
+        match <Wire as serde::Deserialize>::deserialize(deserializer)? {
+            Wire::Began(began) => Some(began).filter(|began| *began > 0),
+            Wire::Unreadable(_) => None,
+        },
+    )
 }
 
 impl OutputStateRepr {
@@ -201,6 +231,11 @@ impl Terminal {
                 saved
             },
             program_state: self.program_state.carried(),
+            program_state_began: self
+                .program_state
+                .state
+                .map(|_| self.program_state.began)
+                .filter(|began| *began > 0),
         }
     }
 
@@ -251,6 +286,7 @@ impl Terminal {
             .map(|SavedModeRepr { mode, set }| (mode, set))
             .collect();
         self.transient.update_has_transient_extras();
-        self.program_state.restore(repr.program_state.as_deref());
+        self.program_state
+            .restore(repr.program_state.as_deref(), repr.program_state_began);
     }
 }

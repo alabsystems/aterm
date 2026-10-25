@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Non-panicking stdout helpers that treat `BrokenPipe` as end-of-answer.
+//! Non-panicking stdout helpers that treat `BrokenPipe` as end-of-answer, and complete stderr diagnostic lines.
 
 use std::fmt;
 use std::io::{self, Write as _};
@@ -81,9 +81,81 @@ pub fn println(args: fmt::Arguments<'_>) {
         .and_then(|()| out.flush());
 }
 
+/// Renders `args` and its newline before writing the complete diagnostic to stderr.
+///
+/// This avoids separate writes for formatting fragments when a child shares stderr.
+/// It uses one `write_all`; partial writes and oversized records still carry no general
+/// cross-process atomicity guarantee.
+///
+/// # Errors
+///
+/// Every stderr write error, including a closed reader.
+pub fn stderr_line(args: fmt::Arguments<'_>) -> io::Result<()> {
+    write_line_to(&mut io::stderr().lock(), args)
+}
+
+fn write_line_to(out: &mut impl io::Write, args: fmt::Arguments<'_>) -> io::Result<()> {
+    let mut line = fmt::format(args);
+    line.push('\n');
+    out.write_all(line.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io::{Error, ErrorKind};
+    use std::io::{Error, ErrorKind, Write as _};
+
+    /// Another process may write between calls even while this process holds stderr's lock.
+    #[test]
+    fn complete_diagnostic_lines_survive_a_shared_writers_intrusion() {
+        struct SharedWriter {
+            bytes: Vec<u8>,
+            other: Option<&'static [u8]>,
+            writes: usize,
+        }
+
+        impl std::io::Write for SharedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(bytes);
+                if let Some(other) = self.other.take() {
+                    self.bytes.extend_from_slice(other);
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let detail = std::hint::black_box(String::from("ready"));
+        let mut fragmented = SharedWriter {
+            bytes: Vec::new(),
+            other: Some(b"child: count=2\n"),
+            writes: 0,
+        };
+        writeln!(fragmented, "parent: {detail}").expect("fragmented diagnostic");
+        let mut complete = SharedWriter {
+            bytes: Vec::new(),
+            other: Some(b"child: count=2\n"),
+            writes: 0,
+        };
+        super::write_line_to(&mut complete, format_args!("parent: {detail}"))
+            .expect("complete diagnostic");
+
+        let records = |bytes: &[u8]| {
+            std::str::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .filter(|line| line.starts_with("child:"))
+                .count()
+        };
+        assert!(fragmented.writes > 1);
+        assert_eq!(records(&fragmented.bytes), 0);
+        assert_eq!(complete.writes, 1);
+        assert_eq!(records(&complete.bytes), 1);
+        assert_eq!(complete.bytes, b"parent: ready\nchild: count=2\n");
+    }
 
     /// A verb's answer whose reader closed the pipe ends with the verb's own code; one a full
     /// disk refused (`aterm drive --help > /dev/full`) is a failure said on stderr, never the

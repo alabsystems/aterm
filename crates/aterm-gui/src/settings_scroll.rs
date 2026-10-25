@@ -3666,35 +3666,6 @@ pub(super) fn focus_keys(node: &UiNode) -> Vec<UiKey> {
     out
 }
 
-/// The list itself.
-pub(super) fn scroll_list_node(
-    key: &str,
-    label: &str,
-    plan: &ScrollPlan,
-    view: Range<usize>,
-    children: Vec<UiNode>,
-) -> UiNode {
-    let whole = view.start == 0 && view.end >= plan.len();
-    let height = if whole {
-        plan.span(view.clone())
-    } else {
-        plan.room().max(plan.span(view.start..view.start + 1))
-    };
-    let screen = Screen {
-        drawn: view.clone(),
-        view,
-        offset: 0.0,
-        height,
-        live: height,
-        fades: false,
-        whole,
-        caption: None,
-        edge_caption: None,
-        bare: false,
-    };
-    list_screen_node(key, label, plan, &screen, children)
-}
-
 /// Give `plan` its `room` and the strip under it a page keeps for a status bar ([`Overhang`]).
 pub(super) fn seat_room(plan: &mut ScrollPlan, room: f32, overhang: Overhang) {
     let now = overhang.now.max(0.0);
@@ -3762,7 +3733,7 @@ pub(super) fn drawn_stops(plan: &ScrollPlan, view: &Range<usize>) -> Range<usize
     plan.screen(view.start).drawn
 }
 
-/// [`scroll_list_node`] for a screen that draws its peek ([`ScrollPlan::screen`]).
+/// The list's frame for one screen ([`ScrollPlan::screen`]), its peek drawn.
 pub(super) fn scroll_list_screen(
     key: &str,
     label: &str,
@@ -3972,8 +3943,13 @@ pub(super) struct SplitCard {
 fn is_heading(node: &UiNode) -> bool {
     match &node.content {
         UiContent::Text(text) => text.role == SemanticRole::Heading,
+        UiContent::Group(_) if node.paint_only => {
+            matches!(node.children.as_slice(), [only] if is_heading(only))
+        }
+        // A caption with its card's action ending its line (the display faces' Reset, the
+        // activity's Open Log): the line is the card's caption.
         UiContent::Group(_) => {
-            node.paint_only && matches!(node.children.as_slice(), [only] if is_heading(only))
+            node.layout.flow == Flow::Row && node.children.first().is_some_and(is_heading)
         }
         _ => false,
     }
@@ -4022,6 +3998,14 @@ impl SplitCard {
                 .map(|(_, height)| height)
                 .sum::<f32>()
             + children.saturating_sub(1) as f32 * self.gap
+    }
+
+    /// How tall the card's first stop is in a list `room` tall
+    /// ([`Self::stops`]): what of it a screen that starts with it must hold.
+    pub(super) fn first_stop_height(&self, room: f32) -> f32 {
+        self.stops(room)
+            .first()
+            .map_or_else(|| self.height(), |stop| self.height_of(0..stop.end))
     }
 
     pub(super) fn height(&self) -> f32 {
@@ -4655,6 +4639,10 @@ pub(super) fn list_page_peeking(
     gap: f32,
     overhang: Overhang,
 ) -> UiNode {
+    let mut items = items;
+    if let Some((name, height)) = state.take_list_head() {
+        items.insert(0, ListItem::Card(Box::new(name), height));
+    }
     let items = fit_rows(&items, room, ListFoot::Peek);
     let seated = SeatedList::new(state, &items, room, gap, overhang);
     let children = seated.screen_children(&items);
@@ -5385,7 +5373,14 @@ mod tests {
             for index in screen.view.clone() {
                 assert_eq!(plan.press_nudge(index, top), None, "{index} on {top}");
             }
-            let node = scroll_list_node("list", "List", &plan, screen.view.clone(), Vec::new());
+            let node = scroll_list_screen(
+                "list",
+                "List",
+                &plan,
+                screen.view.clone(),
+                screen.drawn.clone(),
+                Vec::new(),
+            );
             let thumb = node
                 .children
                 .iter()
@@ -5415,20 +5410,6 @@ mod tests {
             }),
             "a press on the control's cut stop nudges it past a stop"
         );
-    }
-
-    #[test]
-    fn the_thumb_never_runs_past_the_last_card() {
-        let plan = cards(&[40.0, 40.0, 40.0, 40.0, 40.0], 100.0, 10.0);
-        let view = plan.view(plan.limit());
-        let node = scroll_list_node("list", "List", &plan, view.clone(), Vec::new());
-        let thumb = node
-            .children
-            .iter()
-            .find(|child| child.key.as_str() == "list/thumb")
-            .expect("a scrolled list has its thumb");
-        assert_eq!(thumb.layout.height, Length::Fixed(plan.span(view)));
-        assert!(plan.span(plan.view(plan.limit())) < plan.room());
     }
 
     #[test]

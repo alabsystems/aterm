@@ -37,6 +37,19 @@ mod measuring {
                 max_timer_wakes: None,
             },
         ),
+        // A recording prompt frozen in an open Rewind view (design §14.5 R0 item 7). Proven red
+        // 2026-10-24: a release build of c4d3f61702 measured timer_wakes=0 frames=0 over 10 s, and the
+        // same build with a 100 ms refresh deadline armed while any view is open measured
+        // timer_wakes=99 and failed this row.
+        (
+            "an_idle_open_rewind_view_arms_no_timer",
+            SpinRow {
+                scene: SpinScene::Rewound,
+                window: Duration::from_secs(10),
+                max_arms: MAX_ARMS,
+                max_timer_wakes: Some(12),
+            },
+        ),
     ];
 
     fn take(rig: &Rig, row: &SpinRow) -> Outcome {

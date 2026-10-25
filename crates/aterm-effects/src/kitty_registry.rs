@@ -150,11 +150,11 @@ impl KittyLook {
     /// Derive the deterministic app kitty breed for a canonical app id.
     #[inline]
     #[must_use]
-    pub fn for_app(app_id: &str) -> Self {
+    pub const fn for_app(app_id: &str) -> Self {
         if let Some(look) = flagship_look(app_id) {
             return look;
         }
-        let gkey = crate::genome::mix(aterm_lexicon::form_hash(app_id) ^ APP_LOOK_SALT);
+        let gkey = crate::genome::mix(aterm_hash::fnv1a_64(app_id.as_bytes()) ^ APP_LOOK_SALT);
         let (coat, iris) = crate::genome::cat_fills_v4(gkey);
         Self {
             variant: crate::genome::cat_variant_v4(gkey),

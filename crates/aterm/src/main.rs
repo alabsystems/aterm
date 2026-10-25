@@ -1007,29 +1007,70 @@ struct Widened {
 /// watch widened, so a Stop pressed since its look, or asked for the plan it widened, stops the
 /// run it admitted.
 #[cfg(target_os = "macos")]
-fn run_startup_setup(widened: Option<Widened>) {
-    let mut password = None;
-    let (prepared, mut sent) = prepare_first_run_doctor(|initial, on_begin| {
-        let mut answer = aterm_gui::await_initial_setup_answer_while(
-            initial,
-            || {
-                startup_offer_withdrawn(|| {
-                    aterm_cli::macos_doctor::initial_setup_finished().unwrap_or(false)
-                })
-            },
-            on_begin,
+fn run_startup_setup(mut widened: Option<Widened>) {
+    let running = StartupRunning::enter();
+    run_repaired_startups(|reserved| {
+        let mut password = None;
+        let (prepared, mut sent, recovered) =
+            prepare_first_run_doctor(reserved, |initial, on_begin| {
+                let mut answer = aterm_gui::await_initial_setup_answer_while(
+                    initial,
+                    || {
+                        startup_offer_withdrawn(|| {
+                            aterm_cli::macos_doctor::initial_setup_finished().unwrap_or(false)
+                        })
+                    },
+                    on_begin,
+                );
+                password = answer.password.take();
+                answer
+            });
+        if let Some(widened) = widened.take() {
+            sent.inherit_widened(&prepared, widened);
+        }
+        let recovery = recovered.then(|| sent.take_recovery());
+        with_setup_watch(
+            false,
+            || run_prepared_setup(prepared, password, sent),
+            maintain_setup_watch,
         );
-        password = answer.password.take();
-        answer
+        recovery
     });
-    if let Some(widened) = widened {
-        sent.inherit_widened(&prepared, widened);
+    drop(running);
+    read_again_if_unread();
+}
+
+/// A repair ends its bound review, releasing all its leases before another
+/// review starts on this same worker. Unchanged failures retain their own
+/// backoff, and a Stop covering the retired review withholds the fresh offer.
+#[cfg(target_os = "macos")]
+fn run_repaired_startups(mut attempt: impl FnMut(Option<StartupSent>) -> Option<StartupSent>) {
+    let mut reserved = None;
+    while let Some(sent) = attempt(reserved.take()) {
+        let Some(next) = StartupSent::continue_recovery(sent) else {
+            return;
+        };
+        reserved = Some(next);
     }
-    with_setup_watch(
-        false,
-        || run_prepared_setup(prepared, password, sent),
-        maintain_setup_watch,
-    );
+}
+
+/// A startup ended (its capture failed, say) on a saved setup it cannot read, which the page
+/// says aterm reads again by itself ([`aterm_gui::STATE_UNREAD_NOTE`]): after the retry wait, or
+/// a setup wake, the page reads it again, which starts a fresh attempt while it stays unreadable
+/// ([`heal_unread_setup`]).
+#[cfg(target_os = "macos")]
+fn read_again_if_unread() {
+    let unread = || {
+        matches!(
+            aterm_cli::macos_doctor::initial_setup_snapshot(),
+            Err(aterm_cli::macos_doctor::InitialSetupSnapshotError::Read(_))
+        )
+    };
+    if unread() {
+        let mut seen = SETUP_WAKES.count();
+        SETUP_WAKES.back_off(&mut seen, SETUP_RETRY_WAIT);
+        aterm_gui::publish_initial_setup_status(initial_setup_status());
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1428,8 +1469,9 @@ fn startup_offer_withdrawn(finished: impl FnOnce() -> bool) -> bool {
 /// preference writes follow the page's admission of the plan.
 #[cfg(target_os = "macos")]
 fn prepare_first_run_doctor(
+    reserved: Option<StartupSent>,
     offer: impl FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::SetupAnswer,
-) -> (PreparedSetup<StartupClaim>, StartupSent) {
+) -> (PreparedSetup<StartupClaim>, StartupSent, bool) {
     let mut host = LiveSetupStartup {
         offer,
         receipt: None,
@@ -1439,8 +1481,9 @@ fn prepare_first_run_doctor(
         offered: None,
         chosen: false,
         vault_typed: false,
-        sent: StartupSent::default(),
+        sent: reserved.unwrap_or_default(),
         retry_seen: SETUP_WAKES.count(),
+        recovered: false,
     };
     let prepared = match prepare_setup(&mut host) {
         Ok(prepared) => prepared,
@@ -1449,7 +1492,8 @@ fn prepare_first_run_doctor(
             PreparedSetup::Unavailable
         }
     };
-    (prepared, host.sent)
+    startup_went_on();
+    (prepared, host.sent, host.recovered)
 }
 
 /// The startup's admission as Stop and a quit know it: its number ([`SETUP_SENT`]), taken as the
@@ -1461,10 +1505,22 @@ fn prepare_first_run_doctor(
 #[derive(Default)]
 struct StartupSent {
     sent: u64,
+    /// A repaired continuation keeps its reserved admission across send boundaries.
+    recovery: bool,
     under_way: std::sync::Arc<std::sync::Mutex<Option<UnderWay>>>,
+    /// A preparatory write keeps any earlier publication uncertainty through retries.
+    preparing: Option<RepairPublication>,
+    /// A repair's exact staged checkpoint, separate from the next Begin's first save.
+    repair: Option<UnderWay>,
     /// The revision a watch widened into the plan this startup resumes ([`Widened`]).
     widened_from: Option<u64>,
     upgrade: Option<UnderWay>,
+}
+
+#[cfg(target_os = "macos")]
+struct RepairPublication {
+    temporary: bool,
+    uncertain: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -1472,14 +1528,136 @@ type StartupHandoff = Box<dyn FnOnce() + Send>;
 
 #[cfg(target_os = "macos")]
 impl StartupSent {
+    /// Reserve the next review in the same ordering as Stop. Its initial and
+    /// pre-offer sends must never remint this continuation past a later Stop.
+    fn reserve_recovery(from: u64) -> Option<Self> {
+        let _run = SETUP_RUN.lock().ok()?;
+        if stop_covers(from) {
+            return None;
+        }
+        let mut sent = Self::default();
+        sent.send();
+        sent.recovery = true;
+        Some(sent)
+    }
+
+    fn continue_recovery(mut retired: Self) -> Option<Self> {
+        let mut next = Self::reserve_recovery(retired.sent)?;
+        next.repair = retired.repair.take();
+        Some(next)
+    }
+
+    /// The old review and its password retire; only its exact Stop evidence continues.
+    fn take_recovery(&mut self) -> Self {
+        Self {
+            sent: self.sent,
+            repair: self.repair.take(),
+            ..Self::default()
+        }
+    }
+
+    /// Own any publication before a repair can write. Even without a Begin, a
+    /// Stop must wait for that attempt to identify or abandon its checkpoint.
+    fn begin_repair(&mut self) {
+        if self.preparing.is_some() {
+            return;
+        }
+        let mut guard = self
+            .under_way
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let repair = self.repair.as_ref().filter(|guard| guard.0 == self.sent);
+        let temporary = guard.is_none() && repair.is_none();
+        if temporary {
+            *guard = Some(UnderWay::new(self.sent));
+        }
+        let uncertain = guard.as_ref().or(repair).unwrap().begin_publication();
+        self.preparing = Some(RepairPublication {
+            temporary,
+            uncertain,
+        });
+    }
+
+    fn no_repair(&mut self) {
+        if let Some(publication) = self.preparing.take() {
+            let mut guard = self
+                .under_way
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(guard) = guard.as_ref().or(self.repair.as_ref()) {
+                guard.restore_publication(publication.uncertain);
+            }
+            if publication.temporary && !publication.uncertain {
+                guard.take();
+            }
+            if publication.uncertain {
+                self.preparing = Some(publication);
+            }
+        }
+    }
+
+    fn repair_failed(&mut self) {
+        if let Some(publication) = &mut self.preparing {
+            publication.uncertain = true;
+        }
+    }
+
+    /// Collect exact checkpoints while the backend owns its profile lock, then
+    /// update Stop ownership once that lock has been released.
+    fn observe_repair_with<T>(
+        &mut self,
+        work: impl FnOnce(&mut dyn FnMut(u64)) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.begin_repair();
+        let mut published = None;
+        let result = work(&mut |revision| published = Some(revision));
+        if let Some(revision) = published {
+            self.record_repair(revision);
+        }
+        if result.is_ok() {
+            self.no_repair();
+        } else {
+            self.repair_failed();
+        }
+        result
+    }
+
+    fn record_repair(&mut self, target: u64) {
+        let guard = self
+            .under_way
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(guard) = guard {
+            guard.record_publication(Ok(Some(target)));
+            self.repair = Some(guard);
+        } else if let Some(guard) = &self.repair
+            && guard.0 == self.sent
+        {
+            guard.record_publication(Ok(Some(target)));
+        } else {
+            let guard = UnderWay::new(self.sent);
+            guard.record_publication(Ok(Some(target)));
+            self.repair = Some(guard);
+        }
+        self.preparing = None;
+        // Whatever number held the checkpoint, a future Begin must own another
+        // unresolved debt before it can publish its own admitted revision.
+        self.recovery = false;
+    }
+
     /// Stop evidence is independent of whether this review may still admit its plan.
-    fn record_publication(&self, publication: Result<Option<u64>, String>) {
+    fn record_publication(&mut self, publication: Result<Option<u64>, String>) {
+        let confirmed = matches!(publication, Ok(Some(_)));
         let under_way = self
             .under_way
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(under_way) = under_way.as_ref() {
             under_way.record_publication(publication);
+            if confirmed {
+                self.preparing = None;
+            }
         }
     }
 
@@ -1498,8 +1676,30 @@ impl StartupSent {
     }
     /// Number the admission the startup sends now: a resume, or an offer.
     fn send(&mut self) {
-        self.under_way = Default::default();
-        self.sent = send_admission();
+        if !self.recovery {
+            // A repair can publish before any page answer. Keep its Stop guard,
+            // and reserve the distinct future Begin only if Stop did not cover
+            // this review. The two debts must never share an admission number.
+            if self.repair.is_some() {
+                let _run = SETUP_RUN
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !stop_covers(self.sent) {
+                    self.under_way = Default::default();
+                    self.sent = send_admission();
+                }
+                self.recovery = true;
+                return;
+            }
+            if self.preparing.is_some() {
+                // An earlier write has not identified its publication yet. A
+                // later answer may settle it, but numbering cannot escape Stop.
+                self.recovery = true;
+                return;
+            }
+            self.under_way = Default::default();
+            self.sent = send_admission();
+        }
     }
 
     /// The worker read the page's answer. Idempotent with the window's handoff.
@@ -1546,8 +1746,27 @@ trait SetupStartup {
     /// Bring forward a setup a Restore ended before any run was admitted here (an older
     /// aterm's), so this launch's offer gives it aterm's own permissions with its Mac preference
     /// groups left as is (System State design §3.4). It runs once the person is resolved and
-    /// before the records are bound; one that does not finish is left to the next launch.
-    fn bring_forward(&mut self) {}
+    /// before the records are bound. `false` while another pass holds the profile lock past
+    /// the bring-forward's own wait, or a write fails: the startup waits and asks again, so the
+    /// permissions get their run in this launch. A busy lock is quiet; a failure uses the
+    /// ordinary startup retry note.
+    fn bring_forward(&mut self) -> bool {
+        true
+    }
+
+    /// Set aside the saved setup records that are corrupt for good, so the restored setup
+    /// brought forward and the records bound are fresh ones (System State design §3.5). An
+    /// error (a read that failed for another reason, the records another setup holds) is tried
+    /// again.
+    fn set_aside(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Repair records that became corrupt after this review bound. A repair
+    /// retires this review; only a fresh coordinator may bind the new records.
+    fn recover_after_read_error(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
 
     /// Number the admission the startup sends now (`SETUP_SENT`), so a Stop pressed after it
     /// covers the run it admits (`StartupSent`).
@@ -1575,6 +1794,10 @@ trait SetupStartup {
     }
     fn authorize(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<Option<u64>, String>;
     fn authorization_pending(&self) -> bool;
+    /// The last failed admission could not read its current record context.
+    fn authorization_read_failed(&self) -> bool {
+        false
+    }
     fn stopped(&self) -> bool {
         false
     }
@@ -1585,7 +1808,9 @@ trait SetupStartup {
     fn wait_holding_claim(&mut self) -> bool;
     /// Wait before trying again, holding no claim.
     fn backoff(&mut self);
+    /// A step failed that this startup tries again by itself.
     fn report_failure(&mut self, why: &str);
+    /// A step failed that ends this attempt: nothing tries it again by itself.
     fn report_rejection(&mut self, why: &str) {
         self.report_failure(why);
     }
@@ -1610,6 +1835,8 @@ struct LiveSetupStartup<F> {
     sent: StartupSent,
     /// Setup changes heard before the operation whose failure may need a retry.
     retry_seen: u64,
+    /// This bound review repaired corrupt records and retired without adopting them.
+    recovered: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -1666,12 +1893,42 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
         aterm_cli::macos_doctor::initial_setup_scope_ready()
     }
 
-    fn bring_forward(&mut self) {
-        if let Err(why) = aterm_cli::macos_doctor::bring_forward_restored_setup() {
-            aterm_log::warn!(
-                "first-run macOS doctor: bringing a restored setup forward did not finish: {why}"
-            );
+    fn set_aside(&mut self) -> Result<(), String> {
+        let result = self.sent.observe_repair_with(|published| {
+            aterm_cli::macos_doctor::set_aside_unreadable_setup_observing(published)
+        });
+        match result {
+            Ok(Some(set)) => {
+                self.sent.record_repair(set.stop_target);
+                note_setup_set_aside(&set);
+            }
+            Ok(None) => {}
+            Err(why) => return Err(why),
         }
+        Ok(())
+    }
+
+    fn recover_after_read_error(&mut self) -> Result<bool, String> {
+        let result = self.sent.observe_repair_with(|published| {
+            aterm_cli::macos_doctor::set_aside_unreadable_setup_observing(published)
+        });
+        match result {
+            Ok(Some(set)) => {
+                self.sent.record_repair(set.stop_target);
+                note_setup_set_aside(&set);
+                self.recovered = true;
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(why) => Err(why),
+        }
+    }
+
+    fn bring_forward(&mut self) -> bool {
+        let result = self.sent.observe_repair_with(|published| {
+            aterm_cli::macos_doctor::bring_forward_restored_setup_observing(published)
+        });
+        bring_forward_ready(result, |why| self.report_failure(why))
     }
 
     fn send(&mut self) {
@@ -1736,6 +1993,7 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
         &mut self,
         initial: aterm_types::macos_setup::Plan,
     ) -> aterm_gui::WorkstationSetupDecision {
+        startup_went_on();
         self.retry_seen = SETUP_WAKES.count();
         let mut answer = (self.offer)(initial, self.sent.handoff());
         self.receipt = answer.receipt.take();
@@ -1781,6 +2039,10 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
             .is_some_and(aterm_cli::macos_doctor::InitialSetupAuthorization::pending)
     }
 
+    fn authorization_read_failed(&self) -> bool {
+        self.observation.is_none()
+    }
+
     fn stopped(&self) -> bool {
         stop_covers(self.sent.sent)
     }
@@ -1796,7 +2058,9 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
     }
 
     fn report_failure(&mut self, why: &str) {
-        initial_setup_error(why.into(), self.observation.clone());
+        // Every startup step is tried again by itself after a wait: no failure for the page to
+        // signal, one calm line (System State design §3.5, §3.6).
+        startup_step_failed(why);
         report_first_run_doctor_failure(&mut self.last_failure, why);
     }
 
@@ -1831,6 +2095,7 @@ mod startup_answer_tests {
             vault_typed: false,
             sent: StartupSent::default(),
             retry_seen: SETUP_WAKES.count(),
+            recovered: false,
         };
         assert_eq!(
             host.offer(plan.clone()),
@@ -1867,6 +2132,22 @@ enum PreparedSetup<C> {
     Unavailable,
 }
 
+/// Whether the bring-forward has finished its pre-bind work. A busy profile
+/// waits quietly; a write failure reports the ordinary retry note and waits.
+#[cfg(target_os = "macos")]
+fn bring_forward_ready(
+    result: Result<aterm_cli::macos_doctor::BroughtForward, String>,
+    failed: impl FnOnce(&str),
+) -> bool {
+    match result {
+        Ok(outcome) => !matches!(outcome, aterm_cli::macos_doctor::BroughtForward::Busy),
+        Err(why) => {
+            failed(&why);
+            false
+        }
+    }
+}
+
 /// Retry a step of state I/O on the window's background worker, reporting each failure and
 /// backing off, until it succeeds.
 #[cfg(any(target_os = "macos", test))]
@@ -1885,6 +2166,34 @@ fn retry_setup_step<H: SetupStartup, T>(
     }
 }
 
+/// A bound review retries local read errors, but never adopts records repaired
+/// since it bound. The caller releases its claim before asking for recovery.
+#[cfg(any(target_os = "macos", test))]
+fn report_bound_setup_read_error<H: SetupStartup>(host: &mut H, why: &str) -> Result<(), String> {
+    host.report_failure(why);
+    if host.recover_after_read_error().unwrap_or(false) {
+        Err(why.to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn retry_bound_setup_read<H: SetupStartup, T>(
+    host: &mut H,
+    mut read: impl FnMut(&mut H) -> Result<T, String>,
+) -> Result<T, String> {
+    loop {
+        match read(host) {
+            Ok(value) => return Ok(value),
+            Err(why) => {
+                report_bound_setup_read_error(host, &why)?;
+                host.backoff();
+            }
+        }
+    }
+}
+
 /// Offer the plan and keep the page's answer across transient failures. An unavailable window
 /// gives up its claim before waiting, so another app process, or a reopened window here, can
 /// offer setup instead.
@@ -1892,15 +2201,47 @@ fn retry_setup_step<H: SetupStartup, T>(
 fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim>, String> {
     use aterm_gui::WorkstationSetupDecision;
     host.send();
+    if host.stopped() {
+        return Ok(PreparedSetup::Unavailable);
+    }
     // An unavailable home can look like empty setup records. Wait for the account to resolve
-    // before binding its one review; a failed record capture after that still ends this attempt.
+    // before binding its one review.
     if !retry_setup_step(host, H::scope_ready) {
         return Ok(PreparedSetup::Unavailable);
     }
-    host.bring_forward();
+    // A record corrupt for good is set aside first, so what is brought forward and bound is a
+    // fresh record (§3.5); a set-aside that fails is tried again by itself.
+    retry_setup_step(host, H::set_aside);
+    // Finish a bring-forward before binding: another pass's lock and transient
+    // writes both wait here. Stop retires this review before another attempt or
+    // before it can adopt records a later manual choice published.
+    loop {
+        if host.stopped() {
+            return Ok(PreparedSetup::Unavailable);
+        }
+        if host.bring_forward() {
+            break;
+        }
+        if host.stopped() {
+            return Ok(PreparedSetup::Unavailable);
+        }
+        host.backoff();
+    }
+    if host.stopped() {
+        return Ok(PreparedSetup::Unavailable);
+    }
+    // The review is bound once: a capture that failed ends this attempt, never to bind a later
+    // run's revision (a manual repair's) as this launch's own. A saved setup that stays
+    // unreadable starts a fresh attempt from the page's read (`heal_unread_setup`).
     let revision = host
         .bind_authorization()
-        .inspect_err(|why| host.report_failure(why))?;
+        .inspect_err(|why| host.report_rejection(why))?;
+    // Capture holds no automatic claim: a Stop and a later manual admission
+    // may both have completed while it read. This older coordinator cannot
+    // resume that newer run using the Stop-covered admission it sent.
+    if host.stopped() {
+        return Ok(PreparedSetup::Unavailable);
+    }
     enum BeforeOffer {
         Initial(aterm_types::macos_setup::Plan),
         Resume(u64),
@@ -1908,8 +2249,8 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
         Superseded,
     }
     loop {
-        let Some(claim) = retry_setup_step(host, H::claim) else {
-            if retry_setup_step(host, H::finished) {
+        let Some(claim) = retry_bound_setup_read(host, H::claim)? else {
+            if retry_bound_setup_read(host, H::finished)? {
                 return Ok(PreparedSetup::Finished);
             }
             host.backoff();
@@ -1943,7 +2284,7 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
             Ok(BeforeOffer::Superseded) => return Ok(PreparedSetup::Unavailable),
             Err(why) => {
                 drop(claim);
-                host.report_failure(&why);
+                report_bound_setup_read_error(host, &why)?;
                 host.backoff();
                 continue;
             }
@@ -1957,6 +2298,9 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
             continue;
         }
         host.send();
+        if host.stopped() {
+            return Ok(PreparedSetup::Unavailable);
+        }
         match host.offer(initial) {
             WorkstationSetupDecision::Begin(plan) => {
                 host.answered();
@@ -1964,7 +2308,7 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
             }
             WorkstationSetupDecision::Unavailable => {
                 drop(claim);
-                if retry_setup_step(host, H::finished) {
+                if retry_bound_setup_read(host, H::finished)? {
                     return Ok(PreparedSetup::Finished);
                 }
                 host.backoff();
@@ -1995,12 +2339,15 @@ fn finish_setup_choice<H: SetupStartup>(
         let Some(held) = claim.take() else {
             match host.claim() {
                 Ok(Some(held)) => claim = Some(held),
-                Ok(None) if retry_setup_step(host, H::finished) => {
-                    return PreparedSetup::Finished;
-                }
-                Ok(None) => host.backoff(),
+                Ok(None) => match retry_bound_setup_read(host, H::finished) {
+                    Ok(true) => return PreparedSetup::Finished,
+                    Ok(false) => host.backoff(),
+                    Err(_) => return PreparedSetup::Unavailable,
+                },
                 Err(why) => {
-                    host.report_failure(&why);
+                    if report_bound_setup_read_error(host, &why).is_err() {
+                        return PreparedSetup::Unavailable;
+                    }
                     host.backoff();
                 }
             }
@@ -2008,7 +2355,16 @@ fn finish_setup_choice<H: SetupStartup>(
         };
         attempted = true;
         match host.authorize(&plan) {
-            Ok(None) => return PreparedSetup::Unavailable,
+            Ok(None) => {
+                drop(held);
+                // A changed publication already retired this ticket, but its
+                // unreadable replacement may still need recovery. Readable
+                // supersession never starts a new review from the old ticket.
+                if host.authorization_read_failed() {
+                    let _ = host.recover_after_read_error();
+                }
+                return PreparedSetup::Unavailable;
+            }
             // Empty authorization already durably commits completion.
             Ok(Some(_)) if plan.selection.is_empty() => return PreparedSetup::Finished,
             Ok(Some(revision)) => {
@@ -2017,11 +2373,25 @@ fn finish_setup_choice<H: SetupStartup>(
                     revision,
                 };
             }
-            Err(why) if !host.authorization_pending() => {
-                host.report_rejection(&why);
-                return PreparedSetup::Unavailable;
-            }
             Err(why) => {
+                if host.authorization_read_failed() {
+                    // Recovery may replace the bound records. No accepted review
+                    // keeps the automatic claim while that replacement is made.
+                    drop(held);
+                    if report_bound_setup_read_error(host, &why).is_err() {
+                        return PreparedSetup::Unavailable;
+                    }
+                    if !host.authorization_pending() || host.stopped() {
+                        host.report_rejection(&why);
+                        return PreparedSetup::Unavailable;
+                    }
+                    host.backoff();
+                    continue;
+                }
+                if !host.authorization_pending() {
+                    host.report_rejection(&why);
+                    return PreparedSetup::Unavailable;
+                }
                 if host.stopped() {
                     host.report_rejection(&why);
                     return PreparedSetup::Unavailable;
@@ -2068,6 +2438,9 @@ fn run_prepared_setup(
             };
             aterm_gui::publish_initial_setup_status(initial_setup_status());
             (setup_io().run)(claim, revision, password, busy);
+            // The run ended: the page's note that aterm widened it goes with it, before a later
+            // worker the slot keeps busy (a put-back once Full Disk Access is granted) shows it.
+            run_ended_widened(revision);
             if held_widen {
                 put_back_held_widen(revision);
             }
@@ -2078,7 +2451,9 @@ fn run_prepared_setup(
             // sync ([`vault_sync_kept`]), the mend keeps a vault subscriber whose plist runs a copy
             // that is gone, or that this window owes the Mac.
             (setup_io().mend_subscriber)();
-            finish_withheld_preferences();
+            // On a thread of its own: its wait for the profile lock another pass holds must not
+            // hold up the watch for the ALab vault that starts once this returns.
+            (setup_io().start_follow_up)();
         }
         PreparedSetup::Unavailable => {}
     }
@@ -2219,6 +2594,7 @@ fn run_first_run_doctor(
                         success_reported: false,
                         wakes_seen: SETUP_WAKES.count(),
                         park_due_seen: SetupRetryDeadlines::default(),
+                        park_before_pass: None,
                         accounts_said: None,
                     },
                     claim,
@@ -2455,6 +2831,41 @@ fn wait_for_setup_park_change<M: PartialEq>(
     before
 }
 
+/// Keep the local facts a pass began with, before it can discover that they changed.
+#[cfg(any(target_os = "macos", test))]
+fn with_setup_pass_mark<M, T>(
+    before: &mut Option<M>,
+    read: impl FnOnce() -> M,
+    pass: impl FnOnce() -> T,
+) -> T {
+    *before = Some(read());
+    pass()
+}
+
+/// A change during the last pass is ready at entry. Later comparisons use the
+/// fresh parked baseline, so bookkeeping done by the pass cannot keep waking it.
+#[cfg(any(target_os = "macos", test))]
+fn wait_for_setup_park_change_since<M: PartialEq>(
+    before_pass: Option<&M>,
+    mark: impl FnMut() -> M,
+    mut ready: impl FnMut(&M) -> bool,
+    facts_changed: impl Fn(&M, &M) -> bool,
+    still_waiting: impl FnMut() -> bool,
+    wait: impl FnMut(),
+) -> M {
+    let mut entry = true;
+    wait_for_setup_park_change(
+        mark,
+        |current| {
+            let changed = entry && before_pass.is_some_and(|before| facts_changed(current, before));
+            entry = false;
+            ready(current) || changed
+        },
+        still_waiting,
+        wait,
+    )
+}
+
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Default)]
 struct SetupRetryDeadlines {
@@ -2491,6 +2902,9 @@ struct LiveSetupRetry {
     /// Each source's last consumed deadline: an unchanged due attempt cannot
     /// wake every park, nor hide a newly due attempt from another source.
     park_due_seen: SetupRetryDeadlines,
+    /// Local facts before the last pass: a change it refused may already be
+    /// stable by the time its worker reaches the park's initial reading.
+    park_before_pass: Option<aterm_cli::macos_doctor::InitialSetupParkMark>,
     /// The last accounts resync line this worker logged (`accounts_resynced`).
     accounts_said: Option<String>,
 }
@@ -2523,13 +2937,19 @@ impl SetupRetryHost for LiveSetupRetry {
     fn apply(&mut self) -> Result<PassNext, String> {
         clear_initial_setup_rows();
         self.wakes_seen = SETUP_WAKES.count();
-        let observed = with_setup_activity(|| {
-            aterm_cli::macos_doctor::run_initial_setup_pass(
-                self.revision,
-                &mut self.password,
-                SETUP_HOOKS,
-            )
-        });
+        let observed = with_setup_pass_mark(
+            &mut self.park_before_pass,
+            aterm_cli::macos_doctor::initial_setup_park_mark,
+            || {
+                with_setup_activity(|| {
+                    aterm_cli::macos_doctor::run_initial_setup_pass(
+                        self.revision,
+                        &mut self.password,
+                        SETUP_HOOKS,
+                    )
+                })
+            },
+        );
         let Some((report, next)) = observed
             .result
             .inspect_err(|why| initial_setup_error(why.clone(), observed.observation.clone()))?
@@ -2580,8 +3000,10 @@ impl SetupRetryHost for LiveSetupRetry {
         // once a minute makes no network request or setup pass.
         let seen = self.wakes_seen;
         let due_seen = self.park_due_seen;
+        let before_pass = self.park_before_pass.take();
         let mut previous = None;
-        let mark = wait_for_setup_park_change(
+        let mark = wait_for_setup_park_change_since(
+            before_pass.as_ref(),
             || {
                 let mut mark = read_setup_park_mark_with(
                     aterm_cli::macos_doctor::initial_setup_park_mark,
@@ -2594,6 +3016,7 @@ impl SetupRetryHost for LiveSetupRetry {
                 mark
             },
             |mark| due_seen.unseen(mark.retry_due(), mark.mac_settings_retry_due()),
+            aterm_cli::macos_doctor::InitialSetupParkMark::facts_changed_since,
             || SETUP_WAKES.count() == seen,
             || {
                 SETUP_WAKES.wait(seen, std::time::Duration::from_secs(60));
@@ -3313,14 +3736,23 @@ mod setup_retry_tests {
         assert_eq!(idle_after(PassNext::Done, 3), (PassNext::Retry, 0));
     }
 
-    #[test]
-    fn a_route_change_wakes_a_bounded_retry_run_without_another_pass_while_parked() {
-        use super::wait_for_setup_park_change;
+    #[derive(Clone, Copy)]
+    enum RouteChange {
+        WhileParked,
+        DuringLastPass,
+        None,
+    }
+
+    fn retry_with_route_change(pending_secrets: bool, change: RouteChange) {
+        use super::{wait_for_setup_park_change_since, with_setup_pass_mark};
         use std::cell::Cell;
 
         struct Routed {
             inner: Fake,
             pending_secrets: bool,
+            change: RouteChange,
+            network: Cell<u8>,
+            before_pass: Option<(u64, Option<u8>)>,
             waits: usize,
         }
 
@@ -3344,7 +3776,19 @@ mod setup_retry_tests {
                 self.inner.register();
             }
             fn apply(&mut self) -> Result<PassNext, String> {
-                let result = self.inner.apply();
+                let result = with_setup_pass_mark(
+                    &mut self.before_pass,
+                    || (1, self.pending_secrets.then(|| self.network.get())),
+                    || {
+                        let result = self.inner.apply();
+                        if matches!(self.change, RouteChange::DuringLastPass)
+                            && self.inner.state.borrow().applied.len() == SETUP_RETRY_LIMIT as usize
+                        {
+                            self.network.set(2);
+                        }
+                        result
+                    },
+                );
                 if self.inner.parks != 0 {
                     // The route or explicit wake let the next pass finish.
                     self.inner.state.borrow_mut().finished = true;
@@ -3357,22 +3801,32 @@ mod setup_retry_tests {
             fn park(&mut self) {
                 self.inner.park();
                 let state = Rc::clone(&self.inner.state);
-                let network = Cell::new(1);
                 let wakes = Cell::new(0);
-                wait_for_setup_park_change(
+                wait_for_setup_park_change_since(
+                    self.before_pass.take().as_ref(),
                     // Membership remains Unconfigured. Pending network work
                     // adds a route to the CLI's opaque park mark.
-                    || (1, self.pending_secrets.then(|| network.get())),
+                    || (1, self.pending_secrets.then(|| self.network.get())),
                     |_| false,
+                    |current, before| current != before,
                     || wakes.get() == 0,
                     || {
                         self.waits += 1;
+                        assert!(
+                            !matches!(self.change, RouteChange::DuringLastPass),
+                            "the fact changed inside the last pass; do not wait for another change"
+                        );
                         assert!(self.waits <= 3, "the wake must end this wait");
-                        let state = state.borrow();
+                        let mut state = state.borrow_mut();
                         assert!(!state.claimed && !state.busy);
                         assert_eq!(state.applied.len(), SETUP_RETRY_LIMIT as usize);
-                        if self.waits == 2 {
-                            network.set(2);
+                        if matches!(self.change, RouteChange::None) {
+                            // An unchanged failure stays parked. Stop ends the
+                            // inert run without another setup attempt.
+                            state.finished = true;
+                            wakes.set(1);
+                        } else if self.waits == 2 {
+                            self.network.set(2);
                         } else if self.waits == 3 {
                             // A permissions-only run ignores that route. Its
                             // unchanged mark waits until an explicit wake.
@@ -3393,24 +3847,47 @@ mod setup_retry_tests {
             }
         }
 
+        let (mut inner, claim, busy) = fixture();
+        inner.backoff_limit = SETUP_RETRY_LIMIT as usize;
+        let mut host = Routed {
+            inner,
+            pending_secrets,
+            change,
+            network: Cell::new(1),
+            before_pass: None,
+            waits: 0,
+        };
+        run_setup_retry(&mut host, Some(claim), busy, 1);
+        let (waits, extra_pass) = match change {
+            RouteChange::WhileParked => (if pending_secrets { 2 } else { 3 }, 1),
+            RouteChange::DuringLastPass => (0, 1),
+            RouteChange::None => (1, 0),
+        };
+        assert_eq!(host.waits, waits);
+        assert_eq!(host.inner.parks, 1);
+        assert_eq!(host.inner.backoffs, SETUP_RETRY_LIMIT as usize - 1);
+        assert_eq!(
+            host.inner.state.borrow().applied.len(),
+            SETUP_RETRY_LIMIT as usize + extra_pass
+        );
+        assert_eq!(host.inner.completions, 1);
+    }
+
+    #[test]
+    fn a_route_change_wakes_a_bounded_retry_run_without_another_pass_while_parked() {
         for pending_secrets in [true, false] {
-            let (mut inner, claim, busy) = fixture();
-            inner.backoff_limit = SETUP_RETRY_LIMIT as usize;
-            let mut host = Routed {
-                inner,
-                pending_secrets,
-                waits: 0,
-            };
-            run_setup_retry(&mut host, Some(claim), busy, 1);
-            assert_eq!(host.waits, if pending_secrets { 2 } else { 3 });
-            assert_eq!(host.inner.parks, 1);
-            assert_eq!(host.inner.backoffs, SETUP_RETRY_LIMIT as usize - 1);
-            assert_eq!(
-                host.inner.state.borrow().applied.len(),
-                SETUP_RETRY_LIMIT as usize + 1
-            );
-            assert_eq!(host.inner.completions, 1);
+            retry_with_route_change(pending_secrets, RouteChange::WhileParked);
         }
+    }
+
+    #[test]
+    fn late_setup_facts_changed_inside_the_last_pass_wake_before_waiting() {
+        retry_with_route_change(true, RouteChange::DuringLastPass);
+    }
+
+    #[test]
+    fn late_setup_facts_unchanged_still_park_at_the_ten_pass_limit() {
+        retry_with_route_change(true, RouteChange::None);
     }
 
     #[test]
@@ -3850,6 +4327,23 @@ static SETUP_RUN: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
 #[cfg(target_os = "macos")]
 static SETUP_WIDENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Run `revision`'s worker ended: if aterm widened it, the page no longer says so
+/// ([`SETUP_WIDENED`]). A later run's mark stays.
+#[cfg(target_os = "macos")]
+fn run_ended_widened(revision: u64) {
+    if SETUP_WIDENED
+        .compare_exchange(
+            revision,
+            0,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        aterm_gui::publish_initial_setup_status(initial_setup_status());
+    }
+}
+
 /// The revision a person asked to stop (System State's Stop).
 #[cfg(target_os = "macos")]
 static SETUP_STOP: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
@@ -3891,8 +4385,8 @@ fn stop_covers(sent: u64) -> bool {
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 struct StopSaves {
-    /// The last exact revision registered here. Completion releases the active
-    /// registration, but a Stop queued by its last running frame still names it.
+    /// The newest exact run or staged checkpoint confirmed here. Retirement
+    /// releases its guard, but a queued Stop still names its published target.
     /// This evidence alone owes no save and authorizes no work.
     last_registered: Option<u64>,
     /// The newest exact Stop handed here, retained across failed saves and owner retirement.
@@ -3935,9 +4429,10 @@ impl StopSaves {
                 .is_some_and(|requested| self.saved.is_none_or(|saved| saved < requested))
             || self.under_way.iter().any(|debt| {
                 debt.sent <= covers
-                    && debt
-                        .target
-                        .is_none_or(|target| self.saved.is_none_or(|saved| saved < target))
+                    && (debt.unconfirmed
+                        || debt
+                            .target
+                            .is_none_or(|target| self.saved.is_none_or(|saved| saved < target)))
             })
     }
 
@@ -3980,6 +4475,29 @@ impl UnderWay {
         Self(sent)
     }
 
+    /// A new preparatory mutation is unresolved even when an older target's
+    /// Stop is saved. Keep that target as fallback until this publication ends.
+    fn begin_publication(&self) -> bool {
+        let mut saves = stop_saves();
+        let debt = saves
+            .under_way
+            .iter_mut()
+            .find(|debt| debt.sent == self.0)
+            .expect("the publication guard owns its admission");
+        std::mem::replace(&mut debt.unconfirmed, true)
+    }
+
+    fn restore_publication(&self, uncertain: bool) {
+        if let Some(debt) = stop_saves()
+            .under_way
+            .iter_mut()
+            .find(|debt| debt.sent == self.0)
+        {
+            debt.unconfirmed = uncertain;
+        }
+        STOP_SAVES_MOVED.notify_all();
+    }
+
     /// A write attempt's evidence for Stop, never permission to execute or write again.
     fn record_publication(&self, publication: Result<Option<u64>, String>) {
         match publication {
@@ -4018,6 +4536,11 @@ impl UnderWay {
                 debt.target = Some(target);
                 debt.unconfirmed = false;
             }
+            saves.last_registered = Some(
+                saves
+                    .last_registered
+                    .map_or(target, |last| last.max(target)),
+            );
             covered
         };
         if covered {
@@ -4115,6 +4638,62 @@ impl SetupWakes {
 #[cfg(target_os = "macos")]
 static SETUP_APPLY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A person's press waiting for another setup that holds this Mac's setup records (another
+/// aterm, `aterm doctor` in a terminal): the choice's number ([`SETUP_APPLY_GENERATION`]), or
+/// [`RESTORE_QUEUED`] for Restore previous settings, or 0. Published as `SetupStatus::queued`:
+/// the page keeps the press showing and says why in one calm line, and the press is applied
+/// when that setup finishes (System State design §3.3, §3.4). A later choice is the person's
+/// latest intent: it overtakes the one waiting, which is let go.
+#[cfg(target_os = "macos")]
+static SETUP_QUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`SETUP_QUEUED`]'s mark for a Restore, which no choice's number reaches.
+#[cfg(target_os = "macos")]
+const RESTORE_QUEUED: u64 = u64::MAX;
+
+/// How long a waiting press waits between two asks of the setup that holds the records.
+#[cfg(target_os = "macos")]
+const QUEUED_ASK_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Mark `mark`'s press as waiting for another setup ([`SETUP_QUEUED`]), publishing the status
+/// when that changed.
+#[cfg(target_os = "macos")]
+fn queue_setup_press(mark: u64) {
+    if SETUP_QUEUED.swap(mark, std::sync::atomic::Ordering::AcqRel) != mark {
+        aterm_log::info!("System State: a press waits for another setup to finish");
+        aterm_gui::publish_initial_setup_status(initial_setup_status());
+    }
+}
+
+/// `mark`'s press waits no more (admitted, let go, or done); another press's mark stays.
+#[cfg(target_os = "macos")]
+fn unqueue_setup_press(mark: u64) {
+    if SETUP_QUEUED
+        .compare_exchange(
+            mark,
+            0,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        aterm_gui::publish_initial_setup_status(initial_setup_status());
+    }
+}
+
+/// Wait [`QUEUED_ASK_EVERY`] before a waiting press asks again, looking every quarter of it
+/// whether it was `let_go` (a later choice, a Stop): `false` then.
+#[cfg(target_os = "macos")]
+fn wait_while_queued(let_go: impl Fn() -> bool) -> bool {
+    for _ in 0..4 {
+        if let_go() {
+            return false;
+        }
+        std::thread::sleep(QUEUED_ASK_EVERY / 4);
+    }
+    !let_go()
+}
+
 #[cfg(target_os = "macos")]
 const SETUP_HOOKS: aterm_cli::macos_doctor::SetupHooks = aterm_cli::macos_doctor::SetupHooks {
     stop: setup_stop_requested,
@@ -4173,11 +4752,16 @@ struct SetupIo {
     /// the grant ([`start_withheld_follow_up`]).
     start_follow_up: fn(),
     /// Bring forward a setup a Restore left with no admitted run to carry aterm's own
-    /// permissions (`aterm_cli::macos_doctor::bring_forward_restored_setup`): the revision it
-    /// wrote, if any.
-    bring_forward: fn() -> Result<Option<u64>, String>,
+    /// permissions (`aterm_cli::macos_doctor::bring_forward_restored_setup`): a run that waits
+    /// for the startup's offer, nothing, or a profile lock another pass holds.
+    bring_forward: fn() -> Result<aterm_cli::macos_doctor::BroughtForward, String>,
+    /// Check again's look at the LAN, on the reading's worker
+    /// (`aterm_cli::macos_doctor::probe_local_network_again`).
+    probe_lan: fn(),
     /// Run the startup again on a thread of its own, as a launch runs it ([`start_startup_again`]).
-    start_startup: fn(),
+    start_startup: fn() -> bool,
+    /// Continue startup on a worker that has released its previous operation's leases.
+    start_startup_inline: fn(),
 }
 
 #[cfg(target_os = "macos")]
@@ -4194,7 +4778,9 @@ impl SetupIo {
         put_back: aterm_cli::macos_doctor::put_back_held_initial_setup,
         start_follow_up: start_withheld_follow_up,
         bring_forward: aterm_cli::macos_doctor::bring_forward_restored_setup,
+        probe_lan: aterm_cli::macos_doctor::probe_local_network_again,
         start_startup: start_startup_again,
+        start_startup_inline: || run_startup_setup(None),
     };
 }
 
@@ -4254,6 +4840,8 @@ fn access_step_recorded(
     access: aterm_types::macos_setup::Access,
     outcome: aterm_types::macos_setup::AccessOutcome,
 ) {
+    // Local Network's step is kept with its time, so it outranks an older answer a look kept.
+    aterm_cli::macos_doctor::initial_setup_access_step(access, outcome);
     access_fact_observed(access, outcome);
 }
 
@@ -4574,6 +5162,15 @@ fn observe_rows(request: ObserveRequest) {
             _ => true,
         })
         .collect();
+    // Check again reads Local Network as macOS answers now: a look at the LAN first, which
+    // never puts macOS's question on screen.
+    if forced
+        && subjects.contains(&aterm_types::macos_setup::Subject::Access(
+            aterm_types::macos_setup::Access::LocalNetwork,
+        ))
+    {
+        (setup_io().probe_lan)();
+    }
     let started = SETUP_ACTIVITY.lock().map_or(0, |activity| activity.epoch);
     let read = std::panic::catch_unwind(|| (setup_io().read)(&plan, &subjects, network))
         .unwrap_or_else(|_| {
@@ -4709,7 +5306,13 @@ fn setup_run() -> Option<u64> {
 /// thread is started unless the worker could not be when the run registered.
 #[cfg(target_os = "macos")]
 fn stop_initial_setup() -> bool {
-    stop_runs_sent_through(SETUP_SENT.load(std::sync::atomic::Ordering::Acquire))
+    stop_initial_setup_with(|| {})
+}
+
+#[cfg(target_os = "macos")]
+fn stop_initial_setup_with(before_lock: impl FnOnce()) -> bool {
+    before_lock();
+    stop_runs_with_cutoff(|| SETUP_SENT.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// Stop the run registered now ([`stop_setup_run`]), and cover every
@@ -4718,9 +5321,15 @@ fn stop_initial_setup() -> bool {
 /// confirmed revision is still the target of a press queued before it finished.
 #[cfg(target_os = "macos")]
 fn stop_runs_sent_through(through: u64) -> bool {
+    stop_runs_with_cutoff(|| through)
+}
+
+#[cfg(target_os = "macos")]
+fn stop_runs_with_cutoff(through: impl FnOnce() -> u64) -> bool {
     let Ok(run) = SETUP_RUN.lock() else {
         return false;
     };
+    let through = through();
     STOP_COVERS.fetch_max(through, std::sync::atomic::Ordering::AcqRel);
     let revision = (*run).or_else(|| stop_saves().last_registered);
     if let Some(revision) = revision {
@@ -5051,6 +5660,12 @@ fn add_setup_readings(status: &mut aterm_gui::SetupStatus) {
 #[cfg(target_os = "macos")]
 fn initial_setup_status() -> aterm_gui::SetupStatus {
     let snapshot = aterm_cli::macos_doctor::initial_setup_snapshot();
+    if matches!(
+        snapshot,
+        Err(aterm_cli::macos_doctor::InitialSetupSnapshotError::Read(_))
+    ) {
+        heal_unread_setup();
+    }
     let busy = INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire);
     let mut status = match INITIAL_SETUP_ROWS.lock() {
         Ok(last) => initial_setup_status_with(snapshot, busy, &last),
@@ -5058,8 +5673,164 @@ fn initial_setup_status() -> aterm_gui::SetupStatus {
     };
     status.retrying = SETUP_RETRYING.load(std::sync::atomic::Ordering::Acquire) != 0;
     status.widened = SETUP_WIDENED.load(std::sync::atomic::Ordering::Acquire) != 0;
+    status.queued = SETUP_QUEUED.load(std::sync::atomic::Ordering::Acquire) != 0;
+    let startup_retrying = STARTUP_RETRY.lock().is_ok_and(|retry| retry.retrying());
+    add_startup_retry(&mut status, startup_retrying);
     add_setup_readings(&mut status);
     status
+}
+
+/// While the launch's setup tries a step again by itself (`startup_retrying`, System State
+/// design §3.5), say so in one calm line and keep every failure off the menu line and the tab's
+/// attention: nothing a person presses changes what comes next. A saved setup aterm could not
+/// read says so in its own line ([`aterm_gui::STATE_UNREAD_NOTE`]).
+#[cfg(target_os = "macos")]
+fn add_startup_retry(status: &mut aterm_gui::SetupStatus, startup_retrying: bool) {
+    if !startup_retrying {
+        return;
+    }
+    status.retrying = true;
+    if status.plan.is_some() {
+        status
+            .rows
+            .push(aterm_gui::calm_setup_row(aterm_gui::STARTUP_RETRY_NOTE));
+    }
+}
+
+/// When the launch's setup has not started for this long, trying a step again by itself, the
+/// exceptions digest says so: a fact for later, never an alert (System State design §3.6).
+#[cfg(target_os = "macos")]
+const STARTUP_STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The launch's setup could not take a step and tries it again by itself (System State design
+/// §3.5): since when, and whether the exceptions digest has said it has not started.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StartupRetry {
+    since: Option<std::time::Instant>,
+    said: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl StartupRetry {
+    const NONE: Self = Self {
+        since: None,
+        said: false,
+    };
+
+    const fn retrying(&self) -> bool {
+        self.since.is_some()
+    }
+
+    /// A step failed at `now`: whether the exceptions digest says so now, once
+    /// [`STARTUP_STUCK_AFTER`] has passed since the first failure, and only once.
+    fn failed(&mut self, now: std::time::Instant) -> bool {
+        let since = *self.since.get_or_insert(now);
+        let tell = !self.said && now.saturating_duration_since(since) >= STARTUP_STUCK_AFTER;
+        self.said |= tell;
+        tell
+    }
+
+    /// The startup went on, or ended: whether the digest's entry goes now.
+    fn went_on(&mut self) -> bool {
+        let said = self.said;
+        *self = Self::NONE;
+        said
+    }
+}
+
+#[cfg(target_os = "macos")]
+static STARTUP_RETRY: std::sync::Mutex<StartupRetry> = std::sync::Mutex::new(StartupRetry::NONE);
+
+/// A step of the launch's setup failed, which it tries again by itself after a wait: one calm
+/// line on the page ([`add_startup_retry`]), and ten minutes on, the exceptions digest's entry;
+/// the log keeps `why`.
+#[cfg(target_os = "macos")]
+fn startup_step_failed(why: &str) {
+    let tell = STARTUP_RETRY
+        .lock()
+        .is_ok_and(|mut retry| retry.failed(std::time::Instant::now()));
+    if tell {
+        aterm_gui::note_setup_not_started(why);
+    }
+    aterm_gui::publish_initial_setup_status(initial_setup_status());
+}
+
+/// The launch's setup went past the step it was trying again, or ended.
+#[cfg(target_os = "macos")]
+fn startup_went_on() {
+    let (was, said) = STARTUP_RETRY.lock().map_or((false, false), |mut retry| {
+        let was = retry.retrying();
+        (was, retry.went_on())
+    });
+    if said {
+        aterm_gui::clear_setup_not_started();
+    }
+    if was {
+        aterm_gui::publish_initial_setup_status(initial_setup_status());
+    }
+}
+
+/// Startups running in this process ([`run_startup_setup`]).
+#[cfg(target_os = "macos")]
+static STARTUP_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A startup [`heal_unread_setup`] started has not begun yet.
+#[cfg(target_os = "macos")]
+static HEAL_STARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A startup running, counted in [`STARTUP_RUNS`] while it lives.
+#[cfg(target_os = "macos")]
+struct StartupRunning;
+
+#[cfg(target_os = "macos")]
+impl StartupRunning {
+    fn enter() -> Self {
+        STARTUP_RUNS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        HEAL_STARTING.store(false, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for StartupRunning {
+    fn drop(&mut self) {
+        STARTUP_RUNS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// A read of the saved setup failed. A startup sets a corrupt record aside before it binds its
+/// records, and tries a failed read again by itself; with none running in this process (setup
+/// finished before, or the launch's startup long done), one starts now to do so (System State
+/// design §3.5). For a record that reads again it finds the setup finished and does nothing.
+#[cfg(target_os = "macos")]
+fn heal_unread_setup() {
+    if STARTUP_RUNS.load(std::sync::atomic::Ordering::Acquire) == 0
+        && !HEAL_STARTING.swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        if !(setup_io().scope_refused)() {
+            aterm_log::info!(
+                "System State: the saved setup could not be read; setup reads it again"
+            );
+            if !(setup_io().start_startup)() {
+                // No child can take over this reservation after a refused spawn.
+                HEAL_STARTING.store(false, std::sync::atomic::Ordering::Release);
+            }
+        } else {
+            HEAL_STARTING.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// aterm set aside saved setup records it could not parse, and goes on as from a fresh record
+/// (System State design §3.5): the log names them, and the exceptions digest keeps the fact.
+#[cfg(target_os = "macos")]
+fn note_setup_set_aside(set: &aterm_cli::macos_doctor::SetAside) {
+    let kept = set.kept.join(", ");
+    aterm_log::warn!(
+        "System State: saved setup records could not be read and were set aside as {kept}"
+    );
+    aterm_gui::note_setup_set_aside(&kept);
 }
 
 #[cfg(target_os = "macos")]
@@ -5071,6 +5842,11 @@ fn initial_setup_status_with(
     busy: bool,
     last: &InitialSetupRows,
 ) -> aterm_gui::SetupStatus {
+    let changing = matches!(
+        snapshot,
+        Err(aterm_cli::macos_doctor::InitialSetupSnapshotError::Updating)
+    );
+    let recovered = snapshot.as_ref().is_ok_and(|snapshot| snapshot.recovered);
     let (plan, finished, provisional, permissions, mut rows, observation) = match snapshot {
         Ok(snapshot) => (
             Some(snapshot.plan),
@@ -5100,20 +5876,20 @@ fn initial_setup_status_with(
             false,
             None,
             // The page says it in its own words, never the file or the error: `aterm doctor`
-            // reads the same state and says why.
-            vec![aterm_gui::SetupStatusRow {
-                name: aterm_gui::SETUP_ROW.into(),
-                status: match error {
-                    aterm_cli::macos_doctor::InitialSetupSnapshotError::Updating => "pending",
-                    aterm_cli::macos_doctor::InitialSetupSnapshotError::Read(_) => "failed",
-                }
-                .into(),
-                detail: match error {
-                    aterm_cli::macos_doctor::InitialSetupSnapshotError::Updating => String::new(),
-                    aterm_cli::macos_doctor::InitialSetupSnapshotError::Read(_) => {
-                        aterm_gui::STATE_UNREAD_NOTE.into()
+            // reads the same state and says why. A read that failed is no failure (System State
+            // design §3.6): aterm reads it again by itself, and sets aside a record that stays
+            // unreadable ([`heal_unread_setup`]), so it is one calm line.
+            vec![match error {
+                aterm_cli::macos_doctor::InitialSetupSnapshotError::Updating => {
+                    aterm_gui::SetupStatusRow {
+                        name: aterm_gui::SETUP_ROW.into(),
+                        status: "pending".into(),
+                        detail: String::new(),
                     }
-                },
+                }
+                aterm_cli::macos_doctor::InitialSetupSnapshotError::Read(_) => {
+                    aterm_gui::calm_setup_row(aterm_gui::STATE_UNREAD_NOTE)
+                }
             }],
             None,
         ),
@@ -5132,6 +5908,8 @@ fn initial_setup_status_with(
         provisional,
         rows,
         check,
+        changing,
+        recovered,
         ..aterm_gui::SetupStatus::default()
     }
 }
@@ -5243,22 +6021,33 @@ fn publish_initial_setup_error(
     );
 }
 
-/// Publish a Restore that failed as a whole, as [`publish_initial_setup_error`] does a run.
+/// Publish a Restore that failed as a whole, as [`publish_initial_setup_error`] does a run: the
+/// page headlines it as the Restore it is, with its reason in the page's words (System State
+/// design §3.4); the log keeps `detail`.
 #[cfg(target_os = "macos")]
 fn restore_initial_setup_error(
     detail: String,
     observation: Option<aterm_cli::macos_doctor::InitialSetupObservation>,
 ) {
     aterm_log::warn!("System State: Restore failed: {detail}");
-    publish_initial_setup_rows(
-        vec![aterm_gui::SetupStatusRow {
-            name: "Restore previous settings".into(),
-            status: "failed".into(),
-            detail: aterm_gui::RESTORE_FAILED_NOTE.into(),
-        }],
-        None,
-        observation,
-    );
+    publish_initial_setup_rows(vec![restore_failed_row(&detail)], None, observation);
+}
+
+/// The page's row for a Restore that failed as a whole with `detail`: one that cannot read the
+/// settings aterm saved before setup changed them names where to learn why, since pressing it
+/// again reads the same record; any other is pressed again.
+#[cfg(target_os = "macos")]
+fn restore_failed_row(detail: &str) -> aterm_gui::SetupStatusRow {
+    aterm_gui::SetupStatusRow {
+        name: "Restore previous settings".into(),
+        status: "failed".into(),
+        detail: if detail.starts_with(aterm_cli::macos_doctor::BACKUP_UNREAD) {
+            aterm_gui::RESTORE_BACKUP_UNREAD_NOTE
+        } else {
+            aterm_gui::RESTORE_FAILED_NOTE
+        }
+        .into(),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -5494,6 +6283,14 @@ trait SetupRestartHost {
         receipt: Self::Receipt,
     );
     fn failure(&mut self, why: &str);
+    /// `why`, a write the profile lock refused, says another setup held this Mac's setup
+    /// records past the choice's short wait (`aterm_cli::macos_doctor::SETUP_BUSY`).
+    fn held_elsewhere(&self, why: &str) -> bool;
+    /// Another setup holds this Mac's setup records (another aterm, `aterm doctor` in a
+    /// terminal): the page says the choice waits for it, and this waits a moment before the
+    /// next ask. `false` once a later choice overtook this one or a Stop covers it: it is let
+    /// go, as the person's latest press says (System State design §3.3).
+    fn queue(&mut self) -> bool;
 }
 
 /// Admit a person's `plan` holding the setup slot (`busy`). The slot comes back
@@ -5516,9 +6313,12 @@ fn run_setup_restart<H: SetupRestartHost>(
             // run finds the slot this choice holds. A person's choice waits for
             // it rather than be refused (§3.3).
             Ok(None) if host.startup_holds_claim() => host.await_claim(),
+            // Another process's setup, or `aterm doctor`, holds it: the choice waits for it
+            // and is applied when it finishes, never dropped (§3.3).
             Ok(None) => {
-                host.failure("Another setup is running. Try again when it finishes.");
-                return Some(busy);
+                if !host.queue() {
+                    return Some(busy);
+                }
             }
             Err(why) => {
                 host.failure(&why);
@@ -5538,6 +6338,13 @@ fn run_setup_restart<H: SetupRestartHost>(
                 return None;
             }
             Ok(None) => return Some(busy),
+            // Another setup held the records past the choice's wait: it waits on, as for the
+            // claim, and asks again.
+            Err(why) if host.held_elsewhere(&why) => {
+                if !host.queue() {
+                    return Some(busy);
+                }
+            }
             Err(why) => {
                 host.failure(&why);
                 if host.stopped() || !host.pending() {
@@ -5652,6 +6459,7 @@ impl SetupRestartHost for LiveSetupRestart {
             None,
         );
         drop(self.under_way.take());
+        unqueue_setup_press(self.generation);
         clear_initial_setup_rows();
         receipt.accept();
         aterm_gui::publish_initial_setup_status(initial_setup_status());
@@ -5662,6 +6470,23 @@ impl SetupRestartHost for LiveSetupRestart {
 
     fn failure(&mut self, why: &str) {
         initial_setup_error(why.into(), self.observation.clone());
+    }
+
+    fn held_elsewhere(&self, why: &str) -> bool {
+        why == aterm_cli::macos_doctor::SETUP_BUSY
+    }
+
+    fn queue(&mut self) -> bool {
+        queue_setup_press(self.generation);
+        wait_while_queued(|| setup_choice_overtaken(self.generation) || stop_covers(self.sent))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for LiveSetupRestart {
+    fn drop(&mut self) {
+        // Admitted, let go or overtaken: the choice waits for nothing now.
+        unqueue_setup_press(self.generation);
     }
 }
 
@@ -5733,6 +6558,10 @@ mod setup_restart_tests {
         /// The last look found this process's startup coordinator holding it.
         startup_holding: bool,
         awaits: usize,
+        /// The waits for another setup begun, and how many go by before a later choice
+        /// overtakes this one (`None`: none does).
+        queues: usize,
+        overtaken_after: Option<usize>,
         backoffs: usize,
         dispatches: Vec<u64>,
         failures: Vec<String>,
@@ -5753,7 +6582,11 @@ mod setup_restart_tests {
         Rejected(&'static str),
         Admitted(u64),
         Superseded,
+        /// Another setup held the records past the choice's wait.
+        Busy,
     }
+
+    const BUSY: &str = "another setup holds the records";
 
     impl SetupRestartHost for Host {
         type Claim = Lease;
@@ -5794,6 +6627,7 @@ mod setup_restart_tests {
             self.pending = matches!(outcome, Admission::Pending(_));
             match outcome {
                 Admission::Pending(why) | Admission::Rejected(why) => Err(why.into()),
+                Admission::Busy => Err(BUSY.into()),
                 Admission::Admitted(revision) => Ok(Some(revision)),
                 Admission::Superseded => Ok(None),
             }
@@ -5833,6 +6667,19 @@ mod setup_restart_tests {
         fn failure(&mut self, why: &str) {
             self.failures.push(why.into());
         }
+
+        fn held_elsewhere(&self, why: &str) -> bool {
+            why == BUSY
+        }
+
+        fn queue(&mut self) -> bool {
+            // The choice keeps its slot, receipt and password while it waits.
+            assert!(self.state.borrow().alive.len() >= 3);
+            assert_eq!(self.state.borrow().refused, 0);
+            self.queues += 1;
+            self.overtaken_after
+                .is_none_or(|after| self.queues <= after)
+        }
     }
 
     fn run(plan: &Plan, outcomes: Vec<Admission>) -> Host {
@@ -5843,6 +6690,17 @@ mod setup_restart_tests {
 
     /// [`run`] where the claim is held by `held`, look by look, before it is free.
     fn run_held(plan: &Plan, held: Vec<Holder>, outcomes: Vec<Admission>) -> Host {
+        run_overtaken(plan, held, outcomes, None)
+    }
+
+    /// [`run_held`], where a later choice overtakes this one after `overtaken_after` waits for
+    /// another setup.
+    fn run_overtaken(
+        plan: &Plan,
+        held: Vec<Holder>,
+        outcomes: Vec<Admission>,
+        overtaken_after: Option<usize>,
+    ) -> Host {
         let state = Rc::new(RefCell::new(State::default()));
         let password = Password {
             secret: aterm_secrets::SecretBytes::from(b"retained password".as_slice()),
@@ -5862,6 +6720,8 @@ mod setup_restart_tests {
             held: held.into(),
             startup_holding: false,
             awaits: 0,
+            queues: 0,
+            overtaken_after,
             backoffs: 0,
             dispatches: Vec::new(),
             failures: Vec::new(),
@@ -5876,32 +6736,56 @@ mod setup_restart_tests {
         host
     }
 
+    /// A choice that meets another setup is never dropped (System State design §3.3). This
+    /// process's startup coordinator, holding the claim while it reads the plan in force, lets
+    /// go by itself: the choice waits for it. Another process's setup, or `aterm doctor`,
+    /// holding the claim or the records past the choice's wait: the choice waits for it too,
+    /// keeping its slot, receipt and password, says so, and is applied once it finishes, with
+    /// no failure. A later choice overtaking it lets it go, with no failure either.
     #[test]
-    fn a_choice_waits_for_the_startup_claim_here_and_is_refused_for_anothers() {
-        // This process's startup coordinator holds the claim while it reads
-        // the plan in force: the choice waits, keeping its slot, and is
-        // admitted once the coordinator lets go.
+    fn a_choice_waits_for_another_setup_and_is_applied_when_it_finishes() {
         let host = run_held(
             &Plan::default(),
             vec![Holder::Startup, Holder::Startup],
             vec![Admission::Admitted(5)],
         );
         assert_eq!(host.claims, 3);
-        assert_eq!(host.awaits, 2);
+        assert_eq!((host.awaits, host.queues), (2, 0));
         assert_eq!(host.dispatches, [5]);
         assert!(host.failures.is_empty());
         assert_eq!(host.state.borrow().accepted, 1);
         assert!(!host.slot_back);
-        // Another process's setup, or `aterm doctor`, refuses it at once.
-        let host = run_held(&Plan::default(), vec![Holder::Elsewhere], Vec::new());
-        assert_eq!((host.claims, host.awaits), (1, 0));
-        assert!(host.plans.is_empty() && host.dispatches.is_empty());
-        assert_eq!(
-            host.failures,
-            ["Another setup is running. Try again when it finishes."]
+
+        let host = run_held(
+            &Plan::default(),
+            vec![Holder::Elsewhere, Holder::Elsewhere],
+            vec![Admission::Admitted(6)],
         );
-        assert_eq!(host.state.borrow().refused, 1);
-        assert!(host.slot_back, "a refused choice gets its slot back");
+        assert_eq!((host.claims, host.awaits, host.queues), (3, 0, 2));
+        assert_eq!(host.dispatches, [6]);
+        assert!(host.failures.is_empty());
+        assert_eq!(host.state.borrow().accepted, 1);
+        assert!(!host.slot_back);
+
+        let plan = Plan::default();
+        let host = run(&plan, vec![Admission::Busy, Admission::Admitted(7)]);
+        assert_eq!((host.claims, host.queues, host.backoffs), (1, 1, 0));
+        assert_eq!(host.plans, vec![plan.clone(); 2]);
+        assert_eq!(host.dispatches, [7]);
+        assert!(host.failures.is_empty());
+        assert_eq!(host.state.borrow().accepted, 1);
+
+        for (held, outcomes) in [
+            (vec![Holder::Elsewhere, Holder::Elsewhere], Vec::new()),
+            (Vec::new(), vec![Admission::Busy, Admission::Busy]),
+        ] {
+            let host = run_overtaken(&plan, held, outcomes, Some(1));
+            assert_eq!(host.queues, 2);
+            assert!(host.dispatches.is_empty());
+            assert!(host.failures.is_empty(), "a choice let go fails nothing");
+            assert_eq!(host.state.borrow().refused, 1);
+            assert!(host.slot_back, "a choice let go gives its slot back");
+        }
     }
 
     #[test]
@@ -6098,31 +6982,64 @@ impl Drop for PreferenceReadings {
 #[cfg(target_os = "macos")]
 fn restore_initial_setup() -> bool {
     spawn_initial_setup_operation("aterm-setup-restore", |busy| {
-        let observed = with_restore_readings(|| {
+        run_setup_restore(busy, || {
             aterm_cli::macos_doctor::run_observed(aterm_cli::macos_doctor::Action::Restore)
         });
-        match observed.result {
-            Ok(report) => remember_initial_setup_rows(&report, None, observed.observation),
-            Err(why) => restore_initial_setup_error(why, observed.observation),
-        }
-        drop(busy);
-        offer_again_after_restore();
     })
+}
+
+#[cfg(target_os = "macos")]
+fn run_setup_restore(
+    busy: InitialSetupBusy,
+    mut restore: impl FnMut() -> aterm_cli::macos_doctor::InitialSetupObserved<
+        aterm_cli::macos_doctor::Report,
+    >,
+) {
+    let observed = loop {
+        let observed = with_restore_readings(&mut restore);
+        // Another setup held this Mac's setup records past the Restore's wait for them: the
+        // Restore waits on, holding the slot, and runs when that setup finishes (System
+        // State design §3.4).
+        if observed
+            .result
+            .as_ref()
+            .is_err_and(|why| why == aterm_cli::macos_doctor::SETUP_BUSY)
+        {
+            queue_setup_press(RESTORE_QUEUED);
+            std::thread::sleep(QUEUED_ASK_EVERY);
+            continue;
+        }
+        break observed;
+    };
+    unqueue_setup_press(RESTORE_QUEUED);
+    match observed.result {
+        Ok(report) => remember_initial_setup_rows(&report, None, observed.observation),
+        Err(why) => restore_initial_setup_error(why, observed.observation),
+    }
+    drop(busy);
+    offer_again_after_restore();
 }
 
 /// After a Restore, with the setup slot let go: one that ended setup before any run of it was
 /// admitted (a Restore pressed while the launch's offer waited for its answer, which it lets go,
-/// or one before any setup ran here) left aterm's own permissions with no run to carry them. It
-/// is brought forward now and the startup offers it again, as the next launch would (System State
-/// design §3.4), so Full Disk Access, Developer Tools, the debugger and Local Network go on in
-/// this launch with no press. A Restore whose run carries them brings nothing forward and starts
+/// or one before any setup ran here) left aterm's own permissions with no run to carry them. The
+/// Restore brought it forward under its own lock, and the startup offers it again now, as the
+/// next launch would (System State design §3.4), so Full Disk Access, Developer Tools, the
+/// debugger and Local Network go on in this launch with no press. The startup also runs when this
+/// finished a Restore cut short, or met the profile lock busy (the startup waits for it). A
+/// Restore whose admitted run carries the permissions leaves nothing for the offer and starts
 /// nothing.
 #[cfg(target_os = "macos")]
 fn offer_again_after_restore() {
+    use aterm_cli::macos_doctor::BroughtForward;
     let io = setup_io();
     match (io.bring_forward)() {
-        Ok(Some(_)) => (io.start_startup)(),
-        Ok(None) => {}
+        Ok(BroughtForward::Run(_) | BroughtForward::Busy) => {
+            if !(io.start_startup)() {
+                (io.start_startup_inline)();
+            }
+        }
+        Ok(BroughtForward::Nothing) => {}
         Err(why) => aterm_log::warn!(
             "System State: bringing the restored setup forward did not finish: {why}"
         ),
@@ -6132,12 +7049,16 @@ fn offer_again_after_restore() {
 /// The live [`SetupIo::start_startup`]: [`run_startup_setup`] on a thread of its own, as a
 /// launch starts it.
 #[cfg(target_os = "macos")]
-fn start_startup_again() {
-    if let Err(why) = std::thread::Builder::new()
+fn start_startup_again() -> bool {
+    match std::thread::Builder::new()
         .name("aterm-workstation-setup".into())
         .spawn(|| run_startup_setup(None))
     {
-        aterm_log::warn!("first-run macOS doctor worker could not start: {why}");
+        Ok(_) => true,
+        Err(why) => {
+            aterm_log::warn!("first-run macOS doctor worker could not start: {why}");
+            false
+        }
     }
 }
 
@@ -6151,6 +7072,18 @@ mod initial_setup_result_tests {
 
     #[path = "watch_stop_handoff_tests.rs"]
     mod watch_stop_handoff_tests;
+
+    #[path = "startup_recovery_tests.rs"]
+    mod startup_recovery_tests;
+
+    #[path = "progress_publication_tests.rs"]
+    mod progress_publication_tests;
+
+    #[path = "restore_retry_tests.rs"]
+    mod restore_retry_tests;
+
+    #[path = "bind_stop_tests.rs"]
+    mod bind_stop_tests;
 
     use super::*;
     use aterm_cli::macos_doctor::{
@@ -6270,18 +7203,18 @@ mod initial_setup_result_tests {
             InitialSetupSnapshotError::Updating,
             InitialSetupSnapshotError::Read("current records cannot be read".into()),
         ] {
+            let changing = matches!(error, InitialSetupSnapshotError::Updating);
             let status = initial_setup_status_with(Err(error), true, &last);
+            assert_eq!(status.changing, changing, "only a read that met a write");
             assert!(!has_old_result(&status));
             assert!(status.permissions.is_none());
             assert!(status.busy);
             assert_eq!(status.rows.len(), 1);
         }
         let unbound = cached(None, false);
-        assert!(!has_old_result(&initial_setup_status_with(
-            Ok(snapshot(root.path())),
-            false,
-            &unbound,
-        )));
+        let status = initial_setup_status_with(Ok(snapshot(root.path())), false, &unbound);
+        assert!(!has_old_result(&status));
+        assert!(!status.changing, "a read that met no write");
     }
 
     /// A Restore reaches the page as what it did to each System State row: one calm line in
@@ -6330,8 +7263,8 @@ mod initial_setup_result_tests {
         );
         assert_eq!(
             back[0].detail,
-            "Restore previous settings finished. Caps Lock key and the Dock come back at your \
-             next login."
+            "Restore previous settings finished. Caps Lock key and Dock come back at your next \
+             login."
         );
         let failed = initial_setup_report_rows(&report(RestoreOutcome::of([(
             Some(Setting::CapsLock),
@@ -6464,7 +7397,7 @@ mod initial_setup_result_tests {
                 (
                     "Undo",
                     "restored",
-                    "aterm put back what it could not finish. The Dock is as it was."
+                    "aterm put back what it could not finish. Dock is as it was."
                 ),
                 ("GitHub repositories", "ok", "all 3 cloned"),
             ]
@@ -6629,10 +7562,18 @@ mod initial_setup_result_tests {
         startup_failures: Vec<String>,
         /// Follow-ups with Full Disk Access a recorded grant started.
         follow_ups: usize,
-        /// What bringing a restored setup forward wrote.
-        brought_forward: Option<u64>,
+        /// What bringing a restored setup forward found.
+        brought_forward: aterm_cli::macos_doctor::BroughtForward,
+        /// Check again's looks at the LAN.
+        lan_probes: usize,
         /// Startups run again in this process.
         startups: usize,
+        /// Whether each requested startup worker was accepted by the spawner.
+        startup_spawns: VecDeque<bool>,
+        /// Startup continuations on a released Restore worker.
+        startups_inline: usize,
+        /// The widened mark ([`SETUP_WIDENED`]) as each run started.
+        widened: Vec<u64>,
     }
 
     impl Script {
@@ -6665,8 +7606,12 @@ mod initial_setup_result_tests {
             startup_backoff_hold: false,
             startup_failures: Vec::new(),
             follow_ups: 0,
-            brought_forward: None,
+            brought_forward: aterm_cli::macos_doctor::BroughtForward::Nothing,
+            lan_probes: 0,
             startups: 0,
+            startup_spawns: VecDeque::new(),
+            startups_inline: 0,
+            widened: Vec::new(),
         };
     }
 
@@ -6762,7 +7707,13 @@ mod initial_setup_result_tests {
                 put_back: |_| Ok(false),
                 start_follow_up: || change(|script| script.follow_ups += 1),
                 bring_forward: || Ok(script().brought_forward),
-                start_startup: || change(|script| script.startups += 1),
+                probe_lan: || change(|script| script.lan_probes += 1),
+                start_startup: || {
+                    let mut script = script();
+                    script.startups += 1;
+                    script.startup_spawns.pop_front().unwrap_or(true)
+                },
+                start_startup_inline: || change(|script| script.startups_inline += 1),
             };
             reset_worker_state();
             Self { _claims: claims }
@@ -6854,7 +7805,12 @@ mod initial_setup_result_tests {
             _: Option<aterm_secrets::SecretBytes>,
             busy: InitialSetupBusy,
         ) {
-            change(|script| script.runs.push(revision));
+            change(|script| {
+                script.runs.push(revision);
+                script
+                    .widened
+                    .push(SETUP_WIDENED.load(std::sync::atomic::Ordering::Acquire));
+            });
             drop(claim);
             drop(busy);
         }
@@ -6944,17 +7900,57 @@ mod initial_setup_result_tests {
     }
 
     /// A Restore that left aterm's own permissions with no admitted run to carry them (one that
-    /// let the launch's offer go unanswered) is brought forward at once and the startup offers
-    /// it again in this launch; a Restore whose run carries them starts nothing.
+    /// let the launch's offer go unanswered) is offered again in this launch; so is one whose
+    /// bring-forward met the profile lock busy, which the startup waits for. A Restore whose run
+    /// carries them starts nothing.
     #[test]
     fn a_restore_that_left_no_run_for_the_permissions_is_offered_again_in_this_launch() {
+        use aterm_cli::macos_doctor::BroughtForward;
         let _globals = globals();
         let _io = TestIo::install();
         offer_again_after_restore();
         assert_eq!(script().startups, 0, "nothing brought forward");
-        change(|script| script.brought_forward = Some(3));
+        change(|script| script.brought_forward = BroughtForward::Run(3));
         offer_again_after_restore();
         assert_eq!(script().startups, 1);
+        change(|script| script.brought_forward = BroughtForward::Busy);
+        offer_again_after_restore();
+        assert_eq!(script().startups, 2, "the startup waits for the lock");
+    }
+
+    /// A launch whose setup has finished starts the follow-up with Full Disk Access on a thread
+    /// of its own: its wait for a profile lock another pass holds never holds up what the
+    /// startup does next (the watch for the ALab vault).
+    #[test]
+    fn a_finished_launch_starts_its_follow_up_beside_the_startup() {
+        let _globals = globals();
+        let _io = TestIo::install();
+        run_prepared_setup(PreparedSetup::Finished, None, StartupSent::default());
+        assert_eq!(script().follow_ups, 1);
+    }
+
+    /// Check again looks at the LAN before it reads the Local Network row, so the row reads what
+    /// macOS answers now; a reading nobody forced, or a Check of other rows, never looks.
+    #[test]
+    fn check_again_looks_at_the_lan_before_it_reads_local_network() {
+        use aterm_types::macos_setup::Access;
+        let _globals = globals();
+        let _io = TestIo::install();
+        let lan = vec![Subject::Access(Access::LocalNetwork)];
+        for (forced, subjects, looks) in [
+            (false, lan.clone(), 0),
+            (true, vec![Subject::Setting(Setting::Dock)], 0),
+            (true, lan, 1),
+        ] {
+            let choices = OBSERVED_ROWS.lock().unwrap().choices;
+            observe_rows(ObserveRequest {
+                plan: Some(left_as_is()),
+                choices,
+                subjects,
+                forced,
+            });
+            assert_eq!(std::mem::take(&mut script().lan_probes), looks, "{forced}");
+        }
     }
 
     #[test]
@@ -7195,6 +8191,9 @@ mod initial_setup_result_tests {
         }
         fn authorization_pending(&self) -> bool {
             true
+        }
+        fn stopped(&self) -> bool {
+            stop_covers(self.sent.sent)
         }
         fn wait_holding_claim(&mut self) -> bool {
             change(|script| script.retry_waits += 1);
@@ -7482,6 +8481,112 @@ mod initial_setup_result_tests {
         assert!(!held(false, false, false, true), "nobody stopped it");
         wait_until("no Stop is owed", stop_worker_idle);
         reset_worker_state();
+    }
+
+    /// A run aterm widened says so on the page while it goes (System State design §3.5), and no
+    /// longer once its worker has ended: a later worker the slot keeps busy, which the page
+    /// counts as a run (a put-back once Full Disk Access is granted), never shows the note
+    /// again.
+    #[test]
+    fn the_widened_note_goes_when_its_run_ends() {
+        let _globals = globals();
+        let _io = TestIo::install();
+        let claim = StartupClaim::claim().unwrap().unwrap();
+        let sent = StartupSent {
+            widened_from: Some(7),
+            ..StartupSent::default()
+        };
+        run_prepared_setup(PreparedSetup::Authorized { claim, revision: 8 }, None, sent);
+        assert_eq!(script().runs, [8]);
+        assert_eq!(script().widened, [8], "said while the run goes");
+        assert_eq!(
+            SETUP_WIDENED.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "the run ended"
+        );
+        assert!(!initial_setup_status().widened);
+        clear_setup_run(8);
+    }
+
+    /// A saved setup aterm could not read just now is one calm line, no failure (System State
+    /// design §3.6): aterm reads it again by itself.
+    #[test]
+    fn a_saved_setup_unread_just_now_is_one_calm_line() {
+        let status = initial_setup_status_with(
+            Err(InitialSetupSnapshotError::Read(
+                "automatic-plan.json: Permission denied".into(),
+            )),
+            false,
+            &InitialSetupRows::default(),
+        );
+        assert!(status.plan.is_none());
+        assert_eq!(
+            status.rows,
+            [aterm_gui::calm_setup_row(aterm_gui::STATE_UNREAD_NOTE)]
+        );
+        assert!(status.rows.iter().all(|row| row.status != "failed"));
+    }
+
+    /// A step of the launch's setup that failed is tried again by itself: the page says so in
+    /// one calm line with every failure kept off the menu line and the tab (System State design
+    /// §3.5, §3.6); ten minutes on, once, the exceptions digest says setup has not started, and
+    /// the entry goes once the startup goes on.
+    #[test]
+    fn a_startup_that_tries_again_is_calm_and_told_to_the_digest_ten_minutes_on() {
+        let start = Instant::now();
+        let mut retry = StartupRetry::NONE;
+        assert!(!retry.failed(start));
+        assert!(retry.retrying());
+        assert!(!retry.failed(start + Duration::from_secs(9 * 60)));
+        assert!(retry.failed(start + STARTUP_STUCK_AFTER));
+        assert!(!retry.failed(start + STARTUP_STUCK_AFTER * 2), "once");
+        assert!(retry.went_on(), "its entry goes");
+        assert_eq!(retry, StartupRetry::NONE);
+        assert!(!retry.went_on());
+        assert!(
+            !retry.failed(start + STARTUP_STUCK_AFTER * 3),
+            "counted anew"
+        );
+
+        let mut status = aterm_gui::SetupStatus {
+            plan: Some(Plan::default()),
+            ..aterm_gui::SetupStatus::default()
+        };
+        add_startup_retry(&mut status, false);
+        assert!(!status.retrying && status.rows.is_empty());
+        add_startup_retry(&mut status, true);
+        assert!(status.retrying);
+        assert_eq!(
+            status.rows,
+            [aterm_gui::calm_setup_row(aterm_gui::STARTUP_RETRY_NOTE)]
+        );
+        // A saved setup it cannot read says so in its own line alone.
+        let mut unread = initial_setup_status_with(
+            Err(InitialSetupSnapshotError::Read("unread".into())),
+            false,
+            &InitialSetupRows::default(),
+        );
+        add_startup_retry(&mut unread, true);
+        assert_eq!(
+            unread.rows,
+            [aterm_gui::calm_setup_row(aterm_gui::STATE_UNREAD_NOTE)]
+        );
+    }
+
+    /// A Restore that failed as a whole says why in the page's words: one that cannot read the
+    /// settings aterm saved before setup changed them names where to learn why, since pressing
+    /// it again reads the same record.
+    #[test]
+    fn a_whole_restore_failure_says_why_in_the_pages_words() {
+        let unread = restore_failed_row(&format!(
+            "{}: backup: expected value",
+            aterm_cli::macos_doctor::BACKUP_UNREAD
+        ));
+        assert_eq!(unread.detail, aterm_gui::RESTORE_BACKUP_UNREAD_NOTE);
+        assert_eq!(unread.status, "failed");
+        let other = restore_failed_row("state.json: No space left on device");
+        assert_eq!(other.detail, aterm_gui::RESTORE_FAILED_NOTE);
+        assert_eq!(unread.name, other.name);
     }
 
     #[test]

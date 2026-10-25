@@ -102,7 +102,8 @@ path = "examples/objc_ime_drive.rs"
 # table to agree left that test GREEN. This installs the real toolbar in a real
 # NSWindow, enters the registered IMPs through AppKit's own dispatch, captures
 # 26 drawing states with `-cacheDisplayInRect:`, and reads all four classes off
-# the live objects. DECLARED and not auto-discovered for the same reason as its
+# the live objects, then puts a real status item in the menu bar and reads its
+# This Mac row back off AppKit. DECLARED and not auto-discovered for the same reason as its
 # siblings (`aterm-verify`'s `OBJC_DRIVES`). Run by `targo --unverified verify
 # appkit`; by hand it is
 # `targo --unverified run -p aterm-gui --example objc_toolbar_drive`.

@@ -744,39 +744,123 @@ fn scrolled_back_with_a_selection(app: &mut App, wid: WindowId) -> Arc<Mutex<Ter
 
 #[test]
 fn select_all_selects_the_visible_screen_without_snapping() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let term = app.front_terminal(wid).expect("terminal").term.clone();
-    let off = {
-        let mut t = term_lock(&term);
-        t.process("line\r\n".repeat(64).as_bytes());
-        t.scroll_to_top();
-        let off = t.grid().display_offset() as i32;
-        assert_ne!(off, 0, "viewport is in history");
-        off
-    };
-    let rows = i32::from(app.windows[&wid].rows);
+    use aterm_core::selection::SelectionSide;
 
-    app.select_all();
+    let mut failures = Vec::new();
+    for (label, split) in [
+        ("single terminal", None),
+        ("top/bottom", Some(crate::pane::SplitDir::Horizontal)),
+        ("left/right", Some(crate::pane::SplitDir::Vertical)),
+    ] {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let sibling = split.map(|dir| {
+            let sibling = app
+                .front_terminal(wid)
+                .expect("original terminal")
+                .term
+                .clone();
+            app.split_active_stub_tab_dir(wid, dir);
+            sibling
+        });
+        let sibling_before = sibling.as_ref().map(|sibling| {
+            let mut term = term_lock(sibling);
+            term.process(b"SIBLING");
+            let selection = term.text_selection_mut();
+            selection.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+            selection.update_selection(0, 6, SelectionSide::Right);
+            selection.complete_selection();
+            (
+                term.text_selection().clone(),
+                (0..usize::from(term.grid().rows()))
+                    .map(|row| term.row_text(row))
+                    .collect::<Vec<_>>(),
+                term.grid().display_offset(),
+            )
+        });
+        let terminal = app
+            .front_terminal(wid)
+            .expect("focused terminal")
+            .term
+            .clone();
+        let (off, rows, cols) = {
+            let mut term = term_lock(&terminal);
+            let text = (0..128)
+                .map(|row| format!("line-{row:03}\r\n"))
+                .collect::<String>();
+            term.process(text.as_bytes());
+            term.scroll_to_top();
+            let off = term.grid().display_offset() as i32;
+            assert_ne!(off, 0, "viewport is in history");
+            (off, term.grid().rows(), term.grid().cols())
+        };
+        match split {
+            Some(crate::pane::SplitDir::Horizontal) => {
+                assert!(rows < app.windows[&wid].rows, "shorter pane precondition");
+            }
+            Some(crate::pane::SplitDir::Vertical) => {
+                assert!(cols < app.windows[&wid].cols, "narrower pane precondition");
+            }
+            None => assert_eq!(rows, app.windows[&wid].rows),
+        }
+        let expected = (0..rows)
+            .map(|row| format!("line-{row:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
-    let t = term_lock(&term);
-    assert_eq!(
-        t.grid().display_offset() as i32,
-        off,
-        "Select All must not move the viewport"
-    );
-    let sel = t.text_selection();
-    assert!(sel.has_selection(), "a selection was made");
-    assert_eq!(
-        sel.start().row,
-        -off,
-        "the selection starts at the TOP VISIBLE row, not the live top"
-    );
-    assert_eq!(
-        sel.end().row,
-        rows - 1 - off,
-        "…and ends at the bottom visible row"
-    );
+        app.select_all();
+
+        {
+            let term = term_lock(&terminal);
+            assert_eq!(
+                term.grid().display_offset() as i32,
+                off,
+                "Select All must not move the viewport"
+            );
+            let selection = term.text_selection();
+            assert!(selection.has_selection(), "a selection was made");
+            assert_eq!(
+                selection.start().row,
+                -off,
+                "the selection starts at the TOP VISIBLE row, not the live top"
+            );
+            if split.is_none() {
+                assert_eq!(
+                    selection.end().row,
+                    i32::from(rows) - 1 - off,
+                    "…and ends at the bottom visible row"
+                );
+            }
+            let bounds = (
+                selection.start().row,
+                selection.start().col,
+                selection.end().row,
+                selection.end().col,
+            );
+            let expected_bounds = (-off, 0, i32::from(rows) - 1 - off, cols - 1);
+            let copied = term.selection_to_string();
+            if bounds != expected_bounds || copied.as_deref() != Some(expected.as_str()) {
+                failures.push(format!(
+                    "{label}: bounds={bounds:?}, expected_bounds={expected_bounds:?}, copied={copied:?}, expected={expected:?}"
+                ));
+            }
+        }
+        if let (Some(sibling), Some(before)) = (sibling.as_ref(), sibling_before) {
+            let term = term_lock(sibling);
+            assert_eq!(
+                (
+                    term.text_selection().clone(),
+                    (0..usize::from(term.grid().rows()))
+                        .map(|row| term.row_text(row))
+                        .collect::<Vec<_>>(),
+                    term.grid().display_offset(),
+                ),
+                before,
+                "Select All leaves sibling selection, contents and viewport unchanged"
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]

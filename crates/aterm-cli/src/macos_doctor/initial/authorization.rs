@@ -167,6 +167,7 @@ impl AuthorizationCommit {
         admission: Admission,
         vault: AdmittedVault,
         waiting: bool,
+        revision_floor: u64,
     ) -> Result<Self, String> {
         validate_plan(plan)?;
         let previous = baseline.records.plan.as_ref().map(|(plan, _)| plan);
@@ -220,7 +221,7 @@ impl AuthorizationCommit {
             next.done &= !(Stage::Secrets.bit() | Stage::Repositories.bit());
         }
         next.access = carried_access(previous, prior, plan);
-        next.revision = next_revision(prior.unwrap_or_default().revision)?;
+        next.revision = next_revision(prior.unwrap_or_default().revision.max(revision_floor))?;
         next.completed = plan.selection.is_empty();
         next.admitted = false;
         next.running = None;
@@ -341,10 +342,14 @@ impl InitialSetupAuthorization {
         root: &Path,
         read: impl FnOnce() -> Result<Option<ConfiguredVault>, String>,
     ) -> Result<Plan, String> {
-        // A read-only snapshot can still show a saved plan after a read error;
-        // an offer must know the vault its eventual Secrets choice may replace.
-        // Fail before presenting it so startup can retry and offer the current vault.
-        let configured = read()?;
+        // An offer must know the vault its eventual Secrets choice may replace. A vault
+        // configuration aterm cannot read (a root-owned or newer-format `source.toml`) holds
+        // nothing back: it reads as none here, so the offer goes ahead, Permissions and every
+        // other group with it (System State design §3.3). The run's Secrets stage reads it
+        // again before it joins anything, and with this admission's vault recorded as none it
+        // never replaces a vault it did not read ([`AdmittedVault::stands_in`]): one that reads
+        // later stays as it is unless it is the plan's own.
+        let configured = read().unwrap_or(None);
         let records = observation_at(root)
             .map_err(|error| error.to_string())?
             .records;
@@ -352,7 +357,7 @@ impl InitialSetupAuthorization {
         // it is presented with aterm's own permissions, approved by default as on every Mac
         // (System State design §3.5, §6; [`Records::present`]). Only a person's Cancel or Stop
         // holds them, and either ends setup before anything is offered.
-        let plan = offered_plan(records.presented_plan_record(), Ok(configured.clone()))?;
+        let plan = offered_plan(records.presented_plan_record(), Ok(configured.clone()));
         self.vault = AdmittedVault::of(Ok(configured));
         Ok(plan)
     }
@@ -648,9 +653,15 @@ impl InitialSetupAuthorization {
                 let owned = baseline.clone();
                 let vault = read(self.vault)?;
                 let waiting = owned.records.restored.is_some() && restore_waits(root);
+                let revision_floor = revision::floor(root)?;
                 self.state = AuthorizationState::Ended;
                 self.state = AuthorizationState::Writing(AuthorizationCommit::new(
-                    owned, plan, admission, vault, waiting,
+                    owned,
+                    plan,
+                    admission,
+                    vault,
+                    waiting,
+                    revision_floor,
                 )?);
             }
             AuthorizationState::Writing(commit) => {

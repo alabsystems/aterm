@@ -382,8 +382,8 @@ fn the_harness_route_renders_its_cards_and_controls() {
         "Approved: 3 today \u{b7} 41 in 7 days"
     );
     assert_eq!(
-        node(&pages, "harness/did/row/waited-on-you").label,
-        "Waited on you: 2m today \u{b7} 2h 5m in 7 days"
+        node(&pages, "harness/did/row/waited-for-you").label,
+        "Waited for you: 0 today, 2m \u{b7} 0 in 7 days, 2h 5m"
     );
     assert_eq!(
         node(&pages, "harness/did/row/partial").label,
@@ -1757,7 +1757,7 @@ fn sessions_stays_on_the_first_screen_under_todays_lines() {
             if want.is_some() {
                 assert_eq!(
                     node(&pages, "harness/status/today").label,
-                    format!("{first} \u{b7} waited on you 2m"),
+                    format!("{first} \u{b7} waited for you 2m"),
                     "{context}"
                 );
                 assert_eq!(
@@ -1776,7 +1776,7 @@ fn todays_lines_give_way_hero_then_plain_then_the_second_line() {
     use crate::native_ui::{StyleRef, UiContent};
     let lines = (
         "37 approved today \u{b7} 12 kept going \u{b7} 4 answered".to_string(),
-        "2 resumed \u{b7} 1 land prompt \u{b7} waited on you 4m".to_string(),
+        "2 resumed \u{b7} 1 land prompt \u{b7} waited for you 4m".to_string(),
     );
     let drawn = |block: &Option<(UiNode, f32)>| -> Vec<(StyleRef, String)> {
         block
@@ -1786,7 +1786,7 @@ fn todays_lines_give_way_hero_then_plain_then_the_second_line() {
                     .iter()
                     .map(|child| match &child.content {
                         UiContent::Text(text) => (text.style, text.text.clone()),
-                        UiContent::Group(_) => (
+                        UiContent::Group(group) => (
                             child
                                 .children
                                 .iter()
@@ -1799,15 +1799,18 @@ fn todays_lines_give_way_hero_then_plain_then_the_second_line() {
                                     one
                                 })
                                 .unwrap_or(StyleRef::Plain),
-                            child
-                                .children
-                                .iter()
-                                .map(|line| match &line.content {
-                                    UiContent::Text(text) => text.text.clone(),
-                                    other => panic!("a line: {other:?}"),
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" "),
+                            crate::native_ui::joined_as_named(
+                                &child
+                                    .children
+                                    .iter()
+                                    .map(|line| match &line.content {
+                                        UiContent::Text(text) => text.text.clone(),
+                                        other => panic!("a line: {other:?}"),
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                group.label.as_deref().unwrap_or_default(),
+                            ),
                         ),
                         other => panic!("a text: {other:?}"),
                     })
@@ -2036,7 +2039,7 @@ fn a_rows_day_its_show_and_its_landing() {
     let pages = every_page(&mut runtime, instance, view, &view_cx());
     assert_eq!(
         node(&pages, "harness/session/7/today").label,
-        "today: needed you once, 1m at 18:29 \u{b7} 3 approved"
+        "today: waited for you once, 1m at 18:29 \u{b7} 3 approved"
     );
     let show = node(&pages, "harness/session/7/show");
     assert_eq!(show.label, "Show fix the build");
@@ -3655,8 +3658,11 @@ pub(super) fn fixture_landings() -> HarnessState {
     today.unproven = 1;
     today.continued = 4;
     today.land_prompts = 3;
+    today.escalated = 2;
+    today.human_wait_ms = 14 * 60_000;
+    today.needs_told = 2;
     today.by_rule.insert(RULE_DONE_CHECK.to_string(), 1);
-    today.rows = 41;
+    today.rows = 45;
     today.by_session.as_mut().expect("per session").insert(
         "s-8".to_string(),
         aterm_agent::harness::stats::Tally {
@@ -3672,8 +3678,11 @@ pub(super) fn fixture_landings() -> HarnessState {
     week.unproven = 2;
     week.continued = 30;
     week.land_prompts = 11;
+    week.escalated = 5;
+    week.human_wait_ms = 62 * 60_000;
+    week.needs_told = 2;
     week.by_rule.insert(RULE_DONE_CHECK.to_string(), 12);
-    week.rows = 180;
+    week.rows = 187;
     state.stats = HarnessStatsSlot {
         report: Some(std::sync::Arc::new(HarnessStatsReport::new(
             today,
@@ -3706,12 +3715,9 @@ fn the_page_draws_its_landings_and_the_done_claims_checked() {
     }
     let landed = node(&pages, "harness/did/row/landed").label.clone();
     assert!(says(&landed, "2 today \u{b7} 9 in 7 days"), "{landed}");
-    let checked = node(&pages, "harness/did/row/of-them").label.clone();
-    assert!(
-        checked.contains("a done claim checked 1 today \u{b7} 12 in 7 days"),
-        "{checked}"
-    );
-    node(&pages, "harness/did/row/of-those");
+    let checked = node(&pages, "harness/did/row/past--done").label.clone();
+    assert!(says(&checked, "1 today \u{b7} 12 in 7 days"), "{checked}");
+    node(&pages, "harness/did/row/no-safe-rule");
     node(&pages, "harness/did/row/land-prompts");
     let today = node(&pages, "harness/status/today").label.clone();
     assert!(today.starts_with("2 landed today \u{b7} "), "{today}");
@@ -3719,13 +3725,66 @@ fn the_page_draws_its_landings_and_the_done_claims_checked() {
     assert!(day.starts_with("today: 1 landed \u{b7} "), "{day}");
     let (mut runtime, instance, view) = harness_route(fixture());
     let pages = every_page(&mut runtime, instance, view, &view_cx());
-    for key in ["harness/did/row/landed", "harness/did/row/of-them"] {
+    for key in ["harness/did/row/landed", "harness/did/row/past--done"] {
         assert!(
             pages
                 .iter()
                 .all(|page| page.semantic(&UiKey::new(key)).is_none()),
             "{key}"
         );
+    }
+}
+
+/// WHAT THE HARNESS DID'S PLAIN COUNTS ON THE COMPILED PAGE (§14.6): `past “done”`, `no safe
+/// rule`, `Waited for you`, `Needs, carried on` and `None in 7 days` are each a fact of their own
+/// key (the compile refuses two of one key), and no fact of v5's words is drawn: `of them`, `of
+/// those`, `Needed you`, `Needs told`, `Waited on you`, or a count's `0 today · 0 in 7 days`.
+#[test]
+fn the_page_draws_its_plain_counts() {
+    use crate::harness_screen::{
+        DONE_CHECKED_OF_KEPT_GOING, NEEDED_YOU, NEEDS_TOLD, NONE_IN_7_DAYS, UNPROVEN_OF_APPROVED,
+    };
+    for state in [fixture(), fixture_landings()] {
+        let (mut runtime, instance, view) = harness_route(state.clone());
+        let pages = every_page(&mut runtime, instance, view, &view_cx());
+        let rows = state.projection().did_rows;
+        for (label, value) in &rows {
+            let key = format!("harness/did/row/{}", key_fragment(label));
+            assert_eq!(node(&pages, &key).label, format!("{label}: {value}"));
+        }
+        for old in [
+            "of-them",
+            "of-those",
+            "needed-you",
+            "needs-told",
+            "waited-on-you",
+        ] {
+            let key = format!("harness/did/row/{old}");
+            assert!(
+                pages
+                    .iter()
+                    .all(|page| page.semantic(&UiKey::new(key.as_str())).is_none()),
+                "{key}"
+            );
+        }
+        assert!(
+            rows.iter()
+                .all(|(_, value)| value != "0 today \u{b7} 0 in 7 days"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(label, _)| label == NONE_IN_7_DAYS),
+            "{rows:?}"
+        );
+    }
+    let rows = fixture_landings().projection().did_rows;
+    for label in [
+        DONE_CHECKED_OF_KEPT_GOING,
+        UNPROVEN_OF_APPROVED,
+        NEEDED_YOU.label,
+        NEEDS_TOLD.label,
+    ] {
+        assert!(rows.iter().any(|(l, _)| l == label), "{label}: {rows:?}");
     }
 }
 

@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Bundling Homebrew into atpkg and `Brewfile` handling over abrew state.
+//! Native `Brewfile` handling and explicit cleanup of legacy Homebrew bundles.
 
 use std::path::Path;
 
-use super::fetch;
 use super::install::InstallError;
-use super::prefix::{Kind, Prefix, json_escape, publish_directory};
+use super::prefix::{Kind, Prefix};
 
-/// The pinned Homebrew/brew release abrew bundles by default.
-pub const HOMEBREW_BUNDLE_VERSION: &str = "4.5.8";
-pub const HOMEBREW_BUNDLE_SHA256: &str =
-    "6a5a18e6c5bea214983ec102dea3126cbc2d162540f8d93387fa9730d1f03be3";
-
-/// The ownership receipt moves with the bundle.
+/// The embedded ownership receipt written by older abrew versions.
 const BUNDLE_RECEIPT: &str = ".abrew-bundle.json";
 
 fn bundle_record(directory: &Path) -> Option<String> {
@@ -66,141 +60,33 @@ fn valid_sha256(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Lay verified Homebrew with its receipt in a private stage, then publish the directory.
-pub fn install_bundle(
-    prefix: &Prefix,
-    version: Option<&str>,
-    sha256: Option<&str>,
-    force: bool,
-) -> Result<(), InstallError> {
-    let tag = version.unwrap_or(HOMEBREW_BUNDLE_VERSION);
-    let expected = match (version, sha256) {
-        (None, None) => HOMEBREW_BUNDLE_SHA256,
-        (Some(_), Some(hash)) => hash,
-        _ => {
-            return Err(InstallError::Failed(
-                "abrew: bundle overrides need both --version and --sha256".into(),
-            ));
-        }
-    };
-    if !super::valid_component(tag) || !valid_sha256(expected) {
-        return Err(InstallError::Failed(
-            "abrew: invalid bundle version or SHA-256".into(),
-        ));
-    }
-    prefix.ensure()?;
-    let dest = prefix.homebrew_bundle();
-    let occupied = match std::fs::symlink_metadata(&dest) {
-        Ok(_) => {
-            if bundle_record(&dest).is_none() {
-                return Err(InstallError::Failed(format!(
-                    "abrew: refusing to replace unowned bundle path {}",
-                    dest.display()
-                )));
-            }
-            if !force {
-                if let Some(record) = bundle_record(&dest) {
-                    let laid = aterm_json::from_slice::<aterm_json::Value>(record.as_bytes())
-                        .ok()
-                        .and_then(|v| {
-                            v.get("version")
-                                .and_then(aterm_json::Value::as_str)
-                                .map(str::to_owned)
-                        });
-                    if laid.as_deref() != Some(tag) {
-                        return Err(InstallError::Failed(format!(
-                            "abrew: bundled Homebrew {} is laid, not {tag}; use bundle --force --version {tag} --sha256 <sha> to replace it",
-                            laid.as_deref().unwrap_or("unknown")
-                        )));
-                    }
-                }
-                if !runnable_bundle(&dest) {
-                    return Err(InstallError::Failed("abrew: bundled executable is missing or invalid; use bundle --force to repair".into()));
-                }
-                println!(
-                    "abrew: Homebrew bundle already laid at {} (use --force to re-lay)",
-                    dest.display()
-                );
-                return Ok(());
-            }
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(format!("abrew: cannot inspect bundle: {error}").into()),
-    };
-    let url = format!("https://github.com/Homebrew/brew/archive/refs/tags/{tag}.tar.gz");
-    let tarball = prefix.cache().join(format!("homebrew-brew-{tag}.tar.gz"));
-    if fetch::verify_sha256(&tarball, expected).is_err() {
-        println!("==> Bundling Homebrew {tag} into {}", dest.display());
-        fetch::curl_to_file(&url, &tarball, &[])?;
-    }
-    fetch::verify_sha256(&tarball, expected)?;
-    let staging = aterm_tempfile::Builder::new()
-        .prefix(".abrew-bundle-")
-        .tempdir_in(&prefix.root)
-        .map_err(|error| format!("abrew: cannot stage bundle: {error}"))?;
-    let unpacked = staging.path().join("unpacked");
-    fetch::untar_homebrew_bundle(&tarball, &unpacked)?;
-    let inner = unpacked.join(format!("brew-{tag}"));
-    if !runnable_bundle(&inner) {
-        return Err(InstallError::Failed("abrew: bundle tarball needs real root/bin directories and an executable regular bin/brew".into()));
-    }
-    let record = format!(
-        "{{\n  \"installed_by\": \"abrew\",\n  \"version\": \"{}\",\n  \"sha256\": \"{}\",\n  \"source_url\": \"{}\"\n}}\n",
-        json_escape(tag),
-        json_escape(expected),
-        json_escape(&url)
-    );
-    use std::io::Write as _;
-    let mut receipt = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(inner.join(BUNDLE_RECEIPT))
-        .map_err(|error| format!("abrew: cannot stage bundle receipt: {error}"))?;
-    receipt
-        .write_all(record.as_bytes())
-        .map_err(|error| format!("abrew: cannot stage bundle receipt: {error}"))?;
-    publish_directory(&inner, &dest, occupied).map_err(|error| {
-        format!("abrew: cannot publish bundle; existing destination retained: {error}")
-    })?;
-    match super::install_badge() {
-        Some(badge) => println!("{badge}  Homebrew {tag} bundled at {}", dest.display()),
-        None => println!("Homebrew {tag} bundled at {}", dest.display()),
-    }
-    Ok(())
-}
-
-/// The bundled brew abrew may execute.
-pub(super) fn bundled_brew(prefix: &Prefix) -> Option<std::path::PathBuf> {
-    let directory = prefix.homebrew_bundle();
-    bundle_record(&directory)?;
-    if !runnable_bundle(&directory) {
-        return None;
-    }
-    Some(directory.join("bin/brew"))
-}
-
-/// `abrew bundle status`.
+/// Inspect a legacy Homebrew bundle without executing or changing it.
 pub fn bundle_status(prefix: &Prefix) {
     let directory = prefix.homebrew_bundle();
     if let Some(record) = bundle_record(&directory) {
         if !runnable_bundle(&directory) {
-            println!("bundled: invalid executable (use abrew bundle --force to repair)");
-            return;
+            println!(
+                "legacy bundled Homebrew: invalid executable at {} (unused; remove with: abrew bundle remove)",
+                directory.display()
+            );
+        } else {
+            println!(
+                "legacy bundled Homebrew: {} (unused; remove with: abrew bundle remove)",
+                directory.join("bin/brew").display()
+            );
         }
-        println!("bundled: {}", directory.join("bin/brew").display());
         print!("{record}");
     } else if directory.symlink_metadata().is_ok() {
         println!(
-            "bundled: unowned path {} (left untouched)",
+            "legacy bundled Homebrew: unowned path {} (left untouched)",
             directory.display()
         );
     } else {
-        println!("bundled: none (lay one with: abrew bundle)");
+        println!("legacy bundled Homebrew: none");
     }
 }
 
-/// Remove only a bundle carrying this engine's embedded ownership receipt.
+/// Explicitly remove only a legacy bundle carrying abrew's embedded ownership receipt.
 pub fn bundle_remove(prefix: &Prefix) -> Result<(), InstallError> {
     prefix.ensure()?;
     let dest = prefix.homebrew_bundle();
@@ -217,7 +103,7 @@ pub fn bundle_remove(prefix: &Prefix) -> Result<(), InstallError> {
     }
     std::fs::remove_dir_all(&dest)
         .map_err(|error| format!("abrew: cannot remove bundle: {error}"))?;
-    println!("abrew: Homebrew bundle removed");
+    println!("abrew: legacy Homebrew bundle removed");
     Ok(())
 }
 
@@ -368,150 +254,44 @@ mod tests {
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-mod install_tests {
+mod legacy_tests {
     use super::*;
 
-    fn cache_bundle(
-        prefix: &Prefix,
-        tag: &str,
-        entries: &[(&str, u8, &str, &[u8], u32)],
-    ) -> String {
-        prefix.ensure().unwrap();
-        let archive =
-            crate::extract::fixtures::gzip_bytes(&crate::extract::fixtures::tar_bytes(entries));
-        let hash = fetch::sha256_bytes(&archive);
+    fn legacy_receipt(directory: &Path) {
+        std::fs::create_dir_all(directory).unwrap();
         std::fs::write(
-            prefix.cache().join(format!("homebrew-brew-{tag}.tar.gz")),
-            archive,
+            directory.join(BUNDLE_RECEIPT),
+            format!(
+                r#"{{"installed_by":"abrew","version":"old","sha256":"{}"}}"#,
+                "0".repeat(64)
+            ),
         )
         .unwrap();
-        hash
-    }
-
-    fn run_bundle(prefix: &Prefix) -> Vec<u8> {
-        let output = aterm_uds::spawnfd::command(prefix.homebrew_bundle().join("bin/brew"))
-            .output()
-            .expect("the installed executable starts");
-        assert!(output.status.success(), "{output:?}");
-        output.stdout
     }
 
     #[test]
-    fn bundle_publishes_complete_receipts_and_retains_the_previous_executable_on_refusal() {
+    fn legacy_status_preserves_state_until_explicit_owned_removal() {
         let temp = aterm_tempfile::tempdir().unwrap();
         let prefix = Prefix::at(temp.path());
-        let outside = temp.path().join("owner.pc");
-        std::fs::write(&outside, b"keep").unwrap();
-        let first = cache_bundle(
-            &prefix,
-            "first",
-            &[
-                (
-                    "pax_global_header",
-                    b'g',
-                    "",
-                    b"52 comment=0000000000000000000000000000000000000000\n",
-                    0o644,
-                ),
-                (
-                    "brew-first/bin/brew",
-                    b'0',
-                    "",
-                    b"#!/bin/sh\nprintf first",
-                    0o755,
-                ),
-                (
-                    "brew-first/pkgconfig/fuse/demo.pc",
-                    b'2',
-                    outside.to_str().unwrap(),
-                    b"",
-                    0o777,
-                ),
-            ],
-        );
-        install_bundle(&prefix, Some("first"), Some(&first), false).unwrap();
-        assert_eq!(run_bundle(&prefix), b"first");
-        assert_eq!(
-            std::fs::read_link(prefix.homebrew_bundle().join("pkgconfig/fuse/demo.pc")).unwrap(),
-            outside
-        );
-        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
-        assert!(
-            bundle_record(&prefix.homebrew_bundle())
-                .unwrap()
-                .contains(&first)
-        );
+        prefix.ensure().unwrap();
+        let directory = prefix.homebrew_bundle();
+        legacy_receipt(&directory);
+        let legacy_data = directory.join("legacy-data");
+        std::fs::write(&legacy_data, b"legacy").unwrap();
+        let owner_data = prefix.root.join("owner-work");
+        std::fs::write(&owner_data, b"keep").unwrap();
 
-        let bad = cache_bundle(
-            &prefix,
-            "bad",
-            &[("brew-bad/not-brew", b'0', "", b"incomplete", 0o644)],
-        );
-        assert!(install_bundle(&prefix, Some("bad"), Some(&bad), true).is_err());
-        assert_eq!(run_bundle(&prefix), b"first");
-        let malicious = cache_bundle(
-            &prefix,
-            "escape",
-            &[("../outside", b'0', "", b"escape", 0o644)],
-        );
-        assert!(install_bundle(&prefix, Some("escape"), Some(&malicious), true).is_err());
-        assert!(!prefix.root.join("outside").exists());
-        assert_eq!(run_bundle(&prefix), b"first");
-
-        let unexecutable = cache_bundle(
-            &prefix,
-            "unexecutable",
-            &[(
-                "brew-unexecutable/bin/brew",
-                b'0',
-                "",
-                b"not executable",
-                0o644,
-            )],
-        );
-        assert!(install_bundle(&prefix, Some("unexecutable"), Some(&unexecutable), true).is_err());
-        assert_eq!(run_bundle(&prefix), b"first");
-
-        let next = cache_bundle(
-            &prefix,
-            "next",
-            &[(
-                "brew-next/bin/brew",
-                b'0',
-                "",
-                b"#!/bin/sh\nprintf next",
-                0o755,
-            )],
-        );
-        install_bundle(&prefix, Some("next"), Some(&next), true).unwrap();
-        assert_eq!(run_bundle(&prefix), b"next");
+        assert!(bundle_record(&directory).is_some());
         assert!(
-            bundle_record(&prefix.homebrew_bundle())
-                .unwrap()
-                .contains(&next)
+            !runnable_bundle(&directory),
+            "a broken legacy bundle is removable"
         );
-        assert!(
-            !prefix.root.join("homebrew-bundle.json").exists(),
-            "one embedded receipt"
-        );
+        bundle_status(&prefix);
+        assert_eq!(std::fs::read(&legacy_data).unwrap(), b"legacy");
         bundle_remove(&prefix).unwrap();
-        assert!(!prefix.homebrew_bundle().exists());
-    }
-
-    #[test]
-    fn first_publication_refuses_an_empty_foreign_destination() {
-        use std::os::unix::fs::MetadataExt as _;
-        let temp = aterm_tempfile::tempdir().unwrap();
-        let staged = temp.path().join("staged");
-        let dest = temp.path().join("dest");
-        std::fs::create_dir(&staged).unwrap();
-        std::fs::write(staged.join("new"), b"new").unwrap();
-        std::fs::create_dir(&dest).unwrap();
-        let original = std::fs::metadata(&dest).unwrap().ino();
-        assert!(publish_directory(&staged, &dest, false).is_err());
-        assert_eq!(std::fs::metadata(&dest).unwrap().ino(), original);
-        assert!(!dest.join("new").exists());
-        assert_eq!(std::fs::read(staged.join("new")).unwrap(), b"new");
+        assert!(!directory.exists());
+        assert_eq!(std::fs::read(&owner_data).unwrap(), b"keep");
+        bundle_remove(&prefix).unwrap();
     }
 
     #[test]
@@ -522,14 +302,15 @@ mod install_tests {
         std::fs::create_dir(&directory).unwrap();
         let foreign = directory.join("owner-work");
         std::fs::write(&foreign, b"keep").unwrap();
-        let expected = "0".repeat(64);
-        assert!(install_bundle(&prefix, Some("new"), Some(&expected), true).is_err());
         assert!(bundle_remove(&prefix).is_err());
         assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
         let record = temp.path().join("foreign-record");
         std::fs::write(
             &record,
-            format!(r#"{{"installed_by":"abrew","version":"old","sha256":"{expected}"}}"#),
+            format!(
+                r#"{{"installed_by":"abrew","version":"old","sha256":"{}"}}"#,
+                "0".repeat(64)
+            ),
         )
         .unwrap();
         std::os::unix::fs::symlink(&record, directory.join(BUNDLE_RECEIPT)).unwrap();
@@ -537,5 +318,29 @@ mod install_tests {
         assert!(bundle_remove(&prefix).is_err());
         assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
         assert!(std::fs::read(&record).unwrap().starts_with(b"{"));
+    }
+
+    #[test]
+    fn legacy_removal_does_not_follow_a_linked_bundle_directory() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&temp.path().join("prefix"));
+        prefix.ensure().unwrap();
+        let outside = temp.path().join("outside");
+        legacy_receipt(&outside);
+        let owner_data = outside.join("owner-work");
+        std::fs::write(&owner_data, b"keep").unwrap();
+        let directory = prefix.homebrew_bundle();
+        std::os::unix::fs::symlink(&outside, &directory).unwrap();
+
+        assert!(bundle_record(&directory).is_none());
+        assert!(bundle_remove(&prefix).is_err());
+        assert_eq!(std::fs::read(&owner_data).unwrap(), b"keep");
+        assert!(
+            directory
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }

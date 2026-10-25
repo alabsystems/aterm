@@ -182,7 +182,8 @@ impl SettingsRoute {
         Self::ALL.into_iter().find(|route| route.path() == path)
     }
 
-    /// The rail entry a sub-page lives under.
+    /// The rail entry a sub-page lives under: its row is listed, indented, right after this
+    /// one's on every page ([`navigation_groups`]).
     pub(crate) const fn rail_parent(self) -> Option<Self> {
         match self {
             Self::Themes => Some(Self::Appearance),
@@ -191,18 +192,10 @@ impl SettingsRoute {
         }
     }
 
-    /// Whether the rail lists a row for this route whatever page shows.
-    #[cfg(test)]
-    pub(crate) const fn on_rail(self) -> bool {
-        self.rail_parent().is_none()
-    }
-
+    /// How many rows the rail lists: one for every route, on every page.
     #[cfg(test)]
     fn rail_len() -> usize {
-        Self::ALL
-            .into_iter()
-            .filter(|route| route.on_rail())
-            .count()
+        Self::ALL.len()
     }
 
     const fn section(self) -> Option<Section> {
@@ -1519,6 +1512,10 @@ pub(crate) struct SettingsViewState {
     /// The chrome the page last drew its list in at each window, text size and bars ([`page`]).
     page_chromes: RefCell<Vec<(ChromeAt, PageChrome)>>,
     page_chrome_memo: RefCell<Option<(ChromeInputs, PageChrome)>>,
+    /// The page's name and its height where nothing over its list names it
+    /// ([`pinned_heading`]): the first list the page seats leads with it
+    /// ([`SettingsViewState::take_list_head`]).
+    list_head: RefCell<Option<(UiNode, f32)>>,
     /// Where the bar settled ([`page`]) by the inputs, chrome, bar and record of the frame that
     /// seated it, and by the record it left, kept for the frame's inputs.
     bar_seats: RefCell<Vec<(BarAt, BarSeat)>>,
@@ -1721,6 +1718,7 @@ impl SettingsViewState {
             page_chrome_at: Cell::new(None),
             page_chromes: RefCell::new(Vec::new()),
             page_chrome_memo: RefCell::new(None),
+            list_head: RefCell::new(None),
             bar_seats: RefCell::new(Vec::new()),
             showcase_blocks: RefCell::new(None),
             showcase_sheet: RefCell::new(None),
@@ -3195,7 +3193,7 @@ impl SettingsViewState {
     }
 
     fn step_navigation_focus(&mut self, lines: i32) -> bool {
-        let rail: Vec<SettingsRoute> = navigation_groups(self.route)
+        let rail: Vec<SettingsRoute> = navigation_groups()
             .into_iter()
             .flat_map(|(_, routes)| routes)
             .collect();
@@ -3218,7 +3216,7 @@ impl SettingsViewState {
     }
 
     fn focus_navigation_edge(&mut self, first: bool) -> bool {
-        let mut rail = navigation_groups(self.route)
+        let mut rail = navigation_groups()
             .into_iter()
             .flat_map(|(_, routes)| routes);
         let Some(route) = (if first { rail.next() } else { rail.last() }) else {
@@ -9122,12 +9120,9 @@ pub(crate) fn setting_choice_label(key: &str, value: &str) -> String {
         return choice_label("auto");
     }
     if key == prefs::EDIT_WINDOW_THEME && value.eq_ignore_ascii_case("auto") {
-        return if cfg!(target_os = "macos") {
-            "Match macOS"
-        } else {
-            "Match terminal"
-        }
-        .to_string();
+        return prefs::window_theme_auto(std::env::consts::OS)
+            .choice
+            .to_string();
     }
     if key == prefs::EDIT_PALETTE_GENERATE {
         let words = match value.to_ascii_lowercase().as_str() {
@@ -11618,29 +11613,241 @@ fn compact_title_widest() -> f32 {
         .fold(0.0, f32::max)
 }
 
-fn compact_titled_leading(viewport: LogicalRect) -> Option<(ButtonSpec, f32)> {
-    let scale = settings_text_scale();
-    let room = viewport.width - 20.0 - 16.0 - compact_title_widest() - compact_search_least();
-    let least = 94.0 * scale.min(1.4);
-    if least > room {
-        return None;
+/// The narrow toolbar's Search button at its preferred width: a touch target at the live text
+/// size ([`compact_search_open_button`]).
+fn compact_search_button_width() -> f32 {
+    56.0 * settings_text_scale().min(1.4)
+}
+
+/// The least any control of the compact toolbar is given: a touch target.
+const COMPACT_TOUCH_LEAST: f32 = 44.0;
+
+/// How the compact toolbar shows Search: a field to type into, or the magnifying-glass button
+/// `width` wide that opens the field across the bar.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CompactSearch {
+    Field,
+    Button(f32),
+}
+
+/// One way the compact toolbar may draw its leading button: its spec, the width it would take,
+/// and the least it can be given and still draw what it paints whole.
+struct LeadingForm {
+    spec: ButtonSpec,
+    preferred: f32,
+    least: f32,
+}
+
+/// The category sheet's Done button with its word: the toolbar's 94pt slot where it has that,
+/// never less than the word and its padding.
+fn compact_done_word() -> LeadingForm {
+    LeadingForm {
+        // Named by the word it paints, then what it does.
+        spec: ButtonSpec::new("Done")
+            .visual_label("Done")
+            .description("Closes the settings categories"),
+        preferred: 94.0 * settings_text_scale().min(1.4),
+        least: (crate::native_ui::native_button_label_width("Done") + 24.0).ceil(),
     }
+}
+
+/// The ways the compact toolbar may draw its leading button, the fullest first. On a page it is
+/// the back button to the All Settings sheet: its name beside the back arrow, else its name
+/// alone, else the arrow alone, its name kept for assistive technology. On the sheet it is
+/// Done: its word, else a check mark named Done.
+fn compact_leading_forms(state: &SettingsViewState) -> Vec<LeadingForm> {
+    let icon = COMPACT_TOUCH_LEAST.max(compact_search_button_width());
+    if state.compact_navigation {
+        let word = compact_done_word();
+        let mark = LeadingForm {
+            spec: word
+                .spec
+                .clone()
+                .visual_icon(ButtonIcon::Check)
+                .visual_label(""),
+            preferred: icon,
+            least: COMPACT_TOUCH_LEAST,
+        };
+        return vec![word, mark];
+    }
+    let spec = ButtonSpec::new(ALL_SETTINGS);
     let label = crate::native_ui::native_button_label_width(ALL_SETTINGS);
-    let with_arrow = (40.0 + label + 12.0).ceil().max(96.0);
-    let spec = ButtonSpec::new(ALL_SETTINGS).visual_icon(ButtonIcon::Back);
-    Some(if with_arrow <= room {
-        (spec.visual_label(ALL_SETTINGS), with_arrow)
+    // A navigation button with an icon paints it in a 40pt slot, then the label, then 12pt;
+    // one without paints the label centred in 24pt of padding.
+    let with_arrow = (40.0 + label + 12.0).ceil();
+    let alone = (label + 24.0).ceil();
+    vec![
+        LeadingForm {
+            spec: spec
+                .clone()
+                .visual_icon(ButtonIcon::Back)
+                .visual_label(ALL_SETTINGS),
+            preferred: with_arrow.max(96.0),
+            least: with_arrow,
+        },
+        LeadingForm {
+            spec: spec.clone().visual_label(ALL_SETTINGS),
+            preferred: alone,
+            least: alone,
+        },
+        LeadingForm {
+            spec: spec.visual_icon(ButtonIcon::Back),
+            preferred: icon,
+            least: COMPACT_TOUCH_LEAST,
+        },
+    ]
+}
+
+/// The first of `forms` that is whole in `room`, at its preferred width or as much of it as the
+/// room holds.
+fn fit_leading(forms: Vec<LeadingForm>, room: f32) -> Option<(ButtonSpec, f32)> {
+    forms
+        .into_iter()
+        .find(|form| form.least <= room + 0.01)
+        .map(|form| (form.spec, form.preferred.min(room).max(form.least)))
+}
+
+/// Whether the compact toolbar carries the page's title, and how Search stands beside it: where
+/// the toolbar holds the widest title ([`compact_title_widest`]) beside the narrowest leading
+/// button a titled toolbar draws (the arrow, or the sheet's Done word) and a Search field to
+/// type into ([`compact_search_least`]); else beside the Search button, as a navigation bar's
+/// search gives way before its title does. `None` where it holds neither. Decided by the window
+/// alone, never by the route.
+fn compact_titled(viewport: LogicalRect) -> Option<CompactSearch> {
+    let least = compact_search_button_width().max(compact_done_word().least);
+    let room = viewport.width - 20.0 - 16.0 - compact_title_widest() - least;
+    if compact_search_least() <= room + 0.01 {
+        Some(CompactSearch::Field)
+    } else if compact_search_button_width() <= room + 0.01 {
+        Some(CompactSearch::Button(compact_search_button_width()))
     } else {
-        (spec, 56.0 * scale.min(1.4))
-    })
+        None
+    }
 }
 
+/// THE COMPACT TOOLBAR'S CONTROLS, SIZED TOGETHER, every one whole inside the bar (the toolbar
+/// less its 10pt insets): the leading button and its width, whether the toolbar carries the
+/// page's title ([`compact_titled`]), and how Search stands. Beside the title the leading button
+/// takes what the title and Search leave, its name giving way to the arrow first. Else Search is
+/// a field where the leading button's fullest form leaves it room to say "Search"; while it
+/// holds words or the keyboard, beside the fullest form that leaves it its typing room
+/// ([`compact_search_least`]), else open across the bar. Otherwise Search is its button, beside
+/// the leading button's fullest form that is whole beside it, the two sharing the bar where both
+/// cannot have their preferred widths, never below a touch target. Beside a docked status the
+/// leading button is its icon alone.
+struct CompactToolbarSlots {
+    leading: ButtonSpec,
+    leading_width: f32,
+    titled: bool,
+    search: CompactSearch,
+}
+
+fn compact_toolbar_slots(
+    state: &SettingsViewState,
+    viewport: LogicalRect,
+    status_docked: bool,
+) -> CompactToolbarSlots {
+    let bar = (viewport.width - 20.0).max(0.0);
+    let mut forms = compact_leading_forms(state);
+    if status_docked {
+        // A transient status dock replaces Search and keeps the button icon-only, leaving the
+        // horizontal measure for a whole action pair at 2× text.
+        return CompactToolbarSlots {
+            leading: forms.pop().expect("an icon form").spec,
+            leading_width: 56.0,
+            titled: false,
+            search: CompactSearch::Field,
+        };
+    }
+    if let Some(search) = compact_titled(viewport) {
+        let search_width = match search {
+            CompactSearch::Field => compact_search_least(),
+            CompactSearch::Button(width) => width,
+        };
+        let room = bar - 16.0 - compact_title_widest() - search_width;
+        if !state.compact_navigation {
+            // The back button's name gives way to the title before its arrow does.
+            forms.remove(1);
+        }
+        let (leading, leading_width) =
+            fit_leading(forms, room).expect("a titled toolbar holds its narrowest leading button");
+        return CompactToolbarSlots {
+            leading,
+            leading_width,
+            titled: true,
+            search,
+        };
+    }
+    let field_least = crate::native_ui::native_button_label_width("Search\u{2026}") + 40.0;
+    if let Some((leading, leading_width)) =
+        fit_leading(compact_leading_forms(state), bar - 8.0 - field_least)
+        && !compact_search_is_a_button(bar - 8.0 - leading_width)
+    {
+        // While Search holds words or the keyboard, the field keeps its typing room beside the
+        // fullest leading form that leaves it that; where none does, the field opens across the
+        // bar as the Search button's does, so a typed query is never cut to a letter or two.
+        if !compact_search_shows_its_field(state) {
+            return CompactToolbarSlots {
+                leading,
+                leading_width,
+                titled: false,
+                search: CompactSearch::Field,
+            };
+        }
+        let typing = fit_leading(
+            compact_leading_forms(state),
+            bar - 8.0 - compact_search_least(),
+        );
+        return match typing {
+            Some((leading, leading_width)) => CompactToolbarSlots {
+                leading,
+                leading_width,
+                titled: false,
+                search: CompactSearch::Field,
+            },
+            None => CompactToolbarSlots {
+                leading,
+                leading_width,
+                titled: false,
+                search: CompactSearch::Button(compact_search_button_width()),
+            },
+        };
+    }
+    let free = bar - 8.0;
+    let button = compact_search_button_width();
+    let at = forms
+        .iter()
+        .position(|form| form.least + COMPACT_TOUCH_LEAST <= free + 0.01)
+        .unwrap_or(forms.len() - 1);
+    let form = forms.swap_remove(at);
+    let mut leading_width = form.preferred.min((free - button).max(form.least));
+    let mut search_width = (free - leading_width).min(button);
+    if search_width < COMPACT_TOUCH_LEAST {
+        // A bar too narrow for even that: the two share it.
+        leading_width = free / 2.0;
+        search_width = free / 2.0;
+    }
+    CompactToolbarSlots {
+        leading: form.spec,
+        leading_width,
+        titled: false,
+        search: CompactSearch::Button(search_width),
+    }
+}
+
+/// THE COMPACT TOOLBAR NAMES THE PAGE wherever it holds the title beside its leading button and
+/// Search ([`compact_titled`]), as a navigation bar's inline title does: the page then draws no
+/// heading row and its body keeps that height. Decided by the window alone, so a status that
+/// docks never moves the page under the pointer.
 fn compact_toolbar_titles(width: SettingsWidth, viewport: LogicalRect) -> bool {
-    width == SettingsWidth::Compact && compact_titled_leading(viewport).is_some()
+    width == SettingsWidth::Compact && compact_titled(viewport).is_some()
 }
 
+/// Whether something names the page on screen besides the rail's selected row: its heading row,
+/// the compact toolbar's title, or the name a compact page leads its list with where neither
+/// does ([`pinned_heading`]).
 fn page_named(width: SettingsWidth, viewport: LogicalRect) -> bool {
-    compact_toolbar_titles(width, viewport) || window_page_chrome(width, viewport).0
+    width == SettingsWidth::Compact || window_page_chrome(width, viewport).0
 }
 
 fn compact_page_title(state: &SettingsViewState, slot: f32) -> &'static str {
@@ -11657,43 +11864,14 @@ fn compact_page_title(state: &SettingsViewState, slot: f32) -> &'static str {
     }
 }
 
+/// The compact toolbar's leading button and its width ([`compact_toolbar_slots`]).
 fn compact_toolbar_leading(
     state: &SettingsViewState,
     viewport: LogicalRect,
     status_docked: bool,
 ) -> (ButtonSpec, f32) {
-    if state.compact_navigation {
-        let spec = ButtonSpec::new("Done")
-            .visual_label("Done")
-            .description("Closes the settings categories");
-        return (spec, 94.0 * settings_text_scale().min(1.4));
-    }
-    let spec = ButtonSpec::new(ALL_SETTINGS);
-    if status_docked {
-        return (spec.visual_icon(ButtonIcon::Back), 56.0);
-    }
-    if let Some(titled) = compact_titled_leading(viewport) {
-        return titled;
-    }
-    let search = crate::native_ui::native_button_label_width("Search\u{2026}") + 40.0;
-    let room = (viewport.width - 20.0 - 8.0 - search).max(0.0);
-    let label = crate::native_ui::native_button_label_width(ALL_SETTINGS);
-    let with_arrow = (40.0 + label + 12.0).ceil();
-    let alone = (label + 24.0).ceil();
-    if with_arrow <= room {
-        (
-            spec.visual_icon(ButtonIcon::Back)
-                .visual_label(ALL_SETTINGS),
-            with_arrow.max(96.0).min(room),
-        )
-    } else if alone <= room {
-        (spec.visual_label(ALL_SETTINGS), alone)
-    } else {
-        (
-            spec.visual_icon(ButtonIcon::Back),
-            56.0 * settings_text_scale().min(1.4),
-        )
-    }
+    let slots = compact_toolbar_slots(state, viewport, status_docked);
+    (slots.leading, slots.leading_width)
 }
 
 fn compact_toolbar(
@@ -11701,7 +11879,8 @@ fn compact_toolbar(
     viewport: LogicalRect,
     status_docked: bool,
 ) -> UiNode {
-    let (spec, leading_width) = compact_toolbar_leading(state, viewport, status_docked);
+    let slots = compact_toolbar_slots(state, viewport, status_docked);
+    let leading_width = slots.leading_width;
     let leading_height = if status_docked {
         Length::Fixed(scaled_control_height())
     } else {
@@ -11714,7 +11893,9 @@ fn compact_toolbar(
     };
     let leading = UiNode::new(
         key,
-        UiContent::Button(Control::new(spec, ActionId::new(key)).style(StyleRef::Navigation)),
+        UiContent::Button(
+            Control::new(slots.leading, ActionId::new(key)).style(StyleRef::Navigation),
+        ),
     )
     .layout(
         Layout::default()
@@ -11729,9 +11910,15 @@ fn compact_toolbar(
         children.push(dock.dock);
         under = dock.under;
     } else {
+        let search_slot = match slots.search {
+            CompactSearch::Field => compact_search_least(),
+            CompactSearch::Button(width) => width,
+        };
         let mut title_width = 0.0;
-        if compact_toolbar_titles(SettingsWidth::Compact, viewport) {
-            let slot = viewport.width - 20.0 - leading_width - 16.0 - compact_search_least();
+        if slots.titled {
+            // The page's heading, in the toolbar: the Heading role and the page's whole name, at
+            // its measured width.
+            let slot = viewport.width - 20.0 - leading_width - 16.0 - search_slot;
             let title = compact_page_title(state, slot);
             title_width = compact_title_width(title);
             children.push(
@@ -11750,29 +11937,52 @@ fn compact_toolbar(
                 ),
             );
         }
-        let field_width = viewport.width
-            - 2.0 * 10.0
-            - 8.0
-            - leading_width
-            - if title_width > 0.0 {
-                title_width + 8.0
-            } else {
-                0.0
-            };
-        if !compact_search_is_a_button(field_width) {
-            children.push(settings_search_bar(
-                state,
-                &search_placeholder(field_width),
-                Length::Fill,
-            ));
-        } else if !compact_search_shows_its_field(state) {
-            children.push(compact_search_open_button());
-        } else {
-            children = vec![compact_open_search(
-                state,
-                viewport.width - 2.0 * 10.0,
-                compact_header_height(state, viewport) - 2.0 * 8.0,
-            )];
+        match slots.search {
+            CompactSearch::Field => {
+                let field_width = viewport.width
+                    - 2.0 * 10.0
+                    - 8.0
+                    - leading_width
+                    - if title_width > 0.0 {
+                        title_width + 8.0
+                    } else {
+                        0.0
+                    };
+                children.push(settings_search_bar(
+                    state,
+                    &search_placeholder(field_width),
+                    Length::Fill,
+                ));
+            }
+            CompactSearch::Button(width) if !compact_search_shows_its_field(state) => {
+                // At the bar's end: a space takes what the controls before it leave.
+                let before = leading_width
+                    + 8.0
+                    + if title_width > 0.0 {
+                        title_width + 8.0
+                    } else {
+                        0.0
+                    };
+                if viewport.width - 20.0 - before - width > 8.0 + 0.01 {
+                    children.push(
+                        UiNode::new(
+                            "settings/compact-toolbar/space",
+                            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                        )
+                        .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+                    );
+                }
+                let mut button = compact_search_open_button();
+                button.layout.width = Length::Fixed(width);
+                children.push(button);
+            }
+            CompactSearch::Button(_) => {
+                children = vec![compact_open_search(
+                    state,
+                    viewport.width - 2.0 * 10.0,
+                    compact_header_height(state, viewport) - 2.0 * 8.0,
+                )];
+            }
         }
     }
     let toolbar = UiNode::new(
@@ -13839,16 +14049,21 @@ fn navigation_heading(heading: &str) -> TextSpec {
     }
 }
 
-fn navigation_groups(current: SettingsRoute) -> Vec<(&'static str, Vec<SettingsRoute>)> {
+/// `NAVIGATION_GROUPS` as the rail and the category sheet list them, each sub-page's row right
+/// after its parent's ([`SettingsRoute::rail_parent`]). THE ROWS NEVER DEPEND ON THE PAGE
+/// SHOWING, so a click on a row never moves another under the still pointer.
+fn navigation_groups() -> Vec<(&'static str, Vec<SettingsRoute>)> {
     NAVIGATION_GROUPS
         .iter()
         .map(|(heading, routes)| {
-            let mut rows = Vec::with_capacity(routes.len() + 1);
+            let mut rows = Vec::with_capacity(routes.len() + 2);
             for &route in *routes {
                 rows.push(route);
-                if current.rail_parent() == Some(route) {
-                    rows.push(current);
-                }
+                rows.extend(
+                    SettingsRoute::ALL
+                        .into_iter()
+                        .filter(|sub| sub.rail_parent() == Some(route)),
+                );
             }
             (*heading, rows)
         })
@@ -13891,7 +14106,7 @@ fn navigation(
     };
 
     let mut items: Vec<(UiNode, f32, Option<UiKey>)> = Vec::new();
-    for (section, routes) in navigation_groups(state.route) {
+    for (section, routes) in navigation_groups() {
         if !section.is_empty() {
             items.push((
                 UiNode::new(
@@ -14125,7 +14340,7 @@ const fn route_icon(route: SettingsRoute) -> ButtonIcon {
         SettingsRoute::Packages => ButtonIcon::Packages,
         SettingsRoute::Harness => ButtonIcon::Agents,
         SettingsRoute::Ai => ButtonIcon::Spark,
-        SettingsRoute::Tabs => ButtonIcon::Window,
+        SettingsRoute::Tabs => ButtonIcon::Tabs,
         SettingsRoute::Messages => ButtonIcon::Diagnostics,
         SettingsRoute::About => ButtonIcon::Info,
     }
@@ -15181,6 +15396,8 @@ fn page_children(
 ) -> (Vec<UiNode>, PageLayout) {
     #[cfg(test)]
     crate::work_counts::settings_page_built();
+    // A name the last page built left for a list it did not seat is never another page's.
+    state.list_head.replace(None);
     let global_search = !state.search.trim().is_empty();
     let shown = PageLayout::shown(state);
     if global_search {
@@ -15233,6 +15450,12 @@ fn page_children(
     }
 }
 
+/// THE CATEGORY SHEET: every route as one scrolling list, grouped under the rail's group
+/// headings, two to a row wherever the column holds two. Each group is a card listed row by row
+/// ([`ListItem::of`]): its heading leads its first row, is kept over a screen that starts inside
+/// the group, and is let go where it and the row under it cannot both be whole in the room
+/// ([`scroll::ScrollPlan::starts_bare`]), so no row is cut on every screen of a short window.
+/// Every name is whole ([`category_row_lines`]).
 fn compact_navigation_page(
     state: &SettingsViewState,
     packages: &PackagesProjection,
@@ -15241,7 +15464,6 @@ fn compact_navigation_page(
     let scale = settings_text_scale();
     let row_height = 44.0_f32.max(36.0 * scale);
     let page_gap = settings_page_gap(state, SettingsWidth::Compact, cx.viewport);
-    let body = settings_page_body_height(state, SettingsWidth::Compact, cx.viewport);
     let (mut out, used) = pinned_heading(
         state,
         SettingsWidth::Compact,
@@ -15256,116 +15478,236 @@ fn compact_navigation_page(
         PageLayout::Form.maximum(SettingsWidth::Compact),
     );
     let columns = if content_width / scale >= 480.0 { 2 } else { 1 };
+    let cell_width = if columns == 1 {
+        content_width
+    } else {
+        (content_width - 8.0) / 2.0
+    };
     let heading_height = 22.0_f32.max(16.0 * scale);
-    let heading_gap = 6.0;
-    let sheet: Vec<(Option<&'static str>, Vec<SettingsRoute>)> = navigation_groups(state.route)
-        .into_iter()
-        .flat_map(|(heading, routes)| {
-            routes
-                .chunks(columns)
-                .enumerate()
-                .map(|(row, chunk)| {
-                    (
-                        (row == 0 && !heading.is_empty()).then_some(heading),
-                        chunk.to_vec(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    let stop_height =
-        |heading: Option<&str>| row_height + heading.map_or(0.0, |_| heading_height + heading_gap);
-    let mut plan = ScrollPlan::new(6.0);
-    for (heading, chunk) in &sheet {
-        plan.card(
-            stop_height(*heading),
-            chunk
-                .iter()
-                .map(|route| UiKey::new(format!("settings/categories{}", route.path())))
-                .collect(),
-        );
-    }
-    plan.set_room((body - used).max(row_height));
-    let view = state.seat_scroll(&mut plan);
-    let button = |route: SettingsRoute| {
+    let gap = 6.0;
+    let groups = navigation_groups();
+    let cells = category_cells(&groups, cell_width, packages);
+    let button = |route: SettingsRoute, lines: &[String], height: f32| {
+        let mut spec = ButtonSpec::new(route.label())
+            .visual_icon(route_icon(route))
+            .icon_hidden(cells == CategoryCells::Names)
+            .visual_label(lines.join("\n"));
+        if cells == CategoryCells::Arrows {
+            spec = spec.trailing_icon(ButtonIcon::Forward);
+        }
         UiNode::new(
             format!("settings/categories{}", route.path()),
             UiContent::Button(
-                route_control(
-                    route,
-                    ButtonSpec::new(route.label())
-                        .visual_icon(route_icon(route))
-                        .trailing_icon(ButtonIcon::Forward),
-                    packages,
-                )
-                .state(ControlState {
-                    selected: route == state.route,
-                    ..ControlState::default()
-                })
-                .style(StyleRef::Navigation),
+                route_control(route, spec, packages)
+                    .state(ControlState {
+                        selected: route == state.route,
+                        ..ControlState::default()
+                    })
+                    .style(StyleRef::Navigation),
             ),
         )
         .layout(
             Layout::default()
                 .width(Length::Fill)
-                .height(Length::Fixed(row_height)),
+                .height(Length::Fixed(height)),
         )
     };
-    let children = sheet
+    let mut row_index = 0;
+    let items = groups
         .iter()
-        .enumerate()
-        .filter(|(index, _)| view.contains(index))
-        .map(|(index, (heading, chunk))| {
-            let row = if columns == 1 {
-                button(chunk[0])
-            } else {
-                let mut cells: Vec<UiNode> = chunk.iter().copied().map(button).collect();
-                if chunk.len() < columns {
-                    cells.push(
-                        UiNode::new(
-                            format!("settings/categories/row/{index}/rest"),
-                            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        .map(|(heading, routes)| {
+            let mut children = Vec::new();
+            if !heading.is_empty() {
+                children.push(
+                    UiNode::new(
+                        format!("settings/categories/label/{}", key_fragment(heading)),
+                        UiContent::Text(category_heading(heading, content_width)),
+                    )
+                    .layout(Layout::default().height(Length::Fixed(heading_height))),
+                );
+            }
+            for chunk in routes.chunks(columns) {
+                // Each cell's name on the lines it needs, the row as tall as its tallest cell.
+                let named: Vec<(SettingsRoute, Vec<String>)> = chunk
+                    .iter()
+                    .map(|&route| {
+                        (
+                            route,
+                            category_row_lines(route, cell_width, cells, packages),
                         )
-                        .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
-                    );
-                }
-                UiNode::new(
-                    format!("settings/categories/row/{index}"),
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(Layout::row().height(Length::Fixed(row_height)).gap(8.0))
-                .children(cells)
+                    })
+                    .collect();
+                let height = named
+                    .iter()
+                    .map(|(_, lines)| {
+                        crate::native_ui::navigation_row_height_for_lines(lines.len(), row_height)
+                    })
+                    .fold(row_height, f32::max);
+                let row = if columns == 1 {
+                    let (route, lines) = &named[0];
+                    button(*route, lines, height)
+                } else {
+                    let mut nodes: Vec<UiNode> = named
+                        .iter()
+                        .map(|(route, lines)| button(*route, lines, height))
+                        .collect();
+                    // A short last row keeps its button in the first column.
+                    if chunk.len() < columns {
+                        nodes.push(
+                            UiNode::new(
+                                format!("settings/categories/row/{row_index}/rest"),
+                                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                            )
+                            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+                        );
+                    }
+                    UiNode::new(
+                        format!("settings/categories/row/{row_index}"),
+                        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                    )
+                    .layout(
+                        Layout::row()
+                            .width(Length::Fill)
+                            .height(Length::Fixed(height))
+                            .gap(8.0),
+                    )
+                    .children(nodes)
+                };
+                row_index += 1;
+                children.push(row);
+            }
+            let height = children.iter().map(fixed_height).sum::<f32>()
+                + children.len().saturating_sub(1) as f32 * gap;
+            let key = if heading.is_empty() {
+                "settings/categories/group/top".to_string()
+            } else {
+                format!("settings/categories/group/{}", key_fragment(heading))
             };
-            let Some(heading) = heading else {
-                return row;
-            };
-            UiNode::new(
-                format!("settings/categories/group/{}", key_fragment(heading)),
+            let node = UiNode::new(
+                key,
                 UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
             )
             .layout(
                 Layout::column()
-                    .height(Length::Fixed(stop_height(Some(heading))))
-                    .gap(heading_gap),
+                    .width(Length::Fill)
+                    .height(Length::Fixed(height))
+                    .gap(gap),
             )
-            .children(vec![
-                UiNode::new(
-                    format!("settings/categories/label/{}", key_fragment(heading)),
-                    UiContent::Text(navigation_heading(heading)),
-                )
-                .layout(Layout::default().height(Length::Fixed(heading_height))),
-                row,
-            ])
+            .children(children);
+            ListItem::of(node, height)
         })
         .collect();
-    out.push(scroll::scroll_list_node(
+    let room = (settings_list_body_height(state, SettingsWidth::Compact, cx.viewport) - used)
+        .max(row_height);
+    out.push(scroll::list_page_peeking(
+        state,
         "settings/categories/routes",
         "Settings categories",
-        &plan,
-        view,
-        children,
+        items,
+        room,
+        gap,
+        settings_list_overhang(state, SettingsWidth::Compact, cx.viewport),
     ));
     out
+}
+
+/// A category group's heading as the rail paints it ([`navigation_heading`]) where a column
+/// `width` wide holds it, else in the case it is written in, which is narrower than capitals.
+fn category_heading(heading: &str, width: f32) -> TextSpec {
+    let spec = navigation_heading(heading);
+    let (px, face) = crate::native_ui::text_paint_metrics(spec.role, spec.style);
+    if crate::tray_raster::ui_text_width_for(face, &spec.text, px)
+        <= width + crate::native_ui::TEXT_FIT_SLACK
+    {
+        spec
+    } else {
+        TextSpec {
+            text: heading.to_string(),
+            ..spec
+        }
+    }
+}
+
+/// How the category sheet's cells wear what is beside their names, the same in every cell. The
+/// whole cell goes to its page, so the arrow and the pictogram are decoration and a name never
+/// is: both where every name is whole on one line beside them; else the pictogram, where every
+/// name's words are whole beside it, on as many lines as the name needs; else neither, each
+/// name on its lines in its cell's whole room ([`category_row_lines`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CategoryCells {
+    Arrows,
+    Icons,
+    Names,
+}
+
+/// A category cell's button as it is measured for its name in `cells`: its pictogram where it
+/// paints one, its arrow, and the badge the Packages cell wears while a failure is named
+/// ([`route_control`]), counted only while it wears one, so no name is broken for a badge that
+/// is not there.
+fn category_measure_spec(
+    route: SettingsRoute,
+    cells: CategoryCells,
+    packages: &PackagesProjection,
+) -> ButtonSpec {
+    let spec = ButtonSpec::new(route.label())
+        .visual_icon(route_icon(route))
+        .icon_hidden(cells == CategoryCells::Names)
+        .badge(packages_route_attention(route, packages).is_some());
+    if cells == CategoryCells::Arrows {
+        spec.trailing_icon(ButtonIcon::Forward)
+    } else {
+        spec
+    }
+}
+
+/// The sheet's [`CategoryCells`] in cells `cell_width` wide, measured in the semibold a selected
+/// cell wears.
+fn category_cells(
+    groups: &[(&str, Vec<SettingsRoute>)],
+    cell_width: f32,
+    packages: &PackagesProjection,
+) -> CategoryCells {
+    let routes = || groups.iter().flat_map(|(_, routes)| routes.iter().copied());
+    let fits = |text: &str, route: SettingsRoute, cells: CategoryCells| {
+        crate::native_ui::navigation_label_width(text)
+            <= crate::native_ui::navigation_label_room(
+                &category_measure_spec(route, cells, packages),
+                cell_width,
+            ) + crate::native_ui::TEXT_FIT_SLACK
+    };
+    if routes().all(|route| fits(route.label(), route, CategoryCells::Arrows)) {
+        CategoryCells::Arrows
+    } else if routes().all(|route| {
+        route
+            .label()
+            .split_whitespace()
+            .all(|word| fits(word, route, CategoryCells::Icons))
+    }) {
+        CategoryCells::Icons
+    } else {
+        CategoryCells::Names
+    }
+}
+
+/// A CATEGORY'S NAME IS WHOLE: on one line where its cell holds it, else on as many lines as it
+/// needs at its words, a word broken with a hyphen only where it is wider than a line on its own
+/// ([`wrap_to_box`]), in the room its cell leaves it ([`CategoryCells`]), measured in the
+/// semibold a selected cell wears, so selecting it re-wraps nothing.
+fn category_row_lines(
+    route: SettingsRoute,
+    cell_width: f32,
+    cells: CategoryCells,
+    packages: &PackagesProjection,
+) -> Vec<String> {
+    let room = crate::native_ui::navigation_label_room(
+        &category_measure_spec(route, cells, packages),
+        cell_width,
+    );
+    wrap_to_box(
+        route.label(),
+        room,
+        &crate::native_ui::navigation_label_width,
+    )
 }
 
 const FORM_MEASURE: f32 = 720.0;
@@ -15413,7 +15755,23 @@ fn responsive_page_insets(
         insets.top = vertical;
         insets.bottom = vertical;
     }
+    insets.top = heading_top_inset(viewport_height, insets.top);
     insets
+}
+
+/// THE HEADING SITS IN ONE PLACE ON EVERY PAGE: the inset over a page with a heading row, from
+/// the window's height and the text size alone. The width class's own (`natural`) on a window
+/// that holds it, 12pt (the rail title's) on a short one; a page's chrome sheds only what is
+/// under its heading ([`page_chrome_insets`]). A window too short for a heading row
+/// ([`window_page_chrome`]) keeps its own, which its pages' chrome sheds.
+fn heading_top_inset(viewport_height: f32, natural: f32) -> f32 {
+    if !compact_page_omits_heading(viewport_height)
+        && compact_page_effective_height(viewport_height) <= 480.0
+    {
+        natural.min(12.0)
+    } else {
+        natural
+    }
 }
 
 fn responsive_page_gap(width: SettingsWidth, viewport_height: f32) -> f32 {
@@ -15434,6 +15792,15 @@ fn settings_page_gap(
         && compact_header_height(state, viewport) > compact_toolbar_height() + 0.01
     {
         6.0
+    } else if state
+        .page_chrome
+        .get()
+        .inset
+        .is_some_and(|inset| inset <= LEANEST_PAGE_INSET + 0.01)
+    {
+        // The leanest chrome sheds the gaps under the heading as it sheds the inset under the
+        // page, the inset over it being the window's on every page ([`heading_top_inset`]).
+        responsive_page_gap(width, viewport.height).min(LEANEST_PAGE_INSET)
     } else {
         responsive_page_gap(width, viewport.height)
     }
@@ -15538,17 +15905,27 @@ impl PageChrome {
         }
     }
 
+    /// The chrome a page on `viewport` may keep, fullest first: the subtitle where the window
+    /// shows one, then the insets to 12pt and to 4pt where the window's own are more. Under the
+    /// page, and over it only where no heading row sits there, so a heading is where the window
+    /// puts it on every page ([`heading_top_inset`]).
     fn ladder(width: SettingsWidth, viewport: LogicalRect) -> Vec<Self> {
         let natural = responsive_page_insets(viewport.width, viewport.height, width, FORM_MEASURE);
+        let (heading, subtitle) = window_page_chrome(width, viewport);
         let mut ladder = vec![Self::FULL];
-        if window_page_chrome(width, viewport).1 {
+        if subtitle {
             ladder.push(Self {
                 no_subtitle: true,
                 ..Self::FULL
             });
         }
+        let sheds = if heading {
+            natural.bottom
+        } else {
+            natural.top.max(natural.bottom)
+        };
         for inset in [12.0, 4.0] {
-            if natural.top.max(natural.bottom) > inset + 0.01 {
+            if sheds > inset + 0.01 {
                 ladder.push(Self {
                     no_subtitle: true,
                     inset: Some(inset),
@@ -15718,7 +16095,11 @@ fn page_chrome_insets(
 ) -> Insets {
     let mut insets = responsive_page_insets(viewport.width, viewport.height, width, maximum);
     if let Some(inset) = state.page_chrome.get().inset {
-        insets.top = insets.top.min(inset);
+        // Over the page only where no heading row sits under it: else the inset is the
+        // window's, so the heading never moves between pages ([`heading_top_inset`]).
+        if !window_page_chrome(width, viewport).0 {
+            insets.top = insets.top.min(inset);
+        }
         insets.bottom = insets.bottom.min(inset);
     }
     insets
@@ -15748,6 +16129,17 @@ fn pinned_heading(
     subtitle: &str,
 ) -> (Vec<UiNode>, f32) {
     let (heading, show_subtitle) = page_chrome(state, width, viewport);
+    // EVERY PAGE IS NAMED ON SCREEN: a compact page too short for its heading row whose toolbar
+    // cannot hold the title leads its list with its name, in the toolbar title's type on the
+    // lines its column needs, scrolling away with the list as a navigation bar's large title
+    // does; pinned, those lines would take a row's room from every screen.
+    let unnamed = width == SettingsWidth::Compact && !compact_toolbar_titles(width, viewport);
+    state.list_head.replace((!heading && unnamed).then(|| {
+        page_name_node(
+            title,
+            settings_page_content_width(viewport.width, width, FORM_MEASURE),
+        )
+    }));
     if !heading {
         return (Vec::new(), 0.0);
     }
@@ -15797,6 +16189,27 @@ fn pinned_heading(
         subtitle_height = height + gap;
     }
     (nodes, heading_height + gap + subtitle_height)
+}
+
+/// The page's name as a list leads with it ([`pinned_heading`]): its heading, in the toolbar
+/// title's type, on the lines a column `width` wide needs.
+pub(super) fn page_name_node(title: &str, width: f32) -> (UiNode, f32) {
+    let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Plain);
+    wrapped_words_node(
+        &format!("settings/page-heading/{}", key_fragment(title)),
+        title,
+        (SemanticRole::Heading, StyleRef::Plain),
+        width,
+        (px * 1.3).ceil().max(22.0),
+    )
+}
+
+impl SettingsViewState {
+    /// The page's name its list leads with where nothing over the list names it
+    /// ([`pinned_heading`]), and its height: taken by the first list the page seats.
+    pub(super) fn take_list_head(&self) -> Option<(UiNode, f32)> {
+        self.list_head.take()
+    }
 }
 
 fn settings_list_body_height(
@@ -17722,7 +18135,7 @@ fn theme_card_rows(
     host: ThemeRowsHost,
     width: SettingsWidth,
     text_width: f32,
-    single: impl FnOnce() -> Option<(UiNode, f32)>,
+    single: impl FnOnce() -> Option<(UiNode, f32, bool)>,
 ) -> Vec<(UiNode, f32)> {
     let raw = state.raw_value(prefs::EDIT_THEME);
     let following = prefs::theme_mode(raw.as_deref()) == prefs::ThemeMode::FollowSystem;
@@ -17730,35 +18143,57 @@ fn theme_card_rows(
     let mode_height = fixed_height(&mode);
     let mut sized = vec![(mode, mode_height)];
     let mut rows: Vec<UiNode> = Vec::new();
+    // Whether the card's theme pickers fill their lines (stacked under their
+    // names), as the rows just built lay them out: the rows that follow them
+    // (Preview side, Browse themes…) end where they do.
+    let pickers_fill;
     if following {
         let (dark, light) = prefs::theme_slots(raw.as_deref(), &state.assets.themes);
-        rows.push(theme_slot_row(
+        let (dark, dark_stacked) = theme_slot_row(
             state,
             host,
             aterm_types::Appearance::Dark,
             &dark,
             width,
             text_width,
-        ));
-        rows.push(theme_slot_row(
+        );
+        let (light, light_stacked) = theme_slot_row(
             state,
             host,
             aterm_types::Appearance::Light,
             &light,
             width,
             text_width,
-        ));
+        );
+        pickers_fill = dark_stacked || light_stacked;
+        rows.extend([dark, light]);
         if !matches!(host, ThemeRowsHost::List { preview: false, .. }) {
-            rows.push(theme_preview_side_row(state, host, width, text_width));
+            rows.push(theme_preview_side_row(
+                state,
+                host,
+                width,
+                text_width,
+                pickers_fill,
+            ));
         }
+    } else {
+        pickers_fill = false;
     }
     sized.extend(rows.into_iter().map(|row| {
         let height = fixed_height(&row);
         (row, height)
     }));
-    if !following {
-        sized.extend(single());
-    }
+    let pickers_fill = if following {
+        pickers_fill
+    } else {
+        match single() {
+            Some((row, height, stacked)) => {
+                sized.push((row, height));
+                stacked
+            }
+            None => false,
+        }
+    };
     if matches!(
         host,
         ThemeRowsHost::List {
@@ -17766,7 +18201,7 @@ fn theme_card_rows(
             ..
         }
     ) {
-        let row = theme_showcase_row(host, width, text_width);
+        let row = theme_showcase_row(host, width, text_width, pickers_fill);
         let height = fixed_height(&row);
         sized.push((row, height));
     }
@@ -17791,26 +18226,31 @@ fn theme_rows_reserve(
         return 0.0;
     }
     let (dark, light) = prefs::theme_slots(raw.as_deref(), &state.assets.themes);
-    let mut follow = vec![
-        theme_slot_row(
-            state,
-            host,
-            aterm_types::Appearance::Dark,
-            &dark,
-            width,
-            text_width,
-        ),
-        theme_slot_row(
-            state,
-            host,
-            aterm_types::Appearance::Light,
-            &light,
-            width,
-            text_width,
-        ),
-    ];
+    let (dark, dark_stacked) = theme_slot_row(
+        state,
+        host,
+        aterm_types::Appearance::Dark,
+        &dark,
+        width,
+        text_width,
+    );
+    let (light, light_stacked) = theme_slot_row(
+        state,
+        host,
+        aterm_types::Appearance::Light,
+        &light,
+        width,
+        text_width,
+    );
+    let mut follow = vec![dark, light];
     if !matches!(host, ThemeRowsHost::List { preview: false, .. }) {
-        follow.push(theme_preview_side_row(state, host, width, text_width));
+        follow.push(theme_preview_side_row(
+            state,
+            host,
+            width,
+            text_width,
+            dark_stacked || light_stacked,
+        ));
     }
     let follow: f32 = follow.iter().map(|row| fixed_height(row) + gap).sum();
     (follow - single.map_or(0.0, |height| height + gap)).max(0.0)
@@ -17824,6 +18264,7 @@ fn top_row_label_paints_only(row: &mut UiNode) {
     }
 }
 
+/// One theme card row and whether it stacked its controls under its name.
 #[allow(clippy::too_many_arguments)]
 fn theme_card_row(
     key: &str,
@@ -17835,7 +18276,7 @@ fn theme_card_row(
     width: SettingsWidth,
     text_width: f32,
     inline: bool,
-) -> UiNode {
+) -> (UiNode, bool) {
     let label = with_tags(name, tags.iter());
     let fixed = |node: &UiNode| match node.layout.width {
         Length::Fixed(width) => Some(width),
@@ -17958,7 +18399,7 @@ fn theme_card_row(
         false,
     );
     let detail = row_second_line(&placement, None, None, text_width);
-    with_row_detail(row, key, &detail, stacked)
+    (with_row_detail(row, key, &detail, stacked), stacked)
 }
 
 fn fit_stacked_controls(row: &mut UiNode, text_width: f32) {
@@ -18067,19 +18508,24 @@ fn fit_theme_row_buttons(row: &mut UiNode, text_width: f32) {
 
 const THEME_SLOT_RESET_PREFIX: &str = "settings/theme-slot-reset/";
 
+/// A list theme row's Reset, else the place it keeps. Rows with no Reset of their own that follow
+/// the card's pickers (Preview side, Browse themes…) end where the pickers end: before Reset's
+/// place where the pickers sit on their names' lines, at the line's end where they fill it.
 fn theme_row_trailing(
     host: ThemeRowsHost,
     key: &str,
     reset: Option<UiNode>,
-    width: SettingsWidth,
+    pickers_fill: bool,
 ) -> Option<UiNode> {
     match host {
         ThemeRowsHost::Top => None,
-        ThemeRowsHost::List { .. } if reset.is_none() && width == SettingsWidth::Compact => None,
+        ThemeRowsHost::List { .. } if reset.is_none() && pickers_fill => None,
         ThemeRowsHost::List { .. } => Some(reset.unwrap_or_else(|| reset_slot(key))),
     }
 }
 
+/// A Follow-system slot row and whether it stacked its picker under its name; on a compact list
+/// it sits on one line wherever the Color theme row would ([`compact_inline_control_width`]).
 fn theme_slot_row(
     state: &SettingsViewState,
     host: ThemeRowsHost,
@@ -18087,7 +18533,7 @@ fn theme_slot_row(
     name: &str,
     width: SettingsWidth,
     text_width: f32,
-) -> UiNode {
+) -> (UiNode, bool) {
     let title = match side {
         aterm_types::Appearance::Dark => "Dark theme",
         aterm_types::Appearance::Light => "Light theme",
@@ -18109,9 +18555,15 @@ fn theme_slot_row(
                 .collect()
         })
         .unwrap_or_default();
-    let control_width = if width == SettingsWidth::Compact {
+    let list = matches!(host, ThemeRowsHost::List { .. });
+    let inline_width = (list && width == SettingsWidth::Compact)
+        .then(|| compact_inline_control_width(&EditKind::Theme, text_width))
+        .flatten();
+    let control_width = if let Some(inline) = inline_width {
+        Length::Fixed(inline)
+    } else if width == SettingsWidth::Compact {
         Length::Fill
-    } else if matches!(host, ThemeRowsHost::List { .. }) {
+    } else if list {
         Length::Fixed(270.0 * settings_text_scale().min(1.25))
     } else {
         Length::Fixed(
@@ -18143,6 +18595,7 @@ fn theme_slot_row(
                     swatches,
                     chip: None,
                     chevron_row: None,
+                    icon_hidden: false,
                 },
                 ActionId::new(action.clone()),
             )
@@ -18201,18 +18654,23 @@ fn theme_slot_row(
         title,
         (tags, worst),
         vec![control],
-        theme_row_trailing(host, &key, reset, width),
+        // A slot that fills its line under its name is the line its
+        // followers end at; on its name's line it keeps Reset's place.
+        theme_row_trailing(host, &key, reset, control_width == Length::Fill),
         width,
         text_width,
-        false,
+        inline_width.is_some(),
     )
 }
 
+/// Follow system's Preview side row, its control ending where the card's theme pickers end
+/// ([`theme_row_trailing`]).
 fn theme_preview_side_row(
     state: &SettingsViewState,
     host: ThemeRowsHost,
     width: SettingsWidth,
     text_width: f32,
+    pickers_fill: bool,
 ) -> UiNode {
     let side = theme_visible_side(state, state.presented_motion.get().system_dark);
     let shown = match side {
@@ -18237,6 +18695,7 @@ fn theme_preview_side_row(
                     swatches: Vec::new(),
                     chip: None,
                     chevron_row: None,
+                    icon_hidden: false,
                 },
                 ActionId::new(THEME_PREVIEW_SIDE_ACTION),
             )
@@ -18263,11 +18722,12 @@ fn theme_preview_side_row(
         "Preview",
         Default::default(),
         vec![control],
-        theme_row_trailing(host, "theme-preview-side", None, width),
+        theme_row_trailing(host, "theme-preview-side", None, pickers_fill),
         width,
         text_width,
         true,
     )
+    .0
 }
 
 fn theme_mode_row(
@@ -18357,6 +18817,7 @@ fn theme_mode_row(
         text_width,
         inline,
     )
+    .0
 }
 
 fn top_preview(
@@ -18473,7 +18934,9 @@ fn top_cards(
 
     let mut color_rows: Vec<(UiNode, f32)> =
         theme_card_rows(state, ThemeRowsHost::Top, width, text_width, || {
+            // Top keeps no Reset, so no row lines up with a place it keeps.
             top_card_row(state, prefs::EDIT_THEME, None, width, text_width, true)
+                .map(|(row, height)| (row, height, false))
         });
     let sample_at = usize::from(!color_rows.is_empty());
     if let Some(sample) = preview(
@@ -18488,14 +18951,7 @@ fn top_cards(
         "theme",
         "Terminal colors & window appearance",
         Some("Colors & appearance"),
-        Some((
-            if cfg!(target_os = "macos") {
-                "Choose colors; the window can match macOS, Light, or Dark."
-            } else {
-                "Choose colors; the window can match the terminal, Light, or Dark."
-            },
-            None,
-        )),
+        Some((prefs::window_theme_auto(std::env::consts::OS).card, None)),
         color_rows,
         width,
         text_width,
@@ -18608,18 +19064,28 @@ fn theme_browse_button(text_width: f32) -> UiNode {
 
 const THEME_SHOWCASE_ROW_LABEL: &str = "More themes";
 
-fn theme_showcase_row(host: ThemeRowsHost, width: SettingsWidth, text_width: f32) -> UiNode {
+/// The theme card's way to Settings ▸ Themes on a list: a row of its own, its button ending where
+/// the card's theme pickers end ([`theme_row_trailing`]), its label fitted to what that leaves.
+fn theme_showcase_row(
+    host: ThemeRowsHost,
+    width: SettingsWidth,
+    text_width: f32,
+    pickers_fill: bool,
+) -> UiNode {
+    let trailing = theme_row_trailing(host, "theme-browse", None, pickers_fill);
+    let kept = trailing.as_ref().map_or(0.0, |_| reset_slot_width() + 12.0);
     theme_card_row(
         "theme-browse",
         THEME_SHOWCASE_ROW_LABEL,
         THEME_SHOWCASE_ROW_LABEL,
         (RowTags::default(), RowTags::default()),
-        vec![theme_browse_button(text_width)],
-        theme_row_trailing(host, "theme-browse", None, width),
+        vec![theme_browse_button(text_width - kept)],
+        trailing,
         width,
         text_width,
         true,
     )
+    .0
 }
 
 fn top_card_row(
@@ -19106,9 +19572,93 @@ fn display_faces_card(
             .collect(),
     );
     rows.push((note, note_height));
-    let card = page_group_card("Display faces", "display-faces", rows, text_width);
+    let (head, reset_line) = display_faces_head(state, text_width);
+    rows.splice(0..0, reset_line);
+    let mut card = page_group_card("Display faces", "display-faces", rows, text_width);
+    card.head = vec![head];
     let height = card.height();
     (card.node(0..card.rows.len()), height)
+}
+
+/// The faces card's caption, saying the display face setting's state as every row says its own
+/// ([`changed_tags`]: Changed while the key is written), and its Reset, or the place Reset keeps:
+/// ending the caption's line where every word of the caption, Changed too, fits beside it, else
+/// on the card's first line under it. Laid out for Changed either way, so it never moves anything
+/// when it comes. (The faces said neither while Modified listed the key as changed.)
+fn display_faces_head(
+    state: &SettingsViewState,
+    text_width: f32,
+) -> ((UiNode, f32), Option<(UiNode, f32)>) {
+    const CAPTION: &str = "Display faces";
+    let key = prefs::EDIT_DISPLAY_FONT;
+    let (tags, worst) = changed_tags(state, key);
+    let words = |tags: &RowTags| with_tags(CAPTION, tags.iter()).to_ascii_uppercase();
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Quiet);
+    let beside = (text_width - reset_slot_width() - 12.0).max(0.0);
+    let fits_beside = words(&worst)
+        .split_whitespace()
+        .all(|word| crate::tray_raster::ui_text_width_for(face, word, px) <= beside);
+    let room = if fits_beside { beside } else { text_width };
+    let style = (SemanticRole::Heading, StyleRef::Quiet);
+    let reserved = wrapped_words_lines(&words(&worst), style, room).len();
+    let mut lines = wrapped_words_lines(&words(&tags), style, room);
+    lines.resize(reserved.max(lines.len()), String::new());
+    let caption_key = format!(
+        "settings/group-heading/{}/display-faces",
+        key_fragment(CAPTION)
+    );
+    let (caption, height) = words_node_of_lines(
+        &caption_key,
+        &words(&tags),
+        style,
+        lines,
+        caption_line_height(),
+    );
+    let reset = match state.field_by_key(key) {
+        Some(field) if state.is_explicit(key) => setting_reset_button(field),
+        _ => reset_slot(key),
+    };
+    let line = |key: &str, height: f32, children: Vec<UiNode>| {
+        UiNode::new(
+            key,
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(Layout::row().height(Length::Fixed(height)).gap(12.0))
+        .children(children)
+    };
+    if fits_beside {
+        let mut caption = caption;
+        caption.layout.width = Length::Fixed(room);
+        return (
+            (
+                line(
+                    "settings/group-heading-line/display-faces",
+                    height,
+                    vec![caption, reset],
+                ),
+                height,
+            ),
+            None,
+        );
+    }
+    let reset_height = caption_line_height();
+    let spacer = UiNode::new(
+        "settings/group-heading-line/display-faces/spacer",
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(Layout::default().width(Length::Fill).height(Length::Fill))
+    .paint_only();
+    (
+        (caption, height),
+        Some((
+            line(
+                "settings/group-heading-line/display-faces",
+                reset_height,
+                vec![spacer, reset],
+            ),
+            reset_height,
+        )),
+    )
 }
 
 fn display_face_name_height() -> f32 {
@@ -19676,6 +20226,7 @@ fn cursor_style_link_row(state: &SettingsViewState, text_width: f32) -> (UiNode,
         swatches: Vec::new(),
         chip: None,
         chevron_row: None,
+        icon_hidden: false,
     };
     let natural = (crate::native_ui::native_button_label_width("More styles…") + 56.0)
         .min((text_width * 0.5).max(96.0));
@@ -20198,14 +20749,33 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
     let line_height = page_subtitle_height();
     let mut rows: Vec<(UiNode, f32)> = Vec::new();
 
-    let (visual, semantic) = wallpaper_words(state).map_or_else(
-        || {
-            let text =
-                "No wallpaper. Dim and text tint apply once you choose an image.".to_string();
-            (text.clone(), text)
-        },
-        |(visual, spoken)| (visual, format!("Wallpaper: {spoken}")),
+    let (visual, spoken) = wallpaper_words(state).unwrap_or_else(|| {
+        let text = "No wallpaper. Dim and text tint apply once you choose an image.".to_string();
+        (text.clone(), text)
+    });
+    // The image's row names its setting with the state words every row says (a written key is
+    // Changed, as Dim and Text tint under it are), its line keeping room for them; the file it
+    // shows under that, and Remove is its way back.
+    let name = state
+        .field_by_key(prefs::EDIT_WALLPAPER)
+        .map_or("Wallpaper image", |field| field.label);
+    let (tags, worst) = changed_tags(state, prefs::EDIT_WALLPAPER);
+    let placement = place_row_tags(name, &tags, &worst, text_width, false);
+    let mut name_lines = placement.lines;
+    let name_count = name_lines.len() + usize::from(!placement.worst_below.is_empty());
+    if !placement.below.is_empty() {
+        name_lines.push(placement.below.join(FACT_SEPARATOR));
+    }
+    let named = with_tags(name, tags.iter());
+    let (mut name_node, _) = words_node_of_lines(
+        "settings/wallpaper/current/name",
+        &named,
+        (SemanticRole::Text, StyleRef::Primary),
+        name_lines,
+        line_height,
     );
+    let name_height = name_count.max(1) as f32 * line_height;
+    name_node.layout.height = Length::Fixed(name_height);
     let (visual_node, visual_height) = wrapped_words_node(
         "settings/wallpaper/current/visual",
         &visual,
@@ -20213,11 +20783,12 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
         text_width,
         line_height,
     );
+    let current_height = name_height + visual_height;
     rows.push((
         UiNode::new(
             "settings/wallpaper/current",
             UiContent::Group(GroupSpec {
-                label: Some(semantic),
+                label: Some(format!("{named}: {spoken}")),
                 role: SemanticRole::Status,
                 style: StyleRef::Plain,
             }),
@@ -20225,16 +20796,16 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
         .layout(
             Layout::column()
                 .width(Length::Fill)
-                .height(Length::Fixed(visual_height)),
+                .height(Length::Fixed(current_height)),
         )
-        .children(vec![visual_node.paint_only()]),
-        visual_height,
+        .children(vec![name_node.paint_only(), visual_node.paint_only()]),
+        current_height,
     ));
     rows.extend(wallpaper_preview(
         state,
         cx,
         width,
-        room - 2.0 * SETTINGS_GROUP_CARD_INSET - visual_height - 8.0,
+        room - 2.0 * SETTINGS_GROUP_CARD_INSET - current_height - 8.0,
         text_width,
     ));
     if current.is_some()
@@ -21890,6 +22461,27 @@ fn large_text_rows_stack() -> bool {
     settings_text_scale() > 1.25 && rows_too_tall_to_stack().is_none()
 }
 
+/// A SUMMARY THE LIST TAKES IS WHOLE ON SOME SCREEN: the count over a list (Modified's with its
+/// Reset All) listed as the list's stops from `at`, one where it fits the list's `room`, else a
+/// part at a time ([`scroll::row_parts`]): the count's lines, then Reset All.
+fn list_summary(
+    plan: &mut ScrollPlan,
+    stops: &mut Vec<FieldStop>,
+    at: usize,
+    summary: (UiNode, f32),
+    (room, gap): (f32, f32),
+) {
+    let room = room.max(1.0);
+    for (offset, (part, height)) in scroll::row_parts(summary, room, room, gap)
+        .into_iter()
+        .enumerate()
+    {
+        plan.insert_card(at + offset, height, scroll::focus_keys(&part));
+        plan.set_ids_of(at + offset, vec![part.key.clone()]);
+        stops.insert(at + offset, FieldStop::Card(part));
+    }
+}
+
 fn settings_fields_page(
     state: &SettingsViewState,
     modified_only: bool,
@@ -22228,8 +22820,11 @@ fn settings_fields_page(
         )
         .children(vec![count, reset_all])
     });
-    let summary = summary.filter(|_| used + summary_height <= body + 0.01);
-    let starves = summary_height > body - used - summary_height - gap + 0.01;
+    // A summary the body does not hold, or one that would take more of it than it leaves the
+    // list, is the list's first stop rather than pinned ([`list_summary`]), so it is whole on
+    // some screen however short the window.
+    let starves = used + summary_height > body + 0.01
+        || summary_height > body - used - summary_height - gap + 0.01;
     let (summary, listed_summary) = match summary {
         Some(node) if starves => (None, Some(node)),
         summary => (summary, None),
@@ -22402,9 +22997,10 @@ fn settings_fields_page(
                     preview: show_renderer_preview,
                 };
                 let single = || {
+                    let stacked = finished.stacked;
                     let row = finished.whole();
                     let height = fixed_height(&row);
-                    Some((row, height))
+                    Some((row, height, stacked))
                 };
                 let rows = theme_card_rows(state, host, width, group_text_width, single);
                 let value_row = rows
@@ -22660,9 +23256,13 @@ fn settings_fields_page(
     let summary = match summary {
         Some(node) if summary_listed => {
             used -= summary_height + gap;
-            plan.insert_card(0, summary_height, scroll::focus_keys(&node));
-            plan.set_ids_of(0, vec![node.key.clone()]);
-            stops.insert(0, FieldStop::Card(node));
+            list_summary(
+                &mut plan,
+                &mut stops,
+                0,
+                (node, summary_height),
+                (body - used, gap),
+            );
             None
         }
         summary => summary,
@@ -22711,9 +23311,19 @@ fn settings_fields_page(
             stops.first(),
             Some(FieldStop::Card(first)) if first.key.as_str().starts_with("settings/preview")
         ));
-        plan.insert_card(at, summary_height, scroll::focus_keys(&node));
-        plan.set_ids_of(at, vec![node.key.clone()]);
-        stops.insert(at, FieldStop::Card(node));
+        list_summary(
+            &mut plan,
+            &mut stops,
+            at,
+            (node, summary_height),
+            (body - used, gap),
+        );
+    }
+    // The page's name, where nothing over the list names it, leads it.
+    if let Some((name, height)) = state.take_list_head() {
+        plan.insert_card(0, height, Vec::new());
+        plan.set_ids_of(0, vec![name.key.clone()]);
+        stops.insert(0, FieldStop::Card(name));
     }
     scroll::seat_room_under_status(
         state,
@@ -27806,6 +28416,7 @@ fn segmented_choice_node(
                     swatches: Vec::new(),
                     chip: None,
                     chevron_row: None,
+                    icon_hidden: false,
                 },
                 ActionId::new(action),
             )
@@ -29679,6 +30290,22 @@ struct SettingRowParts {
 
 const CHANGED_WORD: &str = "Changed";
 
+/// THE STATE A SETTING'S ROW SAYS ON ITS OWN PAGE, wherever the page draws the control itself:
+/// "Changed" while the key is written (the tags), and the worst case its line keeps room for, so
+/// the word never moves anything when it comes.
+fn changed_tags(state: &SettingsViewState, key: &str) -> (RowTags, RowTags) {
+    let worst = RowTags {
+        state: vec![CHANGED_WORD.to_string()],
+        facts: Vec::new(),
+    };
+    let tags = if state.is_explicit(key) {
+        worst.clone()
+    } else {
+        RowTags::default()
+    };
+    (tags, worst)
+}
+
 const UNSAVED_HINT: &str = "Unsaved";
 
 fn row_shown_value(state: &SettingsViewState, field: &EditField, modified_only: bool) -> String {
@@ -30031,6 +30658,7 @@ fn setting_row_parts_in(
                         swatches: Vec::new(),
                         chip: None,
                         chevron_row: None,
+                        icon_hidden: false,
                     },
                     ActionId::new(format!("settings/font-picker/{}", field.key)),
                 )
@@ -30075,6 +30703,7 @@ fn setting_row_parts_in(
                     swatches: Vec::new(),
                     chip: None,
                     chevron_row: None,
+                    icon_hidden: false,
                 },
                 action,
             )
@@ -30171,14 +30800,11 @@ fn setting_row_parts_in(
             )
         }
     };
-    let mut tags = RowTags::default();
-    let mut worst = RowTags::default();
-    if !modified_only && !direct {
-        if state.is_explicit(field.key) {
-            tags.state.push(CHANGED_WORD.to_string());
-        }
-        worst.state.push(CHANGED_WORD.to_string());
-    }
+    let (mut tags, mut worst) = if !modified_only && !direct {
+        changed_tags(state, field.key)
+    } else {
+        Default::default()
+    };
     let theme_fallback = state.theme_fallback_for(field.key);
     if theme_fallback.is_some() && !direct {
         if state.is_explicit(field.key) {
@@ -31594,9 +32220,19 @@ fn wrap_to_box_from(
     measure: &dyn Fn(&str) -> f32,
     mark: &str,
 ) -> Vec<(usize, String)> {
-    let fits = |line: &str| measure(line) <= width + crate::native_ui::TEXT_FIT_SLACK;
+    // A fact separator a line ends in goes with the break: it never counts
+    // against the word before it ("Problems" / "5", never "Prob-" / "lems · 5").
+    let separator = FACT_SEPARATOR.trim_end();
+    let bare = |line: &str| -> usize { line.strip_suffix(separator).unwrap_or(line).len() };
+    let fits =
+        |line: &str| measure(&line[..bare(line)]) <= width + crate::native_ui::TEXT_FIT_SLACK;
     let at = |piece: &str| piece.as_ptr() as usize - text.as_ptr() as usize;
     let mut lines: Vec<(usize, String)> = Vec::new();
+    // A line the wrap breaks after, its end's separator gone with the break.
+    let push = |lines: &mut Vec<(usize, String)>, line_at: usize, mut line: String| {
+        line.truncate(bare(&line));
+        lines.push((line_at, line));
+    };
     let mut line = String::new();
     let mut line_at = 0;
     for (joiner, piece) in line_pieces(text) {
@@ -31631,7 +32267,7 @@ fn wrap_to_box_from(
                 line.push_str(&part);
                 start = rest;
             }
-            lines.push((line_at, std::mem::take(&mut line)));
+            push(&mut lines, line_at, std::mem::take(&mut line));
         }
         if fits(&text[start..end]) {
             line = text[start..end].to_string();
@@ -31640,7 +32276,9 @@ fn wrap_to_box_from(
         }
         let mut broken = aterm_grapheme::break_inside(text, start..end, mark, &fits);
         let (tail_at, tail) = broken.pop().unwrap_or((start, String::new()));
-        lines.extend(broken);
+        for (part_at, part) in broken {
+            push(&mut lines, part_at, part);
+        }
         line_at = tail_at;
         line = tail;
     }
@@ -34443,8 +35081,10 @@ fn messages_severity_segments(
     height: f32,
 ) -> (UiNode, f32) {
     let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
+    // Whole points, so the segments' edges land on the device grid at 1× and 2×.
     let measure = |label: &str| {
-        crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, label, px) + 28.0
+        (crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, label, px) + 28.0)
+            .ceil()
     };
     let (all, alarms) = messages.severity_counts(filter.tag.as_deref());
     let (all_words, problems_words) = aterm_messages::page::severity_segment_words(all, alarms);
@@ -34537,7 +35177,8 @@ fn messages_chip_words(label: &str, width: f32) -> (String, usize) {
             crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, line, px),
         )
     };
-    let lines = wrap_to_box(label, (width - 20.0).max(0.0), &measure);
+    let room = crate::native_ui::centred_label_room(&ButtonSpec::new(label), width);
+    let lines = wrap_to_box(label, room, &measure);
     let count = lines.len();
     (lines.join("\n"), count)
 }
@@ -34554,10 +35195,12 @@ fn messages_tag_chip_rows(
     first: Option<(UiNode, f32)>,
 ) -> Vec<UiNode> {
     let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
+    // Whole points, so every chip's edges land on the device grid at 1× and 2×.
     let measure = |label: &str| {
-        crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, label, px).max(
+        (crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, label, px).max(
             crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, label, px),
-        ) + 26.0
+        ) + 26.0)
+            .ceil()
     };
     let mut chips: Vec<(String, String, bool)> = vec![(
         MESSAGES_TAGS_ALL.to_string(),
@@ -36253,6 +36896,10 @@ fn messages_plan_opening(
         );
         compact_page_budget(state, viewport).content_height - heading
     });
+    // The page's name, where nothing over its list names it ([`pinned_heading`]), leads it.
+    if let Some(name) = compact.then(|| state.list_head.borrow().clone()).flatten() {
+        header.insert(0, name);
+    }
     header.extend(messages_filter_items(
         state,
         messages,

@@ -1239,6 +1239,48 @@ impl App {
         self.seamless_held_shown.clear();
         self.hand_restored_agents();
         self.settle_carried_settings_drafts();
+        self.regrid_restored_windows();
+    }
+
+    /// Re-grid every window's panes to its layout once the restore has placed all of its tabs. A
+    /// shell a seamless update handed over keeps the grid its engine was parked at, which is not
+    /// its window's where this build sized the window otherwise before the tabs landed (the Deck
+    /// took the other form under a kept frame, [`Self::regrid_to_attach_frame`]). Switching to such
+    /// a tab or drawing it does not re-grid it, nor does a resize that leaves the window's grid as it
+    /// was, so it would keep that grid until something laid out the whole window. Booked
+    /// `site=restore`; a pane already at its size books nothing.
+    ///
+    /// A window the restore asked the OS to maximize or put in full screen is not re-gridded here:
+    /// its grid may still be the one it was made at, and moving its tabs to that grid before the
+    /// OS's size lands would resize each of them twice. Its panes are marked stale instead, as a
+    /// live drag leaves them: the next full layout pass (the grid that size commits) re-grids every
+    /// tab, and until one runs each redraw re-grids the tab on screen, so a show that leaves the
+    /// size as it was strands no tab.
+    fn regrid_restored_windows(&mut self) {
+        let _site = crate::resize_ledger::SiteScope::enter(crate::resize_ledger::Cause::Restore);
+        let windows: Vec<WindowId> = self.windows.keys().copied().collect();
+        for wid in windows {
+            let awaited = self.windows.get_mut(&wid).is_some_and(|ws| {
+                let awaited = std::mem::take(&mut ws.restore_show_awaited);
+                ws.panes_stale |= awaited;
+                awaited
+            });
+            if !awaited {
+                self.resize_panes(wid);
+            }
+        }
+    }
+
+    /// Note that `wl` asks the OS for window `wid`'s size: a maximized or full-screen row is
+    /// re-entered once the window exists, and the size it brings arrives as a later resize. A
+    /// headless app shows no window, so nothing arrives and it awaits nothing.
+    fn note_restored_show(&mut self, wid: WindowId, wl: &restore::WindowLayout) {
+        if !self.headless
+            && (wl.maximized == Some(true) || wl.show.fullscreen == Some(true))
+            && let Some(ws) = self.windows.get_mut(&wid)
+        {
+            ws.restore_show_awaited = true;
+        }
     }
 
     /// Executes one bounded time slice of [`RestoreDrain`], returning whether more work remains.
@@ -1319,6 +1361,7 @@ impl App {
         wid: WindowId,
         wl: restore::WindowLayout,
     ) -> Option<FillingWindow> {
+        self.note_restored_show(wid, &wl);
         if wl.restored_tabs.len() < 2
             || !wl
                 .restored_tabs
@@ -2143,6 +2186,7 @@ impl App {
 
     /// Populates window `wid` from a validated [`restore::WindowLayout`] record.
     pub(crate) fn restore_into_window(&mut self, wid: WindowId, wl: restore::WindowLayout) {
+        self.note_restored_show(wid, &wl);
         if !wl.restored_tabs.is_empty() {
             self.restore_recursive_into_window(wid, wl);
             return;
@@ -3862,6 +3906,8 @@ impl App {
         }
         let switched = window.tab_set.switch_to(id);
         debug_assert!(switched);
+        // A split's leaves were made at the whole window's grid.
+        self.resize_panes(wid);
         self.resync_active_or_window(wid);
         debug_assert!(
             self.structural_invariants_ok(),

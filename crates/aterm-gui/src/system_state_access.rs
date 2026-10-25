@@ -340,10 +340,12 @@ pub(crate) fn lan_target(interfaces: &[LanInterface]) -> Option<Ipv4Addr> {
 /// The one quiet signal (§3.6, pure): `System State: <row> needs you`, from the managed rows
 /// that wait for a person plus a verified Full Disk Access grant that reads off. A failed row,
 /// or a step the last run could not finish, reads `System State: <row> failed` (`1 step
-/// failed`) once the run no longer retries it by itself (§3.5); several are counted
-/// (`2 need you`, `1 needs you, 1 failed`). A row Restore could not put back, alone, reads
-/// `System State: Restore failed for <row>`. The note is the Secrets row's while it needs you
-/// (a waiting vault approval code, or a move to Applications). `None` when nothing does.
+/// failed`) once nothing tries it again by itself (§3.5); a Check's result never does, since a
+/// Check only reads and pressing it again is its remedy ([`SetupStatus::failed_steps`]).
+/// Several are counted (`2 need you`, `1 needs you, 1 failed`). A row Restore could not put
+/// back, alone, reads `System State: Restore failed for <row>`. The note is the Secrets row's
+/// while it needs you (a waiting vault approval code, or a move to Applications). `None` when
+/// nothing does.
 pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<SystemStateLine> {
     let selection = status
         .plan

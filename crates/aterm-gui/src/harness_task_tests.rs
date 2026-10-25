@@ -948,10 +948,14 @@ fn a_proven_self_claims_landing_shows_and_anyones_later_turn_reopens_it() {
         .unwrap()
         .queue_self_task(TaskFace::Landed);
     app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
-    assert_eq!(
-        landing_records(&app, &sid).len(),
-        1,
-        "a landing, recorded once"
+    let records = landing_records(&app, &sid);
+    assert_eq!(records.len(), 1, "a landing, recorded once");
+    assert!(
+        records[0]
+            .1
+            .iter()
+            .any(|line| line.contains(aterm_agent::supervise::mode_words::LANDED_WORDS)),
+        "codex-alab's landing says the one landing sentence, which names no checker: {records:?}"
     );
     app.reopen_self_claim_landing(0);
     assert_eq!(face(&app), Some(TaskFace::Landed), "quiet: still landed");

@@ -593,7 +593,7 @@ const fn bytes_eq(a: &[u8], b: &[u8], len: usize) -> bool {
 }
 
 /// The budget for the short catalog's rows put together (every [`catalog_lines`] row, `\n`-terminated).
-pub const SHORT_CATALOG_MAX_BYTES: usize = 14134;
+pub const SHORT_CATALOG_MAX_BYTES: usize = 14252;
 
 /// The `subscribe` stream vocabulary: frame sources, then the two modifiers.
 pub const SUBSCRIBE_STREAMS: &[&str] = &[
@@ -1218,8 +1218,8 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         App,
-        "find [open|type|key|next|prev|case|regex|accept|cancel|status]: drive the FIND BAR",
-        "— drives the window's find bar (⌘F / Ctrl+Shift+F), which `key` and `send` do not reach. \
+        "find [open|type|key|next|prev|case|regex|accept|cancel|status]: drive the TERMINAL FIND BAR",
+        "— drives the window's terminal find bar (⌘F / Ctrl+Shift+F), which `key` and `send` do not reach. \
          `find open` opens it; `find type <text>` inserts at the caret; `find key <name>` runs \
          one edit (`back`, `delete`, `left`, `right`, `word-left`, `word-right`, `home`, `end`, \
          `kill-start`, `kill-end`, `kill-word-back`, `kill-word-forward`); `find next`/`find \
@@ -1231,7 +1231,8 @@ pub const VERBS: &[VerbSpec] = &[
          screen, negative is scrollback, `-` when no match) — not `search`/`line` absolute rows. \
          `current=`/`matches=` are 1-based (`truncated=1` when capped, `stale=1` when output \
          arrived since the count). Typing or stepping while closed changes nothing and answers \
-         `open=0`. Acts on the front window.",
+         `open=0`. Native apps remain unchanged and answer `OK open=0`; use `invoke Find` \
+         for their supported contextual search. Acts on the front window.",
     ),
     v(
         "selection",
@@ -1539,27 +1540,46 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "aos [status|attach|pause|repair|resume|detach|trace|publish|bundle]: the glow as an Aos task",
+        "aos [status|ls|attach|pause|repair|resume|detach|trace|export|check]: the glow as an Aos task",
         "— hosts the front window's typing-momentum glow as an Aos task, in every build. `aos \
          [status]` answers `OK window=<id> attached=<bool> code=<name> …` (revision, pause queue, \
          trace cursor, hot/active/settling flags, `cold_at=`, last wake and boundary counters). \
-         `aos attach [code=<name>]` checkpoints the glow and records keys, resets, frame ticks and \
-         scheduler queries; `aos pause` holds at the step boundary; `aos repair [code=<name>]` \
-         shadow-replays live and candidate code over the trace from the attach checkpoint and \
-         swaps the candidate in only when live reproduces the paused head and the candidate keeps \
-         `momentum-glow.no-stranded-light`, then delivers the queue (with `code=shipped`, the only \
-         code a release build carries, it verifies and resumes; on a refusal a glow the repair \
-         paused resumes on the old code, and one `aos pause` held stays paused); `aos resume` \
-         drops a pending update; `aos detach` stops hosting; `aos trace` reports the log length, \
-         the trace and checkpoint digests and the broken flag, and `aos trace hex` adds the \
-         exported trace file's bytes. Debug builds only, each answering `ERR aos <form> needs a \
-         debug build` in a release build: `code=demo-stranded-settle`; `aos publish \
-         plan=<24 hex>`, which judges a 12-byte schedule plan under the pinned acceptance policy \
-         and publishes it at the step boundary (pausing first) only if it is admitted and, over \
-         the shipped code, useful (`useful=`, `gain_ppm=`, `bundle=`); and `aos bundle`, which \
-         exports the live plan's candidate bundle (`bundle=<digest> rev= bytes= hex=`).",
+         `aos ls` answers `OK tasks=<n>`, then per window a `slot=<id> kind=effect task=<name> \
+         code= attached= paused= rev= log_epoch= log= waiting= kept= rows= dropped=` line and \
+         its timeline rows, `slot=<id> row=<k> segment cause=full|broken|restored|committed code= \
+         log_epoch= range=<a>..<b> judged=pass|fail:<law>@<cursor>|unjudged:<why> kept=<id>|no` \
+         or `slot=<id> row=<k> detached why=<why>`: an online watcher judges each retired log \
+         epoch on a host worker and keeps a failing one as a fault (at most 4, timeline rows \
+         only, no alert). `aos attach [code=<name>]` checkpoints the glow and records keys, \
+         resets, frame ticks and scheduler queries (refused while Secure Keyboard Entry is on or \
+         the glow wears Sparkle's paper gold on a light theme; a key the tty does not echo, one \
+         under Secure Keyboard Entry, or the gold going on detaches the recording before it is \
+         logged); `aos pause` holds at the step boundary; `aos repair \
+         [code=<name>]` shadow-replays live and candidate code over the trace from the attach \
+         checkpoint on a host worker and, back on the main thread, swaps the candidate in only \
+         when live reproduces the paused head and the candidate keeps \
+         `momentum-glow.no-stranded-light`, then delivers the queue (`code=shipped` verifies and \
+         resumes, `code=safe` names a frame-interval wake whenever the glow is hot; the answer \
+         ends `main_us=<n> off_main=<bool>`; on a refusal a glow the repair paused resumes on the \
+         old code, and one `aos pause` held stays paused); `aos resume` drops a pending update; \
+         `aos detach` stops hosting; `aos trace` reports the log length, the trace and \
+         checkpoint digests and the broken flag, and `aos trace hex` adds the exported trace \
+         file's bytes. `aos export [kept=<n>]` writes the live trace, or kept fault `<n>`, as a \
+         new 0600 file in the state directory's `aos/` (`OK window=<id> exported kept= \
+         log_epoch= identity= bytes= mode=0600 file=<name> path=<path>`, the path last); `aos \
+         check <file>` (a bare export name, or an absolute path) replays a trace file under this \
+         build with no live effect, refusing one recorded under an identity this build does not \
+         run (`ERR aos check refused=identity: …`), and answers `OK checked code= log_epoch= \
+         first= keys= resets= ticks= queries= checkpoint= state= chain= verdict= bytes= file=`. \
+         Debug builds only, each answering `ERR aos <form> needs a debug build` in a release \
+         build: `code=demo-stranded-settle`; `aos publish plan=<24 hex>`, which judges a 12-byte \
+         schedule plan under the pinned acceptance policy and publishes it at the step boundary \
+         (pausing first) only if it is admitted and, over the shipped code, useful (`useful=`, \
+         `gain_ppm=`, `bundle=`; a plan over `code=safe` is refused, it is no policy base); and \
+         `aos bundle`, which exports the live plan's candidate bundle (`bundle=<digest> rev= \
+         bytes= hex=`).",
     )
-    .forms(&[form(AnyOf(&["status", "trace"])).op(Read)])
+    .forms(&[form(AnyOf(&["status", "trace", "ls"])).op(Read)])
     .input(Input::NONE),
 
     v(
@@ -1729,6 +1749,23 @@ pub const VERBS: &[VerbSpec] = &[
          trimmed=<k>`).",
     )
     .forms(&[form(Word("status")).framing(Status)]),
+    v(
+        "rewind",
+        Read,
+        Status,
+        Session,
+        "rewind [status|open|step|text|close]: freeze the pane on a past screen its recorder kept",
+        "— `rewind open [ago=<secs>|at=<tick>]` freezes every view of the session on the newest \
+         recorded state at or before that instant (default: the newest), as View > Rewind Pane \
+         does; `rewind step <+-n>` moves `n` recorded states and `rewind close` returns it to \
+         live. Each answers `OK recording=<bool> view=open|closed at=<tick|-> state=<n>/<N|-> \
+         faithful=yes|no|unchecked|- live_bytes=<n>` once that state is on screen; \
+         `faithful=yes` only when a live witness matched it. `rewind text [trim]` is the shown \
+         screen, framed as `temporal`. While a view is open the person's keys and clicks reach \
+         no program (a client's `send` and `key` still do). Needs `temporal_recording = true` \
+         when the session started (`ERR rewind: this session keeps no screen history; …`).",
+    )
+    .forms(&[form(Word("text")).framing(Bytes)]),
     v(
         "history",
         Read,
@@ -1978,7 +2015,7 @@ pub const VERBS: &[VerbSpec] = &[
          nudge=<idle|armed|short|restoring> nudged=<N>`, then `resize`, `run` and open/owed \
          `epoch` rows. `resize <id> t=<ms> run=<r> ord=<n> from=<CxR> to=<CxR> alt=<0|1> \
          sync=<0|1> trimmed=<k> demoted=<k> pushed=<k> revealed=<k> appended=<k> restored=<k> \
-         shift=<+-k> cut=<k> site=<input|window|chrome|deck|term|pass|redraw|ctl-cross|-> at=<pct \
+         shift=<+-k> cut=<k> site=<input|window|chrome|deck|restore|term|pass|redraw|ctl-cross|-> at=<pct \
          file:line|-> win=<CxR|-> chrome=<k|->`. `run <r> t=<ms> n=<k> alt=<0|1> \
          geom=<CxR>><CxR>>... net=<zero|changed> displaced=<+-k> \
          verdict=<none|silent|desync-risk|unverified|healed|reflow> first_out_ms=<ms|-> \
@@ -2050,11 +2087,18 @@ pub const VERBS: &[VerbSpec] = &[
          judged by aterm and told back to it. `wake label=<1-64 of A-Z a-z 0-9 . _ -> \
          when=<term>[ and <term>…] [for=<dur>] [need=<sys>[ and <sys>…] [for=<dur>]] \
          [unless=<source>]… [prio=critical] [by=+<dur>]`, `<term>` a `pid:<n> exited` of the \
-         session's own tree, an `at:<HH>:<MM>` or `in:<dur>`, or a machine term of `await sys` \
-         (`need=` takes machine terms alone; `free`, `disk=` and `vol=` arrive in a later slice; \
-         `file:` and `gone:` are not served yet), `<dur>` `<n>s|m|h` and `by=` at most +48h \
-         (default +24h): `OK wake #<n>` (` await_only=1` for a time alone, which only `await \
-         wake` answers), `ERR usage wake: <why>`, or `ERR denied wake: <why>`. `wake rm #<n>` \
+         session's own tree, an `at:<HH>:<MM>` or `in:<dur>`, a machine term of `await sys` \
+         (`need=` takes machine terms alone; `free`, `disk=` and `vol=` arrive in a later slice), \
+         or on macOS a `file:<path>` (it is there), `file:<path>~/<re>/` (a line of it matches) \
+         or `gone:<path>` (nothing is there), `<path>` `~/…` or absolute, under \
+         `~/scratch.noindex` or the working directory of the tab's shell or agent below the home, \
+         read through no link, under `containment=user` alone: `ERR denied wake: path \
+         <outside|dot|credential|guarded|link|relative|long|control|unicode|remote|removable>` \
+         (`guarded` a privacy-guarded folder, `remote` a network or automounted volume), `ERR \
+         denied wake: file atoms need containment=user`, and elsewhere `ERR usage wake: file \
+         atoms are served on macOS alone`; `<dur>` `<n>s|m|h` and `by=` at most +48h (default \
+         +24h): `OK wake #<n>` (` await_only=1` for a time alone, which only `await wake` \
+         answers), `ERR usage wake: <why>`, or `ERR denied wake: <why>`. `wake rm #<n>` \
          and `wake taken #<n>` remove it or mark it taken (`OK wake #<n> rm|taken`, `ERR no such \
          wake #<n>`). At most 16 a session. Only a process descended from the session's own PTY \
          child (and from its hosted agent, where aterm hosts one), proved by the kernel's peer \
@@ -2073,12 +2117,14 @@ pub const VERBS: &[VerbSpec] = &[
         "waits [why [#<n>]]: this session's declared wakes",
         "— `OK <n>` then one line a wake, lowest ordinal first: `#<n> <pending|ready|answering|\
          answered|claimed|told|taken|expired> prio=<normal|critical> kinds=<kind>[,…] \
-         declared=<ms> by=<ms> since=<ms|-> label=<token>` (`<kind>` `pid|at|in|sys`, times unix \
-         ms). `waits why` says why each is not told yet: `#<n> <state>[ why=<due|unless|agent|\
-         path|off|admit>] atoms=<kind>:<0|1>[,…][ need=<sys …>] [await_only=1]`, and `waits why \
-         #<n>` that wake alone. A peer outside the session's tree (see `wake`) is shown ordinals, \
-         states, priorities, atom kinds and times alone: no label and no need. `ERR denied wake: \
-         occupancy=off` under `off`.",
+         declared=<ms> by=<ms> since=<ms|-> label=<token>` (`<kind>` \
+         `pid|at|in|sys|file|match|gone`, times unix ms). `waits why` says why each is not told \
+         yet: `#<n> <state>[ why=<due|unless|agent|path|off|admit>] atoms=<kind>:<0|1>[,…][ \
+         need=<sys …>] [await_only=1][ source=<watch|looks>]` (`source=` for an open wake with \
+         file atoms: `looks` where one is read on the looks alone, the watch budget spent or its \
+         watch not opened), and `waits why #<n>` that wake alone. A peer outside the session's \
+         tree (see `wake`) is shown ordinals, states, priorities, atom kinds and times alone: no \
+         label, no need and no source. `ERR denied wake: occupancy=off` under `off`.",
     ),
     v(
         "sys",
@@ -2793,8 +2839,9 @@ pub const VERBS: &[VerbSpec] = &[
         "task [mark <state> …]: a worker's task record: OK task rev= state= from= since_ms=",
         "— `result_bytes= [why=] [exit=] [result_path=] [fact= fact_rev=] agent= program_state= \
          attention=` (or `OK task -` when the session has no task; `program_state=` is `status \
-         program_state=`, a codex's own report, `-` otherwise). `state=`: `working`, `done` (under Land, work landed on remote \
-         `main` and defended with `Nothing left:`), `exited` (`exit=<code>`), or `stalled` \
+         program_state=`, a codex's own report, `-` otherwise). `state=`: `working`, `done` (under Land, a clean `Nothing left:` \
+         defense and a `git` check that found nothing left to land where it could read; `aterm help \
+         harness` names where it cannot), `exited` (`exit=<code>`), or `stalled` \
          (`why=startup|shell|held`; it resumes `working why=moved` or `working why=turn`). `why=` \
          is `landed|marker|done-check|exit|shell|startup|held|turn|moved`. `rev=` increments on \
          record changes and on `meta set attention owner=supervisor|needs|codex-alab` changes \
@@ -3852,6 +3899,12 @@ mod tests {
         assert_eq!(framing_of("temporal", "temporal"), Bytes);
         assert_eq!(framing_of("temporal", "temporal 1200"), Bytes);
         assert_eq!(framing_of("temporal", "@s-a temporal status"), Status);
+        assert_eq!(framing_of("rewind", "rewind"), Status);
+        assert_eq!(framing_of("rewind", "rewind open ago=30"), Status);
+        assert_eq!(framing_of("rewind", "rewind step -1"), Status);
+        assert_eq!(framing_of("rewind", "rewind text"), Bytes);
+        assert_eq!(framing_of("rewind", "@s-a rewind text trim"), Bytes);
+        assert_eq!(framing_of("rewind", "rewind close"), Status);
         assert_eq!(framing_of("topic", "topic"), Lines);
         assert_eq!(framing_of("topic", "topic ls"), Lines);
         assert_eq!(framing_of("topic", "topic add build ttl=60"), Status);

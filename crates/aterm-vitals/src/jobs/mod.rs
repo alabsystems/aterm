@@ -220,6 +220,8 @@ pub enum FdKind {
         tty: bool,
         /// Opened for reading; `true` where unread, `false` for one only written (`tee /dev/tty`).
         read: bool,
+        /// Opened as `/dev/tty`, not inherited or duplicated from a terminal (zsh's fd 10).
+        ctty: bool,
     },
     /// One end of a pipe.
     Pipe {
@@ -282,7 +284,7 @@ pub struct JobProc {
     pub sid: Option<u32>,
     /// When it started, compared for equality only; `None` where unread.
     pub start: Option<u64>,
-    /// How long it had run when the pass read it, ms; `None` where unread.
+    /// How long it had run when the probe read it ([`JobTick::probe_ms`]), ms; `None` where unread.
     pub age_ms: Option<u64>,
     /// Its user.
     pub uid: Option<u32>,
@@ -292,6 +294,8 @@ pub struct JobProc {
     pub exe: Option<String>,
     /// Its state.
     pub state: ProcState,
+    /// A debugger traces it (a debugger's child at a breakpoint is no job-control stop).
+    pub traced: bool,
     /// Its controlling terminal; `None` without one.
     pub tty: Option<u32>,
     /// That terminal's foreground process group.
@@ -596,6 +600,10 @@ pub struct JobTick {
     /// The host's clock, ms, once it had read [`JobTick::procs`]: each shell's terminal group,
     /// which says what is in front, is read after the sweep, past `at_ms`.
     pub read_ms: u64,
+    /// The host's clock, ms, as the probe began reading [`JobTick::procs`], each
+    /// [`JobProc::age_ms`] taken then: a reading that runs late (the sweep before it, under load)
+    /// starts past `at_ms`.
+    pub probe_ms: u64,
     /// aterm's own user (for the own-uid findings).
     pub self_uid: Option<u32>,
     /// The cheap sweep of every process.

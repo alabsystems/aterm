@@ -1689,3 +1689,482 @@ fn a_run_the_hand_has_left_melts_out_over_its_last_letter() {
         );
     }
 }
+
+/// The chroma (most channel less least) of `rgb`.
+fn chroma(rgb: u32) -> i32 {
+    let ch = [16, 8, 0].map(|sh| ((rgb >> sh) & 0xff) as i32);
+    ch.iter().max().unwrap_or(&0) - ch.iter().min().unwrap_or(&0)
+}
+
+/// looks7 M4: a word gap's bed takes the straight line between its letters'
+/// inks. The knots are the gallery's `context` `mid` (Phaser's dark bar
+/// between `the` and `quick`): the gap's own `#032BE7`, the most vivid blue
+/// of the bar, stood a stripe between `#034591` and `#2F1DD3`. Every letter,
+/// a run of three blanks and a blank with a letter on one side only keep
+/// their own ink.
+#[test]
+fn a_word_gap_s_bed_takes_the_line_between_its_letters() {
+    let g = tall_geom();
+    let text = "the quic   x ";
+    let knots: [u32; 13] = [
+        0x001A_152D,
+        0x0013_1A4C,
+        0x0003_4591,
+        0x0003_2BE7,
+        0x002F_1DD3,
+        0x0047_10B5,
+        0x0056_08A9,
+        0x005E_0682,
+        0x0064_0779,
+        0x006B_1464,
+        0x0070_0E6F,
+        0x006A_1060,
+        0x0003_2BE7,
+    ];
+    let row = i32::from(ROW);
+    let lettered = |r: i32, c: i32| {
+        r == row
+            && usize::try_from(c)
+                .ok()
+                .and_then(|c| text.chars().nth(c))
+                .is_some_and(|ch| ch != ' ')
+    };
+    let sample = |c: usize| CometSample {
+        x: f32::from(g.origin_x) + (c as f32 + 0.5) * g.cw as f32,
+        y: f32::from(g.origin_y) + (row as f32 + 0.5) * g.ch as f32,
+        cov: 255,
+        pos: c as f32 / knots.len() as f32,
+    };
+    let runs = vec![(0..knots.len()).map(sample).collect::<Vec<_>>()];
+    let mut inks = knots.to_vec();
+    bed::bridge_word_gaps(&runs, g, lettered, &mut inks);
+    let gap = 3;
+    let vivid = |inks: &[u32]| chroma(inks[gap]) - chroma(inks[gap - 1]).max(chroma(inks[gap + 1]));
+    assert!(
+        vivid(&inks) <= 0,
+        "the word gap's bed is {} more vivid than its letters' (#{:06X})",
+        vivid(&inks),
+        inks[gap]
+    );
+    assert_eq!(
+        inks[gap], 0x0019_31B2,
+        "the gap's ink is the line between its letters'"
+    );
+    for (c, (&got, &knot)) in inks.iter().zip(&knots).enumerate() {
+        if c != gap {
+            assert_eq!(got, knot, "column {c} keeps its own ink");
+        }
+    }
+    assert!(
+        vivid(&knots) >= 40,
+        "control: unbridged, the gap is only {} more vivid than its letters",
+        vivid(&knots)
+    );
+}
+
+/// looks7 M4 through the bar itself: dark Phaser typed over a line the
+/// frame's own cells hold, every word gap's bed (its middle pixel, the bed
+/// alone) is no more vivid than the more vivid of its letters'; the gap
+/// keeping its own knot (the negative control) stands more vivid than both.
+#[test]
+fn phaser_s_dark_bed_lays_no_vivid_knot_in_a_word_gap() {
+    use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
+    let g = tall_geom();
+    let c = resolve_glow_config(
+        GlowKnobs {
+            enabled: true,
+            color: None,
+            accent: None,
+            duration_ms: 260,
+            length: 24,
+            intensity: crate::cursor_fx::default_trail_intensity(Some(GlowStyle::Phaser), false),
+            radius: 0.6,
+            ring: true,
+        },
+        GlowSpelling {
+            style: Some(GlowStyle::Phaser),
+            beam: true,
+            ribbon_tall: true,
+            ribbon_flat: false,
+            classic_mono: false,
+        },
+        CURSOR,
+        true,
+        FG,
+        BG,
+        0.5,
+    );
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let worst = |bridged: bool| -> (i32, usize) {
+        let mut glow = CursorGlow::default();
+        glow.set_bed_word_gaps(bridged);
+        let mut out = Vec::new();
+        let mut text = vec![' '; g.cols];
+        text[0] = '$';
+        let mut t = Instant::now();
+        let (mut worst, mut gaps) = (i32::MIN, 0usize);
+        let y = i32::from(g.origin_y) + i32::from(ROW) * g.ch as i32 + g.ch as i32 / 2;
+        for (k, ch) in std::iter::once(' ').chain(LINE.chars()).enumerate() {
+            if k > 0 {
+                t += Duration::from_millis(60);
+                text[START as usize + k - 1] = ch;
+                glow.note_synthetic_typed(t, 1);
+            }
+            let caret = (ROW, START + k as u16);
+            let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+            for (col, cell) in rows[usize::from(ROW)].iter_mut().enumerate() {
+                (cell.fg, cell.bg, cell.ch) = (rgb(FG), rgb(BG), text[col]);
+            }
+            glow.observe_row(caret.0, caret.1, &text, t);
+            glow.observe_frame_text(Some(caret), &rows, t);
+            glow.tick(Some(caret), t, &c, g, &mut out);
+            let mut glass = Glass::new(g, BG);
+            glass.add_quads(glow.under_quads());
+            let mid = |col: usize| {
+                let x = i32::from(g.origin_x) + col as i32 * g.cw as i32 + g.cw as i32 / 2;
+                glass.at(y, x)
+            };
+            for col in 1..usize::from(caret.1).saturating_sub(1) {
+                let side = |c: usize| text[c] != ' ' && text[c] != '$';
+                if text[col] != ' ' || !side(col - 1) || !side(col + 1) {
+                    continue;
+                }
+                if [col - 1, col, col + 1].iter().any(|&c| chroma(mid(c)) < 24) {
+                    continue;
+                }
+                gaps += 1;
+                let over = chroma(mid(col)) - chroma(mid(col - 1)).max(chroma(mid(col + 1)));
+                worst = worst.max(over);
+            }
+        }
+        (worst, gaps)
+    };
+    let (held, gaps) = worst(true);
+    let (kept, _) = worst(false);
+    assert!(
+        gaps >= 6,
+        "fixture: the bar lay across only {gaps} word gaps"
+    );
+    assert!(
+        held <= 2,
+        "a word gap's bed is {held} more vivid than its letters'"
+    );
+    assert!(
+        kept >= 12,
+        "control: keeping its own knot, a word gap is only {kept} more vivid than its letters'"
+    );
+}
+
+/// looks7 round 2, A LIT PAGE'S BED: on Solarized Dark (its text reads 4.75:1
+/// on `#002b36`, and a dim letter keeps 97% of its own reading under the
+/// lights) no style's bed lays a shade. Typing the line, every frame, every
+/// pixel the beds lay under the line's cells (the rails below the row, their
+/// soft top in its last two pixel rows, are light in the leading) keeps seven
+/// tenths of the page's luminance (a soft edge's sRGB mix of the page and a
+/// hue at its luminance) and none rises over it by more than a byte's
+/// rounding, and the bed wears its hue: some pixel stands well off the page.
+/// Negative controls: held to the letters' budget alone, the bed solves to
+/// black and lays the gallery's black smoke (Beam's tube, Phaser's word gaps,
+/// Lumen's and Laser's tracers) under half the page's luminance; a sample in
+/// the air by its own cell alone ([`crate::cursor_glow::air_lit`]), the one
+/// past the line's last letter wears the air's light and the bed's colour,
+/// drawn toward it, lights the last letter's ground past three times the
+/// page's luminance.
+#[test]
+fn a_lit_page_s_beds_lay_no_shade() {
+    use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
+    const PAGE: u32 = 0x0000_2B36;
+    const TEXT: u32 = 0x0083_9496;
+    let g = tall_geom();
+    let lum = crate::color_math::relative_luminance;
+    let lp = lum(PAGE);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    // (least and most luminance under the line, its farthest OKLab off the
+    // page)
+    let lay = |style: GlowStyle, (unlit, alone): (bool, bool)| -> (f32, f32, f32) {
+        let c = resolve_glow_config(
+            GlowKnobs {
+                enabled: true,
+                color: None,
+                accent: None,
+                duration_ms: 260,
+                length: 24,
+                intensity: crate::cursor_fx::default_trail_intensity(Some(style), false),
+                radius: 0.6,
+                ring: true,
+            },
+            GlowSpelling {
+                style: Some(style),
+                beam: true,
+                ribbon_tall: true,
+                ribbon_flat: false,
+                classic_mono: false,
+            },
+            CURSOR,
+            true,
+            TEXT,
+            PAGE,
+            0.5,
+        );
+        let mut glow = CursorGlow::default();
+        glow.set_bed_page_lit(!unlit);
+        glow.set_bed_air_beside_text(!alone);
+        let mut out = Vec::new();
+        let mut text = vec![' '; g.cols];
+        text[0] = '$';
+        let mut t = Instant::now();
+        let (mut low, mut high, mut far) = (f32::INFINITY, 0.0f32, 0.0f32);
+        let (y0, y1) = (
+            g.origin_y as usize + usize::from(ROW) * g.ch,
+            g.origin_y as usize + usize::from(ROW + 1) * g.ch - 2,
+        );
+        for (k, ch) in std::iter::once(' ').chain(LINE.chars()).enumerate() {
+            if k > 0 {
+                t += Duration::from_millis(60);
+                text[START as usize + k - 1] = ch;
+                glow.note_synthetic_typed(t, 1);
+            }
+            let caret = (ROW, START + k as u16);
+            let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+            for (col, cell) in rows[usize::from(ROW)].iter_mut().enumerate() {
+                (cell.fg, cell.bg, cell.ch) = (rgb(TEXT), rgb(PAGE), text[col]);
+            }
+            glow.observe_row(caret.0, caret.1, &text, t);
+            glow.observe_frame_text(Some(caret), &rows, t);
+            glow.tick(Some(caret), t, &c, g, &mut out);
+            let mut glass = Glass::new(g, PAGE);
+            glass.add_quads(glow.under_quads());
+            let line_end = g.origin_x as usize + usize::from(caret.1) * g.cw;
+            for y in y0..y1 {
+                for x in 0..glass.w {
+                    let px = glass.px[y * glass.w + x];
+                    if px == PAGE {
+                        continue;
+                    }
+                    if x >= line_end {
+                        continue;
+                    }
+                    let l = lum(px);
+                    low = low.min(l);
+                    high = high.max(l);
+                    far = far.max(crate::color_math::oklab_distance(px, PAGE));
+                }
+            }
+        }
+        (low, high, far)
+    };
+    for style in [
+        GlowStyle::Lumen,
+        GlowStyle::Comet,
+        GlowStyle::Laser,
+        GlowStyle::Phaser,
+        GlowStyle::Beam,
+    ] {
+        let (low, high, far) = lay(style, (false, false));
+        assert!(
+            low >= 0.7 * lp,
+            "{style:?}: the bed lays a shade at {low:.4}, the page at {lp:.4}"
+        );
+        assert!(
+            high <= 1.06 * lp,
+            "{style:?}: the bed lays light at {high:.4} over the page's {lp:.4}"
+        );
+        if style == GlowStyle::Phaser {
+            assert!(
+                far >= 0.06,
+                "Phaser's bed lies on the page ({far:.3} OKLab at most)"
+            );
+        }
+        let (unlit, _, _) = lay(style, (true, false));
+        assert!(
+            unlit < 0.5 * lp,
+            "control: {style:?}'s bed held to its budget lays no shade ({unlit:.4} on the page's {lp:.4})"
+        );
+        let (_, alone, _) = lay(style, (false, true));
+        assert!(
+            alone > 3.0 * lp,
+            "control: {style:?}'s air read by each sample's own cell lays no light under the line ({alone:.4} on the page's {lp:.4})"
+        );
+    }
+}
+
+/// looks7 round 3, LUMEN KEEPS A GREY CURSOR GREY: Lumen's light is the cursor's, and its bed
+/// floors the colour's saturation ([`BedShape::sat`]) to stay vivid; on Solarized Dark the
+/// cursor is a grey `#93a1a1` (0.09), whose hue is noise, and floored its Return tracer read a
+/// saturated cyan `#94edfb` the cursor does not have. A colour under
+/// [`BedShape::own_chroma`] keeps its own chroma in the air's light and on its rail (on a lit
+/// page, [`BedShape::on_lit_page`]); the dark gallery's green cursor (0.68) is floored as
+/// before, and so is any style but Lumen's. Negative control: floored, the grey's rail and the
+/// air's ink read past half saturation.
+#[test]
+fn lumen_keeps_a_grey_cursor_grey() {
+    use crate::color_math::rgb2hsv;
+    use crate::cursor_glow::bed::bed_rail_ink;
+    const SOL_PAGE: u32 = 0x0000_2B36;
+    const SOL_TEXT: u32 = 0x0083_9496;
+    const GREY: u32 = 0x0093_A1A1;
+    const GREEN: u32 = 0x0050_FA7B;
+    let lumen = BedShape::of(GlowStyle::Lumen, 1.0).expect("Lumen lays a bed");
+    let comet = BedShape::of(GlowStyle::Comet, 1.0).expect("Comet lays a bed");
+    let sat = |c: u32| rgb2hsv(c).1;
+    assert!(lumen.sat_for(GREY) < 0.1, "the grey keeps its own chroma");
+    assert!(
+        (lumen.sat_for(GREEN) - lumen.sat).abs() < 1e-6,
+        "the green is floored"
+    );
+    assert!(
+        (comet.sat_for(GREY) - comet.sat).abs() < 1e-6,
+        "Comet floors the grey"
+    );
+    let rail = bed_rail_ink(GREY, lumen.on_lit_page());
+    assert!(sat(rail) < 0.15, "Lumen's rail is {rail:06x}");
+    let budget = crate::cursor_glow::dark_bed_budget(SOL_TEXT);
+    let air = AirLight::of(SOL_PAGE, budget, lumen).expect("Solarized Dark's air is lit");
+    let in_air = air.ink(GREY, SOL_PAGE, lumen.sat_for(GREY));
+    assert!(
+        sat(in_air) < 0.2,
+        "Lumen's light in the air is {in_air:06x}"
+    );
+    let floored = crate::rainbow_kitty::ribbon::rail_ink(GREY);
+    assert!(
+        sat(floored) > 0.5,
+        "control: the floored rail reads {floored:06x}"
+    );
+    let floored_air = air.ink(GREY, SOL_PAGE, lumen.sat);
+    assert!(
+        sat(floored_air) > 0.4,
+        "control: the floored air's ink reads {floored_air:06x}"
+    );
+}
+
+/// looks7 round 3 review, A CHOSEN COLOUR KEEPS ITS CHROMA: a trail colour the user chose
+/// ([`ColourPins`]) is drawn as itself, never re-hued or given more chroma; the bed may spend
+/// less light on it, never another chroma. On Solarized Dark the lit page's rail and the air's
+/// light floored a chosen colour to the shape's saturation ([`BedShape::sat`]) and the rail's
+/// ([`crate::rainbow_kitty::ribbon::rail_ink`]): Beam pinned to `#b0b0c8` (0.12) laid its
+/// rail below the row in `#6464ff` (0.61), Lumen pinned to `#d09090` (0.31) in `#ff0000`.
+/// Typing the line with each pinned, no lit quad below the caret's row stands more chroma than
+/// the pin's, and some lie there; the shape's inks for the pin (its rail, the air's light and
+/// the bed under the letters, on Solarized Dark and on the reference dark) keep it too.
+/// Negative control: the same colour unpinned is floored, its rail past half saturation.
+#[test]
+fn a_chosen_colour_keeps_its_chroma_in_the_bed() {
+    use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
+    use crate::cursor_glow::bed::bed_rail_ink;
+    const PAGE: u32 = 0x0000_2B36;
+    const TEXT: u32 = 0x0083_9496;
+    const EPS: f32 = 0.06;
+    let g = tall_geom();
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let sat = |c: u32| hsv(c).1;
+    let row_bot = (usize::from(g.origin_y) + usize::from(ROW + 1) * g.ch) as u16;
+    // (the most chroma a lit quad below the caret's row stands, how many lie there)
+    let lay = |style: GlowStyle, pin: u32, pinned: bool| -> (f32, usize) {
+        let c = resolve_glow_config(
+            GlowKnobs {
+                enabled: true,
+                color: Some(pin),
+                accent: None,
+                duration_ms: 260,
+                length: 24,
+                intensity: crate::cursor_fx::default_trail_intensity(Some(style), false),
+                radius: 0.6,
+                ring: true,
+            },
+            GlowSpelling {
+                style: Some(style),
+                beam: true,
+                ribbon_tall: true,
+                ribbon_flat: false,
+                classic_mono: false,
+            },
+            CURSOR,
+            true,
+            TEXT,
+            PAGE,
+            0.5,
+        );
+        let mut glow = CursorGlow::default();
+        glow.set_colour_pins(ColourPins {
+            trail: pinned,
+            accent: false,
+        });
+        let mut out = Vec::new();
+        let mut text = vec![' '; g.cols];
+        text[0] = '$';
+        let mut t = Instant::now();
+        let (mut most, mut lit) = (0.0f32, 0usize);
+        for (k, ch) in std::iter::once(' ').chain(LINE.chars()).enumerate() {
+            if k > 0 {
+                t += Duration::from_millis(60);
+                text[START as usize + k - 1] = ch;
+                glow.note_synthetic_typed(t, 1);
+            }
+            let caret = (ROW, START + k as u16);
+            let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+            for (col, cell) in rows[usize::from(ROW)].iter_mut().enumerate() {
+                (cell.fg, cell.bg, cell.ch) = (rgb(TEXT), rgb(PAGE), text[col]);
+            }
+            glow.observe_row(caret.0, caret.1, &text, t);
+            glow.observe_frame_text(Some(caret), &rows, t);
+            glow.tick(Some(caret), t, &c, g, &mut out);
+            for q in glow.under_quads() {
+                if q.y < row_bot {
+                    continue;
+                }
+                for (color, alpha) in [(q.color, q.alpha), (q.color2, q.alpha2)] {
+                    if alpha < 64 {
+                        continue;
+                    }
+                    lit += 1;
+                    most = most.max(sat(straight(color, alpha)));
+                }
+            }
+        }
+        (most, lit)
+    };
+    for (style, pin) in [
+        (GlowStyle::Beam, 0x00B0_B0C8),
+        (GlowStyle::Beam, 0x00C8_A0A0),
+        (GlowStyle::Lumen, 0x00D0_9090),
+        (GlowStyle::Lumen, 0x00A0_C0E0),
+    ] {
+        let own = sat(pin);
+        let (most, lit) = lay(style, pin, true);
+        let (most_u, _) = lay(style, pin, false);
+        assert!(
+            lit > 0,
+            "{style:?} {pin:06x}: fixture: the bed lays nothing below the row"
+        );
+        assert!(
+            most <= own + EPS,
+            "{style:?} pinned to {pin:06x} ({own:.2}) lays {most:.2} of chroma below the row"
+        );
+        assert!(
+            most_u > 0.5,
+            "control: {style:?} unpinned in {pin:06x} keeps its chroma below the row ({most_u:.2})"
+        );
+        let shape = BedShape::of(style, 1.0)
+            .expect("the style lays a bed")
+            .pinned();
+        let rail = bed_rail_ink(pin, shape.on_lit_page());
+        assert!(
+            (sat(rail) - own).abs() <= EPS,
+            "{style:?}'s rail in {pin:06x} is {rail:06x}"
+        );
+        let budget = crate::cursor_glow::dark_bed_budget(TEXT);
+        let air = AirLight::of(PAGE, budget, shape).expect("Solarized Dark's air is lit");
+        let in_air = air.ink(pin, PAGE, shape.sat_for(pin));
+        assert!(
+            (sat(in_air) - own).abs() <= EPS,
+            "{style:?}'s light in the air in {pin:06x} is {in_air:06x}"
+        );
+        let dark_budget = crate::cursor_glow::dark_bed_budget(FG);
+        let under =
+            crate::cursor_glow::dark_bed_ink(pin, BG, dark_budget, shape.under_sat_for(pin));
+        assert!(
+            sat(under) <= own + EPS,
+            "{style:?}'s bed under the letters on the reference dark in {pin:06x} is {under:06x}"
+        );
+    }
+}

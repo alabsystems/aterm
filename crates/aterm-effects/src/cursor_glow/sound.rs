@@ -168,7 +168,7 @@ impl CursorGlow {
                 0.0
             };
             let flare = if self.flare != 0.0 {
-                self.flare * (-dt / Self::FLARE_DECAY_TAU).exp()
+                self.flare * (-dt * (1.0 / Self::FLARE_DECAY_TAU)).exp()
             } else {
                 0.0
             };

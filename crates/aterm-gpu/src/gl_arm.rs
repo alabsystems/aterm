@@ -660,6 +660,16 @@ impl GpuRenderer {
                     self.ctx.gl_max_texture_dim = caps.max_texture_dim;
                     self.ctx.srgb_offscreen = caps.srgb_views;
                     self.ctx.adapter_name.clone_from(&caps.renderer);
+                    // `GPU rendering on` named the headless probe's renderer; a window system's
+                    // can be another (Mesa's EGL falls back to software where its DRM screen
+                    // fails), so name the one the windows draw on.
+                    if let Some(ws) = want {
+                        let platform = match ws {
+                            crate::gl::device::WindowSystem::X11 { .. } => "X11",
+                            crate::gl::device::WindowSystem::Wayland { .. } => "Wayland",
+                        };
+                        gl_arm_note(&format!("{platform} windows draw on {}", caps.renderer));
+                    }
                 }
                 self.gl_arm = Some(live);
                 true

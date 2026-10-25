@@ -28,6 +28,8 @@ const PROVIDERS: &[(&str, &str)] = &[
     ("x", "xai"),
 ];
 
+pub mod commons;
+
 struct Csv {
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
@@ -146,6 +148,65 @@ fn object_id(domain: &[u8], parts: &[&[u8]]) -> String {
         hash.update(part);
     }
     hex::encode_lower(&hash.finalize())
+}
+
+/// Prepare an inert, compact source document. Raw unclassified cells and
+/// headers stay in the source file; only their one-based coordinates travel.
+fn candidate_document(path: &Path) -> Result<Value> {
+    let csv = load(path)?;
+    let column = |name: &str| {
+        let matches: Vec<_> = csv
+            .headers
+            .iter()
+            .enumerate()
+            .filter(|(_, header)| header.trim().eq_ignore_ascii_case(name))
+            .map(|(index, _)| index)
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some(*one)),
+            _ => Err(Error::new("CSV has ambiguous identity columns")),
+        }
+    };
+    let email_column = column("email")?.ok_or_else(|| Error::new("CSV has no email column"))?;
+    let machine_column = column("computer")?;
+    let mut rows = Vec::new();
+    for (index, row) in csv.rows.iter().enumerate() {
+        if row.iter().all(|cell| !nonempty(cell)) {
+            continue;
+        }
+        let email = row.get(email_column).map(|s| s.trim()).filter(|email| {
+            crate::contacts::validate("email-addresses", &json!({"address":email})).is_ok()
+        });
+        let machine_slot = machine_column
+            .and_then(|column| row.get(column))
+            .map(|s| s.trim())
+            .filter(|label| crate::machines::Slot::parse(label).is_ok());
+        let mut providers = Vec::new();
+        let mut unresolved = Vec::new();
+        for (column, cell) in row.iter().enumerate() {
+            if !nonempty(cell) {
+                continue;
+            }
+            if let Some(provider) = csv.headers.get(column).and_then(|h| provider(h)) {
+                providers.push(json!({"provider":provider,"column":column+1,"presence_marker":cell.trim()=="1"}));
+            }
+            if !(column == email_column && email.is_some()
+                || Some(column) == machine_column && machine_slot.is_some())
+            {
+                unresolved.push(column + 1);
+            }
+        }
+        rows.push(
+            json!({"record":index+2,"email":email,"email_column":email_column+1,
+            "machine_slot_hint":machine_slot,"machine_column":machine_column.map(|c|c+1),
+            "providers":providers,"unclassified_columns":unresolved}),
+        );
+    }
+    Ok(
+        json!({"schema":1,"source_sha256":hex::encode_lower(&csv.digest),
+        "records":csv.rows.len(),"rows":rows}),
+    )
 }
 
 /// Inspect shapes/counts only. Never prints cells, addresses, phones or payment values.

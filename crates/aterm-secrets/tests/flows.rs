@@ -315,9 +315,7 @@ fn a_lan_vault_from_create_to_revoke() {
 
     {
         let admin_vault = client::admin_open(&admin).expect("open");
-        let mut doc = admin_vault.doc.clone();
-        assert!(doc.remove_machine("mb", false).expect("remove"));
-        client::admin_publish(&admin, &admin_vault, &doc).expect("publish");
+        client::admin_revoke(&admin, &admin_vault, "mb", false).expect("revoke");
     }
     assert_eq!(
         client::sync(&machine, None).expect("sync"),
@@ -443,7 +441,7 @@ fn the_server_and_every_reader_refuse_a_key_the_vault_never_endorsed() {
 fn removing_an_admin_rotates_the_key_and_every_machine_re_pins() {
     let lab = Lab::new("rotating");
     let admin = lab.home("ma");
-    let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
+    let created = client::test_create_unbound(&admin, &lab.url, None, Some("ma")).expect("create");
     let machine = lab.home("mb");
     join_unattended(&machine, &format!("{}#{}", lab.url, created.signer), "mb").expect("join");
     approve_all(&admin);
@@ -530,9 +528,9 @@ fn a_signed_vault_at_a_path_needs_no_server() {
     doc.set_open(true).expect("open");
     client::admin_publish(&admin, &vault, &doc).expect("publish");
     let vault = client::admin_open(&admin).expect("open");
-    let mut doc = vault.doc.clone();
-    assert!(doc.remove_machine("mb", false).expect("remove"));
-    let gone = client::admin_publish(&admin, &vault, &doc).expect("publish");
+    let gone = client::admin_revoke(&admin, &vault, "mb", false)
+        .expect("revoke")
+        .published;
     assert!(gone.kept_out);
     assert!(
         !gone.queued,
@@ -745,9 +743,9 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
 
     let open = client::admin_open(&admin).expect("open");
     let mb = recipient_of(&open.doc, "mb");
-    let mut doc = open.doc.clone();
-    assert!(doc.remove_machine("mb", false).expect("remove"));
-    let gone = client::admin_publish(&admin, &open, &doc).expect("publish");
+    let gone = client::admin_revoke(&admin, &open, "mb", false)
+        .expect("revoke")
+        .published;
     assert!(gone.kept_out && !gone.password_renewed && gone.held.is_empty());
     assert!(gone.queued, "a served vault's approver reads its queue");
     let kept = client::admin_open(&admin).expect("open").doc.clone();
@@ -853,9 +851,9 @@ fn letting_a_machine_go_renews_the_join_password_so_it_is_not_let_in_again() {
 
     let open = client::admin_open(&admin).expect("open");
     let mb = recipient_of(&open.doc, "mb");
-    let mut doc = open.doc.clone();
-    assert!(doc.remove_machine("mb", false).expect("remove"));
-    let done = client::admin_publish(&admin, &open, &doc).expect("publish");
+    let done = client::admin_revoke(&admin, &open, "mb", false)
+        .expect("revoke")
+        .published;
     assert!(done.password_renewed && !done.kept_out && done.held.is_empty());
     let renewed = client::admin_open(&admin)
         .expect("open")
@@ -957,7 +955,7 @@ fn a_join_whose_subscriber_applied_the_approval_first_is_done() {
 fn removing_an_admin_by_any_publish_rotates_and_later_versions_carry_the_handoff() {
     let lab = Lab::new("handoff");
     let admin = lab.home("ma");
-    let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
+    let created = client::test_create_unbound(&admin, &lab.url, None, Some("ma")).expect("create");
     let pinned = format!("{}#{}", lab.url, created.signer);
     let second = lab.home("mb");
     let asleep = lab.home("mc");
@@ -1141,7 +1139,7 @@ fn held(paths: &Paths) -> u64 {
 fn removing_an_admin_renews_the_join_password_it_read() {
     let lab = Lab::new("demote");
     let admin = lab.home("ma");
-    let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
+    let created = client::test_create_unbound(&admin, &lab.url, None, Some("ma")).expect("create");
     let password = client::admin_open(&admin)
         .expect("open")
         .doc
@@ -1492,9 +1490,9 @@ fn an_edit_that_lands_after_a_revocation_keeps_the_machine_out() {
     let base = began.doc.clone();
     {
         let other = client::admin_open(&admin).expect("open");
-        let mut doc = other.doc.clone();
-        assert!(doc.remove_machine("mb", false).expect("remove"));
-        let done = client::admin_publish(&admin, &other, &doc).expect("revoke");
+        let done = client::admin_revoke(&admin, &other, "mb", false)
+            .expect("revoke")
+            .published;
         assert!(done.password_renewed);
     }
     let mut edited = base.clone();
@@ -1573,9 +1571,7 @@ fn a_revoked_machine_that_joins_again_waits_and_asks_again() {
     applied(client::sync(&machine, None).expect("sync"));
     {
         let vault = client::admin_open(&admin).expect("open");
-        let mut doc = vault.doc.clone();
-        assert!(doc.remove_machine("mb", false).expect("remove"));
-        client::admin_publish(&admin, &vault, &doc).expect("publish");
+        client::admin_revoke(&admin, &vault, "mb", false).expect("revoke");
     }
     assert_eq!(
         client::sync(&machine, None).expect("sync"),

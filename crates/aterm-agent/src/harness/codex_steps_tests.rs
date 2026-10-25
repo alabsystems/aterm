@@ -536,6 +536,11 @@ fn every_committed_codex_reduction_folds_whole() {
         let text = std::fs::read_to_string(e.path()).expect("a reduction");
         let header = text.lines().next().unwrap_or("");
         let build = build_of(&name, header).unwrap_or_else(|| panic!("{name}: {header}"));
+        assert_eq!(
+            CODEX_MEASURED_BUILDS.contains(&build),
+            rollout_reduction_stem(build).starts_with("codex-alab-"),
+            "{name}: build.rs lists every codex-alab build a reduction names, and no other"
+        );
         let metas = rows(&text).filter(|r| r.contains("\"type\":\"session_meta\""));
         for m in metas {
             assert!(
@@ -1080,6 +1085,63 @@ fn rollout_says(text: &str, release: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// What the standing check holds the leg `name` (`text`) of the measured `build` to: the fold
+/// whole and `On`, equal to the rollout's own account, and, where `build` has a golden, exactly
+/// that golden (or, for a shape-only one, its shapes). The steps the fold read past its bind.
+fn leg_holds(build: &str, name: &str, text: &str) -> Result<Vec<String>, String> {
+    let release = log_build(build).ok_or_else(|| format!("{build}: no log id"))?;
+    let batch = fold(text);
+    let read = saids(&batch);
+    if read.first().map(String::as_str) != Some("bind 0") {
+        return Err(format!("{name}: no bind first: {read:?}"));
+    }
+    if (batch.lost, batch.overflow) != (0, 0) {
+        return Err(format!(
+            "{name}: lost {} and overflowed {}",
+            batch.lost, batch.overflow
+        ));
+    }
+    if !batch.steps[1..].iter().all(|s| s.state == StepState::On) {
+        return Err(format!("{name}: a step of a measured build is not On"));
+    }
+    let own = rollout_says(text, release.as_str())?;
+    if !own.iter().any(|s| s.starts_with("model ")) {
+        return Err(format!("{name}: the rollout names no model"));
+    }
+    if read[1..] != own {
+        return Err(format!(
+            "{name}: the fold is not the rollout's own account: {:?} where it says {own:?}",
+            &read[1..]
+        ));
+    }
+    if let Some((_, goldens, exact)) = GOLDENS.iter().find(|(b, ..)| *b == build) {
+        let stem = format!("{}-", rollout_reduction_stem(build));
+        let leg = name
+            .strip_prefix(&stem)
+            .and_then(|r| r.strip_suffix(".jsonl"))
+            .ok_or_else(|| format!("{name} is no leg of {build}"))?;
+        let want = goldens
+            .iter()
+            .find(|(l, _)| *l == leg)
+            .map(|(_, w)| *w)
+            .ok_or_else(|| format!("{name}: {build}'s golden has no leg {leg}"))?;
+        if *exact && read[1..] != *want {
+            return Err(format!(
+                "{name}: the fold read {:?} where the exact golden says {want:?}",
+                &read[1..]
+            ));
+        }
+        let wanted: Vec<String> = want.iter().map(|s| shape(s)).collect();
+        let shapes: Vec<String> = read[1..].iter().map(|s| shape(s)).collect();
+        if shapes != wanted {
+            return Err(format!(
+                "{name}: the fold's shapes {shapes:?} where the golden's are {wanted:?}"
+            ));
+        }
+    }
+    Ok(read[1..].to_vec())
+}
+
 #[test]
 fn the_codex_alab_legs_fold_exact() {
     let mut kinds = std::collections::BTreeSet::new();
@@ -1089,46 +1151,10 @@ fn the_codex_alab_legs_fold_exact() {
             !legs.is_empty(),
             "{build} is named, and no reduction of it is"
         );
-        let release = log_build(build).expect("an id");
-        let stem = format!("{}-", rollout_reduction_stem(build));
         let golden = GOLDENS.iter().find(|(b, ..)| *b == build);
         for (name, text) in &legs {
-            let batch = fold(text);
-            let read = saids(&batch);
-            assert_eq!(read[0], "bind 0", "{name}");
-            assert_eq!((batch.lost, batch.overflow), (0, 0), "{name}");
-            assert!(
-                batch.steps[1..].iter().all(|s| s.state == StepState::On),
-                "{name}: a step of a measured build is not On"
-            );
-            let own = rollout_says(text, release.as_str()).expect("read");
-            assert!(
-                own.iter().any(|s| s.starts_with("model ")),
-                "{name}: the rollout names its model"
-            );
-            assert_eq!(
-                read[1..],
-                own,
-                "{name}: the fold is not the rollout's own account"
-            );
-            if let Some((_, goldens, exact)) = golden {
-                let leg = name
-                    .strip_prefix(&stem)
-                    .and_then(|r| r.strip_suffix(".jsonl"))
-                    .unwrap_or_else(|| panic!("{name} is a leg of {build}"));
-                let want = goldens
-                    .iter()
-                    .find(|(l, _)| *l == leg)
-                    .map(|(_, w)| *w)
-                    .unwrap_or_else(|| panic!("{name}: {build}'s golden has no leg {leg}"));
-                if *exact {
-                    assert_eq!(read[1..], *want, "{name}");
-                }
-                let wanted: Vec<String> = want.iter().map(|s| shape(s)).collect();
-                let shapes: Vec<String> = read[1..].iter().map(|s| shape(s)).collect();
-                assert_eq!(shapes, wanted, "{name}");
-            }
-            for s in &read[1..] {
+            let read = leg_holds(build, name, text).unwrap_or_else(|e| panic!("{e}"));
+            for s in &read {
                 kinds.insert(s.split(' ').next().unwrap_or("").to_string());
             }
         }
@@ -1178,6 +1204,40 @@ fn the_codex_alab_legs_fold_exact() {
             .all(|s| s.state == StepState::Partial)
     );
     assert!(saids(&batch).contains(&"model gpt-5.5 - 0.164.0-dev.12522".to_string()));
+}
+
+/// NC4, standing: a moved `duration_ms` is read by the fold and by the rollout's own account
+/// alike (both read the number the row holds), and the reducer keeps numbers, so only an exact
+/// golden sees it. The standing check ([`leg_holds`], what `the_codex_alab_legs_fold_exact`
+/// holds every committed leg to) refuses it on 12521's exact golden, and a shape-only one could
+/// not.
+#[test]
+fn a_moved_duration_fails_the_exact_golden() {
+    let name = format!("{}-first.jsonl", rollout_reduction_stem(ALAB));
+    let first = alab_leg("first");
+    let moved = first.replacen("\"duration_ms\":64,", "\"duration_ms\":65,", 1);
+    assert_ne!(moved, first, "the plant took");
+    let golden = ALAB_LEGS
+        .iter()
+        .find(|(leg, _)| *leg == "first")
+        .map(|(_, want)| *want)
+        .expect("12521's first leg");
+    assert_eq!(
+        leg_holds(ALAB, &name, &first).expect("the committed leg holds"),
+        golden
+    );
+    let read = saids(&fold(&moved));
+    assert_eq!(
+        read[1..],
+        rollout_says(&moved, "0.164.0-dev.12521").expect("read"),
+        "the rollout's own account reads the moved number too"
+    );
+    let e = leg_holds(ALAB, &name, &moved).expect_err("the exact golden sees the moved duration");
+    assert!(e.contains("the exact golden says"), "{e}");
+    assert!(read.contains(&"end 65 1 1".to_string()), "{read:?}");
+    let shapes = |s: &[String]| s.iter().map(|s| shape(s)).collect::<Vec<_>>();
+    let wanted: Vec<String> = golden.iter().map(|s| shape(s)).collect();
+    assert_eq!(shapes(&read[1..]), wanted, "a shape-only golden cannot");
 }
 
 #[test]

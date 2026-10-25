@@ -1273,12 +1273,12 @@ impl ScanMemo {
     }
 
     #[inline]
-    fn pool_target(&self) -> usize {
+    const fn pool_target(&self) -> usize {
         #[cfg(test)]
         if self.no_recycle {
             return 0;
         }
-        self.gen_cap.max(1)
+        if self.gen_cap > 1 { self.gen_cap } else { 1 }
     }
 
     #[inline]
@@ -2274,12 +2274,14 @@ impl WordDecorations {
         let clearance = i32::from(dest_w)
             .max(i32::from(nat_w))
             .saturating_add(i32::from(geom.cell_w).saturating_mul(2));
-        let lift = |q: f32| (0.18 * f32::from(geom.cell_h) * 4.0 * q * (1.0 - q)).round() as i32;
-        let lerp_px = |a: i32, b: i32, q: f32| {
-            (f64::from(a) + (f64::from(b) - f64::from(a)) * f64::from(q))
+        const fn lift(cell_h: u16, q: f32) -> i32 {
+            (0.18 * (cell_h as f32) * 4.0 * q * (1.0 - q)).round() as i32
+        }
+        const fn lerp_px(a: i32, b: i32, q: f32) -> i32 {
+            ((a as f64) + ((b as f64) - (a as f64)) * (q as f64))
                 .round()
-                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
-        };
+                .clamp(i32::MIN as f64, i32::MAX as f64) as i32
+        }
         let (sprite_x, sprite_y) = match placement.leg {
             KittyCursorPlacementLeg::Settled => match placement.sampled_at {
                 None => (target_x, target_y),
@@ -2309,7 +2311,8 @@ impl WordDecorations {
                                 .unwrap_or(0.0)
                                 .min(0.1);
                             if dt > 0.0 && (px != rest.0 || py != rest.1) {
-                                let alpha = 1.0 - (-dt / Self::PLACE_TAU).exp();
+                                const INV_PLACE_TAU: f32 = 1.0 / WordDecorations::PLACE_TAU;
+                                let alpha = 1.0 - (-dt * INV_PLACE_TAU).exp();
                                 px += (rest.0 - px) * alpha;
                                 py += (rest.1 - py) * alpha;
                             }
@@ -2348,7 +2351,7 @@ impl WordDecorations {
                 };
                 (
                     lerp_px(start_x, end_x, eased),
-                    lerp_px(start_y, from_y, eased).saturating_sub(lift(eased)),
+                    lerp_px(start_y, from_y, eased).saturating_sub(lift(geom.cell_h, eased)),
                 )
             }
             KittyCursorPlacementLeg::Enter { direction, eased } => {
@@ -2363,7 +2366,7 @@ impl WordDecorations {
                 };
                 (
                     lerp_px(start_x, target_x, eased),
-                    target_y.saturating_sub(lift(eased)),
+                    target_y.saturating_sub(lift(geom.cell_h, eased)),
                 )
             }
         };
@@ -2516,12 +2519,13 @@ impl WordDecorations {
                 sprite.x + i32::from(sprite.w)
             };
             let mouth_y = sprite.y + i32::from(sprite.h) / 2;
+            const INV_255: f32 = 1.0 / 255.0;
             let note_dir = if flip_x { -1.0 } else { 1.0 };
-            let alpha_f = f32::from(alpha);
+            let alpha_scale = f32::from(alpha) * INV_255 * sing;
             let cw_f = f32::from(geom.cell_w);
             let ch_f = f32::from(geom.cell_h);
             for note in notes.iter().flatten() {
-                let a = (f32::from(note.alpha) * alpha_f / 255.0 * sing) as u8;
+                let a = (f32::from(note.alpha) * alpha_scale) as u8;
                 if a == 0 {
                     continue;
                 }
@@ -2669,12 +2673,13 @@ impl WordDecorations {
         let mut mote_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_MOTES_MAX] =
             [const { None }; crate::kitty_pet::PET_MOTES_MAX];
         if pet.alpha > 0 {
-            let pet_alpha_f = f32::from(pet.alpha);
+            const INV_255: f32 = 1.0 / 255.0;
+            let pet_alpha_scale = f32::from(pet.alpha) * INV_255;
             let cell_dims = (geom.cell_w, geom.cell_h);
             let grid_dims = (geom.cols, geom.rows);
             let mut side = 0u16;
             for (slot, m) in mote_sprites.iter_mut().zip(pet.motes.iter().flatten()) {
-                let alpha = (f32::from(m.alpha) * pet_alpha_f / 255.0) as u8;
+                let alpha = (f32::from(m.alpha) * pet_alpha_scale) as u8;
                 if alpha == 0 {
                     continue;
                 }
@@ -2761,7 +2766,21 @@ impl WordDecorations {
         (art, host): (&Arc<FxArt>, u64),
         live: &[Option<crate::kitty_pet::PetDepartureSprite>],
     ) {
-        let owned = |held: u32| live.iter().flatten().any(|d| d.id == held);
+        const fn departure_owned(
+            held: u32,
+            live: &[Option<crate::kitty_pet::PetDepartureSprite>],
+        ) -> bool {
+            let mut i = 0;
+            while i < live.len() {
+                if let Some(d) = &live[i]
+                    && d.id == held
+                {
+                    return true;
+                }
+                i += 1;
+            }
+            false
+        }
         let mut free_idx = None;
         for (i, slot) in self.pet_depart_tiles.iter_mut().enumerate() {
             match slot.as_ref() {
@@ -2771,7 +2790,7 @@ impl WordDecorations {
                     }
                     return;
                 }
-                Some((held, ..)) if free_idx.is_none() && !owned(*held) => {
+                Some((held, ..)) if free_idx.is_none() && !departure_owned(*held, live) => {
                     free_idx = Some(i);
                 }
                 None if free_idx.is_none() => {
@@ -2939,8 +2958,10 @@ impl WordDecorations {
     ];
 
     #[inline]
-    fn pet_mote_rot_bucket(rot: f32) -> u32 {
-        let turn = rot.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+    const fn pet_mote_rot_bucket(rot: f32) -> u32 {
+        const INV_TAU: f32 = 1.0 / std::f32::consts::TAU;
+        let u = rot * INV_TAU;
+        let turn = u - u.floor();
         ((turn * Self::PET_MOTE_ROT_BUCKETS as f32) as u32) % Self::PET_MOTE_ROT_BUCKETS
     }
 
@@ -4715,9 +4736,10 @@ impl WordDecorations {
                     }
                     let t = now.saturating_duration_since(occ.appeared).as_millis() as u64;
                     if t < GLOW_BURST_MS && out.len() < MAX_DECORATIONS {
+                        const INV_GLOW_BURST_MS: f32 = 1.0 / GLOW_BURST_MS as f32;
                         let until = occ.appeared + Duration::from_millis(GLOW_BURST_MS);
                         arm_until(&mut active_until, until);
-                        let e = (core::f32::consts::PI * t as f32 / GLOW_BURST_MS as f32)
+                        let e = (core::f32::consts::PI * (t as f32 * INV_GLOW_BURST_MS))
                             .sin()
                             .max(0.0);
                         let mid = occ.start_col + (occ.end_col - occ.start_col) / 2;
@@ -4789,10 +4811,11 @@ impl WordDecorations {
                         let f = if cfg.reduced_motion {
                             (!ep.is_some_and(|e| e.burst_done)).then_some(1.0f32)
                         } else if t < cfg.anim_ms + RESIDUAL_FADE_MS {
+                            const INV_RESIDUAL_FADE_MS: f32 = 1.0 / RESIDUAL_FADE_MS as f32;
                             let until = occ.appeared
                                 + Duration::from_millis(cfg.anim_ms + RESIDUAL_FADE_MS);
                             arm_until(&mut active_until, until);
-                            Some(1.0 - (t - cfg.anim_ms) as f32 / RESIDUAL_FADE_MS as f32)
+                            Some(1.0 - (t - cfg.anim_ms) as f32 * INV_RESIDUAL_FADE_MS)
                         } else {
                             None
                         };
@@ -5543,7 +5566,8 @@ fn emit_nova_axis(
                 let end = s + Duration::from_millis(u64::from(nova_duration_ms(occ.genome.gkey)));
                 let t = now.saturating_duration_since(end).as_millis() as u64;
                 (t < RESIDUAL_FADE_MS).then(|| {
-                    let f = 1.0 - t as f32 / RESIDUAL_FADE_MS as f32;
+                    const INV_RESIDUAL_FADE_MS: f32 = 1.0 / RESIDUAL_FADE_MS as f32;
+                    let f = 1.0 - t as f32 * INV_RESIDUAL_FADE_MS;
                     let until = end + Duration::from_millis(RESIDUAL_FADE_MS);
                     arm_until(active_until, until);
                     f
@@ -5665,7 +5689,8 @@ fn emit_super_axis(
         if now >= end {
             let t = now.saturating_duration_since(end).as_millis() as u64;
             if t < RESIDUAL_FADE_MS {
-                let f = 1.0 - t as f32 / RESIDUAL_FADE_MS as f32;
+                const INV_RESIDUAL_FADE_MS: f32 = 1.0 / RESIDUAL_FADE_MS as f32;
+                let f = 1.0 - t as f32 * INV_RESIDUAL_FADE_MS;
                 let until = end + Duration::from_millis(RESIDUAL_FADE_MS);
                 arm_until(active_until, until);
                 let d = WordDecoration {
@@ -5816,13 +5841,15 @@ fn ink_fx(
             continue;
         }
         let t = now.saturating_duration_since(s.start).as_millis() as u64;
+        const INV_CHARGE_END_MS: f32 = 1.0 / supernova::CHARGE_END_MS as f32;
+        const INV_DETONATION_FADE_MS: f32 =
+            1.0 / (supernova::DEBRIS_START_MS - supernova::DETONATION_END_MS) as f32;
         let lift = if t < supernova::CHARGE_END_MS {
-            t as f32 / supernova::CHARGE_END_MS as f32
+            t as f32 * INV_CHARGE_END_MS
         } else if t < supernova::DETONATION_END_MS {
             1.0
         } else if t < supernova::DEBRIS_START_MS {
-            1.0 - (t - supernova::DETONATION_END_MS) as f32
-                / (supernova::DEBRIS_START_MS - supernova::DETONATION_END_MS) as f32
+            1.0 - (t - supernova::DETONATION_END_MS) as f32 * INV_DETONATION_FADE_MS
         } else {
             0.0
         };
@@ -5930,7 +5957,8 @@ const fn authored_cat_size(variant: CatGlyphId, desired_h: f32, cell_h: u16) -> 
 
 #[inline]
 const fn fit_glyph(glyph: &GlyphDef, desired_h: f32, max_w: u16, cell_h: u16) -> (u16, u16) {
-    let aspect = ((glyph.aspect_x1000 as f32) / 1000.0).max(0.001);
+    const INV_1000: f32 = 1.0 / 1000.0;
+    let aspect = ((glyph.aspect_x1000 as f32) * INV_1000).max(0.001);
     let max_w = (if max_w > 1 { max_w } else { 1 }) as f32;
     let ch2 = cell_h.saturating_mul(2);
     let max_h = (if ch2 > 1 { ch2 } else { 1 }) as f32;
@@ -5991,11 +6019,12 @@ const fn anchored_geom(
     (w, hart): (u16, u16),
     glyph: &GlyphDef,
 ) -> CatGeom {
+    const INV_FIXED_ONE: f32 = 1.0 / (FIXED_ONE as f32);
     let cw = geom.cell_w as i32;
     let w_i = w as i32;
     let grid_w = (geom.cols as i32) * cw;
     let mid = ((start_col as i32) * cw + ((end_col as i32) + 1) * cw) / 2;
-    let center = (glyph.center_x as f32) / (FIXED_ONE as f32);
+    let center = (glyph.center_x as f32) * INV_FIXED_ONE;
     let max_x = if grid_w > w_i { grid_w - w_i } else { 0 };
     let raw_x = mid - (center * (w as f32)).round() as i32;
     let x = if raw_x < 0 {
@@ -6067,7 +6096,7 @@ const fn ease_in_out_cubic(p: f32) -> f32 {
         4.0 * p * p * p
     } else {
         let u = -2.0 * p + 2.0;
-        1.0 - u * u * u / 2.0
+        1.0 - u * u * u * 0.5
     }
 }
 
@@ -6156,14 +6185,18 @@ impl CatIdlePose {
     };
 
     #[inline]
-    fn breathing(td_ms: u64, gkey: u64, cell_h: u16) -> Self {
-        let amp = (f32::from(cell_h) * 0.06).clamp(1.0, 2.0);
-        let bob_s = 1.5 + (gkey & 0x3f) as f32 / 63.0 * 0.6;
-        let sway_s = 2.4 + ((gkey >> 6) & 0x3f) as f32 / 63.0 * 0.8;
-        let phase = ((gkey >> 12) & 0xff) as f32 / 255.0;
-        let t = td_ms as f32 / 1000.0;
-        let bob = ((t / bob_s + phase) * core::f32::consts::TAU).sin();
-        let sway = ((t / sway_s + phase) * core::f32::consts::TAU).sin();
+    const fn breathing(td_ms: u64, gkey: u64, cell_h: u16) -> Self {
+        const INV_63: f32 = 1.0 / 63.0;
+        const INV_255: f32 = 1.0 / 255.0;
+        const INV_1000: f32 = 1.0 / 1000.0;
+        let amp = (cell_h as f32 * 0.06).clamp(1.0, 2.0);
+        let bob_s = 1.5 + (gkey & 0x3f) as f32 * INV_63 * 0.6;
+        let sway_s = 2.4 + ((gkey >> 6) & 0x3f) as f32 * INV_63 * 0.8;
+        let phase = ((gkey >> 12) & 0xff) as f32 * INV_255;
+        let t = td_ms as f32 * INV_1000;
+        let (bob, _) = crate::supernova::sin_cos_f32((t / bob_s + phase) * core::f32::consts::TAU);
+        let (sway, _) =
+            crate::supernova::sin_cos_f32((t / sway_s + phase) * core::f32::consts::TAU);
         Self {
             bob_px: (bob * amp).round() as i32,
             lead_px: (sway * amp * 0.8).round() as i32,
@@ -6444,8 +6477,11 @@ fn emit_peek<'a>(
     if !cfg.reduced_motion {
         *fp = fnv_mix_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
     }
+    const INV_CAT_RISE_MS: f32 = 1.0 / CAT_RISE_MS as f32;
+    const INV_CAT_DESCEND_MS: f32 = 1.0 / CAT_DESCEND_MS as f32;
+    const INV_CAT_BOUNCE_MS: f32 = 1.0 / CAT_BOUNCE_MS as f32;
     let p = if in_rise {
-        t as f32 / CAT_RISE_MS as f32
+        t as f32 * INV_CAT_RISE_MS
     } else {
         1.0
     };
@@ -6462,7 +6498,7 @@ fn emit_peek<'a>(
             antic_lift = 2;
             rest
         } else {
-            let pd = (ta - antic) as f32 / CAT_DESCEND_MS as f32;
+            let pd = (ta - antic) as f32 * INV_CAT_DESCEND_MS;
             ((1.0 - ease_in_out_cubic(pd)) * rest as f32).round() as i32
         }
     };
@@ -6476,7 +6512,7 @@ fn emit_peek<'a>(
         .min(2 * ch - (i32::from(g.hart) - i32::from(g.chin)));
     let in_bounce = kitten && !cfg.reduced_motion && in_dwell && td < CAT_BOUNCE_MS;
     let bounce = if in_bounce {
-        let q = td as f32 / CAT_BOUNCE_MS as f32;
+        let q = td as f32 * INV_CAT_BOUNCE_MS;
         (2.0 * (std::f32::consts::PI * q).sin()).round() as i32
     } else {
         0
@@ -6548,42 +6584,32 @@ const fn nudged_ink_pair(class: Class, gkey: u64) -> Option<(u32, u32)> {
 }
 
 #[inline]
-fn feline_glow_env(t_ms: u64, window_ms: u64, amp: f32) -> f32 {
+const fn feline_glow_env(t_ms: u64, window_ms: u64, amp: f32) -> f32 {
     if t_ms >= window_ms {
         return 0.0;
     }
     let p = t_ms as f32 / window_ms as f32;
-    let carrier = 0.5 - 0.5 * (4.0 * core::f32::consts::PI * p).cos();
+    let (_, cos_p) = crate::supernova::sin_cos_f32(4.0 * core::f32::consts::PI * p);
+    let carrier = 0.5 - 0.5 * cos_p;
     amp * carrier * (1.0 - p)
 }
 
 const PAPER_GLOW_KEEP: f32 = 0.9;
 
 #[inline]
-const fn paper_glow_scale_with(
-    table: &crate::color_math::RelativeLuminanceTable,
-    fg: u32,
-    lit: u32,
-    lum_bg: f32,
-    amp: f32,
-) -> f32 {
-    let lum_fg = crate::color_math::relative_luminance_with(table, fg);
+const fn paper_glow_scale_lum(fg: u32, lit: u32, lum_bg: f32, amp: f32) -> f32 {
+    let lum_fg = relative_luminance(fg);
     if lum_bg <= lum_fg || amp <= 0.0 {
         return 1.0;
     }
     let floor = PAPER_GLOW_KEEP * (lum_bg + 0.05) / (lum_fg + 0.05);
     #[inline]
-    const fn reads_rgb(
-        table: &crate::color_math::RelativeLuminanceTable,
-        rgb: u32,
-        lum_bg: f32,
-        floor: f32,
-    ) -> bool {
-        let lum = crate::color_math::relative_luminance_with(table, rgb).min(lum_bg);
+    const fn reads_rgb(rgb: u32, lum_bg: f32, floor: f32) -> bool {
+        let lum = relative_luminance(rgb).min(lum_bg);
         (lum_bg + 0.05) / (lum + 0.05) >= floor
     }
     let mut hi_rgb = mix_rgb(fg, lit, amp);
-    if reads_rgb(table, hi_rgb, lum_bg, floor) {
+    if reads_rgb(hi_rgb, lum_bg, floor) {
         return 1.0;
     }
     let mut lo_rgb = fg & 0x00FF_FFFF;
@@ -6592,7 +6618,7 @@ const fn paper_glow_scale_with(
     while step < 12 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = mix_rgb(fg, lit, mid);
-        if mid_rgb == lo_rgb || (mid_rgb != hi_rgb && reads_rgb(table, mid_rgb, lum_bg, floor)) {
+        if mid_rgb == lo_rgb || (mid_rgb != hi_rgb && reads_rgb(mid_rgb, lum_bg, floor)) {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -6606,16 +6632,15 @@ const fn paper_glow_scale_with(
 
 #[cfg(test)]
 const fn paper_glow_scale(fg: u32, lit: u32, bg: u32, amp: f32) -> f32 {
-    let table = crate::color_math::relative_luminance_table();
-    let lum_bg = crate::color_math::relative_luminance_with(table, bg);
-    paper_glow_scale_with(table, fg, lit, lum_bg, amp)
+    paper_glow_scale_lum(fg, lit, relative_luminance(bg), amp)
 }
 
 /// §4.2 specular lobe at gradient position `u` for sweep center `center`:
 /// `smoothstep(1 − min(1, |u − center|/0.28))²` — 28% wide, 0 outside.
 #[inline]
 const fn spec_lobe(u: f32, center: f32) -> f32 {
-    let d = (u - center).abs() / 0.28;
+    const INV_LOBE_HALF_WIDTH: f32 = 1.0 / 0.28;
+    let d = (u - center).abs() * INV_LOBE_HALF_WIDTH;
     if d >= 1.0 {
         return 0.0;
     }
@@ -6668,8 +6693,7 @@ fn emit_ink(
             let frame_term = frame.wrapping_mul(0x9E37_79B1);
             let cols = &base_cols[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
             let fgs = &base_fg[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
-            let table = crate::color_math::relative_luminance_table();
-            let lum_bg = crate::color_math::relative_luminance_with(table, rgb3_to_u32(occ.ink_bg));
+            let lum_bg = relative_luminance(rgb3_to_u32(occ.ink_bg));
             let mut memo: Option<([u8; 3], [u8; 3])> = None;
             for (&col, &fg_rgb) in cols.iter().zip(fgs) {
                 let color = match memo {
@@ -6680,7 +6704,7 @@ fn emit_ink(
                         let v = u32_to_rgb3(mix_rgb(
                             fg,
                             lit,
-                            glow * paper_glow_scale_with(table, fg, lit, lum_bg, amp),
+                            glow * paper_glow_scale_lum(fg, lit, lum_bg, amp),
                         ));
                         memo = Some((fg_rgb, v));
                         v
@@ -6733,13 +6757,15 @@ fn emit_ink(
     let animating =
         !occ.inert && !fx.freeze && !cfg.reduced_motion && (ink_loop || t < sweep + INK_FADE_MS);
     let (center, glare) = if animating {
+        const INV_INK_RAMP_IN_MS: f32 = 1.0 / INK_RAMP_IN_MS as f32;
+        const INV_INK_FADE_MS: f32 = 1.0 / INK_FADE_MS as f32;
         let phase = if ink_loop { t % sweep } else { t };
         let center = -0.28 + 1.56 * (phase as f32 / sweep as f32);
-        let ramp_in = (t as f32 / INK_RAMP_IN_MS as f32).min(1.0);
+        let ramp_in = (t as f32 * INV_INK_RAMP_IN_MS).min(1.0);
         let ramp_out = if ink_loop || t < sweep {
             1.0
         } else {
-            1.0 - smoothstep((t - sweep) as f32 / INK_FADE_MS as f32)
+            1.0 - smoothstep((t - sweep) as f32 * INV_INK_FADE_MS)
         };
         (center, 0.65 * ramp_in * ramp_out)
     } else {
@@ -6751,15 +6777,13 @@ fn emit_ink(
     } else {
         mid_base
     };
-    let lum_table = crate::color_math::relative_luminance_table();
     let strength = legible_strength(
-        lum_table,
         cfg.ink_strength,
         rgb3_to_u32(base_fg[occ.ink_base]),
         &[mid_raw],
-        crate::color_math::relative_luminance_with(lum_table, rgb3_to_u32(occ.ink_bg)),
+        relative_luminance(rgb3_to_u32(occ.ink_bg)),
     );
-    let span = f32::from(occ.end_col.saturating_sub(occ.start_col)).max(1.0);
+    let inv_span = 1.0 / f32::from(occ.end_col.saturating_sub(occ.start_col)).max(1.0);
     let fold_frame = animating || fx.frame_live;
     let frame_term = frame.wrapping_mul(0x9E37_79B1);
     let cols = &base_cols[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
@@ -6772,7 +6796,7 @@ fn emit_ink(
     let has_dim = dim < 1.0;
     for (&col, &fg_rgb) in cols.iter().zip(fgs) {
         let mut color = if has_strength {
-            let u = f32::from(col.saturating_sub(start_col)) / span;
+            let u = f32::from(col.saturating_sub(start_col)) * inv_span;
             let base = mix_rgb(c0, c1, u);
             let raw = if has_glare {
                 let lobe = glare * spec_lobe(u, center);
@@ -6812,29 +6836,18 @@ fn emit_ink(
     }
 }
 
-const fn legible_strength(
-    table: &crate::color_math::RelativeLuminanceTable,
-    ink_strength: f32,
-    fg_first: u32,
-    samples: &[u32],
-    lum_bg: f32,
-) -> f32 {
+const fn legible_strength(ink_strength: f32, fg_first: u32, samples: &[u32], lum_bg: f32) -> f32 {
     #[inline]
-    const fn contrast(
-        table: &crate::color_math::RelativeLuminanceTable,
-        c: u32,
-        lum_bg: f32,
-    ) -> f32 {
-        let la = crate::color_math::relative_luminance_with(table, c);
+    const fn contrast(c: u32, lum_bg: f32) -> f32 {
+        let la = relative_luminance(c);
         (la.max(lum_bg) + 0.05) / (la.min(lum_bg) + 0.05)
     }
-    let step = ink_strength.clamp(0.0, 1.0) / 8.0;
     let mut strength = ink_strength.clamp(0.0, 1.0);
+    let step = strength * 0.125;
     'guard: while strength > 0.0 {
         let mut idx = 0;
         while idx < samples.len() {
-            if contrast(table, mix_rgb(fg_first, samples[idx], strength), lum_bg) < MIN_INK_CONTRAST
-            {
+            if contrast(mix_rgb(fg_first, samples[idx], strength), lum_bg) < MIN_INK_CONTRAST {
                 strength = (strength - step).max(0.0);
                 continue 'guard;
             }
@@ -6862,8 +6875,7 @@ fn emit_rainbow_ink(
     fp: &mut u64,
     active_until: &mut Option<Instant>,
 ) {
-    let lum_table = crate::color_math::relative_luminance_table();
-    let lum_bg = crate::color_math::relative_luminance_with(lum_table, rgb3_to_u32(occ.ink_bg));
+    let lum_bg = relative_luminance(rgb3_to_u32(occ.ink_bg));
     let (sat, val) = if lum_bg > 0.5 {
         (1.0, 0.62)
     } else {
@@ -6895,13 +6907,12 @@ fn emit_rainbow_ink(
         )
     };
     let strength = legible_strength(
-        lum_table,
         cfg.ink_strength,
         rgb3_to_u32(base_fg[occ.ink_base]),
         &guard_hues[..guard_len],
         lum_bg,
     );
-    let denom = f32::from(occ.ink_cells.saturating_sub(1)).max(1.0);
+    let inv_denom = 1.0 / f32::from(occ.ink_cells.saturating_sub(1)).max(1.0);
     let lift_target = if lum_bg > 0.5 {
         0x000A_0A10
     } else {
@@ -6927,7 +6938,7 @@ fn emit_rainbow_ink(
             } else if i + 1 == cols_len {
                 guard_hues[3]
             } else {
-                hue_at(i as f32 / denom)
+                hue_at(i as f32 * inv_denom)
             };
             mix_rgb(rgb3_to_u32(fg_rgb), target, strength)
         } else {
@@ -6977,20 +6988,21 @@ fn emit_rainbow_sparkles(
     if t >= RAINBOW_SPARKLE_MS {
         return;
     }
-    let p = t as f32 / RAINBOW_SPARKLE_MS as f32;
+    const INV_RAINBOW_SPARKLE_MS: f32 = 1.0 / RAINBOW_SPARKLE_MS as f32;
+    let p = t as f32 * INV_RAINBOW_SPARKLE_MS;
     let envelope = (core::f32::consts::PI * p).sin().max(0.0);
     let width = occ.end_col.saturating_sub(occ.start_col).max(1);
     let base_hue = rainbow_base_hue(occ.genome.gkey);
     let lift = ((i32::from(geom.cell_h).max(8) / 3).min(127)) as i8;
     let count = 3usize.min(MAX_DECORATIONS.saturating_sub(out.len()));
-    let denom = (count.saturating_sub(1).max(1)) as f32;
+    let inv_denom = 1.0 / (count.saturating_sub(1).max(1)) as f32;
     let p_tau = p * 4.0 * core::f32::consts::TAU;
     let seed_phase = (occ.seed & 0xff) as f32 * 0.013;
     let width_f = f32::from(width);
     let env_intensity = cfg.intensity * envelope;
     let hue_drift = 45.0 * p;
     for i in 0..count {
-        let u = i as f32 / denom;
+        let u = i as f32 * inv_denom;
         let phase = p_tau + i as f32 * 2.094 + seed_phase;
         let (sin_p, cos_p) = phase.sin_cos();
         let shimmer = 0.62 + 0.38 * sin_p.abs();
@@ -7040,50 +7052,83 @@ pub(crate) const fn rgb3_to_u32(c: [u8; 3]) -> u32 {
     ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32)
 }
 
-fn cat_color_context(cells: &[RenderCell], start: u16, end: u16) -> CatColorKey {
-    if cells.is_empty() {
-        return CatColorKey::default();
-    }
-    let start = usize::from(start).min(cells.len().saturating_sub(1));
-    let end = usize::from(end).min(cells.len().saturating_sub(1));
-    let Some(principal) = cells
-        .get(start..=end)
-        .and_then(|span| span.iter().find(|cell| !cell.wide))
-        .copied()
-    else {
-        return CatColorKey::default();
-    };
-
-    let mut sum = [
-        u32::from(principal.fg[0]),
-        u32::from(principal.fg[1]),
-        u32::from(principal.fg[2]),
-    ];
-    let mut count = 1u32;
-    let lo = start.saturating_sub(4);
-    let hi = end.saturating_add(4).min(cells.len().saturating_sub(1));
-    for cell in cells[lo..start].iter().chain(&cells[end + 1..hi + 1]) {
-        if cell.wide
-            || cell.ch == ' '
-            || cell.ch == '\0'
-            || (if cell.ch.is_ascii() {
-                cell.ch.is_ascii_whitespace()
-            } else {
-                cell.ch.is_whitespace()
-            })
-        {
-            continue;
-        }
-        sum[0] += u32::from(cell.fg[0]);
-        sum[1] += u32::from(cell.fg[1]);
-        sum[2] += u32::from(cell.fg[2]);
-        count += 1;
-    }
-    let surrounding = [
+#[inline]
+pub(crate) const fn avg_rgb(sum: [u32; 3], count: u32) -> [u8; 3] {
+    [
         (sum[0] / count) as u8,
         (sum[1] / count) as u8,
         (sum[2] / count) as u8,
+    ]
+}
+
+#[inline]
+pub(crate) const fn is_ink_char(ch: char) -> bool {
+    ch != ' '
+        && ch != '\0'
+        && !(if ch.is_ascii() {
+            ch.is_ascii_whitespace()
+        } else {
+            ch.is_whitespace()
+        })
+}
+
+const fn cat_color_context(cells: &[RenderCell], start: u16, end: u16) -> CatColorKey {
+    if cells.is_empty() {
+        return CatColorKey::DEFAULT;
+    }
+    let last = cells.len() - 1;
+    let start_u = start as usize;
+    let end_u = end as usize;
+    let start = if start_u < last { start_u } else { last };
+    let end = if end_u < last { end_u } else { last };
+    if start > end {
+        return CatColorKey::DEFAULT;
+    }
+    let mut principal = None;
+    let mut idx = start;
+    while idx <= end {
+        if !cells[idx].wide {
+            principal = Some(cells[idx]);
+            break;
+        }
+        idx += 1;
+    }
+    let Some(principal) = principal else {
+        return CatColorKey::DEFAULT;
+    };
+
+    let mut sum = [
+        principal.fg[0] as u32,
+        principal.fg[1] as u32,
+        principal.fg[2] as u32,
     ];
+    let mut count = 1u32;
+    let lo = start.saturating_sub(4);
+    let hi_cand = end.saturating_add(4);
+    let hi = if hi_cand < last { hi_cand } else { last };
+    let mut i = lo;
+    while i < start {
+        let cell = &cells[i];
+        if !cell.wide && is_ink_char(cell.ch) {
+            sum[0] += cell.fg[0] as u32;
+            sum[1] += cell.fg[1] as u32;
+            sum[2] += cell.fg[2] as u32;
+            count += 1;
+        }
+        i += 1;
+    }
+    let mut i = end + 1;
+    while i <= hi {
+        let cell = &cells[i];
+        if !cell.wide && is_ink_char(cell.ch) {
+            sum[0] += cell.fg[0] as u32;
+            sum[1] += cell.fg[1] as u32;
+            sum[2] += cell.fg[2] as u32;
+            count += 1;
+        }
+        i += 1;
+    }
+    let surrounding = avg_rgb(sum, count);
     CatColorKey::from_rgb(
         rgb3_to_u32(principal.bg),
         rgb3_to_u32(principal.fg),
@@ -7095,7 +7140,7 @@ fn cat_color_context(cells: &[RenderCell], start: u16, end: u16) -> CatColorKey 
     clippy::too_many_arguments,
     reason = "the cold sampler receives one resolved occurrence span plus its immutable frame surface"
 )]
-fn cat_color_context_footprint(
+const fn cat_color_context_footprint(
     cells: &[Vec<RenderCell>],
     geom: EffectGeom,
     row: u16,
@@ -7107,37 +7152,64 @@ fn cat_color_context_footprint(
 ) -> CatColorKey {
     const MAX_SAMPLES: u32 = 64;
     if geom.cell_w == 0 || geom.cell_h == 0 || cells.is_empty() {
-        return CatColorKey::default();
+        return CatColorKey::DEFAULT;
     }
-    let Some(principal) = cells
-        .get(usize::from(row))
-        .and_then(|line| {
-            let lo = usize::from(start).min(line.len().saturating_sub(1));
-            let hi = usize::from(end).min(line.len().saturating_sub(1));
-            line.get(lo..=hi)
-        })
-        .and_then(|span| span.iter().find(|cell| !cell.wide))
-    else {
-        return CatColorKey::default();
+    let row_u = row as usize;
+    if row_u >= cells.len() {
+        return CatColorKey::DEFAULT;
+    }
+    let row_line = cells[row_u].as_slice();
+    if row_line.is_empty() {
+        return CatColorKey::DEFAULT;
+    }
+    let last_col = row_line.len() - 1;
+    let lo_u = start as usize;
+    let hi_u = end as usize;
+    let lo = if lo_u < last_col { lo_u } else { last_col };
+    let hi = if hi_u < last_col { hi_u } else { last_col };
+    if lo > hi {
+        return CatColorKey::DEFAULT;
+    }
+    let mut principal = None;
+    let mut idx = lo;
+    while idx <= hi {
+        if !row_line[idx].wide {
+            principal = Some(&row_line[idx]);
+            break;
+        }
+        idx += 1;
+    }
+    let Some(principal) = principal else {
+        return CatColorKey::DEFAULT;
     };
-    let special = feline_magic
-        .then(|| special_variant_v4(genome.magic))
-        .flatten();
-    let variant = special.unwrap_or_else(|| cat_variant_v4(genome.gkey));
+    let variant = if feline_magic && let Some(v) = special_variant_v4(genome.magic) {
+        v
+    } else {
+        cat_variant_v4(genome.gkey)
+    };
     let g = cat_geometry_for(start, end, genome.gkey, geom, variant);
-    let cw = i64::from(geom.cell_w);
-    let ch = i64::from(geom.cell_h);
-    let x0 = i64::from(g.x);
-    let x1 = (x0 + i64::from(g.w)).min(i64::from(geom.cols) * cw);
-    let y0 = (i64::from(row) * ch + i64::from(g.chin) - i64::from(g.hart)).max(0);
-    let y1 = (i64::from(row) * ch + i64::from(g.chin)).min(i64::from(geom.rows) * ch);
+    let cw = geom.cell_w as i64;
+    let ch = geom.cell_h as i64;
+    let x0 = g.x as i64;
+    let x1_max = (geom.cols as i64) * cw;
+    let x1_cand = x0 + (g.w as i64);
+    let x1 = if x1_cand < x1_max { x1_cand } else { x1_max };
+    let y0_cand = (row as i64) * ch + (g.chin as i64) - (g.hart as i64);
+    let y0 = if y0_cand > 0 { y0_cand } else { 0 };
+    let y1_max = (geom.rows as i64) * ch;
+    let y1_cand = (row as i64) * ch + (g.chin as i64);
+    let y1 = if y1_cand < y1_max { y1_cand } else { y1_max };
     if x1 <= x0 || y1 <= y0 {
-        return CatColorKey::default();
+        return CatColorKey::DEFAULT;
     }
-    let c0 = usize::try_from(x0 / cw).unwrap_or(0);
-    let c1 = usize::try_from((x1 - 1) / cw).unwrap_or(usize::MAX);
-    let r0 = usize::try_from(y0 / ch).unwrap_or(0);
-    let r1 = usize::try_from((y1 - 1) / ch).unwrap_or(usize::MAX);
+    let c0 = if x0 >= 0 { (x0 / cw) as usize } else { 0 };
+    let c1 = if x1 > 0 {
+        ((x1 - 1) / cw) as usize
+    } else {
+        usize::MAX
+    };
+    let r0 = (y0 / ch) as usize;
+    let r1 = ((y1 - 1) / ch) as usize;
     let mut bg_sum = [0u32; 3];
     let mut fg_sum = [0u32; 3];
     let mut sampled = 0u32;
@@ -7147,11 +7219,28 @@ fn cat_color_context_footprint(
     let fallback_bg = u32_to_rgb3(default_bg);
     let fallback_band = CatColorKey::background_band(default_bg);
     let mut last_bg = (fallback_bg, fallback_band);
-    'rows: for line in (r0..=r1).map(|row| cells.get(row)) {
-        for col in c0..=c1 {
-            let cell = line.and_then(|line| line.get(col));
+    let mut r = r0;
+    'rows: while r <= r1 {
+        let line = if r < cells.len() {
+            cells[r].as_slice()
+        } else {
+            &[]
+        };
+        let mut col = c0;
+        while col <= c1 {
+            let cell = if col < line.len() {
+                Some(&line[col])
+            } else {
+                None
+            };
             let (background, band) = match cell {
-                Some(cell) if cell.bg == last_bg.0 => (cell.bg, last_bg.1),
+                Some(cell)
+                    if cell.bg[0] == last_bg.0[0]
+                        && cell.bg[1] == last_bg.0[1]
+                        && cell.bg[2] == last_bg.0[2] =>
+                {
+                    (cell.bg, last_bg.1)
+                }
                 Some(cell) => {
                     let b = CatColorKey::background_band(rgb3_to_u32(cell.bg));
                     last_bg = (cell.bg, b);
@@ -7159,40 +7248,46 @@ fn cat_color_context_footprint(
                 }
                 None => (fallback_bg, fallback_band),
             };
-            min_background_band = min_background_band.min(band);
-            max_background_band = max_background_band.max(band);
-            bg_sum[0] += u32::from(background[0]);
-            bg_sum[1] += u32::from(background[1]);
-            bg_sum[2] += u32::from(background[2]);
+            if band < min_background_band {
+                min_background_band = band;
+            }
+            if band > max_background_band {
+                max_background_band = band;
+            }
+            bg_sum[0] += background[0] as u32;
+            bg_sum[1] += background[1] as u32;
+            bg_sum[2] += background[2] as u32;
             sampled += 1;
             if let Some(cell) = cell
                 && !cell.wide
-                && cell.ch != ' '
-                && cell.ch != '\0'
-                && !(if cell.ch.is_ascii() {
-                    cell.ch.is_ascii_whitespace()
-                } else {
-                    cell.ch.is_whitespace()
-                })
+                && is_ink_char(cell.ch)
             {
-                fg_sum[0] += u32::from(cell.fg[0]);
-                fg_sum[1] += u32::from(cell.fg[1]);
-                fg_sum[2] += u32::from(cell.fg[2]);
+                fg_sum[0] += cell.fg[0] as u32;
+                fg_sum[1] += cell.fg[1] as u32;
+                fg_sum[2] += cell.fg[2] as u32;
                 visible += 1;
             }
             if sampled == MAX_SAMPLES {
                 break 'rows;
             }
+            if col == usize::MAX {
+                break;
+            }
+            col += 1;
         }
+        if r == usize::MAX {
+            break;
+        }
+        r += 1;
     }
     if sampled == 0 {
-        return CatColorKey::default();
+        return CatColorKey::DEFAULT;
     }
-    let background = bg_sum.map(|channel| (channel / sampled) as u8);
+    let background = avg_rgb(bg_sum, sampled);
     let surrounding = if visible == 0 {
         principal.fg
     } else {
-        fg_sum.map(|channel| (channel / visible) as u8)
+        avg_rgb(fg_sum, visible)
     };
     CatColorKey::from_rgb_span(
         rgb3_to_u32(background),
@@ -7241,14 +7336,7 @@ fn clear_band_occupancy(
                 return None;
             }
             let ch = cell.ch;
-            if ch != ' '
-                && ch != '\0'
-                && !(if ch.is_ascii() {
-                    ch.is_ascii_whitespace()
-                } else {
-                    ch.is_whitespace()
-                })
-            {
+            if is_ink_char(ch) {
                 if !('\u{2500}'..='\u{259F}').contains(&ch) {
                     return None;
                 }
@@ -7259,7 +7347,7 @@ fn clear_band_occupancy(
     Some(occupied as f32 / total as f32)
 }
 
-fn band_occupancy(
+const fn band_occupancy(
     cells: &[Vec<RenderCell>],
     r0: usize,
     r1: usize,
@@ -7276,52 +7364,82 @@ fn band_occupancy(
     if width.saturating_mul(height) > MAX_SAMPLES {
         return None;
     }
-    let skip_per_row = skip_cols.as_ref().map_or(0usize, |s| {
-        let s0 = (*s.start()).max(c0);
-        let s1 = (*s.end()).min(c1);
-        if s1 >= s0 { s1 - s0 + 1 } else { 0 }
-    });
+    let skip_per_row = match &skip_cols {
+        Some(s) => {
+            let s0 = if *s.start() > c0 { *s.start() } else { c0 };
+            let s1 = if *s.end() < c1 { *s.end() } else { c1 };
+            if s1 >= s0 { s1 - s0 + 1 } else { 0 }
+        }
+        None => 0,
+    };
     let sampled = (width - skip_per_row) * height;
     if sampled == 0 {
         return None;
     }
-    let is_occupied = |cell: &RenderCell| {
-        cell.wide
-            || (cell.ch != ' '
-                && cell.ch != '\0'
-                && !(if cell.ch.is_ascii() {
-                    cell.ch.is_ascii_whitespace()
-                } else {
-                    cell.ch.is_whitespace()
-                }))
-    };
     let mut occupied = 0u32;
-    for r in r0..=r1 {
-        let Some(line) = cells.get(r) else {
-            continue;
-        };
-        let end = line.len().min(c1.saturating_add(1));
-        if end <= c0 {
-            continue;
-        }
-        match &skip_cols {
-            Some(s) if *s.start() <= c1 && *s.end() >= c0 => {
-                let s0 = (*s.start()).clamp(c0, end);
-                let s1 = s.end().saturating_add(1).clamp(s0, end);
-                for cell in line[c0..s0].iter().chain(&line[s1..end]) {
-                    if is_occupied(cell) {
-                        occupied += 1;
+    let mut r = r0;
+    while r <= r1 {
+        if r < cells.len() {
+            let line = cells[r].as_slice();
+            let end_cand = c1.saturating_add(1);
+            let end = if end_cand < line.len() {
+                end_cand
+            } else {
+                line.len()
+            };
+            if end > c0 {
+                match &skip_cols {
+                    Some(s) if *s.start() <= c1 && *s.end() >= c0 => {
+                        let start_col = *s.start();
+                        let s0 = if start_col < c0 {
+                            c0
+                        } else if start_col > end {
+                            end
+                        } else {
+                            start_col
+                        };
+                        let end_col = s.end().saturating_add(1);
+                        let s1 = if end_col < s0 {
+                            s0
+                        } else if end_col > end {
+                            end
+                        } else {
+                            end_col
+                        };
+                        let mut c = c0;
+                        while c < s0 {
+                            let cell = &line[c];
+                            if cell.wide || is_ink_char(cell.ch) {
+                                occupied += 1;
+                            }
+                            c += 1;
+                        }
+                        let mut c = s1;
+                        while c < end {
+                            let cell = &line[c];
+                            if cell.wide || is_ink_char(cell.ch) {
+                                occupied += 1;
+                            }
+                            c += 1;
+                        }
+                    }
+                    _ => {
+                        let mut c = c0;
+                        while c < end {
+                            let cell = &line[c];
+                            if cell.wide || is_ink_char(cell.ch) {
+                                occupied += 1;
+                            }
+                            c += 1;
+                        }
                     }
                 }
             }
-            _ => {
-                for cell in &line[c0..end] {
-                    if is_occupied(cell) {
-                        occupied += 1;
-                    }
-                }
-            }
         }
+        if r == usize::MAX {
+            break;
+        }
+        r += 1;
     }
     Some(occupied as f32 / sampled as f32)
 }
@@ -7382,7 +7500,8 @@ fn cat_peek_plan(
         c1,
         Some(usize::from(start)..=usize::from(end)),
     );
-    let score_of = |band: f32| own.map_or(band, |o| (band * 2.0 + o) / 3.0);
+    const INV_3: f32 = 1.0 / 3.0;
+    let score_of = |band: f32| own.map_or(band, |o| (band * 2.0 + o) * INV_3);
     let up = up_band.map(score_of);
     let down = down_band.map(score_of);
     match (up, down) {
@@ -7406,7 +7525,7 @@ pub(crate) const fn u32_to_rgb3(c: u32) -> [u8; 3] {
 }
 
 #[cfg(test)]
-fn contrast_ratio(a: u32, b: u32) -> f32 {
+const fn contrast_ratio(a: u32, b: u32) -> f32 {
     let (la, lb) = (relative_luminance(a), relative_luminance(b));
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
@@ -7493,8 +7612,9 @@ const fn pick_color(cfg: &DecoConfig, s: u64) -> u32 {
 }
 
 #[inline]
-fn twinkle(s: u64, age_s: f32) -> f32 {
-    let phase = (s & 0xff) as f32 / 255.0 * std::f32::consts::TAU;
+const fn twinkle(s: u64, age_s: f32) -> f32 {
+    const BYTE_TO_RAD: f32 = std::f32::consts::TAU / 255.0;
+    let phase = (s & 0xff) as f32 * BYTE_TO_RAD;
     crate::effect_util::twinkle_env(age_s, phase)
 }
 

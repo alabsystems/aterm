@@ -7,17 +7,15 @@ use std::path::{Path, PathBuf};
 use super::prefix::Prefix;
 use crate::store::Layout;
 
-/// First-arg escape flag: `brew --real …` runs real Homebrew.
+/// Retired escape flag, refused before a native command runs.
 pub const REAL_FLAG: &str = "--real";
-/// Env escape: engaged (non-empty, not `0`) means run real Homebrew.
+/// Retired escape environment; engaged values block ordinary commands, leaving `on` and `status` available.
 pub const REAL_ENV: &str = "ABREW_REAL";
-/// Pin the real brew's path (ops/tests). Absolute + executable or ignored.
-pub const BREW_PATH_ENV: &str = "ABREW_BREW_PATH";
-/// Marker set on children of a rerouted run, so nothing loops.
-pub const REROUTED_ENV: &str = "__ABREW_REROUTED";
-/// The hidden verb the stub execs: `atpkg __abrew [args…]`.
-pub const HIDDEN_VERB: &str = "__abrew";
-const STUB_MARKER: &str = "# atpkg-abrew stub v1 — regenerable; brew --real runs real Homebrew";
+/// Native-only capability route: an older backend refuses this instead of entering its legacy brew handler.
+pub const HIDDEN_VERB: &str = "__abrew_native";
+const STUB_MARKER: &str = "# atpkg-abrew stub v2 — regenerable; native atpkg only";
+const LEGACY_STUB_MARKER: &str =
+    "# atpkg-abrew stub v1 — regenerable; brew --real runs real Homebrew";
 
 /// The stub file for a layout.
 #[must_use]
@@ -25,15 +23,14 @@ pub fn stub_path(layout: &Layout) -> PathBuf {
     crate::reroute::dir(layout).join("brew")
 }
 
-/// Format the stub body for `atpkg`, `disabled_file`, and `bundled_brew`.
+/// Format the native-only stub body for `atpkg`.
 #[must_use]
-pub fn stub_body(atpkg: &Path, disabled_file: &Path, bundled_brew: &Path) -> String {
+pub fn stub_body(atpkg: &Path) -> String {
     format!(
-        "#!/bin/sh\n{STUB_MARKER}\nATPKG='{atpkg}'\nDISABLED='{disabled}'\nBUNDLED='{bundled}'\n{S}",
+        "#!/bin/sh\n{STUB_MARKER}\nATPKG='{atpkg}'\n{STUB_GUARDS}\
+if [ -x \"$ATPKG\" ]; then\n  exec \"$ATPKG\" {HIDDEN_VERB} \"$@\"\nfi\n\
+echo \"abrew: atpkg unreachable; run aterm pkg repair; real Homebrew is never a fallback\" >&2\nexit 127\n",
         atpkg = sh_single(&atpkg.to_string_lossy()),
-        disabled = sh_single(&disabled_file.to_string_lossy()),
-        bundled = sh_single(&bundled_brew.to_string_lossy()),
-        S = STUB_TAIL,
     )
 }
 
@@ -41,41 +38,32 @@ fn sh_single(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
-const STUB_TAIL: &str = r#"real_brew() {
-  if [ -n "${ABREW_BREW_PATH:-}" ] && [ -x "$ABREW_BREW_PATH" ]; then
-    printf '%s' "$ABREW_BREW_PATH"; return 0
-  fi
-  if [ -x "$BUNDLED" ]; then printf '%s' "$BUNDLED"; return 0; fi
-  _oldifs=$IFS; IFS=:
-  for _d in $PATH; do
-    IFS=$_oldifs
-    [ -n "$_d" ] || _d=.
-    [ -e "$_d/.atpkg-reroute-dir" ] && continue
-    if [ -x "$_d/brew" ]; then printf '%s' "$_d/brew"; return 0; fi
-    IFS=:
-  done
-  IFS=$_oldifs
-  for _d in /opt/homebrew/bin /usr/local/bin "$HOME/.linuxbrew/bin"; do
-    if [ -x "$_d/brew" ]; then printf '%s' "$_d/brew"; return 0; fi
-  done
-  return 1
-}
-run_real() {
-  _b=$(real_brew) || { echo "abrew: no real Homebrew found (lay one with: abrew bundle)" >&2; exit 127; }
-  __ABREW_REROUTED=1; export __ABREW_REROUTED
-  exec "$_b" "$@"
-}
-case "${ABREW_REAL:-}" in ''|0) ;; *) run_real "$@" ;; esac
-case "${__ABREW_REROUTED:-}" in ''|0) ;; *) run_real "$@" ;; esac
-case "${__ATERM_REROUTE_PASSTHROUGH:-}" in ''|0) ;; *) run_real "$@" ;; esac
-if [ "${1:-}" = "--real" ]; then shift; run_real "$@"; fi
-if [ -e "$DISABLED" ]; then run_real "$@"; fi
-if [ -x "$ATPKG" ]; then
-  __ABREW_REROUTED=1; export __ABREW_REROUTED
-  exec "$ATPKG" __abrew "$@"
+const STUB_GUARDS: &str = r#"_ABREW_COMMAND=${1:-}
+case "$_ABREW_COMMAND" in
+  --verbose|-v|--debug|-d)
+    case "${2:-}" in
+      ''|-*) ;;
+      *) _ABREW_COMMAND=$2 ;;
+    esac
+    ;;
+esac
+case "$_ABREW_COMMAND" in
+  on|status) ;;
+  *)
+    case "${ABREW_REAL:-}" in
+      ''|0) ;;
+      *) echo "abrew: ABREW_REAL is unsupported; brew uses native atpkg, never real Homebrew" >&2; exit 2 ;;
+    esac
+    case "${__ATERM_REROUTE_PASSTHROUGH:-}" in
+      ''|0) ;;
+      *) echo "abrew: brew is unavailable in a --no-reroute session; real Homebrew is never a fallback" >&2; exit 2 ;;
+    esac
+    ;;
+esac
+if [ "${1:-}" = "--real" ]; then
+  echo "abrew: --real is unsupported; brew uses native atpkg, never real Homebrew" >&2
+  exit 2
 fi
-echo "abrew: atpkg unreachable; running real brew" >&2
-run_real "$@"
 "#;
 
 /// Whether the file at `path` is an abrew stub (by its marker line).
@@ -86,7 +74,7 @@ pub fn is_abrew_stub(path: &Path) -> bool {
             && String::from_utf8_lossy(&b)
                 .lines()
                 .take(3)
-                .any(|l| l.trim() == STUB_MARKER)
+                .any(|l| matches!(l.trim(), STUB_MARKER | LEGACY_STUB_MARKER))
     })
 }
 
@@ -102,10 +90,6 @@ pub fn lay(layout: &Layout) -> std::io::Result<()> {
 pub(crate) fn lay_with(layout: &Layout, embedder: &crate::stub::Embedder) -> std::io::Result<()> {
     match plan(layout, embedder) {
         Plan::Nothing => Ok(()),
-        Plan::Remove(path) => {
-            let _ = std::fs::remove_file(&path);
-            Ok(())
-        }
         Plan::Lay(path, body) => {
             layout.ensure_dir(&crate::reroute::dir(layout))?;
             crate::lay::write_regenerable(&crate::lay::Executable::new(&path, body.as_bytes()))
@@ -113,7 +97,7 @@ pub(crate) fn lay_with(layout: &Layout, embedder: &crate::stub::Embedder) -> std
     }
 }
 
-/// Whether [`lay_with`] would write or remove the stub now: what `aterm pkg repair`'s
+/// Whether [`lay_with`] would write the stub now: what `aterm pkg repair`'s
 /// `base.pkg.stubs` item reads beside the reroute stubs. Changes nothing.
 pub(crate) fn lay_pending(layout: &Layout, embedder: &crate::stub::Embedder) -> bool {
     !matches!(plan(layout, embedder), Plan::Nothing)
@@ -121,7 +105,6 @@ pub(crate) fn lay_pending(layout: &Layout, embedder: &crate::stub::Embedder) -> 
 
 enum Plan {
     Nothing,
-    Remove(PathBuf),
     Lay(PathBuf, String),
 }
 
@@ -132,29 +115,14 @@ fn plan(layout: &Layout, embedder: &crate::stub::Embedder) -> Plan {
     if layout.declined().is_file() {
         return Plan::Nothing;
     }
-    let prefix = match std::env::var_os(super::prefix::PREFIX_ENV) {
-        Some(p) if PathBuf::from(&p).is_absolute() => Prefix::at(&PathBuf::from(p)),
-        _ => Prefix::at(&layout.prefix.join("abrew")),
-    };
     let path = stub_path(layout);
-    if !crate::config::load_abrew().enabled() || prefix.is_disabled() {
-        return if is_abrew_stub(&path) {
-            Plan::Remove(path)
-        } else {
-            Plan::Nothing
-        };
-    }
     let standing = is_abrew_stub(&path)
         .then(|| std::fs::read_to_string(&path).ok())
         .flatten()
         .and_then(|body| crate::stub::sh_named_atpkg(&body, "ATPKG"));
     let offered = embedder.embed(standing.as_deref());
     let atpkg = crate::stub::named(offered.as_deref());
-    let body = stub_body(
-        atpkg,
-        &prefix.disabled_path(),
-        &prefix.homebrew_bundle().join("bin/brew"),
-    );
+    let body = stub_body(atpkg);
     match std::fs::symlink_metadata(&path) {
         Err(_) => Plan::Lay(path, body),
         Ok(_) if is_abrew_stub(&path) => {
@@ -172,13 +140,10 @@ fn plan(layout: &Layout, embedder: &crate::stub::Embedder) -> Plan {
 #[must_use]
 pub fn doctor_row(layout: &Layout) -> (crate::doctor::Row, aterm_converge::Class) {
     let prefix = Prefix::resolve();
-    let real =
-        resolve_real_brew(&prefix).map_or_else(|| "none".to_string(), |p| p.display().to_string());
     doctor_row_with(
         layout,
         crate::config::load_abrew().enabled(),
         prefix.is_disabled(),
-        &real,
     )
 }
 
@@ -186,37 +151,54 @@ fn doctor_row_with(
     layout: &Layout,
     enabled: bool,
     disabled: bool,
-    real: &str,
 ) -> (crate::doctor::Row, aterm_converge::Class) {
     use crate::doctor::{Level, Row};
     use aterm_converge::Class;
     let path = stub_path(layout);
     let row = |level, text| (Row { level, text }, Class::Relay);
+    if is_abrew_stub(&path)
+        && std::fs::read_to_string(&path).is_ok_and(|body| {
+            body.lines()
+                .take(3)
+                .any(|line| line.trim() == LEGACY_STUB_MARKER)
+        })
+    {
+        return row(
+            Level::Warn,
+            "reroute stub brew needs native-only refresh; run aterm pkg repair".to_string(),
+        );
+    }
     if !enabled {
         return row(
             Level::Note,
-            format!("abrew off by [abrew] enabled=false; real brew: {real}"),
+            "abrew off by [abrew] enabled=false; brew refuses commands until re-enabled"
+                .to_string(),
         );
     }
     if disabled {
         return row(
             Level::Note,
-            format!("abrew off (`abrew on` re-enables); real brew: {real}"),
+            "abrew off (`abrew on` re-enables); brew never falls back to Homebrew".to_string(),
         );
     }
     if is_abrew_stub(&path) {
-        let live = std::fs::read_to_string(&path).is_ok_and(|body| stub_names_live_atpkg(&body));
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        if !body.lines().take(3).any(|line| line.trim() == STUB_MARKER) {
+            return row(
+                Level::Warn,
+                "reroute stub brew needs native-only refresh; run aterm pkg repair".to_string(),
+            );
+        }
+        let live = stub_names_live_atpkg(&body);
         if live {
             row(
                 Level::Ok,
-                format!("reroute stub brew laid (abrew); real brew: {real}"),
+                "reroute stub brew laid (native atpkg only)".to_string(),
             )
         } else {
             row(
                 Level::Warn,
-                format!(
-                    "reroute stub brew names no live atpkg, so brew runs real Homebrew; `aterm pkg repair` re-lays it; real brew: {real}"
-                ),
+                "reroute stub brew names no live atpkg; brew refuses commands until aterm pkg repair re-lays it".to_string(),
             )
         }
     } else if path.exists() {
@@ -233,9 +215,8 @@ fn doctor_row_with(
     } else {
         row(
             Level::Warn,
-            format!(
-                "reroute stub brew missing; the next aterm session lays it — now: aterm pkg repair; real brew: {real}"
-            ),
+            "reroute stub brew missing; the next aterm session lays it — now: aterm pkg repair"
+                .to_string(),
         )
     }
 }
@@ -246,60 +227,11 @@ pub fn stub_names_live_atpkg(body: &str) -> bool {
     crate::stub::sh_named_atpkg(body, "ATPKG").is_some_and(|p| crate::stub::is_live_atpkg(&p))
 }
 
-/// Remove an ours stub (`abrew off`, uninstall).
+/// Remove an owned stub during uninstall.
 pub fn remove(layout: &Layout) {
     let path = stub_path(layout);
     if is_abrew_stub(&path) {
         let _ = std::fs::remove_file(path);
-    }
-}
-
-/// Resolve the real Homebrew: `ABREW_BREW_PATH`, bundled, PATH walk past reroute dirs, or well-known prefixes.
-#[must_use]
-pub fn resolve_real_brew(prefix: &Prefix) -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os(BREW_PATH_ENV) {
-        let p = PathBuf::from(p);
-        if p.is_absolute() && is_executable(&p) {
-            return Some(p);
-        }
-        eprintln!("abrew: ignoring {BREW_PATH_ENV} (must be an absolute executable path)");
-    }
-    if let Some(bundled) = super::bundle::bundled_brew(prefix) {
-        return Some(bundled);
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            if dir.join(crate::reroute::DIR_MARKER_FILE).exists() {
-                continue;
-            }
-            let cand = dir.join("brew");
-            if is_executable(&cand) && !is_abrew_stub(&cand) {
-                return Some(cand);
-            }
-        }
-    }
-    for cand in [
-        PathBuf::from("/opt/homebrew/bin/brew"),
-        PathBuf::from("/usr/local/bin/brew"),
-    ] {
-        if is_executable(&cand) {
-            return Some(cand);
-        }
-    }
-    aterm_types::dirs::home_dir()
-        .map(|h| h.join(".linuxbrew/bin/brew"))
-        .filter(|p| is_executable(p))
-}
-
-fn is_executable(p: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        p.is_file()
     }
 }
 
@@ -318,7 +250,7 @@ mod tests {
         use crate::doctor::Level;
         use aterm_converge::Class;
         let l = crate::testdir::layout("atpkg-abrew-row-");
-        let (row, class) = doctor_row_with(&l, true, false, "none");
+        let (row, class) = doctor_row_with(&l, true, false);
         assert_eq!(
             (row.level, class),
             (Level::Warn, Class::Relay),
@@ -332,7 +264,7 @@ mod tests {
             "#!/bin/sh\nexec /opt/homebrew/bin/brew \"$@\"\n",
         )
         .unwrap();
-        let (row, class) = doctor_row_with(&l, true, false, "none");
+        let (row, class) = doctor_row_with(&l, true, false);
         assert_eq!(
             (row.level, class),
             (Level::Warn, Class::Person),
@@ -344,7 +276,7 @@ mod tests {
             "{}",
             row.text
         );
-        let (row, class) = doctor_row_with(&l, false, false, "none");
+        let (row, class) = doctor_row_with(&l, false, false);
         assert_eq!(
             (row.level, class),
             (Level::Note, Class::Relay),
@@ -353,50 +285,234 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_brew_stub_needs_repair_even_when_native_routing_is_disabled() {
+        use crate::doctor::Level;
+        use aterm_converge::Class;
+        let layout = crate::testdir::layout("atpkg-abrew-legacy-row-");
+        let path = stub_path(&layout);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = format!("#!/bin/sh\n{LEGACY_STUB_MARKER}\nexec /old/atpkg __abrew \"$@\"\n");
+        std::fs::write(&path, &old).unwrap();
+        for (enabled, disabled) in [(true, false), (false, false), (true, true)] {
+            let (row, class) = doctor_row_with(&layout, enabled, disabled);
+            assert_eq!((row.level, class), (Level::Warn, Class::Relay));
+            assert!(row.text.contains("native-only refresh"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn stub_execs_abrew_and_real_escape() {
+    fn stub_execs_only_native_abrew_and_refuses_real_brew_bypasses() {
         use std::os::unix::fs::PermissionsExt;
-        let tmp = std::env::temp_dir().join(format!("abrew-stub-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let owned = aterm_tempfile::TempDir::new().unwrap();
+        let tmp = owned.path().join("quoted ' paths");
         std::fs::create_dir_all(&tmp).unwrap();
-        let fake_atpkg = tmp.join("atpkg");
-        std::fs::write(&fake_atpkg, "#!/bin/sh\necho ATPKG \"$@\"\n").unwrap();
+        let fake_atpkg = tmp.join("atpkg ' backend");
+        std::fs::write(
+            &fake_atpkg,
+            "#!/bin/sh\nprintf 'ATPKG\\n'\nprintf '<%s>\\n' \"$@\"\n",
+        )
+        .unwrap();
         let fake_brew = tmp.join("real-brew");
-        std::fs::write(&fake_brew, "#!/bin/sh\necho REAL \"$@\"\n").unwrap();
+        std::fs::write(
+            &fake_brew,
+            "#!/bin/sh\nprintf 'called\\n' >> \"${BREW_CALLED:?}\"\nprintf 'REAL\\n'\n",
+        )
+        .unwrap();
         for f in [&fake_atpkg, &fake_brew] {
             std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let stub_file = tmp.join("brew");
-        let body = stub_body(
-            &fake_atpkg,
-            &tmp.join("disabled"),
-            &tmp.join("none/bin/brew"),
-        );
-        std::fs::write(&stub_file, body).unwrap();
-        std::fs::set_permissions(&stub_file, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let run = |args: &[&str], real_env: bool| -> String {
-            let stub_s = stub_file.to_string_lossy().into_owned();
-            let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
-            cmd.arg(stub_s.as_str()).args(args);
-            cmd.env("ABREW_BREW_PATH", fake_brew.as_os_str());
-            if real_env {
-                cmd.env("ABREW_REAL", "1");
+        let disabled_file = tmp.join("disabled");
+        let called = tmp.join("real-brew-called");
+        let mut failures = Vec::new();
+        for (label, args, env, disabled, missing, expected) in [
+            (
+                "native arguments",
+                vec!["install", "a b", "'quoted'", "", "$(literal)"],
+                None,
+                false,
+                false,
+                Some("ATPKG\n<__abrew_native>\n<install>\n<a b>\n<'quoted'>\n<>\n<$(literal)>\n"),
+            ),
+            (
+                "real flag",
+                vec!["--real", "list"],
+                None,
+                false,
+                false,
+                None,
+            ),
+            (
+                "real environment",
+                vec!["list"],
+                Some(("ABREW_REAL", "1")),
+                false,
+                false,
+                None,
+            ),
+            (
+                "no-reroute environment",
+                vec!["list"],
+                Some(("__ATERM_REROUTE_PASSTHROUGH", "1")),
+                false,
+                false,
+                None,
+            ),
+            (
+                "inherited child marker",
+                vec!["list"],
+                Some(("__ABREW_REROUTED", "1")),
+                false,
+                false,
+                Some("ATPKG\n<__abrew_native>\n<list>\n"),
+            ),
+            (
+                "disabled backend routing",
+                vec!["list"],
+                None,
+                true,
+                false,
+                Some("ATPKG\n<__abrew_native>\n<list>\n"),
+            ),
+            (
+                "disabled recovery",
+                vec!["on"],
+                None,
+                true,
+                false,
+                Some("ATPKG\n<__abrew_native>\n<on>\n"),
+            ),
+            ("missing backend", vec!["list"], None, false, true, None),
+            (
+                "legacy env on recovery",
+                vec!["on"],
+                Some(("ABREW_REAL", "1")),
+                false,
+                false,
+                Some("ATPKG\n<__abrew_native>\n<on>\n"),
+            ),
+            (
+                "legacy env status recovery",
+                vec!["status"],
+                Some(("ABREW_REAL", "1")),
+                false,
+                false,
+                Some("ATPKG\n<__abrew_native>\n<status>\n"),
+            ),
+            (
+                "no-reroute on recovery",
+                vec!["on"],
+                Some(("__ATERM_REROUTE_PASSTHROUGH", "1")),
+                false,
+                false,
+                Some("ATPKG\n<__abrew_native>\n<on>\n"),
+            ),
+            (
+                "no-reroute status recovery",
+                vec!["status"],
+                Some(("__ATERM_REROUTE_PASSTHROUGH", "1")),
+                false,
+                false,
+                Some("ATPKG\n<__abrew_native>\n<status>\n"),
+            ),
+        ] {
+            let _ = std::fs::remove_file(&called);
+            if disabled {
+                std::fs::write(&disabled_file, "off\n").unwrap();
             } else {
-                cmd.env_remove("ABREW_REAL");
+                let _ = std::fs::remove_file(&disabled_file);
             }
-            cmd.env_remove("__ABREW_REROUTED");
-            cmd.env_remove("__ATERM_REROUTE_PASSTHROUGH");
+            let missing_atpkg = tmp.join("missing-atpkg");
+            let backend = if missing { &missing_atpkg } else { &fake_atpkg };
+            std::fs::write(&stub_file, stub_body(backend)).unwrap();
+            let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+            cmd.arg(&stub_file).args(&args);
+            cmd.env("ABREW_BREW_PATH", &fake_brew);
+            cmd.env("BREW_CALLED", &called);
+            cmd.env("PATH", &tmp);
+            for name in [
+                "ABREW_REAL",
+                "__ABREW_REROUTED",
+                "__ATERM_REROUTE_PASSTHROUGH",
+            ] {
+                cmd.env_remove(name);
+            }
+            if let Some((name, value)) = env {
+                cmd.env(name, value);
+            }
             let out = cmd.output().unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        assert_eq!(run(&["list"], false), "ATPKG __abrew list");
-        assert_eq!(run(&["--real", "list"], false), "REAL list");
-        assert_eq!(run(&["list"], true), "REAL list");
-        std::fs::write(tmp.join("disabled"), "off\n").unwrap();
-        assert_eq!(run(&["info", "wget"], false), "REAL info wget");
-        let _ = std::fs::remove_dir_all(&tmp);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let routed = match expected {
+                Some(expected) => out.status.success() && stdout == expected,
+                None => !out.status.success() && stdout.is_empty() && !stderr.is_empty(),
+            };
+            if !routed || called.exists() {
+                failures.push((
+                    label,
+                    out.status.code(),
+                    stdout.into_owned(),
+                    stderr.into_owned(),
+                    called.exists(),
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "(case, exit, stdout, stderr, real brew called): {failures:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefixed_recovery_preserves_arguments_and_keeps_ordinary_commands_blocked() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = aterm_tempfile::TempDir::new().unwrap();
+        let backend = temp.path().join("atpkg");
+        std::fs::write(
+            &backend,
+            "#!/bin/sh\nprintf 'ATPKG\\n'\nprintf '<%s>\\n' \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = temp.path().join("brew");
+        std::fs::write(&path, stub_body(&backend)).unwrap();
+        let mut failures = Vec::new();
+        for flag in ["--verbose", "-v", "--debug", "-d"] {
+            for command in ["on", "status", "list"] {
+                for env in ["ABREW_REAL", "__ATERM_REROUTE_PASSTHROUGH"] {
+                    let mut child = aterm_uds::spawnfd::command("/bin/sh");
+                    child.arg(&path).args([flag, command]);
+                    for name in ["ABREW_REAL", "__ATERM_REROUTE_PASSTHROUGH"] {
+                        child.env_remove(name);
+                    }
+                    let output = child.env(env, "1").output().unwrap();
+                    let valid = if command == "list" {
+                        !output.status.success()
+                            && output.stdout.is_empty()
+                            && !output.stderr.is_empty()
+                    } else {
+                        output.status.success()
+                            && output.stdout
+                                == format!("ATPKG\n<{HIDDEN_VERB}>\n<{flag}>\n<{command}>\n")
+                                    .as_bytes()
+                    };
+                    if !valid {
+                        failures.push(format!(
+                            "{env}=1 {flag} {command}: status={:?}, stdout={:?}, stderr={:?}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[cfg(unix)]
@@ -408,8 +524,7 @@ mod tests {
         let fake = tmp.join("atpkg");
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let body =
-            |atpkg: &Path| stub_body(atpkg, &tmp.join("disabled"), &tmp.join("none/bin/brew"));
+        let body = stub_body;
         assert!(stub_names_live_atpkg(&body(&fake)));
         assert!(!stub_names_live_atpkg(&body(Path::new(""))));
         assert!(!stub_names_live_atpkg(&body(&tmp.join("gone/atpkg"))));
@@ -419,17 +534,178 @@ mod tests {
         assert!(!stub_names_live_atpkg(&body(&dull)));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn stub_body_carries_escapes_and_marker() {
-        let body = stub_body(
-            Path::new("/opt/aterm/atpkg"),
-            Path::new("/p/disabled"),
-            Path::new("/p/homebrew/bin/brew"),
+    fn legacy_stub_refresh_does_not_call_an_old_backend_legacy_brew_route() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = aterm_tempfile::TempDir::new().unwrap();
+        let old = temp.path().join("Legacy.app/Contents/MacOS/atpkg");
+        let transient = temp.path().join("transient");
+        let offered = transient.join("atpkg");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&transient).unwrap();
+        std::fs::write(
+            &old,
+            "#!/bin/sh\nif [ \"${1:-}\" = __abrew ]; then\n  printf 'legacy brew fallback\\n' >> \"${LEGACY_BREW_CALLED:?}\"\n  exit 0\nfi\nprintf 'old backend: unknown verb\\n' >&2\nexit 2\n",
+        )
+        .unwrap();
+        std::fs::write(&offered, "#!/bin/sh\nprintf 'new backend\\n' >&2\nexit 1\n").unwrap();
+        for backend in [&old, &offered] {
+            std::fs::set_permissions(backend, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let embedder = crate::stub::Embedder::offering(&offered, &[transient]);
+        assert_eq!(embedder.embed(Some(&old)), Some(old.clone()));
+
+        let mut failures = Vec::new();
+        for disabled in [false, true] {
+            let layout = crate::testdir::layout("native-brew-old-backend-");
+            let prefix = Prefix::at(&layout.prefix.join("abrew"));
+            if disabled {
+                std::fs::create_dir_all(&prefix.root).unwrap();
+                std::fs::write(prefix.disabled_path(), "off\n").unwrap();
+            }
+            let path = stub_path(&layout);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\n{LEGACY_STUB_MARKER}\nATPKG='{}'\n",
+                    sh_single(&old.to_string_lossy())
+                ),
+            )
+            .unwrap();
+            assert!(lay_pending(&layout, &embedder));
+            lay_with(&layout, &embedder).unwrap();
+            let refreshed = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                crate::stub::sh_named_atpkg(&refreshed, "ATPKG"),
+                Some(old.clone()),
+                "repair preserves the more durable installed backend"
+            );
+            assert!(!lay_pending(&layout, &embedder));
+            assert_eq!(prefix.is_disabled(), disabled);
+
+            let called = layout.prefix.join("legacy-brew-called");
+            let mut command = aterm_uds::spawnfd::command("/bin/sh");
+            command
+                .arg(&path)
+                .args(["services", "list"])
+                .env("LEGACY_BREW_CALLED", &called)
+                .env("ABREW_PREFIX", &prefix.root);
+            for name in ["ABREW_REAL", "__ATERM_REROUTE_PASSTHROUGH"] {
+                command.env_remove(name);
+            }
+            let output = command.output().unwrap();
+            if output.status.success()
+                || called.exists()
+                || !String::from_utf8_lossy(&output.stderr).contains("old backend: unknown verb")
+            {
+                failures.push(format!(
+                    "disabled={disabled}: status={:?}, legacy_called={}, stdout={:?}, stderr={:?}",
+                    output.status,
+                    called.exists(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_stub_refresh_keeps_disabled_native_route() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "ATERM_NATIVE_BREW_OFF_CONFIG_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let config = aterm_tempfile::TempDir::new().unwrap();
+            let config_dir = config.path().join("aterm");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            std::fs::write(config_dir.join("aterm.toml"), "[abrew]\nenabled = false\n").unwrap();
+            let output = aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "abrew::stub::tests::legacy_stub_refresh_keeps_disabled_native_route",
+                    "--nocapture",
+                ])
+                .env(CHILD, config.path().join("child-completed"))
+                .env("XDG_CONFIG_HOME", config.path())
+                .env_remove("ABREW_PREFIX")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "disabled-config child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read(config.path().join("child-completed")).unwrap(),
+                b"refreshed both stubs\n"
+            );
+            return;
+        }
+        assert!(
+            !crate::config::load_abrew().enabled(),
+            "the child really uses disabled configuration"
         );
-        assert!(body.contains(STUB_MARKER));
-        assert!(body.contains("__abrew"));
-        assert!(body.contains("--real"));
-        assert!(body.contains("ABREW_REAL"));
-        assert!(body.contains(".atpkg-reroute-dir"));
+        for disabled in [false, true] {
+            let layout = crate::testdir::layout("native-brew-legacy-");
+            let backend = layout.prefix.join("atpkg ' backend");
+            std::fs::write(
+                &backend,
+                "#!/bin/sh\nprintf 'ATPKG\\n'\nprintf '<%s>\\n' \"$@\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let embedder = crate::stub::Embedder::offering(&backend, &[]);
+            let prefix = Prefix::at(&layout.prefix.join("abrew"));
+            if disabled {
+                std::fs::create_dir_all(&prefix.root).unwrap();
+                std::fs::write(prefix.disabled_path(), "off\n").unwrap();
+            }
+            let path = stub_path(&layout);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let legacy = format!(
+                "#!/bin/sh\n{LEGACY_STUB_MARKER}\nATPKG='{}'\nprintf 'LEGACY\\n'\n",
+                sh_single(&backend.to_string_lossy())
+            );
+            std::fs::write(&path, &legacy).unwrap();
+            assert!(is_abrew_stub(&path));
+            assert!(lay_pending(&layout, &embedder));
+            lay_with(&layout, &embedder).unwrap();
+            let refreshed = std::fs::read_to_string(&path).unwrap();
+            assert_ne!(
+                refreshed, legacy,
+                "the old fallback-capable stub is refreshed"
+            );
+            assert!(is_abrew_stub(&path));
+            assert_eq!(
+                crate::stub::sh_named_atpkg(&refreshed, "ATPKG"),
+                Some(backend.clone())
+            );
+            assert!(!lay_pending(&layout, &embedder));
+            assert_eq!(
+                prefix.is_disabled(),
+                disabled,
+                "stub repair preserves the off sentinel"
+            );
+            let mut command = aterm_uds::spawnfd::command("/bin/sh");
+            command.arg(&path).arg("status");
+            for name in ["ABREW_REAL", "__ATERM_REROUTE_PASSTHROUGH"] {
+                command.env_remove(name);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"ATPKG\n<__abrew_native>\n<status>\n");
+
+            let foreign = "#!/bin/sh\nprintf 'foreign\\n'\n";
+            std::fs::write(&path, foreign).unwrap();
+            lay_with(&layout, &embedder).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), foreign);
+        }
+        std::fs::write(std::env::var_os(CHILD).unwrap(), "refreshed both stubs\n").unwrap();
     }
 }

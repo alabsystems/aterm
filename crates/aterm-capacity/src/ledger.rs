@@ -1,0 +1,435 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! THE LEDGER: one directory of claims per user. A claim is a file its holder keeps locked
+//! ([`RecordLock`]) for as long as it lives, and its record says who holds it and for what:
+//! `<start>-<pid>-<seq>.wait` while it waits, `.claim` once admitted. The kernel lets the lock
+//! go when the holder dies, however it dies, so a file whose lock can be taken is a dead
+//! holder's and counts for nothing. `ledger.lock` orders the admissions: a waiter holds it only
+//! while it reads the ledger and decides.
+
+use std::fs::File;
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use aterm_json::{Map, Value};
+use aterm_toolchain::record_lock::RecordLock;
+
+use crate::Need;
+
+/// The most of a claim file any reader takes, and where its lock's range starts on Windows: the record lies before it.
+pub const RECORD_MAX: u64 = 16 * 1024;
+
+/// The most bytes of `what`, `checkout` or the volume a record keeps.
+const TEXT_MAX: usize = 512;
+
+// A record's three texts at their longest, each character escaped to JSON's six bytes, and its
+// figures and admission line, still lie before RECORD_MAX: no live claim reads back cut short.
+const _: () = assert!(3 * 6 * TEXT_MAX + 1024 <= RECORD_MAX as usize);
+
+/// A waiting claim's suffix.
+const WAIT: &str = ".wait";
+/// An admitted claim's suffix.
+const CLAIM: &str = ".claim";
+/// The suffix of a claim file being laid: no reader looks at it.
+const TAKING: &str = ".taking";
+/// The admissions' lock.
+const LOCK: &str = "ledger.lock";
+
+/// The ledger's directory under the per-user cache: `~/Library/Caches/aterm/capacity` on macOS, `~/.cache/aterm/capacity` on Linux, `%LOCALAPPDATA%\aterm\capacity` on Windows; `None` with no home. On Unix `~` is the account database's home, whatever `$HOME` or `$XDG_CACHE_HOME` says, so a tool run under a scratch home (the lab, the release buildplan, verify's smoke stages) claims in the one ledger every session of this user reads.
+#[must_use]
+pub fn user_dir() -> Option<PathBuf> {
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    if cfg!(windows) {
+        return var("LOCALAPPDATA").map(|d| PathBuf::from(d).join("aterm").join("capacity"));
+    }
+    let home = crate::account_home().or_else(|| var("HOME").map(PathBuf::from))?;
+    Some(if cfg!(target_os = "macos") {
+        home.join("Library/Caches/aterm/capacity")
+    } else {
+        home.join(".cache/aterm/capacity")
+    })
+}
+
+/// An admitted claim's grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// When it was admitted, unix ms.
+    pub admitted_ms: u64,
+    /// The cores it was granted.
+    pub cores: u32,
+}
+
+/// One claim's record: who holds it, for what, and whether it is admitted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Record {
+    /// The holder's pid.
+    pub pid: u32,
+    /// When the claim was made, unix ms: waiters are served in this order.
+    pub start_ms: u64,
+    /// The holder's own count of its claims, which orders two made in one millisecond.
+    pub seq: u64,
+    /// The checkout the holder ran in (its working directory's enclosing git checkout).
+    pub checkout: String,
+    /// What it needs; its `path` is the mount of the volume its disk need is on.
+    pub need: Need,
+    /// Its grant, once admitted.
+    pub held: Option<Held>,
+}
+
+impl Record {
+    /// Its place in the queue: earlier is served first.
+    #[must_use]
+    pub const fn order(&self) -> (u64, u32, u64) {
+        (self.start_ms, self.pid, self.seq)
+    }
+
+    /// The file stem every file of this claim carries.
+    fn stem(&self) -> String {
+        format!("{:013}-{}-{}", self.start_ms, self.pid, self.seq)
+    }
+
+    /// The record's first line: who and what.
+    fn head_line(&self) -> String {
+        let mut o = Map::new();
+        o.insert("v".to_owned(), Value::from(1u64));
+        o.insert("pid".to_owned(), Value::from(self.pid));
+        o.insert("start_ms".to_owned(), Value::from(self.start_ms));
+        o.insert("seq".to_owned(), Value::from(self.seq));
+        o.insert("checkout".to_owned(), Value::from(cut(&self.checkout)));
+        o.insert("what".to_owned(), Value::from(cut(&self.need.what)));
+        o.insert("mem".to_owned(), Value::from(self.need.mem));
+        o.insert("cores".to_owned(), Value::from(self.need.cores));
+        o.insert("disk".to_owned(), Value::from(self.need.disk));
+        o.insert("quiet".to_owned(), Value::from(self.need.quiet));
+        o.insert(
+            "volume".to_owned(),
+            Value::from(self.need.path.as_deref().and_then(Path::to_str).map(cut)),
+        );
+        line_of(o)
+    }
+
+    /// The line an admission adds.
+    fn held_line(held: Held) -> String {
+        let mut o = Map::new();
+        o.insert("admitted_ms".to_owned(), Value::from(held.admitted_ms));
+        o.insert("cores".to_owned(), Value::from(held.cores));
+        line_of(o)
+    }
+
+    /// A record read back from a claim file's text; `held` says the file is admitted (`.claim`).
+    #[must_use]
+    pub fn decode(text: &str, held: bool) -> Option<Record> {
+        let mut lines = text.lines();
+        let head: Value = aterm_json::from_str(lines.next()?).ok()?;
+        if head.get("v").and_then(Value::as_u64) != Some(1) {
+            return None;
+        }
+        let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64);
+        let start_ms = num(&head, "start_ms")?;
+        let need = Need {
+            what: head.get("what").and_then(Value::as_str)?.to_owned(),
+            mem: num(&head, "mem")?,
+            cores: u32::try_from(num(&head, "cores")?).ok()?,
+            disk: num(&head, "disk")?,
+            quiet: head.get("quiet").and_then(Value::as_f64),
+            path: head
+                .get("volume")
+                .and_then(Value::as_str)
+                .map(PathBuf::from),
+        };
+        let held = held.then(|| {
+            lines
+                .next()
+                .and_then(|l| aterm_json::from_str::<Value>(l).ok())
+                .and_then(|v| {
+                    Some(Held {
+                        admitted_ms: num(&v, "admitted_ms")?,
+                        cores: u32::try_from(num(&v, "cores")?).ok()?,
+                    })
+                })
+                .unwrap_or(Held {
+                    admitted_ms: start_ms,
+                    cores: need.cores,
+                })
+        });
+        Some(Record {
+            pid: u32::try_from(num(&head, "pid")?).ok()?,
+            start_ms,
+            seq: num(&head, "seq")?,
+            checkout: head
+                .get("checkout")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            need,
+            held,
+        })
+    }
+}
+
+/// `text` cut on a character boundary short of [`TEXT_MAX`] bytes.
+fn cut(text: &str) -> &str {
+    let mut end = text.len().min(TEXT_MAX);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// One JSON object and its newline.
+fn line_of(o: Map) -> String {
+    let mut line = aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| "{}".to_owned());
+    line.push('\n');
+    line
+}
+
+/// The next claim of this process: two claims of one process never share a stem.
+fn next_seq() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A claim file this process laid and keeps locked; it goes, and its lock with it, when this is dropped.
+#[derive(Debug)]
+pub(crate) struct Laid {
+    lock: RecordLock,
+    path: PathBuf,
+}
+
+impl Laid {
+    /// The claim file.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Laid {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        self.lock.unlock();
+    }
+}
+
+/// The admissions' lock, held while one waiter reads the ledger and decides; its holder's pid lies before the locked range, for a waiter kept out to name.
+#[derive(Debug)]
+pub(crate) struct Turn {
+    _lock: RecordLock,
+}
+
+/// The claims of one user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ledger {
+    dir: PathBuf,
+}
+
+impl Ledger {
+    /// The ledger in `dir`.
+    #[must_use]
+    pub fn at(dir: impl Into<PathBuf>) -> Ledger {
+        Ledger { dir: dir.into() }
+    }
+
+    /// This user's ledger ([`user_dir`]).
+    #[must_use]
+    pub fn user() -> Option<Ledger> {
+        user_dir().map(Ledger::at)
+    }
+
+    /// Its directory.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Every live claim, oldest first, read without the admissions' lock and without removing a dead holder's file: what `aterm pkg capacity` prints.
+    ///
+    /// # Errors
+    /// The directory could not be listed (never `NotFound`, which is no claims), or a claim file could not be tested.
+    pub fn list(&self) -> io::Result<Vec<Record>> {
+        self.scan(false)
+    }
+
+    /// Every live claim, oldest first, a dead holder's file removed when `reap`.
+    pub(crate) fn scan(&self, reap: bool) -> io::Result<Vec<Record>> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut live = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let held = if name.ends_with(CLAIM) {
+                true
+            } else if name.ends_with(WAIT) {
+                false
+            } else {
+                continue;
+            };
+            if let Some(record) = probe(&entry.path(), held, reap)? {
+                live.push(record);
+            }
+        }
+        live.sort_by_key(Record::order);
+        Ok(live)
+    }
+
+    /// Take the admissions' lock if nobody holds it, writing this process's pid into it; `Err(holder)` while another waiter holds it (its pid, where it wrote one).
+    pub(crate) fn try_turn(&self) -> io::Result<Result<Turn, Option<u32>>> {
+        ensure_dir(&self.dir)?;
+        let path = self.dir.join(LOCK);
+        let file = open_rendezvous(&path)?;
+        match RecordLock::try_lock(file, RECORD_MAX) {
+            Ok(mut lock) => {
+                let _ = lock
+                    .set_len(0)
+                    .and_then(|()| lock.seek(SeekFrom::Start(0)))
+                    .and_then(|_| writeln!(lock, "{}", std::process::id()));
+                Ok(Ok(Turn { _lock: lock }))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(Err(lock_holder(&path))),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    /// A claim for `need` in the queue: the record laid under a name no reader looks at, locked, then named a waiter.
+    pub(crate) fn lay(&self, need: &Need, start_ms: u64) -> io::Result<(Record, Laid)> {
+        ensure_dir(&self.dir)?;
+        let record = Record {
+            pid: std::process::id(),
+            start_ms,
+            seq: next_seq(),
+            checkout: checkout_of_cwd(),
+            need: need.clone(),
+            held: None,
+        };
+        let stem = record.stem();
+        let taking = self.dir.join(format!("{stem}{TAKING}"));
+        let path = self.dir.join(format!("{stem}{WAIT}"));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file: File = options.open(&taking)?;
+        let lock = match RecordLock::try_lock(file, RECORD_MAX) {
+            Ok(lock) => lock,
+            Err(e) => {
+                let _ = std::fs::remove_file(&taking);
+                return Err(match e {
+                    std::fs::TryLockError::Error(e) => e,
+                    std::fs::TryLockError::WouldBlock => io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "a claim file this process just created was already locked",
+                    ),
+                });
+            }
+        };
+        let mut laid = Laid { lock, path: taking };
+        laid.lock.write_all(record.head_line().as_bytes())?;
+        std::fs::rename(&laid.path, &path)?;
+        laid.path = path;
+        Ok((record, laid))
+    }
+
+    /// Mark `laid` admitted with `held`: its grant written, then the file named a claim.
+    pub(crate) fn admit(&self, laid: &mut Laid, record: &mut Record, held: Held) -> io::Result<()> {
+        if record.held.is_none() {
+            laid.lock.write_all(Record::held_line(held).as_bytes())?;
+        }
+        let claim = self.dir.join(format!("{}{CLAIM}", record.stem()));
+        std::fs::rename(&laid.path, &claim)?;
+        laid.path = claim;
+        record.held = Some(held);
+        Ok(())
+    }
+}
+
+/// The pid the admissions' lock at `path` names: its holder's, unless it was let go meanwhile.
+fn lock_holder(path: &Path) -> Option<u32> {
+    let mut text = String::new();
+    File::open(path)
+        .and_then(|f| f.take(64).read_to_string(&mut text))
+        .ok()?;
+    text.trim().parse().ok()
+}
+
+/// Test one claim file: `Some(record)` while its holder lives, `None` for a dead holder's (removed when `reap`) or one gone meanwhile.
+fn probe(path: &Path, held: bool, reap: bool) -> io::Result<Option<Record>> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match RecordLock::try_lock(file, RECORD_MAX) {
+        Ok(lock) => {
+            if reap {
+                let _ = std::fs::remove_file(path);
+            }
+            drop(lock);
+            Ok(None)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let mut text = String::new();
+            File::open(path)
+                .and_then(|f| f.take(RECORD_MAX).read_to_string(&mut text))
+                .or_else(|e| match e.kind() {
+                    io::ErrorKind::NotFound => Ok(0),
+                    _ => Err(e),
+                })?;
+            Ok(Record::decode(&text, held))
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// The ledger's directory, made if absent: private (`0700`) on Unix, since a record names a checkout.
+fn ensure_dir(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Open (creating) a lock file: `0600`, never truncated.
+fn open_rendezvous(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// The working directory's enclosing git checkout (the nearest directory holding `.git`), else the working directory; empty where it cannot be read.
+fn checkout_of_cwd() -> String {
+    let Ok(cwd) = std::env::current_dir() else {
+        return String::new();
+    };
+    let found = cwd
+        .ancestors()
+        .find(|d| d.join(".git").symlink_metadata().is_ok())
+        .unwrap_or(&cwd);
+    found.to_string_lossy().into_owned()
+}

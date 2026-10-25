@@ -943,6 +943,193 @@ fn a_text_the_dialog_never_took_is_handed_over_never_written_twice() {
     );
 }
 
+/// A policy text the worker has not drawn is waited for, not read back as refused
+/// ([`Session::text_undrawn`]). A starved worker whose screen stands where the text was written
+/// and draws it 45 s later, and one that reads it 25 s late while its screen moves without it,
+/// both have the dialog answered: one `send`, its Enter, the choice told once, no hand-over. A
+/// worker that never reads the text, its screen never moving, ends the wait
+/// `UNDRAWN_INPUT_HANG` after the write, a hang detector: the dialog is handed over and the text
+/// is not written twice. Negative control: a screen that
+/// moves past the write, its input read and the field still empty, is handed over at the second
+/// read-back, as before ([`a_text_the_dialog_never_took_is_handed_over_never_written_twice`]).
+#[test]
+fn a_policy_text_the_worker_has_not_drawn_is_waited_for_not_handed_over() {
+    let hang = super::super::turn_end_loop::UNDRAWN_INPUT_HANG;
+    let not_taken = "the dialog did not take the policy text: a text is never written twice";
+    let world = |unmoved: Option<Duration>, unread: Option<Duration>| {
+        let (_, _, free, typed) = single_screens(LONG_TERM_TEXT);
+        let after = vec![typed, busy_screen(), idle_screen()];
+        let mut screens = match (unmoved, unread) {
+            (_, Some(_)) => vec![free.clone(), free.clone(), free],
+            (Some(_), None) => vec![free],
+            (None, None) => vec![free],
+        };
+        if unmoved.is_some() || unread.is_some() {
+            screens.extend(after);
+        }
+        let mut m = texting(screens);
+        m.vanish_after = Some(12);
+        m.unmoved_after_send = unmoved;
+        m.unread_after_write = unread;
+        let opts = SuperviseOpts {
+            max: Duration::from_secs(600),
+            ..hosted_by(LONG)
+        };
+        let lines = hosted_run(&mut m, &opts, None);
+        let sent = m.first_send_at.expect("the text was sent");
+        let reads: Vec<Duration> = m.read_times[m.reads_at_send.unwrap_or(0)..]
+            .iter()
+            .map(|(_, at)| at.saturating_duration_since(sent))
+            .collect();
+        (m, lines, reads)
+    };
+    let answered = |m: &Mock, lines: &[String], what: &str| {
+        assert_eq!(
+            m.writes(),
+            [format!("text:{LONG_TERM_TEXT}"), "enter".to_string()],
+            "{what}: {:#?}",
+            m.requests
+        );
+        assert_eq!(badge(m), None, "{what}: {:#?}", m.requests);
+        let told = lines.iter().filter(|l| l.starts_with("CHOSE ")).count();
+        assert_eq!(told, 1, "{what}: {lines:#?}");
+    };
+    let handed_over = |m: &Mock, what: &str| {
+        assert_eq!(
+            m.writes(),
+            [format!("text:{LONG_TERM_TEXT}")],
+            "{what}: {:#?}",
+            m.requests
+        );
+        assert!(
+            badge(m).is_some_and(|b| b.contains(not_taken)),
+            "{what}: {:#?}",
+            m.requests
+        );
+    };
+
+    let (m, lines, _) = world(Some(Duration::from_secs(45)), None);
+    answered(&m, &lines, "a worker that draws the text late");
+
+    let (m, lines, _) = world(None, Some(Duration::from_secs(25)));
+    answered(&m, &lines, "a worker that reads the text late");
+
+    let never = Some(Duration::from_secs(200));
+    let (m, _, reads) = world(never, never);
+    handed_over(&m, "a worker that never reads or draws the text");
+    assert!(
+        reads.iter().any(|&at| at >= hang) && reads.iter().all(|&at| at < hang + WAIT_STEP),
+        "judged once the hang passed ({reads:?}): {:#?}",
+        m.requests
+    );
+
+    let (m, _, reads) = world(None, None);
+    handed_over(&m, "the control: a screen that moved without the text");
+    assert!(
+        reads.len() <= 3 && reads.iter().all(|&at| at < Duration::from_secs(35)),
+        "the control is judged at its second read-back ({reads:?}): {:#?}",
+        m.requests
+    );
+}
+
+/// A read-back frame caught half drawn is not read as the dialog gone (`Back::Gone`). A
+/// starved worker that clears its screen and draws the text's frame over two looks (a look reads
+/// the tail, then the whole screen when the tail shows no dialog), each moving the screen with no
+/// dialog on it, has its dialog answered: one `send`, its Enter, the choice told once, no
+/// hand-over. So does one whose cleared screen stands blank for three looks before it draws.
+/// Negative control: a dialog gone for good, the screen holding still on the composer with no
+/// dialog on it, is handed over at the second read-back, the text not written twice.
+#[test]
+fn a_read_back_frame_caught_half_drawn_is_waited_for_not_handed_over() {
+    let gone_said =
+        "the policy text did not read back as written (the dialog is no longer the question";
+    let run = |after: Vec<Vec<String>>, still_from: Option<usize>, drawn_at: Option<usize>| {
+        let (_, _, free, _) = single_screens(LONG_TERM_TEXT);
+        let mut screens = vec![free];
+        screens.extend(after);
+        let mut m = texting(screens);
+        m.vanish_after = Some(12);
+        if let Some(i) = still_from {
+            m.key_gates.push((i, 0));
+        }
+        m.redrawn_after_reads = drawn_at;
+        let opts = SuperviseOpts {
+            max: Duration::from_secs(600),
+            ..hosted_by(LONG)
+        };
+        let lines = hosted_run(&mut m, &opts, None);
+        (m, lines)
+    };
+    let (_, _, _, typed) = single_screens(LONG_TERM_TEXT);
+    let cleared = vec![String::new(); typed.len()];
+    let top_half = typed[..typed.len() / 2].to_vec();
+    let (m, lines) = run(
+        vec![
+            cleared.clone(),
+            cleared.clone(),
+            top_half.clone(),
+            top_half,
+            typed.clone(),
+            busy_screen(),
+            idle_screen(),
+        ],
+        None,
+        None,
+    );
+    let answered = |m: &Mock, lines: &[String], what: &str| {
+        assert_eq!(
+            m.writes(),
+            [format!("text:{LONG_TERM_TEXT}"), "enter".to_string()],
+            "{what}: {:#?}",
+            m.requests
+        );
+        assert_eq!(badge(m), None, "{what}: {:#?}", m.requests);
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("CHOSE ")).count(),
+            1,
+            "{what}: {lines:#?}"
+        );
+    };
+    answered(&m, &lines, "a frame drawn over two looks");
+
+    let (m, lines) = run(
+        vec![cleared, typed, busy_screen(), idle_screen()],
+        Some(1),
+        Some(8),
+    );
+    answered(
+        &m,
+        &lines,
+        "a cleared screen that stands blank for three looks",
+    );
+
+    let (m, _) = run(vec![idle_screen()], Some(1), None);
+    let policy_text = format!("text:{LONG_TERM_TEXT}");
+    assert!(
+        m.writes().iter().filter(|w| **w == policy_text).count() == 1
+            && !m.writes().iter().any(|w| w == "enter"),
+        "the control writes its text once and no Enter: {:#?}",
+        m.requests
+    );
+    assert!(
+        badge(&m).is_some_and(|b| b.contains(gone_said)),
+        "the control is handed over as gone: {:#?}",
+        m.requests
+    );
+    let looks = m
+        .requests
+        .iter()
+        .skip_while(|r| verb_of(r) != "send")
+        .take_while(|r| !r.starts_with("meta set attention "))
+        .filter(|r| r.starts_with("text --json tail="))
+        .count();
+    assert!(
+        looks <= 3,
+        "the control is judged once its screen held still: {looks} read-backs: {:#?}",
+        m.requests
+    );
+}
+
 /// A window that cannot fence a typed answer (no `send if-gen=`, no person count, or no person
 /// stamp) gets the recommended option, ledgered under the word's rule with the fallback said
 /// (`(recommended: this window cannot fence a typed answer: no …)`).

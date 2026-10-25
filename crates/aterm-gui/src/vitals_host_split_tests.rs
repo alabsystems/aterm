@@ -18,6 +18,9 @@ struct Reads {
     coalitions: usize,
     /// Sweeps that read each process's coalition.
     swept: usize,
+    /// Sweeps that read the pid version of each process whose start they
+    /// cannot read.
+    versioned: usize,
     births: usize,
     tables: usize,
     identities: usize,
@@ -40,6 +43,7 @@ thread_local! {
         Cell::new(Reads {
             coalitions: 0,
             swept: 0,
+            versioned: 0,
             births: 0,
             tables: 0,
             identities: 0,
@@ -442,7 +446,10 @@ fn the_kernels_readers_read_this_process_as_a_split_tick_takes_it() {
     assert_eq!((split.lane, split.vouches), (CoalLane::On, true));
     let coalition = (kernel.self_check)(me).expect("the self-check");
     let mut ids = aterm_sysprobe::coalitions::CoalitionIds::default();
-    let opts = aterm_sysprobe::SweepOpts { coalitions: true };
+    let opts = aterm_sysprobe::SweepOpts {
+        coalitions: true,
+        ..aterm_sysprobe::SweepOpts::default()
+    };
     let sweep = (kernel.sweep)(opts, &mut ids).expect("a sweep");
     let row = sweep
         .procs
@@ -1004,6 +1011,136 @@ fn many_births_are_read_in_one_read_of_the_table() {
     }
 }
 
+thread_local! {
+    /// [`FOREIGN`]'s processes by pid and name, each another user's.
+    static FOREIGN_ROWS: RefCell<Vec<(u32, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The stand-in kernel with a sweep of [`FOREIGN_ROWS`] and this process's
+/// own row (as the kernel's sweep reads it, so a delegated job another test
+/// carried for this process still reads complete): each of the others
+/// another user's, whose usage the kernel refuses, so the sweep reads no
+/// start for it, and its pid version only where the options ask (as the
+/// kernel's sweep reads it).
+const FOREIGN: CoalProbe = CoalProbe {
+    sweep: |opts, _| {
+        count(|r| {
+            r.swept += usize::from(opts.coalitions);
+            r.versioned += usize::from(opts.versions);
+        });
+        let me = std::process::id();
+        let own = aterm_sysprobe::processes()?
+            .procs
+            .into_iter()
+            .find(|p| p.pid == me)?;
+        let mut procs: Vec<aterm_sysprobe::ProcessReading> = FOREIGN_ROWS.with(|rows| {
+            rows.borrow()
+                .iter()
+                .map(|(pid, name)| aterm_sysprobe::ProcessReading {
+                    pid: *pid,
+                    ppid: 1,
+                    name: name.clone(),
+                    uid: Some(0),
+                    coalition: opts.coalitions.then_some(u64::from(*pid)),
+                    version: (opts.coalitions || opts.versions)
+                        .then(|| (STAND_IN.version)(*pid))
+                        .flatten(),
+                    ..aterm_sysprobe::ProcessReading::default()
+                })
+                .collect()
+        });
+        procs.push(own);
+        Some(aterm_sysprobe::Sweep {
+            procs,
+            truncated: false,
+        })
+    },
+    ..STAND_IN
+};
+
+/// ANOTHER USER'S PROCESS IS KNOWN FROM ONE WHOLE READING TO THE NEXT
+/// (§7.2 item 1): with more than [`BIRTHS_AT_ONCE`] such processes, whose
+/// start no sweep reads, the first reading reads the births table and the
+/// plain readings and split ticks after it read none, since every sweep
+/// reads their pid versions. NEGATIVE CONTROL: a new process at one of their
+/// pids, under the same name, moves its version and is read again (its one
+/// record), and its new birth is the one kept.
+#[test]
+fn another_users_births_are_read_once_across_plain_readings_and_split_ticks() {
+    const BORN: i64 = 1_790_000_000_000;
+    let me = std::process::id();
+    let own = own_swept_name();
+    let pids: Vec<u32> = (2_000..)
+        .filter(|pid| *pid != me)
+        .take(BIRTHS_AT_ONCE + 1)
+        .collect();
+    let names: Vec<String> = pids.iter().map(|pid| format!("rootd{pid}")).collect();
+    let again = pids[5];
+    let rows = |again_ms: Option<i64>| {
+        let mut rows: Vec<(u32, &str, i64, bool)> = pids
+            .iter()
+            .zip(&names)
+            .map(|(pid, name)| {
+                let ms = again_ms
+                    .filter(|_| *pid == again)
+                    .unwrap_or(i64::from(*pid) * 10);
+                (*pid, name.as_str(), ms, true)
+            })
+            .collect();
+        rows.push((me, own.as_str(), BORN, false));
+        kernel(&rows);
+    };
+    rows(None);
+    FOREIGN_ROWS.with(|r| *r.borrow_mut() = pids.iter().copied().zip(names.clone()).collect());
+    let mut reader = Reader::new(Arc::default());
+    reader.split = SplitReader::new(FOREIGN, gauge());
+    let born = |reader: &Reader, pid: u32| reader.split.births.get(&pid).map(|b| b.ms);
+    let all_born = |reader: &Reader| {
+        pids.iter()
+            .all(|pid| born(reader, *pid) == Some(i64::from(*pid) * 10))
+    };
+    READS.take();
+    let _ = reader.read(&bars());
+    let r = READS.take();
+    assert_eq!((r.tables, r.births), (1, 0), "the table, once");
+    assert_eq!(r.swept, 1, "the first, a split tick");
+    assert!(all_born(&reader), "{:?}", reader.split.births);
+
+    for k in 1..=8 {
+        if k % 4 == 0 {
+            reader.split.last = Instant::now().checked_sub(SPLIT_EVERY);
+        } else {
+            just_read(&mut reader);
+        }
+        let _ = reader.read(&bars());
+        assert!(all_born(&reader), "reading {k}: {:?}", reader.split.births);
+    }
+    let r = READS.take();
+    assert_eq!((r.tables, r.births), (0, 0), "every birth kept");
+    assert_eq!(
+        (r.swept, r.versioned),
+        (2, 8),
+        "6 plain readings and 2 split ticks, each sweep reading versions"
+    );
+
+    rows(Some(99_000));
+    reborn(again);
+    just_read(&mut reader);
+    let _ = reader.read(&bars());
+    let r = READS.take();
+    assert_eq!((r.swept, r.tables, r.births), (0, 0, 1), "NEGATIVE CONTROL");
+    assert_eq!(
+        born(&reader, again),
+        Some(99_000),
+        "the new process's birth"
+    );
+    just_read(&mut reader);
+    let _ = reader.read(&bars());
+    assert_eq!(born(&reader, again), Some(99_000));
+    let r = READS.take();
+    assert_eq!((r.tables, r.births), (0, 0), "kept under its new version");
+}
+
 #[test]
 fn every_voucher_is_unknown_when_launchd_does_not_read_as_apples() {
     for (launchd, voucher) in [(false, Voucher::Unknown), (true, Voucher::Apple)] {
@@ -1207,7 +1344,6 @@ fn the_reader_reads_its_scene_on_its_own_split_ticks() {
 
 /// This process's name as the sweep reads it, which the stand-in kernel's
 /// record must name for its birth to be taken.
-#[cfg(target_os = "macos")]
 fn own_swept_name() -> String {
     let me = std::process::id();
     aterm_sysprobe::processes()

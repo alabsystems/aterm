@@ -14,6 +14,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+mod admin_keys;
+mod admission;
+mod creation;
+mod enrollment;
+mod retirement;
+use admin_keys::parse_admin;
+pub use admission::{Evidence as AdmissionEvidence, Method as AdmissionMethod};
+pub use enrollment::admin_cached;
+pub use retirement::{Retirement, Revocation, admin_retire, admin_revoke};
+#[cfg(test)]
+mod birth_tests;
+
 /// Where a machine keeps its vault state, under one home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -943,51 +955,6 @@ fn with_ready_state<T>(
     read(config, state).map(Some)
 }
 
-const ADMIN_MAGIC: &str = "alab-vault-admin/1";
-
-fn admin_plaintext(seed: &[u8; 32], doc: &Document) -> SecretBytes {
-    let rendered = doc.render();
-    let mut seed_text = crate::b64::encode_padded(seed);
-    let mut out = Vec::with_capacity(ADMIN_MAGIC.len() + 16 + seed_text.len() + rendered.len());
-    out.extend_from_slice(ADMIN_MAGIC.as_bytes());
-    out.extend_from_slice(b"\nsigner-seed: ");
-    out.extend_from_slice(seed_text.as_bytes());
-    out.extend_from_slice(b"\n\n");
-    out.extend_from_slice(rendered.as_slice());
-    zeroize::Zeroize::zeroize(&mut seed_text);
-    SecretBytes::new(out)
-}
-
-struct AdminText {
-    seed: [u8; 32],
-    doc: Document,
-}
-
-impl Drop for AdminText {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.seed);
-    }
-}
-
-fn parse_admin(plain: &SecretBytes) -> crate::Result<AdminText> {
-    let text = plain
-        .as_str()
-        .ok_or_else(|| Error::new("admin locker: not UTF-8"))?;
-    let rest = text
-        .strip_prefix(ADMIN_MAGIC)
-        .and_then(|rest| rest.strip_prefix("\nsigner-seed: "))
-        .ok_or_else(|| Error::new("admin locker: not an admin locker"))?;
-    let (seed_text, doc) = rest
-        .split_once("\n\n")
-        .ok_or_else(|| Error::new("admin locker: malformed"))?;
-    let mut decoded = crate::b64::decode_padded(seed_text).unwrap_or_default();
-    let seed = <[u8; 32]>::try_from(decoded.as_slice());
-    zeroize::Zeroize::zeroize(&mut decoded);
-    let seed = seed.map_err(|_| Error::new("admin locker: bad seed"))?;
-    let doc = Document::parse(doc).map_err(|e| Error::new(format!("admin locker: {e}")))?;
-    Ok(AdminText { seed, doc })
-}
-
 fn open_lockers(envelope: &Envelope, identity: &Identity) -> crate::Result<Option<Vec<Entry>>> {
     let identities = std::slice::from_ref(identity);
     let mut everyone: BTreeMap<String, Entry> = BTreeMap::new();
@@ -1031,30 +998,48 @@ fn open_lockers(envelope: &Envelope, identity: &Identity) -> crate::Result<Optio
 
 /// The offline Commons reader, kept beside the vault's lock, pin and version
 /// checks so it cannot accidentally bypass the locally applied source binding.
-pub(crate) fn cached_commons(paths: &Paths) -> crate::Result<Option<crate::commons::Snapshot>> {
+pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Observation> {
+    use crate::commons::{Observation, Unavailable};
+    let unavailable = |reason| Ok(Observation::Unavailable(reason));
     let Some(_observation) = StateLock::observe(paths)? else {
-        return Ok(None);
+        if fsx::kind(&paths.lock_file())? != fsx::Kind::Missing {
+            return unavailable(Unavailable::Busy);
+        }
+        if config(paths)?.is_none() {
+            return unavailable(Unavailable::Unconfigured);
+        }
+        return unavailable(Unavailable::MissingStateLock);
     };
     let Some(config) = config(paths)? else {
-        return Ok(None);
+        return unavailable(Unavailable::Unconfigured);
     };
     let Some(pin) = config.signer else {
-        return Ok(None);
+        return unavailable(Unavailable::UnsignedSource);
     };
     let state = load_state(paths)?;
-    if state.membership != Stored::In
-        || state.failed
-        || !state.pending.is_empty()
-        || !source_bound(&config, &state)
-        || !pin_admitted(&config, None)
-    {
-        return Ok(None);
+    if state.membership == Stored::Revoked {
+        return unavailable(Unavailable::Revoked);
     }
-    let (Some(digest), Some(identity)) = (state.digest, read_identity(paths)?) else {
-        return Ok(None);
+    if state.membership != Stored::In {
+        return unavailable(Unavailable::NotAdmitted);
+    }
+    if state.failed || !state.pending.is_empty() {
+        return unavailable(Unavailable::IncompleteApply);
+    }
+    let Some(digest) = state.digest else {
+        return unavailable(Unavailable::IncompleteApply);
+    };
+    if !source_bound(&config, &state) {
+        return unavailable(Unavailable::SourceChanged);
+    }
+    if !pin_admitted(&config, None) {
+        return unavailable(Unavailable::UntrustedPin);
+    }
+    let Some(identity) = read_identity(paths)? else {
+        return unavailable(Unavailable::MissingIdentity);
     };
     let Some(bytes) = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)? else {
-        return Ok(None);
+        return unavailable(Unavailable::MissingCache);
     };
     let (envelope, pinned, verdict) = envelope::verify_for_reader(
         bytes.as_slice(),
@@ -1064,7 +1049,7 @@ pub(crate) fn cached_commons(paths: &Paths) -> crate::Result<Option<crate::commo
         Some(&Floor::version(state.seq, digest)),
     )?;
     if verdict != Verdict::Unchanged || !matches!(pinned, Pin::Same) {
-        return Ok(None);
+        return unavailable(Unavailable::PendingApply);
     }
     let mut control = None;
     for locker in envelope
@@ -1098,15 +1083,16 @@ pub(crate) fn cached_commons(paths: &Paths) -> crate::Result<Option<crate::commo
             control = Some(entry.value);
         }
     }
-    Ok(control.map(|control| {
-        crate::commons::Snapshot::verified(
+    Ok(match control {
+        Some(control) => Observation::Visible(crate::commons::Snapshot::verified(
             config.name,
             &envelope,
             config.followed,
             identity.recipient(),
             control,
-        )
-    }))
+        )),
+        None => Observation::Unavailable(Unavailable::ControlNotVisible),
+    })
 }
 
 fn plain_entries(config: &Config, path: &Path) -> crate::Result<Vec<Entry>> {
@@ -1426,7 +1412,7 @@ const fn quiet(report: &Report) -> bool {
 
 /// Fetch, verify, decrypt, and materialize once, optionally long-polling for `wait`.
 pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome> {
-    let mut config = config(paths)?.ok_or_else(|| {
+    let config = config(paths)?.ok_or_else(|| {
         Error::new("no vault configured: run aterm secrets join <url> (or aterm init)")
     })?;
     let before = load_state(paths)?;
@@ -1442,6 +1428,15 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
         }
         _ => transport::fetch(&config.source, None, Duration::from_secs(30))?,
     };
+    apply_fetched(paths, config, before, fetched)
+}
+
+fn apply_fetched(
+    paths: &Paths,
+    mut config: Config,
+    before: State,
+    fetched: Fetched,
+) -> crate::Result<SyncOutcome> {
     let lock = StateLock::take(paths)?;
     if self::config(paths)?.as_ref() != Some(&config) {
         return Ok(SyncOutcome::Unchanged { seq: before.seq });
@@ -1767,6 +1762,7 @@ fn subscriber_pass(
     paths: &Paths,
     repaired: &mut Option<([u8; 32], u64)>,
 ) -> crate::Result<(Config, SyncOutcome)> {
+    creation::resume(paths)?;
     let config = config(paths)?
         .ok_or_else(|| Error::new("no vault configured; waiting for aterm secrets join"))?;
     let before = *repaired;
@@ -1884,7 +1880,9 @@ fn admin_here_approving(
         Err(age::AgeError::NoMatch) => return Ok(None),
         Err(error) => return Err(Error::new(format!("admin locker: {error}"))),
     };
-    Ok(Approval::of(&parse_admin(&plain)?.doc))
+    let opened = parse_admin(&plain)?;
+    opened.admissions.validate(&opened.doc, envelope.seq)?;
+    Ok(Approval::of(&opened.doc))
 }
 
 struct ApprovalCheck {
@@ -2076,23 +2074,24 @@ pub fn auto_approve(paths: &Paths) -> crate::Result<AutoApproved> {
 
 fn auto_approve_opened(paths: &Paths, admin: &Admin) -> crate::Result<AutoApproved> {
     let mut done = AutoApproved::default();
-    let Some(approval) = Approval::of(&admin.doc) else {
+    let Some(approval) = Approval::of(&admin.published_doc) else {
         return Ok(done);
     };
     let name = &admin.config.name;
     let key = admin
-        .doc
+        .published_doc
         .join_password()
         .filter(|_| approval == Approval::Password)
         .map(|password| join::Key::derive(name, password.as_slice()));
     let mut members: Vec<String> = admin
-        .doc
+        .published_doc
         .machines()
         .into_iter()
         .map(|machine| machine.recipient)
         .collect();
-    let code_only = admin.doc.code_only();
-    let mut doc = admin.doc.clone();
+    let code_only = admin.published_doc.code_only();
+    let mut doc = admin.published_doc.clone();
+    let mut admissions = Vec::new();
     for request in requests_for(&admin.config, None)? {
         if !approval.reads(&request) {
             continue;
@@ -2114,6 +2113,13 @@ fn auto_approve_opened(paths: &Paths, admin: &Admin) -> crate::Result<AutoApprov
                 doc.add_machine(&host, &request.recipient)
                     .map_err(|e| Error::new(e.to_string()))?;
                 done.approved.push(host);
+                admissions.push((
+                    request.recipient.clone(),
+                    match approval {
+                        Approval::Password => AdmissionMethod::Password,
+                        Approval::Open => AdmissionMethod::Open,
+                    },
+                ));
                 members.push(request.recipient.clone());
             } else if approval == Approval::Password {
                 done.refused.push(request.recipient.clone());
@@ -2124,7 +2130,7 @@ fn auto_approve_opened(paths: &Paths, admin: &Admin) -> crate::Result<AutoApprov
         done.judged.push(judged);
     }
     if !done.approved.is_empty() {
-        done.seq = Some(admin_publish(paths, admin, &doc)?.seq);
+        done.seq = Some(publish_as(paths, admin, &doc, false, &admissions)?.seq);
     }
     Ok(done)
 }
@@ -2338,6 +2344,7 @@ fn join_with(
         plain_entries(&config, path)?;
         let identity = {
             let _lock = StateLock::take(paths)?;
+            creation::permit_join(paths)?;
             expected.check(paths)?;
             let identity = match identity {
                 Some(identity) => identity,
@@ -2404,6 +2411,7 @@ fn join_with(
     };
     let identity = {
         let _lock = StateLock::take(paths)?;
+        creation::permit_join(paths)?;
         expected.check(paths)?;
         let identity = match identity {
             Some(identity) => identity,
@@ -2551,14 +2559,19 @@ fn already_in(paths: &Paths) -> crate::Result<Option<JoinOutcome>> {
     )
 }
 
-/// An open vault, as an admin sees it: the text, the signing seed, and where it came from.
+/// An open vault, as an admin sees it: text, private authority custody and source.
 pub struct Admin {
     /// The vault text.
     pub doc: Document,
     /// The source config.
     pub config: Config,
+    /// Authenticated baseline, unaffected by edits through the public draft.
+    published_doc: Document,
     commons_eligibility: crate::commons::membership::Eligibility,
+    admissions: admission::Ledger,
     seed: [u8; 32],
+    commons_seed: [u8; 32],
+    commons_bound: bool,
     seq: u64,
     /// The handoff chain from the vault's first key to the current one, carried whole on
     /// every version, so a machine pinned to any earlier key (asleep across rotations, or a
@@ -2572,6 +2585,7 @@ pub struct Admin {
 impl Drop for Admin {
     fn drop(&mut self) {
         zeroize::Zeroize::zeroize(&mut self.seed);
+        zeroize::Zeroize::zeroize(&mut self.commons_seed);
     }
 }
 
@@ -2582,6 +2596,156 @@ impl std::fmt::Debug for Admin {
 }
 
 impl Admin {
+    /// Admission metadata from the authenticated published snapshot. A row is
+    /// historical provenance, not current membership or a transferable grant.
+    pub fn commons_admission(&self, host: &str) -> Option<AdmissionEvidence> {
+        let machine = self
+            .published_doc
+            .machines()
+            .into_iter()
+            .find(|m| m.name == host)?;
+        self.admissions
+            .evidence(&Recipient::parse(&machine.recipient).ok()?)
+    }
+
+    /// Automatically certify only a proven recipient with durable eligible
+    /// admission evidence. Current audience, root, retirement and possession
+    /// checks still apply. An open-vault admission alone is insufficient.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "Password",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "Manual",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "OpenClosed",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "Removed",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "Readded",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "GenericEdit",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "Rotate",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "Rename",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "Excluded",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "Legacy",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "Draft",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "InvalidProof",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "ForeignRoot",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAdmissionEvidence",
+            action = "Founder",
+            project = "aterm_secrets::client::admission::tests::admission_transition"
+        )
+    )]
+    pub fn auto_approve_commons_member(
+        &self,
+        journal: &crate::commons::journal::Journal,
+        host: &str,
+        possession: crate::commons::binding::Possession,
+    ) -> crate::Result<crate::commons::membership::Certificate> {
+        if !self
+            .admissions
+            .permits(journal.trust(), &possession.binding().recipient())
+        {
+            return Err(Error::new(
+                "Commons enrollment needs authenticated admission evidence",
+            ));
+        }
+        self.approve_commons_member(journal, host, possession)
+    }
+
+    /// The public Commons authority, whose private custody survives vault signer
+    /// rotations. Legacy lockers retain their original shared signing seed.
+    pub fn commons_authority(&self) -> crate::Result<[u8; 32]> {
+        envelope::signer_public(&self.commons_seed)
+    }
+
     /// Prepare an initial typed Commons roster from consumed joint-possession
     /// proofs and the authenticated eligibility snapshot captured on open.
     /// Use only for a new network and durably publish its returned genesis as
@@ -2592,7 +2756,12 @@ impl Admin {
         network: [u8; 16],
         members: Vec<crate::commons::roster::Enrollment>,
     ) -> crate::Result<crate::commons::node::Node> {
-        crate::commons::roster::create(&self.seed, &self.commons_eligibility, network, members)
+        crate::commons::roster::create(
+            &self.commons_seed,
+            &self.commons_eligibility,
+            network,
+            members,
+        )
     }
 
     /// Prepare a fresh key epoch and typed roster extending the exact current
@@ -2604,7 +2773,12 @@ impl Admin {
         journal: &crate::commons::journal::Journal,
         members: Vec<crate::commons::roster::Grant>,
     ) -> crate::Result<crate::commons::node::Node> {
-        crate::commons::roster::rotate(&self.seed, &self.commons_eligibility, journal, members)
+        crate::commons::roster::rotate(
+            &self.commons_seed,
+            &self.commons_eligibility,
+            journal,
+            members,
+        )
     }
 
     /// Prepare one atomic retirement and fresh-key roster update. Retired actors
@@ -2616,7 +2790,7 @@ impl Admin {
         retirements: &[[u8; 48]],
     ) -> crate::Result<crate::commons::node::Node> {
         crate::commons::roster::rotate_retiring(
-            &self.seed,
+            &self.commons_seed,
             &self.commons_eligibility,
             journal,
             members,
@@ -2637,7 +2811,7 @@ impl Admin {
         possession: crate::commons::binding::Possession,
     ) -> crate::Result<crate::commons::membership::Certificate> {
         crate::commons::membership::approve(
-            &self.seed,
+            &self.commons_seed,
             journal,
             &self.commons_eligibility,
             host,
@@ -2645,7 +2819,7 @@ impl Admin {
         )
     }
 
-    /// Prepare a domain-separated control node without exporting the vault key.
+    /// Prepare a domain-separated control node without exporting its authority key.
     /// Persist and retry its exact bytes: a freshly encrypted draft is a distinct
     /// event. Named recipients must already be in this admin's document; callers
     /// still decide which machines qualify for Commons membership.
@@ -2675,9 +2849,16 @@ impl Admin {
         let authored_ms = aterm_time::unix_millis()
             .ok_or_else(|| Error::new("system clock cannot represent an author timestamp"))?;
         if facts.is_empty() {
-            Node::seal(&self.seed, network, edit, &recipients, authored_ms)
+            Node::seal(&self.commons_seed, network, edit, &recipients, authored_ms)
         } else {
-            Node::seal_restricted(&self.seed, network, edit, &recipients, authored_ms, facts)
+            Node::seal_restricted(
+                &self.commons_seed,
+                network,
+                edit,
+                &recipients,
+                authored_ms,
+                facts,
+            )
         }
     }
 
@@ -2802,6 +2983,7 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
         Err(error) => return Err(Error::new(format!("admin locker: {error}"))),
     };
     let opened = parse_admin(&plain)?;
+    opened.admissions.validate(&opened.doc, envelope.seq)?;
     if envelope::signer_public(&opened.seed)? != envelope.signer {
         return Err(Error::new(
             "the admin locker's key does not match the envelope's signer",
@@ -2816,9 +2998,13 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
     }
     Ok(Admin {
         commons_eligibility: crate::commons::membership::Eligibility::from_document(&opened.doc),
+        admissions: opened.admissions.clone(),
         doc: opened.doc.clone(),
+        published_doc: opened.doc.clone(),
         config,
         seed: opened.seed,
+        commons_seed: opened.commons_seed,
+        commons_bound: opened.commons_bound,
         seq: envelope.seq,
         handoff,
         opened_pairs: envelope.handoff.len(),
@@ -2843,13 +3029,75 @@ fn recipients_of(names: &[String], doc: &Document) -> crate::Result<Vec<Recipien
     Ok(out)
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAuthorityCustody",
+        action = "NewVault",
+        project = "aterm_secrets::client::admin_keys::tests::custody_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAuthorityCustody",
+        action = "VaultRotation",
+        project = "aterm_secrets::client::admin_keys::tests::custody_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAuthorityCustody",
+        action = "LegacyRotation",
+        project = "aterm_secrets::client::admin_keys::tests::custody_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAuthorityCustody",
+        action = "ChangedDescriptor",
+        project = "aterm_secrets::client::admin_keys::tests::custody_transition"
+    )
+)]
 fn seal(
     name: &str,
     seq: u64,
     seed: &[u8; 32],
+    commons_seed: &[u8; 32],
+    commons_bound: bool,
     doc: &Document,
     handoff: &[([u8; 32], [u8; 64])],
 ) -> crate::Result<Vec<u8>> {
+    seal_with_admissions(
+        name,
+        seq,
+        seed,
+        commons_seed,
+        commons_bound,
+        doc,
+        handoff,
+        &admission::Ledger::default().retained(doc)?,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "vault seal has independent custody and admission provenance"
+)]
+fn seal_with_admissions(
+    name: &str,
+    seq: u64,
+    seed: &[u8; 32],
+    commons_seed: &[u8; 32],
+    commons_bound: bool,
+    doc: &Document,
+    handoff: &[([u8; 32], [u8; 64])],
+    admissions: &admission::Ledger,
+) -> crate::Result<Vec<u8>> {
+    admin_keys::validate_commons(doc, commons_seed)?;
+    admissions.validate(doc, seq)?;
     let admins = recipients_of(&doc.admins(), doc)?;
     if admins.is_empty() {
         return Err(Error::new("the vault needs at least one admin"));
@@ -2858,7 +3106,14 @@ fn seal(
         label: "admin".to_string(),
         armored: age::armor(&age::encrypt(
             &admins,
-            admin_plaintext(seed, doc).as_slice(),
+            admin_keys::admin_plaintext_with_admissions(
+                seed,
+                commons_seed,
+                commons_bound || admin_keys::has_control(doc),
+                doc,
+                admissions,
+            )
+            .as_slice(),
         )?),
     }];
     for (index, plan) in doc.lockers().into_iter().enumerate() {
@@ -2946,44 +3201,113 @@ fn alab_release(
 
 /// Publish `doc` as the next version, rotating keys or join credentials when members leave.
 pub fn admin_publish(paths: &Paths, admin: &Admin, doc: &Document) -> crate::Result<Published> {
-    publish_as(paths, admin, doc, false)
+    publish_as(paths, admin, doc, false, &[])
+}
+
+/// Publish explicit manual recipient approvals with their machine-list changes.
+/// This is an authority decision: ordinary document edits use `admin_publish`
+/// and cannot create admission provenance. Existing recipients can be approved
+/// again without creating a duplicate machine or trusting their old join path.
+pub fn admin_publish_approved(
+    paths: &Paths,
+    admin: &Admin,
+    doc: &Document,
+    recipients: &[String],
+) -> crate::Result<Published> {
+    let admissions = recipients
+        .iter()
+        .map(|r| (r.clone(), AdmissionMethod::Manual))
+        .collect::<Vec<_>>();
+    publish_as(paths, admin, doc, false, &admissions)
 }
 
 /// Publish `doc` signed by a newly rotated vault key endorsed by the current key.
 pub fn admin_rotate(paths: &Paths, admin: &Admin, doc: &Document) -> crate::Result<Published> {
-    publish_as(paths, admin, doc, true)
+    publish_as(paths, admin, doc, true, &[])
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAuthorityCustody",
+        action = "UnboundRotation",
+        project = "aterm_secrets::client::admin_keys::tests::custody_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAuthorityCustody",
+        action = "BoundDemotion",
+        project = "aterm_secrets::client::admin_keys::tests::custody_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAuthorityCustody",
+        action = "RemovedDescriptor",
+        project = "aterm_secrets::client::admin_keys::tests::custody_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAuthorityCustody",
+        action = "LegacyUnknown",
+        project = "aterm_secrets::client::admin_keys::tests::custody_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbFoundationBirth",
+        action = "Rotate",
+        project = "aterm_secrets::client::birth_tests::birth_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbFoundationBirth",
+        action = "Enroll",
+        project = "aterm_secrets::client::birth_tests::birth_transition"
+    )
+)]
 fn publish_as(
     paths: &Paths,
     admin: &Admin,
     doc: &Document,
     rotate: bool,
+    approved: &[(String, AdmissionMethod)],
 ) -> crate::Result<Published> {
+    admin_keys::validate_commons_transition(&admin.published_doc, doc)?;
     let seq = envelope::next_seq(admin.seq)?;
     let identity = machine_identity(paths)?;
-    let mine = identity.recipient().to_bech32();
-    let me = doc
-        .machines()
-        .into_iter()
-        .find(|machine| machine.recipient == mine)
-        .ok_or_else(|| {
-            Error::new("this machine would no longer be in the vault; refusing to publish")
-        })?;
-    if !doc.admins().contains(&me.name) {
-        return Err(Error::new(format!(
-            "{} would no longer be an admin; refusing to publish (make another admin first)",
-            me.name
-        )));
-    }
-    let before = recipients_of(&admin.doc.admins(), &admin.doc)?;
-    let after = recipients_of(&doc.admins(), doc)?;
-    let rotate = rotate || before.iter().any(|old| !after.contains(old));
-    let renewed = renew_join_password(&admin.doc, doc)?;
+    let (bound, demoted) = publication_rights(admin, doc, &identity)?;
+    retirement::validate_removals(paths, admin, doc)?;
+    let rotate = rotate || demoted;
+    let renewed = renew_join_password(&admin.published_doc, doc)?;
     let password_renewed = renewed.is_some();
     let doc = renewed.as_ref().unwrap_or(doc);
-    let (recorded, kept_out, held) = code_only_for(&admin.config, &admin.doc, doc)?;
+    let (recorded, kept_out, held) = code_only_for(&admin.config, &admin.published_doc, doc)?;
     let doc = recorded.as_ref().unwrap_or(doc);
+    let shared = enrollment::include_approved(doc, approved)?;
+    let doc = shared.as_ref().unwrap_or(doc);
+    let mut admissions = admin.admissions.retained(doc)?;
+    for (recipient, method) in approved {
+        admissions.record(
+            doc,
+            recipient,
+            AdmissionEvidence {
+                method: *method,
+                sequence: seq,
+                authored_ms: aterm_time::unix_millis()
+                    .ok_or_else(|| Error::new("system clock cannot represent admission time"))?,
+                author: identity.recipient(),
+            },
+        )?;
+    }
     let (bytes, release, pairs) = if rotate {
         let mut seed = [0u8; 32];
         aterm_uds::rand::fill(&mut seed)?;
@@ -2992,14 +3316,40 @@ fn publish_as(
             let endorsement = envelope::endorse(&admin.seed, &admin.config.name, &new)?;
             let mut handoff = admin.handoff.clone();
             handoff.push((old, endorsement));
-            let bytes = seal(&admin.config.name, seq, &seed, doc, &handoff)?;
+            let mut commons_seed = zeroize::Zeroizing::new(admin.commons_seed);
+            if !bound {
+                aterm_uds::rand::fill(commons_seed.as_mut())?;
+                let public = envelope::signer_public(&commons_seed)?;
+                if public == new || public == admin.commons_authority()? {
+                    return Err(Error::new("new vault authorities must have distinct keys"));
+                }
+            }
+            let bytes = seal_with_admissions(
+                &admin.config.name,
+                seq,
+                &seed,
+                &commons_seed,
+                bound,
+                doc,
+                &handoff,
+                &admissions,
+            )?;
             let release = alab_release(&Retired::compiled(), &handoff, &new);
             Ok((bytes, release, handoff.len()))
         });
         zeroize::Zeroize::zeroize(&mut seed);
         sealed?
     } else {
-        let bytes = seal(&admin.config.name, seq, &admin.seed, doc, &admin.handoff)?;
+        let bytes = seal_with_admissions(
+            &admin.config.name,
+            seq,
+            &admin.seed,
+            &admin.commons_seed,
+            bound,
+            doc,
+            &admin.handoff,
+            &admissions,
+        )?;
         (bytes, None, admin.handoff.len())
     };
     {
@@ -3018,6 +3368,42 @@ fn publish_as(
         held,
         local,
     })
+}
+
+/// Shared preflight for publication and irreversible membership retirement.
+/// Returns whether Commons custody is bound and a vault admin was removed.
+fn publication_rights(
+    admin: &Admin,
+    doc: &Document,
+    identity: &Identity,
+) -> crate::Result<(bool, bool)> {
+    let mine = identity.recipient().to_bech32();
+    let me = doc
+        .machines()
+        .into_iter()
+        .find(|machine| machine.recipient == mine)
+        .ok_or_else(|| {
+            Error::new("this machine would no longer be in the vault; refusing to publish")
+        })?;
+    if !doc.admins().contains(&me.name) {
+        return Err(Error::new(format!(
+            "{} would no longer be an admin; refusing to publish (make another admin first)",
+            me.name
+        )));
+    }
+    let before = recipients_of(&admin.published_doc.admins(), &admin.published_doc)?;
+    let after = recipients_of(&doc.admins(), doc)?;
+    let bound = admin.commons_bound
+        || admin_keys::has_control(&admin.published_doc)
+        || admin_keys::has_control(doc);
+    let demoted = before.iter().any(|old| !after.contains(old));
+    if demoted && bound {
+        return Err(Error::new(
+            "cannot demote a vault admin whose Commons authority may already be pinned; \
+            a Commons authority transfer is required and is not yet supported",
+        ));
+    }
+    Ok((bound, demoted))
 }
 
 fn configured_admin(paths: &Paths, expected: &Config) -> crate::Result<StateLock> {
@@ -3107,7 +3493,7 @@ pub struct Created {
     pub fingerprint: String,
     /// Names imported into `[everyone]`.
     pub imported: Vec<String>,
-    /// Why this machine's own sync after the publish failed, if it did.
+    /// Why this machine's local installation after the publish failed, if it did.
     pub local: Option<String>,
 }
 
@@ -3118,6 +3504,56 @@ pub fn create(
     import: Option<&Path>,
     host: Option<&str>,
 ) -> crate::Result<Created> {
+    create_initial(paths, source, import, host, true)
+}
+
+/// An explicitly requested remote creation still needs background recovery.
+pub(crate) fn creation_pending(paths: &Paths) -> crate::Result<bool> {
+    creation::pending_remote(paths)
+}
+
+pub(crate) fn creation_requires_device(paths: &Paths) -> crate::Result<bool> {
+    creation::requires_device(paths)
+}
+
+/// Construct a pre-foundation vault for compatibility tests. New installations
+/// always use [`create`]; this seam is absent from production release builds.
+#[cfg(any(test, debug_assertions))]
+pub fn test_create_unbound(
+    paths: &Paths,
+    source: &str,
+    import: Option<&Path>,
+    host: Option<&str>,
+) -> crate::Result<Created> {
+    create_initial(paths, source, import, host, false)
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbFoundationBirth",
+        action = "Create",
+        project = "aterm_secrets::client::birth_tests::birth_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbFoundationBirth",
+        action = "Legacy",
+        project = "aterm_secrets::client::birth_tests::birth_transition"
+    )
+)]
+fn create_initial(
+    paths: &Paths,
+    source: &str,
+    import: Option<&Path>,
+    host: Option<&str>,
+    foundation: bool,
+) -> crate::Result<Created> {
+    if foundation {
+        return creation::create(paths, source, import, host);
+    }
     let (source, _) = transport::parse_source(source, &paths.home)?;
     let name = transport::vault_name(&source)?;
     match &source {
@@ -3148,8 +3584,43 @@ pub fn create(
         Some(host) => return Err(Error::new(format!("{host:?} is not a valid machine name"))),
         None => default_host_name(),
     };
+    let (bytes, signer, imported) = prepare_initial(paths, &name, import, &host, false)?;
+    transport::publish(&source, &bytes)?;
+    let config = Config {
+        source,
+        name: name.clone(),
+        signer: Some(signer),
+        followed: Vec::new(),
+        host,
+    };
+    {
+        let _lock = StateLock::take(paths)?;
+        let mut state = load_state(paths)?;
+        state.seq = 0;
+        state.digest = None;
+        state.membership = Stored::None;
+        prepare_materialization(paths, &mut state)?;
+        save_config(paths, &config)?;
+    }
+    let local = sync(paths, None).err().map(|error| error.to_string());
+    Ok(Created {
+        name,
+        signer: crate::b64::encode_padded(&signer),
+        fingerprint: envelope::fingerprint(&signer),
+        imported,
+        local,
+    })
+}
+
+fn prepare_initial(
+    paths: &Paths,
+    name: &str,
+    import: Option<&Path>,
+    host: &str,
+    foundation: bool,
+) -> crate::Result<(Vec<u8>, [u8; 32], Vec<String>)> {
     let identity = machine_identity(paths)?;
-    let mut doc = Document::new_vault(&host, &identity.recipient().to_bech32());
+    let mut doc = Document::new_vault(host, &identity.recipient().to_bech32());
     let password = join::generate()?;
     doc.set_join_password(Some(password.as_slice()))
         .map_err(|e| Error::new(e.to_string()))?;
@@ -3178,36 +3649,53 @@ pub fn create(
             imported.push(name);
         }
     }
-    let mut seed = [0u8; 32];
-    aterm_uds::rand::fill(&mut seed)?;
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+    aterm_uds::rand::fill(seed.as_mut())?;
     let signer = envelope::signer_public(&seed)?;
-    let bytes = seal(&name, 1, &seed, &doc, &[]);
-    zeroize::Zeroize::zeroize(&mut seed);
-    transport::publish(&source, &bytes?)?;
-    let config = Config {
-        source,
-        name: name.clone(),
-        signer: Some(signer),
-        followed: Vec::new(),
-        host,
-    };
-    {
-        let _lock = StateLock::take(paths)?;
-        let mut state = load_state(paths)?;
-        state.seq = 0;
-        state.digest = None;
-        state.membership = Stored::None;
-        prepare_materialization(paths, &mut state)?;
-        save_config(paths, &config)?;
+    let mut commons_seed = zeroize::Zeroizing::new([0u8; 32]);
+    aterm_uds::rand::fill(commons_seed.as_mut())?;
+    if envelope::signer_public(&commons_seed)? == signer {
+        return Err(Error::new("new vault authorities must have distinct keys"));
     }
-    let local = sync(paths, None).err().map(|error| error.to_string());
-    Ok(Created {
-        name,
-        signer: crate::b64::encode_padded(&signer),
-        fingerprint: envelope::fingerprint(&signer),
-        imported,
-        local,
-    })
+    if foundation {
+        let anchor =
+            crate::commons::node::Node::foundation(envelope::signer_public(&commons_seed)?)?;
+        let descriptor = crate::commons::bootstrap::Descriptor::from_genesis(anchor)?;
+        doc.set_entry(
+            &Audience::Hosts(vec![host.to_string()]),
+            crate::commons::ENTRY,
+            &descriptor.bytes(),
+        )
+        .map_err(|error| Error::new(error.to_string()))?;
+        // Creation explicitly authorizes this first owner. Do not reuse this
+        // path for admission to an existing vault: its eligibility must come
+        // from the authenticated published document captured by Admin.
+        let descriptor = creation::enroll_founder(paths, &doc, host, &commons_seed, descriptor)?;
+        doc.set_entry(
+            &Audience::Hosts(vec![host.to_string()]),
+            crate::commons::ENTRY,
+            &descriptor.bytes(),
+        )
+        .map_err(|error| Error::new(error.to_string()))?;
+    }
+    let bytes = if foundation {
+        let mut admissions = admission::Ledger::default();
+        admissions.record(
+            &doc,
+            &identity.recipient().to_bech32(),
+            AdmissionEvidence {
+                method: AdmissionMethod::Founder,
+                sequence: 1,
+                authored_ms: aterm_time::unix_millis()
+                    .ok_or_else(|| Error::new("system clock cannot represent admission time"))?,
+                author: identity.recipient(),
+            },
+        )?;
+        seal_with_admissions(name, 1, &seed, &commons_seed, true, &doc, &[], &admissions)?
+    } else {
+        seal(name, 1, &seed, &commons_seed, false, &doc, &[])?
+    };
+    Ok((bytes, signer, imported))
 }
 
 /// A pending join request.
@@ -3963,10 +4451,12 @@ mod tests {
             doc.set_entry(&Audience::Everyone, &format!("a{n}"), &value)
                 .expect("set");
         }
-        seal("alab", 1, &[7u8; 32], &doc, &[]).expect("five values of 1 MiB fit");
+        seal("alab", 1, &[7u8; 32], &[8u8; 32], false, &doc, &[])
+            .expect("five values of 1 MiB fit");
         doc.set_entry(&Audience::Everyone, "a6", &value)
             .expect("the text holds a sixth");
-        let error = seal("alab", 1, &[7u8; 32], &doc, &[]).expect_err("too large");
+        let error =
+            seal("alab", 1, &[7u8; 32], &[8u8; 32], false, &doc, &[]).expect_err("too large");
         assert!(
             error.0.contains("too large to publish") && error.0.contains("entries fit"),
             "{error}"
@@ -4493,6 +4983,8 @@ mod tests {
 
         let first = load_state(&admin).unwrap();
         let other = root.path().join("other.vault");
+        let admin = Paths::for_home(&root.path().join("admin-other"));
+        let token = materialize::target_path(&admin.home, "token").unwrap();
         create(&admin, other.to_str().unwrap(), None, Some("admin")).unwrap();
         let opened = admin_open(&admin).unwrap();
         let mut doc = opened.doc.clone();
@@ -4528,6 +5020,8 @@ mod tests {
         let socket = bound();
         let server = serve(&store, &socket);
         let url = format!("http://{}/v1/served", server.addr);
+        let admin = Paths::for_home(&root.path().join("admin-served"));
+        let token = materialize::target_path(&admin.home, "token").unwrap();
         create(&admin, &url, None, Some("admin")).unwrap();
         let opened = admin_open(&admin).unwrap();
         let mut doc = opened.doc.clone();
@@ -4945,7 +5439,7 @@ mod tests {
         let running = serve(&store, &socket);
         let url = format!("http://{}/v1/alab", running.addr);
         let admin = Paths::for_home(&root.path().join("ma"));
-        create(&admin, &url, None, Some("ma")).expect("create");
+        test_create_unbound(&admin, &url, None, Some("ma")).expect("create");
         let stale = root.path().join("stale");
         std::fs::create_dir_all(&stale).expect("dir");
         std::fs::copy(store.join("alab.vault"), stale.join("alab.vault")).expect("copied");
@@ -5436,20 +5930,25 @@ mod tests {
         let server = Stop(Some(serve(&root.path().join("store"), &bound())));
         let addr = server.0.as_ref().expect("running").addr;
         let admin = Paths::for_home(&root.path().join("admin"));
+        let recipient = machine_identity(&admin).unwrap().recipient().to_bech32();
         let mut sources = Vec::new();
         for (name, value) in [("first", b"inert-first"), ("second", b"inert-other")] {
+            let creator = Paths::for_home(&root.path().join(format!("creator-{name}")));
             let url = format!("http://{addr}/v1/{name}");
-            let created = create(&admin, &url, None, Some("admin")).expect("create");
-            let opened = admin_open(&admin).expect("open");
+            let created = create(&creator, &url, None, Some("creator")).expect("create");
+            let opened = admin_open(&creator).expect("open");
             let mut doc = opened.doc.clone();
+            doc.add_machine("admin", &recipient).unwrap();
+            doc.add_admin("admin").unwrap();
             if name == "first" {
                 doc.set_open(true).expect("open first vault");
             }
             doc.set_entry(&Audience::Everyone, "token", value)
                 .expect("set token");
-            admin_publish(&admin, &opened, &doc).expect("publish open vault");
+            admin_publish(&creator, &opened, &doc).expect("publish open vault");
             sources.push(format!("{url}#{}", created.signer));
         }
+        join_pinned(&admin, &sources[1], "admin");
         let second_config = pinned(&admin);
         let from_a = Paths::for_home(&root.path().join("from-a"));
         let from_b = Paths::for_home(&root.path().join("from-b"));
@@ -6181,7 +6680,16 @@ mod tests {
             envelope::signer_public(&opened.seed).expect("public"),
             envelope::endorse(&opened.seed, name, &next).expect("endorsed"),
         );
-        let cut = seal(name, opened.seq + 1, &seed, &opened.doc, &[link]).expect("sealed");
+        let cut = seal(
+            name,
+            opened.seq + 1,
+            &seed,
+            &opened.commons_seed,
+            opened.commons_bound,
+            &opened.doc,
+            &[link],
+        )
+        .expect("sealed");
         transport::publish(&opened.config.source, &cut).expect("written");
 
         let error = sync(&reader, None).expect_err("refused");
@@ -6695,7 +7203,7 @@ mod commons_tests {
         let root = aterm_tempfile::tempdir().unwrap();
         let source = root.path().join("team.vault");
         let paths = Paths::for_home(&root.path().join("admin"));
-        create(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+        test_create_unbound(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
         let admin = admin_open(&paths).unwrap();
         let mut document = admin.doc.clone();
         document
@@ -6710,6 +7218,77 @@ mod commons_tests {
             .unwrap();
         admin_publish(&paths, &admin, &document).unwrap();
         (root, paths, source)
+    }
+
+    #[test]
+    fn unavailable_control_observations_name_the_boundary_without_initializing() {
+        use commons::{Observation, Unavailable};
+        let reason = |paths: &Paths| match commons::observe(paths).unwrap() {
+            Observation::Unavailable(reason) => reason,
+            Observation::Visible(_) => panic!("unexpected visible control"),
+        };
+        let empty = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(&empty.path().join("unconfigured"));
+        assert_eq!(reason(&paths), Unavailable::Unconfigured);
+        assert!(!paths.home.exists());
+        let lock = StateLock::take(&paths).unwrap();
+        assert_eq!(reason(&paths), Unavailable::Busy);
+        drop(lock);
+        assert_eq!(reason(&paths), Unavailable::Unconfigured);
+        let (_root, paths, _) = fixture();
+        let original = load_state(&paths).unwrap();
+        for (variant, expected) in [
+            (0, Unavailable::NotAdmitted),
+            (1, Unavailable::Revoked),
+            (2, Unavailable::IncompleteApply),
+            (3, Unavailable::IncompleteApply),
+            (4, Unavailable::SourceChanged),
+            (5, Unavailable::IncompleteApply),
+        ] {
+            let mut state = original.clone();
+            match variant {
+                0 => state.membership = Stored::Pending,
+                1 => state.membership = Stored::Revoked,
+                2 => state.failed = true,
+                3 => {
+                    state.pending.insert("ordinary".into(), "incomplete".into());
+                }
+                4 => state.source_identity = None,
+                _ => state.digest = None,
+            }
+            save_state(&paths, &state).unwrap();
+            assert_eq!(reason(&paths), expected);
+        }
+        save_state(&paths, &original).unwrap();
+        let lock = StateLock::take(&paths).unwrap();
+        assert_eq!(reason(&paths), Unavailable::Busy);
+        drop(lock);
+        for (path, expected) in [
+            (paths.lock_file(), Unavailable::MissingStateLock),
+            (paths.identity_file(), Unavailable::MissingIdentity),
+            (paths.cache_file(), Unavailable::MissingCache),
+        ] {
+            let aside = path.with_extension("retained-test-copy");
+            std::fs::rename(&path, &aside).unwrap();
+            assert_eq!(reason(&paths), expected);
+            assert!(!path.exists(), "observation cannot replace missing custody");
+            std::fs::rename(aside, path).unwrap();
+        }
+        let bytes = std::fs::read(paths.cache_file()).unwrap();
+        fsx::write_atomic(&paths.cache_file(), b"corrupt", 0o600).unwrap();
+        assert!(commons::observe(&paths).is_err());
+        fsx::write_atomic(&paths.cache_file(), &bytes, 0o600).unwrap();
+        let admin = admin_open(&paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.unset_entry(&Audience::Hosts(vec!["m1".into()]), ENTRY)
+            .unwrap();
+        admin_publish(&paths, &admin, &doc).unwrap();
+        assert_eq!(reason(&paths), Unavailable::ControlNotVisible);
+        assert!(matches!(
+            status(&paths).unwrap().membership,
+            Membership::In { .. }
+        ));
+        assert!(!paths.dir.join("commons").exists());
     }
 
     #[test]
@@ -6871,7 +7450,7 @@ mod commons_tests {
     }
 
     #[test]
-    fn control_journal_uses_the_admin_signer_without_ordinary_materialization() {
+    fn control_journal_uses_its_own_authority_without_ordinary_materialization() {
         use crate::commons::{
             journal::{Journal, State, Trust},
             node::Edit,
@@ -6889,7 +7468,8 @@ mod commons_tests {
                 },
             )
             .unwrap();
-        assert_eq!(Some(node.authority()), admin.config.signer);
+        assert_eq!(node.authority(), admin.commons_authority().unwrap());
+        assert_ne!(Some(node.authority()), admin.config.signer);
         assert!(
             admin
                 .seal_commons(
@@ -6987,7 +7567,7 @@ mod commons_tests {
         };
         let (_root, paths, source) = fixture();
         let admin = admin_open(&paths).unwrap();
-        let authority = admin.config.signer.unwrap();
+        let authority = admin.commons_authority().unwrap();
         let network = [39; 16];
         let device = Device::open(&paths).unwrap().unwrap();
         let request = device.request(network, authority).unwrap();

@@ -22,7 +22,7 @@ impl CursorGlow {
     /// The cadence credit one keystroke at inter-key gap `gap` earns: full at ≤ [`Self::HEAT_GAP_FULL`], none at ≥ [`Self::HEAT_GAP_ZERO`].
     #[inline]
     pub(super) const fn heat_cadence(gap: f32) -> f32 {
-        1.0 - ((gap - Self::HEAT_GAP_FULL) / (Self::HEAT_GAP_ZERO - Self::HEAT_GAP_FULL))
+        1.0 - ((gap - Self::HEAT_GAP_FULL) * (1.0 / (Self::HEAT_GAP_ZERO - Self::HEAT_GAP_FULL)))
             .clamp(0.0, 1.0)
     }
 
@@ -61,7 +61,7 @@ impl CursorGlow {
             Some(b) => b,
             None => REF_BAND,
         };
-        let t = ((self.cursor_temp - Self::FORGE_MIN_TEMP) / (1.0 - Self::FORGE_MIN_TEMP))
+        let t = ((self.cursor_temp - Self::FORGE_MIN_TEMP) * (1.0 / (1.0 - Self::FORGE_MIN_TEMP)))
             .clamp(0.0, 1.0);
         let (s, _) = crate::supernova::sin_cos_f32(self.flame_phase * 1.7);
         let breathe = 0.045 * t * s;
@@ -140,7 +140,7 @@ impl CursorGlow {
                 if fire {
                     let coal_cred = 1.0
                         - ((gap - Self::COAL_GAP_FULL)
-                            / (Self::COAL_GAP_ZERO - Self::COAL_GAP_FULL))
+                            * (1.0 / (Self::COAL_GAP_ZERO - Self::COAL_GAP_FULL)))
                             .clamp(0.0, 1.0);
                     self.coal = (self.coal + coal_cred * Self::COAL_GAIN).min(1.0);
                 }
@@ -213,46 +213,37 @@ impl ForgeBand {
 
     /// Solve the band for `ground`, preferring the side `dark` names.
     pub(super) const fn solve(ground: u32, dark: bool) -> Self {
-        let table = crate::color_math::relative_luminance_table();
         #[inline]
-        const fn ratio(table: &crate::color_math::RelativeLuminanceTable, lum: f32, p: f32) -> f32 {
-            let l = crate::color_math::relative_luminance_with(table, fire_ramp(p));
+        const fn ratio(lum: f32, p: f32) -> f32 {
+            let l = crate::color_math::relative_luminance(fire_ramp(p));
             (l.max(lum) + 0.05) / (l.min(lum) + 0.05)
         }
         #[inline]
-        const fn lit_rgb(
-            table: &crate::color_math::RelativeLuminanceTable,
-            lum: f32,
-            rgb: u32,
-        ) -> bool {
-            let l = crate::color_math::relative_luminance_with(table, rgb);
+        const fn lit_rgb(lum: f32, rgb: u32) -> bool {
+            let l = crate::color_math::relative_luminance(rgb);
             l > lum && (l + 0.05) / (lum + 0.05) >= ForgeBand::PAGE_CONTRAST
         }
         #[inline]
-        const fn deep_ok_rgb(
-            table: &crate::color_math::RelativeLuminanceTable,
-            lum: f32,
-            rgb: u32,
-        ) -> bool {
-            let l = crate::color_math::relative_luminance_with(table, rgb);
+        const fn deep_ok_rgb(lum: f32, rgb: u32) -> bool {
+            let l = crate::color_math::relative_luminance(rgb);
             l < lum && (lum + 0.05) / (l + 0.05) >= ForgeBand::PAGE_CONTRAST
         }
-        let lum = crate::color_math::relative_luminance_with(table, ground);
-        let bright = if lit_rgb(table, lum, fire_ramp(Self::TOP)) {
-            let lo = if lit_rgb(table, lum, fire_ramp(Self::COLD)) {
+        let lum = crate::color_math::relative_luminance(ground);
+        let bright = if lit_rgb(lum, fire_ramp(Self::TOP)) {
+            let lo = if lit_rgb(lum, fire_ramp(Self::COLD)) {
                 Self::COLD
             } else {
-                bisect_edge(table, lum, Self::COLD, Self::TOP, true).1
+                bisect_edge(lum, Self::COLD, Self::TOP, true).1
             };
             Some((lo, (lo + Self::MIN_ARC).clamp(Self::HOT, Self::TOP)))
         } else {
             None
         };
-        let deep = if deep_ok_rgb(table, lum, fire_ramp(0.0)) {
-            let hi = if deep_ok_rgb(table, lum, fire_ramp(Self::HOT)) {
+        let deep = if deep_ok_rgb(lum, fire_ramp(0.0)) {
+            let hi = if deep_ok_rgb(lum, fire_ramp(Self::HOT)) {
                 Self::HOT
             } else {
-                bisect_edge(table, lum, 0.0, Self::HOT, false).0
+                bisect_edge(lum, 0.0, Self::HOT, false).0
             };
             Some((Self::COLD.min(hi), hi))
         } else {
@@ -279,7 +270,7 @@ impl ForgeBand {
             Some(pair) => pair,
             None => {
                 // Neither side reads: the ramp end that comes closest.
-                if ratio(table, lum, Self::TOP) >= ratio(table, lum, 0.0) {
+                if ratio(lum, Self::TOP) >= ratio(lum, 0.0) {
                     (true, (Self::TOP, Self::TOP))
                 } else {
                     (false, (0.0, 0.0))
@@ -307,13 +298,7 @@ impl ForgeBand {
 /// well under one ramp step; the caller has checked it holds at `lo` and
 /// fails at `hi`.
 #[inline]
-const fn bisect_edge(
-    table: &crate::color_math::RelativeLuminanceTable,
-    lum: f32,
-    mut lo: f32,
-    mut hi: f32,
-    want_not_lit: bool,
-) -> (f32, f32) {
+const fn bisect_edge(lum: f32, mut lo: f32, mut hi: f32, want_not_lit: bool) -> (f32, f32) {
     let (mut lo_rgb, mut hi_rgb) = (fire_ramp(lo), fire_ramp(hi));
     let mut i = 0;
     while i < 16 {
@@ -324,7 +309,7 @@ const fn bisect_edge(
         } else if mid_rgb == hi_rgb {
             hi = mid;
         } else {
-            let l = crate::color_math::relative_luminance_with(table, mid_rgb);
+            let l = crate::color_math::relative_luminance(mid_rgb);
             let holds = if want_not_lit {
                 !(l > lum && (l + 0.05) / (lum + 0.05) >= ForgeBand::PAGE_CONTRAST)
             } else {

@@ -10,7 +10,9 @@ use aterm_aos::checkpoint::CheckpointFault;
 use aterm_aos::contract::{Contract, Verdict};
 use aterm_aos::effects::EffectPort;
 use aterm_aos::log::LogFault;
-use aterm_aos::publish::{Admit, Boundary, Commit, Head, PublishRefusal, Stats};
+use aterm_aos::publish::{
+    Admit, Boundary, Commit, Head, Prepared, PublishRefusal, RETIRED_CAP, Stats,
+};
 use aterm_aos::replay::{Run, chain_link, empty_chain};
 use aterm_aos::task::{Code, EntryRefusal, PausedClass, Schema, StepRefusal, state_digest};
 use aterm_aos::wire::{Dec, Enc, WireFault};
@@ -97,13 +99,19 @@ mod test_fixtures;
 mod trace;
 #[cfg(test)]
 mod trace_tests;
+#[cfg(test)]
+mod vivid_tests;
+mod watch;
+#[cfg(test)]
+mod watch_tests;
 
 #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
 use plan::{PlanView, SchedulePlan};
 pub use trace::{
-    EventCounts, MomentumTrace, ReadTrace, TRACE_FILE_DOMAIN, TRACE_FILE_MAGIC, TraceFault,
-    TraceReplay,
+    EventCounts, MomentumTrace, ReadTrace, TRACE_FILE_DOMAIN, TRACE_FILE_MAGIC, TraceCheck,
+    TraceFault, TraceReplay,
 };
+pub use watch::{Segment, SegmentJudgement};
 
 /// The version of the input and observation encodings ([`MomentumSchema`]).
 pub const MOMENTUM_EVENT_ENCODING: u16 = 1;
@@ -116,6 +124,8 @@ pub const SCHEMA_NAME: &str = "momentum-glow.state+events";
 pub const CONTRACT_NAME: &str = "momentum-glow.no-stranded-light";
 /// The shipped code artifact's name ([`MomentumCode::Shipped`]).
 pub const SHIPPED_CODE_NAME: &str = "momentum-glow.shipped";
+/// The safe code artifact's name ([`MomentumCode::Safe`]).
+pub const SAFE_CODE_NAME: &str = "momentum-glow.safe";
 /// The demonstration fault's code artifact name, defined in every build so the acceptance policy binds the same bases even where the fault's code is compiled out.
 pub const DEMO_CODE_NAME: &str = "momentum-glow.demo-stranded-settle";
 /// The numerical half of the profile artifact's name, after the target.
@@ -863,6 +873,8 @@ pub fn momentum_identity(code: &PrebuiltMomentum) -> TaskIdentity {
 pub enum MomentumCode {
     /// The shipped engine, called directly.
     Shipped,
+    /// The shipped engine with a frame-interval wake whenever the glow is hot, so no settle forecast can strand it.
+    Safe,
     /// **An intentionally introduced demonstration fault, not a defect of shipped code**.
     #[cfg(any(test, debug_assertions))]
     DemoStrandedSettle,
@@ -872,6 +884,7 @@ impl MomentumCode {
     /// Every implementation in this build.
     pub const ALL: &'static [MomentumCode] = &[
         MomentumCode::Shipped,
+        MomentumCode::Safe,
         #[cfg(any(test, debug_assertions))]
         MomentumCode::DemoStrandedSettle,
     ];
@@ -882,17 +895,19 @@ impl MomentumCode {
     pub const fn artifact_name(self) -> &'static str {
         match self {
             MomentumCode::Shipped => SHIPPED_CODE_NAME,
+            MomentumCode::Safe => SAFE_CODE_NAME,
             #[cfg(any(test, debug_assertions))]
             MomentumCode::DemoStrandedSettle => DEMO_CODE_NAME,
         }
     }
 
-    /// The short name a control verb takes (`shipped`, `demo-stranded-settle`).
+    /// The short name a control verb takes (`shipped`, `safe`, `demo-stranded-settle`).
     #[inline]
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             MomentumCode::Shipped => "shipped",
+            MomentumCode::Safe => "safe",
             #[cfg(any(test, debug_assertions))]
             MomentumCode::DemoStrandedSettle => "demo-stranded-settle",
         }
@@ -912,6 +927,10 @@ impl MomentumCode {
     const fn note(self) -> &'static str {
         match self {
             MomentumCode::Shipped => "the shipped engine, called directly",
+            MomentumCode::Safe => {
+                "the shipped engine, its scheduler answer replaced: next_change_deadline is \
+                 Some(now + frame_interval) while is_active or settling, None otherwise"
+            }
             #[cfg(any(test, debug_assertions))]
             MomentumCode::DemoStrandedSettle => {
                 "an intentionally introduced demonstration fault, not a defect of shipped code: \
@@ -964,6 +983,13 @@ impl MomentumCode {
     ) -> Option<Instant> {
         match self {
             MomentumCode::Shipped => s.glow.next_change_deadline(now, frame_interval),
+            MomentumCode::Safe => {
+                if s.glow.is_active() || s.glow.settling() {
+                    now.checked_add(frame_interval)
+                } else {
+                    None
+                }
+            }
             #[cfg(any(test, debug_assertions))]
             MomentumCode::DemoStrandedSettle => {
                 // The demonstration fault: the settle forecast is forgotten.
@@ -1530,15 +1556,30 @@ enum HostMode {
     Hosted(Box<Hosted>),
 }
 
+/// Why the host stopped recording by itself: the light-page glow put on its vivid ink, which no input or state of the schema records.
+pub const VIVID_INK: &str = "vivid light-page ink";
+
+/// Why the host stopped recording by itself: live time passed the hosted horizon.
+pub const PAST_HORIZON: &str = "past the hosted horizon";
+
 /// The momentum glow as the host holds it.
 pub struct MomentumHost {
     mode: HostMode,
+    /// Whether the light-page glow wears its vivid ink, as the host last set it; a glow is never hosted while it does.
+    light_vivid: bool,
+    /// Retired segments a detach the host made by itself took from its recording, oldest first, at most [`RETIRED_CAP`].
+    left: Vec<Segment>,
+    /// Why the host last stopped recording by itself, until [`Self::aos_take_detached`] takes it.
+    detached: Option<&'static str>,
 }
 
 impl Default for MomentumHost {
     fn default() -> Self {
         MomentumHost {
             mode: HostMode::Direct(MomentumGlow::default()),
+            light_vivid: false,
+            left: Vec::new(),
+            detached: None,
         }
     }
 }
@@ -1805,8 +1846,18 @@ impl MomentumHost {
             && !h.boundary.is_paused()
             && h.logical(now).0 > horizon_ns()
         {
-            self.aos_detach();
+            self.detach_by_itself(PAST_HORIZON);
         }
+    }
+
+    /// Stops recording for the reason `why`, keeping the recording's retired segments for the watcher.
+    fn detach_by_itself(&mut self, why: &'static str) {
+        let retired = self.aos_take_retired();
+        self.left = retired;
+        let over = self.left.len().saturating_sub(RETIRED_CAP);
+        self.left.drain(..over);
+        self.aos_detach();
+        self.detached = Some(why);
     }
 
     /// One printable key (`MomentumGlow::on_key`).
@@ -1845,14 +1896,29 @@ impl MomentumHost {
         }
     }
 
-    /// Whether the light-page glow wears its hue's vivid ink
-    /// (`MomentumGlow::set_light_vivid`, Sparkle's paper gold). A hosted plan
-    /// runs as its trace recorded it, the walk toward white.
+    /// Sets whether the light-page glow wears its hue's vivid ink (`MomentumGlow::set_light_vivid`, Sparkle's paper gold), which changes the Frame observations' quads and which no input or state of the schema records, so turning it on stops a recording ([`VIVID_INK`]).
     #[inline]
     pub fn set_light_vivid(&mut self, vivid: bool) {
+        self.light_vivid = vivid;
+        if vivid && self.aos_attached() {
+            self.detach_by_itself(VIVID_INK);
+        }
         if let HostMode::Direct(g) = &mut self.mode {
             g.set_light_vivid(vivid);
         }
+    }
+
+    /// Whether the light-page glow wears its vivid ink, which [`Self::aos_attach`] refuses to record.
+    #[inline]
+    #[must_use]
+    pub const fn light_vivid(&self) -> bool {
+        self.light_vivid
+    }
+
+    /// Why the host stopped recording by itself since the last call ([`VIVID_INK`], [`PAST_HORIZON`]), taken.
+    #[inline]
+    pub const fn aos_take_detached(&mut self) -> Option<&'static str> {
+        self.detached.take()
     }
 
     /// One frame (`MomentumGlow::tick`).
@@ -2007,6 +2073,9 @@ impl MomentumHost {
         queue_cap: usize,
         max_events: usize,
     ) {
+        if self.light_vivid {
+            return;
+        }
         if let HostMode::Hosted(h) = &mut self.mode
             && h.epoch() == epoch
             && h.sched() == sched
@@ -2065,9 +2134,10 @@ impl MomentumHost {
         }
     }
 
-    /// Stops hosting.
+    /// Stops hosting; the glow draws on in the ink the host last set.
     pub fn aos_detach(&mut self) {
-        let glow = self.take_glow();
+        let mut glow = self.take_glow();
+        glow.set_light_vivid(self.light_vivid);
         self.mode = HostMode::Direct(glow);
     }
 
@@ -2111,6 +2181,65 @@ impl MomentumHost {
         Ok(commit)
     }
 
+    /// A copy of the paused glow's boundary and `candidate`, for [`RepairJob::prepare`] on another thread.
+    /// # Errors
+    /// [`PublishRefusal::NotAttached`] or [`PublishRefusal::NotPaused`].
+    pub fn aos_repair_job(&self, candidate: MomentumCode) -> Result<RepairJob, PublishRefusal> {
+        let HostMode::Hosted(h) = &self.mode else {
+            return Err(PublishRefusal::NotAttached);
+        };
+        if !h.boundary.is_paused() {
+            return Err(PublishRefusal::NotPaused);
+        }
+        Ok(RepairJob {
+            boundary: Box::new(h.boundary.clone()),
+            candidate: PrebuiltMomentum::new(candidate, &h.build),
+        })
+    }
+
+    /// Commits a prepare made on a copy of this glow's boundary, with every check `commit` makes, and folds what the queue returned.
+    /// # Errors
+    /// The prepare's refusal, then [`PublishRefusal::NotAttached`] or any refusal `commit` returns (`NotPaused`, `StaleHead`, `WitnessMismatch`, …).
+    pub fn aos_commit(
+        &mut self,
+        prepared: PreparedRepair,
+    ) -> Result<Commit<MomentumSchema>, PublishRefusal> {
+        let prepared = prepared.prepared?;
+        let HostMode::Hosted(h) = &mut self.mode else {
+            return Err(PublishRefusal::NotAttached);
+        };
+        let first = h.cursor();
+        let commit = h.boundary.commit(prepared)?;
+        h.fold_delivered(first, &commit.delivered);
+        Ok(commit)
+    }
+
+    /// How many retired log epochs wait for [`Self::aos_take_retired`].
+    #[inline]
+    #[must_use]
+    pub fn aos_retired_waiting(&self) -> usize {
+        self.left.len()
+            + match &self.mode {
+                HostMode::Direct(_) => 0,
+                HostMode::Hosted(h) => h.boundary.retired_len(),
+            }
+    }
+
+    /// Takes the retired log epochs, oldest first, for the online watcher ([`Segment::judge`]), with those a detach the host made by itself kept.
+    pub fn aos_take_retired(&mut self) -> Vec<Segment> {
+        let mut out = core::mem::take(&mut self.left);
+        if let HostMode::Hosted(h) = &mut self.mode {
+            let schema = h.boundary.schema().clone();
+            out.extend(
+                h.boundary
+                    .drain_retired()
+                    .into_iter()
+                    .map(|retired| Segment::new(schema.clone(), retired)),
+            );
+        }
+        out
+    }
+
     /// Rejects the pending update.
     pub fn aos_resume(&mut self) -> Vec<Result<MomentumObservation, StepRefusal>> {
         let HostMode::Hosted(h) = &mut self.mode else {
@@ -2134,6 +2263,16 @@ impl MomentumHost {
     #[must_use]
     pub const fn aos_paused(&self) -> bool {
         matches!(&self.mode, HostMode::Hosted(h) if h.boundary.is_paused())
+    }
+
+    /// The head the attached glow is paused at, if it is.
+    #[inline]
+    #[must_use]
+    pub const fn aos_paused_head(&self) -> Option<&Head> {
+        match &self.mode {
+            HostMode::Direct(_) => None,
+            HostMode::Hosted(h) => h.boundary.paused_head(),
+        }
     }
 
     /// The prebuilt code running the glow (always [`MomentumCode::Shipped`] unattached), or `None` while the live code is a schedule plan.
@@ -2240,6 +2379,66 @@ impl MomentumHost {
             head_state: state_digest(b.schema(), h.state()),
             head_chain: h.live_chain(),
         })
+    }
+}
+
+/// A paused glow's boundary, copied, with the candidate to prepare against it away from the host's main thread.
+pub struct RepairJob {
+    boundary: Box<Boundary<MomentumSchema, PrebuiltMomentum, NoStrandedLight>>,
+    candidate: PrebuiltMomentum,
+}
+
+impl fmt::Debug for RepairJob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RepairJob")
+            .field("boundary", &self.boundary)
+            .field("candidate", &self.candidate.id)
+            .finish()
+    }
+}
+
+impl RepairJob {
+    /// Shadow-replays the copy's live code and the candidate from the ancestor checkpoint ([`Boundary::prepare`]).
+    #[must_use]
+    pub fn prepare(self) -> PreparedRepair {
+        let mut boundary = self.boundary;
+        let before = boundary.stats().replays;
+        let prepared = boundary.prepare(self.candidate);
+        PreparedRepair {
+            replays: boundary.stats().replays.saturating_sub(before),
+            prepared,
+        }
+    }
+}
+
+/// What [`RepairJob::prepare`] made, for [`MomentumHost::aos_commit`].
+pub struct PreparedRepair {
+    prepared: Result<Prepared<MomentumSchema, PrebuiltMomentum>, PublishRefusal>,
+    replays: u64,
+}
+
+impl fmt::Debug for PreparedRepair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedRepair")
+            .field("prepared", &self.prepared)
+            .field("replays", &self.replays)
+            .finish()
+    }
+}
+
+impl PreparedRepair {
+    /// How many replays the prepare ran (on the copy, never on the live boundary).
+    #[inline]
+    #[must_use]
+    pub const fn replays(&self) -> u64 {
+        self.replays
+    }
+
+    /// The prepare's refusal, if it refused.
+    #[inline]
+    #[must_use]
+    pub fn refusal(&self) -> Option<&PublishRefusal> {
+        self.prepared.as_ref().err()
     }
 }
 

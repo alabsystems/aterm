@@ -2,6 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! THE OWNER'S NOTICES WHEN A SIGN-IN, A RENEWAL OR AN ACCOUNT MOVE CANNOT FINISH ON ITS OWN: each says what happened, what aterm already did, the one thing to do now and what to expect.
+//!
+//! A roster row with an email is signed in by aterm itself (`crate::harness::sign_in_ladder`), so no notice asks a person to sign one in: a tab whose lost login is such a row's types no `/login`, waits on that sign-in and is moved onto it (`super::turn_end`'s `login_wall_waits`), and raises none, its wait naming what holds the move where nothing can make it; the roster's two notices no tab raises, [`ACCOUNT_SIGNED_OUT`] (a row with no email, which no route can sign in) and [`RENEWAL_WRONG_ACCOUNT`], are facts for later whose step reads what aterm tried (`aterm harness accounts`).
 
 /// One notice's constant words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,13 +130,6 @@ pub const WHYS: &[&str] = &[
     WHY_TURN_YOURS,
 ];
 
-/// What holds a renewed login's relaunch (`super::turn_end::RenewStep::ByHand`), [`RENEWED_BY_HAND`]'s `{why}`: `relaunch` off, `resume_limits` off, no host that relaunches the agent.
-pub const BY_HAND_WHYS: &[&str] = &[
-    "relaunch is off in aterm.toml",
-    "resume_limits is off in aterm.toml",
-    "it cannot restart this Claude Code",
-];
-
 /// The `/login` aterm typed opened its browser sign-in (the hand-off read on the screen), the method picker answered with the method the session already uses: the sign-in in the browser is the one step left, and only the owner can take it.
 pub const LOGIN_SIGN_IN: NoticeText = NoticeText {
     id: "login-sign-in",
@@ -152,7 +147,7 @@ pub const LOGIN_SIGN_IN: NoticeText = NoticeText {
     back: BACK,
 };
 
-/// [`LOGIN_SIGN_IN`] for a session whose login is a roster row (`{label}`: the renewable login it runs on, or the account a move put it on): the browser sign-in must be that row's own account, or two rows of the roster become one account.
+/// [`LOGIN_SIGN_IN`] for a session whose login is a roster row (`{label}`: the renewable login it runs on, or the account a move put it on): the browser sign-in must be that row's own account, or two rows of the roster become one account. aterm types no `/login` over the lost login of a row the roster lists for the session (`super::turn_end`'s `login_wall_waits`: its sign-in ladder signs the row in), so this is the `/login` it typed before the roster named the row, or over a moved session's account the roster gives no row of.
 pub const LOGIN_SIGN_IN_AS: NoticeText = NoticeText {
     id: "login-sign-in-as",
     code: "sa",
@@ -322,41 +317,29 @@ pub const RENEWED_DRAFT: NoticeText = NoticeText {
     back: BACK,
 };
 
-/// The login `{label}` was renewed, and nothing here can move the tab onto it (`{why}`: `relaunch` or `resume_limits` off, no host that relaunches).
-pub const RENEWED_BY_HAND: NoticeText = NoticeText {
-    id: "renewed-by-hand",
-    code: "rh",
-    title: "Claude login renewed",
-    short_title: "Login renewed",
-    happened: "This tab's login was renewed, and the tab still runs on the old one.",
-    did: "aterm cannot switch the tab to the renewed login: {why}.",
-    todo: TYPE_LOGIN,
-    todo_as: Some(TYPE_LOGIN_AS),
-    expect: CONTINUES,
-    expect_reset: None,
-    undo: None,
-    whys: BY_HAND_WHYS,
-    back: BACK,
-};
-
-/// A roster account is signed out: no session is moved onto it.
+/// A ROSTER ROW WITH NO EMAIL IS SIGNED OUT, its recorded error: aterm's sign-in ladder
+/// (`crate::harness::sign_in_ladder`) signs a row in by its email, so no route exists for this
+/// one, and no session is moved onto it. A row with an email is never this notice's: the ladder
+/// signs it in by itself, and records each route tried where none can.
 pub const ACCOUNT_SIGNED_OUT: NoticeText = NoticeText {
     id: "account-signed-out",
     code: "so",
     title: "Claude account signed out",
     short_title: "Account signed out",
-    happened: "A Claude account listed in accounts.toml is signed out.",
-    did: "aterm switches no session to an account that is signed out.",
-    todo: "Run aterm harness accounts login {label}",
+    happened: "A Claude account listed in accounts.toml is signed out, and its row has no email.",
+    did: "aterm can sign in only a row with an email, and {label} has none.",
+    todo: "Run aterm harness accounts",
     todo_as: None,
-    expect: "Once it is signed in, aterm can switch sessions to it again.",
+    expect: "aterm switches no session to it, and signs it in once its row has an email.",
     expect_reset: None,
     undo: None,
     whys: &[],
     back: BACK,
 };
 
-/// A renewal signed in an account other than its row's: nothing live changed.
+/// A RENEWAL SIGNED IN AN ACCOUNT OTHER THAN ITS ROW'S, a fact for later: nothing live changed,
+/// and aterm's sign-in ladder signs the row in again by itself (never again through the profile
+/// that answered another account), naming each route it tried where none can.
 pub const RENEWAL_WRONG_ACCOUNT: NoticeText = NoticeText {
     id: "renewal-wrong-account",
     code: "wa",
@@ -364,57 +347,19 @@ pub const RENEWAL_WRONG_ACCOUNT: NoticeText = NoticeText {
     short_title: "Wrong account",
     happened: "A login renewal signed in to a different Claude account from the one it renews.",
     did: "aterm threw that sign-in away, so the login of {label} did not change.",
-    todo: "Run aterm harness accounts renew {label}",
+    todo: "Run aterm harness accounts",
     todo_as: None,
-    expect: "Until it is renewed again, sessions on {label} keep their old login.",
+    expect: "aterm signs {label} in again by itself, as its own account.",
     expect_reset: None,
     undo: None,
     whys: &[],
     back: BACK,
 };
 
-/// Claude Code hit a multi-day usage limit and no other account in the roster can take over: the owner can sign in another account in-place — only where no roster row is the session's login (`super::turn_end::RosterWord::Unlisted`, or no roster word at all).
-pub const LIMIT_SIGN_IN: NoticeText = NoticeText {
-    id: "limit-sign-in",
-    code: "ls",
-    title: "Claude usage limit reached",
-    short_title: "Usage limit",
-    happened: "Claude Code hit this account's usage limit, and no other account is ready to take over.",
-    did: "aterm has no other Claude account it can switch this tab to.",
-    todo: "Sign in to another account: type /login in the tab.",
-    todo_as: None,
-    expect: CONTINUES,
-    expect_reset: Some("The tab continues once you sign in, else after the reset {reset}."),
-    undo: None,
-    whys: &[],
-    back: SWITCHED,
-};
-
-/// What a weekly limit on a roster row asks of nobody: a sign-in in the tab,
-/// which would sign another account into the row's own login.
-const LIMIT_HAPPENED_ROW: &str =
-    "Claude Code hit this account's usage limit, and the next listed account is not signed in.";
-
-/// What follows the sign-in of the roster row `{label}` by name: the waiting
-/// tab is decided again at the accounts' news, and moves.
-const LIMIT_MOVES: &str = "Once {label} is signed in, aterm switches this tab to it by itself.";
-
-/// [`LIMIT_MOVES`] where the limit's reset is known: the tab continues past
-/// it if nobody signs the row in (`it`: the row the line before names, so
-/// the sentence holds the reset at any label's length).
-const LIMIT_MOVES_RESET: &str =
-    "The tab moves to it once signed in, else continues after the reset {reset}.";
-
 /// What follows a usage limit where aterm cannot tell which account is next
 /// ([`LIMIT_UNREAD`]), its reset known: aterm continues the tab past it
 /// (`resume_limits`).
 const LIMIT_RESUMES: &str = "aterm continues the tab by itself after the reset {reset}.";
-
-/// [`LIMIT_MOVES`] where the roster holds the tab at its limit even once
-/// `{label}` is ready (`super::turn_end::HeldBy`): no switch follows the
-/// sign-in by itself, and the notice that follows it names the step that
-/// moves the tab ([`LIMIT_USE`]).
-const LIMIT_NEXT: &str = "Once {label} is signed in, aterm names the next step to move the tab.";
 
 /// What follows a step after which aterm names another, the limit's reset
 /// known (`resume_limits` on): BOTH OUTCOMES, EACH WITH ITS CONDITION — the
@@ -425,67 +370,16 @@ const LIMIT_NEXT_RESET: &str =
 
 /// What follows a step after which aterm names the one that moves the tab to
 /// another account, whichever that is: the account [`LIMIT_ROSTER`] asks to
-/// be added (`accounts add` prints the line that signs it in, and once it is
-/// ready the tab moves, or the notice that follows names what does), or the
-/// lines of aterm.toml [`LIMIT_STAY_HELD`] asks to be set.
+/// be added (a row with an email, which aterm's sign-in ladder signs in by
+/// itself, and once it is ready the tab moves, or the notice that follows
+/// names what does), or the lines of aterm.toml [`LIMIT_STAY_HELD`] asks to
+/// be set.
 const LIMIT_NEXT_ANY: &str = "aterm then names the next step to move this tab to another account.";
 
 /// What follows a usage limit's notice where aterm continues nothing
 /// past the limit's reset: the owner's `resume_limits = false`.
 const LIMIT_NOT_RESUMED: &str =
     "aterm does not continue this tab after the limit resets, as resume_limits is off.";
-
-/// A multi-day usage limit on a roster row's login, and the row `{label}` (one with an email) is not signed in on this machine: its renewal signs it in as its own account.
-pub const LIMIT_RENEW: NoticeText = NoticeText {
-    id: "limit-renew",
-    code: "lr",
-    title: "Claude usage limit reached",
-    short_title: "Usage limit",
-    happened: LIMIT_HAPPENED_ROW,
-    did: "aterm found {label} in accounts.toml, ready to take over once signed in.",
-    todo: "Run aterm harness accounts renew {label}",
-    todo_as: None,
-    expect: LIMIT_MOVES,
-    expect_reset: Some(LIMIT_MOVES_RESET),
-    undo: None,
-    whys: &[],
-    back: SWITCHED,
-};
-
-/// [`LIMIT_RENEW`] for a row `{label}` with no email: it signs in through `accounts login`.
-pub const LIMIT_LOGIN: NoticeText = NoticeText {
-    id: "limit-login",
-    code: "lg",
-    title: "Claude usage limit reached",
-    short_title: "Usage limit",
-    happened: LIMIT_HAPPENED_ROW,
-    did: "aterm found {label} in accounts.toml, ready to take over once signed in.",
-    todo: "Run aterm harness accounts login {label}",
-    todo_as: None,
-    expect: LIMIT_MOVES,
-    expect_reset: Some(LIMIT_MOVES_RESET),
-    undo: None,
-    whys: &[],
-    back: SWITCHED,
-};
-
-/// [`LIMIT_RENEW`] where the roster holds the tab at this limit even once `{label}` is signed in (`super::turn_end::RosterWord::Row`'s `held`: a limit from before this Claude Code started under `accounts = "wall"`, the owner's pin, a limit reset kept): no switch follows the sign-in by itself, so none is promised — the notice that follows names the step that moves the tab ([`LIMIT_USE`]).
-pub const LIMIT_RENEW_HELD: NoticeText = NoticeText {
-    id: "limit-renew-held",
-    code: "ln",
-    expect: LIMIT_NEXT,
-    expect_reset: Some(LIMIT_NEXT_RESET),
-    ..LIMIT_RENEW
-};
-
-/// [`LIMIT_LOGIN`] where the roster holds the tab at this limit even once `{label}` is signed in, as [`LIMIT_RENEW_HELD`].
-pub const LIMIT_LOGIN_HELD: NoticeText = NoticeText {
-    id: "limit-login-held",
-    code: "lj",
-    expect: LIMIT_NEXT,
-    expect_reset: Some(LIMIT_NEXT_RESET),
-    ..LIMIT_LOGIN
-};
 
 /// What [`LIMIT_USE`]'s `{why}` names (`super::turn_end::HeldBy`): the limit stands from before this Claude Code started, and the roster rotates at a limit the process itself hit.
 pub const WHY_USE_EARLIER: &str = "this Claude Code started after the limit";
@@ -707,14 +601,8 @@ pub const ALL: &[NoticeText] = &[
     LOGIN_NOT_RUN,
     LOGIN_NOT_RUN_DRAFT,
     RENEWED_DRAFT,
-    RENEWED_BY_HAND,
     ACCOUNT_SIGNED_OUT,
     RENEWAL_WRONG_ACCOUNT,
-    LIMIT_SIGN_IN,
-    LIMIT_RENEW,
-    LIMIT_RENEW_HELD,
-    LIMIT_LOGIN,
-    LIMIT_LOGIN_HELD,
     LIMIT_USE,
     LIMIT_DRAFT,
     LIMIT_DRAFT_OWN,

@@ -2793,6 +2793,10 @@ impl Wake {
             | Wake::LoginNotice { .. }
             | Wake::CardSeed { .. }
             | Wake::Aos { .. }
+            | Wake::Rewind { .. }
+            | Wake::RewindFolded(..)
+            | Wake::AosWorked(..)
+            | Wake::AosExport { .. }
             | Wake::PersonStandIn { .. }
             | Wake::ControlSecurityPosture { .. }
             | Wake::UpdateHealth { .. }

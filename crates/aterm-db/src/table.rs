@@ -176,7 +176,7 @@ impl<'a> Session<'a> {
                 .journal
                 .node(&id)
                 .ok_or_else(|| Error::new("selected control node is missing"))?;
-            if node.kind() != aterm_secrets::commons::node::Kind::Recovery {
+            if node.has_payload() {
                 selected.insert(id);
             }
             cursor = node.selected().or_else(|| node.parents().first().copied());
@@ -263,7 +263,7 @@ impl<'a> Session<'a> {
         }
         Ok(())
     }
-    fn writer(&self) -> Result<()> {
+    pub(crate) fn writer(&self) -> Result<()> {
         if self.access.local().role() != Role::Writer || !self.access.is_current(&self.journal) {
             return Err(Error::new(
                 "current Commons membership does not grant table writing",
@@ -417,6 +417,23 @@ impl<'a> Session<'a> {
     }
 
     fn open_envelope(&self, scope: Scope, envelope: Envelope<'_>) -> Result<Record> {
+        self.decode_envelope(scope, envelope, false)?
+            .ok_or_else(|| Error::new("table payload authentication failed"))
+    }
+
+    /// Negative-only bytes have no prior positive admission. Missing selected
+    /// history still withholds evaluation; invalid payloads or writer roles do
+    /// not make an obsolete certificate a fault of an unrelated writer.
+    fn negative_record(&self, scope: Scope, wire: &[u8]) -> Result<Option<Record>> {
+        self.decode_envelope(scope, self.envelope(scope, wire)?, true)
+    }
+
+    fn decode_envelope(
+        &self,
+        scope: Scope,
+        envelope: Envelope<'_>,
+        negative: bool,
+    ) -> Result<Option<Record>> {
         let Envelope {
             roster,
             epoch,
@@ -442,43 +459,49 @@ impl<'a> Session<'a> {
                 .iter()
                 .any(|member| member.binding().actor() == actor && member.role() == Role::Writer)
         {
+            if negative {
+                return Ok(None);
+            }
             return Err(Error::new("record lacks an exact historical writer grant"));
         }
         let mut payload = Zeroizing::new(body.to_vec());
         let len = history
             .with_key(&self.journal, |network_key| {
-                crypto::cipher(&scope.key(&roster, epoch, network_key), &salt, aad)?
-                    .open_in_place(
-                        aead::Nonce::assume_unique_for_key([0; 12]),
-                        aead::Aad::from(aad),
-                        &mut payload,
-                    )
-                    .map(|plain| plain.len())
-                    .map_err(|_| Error::new("table payload authentication failed"))
+                Ok::<_, Error>(
+                    crypto::cipher(&scope.key(&roster, epoch, network_key), &salt, aad)?
+                        .open_in_place(
+                            aead::Nonce::assume_unique_for_key([0; 12]),
+                            aead::Aad::from(aad),
+                            &mut payload,
+                        )
+                        .ok()
+                        .map(|plain| plain.len()),
+                )
             })
             .map_err(failure)??;
+        let Some(len) = len else { return Ok(None) };
         payload.truncate(len);
-        Ok(Record {
+        Ok(Some(Record {
             scope,
             roster,
             epoch,
             header,
             authored_ms,
             payload: SecretBytes::new(std::mem::take(&mut *payload)),
-        })
+        }))
     }
 
     // Only classifies source metadata. The store must first prove these exact
     // bytes were already witnessed; this never authorizes remote ingestion.
     fn discarded_source(&self, envelope: &Envelope<'_>) -> bool {
-        use aterm_secrets::commons::{constraints::Fact, journal::State, node::Kind};
+        use aterm_secrets::commons::{constraints::Fact, journal::State};
         let State::Ready { head, .. } = self.journal.state() else {
             return false;
         };
         let Some(node) = self.journal.node(&envelope.roster) else {
             return false;
         };
-        node.kind() != Kind::Recovery
+        node.has_payload()
             && !self.journal.selected_ancestor(envelope.roster, head)
             && node.facts().iter().any(|fact| {
                 matches!(fact,
@@ -488,6 +511,43 @@ impl<'a> Session<'a> {
                 matches!(fact,
                 Fact::Bind { binding } if binding.actor() == envelope.header.actor)
             })
+    }
+
+    // A named recovery authenticates a historical branch choice. Current
+    // selected-path status is checked separately before applying quarantine;
+    // an overruled choice never supplies a current restriction or grant.
+    fn discarded_by(&self, envelope: &Envelope<'_>, recovery: Digest) -> bool {
+        use aterm_secrets::commons::constraints::Fact;
+        let Some(choice) = self.journal.node(&recovery) else {
+            return false;
+        };
+        let Some(selected) = choice.selected() else {
+            return false;
+        };
+        let Some(source) = self.journal.node(&envelope.roster) else {
+            return false;
+        };
+        source.has_payload()
+            && !self.journal.selected_ancestor(envelope.roster, selected)
+            && choice
+                .parents()
+                .iter()
+                .any(|parent| self.journal.selected_ancestor(envelope.roster, *parent))
+            && source.facts().iter().any(|fact| {
+                matches!(fact,
+                Fact::Epoch { generation, .. } if *generation == envelope.epoch)
+            })
+            && source.facts().iter().any(|fact| {
+                matches!(fact,
+                Fact::Bind { binding } if binding.actor() == envelope.header.actor)
+            })
+    }
+
+    fn discarding_recovery(&self, envelope: &Envelope<'_>) -> Option<Digest> {
+        self.journal
+            .inventory()
+            .copied()
+            .find(|id| self.discarded_by(envelope, *id))
     }
 }
 

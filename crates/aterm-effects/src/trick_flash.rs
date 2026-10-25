@@ -254,10 +254,11 @@ impl TrickFlash {
         let Some(caret) = caret else {
             return;
         };
-        if self.last_start.is_some_and(|started| {
-            now.saturating_duration_since(started)
-                < Duration::from_millis(u64::from(MIN_ANIMATION_MS))
-        }) {
+        const MIN_ANIMATION_DUR: Duration = Duration::from_millis(MIN_ANIMATION_MS as u64);
+        if self
+            .last_start
+            .is_some_and(|started| now.saturating_duration_since(started) < MIN_ANIMATION_DUR)
+        {
             return;
         }
         let mut chars = ['\0'; MAX_CHARS];
@@ -449,17 +450,18 @@ impl TrickFlash {
         }
         let revoked_t = slot.revoked_at.map(|at| millis_since(at, loc.since));
         let tint = envelope(t, revoked_t) * loc.strength;
+        const DEG_PER_MS: f32 = 360.0 / FLASH_MS as f32;
         let n = usize::from(slot.len);
         let hue0 = rainbow_base_hue(slot.hue_seed);
         let steps = n.saturating_sub(1) as f32;
         let span = RAINBOW_SPAN_DEG.min(100.0 * steps);
-        let denom = steps.max(1.0);
-        let time_deg = 360.0 * (t as f32 / FLASH_MS as f32);
+        let span_per_step = span / steps.max(1.0);
+        let time_deg = t as f32 * DEG_PER_MS;
         let mut search_from = 0usize;
         let has_tint = tint > 0.0;
         for i in 0..n {
             let target = if has_tint {
-                let hue = hue0 + (i as f32 / denom) * span + time_deg;
+                let hue = hue0 + i as f32 * span_per_step + time_deg;
                 hsv2rgb(hue, loc.sat, loc.val)
             } else {
                 0
@@ -509,18 +511,36 @@ impl TrickFlash {
     }
 
     #[inline]
-    fn remember_base_y(&mut self, scope: Option<u64>, base_y: Option<i64>) {
-        let len = usize::from(self.base_y_len);
-        let at = self.base_y[..len].iter().position(|(key, _)| *key == scope);
+    const fn remember_base_y(&mut self, scope: Option<u64>, base_y: Option<i64>) {
+        let len = self.base_y_len as usize;
+        let mut at = None;
+        let mut idx = 0;
+        while idx < len {
+            if matches!((self.base_y[idx].0, scope), (None, None))
+                || matches!((self.base_y[idx].0, scope), (Some(a), Some(b)) if a == b)
+            {
+                at = Some(idx);
+                break;
+            }
+            idx += 1;
+        }
         match (at, base_y) {
             (Some(i), Some(y)) => self.base_y[i].1 = y,
             (Some(i), None) => {
-                self.base_y.copy_within(i + 1..len, i);
+                let mut k = i;
+                while k + 1 < len {
+                    self.base_y[k] = self.base_y[k + 1];
+                    k += 1;
+                }
                 self.base_y_len -= 1;
             }
             (None, Some(y)) => {
                 if len >= BASE_Y_MEMO_CAP {
-                    self.base_y.copy_within(1..BASE_Y_MEMO_CAP, 0);
+                    let mut k = 0;
+                    while k + 1 < BASE_Y_MEMO_CAP {
+                        self.base_y[k] = self.base_y[k + 1];
+                        k += 1;
+                    }
                     self.base_y[BASE_Y_MEMO_CAP - 1] = (scope, y);
                 } else {
                     self.base_y[len] = (scope, y);
@@ -581,11 +601,14 @@ fn window_ms(loc: &Located, revoked_at: Option<Instant>) -> u64 {
 /// last [`FADE_MS`]; zero at both ends.
 #[inline]
 const fn envelope(t: u64, revoked_t: Option<u64>) -> f32 {
+    const INV_RAMP_MS: f32 = 1.0 / RAMP_MS as f32;
+    const INV_FADE_MS: f32 = 1.0 / FADE_MS as f32;
+    const INV_REVOKE_FADE_MS: f32 = 1.0 / REVOKE_FADE_MS as f32;
     let t = t as f32;
-    let ramp = smoothstep(t / RAMP_MS as f32);
-    let fade = 1.0 - smoothstep((t - (FLASH_MS - FADE_MS) as f32) / FADE_MS as f32);
+    let ramp = smoothstep(t * INV_RAMP_MS);
+    let fade = 1.0 - smoothstep((t - (FLASH_MS - FADE_MS) as f32) * INV_FADE_MS);
     let revoke = match revoked_t {
-        Some(r) => 1.0 - smoothstep((t - r as f32) / REVOKE_FADE_MS as f32),
+        Some(r) => 1.0 - smoothstep((t - r as f32) * INV_REVOKE_FADE_MS),
         None => 1.0,
     };
     ramp * fade * revoke
@@ -635,7 +658,7 @@ const fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
         (lo << 16) | (lo << 8) | hi,
         (hi << 16) | (lo << 8) | hi,
     ];
-    let step = FLASH_STRENGTH / 8.0;
+    let step = FLASH_STRENGTH * 0.125;
     let mut strength = FLASH_STRENGTH;
     'guard: while strength > 0.0 {
         let mut idx = 0;
@@ -909,16 +932,26 @@ fn follow(
 /// and, from the first lead cell, the background the legibility guard judges
 /// against.
 #[inline]
-fn capture(loc: &mut Located, n: usize, cells: &[RenderCell]) -> bool {
+const fn capture(loc: &mut Located, n: usize, cells: &[RenderCell]) -> bool {
     let first_col = loc.cols[0] as usize;
-    let Some(first) = cells.get(first_col) else {
+    if first_col >= cells.len() {
         return false;
-    };
-    let same_lead = loc.strength > 0.0 && first.fg == loc.fg[0] && first.bg == loc.bg;
-    for i in 0..n {
-        if let Some(cell) = cells.get(loc.cols[i] as usize) {
-            loc.fg[i] = cell.fg;
+    }
+    let first = &cells[first_col];
+    let same_lead = loc.strength > 0.0
+        && first.fg[0] == loc.fg[0][0]
+        && first.fg[1] == loc.fg[0][1]
+        && first.fg[2] == loc.fg[0][2]
+        && first.bg[0] == loc.bg[0]
+        && first.bg[1] == loc.bg[1]
+        && first.bg[2] == loc.bg[2];
+    let mut i = 0;
+    while i < n {
+        let col = loc.cols[i] as usize;
+        if col < cells.len() {
+            loc.fg[i] = cells[col].fg;
         }
+        i += 1;
     }
     if same_lead {
         return true;

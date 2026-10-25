@@ -331,6 +331,54 @@ impl Journal {
     /// Decrypt only a unique complete snapshot; incomplete/conflicting histories
     /// return no current value. Schema and monotone revocation checks belong to
     /// the consuming membership application, before it grants any privileges.
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "DbFoundation",
+            action = "NoAccess",
+            project = "aterm_secrets::commons::node::foundation::tests::foundation_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "DbFoundationRepair",
+            action = "FirstA",
+            project = "aterm_secrets::commons::node::foundation::tests::repair_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "DbFoundationRepair",
+            action = "FirstB",
+            project = "aterm_secrets::commons::node::foundation::tests::repair_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "DbFoundationRepair",
+            action = "Exchange",
+            project = "aterm_secrets::commons::node::foundation::tests::repair_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "DbFoundationRepair",
+            action = "Recover",
+            project = "aterm_secrets::commons::node::foundation::tests::repair_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "DbFoundationRepair",
+            action = "Rotate",
+            project = "aterm_secrets::commons::node::foundation::tests::repair_transition"
+        )
+    )]
     pub fn current(&self, identity: &Identity) -> Result<Option<Current>> {
         let State::Ready { head, basis } = self.state() else {
             return Ok(None);
@@ -339,6 +387,9 @@ impl Journal {
             .nodes
             .get(&basis)
             .ok_or_else(|| Error::new("current control basis missing"))?;
+        if node.is_foundation() {
+            return Ok(None);
+        }
         Ok(Some(Current {
             head,
             basis,
@@ -414,13 +465,21 @@ impl Journal {
     /// Whether a data node is on this descendant's selected path, including
     /// the descendant itself. Recovery's unselected parents never qualify.
     /// This graph query grants no membership or key access.
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "DbFoundation",
+            action = "NoHistorical",
+            project = "aterm_secrets::commons::node::foundation::tests::foundation_transition"
+        )
+    )]
     pub fn selected_ancestor(&self, ancestor: Digest, descendant: Digest) -> bool {
         let mut cursor = descendant;
         for _ in 0..self.nodes.len() {
             let Some(node) = self.nodes.get(&cursor) else {
                 return false;
             };
-            if cursor == ancestor && node.kind() != Kind::Recovery {
+            if cursor == ancestor && node.has_payload() {
                 return true;
             }
             let Some(parent) = node.selected().or_else(|| node.parents().first().copied()) else {

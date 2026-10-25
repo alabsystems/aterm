@@ -34,7 +34,7 @@ mod macos {
         protocol_method_types, sel, strip_method_offsets, superclass_of,
     };
     use aterm_window::application::ApplicationHandler;
-    use aterm_window::event_loop::{ActiveEventLoop, EventLoop};
+    use aterm_window::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
     use aterm_window::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
     use aterm_window::window::{Window, WindowId as WinitWindowId};
 
@@ -764,6 +764,43 @@ mod macos {
             rows.len(),
             unauthoritative.len(),
             unauthoritative.join(" ")
+        );
+    }
+
+    /// Stage 11: a real `NSStatusItem` carrying a Land desk at rest
+    /// ([`crate::status_item::a_land_desk_at_rest`]), its menu repainted by its own delegate as a
+    /// person's open repaints it, and This Mac read back off AppKit's item: once, greyed, in the
+    /// words `here_line` makes of the glance's counts, the held Land sessions counted `landing`
+    /// past the one whose need counts first (§14.6 of `docs/DESIGN-harness-autopilot-2026-10-15.md`).
+    /// The item leaves the bar when the stage ends.
+    fn this_mac_on_the_bar(cx: &mut Ctx, proxy: &EventLoopProxy<Wake>) {
+        let rows = crate::status_item::a_land_desk_at_rest();
+        let now_ms = aterm_time::unix_millis().unwrap_or(0);
+        let glance = crate::status_item::Glance::build(&rows, &[], None, now_ms, None);
+        let h = &glance.here;
+        let counts = (h.need_you, h.landing, h.resting, h.landed, h.shells);
+        cx.check(
+            counts == (1, 6, 1, 5, 3),
+            format!(
+                "the desk's glance counts 1 need you, 6 landing, 1 resting, 5 landed and 3 shells (got {counts:?})"
+            ),
+        );
+        let want = crate::status_item::here_line(h);
+        let Some(item) = crate::status_item::install(proxy, &glance) else {
+            cx.check(false, "the status bar gave the drive no item".to_owned());
+            return;
+        };
+        let items = crate::status_item::items_on_the_bar(&item);
+        drop(item);
+        for (title, enabled) in items.iter().filter(|(t, _)| t.starts_with("This Mac")) {
+            println!("  --  {title:?} enabled={enabled}");
+        }
+        cx.check(
+            items.iter().filter(|(t, on)| *t == want && !on).count() == 1,
+            format!(
+                "the real status item's NSMenu holds {want:?} once, greyed ({} items)",
+                items.len()
+            ),
         );
     }
 
@@ -1863,6 +1900,9 @@ mod macos {
         for dcl in &declared {
             audit_declared(&mut cx, dcl);
         }
+
+        println!("\n-- stage 11: the menu bar's This Mac row, off the real status item's NSMenu");
+        this_mac_on_the_bar(&mut cx, &proxy);
 
         drop(handle);
         drop(d.window.take());

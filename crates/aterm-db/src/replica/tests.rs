@@ -18,6 +18,74 @@ use std::{
     time::Duration,
 };
 
+#[test]
+fn automatic_batches_recheck_local_policy_and_new_catalog_conflicts() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let config = lab.paths[0].home.join("config.toml");
+    let a = lab.bootstrap(0);
+    let b = lab.bootstrap(1);
+    let peer = b.request().unwrap().binding().actor();
+    let directory = crate::catalog::Directory::new(&lab.paths[0], a.trust());
+    let sa = Session::open(&a).unwrap();
+    let scope = directory
+        .open_application(&sa, "accounts", "proposals", 1)
+        .unwrap();
+    drop(sa);
+    let replica = Replica::commons(lab.paths[0].clone(), config.clone()).unwrap();
+    let round = replica.round(peer).unwrap();
+    round.active_table.set(Some(scope.digest()));
+    assert!(round.local(peer, |_| Ok(())).is_ok());
+    aterm_secrets::fsx::write_atomic(&config, b"[commons]\nenabled=false\n", 0o600).unwrap();
+    assert!(
+        round
+            .local(peer, |_| -> Result<()> {
+                panic!("disabled batch must not run")
+            })
+            .is_err()
+    );
+    aterm_secrets::fsx::write_atomic(&config, b"[commons]\n", 0o600).unwrap();
+    assert!(round.local(peer, |_| Ok(())).is_ok());
+    let sa = Session::open(&a).unwrap();
+    let mut store = Store::open(
+        &sa,
+        &directory.path(directory.catalog_scope()).unwrap(),
+        directory.catalog_scope(),
+    )
+    .unwrap();
+    let incompatible =
+        crate::catalog::Descriptor::application(a.trust(), "accounts", "proposals", 2).unwrap();
+    store
+        .commit_catalog(&sa, &incompatible.encode().unwrap())
+        .unwrap();
+    drop(store);
+    drop(sa);
+    assert!(
+        round
+            .local(peer, |_| -> Result<()> {
+                panic!("conflicted table batch must not run")
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn automatic_application_refusal_preserves_control_for_retired_members() {
+    let p = Pair::new(false, 0);
+    p.retire_b();
+    let a = p
+        .endpoint(0, false)
+        .with_commons(p.lab.paths[0].clone(), p.lab.paths[0].home.join("config"))
+        .unwrap();
+    let b = p
+        .endpoint(1, false)
+        .with_commons(p.lab.paths[1].clone(), p.lab.paths[1].home.join("config"))
+        .unwrap();
+    let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
+    p.round(&a, &b, &mut ra, &mut rb);
+    assert!(ra.actor().is_some() && rb.actor().is_some());
+    assert!(ra.application().is_none() && rb.application().is_none());
+}
+
 struct Pair {
     lab: Lab,
     scope: Scope,
@@ -53,12 +121,9 @@ impl Pair {
         Self { lab, scope, paths }
     }
     fn endpoint(&self, n: usize, data: bool) -> Endpoint {
-        // These tests need each round to complete: on a loaded machine one outlasts the
-        // product's 30 s deadline, and its application report then reads as missing.
         let endpoint = Endpoint::from_bootstrap(&self.lab.bootstrap(n))
             .unwrap()
-            .unwrap()
-            .within(Duration::from_secs(60));
+            .unwrap();
         if data {
             endpoint
                 .with_tables(
@@ -590,7 +655,10 @@ fn fresh_inbound_connections_continue_past_the_first_history_window() {
     for round in 0..4 {
         let mut incoming = PeerRepair::default();
         p.round(&a, &b, &mut outgoing, &mut incoming);
-        let keys = incoming.application().unwrap().keys_received;
+        let keys = incoming
+            .application()
+            .unwrap_or_else(|| panic!("{incoming:?}"))
+            .keys_received;
         if round == 0 {
             first = keys;
         } else {
@@ -675,12 +743,17 @@ fn lost_conflict_ack_retries_the_original_durable_certificate() {
 }
 
 #[test]
-fn version_one_application_frames_cannot_bypass_certificate_exchange() {
+fn older_application_frames_cannot_bypass_certificate_exchange() {
     let p = Pair::new(false, 0);
     let replica = p.replica(0);
     let peer = p.replica(1).actor;
     let round = replica.round(peer).unwrap();
-    for (old, expected) in [(b"ACTP1", PROBE), (b"ACTA1", READY)] {
+    for (old, expected) in [
+        (b"ACTP1", PROBE),
+        (b"ACTA1", READY),
+        (b"ACTP2", PROBE),
+        (b"ACTA2", READY),
+    ] {
         let mut frame = Vec::new();
         control::send_frame(&mut frame, &[old.as_slice(), &round.observation].concat()).unwrap();
         assert!(
@@ -691,9 +764,29 @@ fn version_one_application_frames_cannot_bypass_certificate_exchange() {
     }
     let actors = BTreeSet::from([[1; 48], [2; 48]]);
     let mut frame = Vec::new();
-    send_inventory(&mut frame, Some(&actors)).unwrap();
+    send_inventory(&mut frame, Some(&actors), MAX_RECORDS).unwrap();
     assert_eq!(
-        receive_inventory::<48>(&mut Cursor::new(frame)).unwrap(),
+        receive_inventory::<48>(&mut Cursor::new(frame), MAX_RECORDS).unwrap(),
         Some(actors)
     );
+}
+
+#[test]
+fn proof_inventory_carries_both_retained_source_pools_without_unbounded_allocation() {
+    let proofs: BTreeSet<ProofKey> = (0..MAX_PROOFS as u32)
+        .map(|n| {
+            let mut key = [0; 81];
+            key[77..].copy_from_slice(&n.to_be_bytes());
+            key
+        })
+        .collect();
+    let mut wire = Vec::new();
+    send_inventory(&mut wire, Some(&proofs), MAX_PROOFS).unwrap();
+    assert_eq!(
+        receive_inventory::<81>(&mut Cursor::new(wire), MAX_PROOFS).unwrap(),
+        Some(proofs)
+    );
+    let mut oversized = vec![1];
+    oversized.extend_from_slice(&(MAX_PROOFS as u32 + 1).to_le_bytes());
+    assert!(receive_inventory::<81>(&mut Cursor::new(oversized), MAX_PROOFS).is_err());
 }

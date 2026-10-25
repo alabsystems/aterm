@@ -47,6 +47,9 @@ pub enum Fact {
     /// Permanent authority attestation of an actor's canonical device identity.
     /// This is retained evidence, not an active membership grant.
     Bind { binding: Binding },
+    /// This recipient is permanently excluded, even if its writer binding is
+    /// learned after retirement or arrives on a concurrent control branch.
+    RetireRecipient { recipient: crate::age::Recipient },
 }
 impl Fact {
     pub(crate) fn validate(&self) -> Result<()> {
@@ -67,6 +70,10 @@ impl Fact {
                     && through.is_none_or(|f| f.sequence > 0 && f.digest != [0; 32])
             }
             Self::Bind { binding } => Binding::decode(&binding.bytes()).is_ok(),
+            Self::RetireRecipient { recipient } => {
+                crate::x25519::canonical_u(&recipient.0)
+                    && crate::age::Recipient::parse(&recipient.to_bech32()).is_ok()
+            }
         };
         if valid {
             Ok(())
@@ -107,6 +114,10 @@ impl Fact {
             Self::Bind { binding } => {
                 wire.push(4);
                 wire.extend_from_slice(&binding.bytes());
+            }
+            Self::RetireRecipient { recipient } => {
+                wire.push(5);
+                wire.extend_from_slice(&recipient.0);
             }
         }
     }
@@ -186,17 +197,29 @@ impl Constraints {
             out.binding_legacy |= !node.binding_evidence();
             out.facts.extend(node.facts().iter().cloned());
         }
-        let retired: BTreeMap<_, _> = out
+        let banned: BTreeSet<_> = out
+            .facts
+            .iter()
+            .filter_map(|fact| match fact {
+                Fact::RetireRecipient { recipient } => Some(*recipient),
+                _ => None,
+            })
+            .collect();
+        if banned.len() > MAX_RETIRED_ACTORS {
+            return Err(Error::new(
+                "recipient retirements exceed the policy computation bound",
+            ));
+        }
+        out.retired_recipients.extend(banned.iter().copied());
+        let explicit_retired: BTreeSet<_> = out
             .facts
             .iter()
             .filter_map(|fact| match fact {
                 Fact::Retire { actor } => Some(*actor),
                 _ => None,
             })
-            .enumerate()
-            .map(|(bit, actor)| (actor, bit))
             .collect();
-        if retired.len() > MAX_RETIRED_ACTORS {
+        if explicit_retired.len() > MAX_RETIRED_ACTORS {
             return Err(Error::new(
                 "control retirements exceed the policy computation bound",
             ));
@@ -219,14 +242,45 @@ impl Constraints {
                 }
             }
         }
-        for actor in retired.keys() {
+        for actor in &explicit_retired {
             if let Some(binding) = out.bindings.get(actor) {
-                out.retired_writers.insert(*binding.writer());
                 out.retired_recipients.insert(binding.recipient());
             } else {
                 out.missing_retired_binding = true;
             }
         }
+        let mut retired_actors = explicit_retired;
+        for (actor, binding) in &out.bindings {
+            if out.retired_recipients.contains(&binding.recipient()) {
+                retired_actors.insert(*actor);
+                out.retired_writers.insert(*binding.writer());
+            }
+        }
+        if retired_actors.len() > MAX_RETIRED_ACTORS {
+            return Err(Error::new(
+                "control retirements exceed the policy computation bound",
+            ));
+        }
+        let retired: BTreeMap<_, _> = retired_actors
+            .into_iter()
+            .enumerate()
+            .map(|(bit, actor)| (actor, bit))
+            .collect();
+        let mut recipient_bits: BTreeMap<crate::age::Recipient, Vec<usize>> = BTreeMap::new();
+        for (actor, bit) in &retired {
+            if let Some(binding) = out.bindings.get(actor) {
+                recipient_bits
+                    .entry(binding.recipient())
+                    .or_default()
+                    .push(*bit);
+            }
+        }
+        let recipient_coverage: BTreeMap<_, _> = banned
+            .iter()
+            .enumerate()
+            .map(|(bit, recipient)| (*recipient, retired.len() + bit))
+            .collect();
+        let coverage_len = retired.len() + banned.len();
         let mut index = Index::new(nodes.len());
         for node in nodes.values() {
             index
@@ -242,9 +296,9 @@ impl Constraints {
                 "control restrictions require their exact ready head",
             ));
         }
-        // At the journal's node cap, 4096 nodes x 4096 actors is 2 MiB.
+        // At the journal cap, actor and recipient coverage uses at most 4 MiB.
         // Bits name facts, not occurrences: repeating a retirement is idempotent.
-        let words = retired.len().div_ceil(64);
+        let words = coverage_len.div_ceil(64);
         let mut ancestry: BTreeMap<Digest, Vec<u64>> = BTreeMap::new();
         for id in projection.ordered {
             let node = nodes[&id];
@@ -260,9 +314,25 @@ impl Constraints {
                 if let Fact::Retire { actor } = fact {
                     let bit = retired[actor];
                     bits[bit / 64] |= 1u64 << (bit % 64);
+                    if let Some(binding) = out.bindings.get(actor)
+                        && let Some(related) = recipient_bits.get(&binding.recipient())
+                    {
+                        for bit in related {
+                            bits[bit / 64] |= 1u64 << (bit % 64);
+                        }
+                    }
+                }
+                if let Fact::RetireRecipient { recipient } = fact {
+                    let bit = recipient_coverage[recipient];
+                    bits[bit / 64] |= 1u64 << (bit % 64);
+                    if let Some(bound) = recipient_bits.get(recipient) {
+                        for bit in bound {
+                            bits[bit / 64] |= 1u64 << (bit % 64);
+                        }
+                    }
                 }
             }
-            let covers = (0..retired.len()).all(|bit| bits[bit / 64] & (1u64 << (bit % 64)) != 0);
+            let covers = (0..coverage_len).all(|bit| bits[bit / 64] & (1u64 << (bit % 64)) != 0);
             for fact in node.facts() {
                 if let Fact::Epoch {
                     generation,
@@ -422,11 +492,52 @@ impl Constraints {
     )]
     pub fn check_actor(&self, actor: &Actor) -> Result<()> {
         self.complete()?;
-        if self.facts.contains(&Fact::Retire { actor: *actor }) {
+        if self.facts.contains(&Fact::Retire { actor: *actor })
+            || self
+                .bindings
+                .get(actor)
+                .is_some_and(|binding| self.retired_recipients.contains(&binding.recipient()))
+        {
             Err(Error::new("writer incarnation is permanently retired"))
         } else {
             Ok(())
         }
+    }
+
+    /// Whether this recipient is permanently denied future bindings. Legacy
+    /// or ambiguous binding evidence cannot establish a negative answer.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbRecipientRetirement",
+            action = "LateBinding",
+            project = "aterm_secrets::client::retirement::tests::recipient_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbRecipientRetirement",
+            action = "ConcurrentRecovery",
+            project = "aterm_secrets::client::retirement::tests::recipient_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbRecipientRetirement",
+            action = "UnboundEpoch",
+            project = "aterm_secrets::client::retirement::tests::recipient_transition"
+        )
+    )]
+    pub fn recipient_retired(&self, recipient: &crate::age::Recipient) -> Result<bool> {
+        self.complete()?;
+        if self.binding_legacy || self.ambiguous_binding || self.missing_retired_binding {
+            return Err(Error::new(
+                "recipient retirement requires complete binding evidence",
+            ));
+        }
+        Ok(self.retired_recipients.contains(recipient))
     }
     fn complete(&self) -> Result<()> {
         if self.legacy {
@@ -620,6 +731,11 @@ impl Constraints {
                 _ => {}
             }
         }
+        retired.extend(self.bindings.iter().filter_map(|(actor, binding)| {
+            self.retired_recipients
+                .contains(&binding.recipient())
+                .then_some(*actor)
+        }));
         let allowed: BTreeMap<_, _> = cutoffs
             .iter()
             .map(|(actor, frontiers)| {

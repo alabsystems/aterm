@@ -1757,7 +1757,7 @@ mod tests {
                 UiNode::new(
                     "brand",
                     UiContent::Group(GroupSpec {
-                        label: Some("aterm · ALab".to_string()),
+                        label: Some("aterm ALab".to_string()),
                         role: SemanticRole::Text,
                         style: StyleRef::Plain,
                     }),
@@ -1775,7 +1775,7 @@ mod tests {
         assert_eq!(note.label(), Some("Changes apply at once"), "UIA's Name");
         let brand = node(&projection, "brand");
         assert_eq!(brand.role(), Role::Label);
-        assert_eq!(brand.value(), Some("aterm · ALab"));
+        assert_eq!(brand.value(), Some("aterm ALab"));
         let title = node(&projection, "title");
         assert_eq!(title.role(), Role::Heading);
         assert_eq!(title.label(), Some("Appearance"));

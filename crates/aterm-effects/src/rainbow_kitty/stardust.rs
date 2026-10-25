@@ -124,6 +124,8 @@ pub const fn field_fade_life_s() -> f32 {
     half_life_life_s(FIELD_HOLD_MS / 1000.0, FIELD_TAU_MS / 1000.0)
 }
 
+const FIELD_FADE_LIFE_S: f32 = field_fade_life_s();
+
 /// The spine above which a strike also throws a second m3 from the caret's leading edge (§5.6).
 pub const STRIKE_SECOND_M3_DISP: f32 = 0.5;
 
@@ -178,7 +180,7 @@ pub const CELL_1X_CH: f32 = 14.0;
 #[inline]
 #[must_use]
 pub const fn px_scale(ch: f32) -> f32 {
-    ch / CELL_1X_CH
+    ch * (1.0 / CELL_1X_CH)
 }
 
 /// An integer pixel size ruled at 1×, at cell height `ch`: truncated like `star_arm_px` (never
@@ -485,8 +487,9 @@ const fn stream_px_per_s_with_share(share: f32, cw: f32, ioi_ms: f32) -> f32 {
         return 0.0;
     }
     let ioi = ioi_ms.clamp(STREAM_IOI_MIN_MS, STREAM_IOI_MAX_MS);
-    let gate =
-        smoothstep01((STREAM_IOI_STROLL_MS - ioi) / (STREAM_IOI_STROLL_MS - STREAM_IOI_RUN_MS));
+    let gate = smoothstep01(
+        (STREAM_IOI_STROLL_MS - ioi) * (1.0 / (STREAM_IOI_STROLL_MS - STREAM_IOI_RUN_MS)),
+    );
     share * cw * 1000.0 / ioi * gate
 }
 
@@ -495,7 +498,7 @@ const fn stream_px_per_s_with_share(share: f32, cw: f32, ioi_ms: f32) -> f32 {
 #[inline]
 #[must_use]
 pub const fn stream_travel_px(px_per_s: f32) -> f32 {
-    px_per_s / 1000.0 * STREAM_TAU_MS * STREAM_SPENT
+    px_per_s * (STREAM_TAU_MS * STREAM_SPENT / 1000.0)
 }
 
 #[inline]
@@ -507,7 +510,8 @@ const fn stream_unit(age_ms: f32) -> f32 {
     if age_ms >= STREAM_END_MS {
         return 1.0;
     }
-    ((1.0 - crate::color_math::exp_f32(-age_ms / STREAM_TAU_MS)) / STREAM_SPENT).min(1.0)
+    ((1.0 - crate::color_math::exp_f32(-age_ms * (1.0 / STREAM_TAU_MS))) * (1.0 / STREAM_SPENT))
+        .min(1.0)
 }
 
 /// The mend's pull window, ms: a key that mends a typo run ([`super::Mend`], §23) takes its strike
@@ -832,7 +836,9 @@ impl Motion {
     const fn k_at(self, age_ms: f32) -> f32 {
         match self {
             Self::Lift => age_ms,
-            Self::Drag => DRAG_TAU_MS * (1.0 - crate::color_math::exp_f32(-age_ms / DRAG_TAU_MS)),
+            Self::Drag => {
+                DRAG_TAU_MS * (1.0 - crate::color_math::exp_f32(-age_ms * (1.0 / DRAG_TAU_MS)))
+            }
             Self::Throw(window_ms) => window_ms * (1.0 - spend(age_ms / window_ms)),
         }
     }
@@ -983,7 +989,7 @@ impl Star {
     #[must_use]
     pub fn dead(&self, now: Instant) -> bool {
         self.age_s(now) >= self.life_s()
-            || (self.lane == StarLane::Field && self.idle_s(now) >= field_fade_life_s())
+            || (self.lane == StarLane::Field && self.idle_s(now) >= FIELD_FADE_LIFE_S)
             || self.finish.is_some_and(|f| f.gain(now) < STAR_CULL_ALPHA)
     }
 
@@ -1004,8 +1010,8 @@ impl Star {
         }
         if reduced_motion {
             let life = self.life_s();
-            let fade = REDUCED_MOTION_FADE_MS / 1000.0;
-            return clamp01((life - age) / fade.max(f32::EPSILON)) * fin;
+            const INV_FADE_S: f32 = 1.0 / (REDUCED_MOTION_FADE_MS / 1000.0).max(f32::EPSILON);
+            return clamp01((life - age) * INV_FADE_S) * fin;
         }
         let (hold, tau) = self.class.envelope_s(self.lane);
         half_life(age, hold, tau) * fin
@@ -1129,9 +1135,11 @@ impl Star {
         let theta = omega * self.age_s(now) + self.lum_phase();
         let k0 = (nominal * floor - 0.5).ceil().max(min) as i32;
         let k1 = (nominal - 0.5).floor() as i32;
+        let inv_nominal = 1.0 / nominal;
+        let inv_depth = 1.0 / depth;
         let mut best: Option<f32> = None;
         for k in k0..=k1 {
-            let c = ((k as f32 + 0.5) / nominal - floor) / depth;
+            let c = ((k as f32 + 0.5) * inv_nominal - floor) * inv_depth;
             if c > 0.0
                 && c < 1.0
                 && let Some(dt) = next_sine_crossing_s(theta, c.sqrt().asin(), omega)
@@ -1150,8 +1158,18 @@ impl Star {
         if !self.gold {
             return None;
         }
+        const TWINKLE_GLINT_ASIN: f32 = {
+            let mut y = 1.168_f32;
+            let mut i = 0;
+            while i < 6 {
+                let (sy, cy) = crate::supernova::sin_cos_f32(y);
+                y -= (sy - TWINKLE_GLINT_FRAC) / cy;
+                i += 1;
+            }
+            y
+        };
         let theta = TWINKLE_OMEGA * self.age_s(now) + self.lum_phase();
-        next_sine_crossing_s(theta, TWINKLE_GLINT_FRAC.asin(), TWINKLE_OMEGA)
+        next_sine_crossing_s(theta, TWINKLE_GLINT_ASIN, TWINKLE_OMEGA)
     }
 
     /// Seconds until a lifting star's integer position next steps (§5.6):
@@ -1169,7 +1187,7 @@ impl Star {
                 continue;
             }
             let next_ms = ((v * age_ms).round() + 0.5) / v;
-            let dt = (next_ms - age_ms) / 1000.0;
+            let dt = (next_ms - age_ms) * (1.0 / 1000.0);
             if dt > 0.0 {
                 best = Some(best.map_or(dt, |b| b.min(dt)));
             }
@@ -1203,7 +1221,7 @@ impl Star {
             return None;
         }
         let t_ms = -STREAM_TAU_MS * (1.0 - u * STREAM_SPENT).ln();
-        Some(((t_ms.min(STREAM_END_MS) - age_ms) / 1000.0).max(0.0))
+        Some(((t_ms.min(STREAM_END_MS) - age_ms) * (1.0 / 1000.0)).max(0.0))
     }
 
     #[inline]
@@ -1211,7 +1229,7 @@ impl Star {
         if self.pull <= 0.0 || age_ms >= MEND_PULL_MS {
             return 0;
         }
-        (self.pull * spend(age_ms / MEND_PULL_MS)).round() as i32
+        (self.pull * spend(age_ms * (1.0 / MEND_PULL_MS))).round() as i32
     }
 
     /// The centre at `now`, pinned to a device pixel (§5.4), by the population's [`Motion`] law.
@@ -1276,7 +1294,8 @@ impl Star {
             self.v0 = (0.0, 0.0);
             return;
         }
-        self.v0 = ((rest.0 - bx) as f32 / k, (rest.1 - by) as f32 / k);
+        let inv_k = 1.0 / k;
+        self.v0 = ((rest.0 - bx) as f32 * inv_k, (rest.1 - by) as f32 * inv_k);
     }
 }
 
@@ -2031,8 +2050,9 @@ impl Stardust {
         }
         let (vx, vy) = spec.v_head;
         let speed = vx.hypot(vy).max(f32::EPSILON);
-        let (ux, uy) = (vx / speed, vy / speed);
-        let (along_x, along_y) = (ux * speed * SHED_ALONG_SHARE, uy * speed * SHED_ALONG_SHARE);
+        let inv_speed = 1.0 / speed;
+        let (ux, uy) = (vx * inv_speed, vy * inv_speed);
+        let (along_x, along_y) = (vx * SHED_ALONG_SHARE, vy * SHED_ALONG_SHARE);
         let scale = px_scale(ctx.geom.ch as f32);
         let tint = spectrum_snap(spec.tint_t);
         for k in 0..spec.n {
@@ -2067,8 +2087,8 @@ impl Stardust {
     /// the hero coloured by the landing walk at its rest column.
     pub fn sow_fan(&mut self, at: Instant, spec: FanSow, ctx: &Ctx<'_>) {
         let n = usize::from(spec.n).max(1);
-        let nf = n as f32;
-        let cw = (ctx.geom.cw as f32).max(1.0);
+        let inv_n = 1.0 / (n as f32);
+        let inv_cw = 1.0 / (ctx.geom.cw as f32).max(1.0);
         let (rise_up, rise_down) = fan_rise(spec.reach, spec.at_px, ctx.geom);
         for k in 0..n {
             let seed = mix32(spec.seed ^ (k as u32).wrapping_mul(0x85EB_CA6B));
@@ -2076,17 +2096,17 @@ impl Stardust {
             if class == StarClass::M3 && !light_keeps(seed, ctx.cfg) {
                 continue;
             }
-            let a = (k as f32 / nf + hash01(seed) / nf) * std::f32::consts::TAU;
+            let a = ((k as f32 + hash01(seed)) * inv_n) * std::f32::consts::TAU;
             let reach = spec.reach
                 * (FAN_THROW_JITTER_MIN
                     + (FAN_THROW_JITTER_MAX - FAN_THROW_JITTER_MIN) * hash01(mix32(seed ^ 3)));
             let (dx, dy) = fan_ray(a, reach, rise_up, rise_down, hash01(mix32(seed ^ 5)));
-            let v0 = (dx / FAN_THROW_MS, dy / FAN_THROW_MS);
+            let v0 = (dx * (1.0 / FAN_THROW_MS), dy * (1.0 / FAN_THROW_MS));
             let gold = class == StarClass::M1 && spec.hero;
             let tint = if gold {
                 TINT_GOLD_RGB
             } else {
-                spectrum_snap(spec.walk.at(dx / cw))
+                spectrum_snap(spec.walk.at(dx * inv_cw))
             };
             self.throw(
                 Throw {
@@ -2108,7 +2128,7 @@ impl Stardust {
     /// The mini-fan (§6.12, D17): a same-row nav hop of 2-7 cells.
     pub fn sow_mini_fan(&mut self, at: Instant, at_px: (f32, f32), seed: u32, ctx: &Ctx<'_>) {
         let n = MINI_FAN_M2_N + MINI_FAN_M3_N;
-        let nf = f32::from(n);
+        const INV_N: f32 = 1.0 / (MINI_FAN_M2_N + MINI_FAN_M3_N) as f32;
         let scale = px_scale(ctx.geom.ch as f32);
         for k in 0..n {
             let s = mix32(seed ^ u32::from(k).wrapping_mul(0xC2B2_AE35));
@@ -2120,12 +2140,12 @@ impl Stardust {
             if class == StarClass::M3 && !light_keeps(s, ctx.cfg) {
                 continue;
             }
-            let a = (f32::from(k) / nf + hash01(s) / nf) * std::f32::consts::TAU;
+            let a = ((f32::from(k) + hash01(s)) * INV_N) * std::f32::consts::TAU;
             let reach = (MINI_FAN_REACH_MIN_PX
                 + (MINI_FAN_REACH_MAX_PX - MINI_FAN_REACH_MIN_PX) * hash01(mix32(s ^ 5)))
                 * scale;
             let (sa, ca) = a.sin_cos();
-            let v = reach / MINI_FAN_THROW_MS;
+            let v = reach * (1.0 / MINI_FAN_THROW_MS);
             let v0 = (ca * v, sa * v);
             let (tint, gold) = class_tint(class, s, ctx.caret_t);
             self.throw(
@@ -2264,12 +2284,12 @@ impl Stardust {
             cad.brisk();
             return cad.take();
         }
-        let fade_life = field_fade_life_s();
-        let fade_lead_s = REDUCED_MOTION_FADE_MS / 1000.0;
-        let fade_from_idle = fade_life - fade_lead_s;
-        let fade_from_field = FIELD_LIFE_S - fade_lead_s;
-        let field_hold_s = FIELD_HOLD_MS / 1000.0;
-        let field_melt_start = FIELD_LIFE_S * (1.0 - EXPIRY_MELT_SHARE);
+        let fade_life = FIELD_FADE_LIFE_S;
+        const FADE_LEAD_S: f32 = REDUCED_MOTION_FADE_MS / 1000.0;
+        let fade_from_idle = fade_life - FADE_LEAD_S;
+        const FADE_FROM_FIELD: f32 = FIELD_LIFE_S - FADE_LEAD_S;
+        const FIELD_HOLD_S: f32 = FIELD_HOLD_MS / 1000.0;
+        const FIELD_MELT_START: f32 = FIELD_LIFE_S * (1.0 - EXPIRY_MELT_SHARE);
         for v in &self.veil {
             if cad.at_tail_floor() {
                 return cad.take();
@@ -2282,16 +2302,16 @@ impl Stardust {
             }
             if self.reduced {
                 cad.tail((fade_from_idle - idle).max(0.0));
-                cad.tail((fade_from_field - age).max(0.0));
+                cad.tail((FADE_FROM_FIELD - age).max(0.0));
             } else {
-                if idle < field_hold_s {
-                    cad.tail(field_hold_s - idle);
+                if idle < FIELD_HOLD_S {
+                    cad.tail(FIELD_HOLD_S - idle);
                 } else {
                     cad.tail(0.0);
                 }
                 if age < EDGE_IN_S {
                     cad.tail(EDGE_IN_S - age);
-                } else if age >= field_melt_start {
+                } else if age >= FIELD_MELT_START {
                     cad.tail(0.0);
                 }
             }
@@ -2313,13 +2333,13 @@ impl Stardust {
                 let idle = s.idle_s(now);
                 if self.reduced {
                     cad.tail((fade_from_idle - idle).max(0.0));
-                } else if idle < field_hold_s {
-                    cad.tail(field_hold_s - idle);
+                } else if idle < FIELD_HOLD_S {
+                    cad.tail(FIELD_HOLD_S - idle);
                 }
                 cad.tail(fade_life - idle);
             }
             if self.reduced {
-                let fade_from = life - fade_lead_s;
+                let fade_from = life - FADE_LEAD_S;
                 if age < fade_from {
                     cad.tail(fade_from - age);
                 } else {
@@ -2457,9 +2477,9 @@ impl Stardust {
         };
         let field_share = field_step
             .max(FIELD_SHARE_COLD + (FIELD_SHARE_FLOW - FIELD_SHARE_COLD) * clamp01(ctx.flow.heat));
-        let m1 = scale / DEAL_M1_IN as f32;
-        let m2 = m1 + scale / DEAL_M2_IN as f32;
-        let m3 = m2 + scale / DEAL_M3_IN as f32;
+        let m1 = scale * (1.0 / DEAL_M1_IN as f32);
+        let m2 = m1 + scale * (1.0 / DEAL_M2_IN as f32);
+        let m3 = m2 + scale * (1.0 / DEAL_M3_IN as f32);
         let earned = matches!(class, TypedClass::Capital | TypedClass::Bang);
         let (row, head) = ctx.caret;
         let n_cells = cells.max(1);
@@ -2632,7 +2652,10 @@ impl Stardust {
             return;
         }
         let rise = rise.min(self.rule_headroom_px(px_col(x - reach, g)..=i32::from(col), y, g));
-        let v0 = (-reach / EXHAUST_THROW_MS, -rise / EXHAUST_THROW_MS);
+        let v0 = (
+            -reach * (1.0 / EXHAUST_THROW_MS),
+            -rise * (1.0 / EXHAUST_THROW_MS),
+        );
         let (tint, gold) = class_tint(class, seed, self.field_t((row, col), ctx, ribbon));
         self.throw(
             Throw {
@@ -2700,7 +2723,7 @@ impl Stardust {
             + (ERASE_REACH_MAX_PX - ERASE_REACH_MIN_PX) * hash01(mix32(seed ^ 7)))
             * px_scale(ctx.geom.ch as f32);
         let (sa, ca) = a.sin_cos();
-        let v = reach / ERASE_THROW_MS;
+        let v = reach * (1.0 / ERASE_THROW_MS);
         let v0 = (ca * v, sa * v);
         let (tint, gold) = deal_tint(seed, ctx.caret_t);
         self.throw(
@@ -2775,7 +2798,7 @@ impl Stardust {
             _ if spec.pull.is_some() => (0.0, 0.0),
             (StarClass::M1 | StarClass::M2, StarLane::Strike) => {
                 let g = ctx.geom;
-                let lift = sky_lift_px_per_s(g.ch as f32) / 1000.0;
+                let lift = sky_lift_px_per_s(g.ch as f32) * (1.0 / 1000.0);
                 let life_ms = class.life_s(spec.lane) * 1000.0;
                 let room = self.rule_headroom_px(px_col(x - stream, g)..=px_col(x, g), y, g);
                 (0.0, lift.max(-room / life_ms))
@@ -2927,12 +2950,12 @@ impl Stardust {
     }
 
     #[inline]
-    fn stream_reach(&self, x: f32, y: f32, ctx: &Ctx<'_>) -> f32 {
+    const fn stream_reach(&self, x: f32, y: f32, ctx: &Ctx<'_>) -> f32 {
         let want = stream_travel_px(stream_px_per_s(ctx.geom.cw as f32, self.ioi_ms));
         self.blank_frontier_px(x, (y, y), want, ctx)
     }
 
-    fn blank_frontier_px(&self, x: f32, band: (f32, f32), want: f32, ctx: &Ctx<'_>) -> f32 {
+    const fn blank_frontier_px(&self, x: f32, band: (f32, f32), want: f32, ctx: &Ctx<'_>) -> f32 {
         let g = ctx.geom;
         if !want.is_finite() || want < 0.5 {
             return 0.0;
@@ -2943,31 +2966,44 @@ impl Stardust {
         }
         let (first, last) = (px_row(band.0, g), px_row(band.1, g));
         let mut frontier = col;
-        let floor_of = |frontier: i32| (g.fx_left() + frontier * g.cw as i32) as f32;
+        let fx_left = g.fx_left();
+        let cw_i32 = g.cw as i32;
         while frontier > 0 {
             // Already clear of the priced travel: no column further left can
             // lower `want.min(x − floor_x)`, so the walk is over.
-            if x - floor_of(frontier) >= want {
+            if x - (fx_left + frontier * cw_i32) as f32 >= want {
                 break;
             }
             let left = frontier - 1;
-            let clear = u16::try_from(left).is_ok_and(|c| {
-                (first..=last).all(|r| self.probe.sky_at(r, c, g.rows) == Some(false))
-            });
+            let clear = if left >= 0 && left <= u16::MAX as i32 {
+                let c = left as u16;
+                let mut r = first;
+                let mut all_clear = true;
+                while r <= last {
+                    if !matches!(self.probe.sky_at(r, c, g.rows), Some(false)) {
+                        all_clear = false;
+                        break;
+                    }
+                    r += 1;
+                }
+                all_clear
+            } else {
+                false
+            };
             if !clear {
                 break;
             }
             frontier = left;
         }
-        want.min(x - floor_of(frontier)).max(0.0)
+        want.min(x - (fx_left + frontier * cw_i32) as f32).max(0.0)
     }
 
-    fn rule_headroom_px(&self, cols: std::ops::RangeInclusive<i32>, y: f32, g: Geom) -> f32 {
+    const fn rule_headroom_px(&self, cols: std::ops::RangeInclusive<i32>, y: f32, g: Geom) -> f32 {
         let row = px_row(y, g);
         if !self.probe.has_rule_in(row, cols) {
             return f32::INFINITY;
         }
-        let row_top = f32::from(g.origin_y) + row as f32 * g.ch as f32;
+        let row_top = g.origin_y as f32 + row as f32 * g.ch as f32;
         let band = rule_stroke_px(g.ch);
         if y < row_top + band.start as f32 {
             return f32::INFINITY;
@@ -3038,10 +3074,11 @@ impl Stardust {
         }
         let (dx, dy) = ((rest.0 - origin.0) as f32, (rest.1 - origin.1) as f32);
         let steps = dx.hypot(dy).ceil().max(1.0) as i32;
+        let inv_steps = 1.0 / steps as f32;
         let p = (0..steps)
             .rev()
             .map(|i| {
-                let t = i as f32 / steps as f32;
+                let t = i as f32 * inv_steps;
                 (
                     origin.0 + (dx * t).round() as i32,
                     origin.1 + (dy * t).round() as i32,
@@ -3129,7 +3166,7 @@ impl Stardust {
     fn finish_field(&mut self, caret: (u16, u16), span_ms: f32, at: Instant, geom: Geom) {
         let (row, col) = caret;
         let col_i32 = i32::from(col);
-        let span_s = span_ms / 1000.0;
+        let span_s = span_ms * (1.0 / 1000.0);
         for s in &mut self.stars {
             if s.lane != StarLane::Field {
                 continue;
@@ -3449,12 +3486,12 @@ impl Paint {
         let (env, e) = if held {
             (1.0, 1.0)
         } else {
-            (tw, clamp01((tw - 0.55) / 0.45))
+            (tw, clamp01((tw - 0.55) * (1.0 / 0.45)))
         };
         let floor = star.class.core_floor();
         let mut c = star.class.cov(star.lane) * alpha * clamp01(ctx.cfg.intensity);
         if star.lane.is_transient() && probe.at_px(x, y, ctx.geom) != Some(false) {
-            c /= TEXT_SAFE_DIV;
+            c *= 1.0 / TEXT_SAFE_DIV;
         }
         let arm = if held {
             arm_hi
@@ -3776,18 +3813,22 @@ fn arm_px(star: &Star, ch: f32, held: bool, now: Instant) -> i32 {
 
 #[inline]
 #[must_use]
-fn next_sine_crossing_s(theta: f32, a0: f32, omega: f32) -> Option<f32> {
+const fn next_sine_crossing_s(theta: f32, a0: f32, omega: f32) -> Option<f32> {
     use std::f32::consts::PI;
     if !(omega.is_finite() && theta.is_finite() && a0.is_finite()) || omega <= 0.0 {
         return None;
     }
-    let base = theta.rem_euclid(PI);
+    let rem = theta % PI;
+    let base = if rem < 0.0 { rem + PI } else { rem };
     let mut gap = f32::INFINITY;
-    for cand in [a0, PI - a0, PI + a0, 2.0 * PI - a0] {
-        let g = cand - base;
+    let cands = [a0, PI - a0, PI + a0, 2.0 * PI - a0];
+    let mut i = 0;
+    while i < cands.len() {
+        let g = cands[i] - base;
         if g > 1e-5 && g < gap {
             gap = g;
         }
+        i += 1;
     }
     if gap.is_finite() {
         Some(gap / omega)
@@ -3831,7 +3872,7 @@ const fn cell_hash(row: u16, col: u16, salt: u32) -> u32 {
 /// A seed's uniform draw on `[0, 1)`.
 #[inline]
 pub(super) const fn hash01(h: u32) -> f32 {
-    (h >> 8) as f32 / 16_777_216.0
+    (h >> 8) as f32 * (1.0 / 16_777_216.0)
 }
 
 #[inline]
@@ -4130,7 +4171,7 @@ impl Veil {
     #[must_use]
     pub fn dead(&self, now: Instant) -> bool {
         self.age_s(now) >= FIELD_LIFE_S
-            || self.idle_s(now) >= field_fade_life_s()
+            || self.idle_s(now) >= FIELD_FADE_LIFE_S
             || self.finish.is_some_and(|f| f.gain(now) < STAR_CULL_ALPHA)
     }
 
@@ -4158,14 +4199,15 @@ impl Veil {
 #[must_use]
 pub const fn field_lane_envelope(age_s: f32, idle_s: f32, fin: f32, reduced_motion: bool) -> f32 {
     if reduced_motion {
-        let fade = REDUCED_MOTION_FADE_MS / 1000.0;
-        return clamp01((FIELD_LIFE_S - age_s) / fade.max(f32::EPSILON))
-            * reduced_fade(field_fade_life_s() - idle_s)
+        const INV_FADE_S: f32 = 1.0 / (REDUCED_MOTION_FADE_MS / 1000.0).max(f32::EPSILON);
+        return clamp01((FIELD_LIFE_S - age_s) * INV_FADE_S)
+            * reduced_fade(FIELD_FADE_LIFE_S - idle_s)
             * fin;
     }
     let birth = BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * edge_in(age_s);
     let hand = half_life(idle_s, FIELD_HOLD_MS / 1000.0, FIELD_TAU_MS / 1000.0);
-    birth * expiry_melt(age_s / FIELD_LIFE_S.max(f32::EPSILON)) * hand * fin
+    const INV_FIELD_LIFE_S: f32 = 1.0 / FIELD_LIFE_S.max(f32::EPSILON);
+    birth * expiry_melt(age_s * INV_FIELD_LIFE_S) * hand * fin
 }
 
 /// The aurora's gain at a birth spine: `0` below [`AURORA_COLD_DISP`], then `smoothstep` up to `1`
@@ -4176,7 +4218,7 @@ pub const fn veil_gain(birth_disp: f32) -> f32 {
     if !birth_disp.is_finite() || birth_disp < AURORA_COLD_DISP {
         return 0.0;
     }
-    smoothstep01((birth_disp - AURORA_COLD_DISP) / (1.0 - AURORA_COLD_DISP))
+    smoothstep01((birth_disp - AURORA_COLD_DISP) * (1.0 / (1.0 - AURORA_COLD_DISP)))
 }
 
 #[inline]
@@ -4197,7 +4239,7 @@ const fn halo_rgb(tint: u32, gold: bool, env: f32) -> u32 {
     if gold || tint == TINT_WHITE_RGB {
         return tint;
     }
-    let breath = clamp01((env - 0.55) / 0.45) * 2.0 - 1.0;
+    let breath = clamp01((env - 0.55) * (1.0 / 0.45)) * 2.0 - 1.0;
     let step = (breath * HALO_HUE_SWING_ENTRIES as f32).round() as i32;
     if step == 0 {
         return tint;
@@ -5867,13 +5909,16 @@ mod tests {
                 TINT_WHITE_RGB,
             );
             s.seed = k;
+            // A row clear of the caret's cell, which keeps every star off.
             s.x = 100.0 + 5.0 * k as f32;
+            s.y = 200.0;
             sky.sow(s);
         }
         let evict_at = t0 + Duration::from_millis(41);
         let mut newborn = star(StarClass::M1, StarLane::Strike, evict_at, TINT_WHITE_RGB);
         newborn.seed = 1000;
         newborn.x = 400.0;
+        newborn.y = 200.0;
         sky.sow(newborn);
         let finishing: Vec<u32> = sky
             .live_iter()
@@ -5888,7 +5933,7 @@ mod tests {
 
         let lit = |sky: &mut Stardust, ms: u64, x: i32| {
             let sc = frame_at(sky, evict_at + Duration::from_millis(ms), &c);
-            lum(px(&sc.out, x, 100)) > 0
+            lum(px(&sc.out, x, 200)) > 0
         };
         assert!(
             lit(&mut sky, 10, 100),
@@ -6606,6 +6651,46 @@ mod tests {
         );
     }
 
+    /// On a dark page no star stands on the caret's block: after the
+    /// gallery's dark Return a fan star's crosshair stood at the new caret's
+    /// corner, its hairline at the block's edge (looks7 M3, `e120`). A star
+    /// whose arm at its peak reaches the caret's cell or within
+    /// [`crate::rainbow_kitty::DARK_CARET_GAP_PX`] of it is not drawn, over its
+    /// life; with the caret a few cells off (the negative control) the same
+    /// stars are.
+    #[test]
+    fn no_dark_star_stands_on_the_caret_s_block() {
+        let c = cfg(true);
+        let g = geom();
+        let t0 = Instant::now();
+        // The caret's cell at (3, 10): x 90..99, y 94..112.
+        let drawn = |caret: (u16, u16)| -> usize {
+            let mut n = 0;
+            for (x, y) in [(94.0, 103.0), (104.0, 110.0), (86.0, 90.0), (95.0, 116.0)] {
+                let mut sky = sky();
+                let mut s = star(StarClass::M3, StarLane::Fan, t0, TINT_WHITE_RGB);
+                (s.x, s.y) = (x, y);
+                sky.sow(s);
+                for at in [0u64, 30, 90, 160] {
+                    let mut sc = Scratch::default();
+                    let mut f = sc.frame();
+                    sky.emit(
+                        &ctx_in(g, t0 + Duration::from_millis(at), &c, caret),
+                        &mut f,
+                    );
+                    n += sc.out.len() + sc.halos.len();
+                }
+            }
+            n
+        };
+        let on = drawn((3, 10));
+        assert_eq!(on, 0, "{on} star lights stand on the dark caret's block");
+        assert!(
+            drawn((3, 30)) > 0,
+            "control: off the caret the stars are not drawn either"
+        );
+    }
+
     #[test]
     fn an_over_budget_frame_keeps_every_star_s_core() {
         let c = cfg(true);
@@ -6614,7 +6699,9 @@ mod tests {
         for k in 0..STAR_CAP as u32 {
             let mut s = star(StarClass::M1, StarLane::Strike, t0, TINT_WHITE_RGB);
             s.seed = peak_seed();
+            // A row clear of the caret's cell, which keeps every star off.
             s.x = 20.0 + 24.0 * k as f32;
+            s.y = 200.0;
             sky.sow(s);
         }
         for k in 0..STAR_FINISH_SLACK as u32 {
@@ -6633,7 +6720,7 @@ mod tests {
         );
         for k in 0..STAR_CAP as i32 {
             assert!(
-                lum(px(&sc.out, 20 + 24 * k, 100)) > 0,
+                lum(px(&sc.out, 20 + 24 * k, 200)) > 0,
                 "hero {k} lost its core to the budget"
             );
         }

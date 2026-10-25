@@ -69,3 +69,10 @@ name = "spin"
 path = "benches/spin.rs"
 harness = false
 test = false
+
+# The aos repair row: as `paint`, with ATERM_AOS_BIN (or ATERM_PAINT_BIN).
+[[bench]]
+name = "aos"
+path = "benches/aos.rs"
+harness = false
+test = false

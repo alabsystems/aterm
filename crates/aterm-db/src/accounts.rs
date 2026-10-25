@@ -8,6 +8,9 @@
 use crate::{Error, Result, crypto::name};
 use aterm_json::Value;
 
+#[cfg(unix)]
+pub mod proposals;
+
 /// Validate the closed account schema, rejecting unknown credential-bearing fields.
 pub fn validate(value: &Value) -> Result<()> {
     let object = value
@@ -73,18 +76,7 @@ pub fn validate(value: &Value) -> Result<()> {
         }
     }
     if let Some(reference) = value.get("secret_ref").filter(|v| !v.is_null()) {
-        let r = reference
-            .as_object()
-            .ok_or_else(|| Error::new("secret reference must name a vault and entry"))?;
-        if r.len() != 2
-            || !["vault", "entry"]
-                .iter()
-                .all(|k| r.get(*k).and_then(Value::as_str).is_some_and(name))
-        {
-            return Err(Error::new(
-                "secret reference must contain only vault and entry names",
-            ));
-        }
+        crate::contacts::validate_secret_ref(reference)?;
     }
     if let Some(machines) = value.get("machines") {
         let machines = machines.as_array().ok_or_else(|| {

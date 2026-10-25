@@ -125,7 +125,7 @@ impl Worker {
 
 struct Link {
     source: IpAddr,
-    listener: Listener,
+    listener: Option<Listener>,
     hints: Multicast,
 }
 
@@ -138,6 +138,8 @@ pub(super) struct Transport {
     dial: Instant,
     rotate: Instant,
     scope: Scope,
+    #[cfg(test)]
+    observed: std::collections::BTreeMap<astream_wire::sync::Digest, usize>,
 }
 impl Transport {
     pub(super) fn open(endpoint: Endpoint, addresses: &[SocketAddr]) -> Result<Self> {
@@ -155,6 +157,8 @@ impl Transport {
             dial: now,
             rotate: now + Duration::from_secs(300),
             scope: Scope::Lan,
+            #[cfg(test)]
+            observed: std::collections::BTreeMap::new(),
         };
         transport.refresh(addresses);
         Ok(transport)
@@ -167,9 +171,15 @@ impl Transport {
             if self.links.iter().any(|link| link.source == address.ip()) {
                 continue;
             }
-            if let Ok(listener) = Listener::bind(*address, self.scope)
-                && let Ok(hints) = Multicast::bind(source, GROUP, PORT, self.scope)
-            {
+            let listener = if self.endpoint.pending() {
+                None
+            } else {
+                let Ok(listener) = Listener::bind(*address, self.scope) else {
+                    continue;
+                };
+                Some(listener)
+            };
+            if let Ok(hints) = Multicast::bind(source, GROUP, PORT, self.scope) {
                 self.links.push(Link {
                     source: address.ip(),
                     listener,
@@ -199,15 +209,22 @@ impl Transport {
             if self.workers[index].task.is_finished() {
                 let worker = self.workers.swap_remove(index);
                 match worker.task.join() {
-                    Ok((Some(address), repair, success)) => {
-                        self.hints.finish(address, repair, success, now)
+                    Ok((target, repair, success)) => {
+                        #[cfg(test)]
+                        if let Some(report) = repair.application()
+                            && let Some(table) = report.table
+                        {
+                            self.observed.insert(table, report.retained);
+                        }
+                        if let Some(address) = target {
+                            self.hints.finish(address, repair, success, now);
+                        }
                     }
                     Err(_) => {
                         if let Some(address) = worker.target {
                             self.hints.finish(address, Repair::default(), false, now);
                         }
                     }
-                    Ok((None, _, _)) => {}
                 }
             } else {
                 index += 1;
@@ -217,11 +234,15 @@ impl Transport {
         while index < self.links.len() {
             let link = &self.links[index];
             let serviced = (|| -> io::Result<()> {
-                link.listener.recheck()?;
+                if let Some(listener) = &link.listener {
+                    listener.recheck()?;
+                }
                 link.hints.recheck()?;
-                if now >= self.beacon {
+                if now >= self.beacon
+                    && let Some(listener) = &link.listener
+                {
                     link.hints
-                        .send(&self.hints.wire(link.listener.local_addr()?.port()))?;
+                        .send(&self.hints.wire(listener.local_addr()?.port()))?;
                 }
                 // Bound work from an unauthenticated multicast flood per tick.
                 for _ in 0..16 {
@@ -238,8 +259,9 @@ impl Transport {
                 // Unproved inbound peers cannot occupy the outbound repair budget.
                 if self.workers.len() < WORKERS
                     && self.workers.iter().filter(|worker| worker.incoming).count() < WORKERS / 2
+                    && let Some(listener) = &link.listener
                 {
-                    match link.listener.accept() {
+                    match listener.accept() {
                         Ok(connection) => self.workers.push(Worker::start(
                             self.endpoint.clone(),
                             Some(connection),
@@ -251,7 +273,7 @@ impl Transport {
                         Err(_) => {
                             // Refusing one hostile or vanished peer cannot withdraw
                             // a healthy listener. Only its own evidence can do so.
-                            link.listener.recheck()?;
+                            listener.recheck()?;
                         }
                     }
                 }

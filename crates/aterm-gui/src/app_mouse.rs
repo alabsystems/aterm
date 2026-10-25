@@ -601,6 +601,20 @@ pub(crate) struct NativePointerRest {
     px: (f64, f64),
     seen: Option<(crate::tab_model::ViewId, crate::native_ui::UiKey)>,
     asks: bool,
+    /// The presses made at this rest ([`PressStreak`]).
+    streak: Option<PressStreak>,
+}
+
+/// A RUN OF PRESSES AT A STILL POINTER, each within a double click's interval of the one before
+/// ([`crate::multi_click_ms`]), and the control the run's first press landed on. A later press of
+/// the run that lands on another control lands where the first press's action put that control
+/// under the pointer: one double-click, not a press of what came up (a double-click on the Themes
+/// strip's Keep pressed the Customize that took Keep's place).
+#[derive(Clone, Debug, PartialEq)]
+struct PressStreak {
+    at: std::time::Instant,
+    view: crate::tab_model::ViewId,
+    key: crate::native_ui::UiKey,
 }
 
 impl NativePointerRest {
@@ -615,8 +629,51 @@ impl NativePointerRest {
                 px,
                 asks: seen.is_some_and(|(_, _, asks)| asks),
                 seen: seen.map(|(view, key, _)| (view, key.clone())),
+                streak: None,
             }),
         }
+    }
+
+    /// Count a press at `px` on `(view, key)` at `now` into the run of presses at this rest, and
+    /// say whether it continues a run whose first press landed on another control
+    /// ([`PressStreak`]), which the press then must not take.
+    fn press(
+        rest: &mut Option<Self>,
+        px: (f64, f64),
+        (view, key): (crate::tab_model::ViewId, &crate::native_ui::UiKey),
+        now: std::time::Instant,
+    ) -> bool {
+        let here = rest.get_or_insert_with(|| Self {
+            px,
+            seen: Some((view, key.clone())),
+            asks: false,
+            streak: None,
+        });
+        if here.px != px {
+            *here = Self {
+                px,
+                seen: Some((view, key.clone())),
+                asks: false,
+                streak: None,
+            };
+        }
+        let continues = here.streak.as_ref().filter(|streak| {
+            now.saturating_duration_since(streak.at).as_millis() <= crate::multi_click_ms()
+        });
+        let onto_another =
+            continues.is_some_and(|streak| streak.view != view || streak.key != *key);
+        here.streak = Some(match continues {
+            Some(streak) => PressStreak {
+                at: now,
+                ..streak.clone()
+            },
+            None => PressStreak {
+                at: now,
+                view,
+                key: key.clone(),
+            },
+        });
+        onto_another
     }
 
     fn looked_at(
@@ -637,11 +694,27 @@ impl NativePointerRest {
     fn on(
         px: (f64, f64),
         (view, key, asks): (crate::tab_model::ViewId, &crate::native_ui::UiKey, bool),
+        streak: Option<PressStreak>,
     ) -> Self {
         Self {
             px,
             seen: Some((view, key.clone())),
             asks,
+            streak,
+        }
+    }
+
+    /// Let a double click's interval pass since the last press at this rest, as a person's next,
+    /// separate click would: the press is stamped that long ago.
+    #[cfg(test)]
+    pub(crate) fn age_press(&mut self) {
+        let interval = std::time::Duration::from_millis(
+            u64::try_from(crate::multi_click_ms()).expect("a double click's interval") + 1,
+        );
+        if let Some(streak) = self.streak.as_mut()
+            && let Some(at) = streak.at.checked_sub(interval)
+        {
+            streak.at = at;
         }
     }
 }
@@ -2127,7 +2200,7 @@ impl App {
             })
     }
 
-    /// A WHEEL'S PAGE IS HOVERED WHERE THE POINTER IS ON THE FRAME IT LEFT.
+    /// A PAGE A WHEEL OR A PRESS MOVED IS HOVERED WHERE THE POINTER IS ON THE FRAME IT LEFT.
     pub(crate) fn refresh_native_hover_for_frame(&mut self, wid: WindowId) {
         let Some((_, front)) = self.active_native_view(wid) else {
             return;
@@ -4488,6 +4561,12 @@ impl App {
                         .is_some_and(|(_, live)| live == release_view)
                     && self.native_runtime.view_generation(release_view) == Some(generation)
                 {
+                    // WHAT IS LIT IS WHAT A PRESS HITS: the action may move the page under the
+                    // still pointer (a page that replaces it, a row it removes), so its next
+                    // frame on glass is hovered where the pointer then is, as a wheel's is.
+                    if let Some(ws) = self.windows.get_mut(&wid) {
+                        ws.native_rehover = true;
+                    }
                     let _ = self.dispatch_native_event(
                         wid,
                         crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
@@ -4546,18 +4625,33 @@ impl App {
                 } else {
                     None
                 };
+                let onto_another = press.as_ref().is_some_and(|(target_view, _, key, ..)| {
+                    self.windows.get_mut(&wid).is_some_and(|ws| {
+                        NativePointerRest::press(
+                            &mut ws.native_rest,
+                            (px, py),
+                            (*target_view, key),
+                            std::time::Instant::now(),
+                        )
+                    })
+                });
                 if let Some((target_view, generation, key, _, _, asks)) = &press
-                    && !NativePointerRest::looked_at(
-                        self.windows
-                            .get(&wid)
-                            .and_then(|ws| ws.native_rest.as_ref()),
-                        (px, py),
-                        (*target_view, key, *asks),
-                    )
+                    && (onto_another
+                        || !NativePointerRest::looked_at(
+                            self.windows
+                                .get(&wid)
+                                .and_then(|ws| ws.native_rest.as_ref()),
+                            (px, py),
+                            (*target_view, key, *asks),
+                        ))
                 {
                     if let Some(ws) = self.windows.get_mut(&wid) {
-                        ws.native_rest =
-                            Some(NativePointerRest::on((px, py), (*target_view, key, *asks)));
+                        let streak = ws.native_rest.take().and_then(|rest| rest.streak);
+                        ws.native_rest = Some(NativePointerRest::on(
+                            (px, py),
+                            (*target_view, key, *asks),
+                            streak,
+                        ));
                     }
                     if self.native_runtime.view_generation(*target_view) == Some(*generation)
                         && let Some(state) = self.native_runtime.view_state_mut(*target_view)
@@ -4843,6 +4937,12 @@ impl App {
         {
             return;
         }
+        if let Some(session) = self.rewound_front(wid) {
+            if pressed {
+                self.note_rewind_withheld(session);
+            }
+            return;
+        }
         let mut click_count: u8 = 1;
         if button == WinitMouseButton::Left {
             let Some(term) = self
@@ -5060,6 +5160,12 @@ impl App {
             .windows
             .get(&wid)
             .is_none_or(|ws| ws.tab_menu.is_some() || ws.overlay_open());
+        if !(seam_owned || palette || overview || native_page)
+            && let Some(session) = self.rewound_under_pointer(wid)
+        {
+            self.note_rewind_withheld(session);
+            return;
+        }
         let (dx, dy) = match delta {
             MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
             MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
@@ -5295,10 +5401,10 @@ impl App {
         let Some(terminal) = ws.front_terminal() else {
             return;
         };
-        let last = i32::from(ws.rows.saturating_sub(1));
-        let max_col = ws.cols.saturating_sub(1);
         {
             let mut term = term_lock(&terminal.term);
+            let last = i32::from(term.grid().rows().saturating_sub(1));
+            let max_col = term.grid().cols().saturating_sub(1);
             let off = term.grid().display_offset() as i32;
             let sel = term.text_selection_mut();
             sel.start_selection(-off, 0, SelectionSide::Left, SelectionType::Lines);
@@ -5702,7 +5808,7 @@ mod tests {
             Rest::looked_at(still.as_ref(), at, (view, &next, false)),
             "rows as before"
         );
-        let lit = Rest::on(at, (view, &bulk, true));
+        let lit = Rest::on(at, (view, &bulk, true), None);
         assert!(
             Rest::looked_at(Some(&lit), at, (view, &bulk, true)),
             "the next press takes it"
@@ -5711,7 +5817,7 @@ mod tests {
         assert!(!Rest::looked_at(on_bulk.as_ref(), at, (view, &row, false)));
         assert!(!Rest::looked_at(on_bulk.as_ref(), at, (other, &bulk, true)));
         assert!(Rest::looked_at(on_bulk.as_ref(), at, (view, &bulk, true)));
-        let lit = Rest::on(at, (view, &row, false));
+        let lit = Rest::on(at, (view, &row, false), None);
         assert!(
             Rest::looked_at(Some(&lit), at, (view, &row, false)),
             "the next press takes it"
@@ -5854,6 +5960,96 @@ mod tests {
                 "the preview tries {tried:?}, the row under the pointer is {shown:?}"
             );
         }
+    }
+
+    /// A click on a rail row from a sub-page leaves that row under the still pointer and lit,
+    /// and a second click keeps its page: no page moves the rail's rows. CONTROL: the first
+    /// click opens the row's page.
+    #[test]
+    fn a_second_click_on_a_rail_row_opens_the_page_the_first_did() {
+        use super::{NativePointerTarget, PointerAt};
+        use crate::native_settings::SettingsRoute;
+        for (from, row) in [
+            (SettingsRoute::Themes, SettingsRoute::Wallpaper),
+            (SettingsRoute::Ai, SettingsRoute::Security),
+            (SettingsRoute::Tabs, SettingsRoute::Security),
+        ] {
+            let (mut app, _wid, view) =
+                settings_sized_in(crate::App::headless_for_test(), from, (1_000, 900));
+            let key = format!("settings/nav{}", row.path());
+            let route = |app: &crate::App| match app.native_runtime.view_state(view) {
+                Some(crate::native_app::AppViewState::Settings(settings)) => settings.route,
+                _ => unreachable!(),
+            };
+            let hovered = |app: &crate::App| {
+                app.native_runtime
+                    .view_state(view)
+                    .and_then(|state| state.common().hovered.clone())
+                    .map(|key| key.as_str().to_string())
+            };
+            app.pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Key(
+                key.clone(),
+            )))
+            .expect("the move aims at the row");
+            for click in 0..2 {
+                let cell = app.pointer_cmd(PointerAction::Click).expect("a click");
+                assert_eq!(route(&app), row, "{from:?}: click {click} opens {row:?}");
+                let under = match app.pointer_reply(cell) {
+                    Ok(PointerAt::Native { key, .. }) => key,
+                    other => panic!("a native answer: {other:?}"),
+                };
+                assert_eq!(
+                    under.as_deref(),
+                    Some(key.as_str()),
+                    "{from:?}: click {click} leaves the row under the pointer"
+                );
+                assert_eq!(
+                    hovered(&app).as_deref(),
+                    Some(key.as_str()),
+                    "{from:?}: click {click} leaves the row lit"
+                );
+            }
+        }
+    }
+
+    /// The frame after a press is hovered where the still pointer then is, as a wheel's is:
+    /// All Settings opens the category sheet, whose Done takes its place, and the button the
+    /// press replaced no longer reads as hovered. CONTROL: before the click All Settings is the
+    /// hovered control.
+    #[test]
+    fn the_frame_after_a_press_is_hovered_where_the_pointer_is() {
+        use super::{NativePointerTarget, PointerAt};
+        let (mut app, _wid, view) = settings_sized_in(
+            crate::App::headless_for_test(),
+            crate::native_settings::SettingsRoute::KeyboardInput,
+            (584, 348),
+        );
+        let hovered = |app: &crate::App| {
+            app.native_runtime
+                .view_state(view)
+                .and_then(|state| state.common().hovered.clone())
+                .map(|key| key.as_str().to_string())
+        };
+        app.pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Key(
+            "settings/compact-navigation".into(),
+        )))
+        .expect("the move aims at All Settings");
+        assert_eq!(
+            hovered(&app).as_deref(),
+            Some("settings/compact-navigation"),
+            "CONTROL: All Settings is hovered"
+        );
+        let cell = app.pointer_cmd(PointerAction::Click).expect("a click");
+        let under = match app.pointer_reply(cell) {
+            Ok(PointerAt::Native { key, .. }) => key,
+            other => panic!("a native answer: {other:?}"),
+        };
+        assert_eq!(
+            under.as_deref(),
+            Some("settings/compact-navigation-close"),
+            "the sheet's Done is under the pointer"
+        );
+        assert_eq!(hovered(&app), under, "and it is the hovered control");
     }
 
     fn settings_at_1000_by_600(

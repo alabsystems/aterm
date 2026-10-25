@@ -32,7 +32,7 @@ const PAGE: &str = r#"text key="harness/status/row/sessions" role=Group label="S
 text key="harness/session/0" role=Group label="land-a: Window 2, tab 2 · Claude Code · supervised · autopilot land"
 text key="harness/session/0/show" role=Button label="Show land-a"
 text key="harness/session/0/state" role=Status label="needs you: rotate the deploy key; carrying on · pausing until 03:24 (a short turn)"
-text key="harness/session/0/today" role=Group label="today: 1 need told"
+text key="harness/session/0/today" role=Group label="today: 1 need, carried on"
 text key="harness/session/11" role=Group label="land-ab: Window 2, tab 3 · Claude Code · supervised · autopilot land"
 text key="harness/session/11/state" role=Status label="landed 03:20""#;
 
@@ -208,7 +208,7 @@ fn the_page_is_read_by_key_and_a_session_by_its_label() {
         Some(
             "head=land-a: Window 2, tab 2 · Claude Code · supervised · autopilot land\n\
              state=needs you: rotate the deploy key; carrying on · pausing until 03:24 (a short turn)\n\
-             today=today: 1 need told"
+             today=today: 1 need, carried on"
         )
     );
     assert_eq!(
@@ -715,13 +715,21 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
         mode_words(Autopilot::Land).chip
     );
     assert_eq!(title_says(&unread, "land"), TitleSays::Sentence);
-    assert_eq!(
-        title_says(
-            "autopilot: land, landed 14:05 \u{2014} all of the work is on the remote main branch",
-            "land"
-        ),
-        TitleSays::Past("landed")
+    let landed = format!(
+        "autopilot: land, landed 14:05 \u{2014} {} \u{b7} click: off",
+        aterm_agent::supervise::mode_words::LANDED_WORDS
     );
+    assert_eq!(title_says(&landed, "land"), TitleSays::Past("landed"));
+    for wrong in [
+        "autopilot: land, landed 14:05 \u{2014} all of the work is on the remote main branch",
+        "autopilot: land, landed 14:05",
+        &landed[..landed.len() - 20],
+    ] {
+        assert!(
+            matches!(title_says(wrong, "land"), TitleSays::Wrong(_)),
+            "a landed title that does not say LANDED_WORDS whole: {wrong}"
+        );
+    }
 
     let ok = |s: &Seen, c: Chain, p: &'static str| title_words(s, &title_cx(c, p));
     let n = title_seen(
@@ -894,6 +902,8 @@ fn the_landed_row_counts_every_landing() {
         "Landed: 5 today \u{b7} 4 in 7 days",
         "Land prompts: 5 today \u{b7} 5 in 7 days",
         "Landed: five today",
+        "None in 7 days: declined \u{b7} landed \u{b7} upgraded",
+        "None in 7 days: declined \u{b7} land prompts",
     ] {
         assert!(matches!(judge(Some(rest(bad))), Verdict::Fail(_)), "{bad}");
     }
@@ -906,6 +916,143 @@ fn the_landed_row_counts_every_landing() {
         did_landed_of(&rows).as_deref(),
         Some("Landed: 5 today · 5 in 7 days")
     );
+    let none = "None in 7 days: declined \u{b7} landed \u{b7} upgraded";
+    let rows = page_rows(&format!(
+        "text key=\"harness/did/row/land-prompts\" role=Group label=\"Land prompts: 9 today · 9 in 7 days\"\ntext key=\"harness/did/row/none-in-7-days\" role=Group label=\"{none}\""
+    ));
+    assert_eq!(did_landed_of(&rows).as_deref(), Some(none));
+    let s = |did: &str| Seen {
+        window: Window {
+            read: true,
+            rest: Some(format!(
+                "here=\"x\" landed_tabs=0 landing_tabs=1 landings=0 today=\"x\" every=\"x\" did=\"{did}\""
+            )),
+            ..Window::default()
+        },
+        ..Seen::default()
+    };
+    assert!(matches!(
+        l7_did(&s(none), &title_cx(Chain::LandE, "claude")),
+        Verdict::Pass(_)
+    ));
+    // A None row that does not name `landed`, with no Landed row over it, is a page that dropped
+    // the count (6a: a week with counts always says landed): read in the Landed row's place, so
+    // the wheel stops there and L7 fails it, never a skip.
+    let dropped = "None in 7 days: land prompts \u{b7} upgraded";
+    let rows = page_rows(&format!(
+        "text key=\"harness/did/row/none-in-7-days\" role=Group label=\"{dropped}\""
+    ));
+    assert_eq!(
+        did_landed_of(&rows).as_deref(),
+        Some(dropped),
+        "land prompts is not landed"
+    );
+    assert_eq!(did_step(&rows), DidStep::Read(dropped.into()));
+    assert!(matches!(
+        l7_did(&s(dropped), &title_cx(Chain::LandE, "claude")),
+        Verdict::Fail(_)
+    ));
+    let rows = page_rows(&format!(
+        "text key=\"harness/did/row/landed\" role=Group label=\"Landed: 5 today · 5 in 7 days\"\ntext key=\"harness/did/row/none-in-7-days\" role=Group label=\"{dropped}\""
+    ));
+    assert_eq!(
+        did_landed_of(&rows).as_deref(),
+        Some("Landed: 5 today · 5 in 7 days"),
+        "the Landed row first"
+    );
+}
+
+/// L7 widened (§14.6): This Mac's `landing` is every Land tab that holds at rest, less those
+/// whose need it counts first. CONTROL: `b42ae72fc3`'s menu, which calls the held tabs `resting`.
+/// It never passes on `-` (§14.0 limit 7): no held tab, a hold no `status` names, or a wait This
+/// Mac counts first is UNOBSERVED, main's row included.
+#[test]
+fn this_mac_counts_every_held_landing() {
+    let rest = |here: &str, held: usize, needs: usize, unread: usize| {
+        format!(
+            "here=\"{here}\" landed_tabs=5 landing_tabs=7 held_landing={held} held_needs={needs} held_unread={unread} landings=5 today=\"5 landed today\" every=\"x\" did=\"-\""
+        )
+    };
+    let judge = |r: Option<String>| {
+        let s = Seen {
+            window: Window {
+                read: true,
+                rest: r,
+                ..Window::default()
+            },
+            ..Seen::default()
+        };
+        l7_here(&s, &title_cx(Chain::LandE, "claude"))
+    };
+    const NOW: &str = "This Mac \u{2014} 1 need you \u{b7} 6 landing \u{b7} 1 resting \u{b7} 5 landed \u{b7} 3 shells";
+    const MAIN: &str =
+        "This Mac \u{2014} 1 need you \u{b7} 7 resting \u{b7} 5 landed \u{b7} 3 shells";
+    let pass = judge(Some(rest(NOW, 7, 1, 0)));
+    assert!(matches!(pass, Verdict::Pass(_)), "{pass:?}");
+    let control = judge(Some(rest(MAIN, 7, 1, 0)));
+    assert!(
+        matches!(&control, Verdict::Fail(why) if why.contains("0 landing, not 6")),
+        "{control:?}"
+    );
+    for (here, held, needs) in [
+        (NOW, 7, 2),
+        (NOW, 7, 0),
+        (
+            "This Mac \u{2014} 7 landing \u{b7} 1 resting \u{b7} 5 landed \u{b7} 3 shells",
+            7,
+            1,
+        ),
+        ("This Mac \u{2014} 2 landing \u{b7} 5 landed", 1, 0),
+    ] {
+        assert!(
+            matches!(judge(Some(rest(here, held, needs, 0))), Verdict::Fail(_)),
+            "{here} against {held} held, {needs} with a need"
+        );
+    }
+    for (why, r) in [
+        ("main's row, no tab held", Some(rest(MAIN, 0, 0, 0))),
+        (
+            "no tab held",
+            Some(rest("This Mac \u{2014} 5 landed", 0, 0, 0)),
+        ),
+        ("a hold no status named", Some(rest(MAIN, 0, 0, 8))),
+        ("one hold unread", Some(rest(NOW, 7, 1, 1))),
+        (
+            "a wait counted first",
+            Some(rest(
+                "This Mac \u{2014} 1 need you \u{b7} 1 waiting \u{b7} 6 landing \u{b7} 5 landed",
+                8,
+                1,
+                0,
+            )),
+        ),
+        ("no rest read", None),
+        (
+            "no held_needs",
+            Some(rest(NOW, 7, 1, 0).replace(" held_needs=1", "")),
+        ),
+        (
+            "no held_unread",
+            Some(rest(NOW, 7, 1, 0).replace(" held_unread=0", "")),
+        ),
+        ("no This Mac row", Some(rest("", 7, 1, 0))),
+    ] {
+        let got = judge(r);
+        assert!(matches!(got, Verdict::Unobserved(_)), "{why}: {got:?}");
+    }
+    assert_eq!(
+        held_at_rest("autopilot=land task=open land_held=repo land_nudges=2 land_since=1792159320"),
+        Some(true)
+    );
+    assert_eq!(
+        held_at_rest("autopilot=land task=open land_held=- land_nudges=0 land_since=1792159320"),
+        Some(true)
+    );
+    assert_eq!(
+        held_at_rest("autopilot=land task=open land_held=- land_nudges=- land_since=-"),
+        Some(false)
+    );
+    assert_eq!(held_at_rest("autopilot=land task=open"), None);
 }
 
 /// END's wheel down the page reads the Landed row where a screen shows it, turns again while the
@@ -1151,8 +1298,10 @@ fn a_past_or_held_title_is_judged_against_its_own_chips_face() {
         "autopilot: land \u{2014} {} \u{b7} click: off \u{b7} right-click: more",
         mode_words(Autopilot::Land).chip
     );
-    let landed =
-        "autopilot: land, landed 06:12 \u{2014} all of the work is on the remote main branch";
+    let landed: &str = &format!(
+        "autopilot: land, landed 06:12 \u{2014} {}",
+        aterm_agent::supervise::mode_words::LANDED_WORDS
+    );
     let quiet = "autopilot: land, quiet \u{2014} a person's own exchange";
     let held = "autopilot: land \u{2014} not landed yet: no \u{201c}Nothing left:\u{201d} defense yet \u{b7} landing since 14:02";
     let at_end = |face: &str, drawn: &str, title: &str| {

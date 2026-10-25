@@ -4530,6 +4530,7 @@ fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
         task: None,
         autopilot_end: None,
         wakes: None,
+        box_receipt: None,
     }];
     assert!(
         app.post_managed_current(
@@ -5371,6 +5372,7 @@ fn a_font_row_raised_over_a_terminal_is_a_record_once_settings_comes_to_front() 
         .map(|live| live.id)
         .expect("over a terminal the problem is a band row");
     assert!(app.messages.live_by_key(keys).is_some());
+    assert_eq!(app.message_band_rows, 2, "PRECONDITION: two band rows");
 
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
     assert!(app.settings_in_front());
@@ -5378,19 +5380,98 @@ fn a_font_row_raised_over_a_terminal_is_a_record_once_settings_comes_to_front() 
         app.messages.live_by_key(fonts).is_none(),
         "with Settings in front the font problem is no band row"
     );
+    assert_eq!(
+        (app.messages.committed_rows(), app.message_band_rows),
+        (1, 1),
+        "its band row left with it, before Settings' first frame"
+    );
+    assert!(
+        app.messages.quiet_shrink_at().is_none(),
+        "no shrink is left waiting its quiet"
+    );
     let rec = app.messages.log().get(row).expect("logged");
     assert_eq!(rec.retired(), Some(&Retired::Recorded), "{rec:?}");
     assert!(
         app.messages.live_by_key(keys).is_some(),
         "a misspelled key no row says keeps its band row"
     );
-    app.switch_tab(0);
+    app.switch_tab_in(WindowId(0), 0);
     assert!(!app.settings_in_front());
     reload(&mut app);
     assert!(
         app.messages.live_by_key(fonts).is_none(),
         "a problem already told is never raised again"
     );
+    assert_eq!(app.message_band_rows, 1, "the misspelled key's row alone");
+}
+
+/// A CHANGE OF TAB GIVES BACK A ROW ITS QUIET STILL HELD (t-3): the tab brought to the
+/// front, a terminal or Settings, is laid out without it at once. CONTROL: with no change of
+/// tab the row waits its quiet.
+#[test]
+fn a_change_of_tab_gives_back_a_row_its_quiet_still_held() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let session = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(session));
+    app.switch_tab_in(wid, 0);
+    let id = app.post_message(warn("a warning"));
+    assert_eq!(app.message_band_rows, 1, "PRECONDITION: on glass");
+    assert!(app.withdraw_message(id));
+    assert_eq!(app.message_band_rows, 1, "CONTROL: the row waits its quiet");
+    app.sync_active_session();
+    assert_eq!(
+        app.message_band_rows, 1,
+        "CONTROL: nothing on screen changed, nothing is taken"
+    );
+    app.switch_tab_in(wid, 1);
+    assert_eq!(
+        (app.messages.committed_rows(), app.message_band_rows),
+        (0, 0),
+        "the other terminal is laid out without it"
+    );
+
+    // Settings brought to the front, likewise.
+    let id = app.post_message(warn("another warning"));
+    assert_eq!(app.message_band_rows, 1, "PRECONDITION: on glass");
+    assert!(app.withdraw_message(id));
+    assert_eq!(app.message_band_rows, 1, "CONTROL: the row waits its quiet");
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
+    assert_eq!(app.message_band_rows, 0, "Settings is laid out without it");
+}
+
+/// THE REGROW FLOOR STILL HOLDS A FALL A CHANGE OF TAB TAKES (ruling 414): the band
+/// re-grids the background tabs too, so a row that rose inside the floor falls at it.
+#[test]
+fn a_fall_a_change_of_tab_takes_waits_only_the_regrow_floor() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let session = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(session));
+    app.switch_tab_in(wid, 0);
+    app.windows
+        .get_mut(&wid)
+        .expect("window 0")
+        .chrome_regrids_for_test = true;
+    let id = app.post_message(warn("a warning"));
+    assert_eq!(app.message_band_rows, 1, "PRECONDITION: on glass");
+    let rose = Instant::now() + std::time::Duration::from_secs(60);
+    app.windows
+        .get_mut(&wid)
+        .expect("window 0")
+        .regrow_floor
+        .rose(rose);
+    let floor = app.chrome_regrow_floor(wid).expect("a floor");
+    assert!(app.withdraw_message(id));
+    app.switch_tab_in(wid, 1);
+    assert_eq!(app.message_band_rows, 1, "inside the floor the row stays");
+    assert_eq!(
+        app.messages.deadline(true),
+        Some(floor),
+        "the fall is due at the floor"
+    );
+    app.settle_messages(floor);
+    assert_eq!(app.message_band_rows, 0, "at the floor it falls");
 }
 
 #[test]
@@ -5576,7 +5657,7 @@ fn a_restatement_carries_the_titles_short_form() {
         )
     };
     let first = ask(&notice::LOGIN_SIGN_IN);
-    let then = ask(&notice::LIMIT_SIGN_IN);
+    let then = ask(&notice::LIMIT_ROSTER);
     assert_ne!(first.title, then.title, "the title changes");
     let short = then.short_title.clone().expect("a short form");
     let restated = |r: Restatement| {

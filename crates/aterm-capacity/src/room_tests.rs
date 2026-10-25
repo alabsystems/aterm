@@ -4,6 +4,7 @@
 //! The room meter on injected instants (design `docs/DESIGN-disk-awareness-2026-10-17.md` §6.3).
 
 use super::*;
+use crate::floor::GIB;
 
 const DAY0: i64 = 1_792_195_200;
 const H: i64 = 3_600;
@@ -137,7 +138,10 @@ fn the_rooms_round_trip_and_a_corrupt_file_is_no_history() {
 
 #[test]
 fn the_rooms_persist_in_the_harness_state_directory() {
-    let tmp = super::super::tests::Tmp::new("room-file");
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("cap-room-file-")
+        .tempdir()
+        .expect("a scratch state");
     assert_eq!(Rooms::load(tmp.path()), Rooms::default());
     let mut rooms = Rooms::default();
     fall_on(rooms.meter("fsid:7").expect("room"), 0, 30);

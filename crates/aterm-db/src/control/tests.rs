@@ -3,11 +3,107 @@
 
 use super::*;
 use aterm_net::lan::{Connection, Scope};
-use aterm_secrets::{age::Identity, commons::node::Edit};
+use aterm_secrets::{
+    age::Identity,
+    commons::{journal::State, node::Edit},
+};
 use std::{io::Cursor, net::TcpListener, thread};
 
 const ROOT: [u8; 32] = [17; 32];
 const NETWORK: [u8; 16] = [9; 16];
+
+#[test]
+fn canonical_foundation_grants_no_channel_but_competing_signed_members_can_repair() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let foundation = Node::foundation(crate::crypto::public(&ROOT).unwrap()).unwrap();
+    let trust = Trust {
+        network: foundation.network(),
+        authority: foundation.authority(),
+        genesis: foundation.id(),
+    };
+    let identities = [Identity::generate().unwrap(), Identity::generate().unwrap()];
+    let requests: [Request; 2] = std::array::from_fn(|n| {
+        Request::create(
+            trust.network,
+            trust.authority,
+            [n as u8 + 1; 16],
+            [n as u8 + 3; 16],
+            &identities[n],
+            &[n as u8 + 31; 32],
+        )
+        .unwrap()
+    });
+    let branches: [Node; 2] = std::array::from_fn(|n| {
+        Node::test_seal(
+            &ROOT,
+            trust.network,
+            Edit::Update {
+                parent: foundation.id(),
+                hosts: &[],
+                payload: b"transport witness",
+            },
+            &[identities[n].recipient()],
+            1,
+            &[Fact::Bind {
+                binding: requests[n].binding().clone(),
+            }],
+        )
+        .unwrap()
+    });
+    let paths = [root.path().join("a"), root.path().join("b")];
+    for n in 0..2 {
+        let mut journal = Journal::open(&paths[n], trust).unwrap();
+        journal.ingest(foundation.bytes()).unwrap();
+        journal.ingest(branches[n].bytes()).unwrap();
+        assert!(
+            Endpoint::configured(
+                &paths[n],
+                trust,
+                &requests[n],
+                foundation.bytes(),
+                &[n as u8 + 31; 32]
+            )
+            .is_err()
+        );
+    }
+    let endpoints: [Endpoint; 2] = std::array::from_fn(|n| {
+        Endpoint::new(
+            &paths[n],
+            trust,
+            &requests[n],
+            branches[n].bytes(),
+            &[n as u8 + 31; 32],
+        )
+        .unwrap()
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            endpoints[1]
+                .exchange(
+                    Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                    Side::Responder,
+                    &mut Repair::default(),
+                )
+                .unwrap()
+        });
+        endpoints[0]
+            .exchange(
+                Connection::connect(addr, Scope::Loopback, Duration::from_secs(60)).unwrap(),
+                Side::Initiator,
+                &mut Repair::default(),
+            )
+            .unwrap();
+        server.join().unwrap();
+    });
+    for path in &paths {
+        let journal = Journal::open_existing(path, trust).unwrap();
+        assert!(matches!(journal.state(), State::Conflict { heads } if heads.len() == 2));
+        assert_eq!(journal.inventory().count(), 3);
+        assert!(journal.current(&identities[0]).unwrap().is_none());
+    }
+}
 
 #[test]
 fn established_repair_storage_cannot_reinitialize_after_directory_loss() {
@@ -40,7 +136,7 @@ fn control_endpoint_uses_the_secrets_backed_bootstrap_identity() {
     let home = aterm_tempfile::tempdir().unwrap();
     let source = home.path().join("test.vault");
     let paths = Paths::for_home(&home.path().join("m1"));
-    client::create(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+    client::test_create_unbound(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
     let admin = client::admin_open(&paths).unwrap();
     let mut document = admin.doc.clone();
     document
@@ -54,7 +150,7 @@ fn control_endpoint_uses_the_secrets_backed_bootstrap_identity() {
     let admin = client::admin_open(&paths).unwrap();
     let device = Device::open(&paths).unwrap().unwrap();
     let request = device
-        .request(NETWORK, admin.config.signer.unwrap())
+        .request(NETWORK, admin.commons_authority().unwrap())
         .unwrap();
     let (mut pending, challenge) =
         Pending::issue(&request, NETWORK, *request.binding().authority()).unwrap();
@@ -830,6 +926,44 @@ fn control_repair_model_conforms_and_rejects_freezing_after_deferral() {
 }
 
 #[test]
+fn either_direction_refuses_a_second_channel_for_the_same_peer_before_inventory() {
+    let lab = Lab::new();
+    for side in [Side::Initiator, Side::Responder] {
+        let endpoint = lab.endpoint(1);
+        let peer = lab.endpoint(0);
+        let mut held = Repair::default();
+        let lease = endpoint.peers.acquire(peer.actor, &mut held).unwrap();
+        let proof = NodeProof {
+            node: peer.identity.node().into(),
+            key: peer.identity.key(),
+        };
+        let mut input = Vec::new();
+        send_frame(&mut input, &peer.hello).unwrap();
+        let mut stream = Script {
+            input: Cursor::new(input),
+            output: Vec::new(),
+        };
+        let mut repair = Repair::default();
+        assert!(
+            endpoint
+                .connected(&mut stream, Some(&proof), side, &mut repair)
+                .is_err()
+        );
+        assert_eq!(
+            stream.output.len(),
+            if side == Side::Initiator {
+                4 + endpoint.hello.len()
+            } else {
+                0
+            }
+        );
+        assert_eq!(repair.actor(), Some(peer.actor));
+        drop(lease);
+        drop(endpoint.peers.acquire(peer.actor, &mut held).unwrap());
+    }
+}
+
+#[test]
 fn failed_responder_hello_reports_current_peer_without_stale_application_success() {
     struct FailedReply(Cursor<Vec<u8>>);
     impl Read for FailedReply {
@@ -857,7 +991,7 @@ fn failed_responder_hello_reports_current_peer_without_stale_application_success
             saved.prepare(lab.trust, peer.actor);
             saved.cursor = Some([9; 32]);
             saved.application = Some(crate::replica::Report::default());
-            drop(endpoint.inbound.acquire(peer.actor, &mut saved).unwrap());
+            drop(endpoint.peers.acquire(peer.actor, &mut saved).unwrap());
         }
         let mut repair = Repair::default();
         repair.prepare(lab.trust, endpoint.actor);

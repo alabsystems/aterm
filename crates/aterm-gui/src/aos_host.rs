@@ -3,12 +3,15 @@
 
 //! Main-thread host operations for the `aos` verb on the front window's momentum glow.
 
-use std::time::Instant;
+use std::collections::VecDeque;
+use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 use aterm_aos::Digest;
 use aterm_aos::checkpoint::Checkpoint;
 use aterm_aos::log::{EventLog, Tail};
 use aterm_aos::publish::{Commit, Head, PublishRefusal};
+use aterm_aos::registry::{Listing, Registry, Row, TaskKind, Timeline};
 use aterm_aos::task::StepRefusal;
 #[cfg(debug_assertions)]
 use aterm_effects::aos_momentum::Sched;
@@ -20,10 +23,20 @@ use aterm_effects::aos_momentum::m4::Admitted;
 use aterm_effects::aos_momentum::publish::{PlanPublishRefusal, Published};
 use aterm_effects::aos_momentum::{
     EventCounts, MOMENTUM_MAX_EVENTS, MomentumAosStatus, MomentumCode, MomentumObservation,
-    MomentumSchema, MomentumTrace, TraceRefusal,
+    MomentumSchema, MomentumTrace, PreparedRepair, RepairJob, Segment, SegmentJudgement, TASK_NAME,
+    TraceRefusal,
 };
 
 use crate::{App, WindowId};
+
+/// The most kept faults a window holds before it drops the oldest.
+pub(crate) const KEPT_CAP: usize = 4;
+
+/// Why a press detached the recording: the tty does not echo it.
+pub(crate) const NO_ECHO_KEY: &str = "no-echo key";
+
+/// Why a press or a config change detached the recording: Secure Keyboard Entry is on.
+pub(crate) const SECURE_ENTRY: &str = "secure keyboard entry";
 
 /// What the verb keeps per window between its calls.
 #[derive(Debug, Default)]
@@ -35,6 +48,77 @@ pub(crate) struct AosWindow {
     /// The last publication's bundle while its plan may be live: a later publication replaces it, and an attach, a detach or a committed repair drops it.
     #[cfg(debug_assertions)]
     published: Option<LivePlan>,
+    /// The watcher's judgements of retired segments and the privacy detaches, oldest first.
+    timeline: Timeline,
+    /// Failing segments kept as trace files, oldest first, at most [`KEPT_CAP`].
+    kept: VecDeque<Kept>,
+    /// The id the next kept fault gets.
+    next_kept: u64,
+    /// Retired segments a privacy detach took from the recording it dropped, for the watcher.
+    orphans: Vec<Segment>,
+    /// Whether a host worker is judging this window's segments.
+    watching: bool,
+    /// The repair whose prepare is out on a host worker.
+    repairing: Option<PendingRepair>,
+    /// Repairs started so far; each one's token is the count including it.
+    repairs: u64,
+}
+
+/// Where an `aos` ask's answer goes.
+type Reply = Sender<Result<String, String>>;
+
+/// A failing segment the watcher kept.
+#[derive(Debug)]
+struct Kept {
+    /// Its id, which `aos export kept=<id>` names.
+    id: u64,
+    log_epoch: u64,
+    /// The segment as a trace file's contents.
+    trace: MomentumTrace,
+}
+
+/// A repair waiting for its prepare from a host worker.
+#[derive(Debug)]
+struct PendingRepair {
+    /// Which repair of the window it is.
+    token: u64,
+    /// Whether the repair paused a running glow first.
+    paused_first: bool,
+    /// The head the job was copied at.
+    head: Head,
+    /// Main-thread time spent on it so far.
+    main: Duration,
+    /// Where the verb's answer goes.
+    reply: Reply,
+}
+
+/// What a host worker hands back to the main thread (`Wake::AosWorked`).
+#[derive(Debug)]
+pub(crate) enum Worked {
+    /// A repair's prepare, made on a copy of the paused boundary.
+    Repair {
+        window: WindowId,
+        token: u64,
+        prepared: Box<PreparedRepair>,
+    },
+    /// The watcher's judgements of a window's retired segments, oldest first.
+    Watch {
+        window: WindowId,
+        judged: Vec<SegmentJudgement>,
+    },
+}
+
+/// A trace file for `aos export`, which the control thread writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Exported {
+    pub(crate) window: WindowId,
+    /// The kept fault it is, or `None` for the live recording.
+    pub(crate) kept: Option<u64>,
+    pub(crate) log_epoch: u64,
+    /// The task identity it was recorded under.
+    pub(crate) identity: Digest,
+    /// [`MomentumTrace::encode`]'s bytes.
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// A plan's publication as the window keeps it, since its bundle cannot be recomputed once the commit has replaced the log: the bundle, and the code and revision [`App::aos_bundle_now`] checks the glow still runs.
@@ -66,6 +150,16 @@ pub(crate) enum AosRefusal {
     Trace(TraceRefusal),
     /// The exported trace did not decode back: a fault of the export.
     Decode(String),
+    /// A repair of the front window is already being prepared.
+    Repairing,
+    /// The host worker for the prepare did not run.
+    Worker(String),
+    /// Secure Keyboard Entry is on, so nothing is recorded.
+    SecureEntry,
+    /// No kept fault has this id.
+    NoKept(u64),
+    /// The glow wears its vivid light-page ink, which a recording cannot hold.
+    VividInk,
 }
 
 impl std::fmt::Display for AosRefusal {
@@ -82,6 +176,17 @@ impl std::fmt::Display for AosRefusal {
             ),
             AosRefusal::Trace(r) => write!(f, "{r}"),
             AosRefusal::Decode(why) => write!(f, "the exported trace does not decode: {why}"),
+            AosRefusal::Repairing => {
+                f.write_str("a repair of the front window is already being prepared")
+            }
+            AosRefusal::Worker(why) => write!(f, "the repair's host worker did not run: {why}"),
+            AosRefusal::SecureEntry => f.write_str(
+                "Secure Keyboard Entry is on, so the glow is not recorded (turn it off to attach)",
+            ),
+            AosRefusal::NoKept(id) => write!(f, "no kept fault {id} in the front window"),
+            AosRefusal::VividInk => f.write_str(
+                "the glow wears Sparkle's paper gold on a light theme, which a recording cannot hold yet (pin the cursor colour or pick another glow style to attach)",
+            ),
         }
     }
 }
@@ -102,6 +207,10 @@ pub(crate) struct Repaired {
     pub(crate) paused_first: bool,
     /// The new revision, its witness and what the queued keys returned.
     pub(crate) commit: Commit<MomentumSchema>,
+    /// Main-thread time the repair took.
+    pub(crate) main: Duration,
+    /// Whether its prepare ran on a host worker.
+    pub(crate) off_main: bool,
 }
 
 /// A published plan (a debug build only).
@@ -172,8 +281,14 @@ impl App {
         now: Instant,
     ) -> Result<(WindowId, MomentumAosStatus), AosRefusal> {
         let id = self.aos_front()?;
+        if self.config.secure_keyboard_entry_or_default() {
+            return Err(AosRefusal::SecureEntry);
+        }
         let build = aterm_types::version::build_id();
         let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        if ws.fx.cursor().momentum.light_vivid() {
+            return Err(AosRefusal::VividInk);
+        }
         ws.aos.attaches = ws.aos.attaches.saturating_add(1);
         ws.aos.epoch = Some(now);
         #[cfg(debug_assertions)]
@@ -210,8 +325,12 @@ impl App {
         code: MomentumCode,
         now: Instant,
     ) -> Result<Repaired, AosRefusal> {
+        let started = Instant::now();
         let id = self.aos_front()?;
         let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        if ws.aos.repairing.is_some() {
+            return Err(AosRefusal::Repairing);
+        }
         let lane = ws.effect_present_interval();
         let momentum = &mut ws.fx.cursor_mut().momentum;
         let paused_first = momentum.aos_attached() && !momentum.aos_paused();
@@ -229,6 +348,8 @@ impl App {
                     window: id,
                     paused_first,
                     commit,
+                    main: started.elapsed(),
+                    off_main: false,
                 })
             }
             Err(refusal) => {
@@ -237,6 +358,323 @@ impl App {
                 }
                 Err(refusal.into())
             }
+        }
+    }
+
+    /// `aos repair` from the `Wake::Aos` handler: pauses the front window's glow at `now` if it runs, hands a copy of the paused boundary to a host worker for the prepare, and answers `reply` once [`Self::aos_worked`] commits it; with no event-loop proxy (a test app) it repairs in place ([`Self::aos_repair_at`]).
+    pub(crate) fn aos_repair_begin(&mut self, code: MomentumCode, now: Instant, reply: Reply) {
+        let post = self.proxy.clone().map(|proxy| {
+            move |worked: Worked| {
+                let _ = proxy.send_event(crate::Wake::AosWorked(Box::new(worked)));
+            }
+        });
+        self.aos_repair_via(code, now, reply, post);
+    }
+
+    /// [`Self::aos_repair_begin`] with the worker's prepare handed to `post` for the main thread, or with no `post` the repair made in place.
+    pub(crate) fn aos_repair_via<P>(
+        &mut self,
+        code: MomentumCode,
+        now: Instant,
+        reply: Reply,
+        post: Option<P>,
+    ) where
+        P: FnOnce(Worked) + Send + 'static,
+    {
+        let started = Instant::now();
+        let Some(post) = post else {
+            let answer = self
+                .aos_repair_at(code, now)
+                .map(|r| crate::aos_verb::repair_line(&r))
+                .map_err(|refusal| refusal.to_string());
+            let _ = reply.send(answer);
+            return;
+        };
+        match self.aos_repair_stage(code, now, reply) {
+            Ok((id, token, job)) => {
+                let spawned = std::thread::Builder::new()
+                    .name("aterm-aos-repair".into())
+                    .spawn(move || {
+                        crate::qos::set_self(crate::qos::Role::Responsive);
+                        let prepared = job.prepare();
+                        post(Worked::Repair {
+                            window: id,
+                            token,
+                            prepared: Box::new(prepared),
+                        });
+                    });
+                match spawned {
+                    Ok(_) => {
+                        if let Some(p) = self
+                            .windows
+                            .get_mut(&id)
+                            .and_then(|ws| ws.aos.repairing.as_mut())
+                        {
+                            p.main = started.elapsed();
+                        }
+                    }
+                    Err(e) => self.aos_repair_finish(id, token, Err(e.to_string())),
+                }
+            }
+            Err((reply, refusal)) => {
+                let _ = reply.send(Err(refusal.to_string()));
+            }
+        }
+    }
+
+    /// [`Self::aos_repair_begin`]'s main-thread half before the worker: the pause, the copy and the pending repair, whose token it returns with the job.
+    /// # Errors
+    /// The refusal with `reply` handed back, after which a glow this call paused resumes on the old code.
+    pub(crate) fn aos_repair_stage(
+        &mut self,
+        code: MomentumCode,
+        now: Instant,
+        reply: Reply,
+    ) -> Result<(WindowId, u64, RepairJob), (Reply, AosRefusal)> {
+        let id = match self.aos_front() {
+            Ok(id) => id,
+            Err(refusal) => return Err((reply, refusal)),
+        };
+        let Some(ws) = self.windows.get_mut(&id) else {
+            return Err((reply, AosRefusal::NoWindow));
+        };
+        if ws.aos.repairing.is_some() {
+            return Err((reply, AosRefusal::Repairing));
+        }
+        let lane = ws.effect_present_interval();
+        let momentum = &mut ws.fx.cursor_mut().momentum;
+        let paused_first = momentum.aos_attached() && !momentum.aos_paused();
+        if paused_first && let Err(refusal) = momentum.aos_pause(now, lane) {
+            return Err((reply, refusal.into()));
+        }
+        let staged = momentum.aos_repair_job(code).and_then(|job| {
+            momentum
+                .aos_paused_head()
+                .cloned()
+                .map(|head| (job, head))
+                .ok_or(PublishRefusal::NotPaused)
+        });
+        let (job, head) = match staged {
+            Ok(staged) => staged,
+            Err(refusal) => {
+                if paused_first {
+                    let _ = momentum.aos_resume();
+                }
+                return Err((reply, refusal.into()));
+            }
+        };
+        ws.aos.repairs = ws.aos.repairs.saturating_add(1);
+        let token = ws.aos.repairs;
+        ws.aos.repairing = Some(PendingRepair {
+            token,
+            paused_first,
+            head,
+            main: Duration::ZERO,
+            reply,
+        });
+        Ok((id, token, job))
+    }
+
+    /// Commits window `id`'s pending repair `token` from its worker's prepare (every check `commit` makes, on the original boundary) and answers the verb; a refusal resumes a glow the repair paused while it is still paused at the head the job was copied at.
+    pub(crate) fn aos_repair_finish(
+        &mut self,
+        id: WindowId,
+        token: u64,
+        prepared: Result<PreparedRepair, String>,
+    ) {
+        let started = Instant::now();
+        let Some(ws) = self.windows.get_mut(&id) else {
+            return;
+        };
+        let Some(pending) = ws.aos.repairing.take_if(|p| p.token == token) else {
+            return;
+        };
+        let momentum = &mut ws.fx.cursor_mut().momentum;
+        let committed = match prepared {
+            Ok(prepared) => momentum.aos_commit(prepared).map_err(AosRefusal::from),
+            Err(why) => Err(AosRefusal::Worker(why)),
+        };
+        let answer = match committed {
+            Ok(commit) => {
+                #[cfg(debug_assertions)]
+                {
+                    ws.aos.published = None;
+                }
+                Ok(Repaired {
+                    window: id,
+                    paused_first: pending.paused_first,
+                    commit,
+                    main: pending.main.saturating_add(started.elapsed()),
+                    off_main: true,
+                })
+            }
+            Err(refusal) => {
+                if pending.paused_first && momentum.aos_paused_head() == Some(&pending.head) {
+                    let _ = momentum.aos_resume();
+                }
+                Err(refusal)
+            }
+        };
+        self.aos_reconcile(id);
+        let _ = pending.reply.send(
+            answer
+                .map(|r| crate::aos_verb::repair_line(&r))
+                .map_err(|refusal| refusal.to_string()),
+        );
+    }
+
+    /// The `Wake::AosWorked` handler.
+    pub(crate) fn aos_worked(&mut self, worked: Worked) {
+        match worked {
+            Worked::Repair {
+                window,
+                token,
+                prepared,
+            } => self.aos_repair_finish(window, token, Ok(*prepared)),
+            Worked::Watch { window, judged } => self.aos_watch_fold(window, judged),
+        }
+    }
+
+    /// The online watcher's main-thread half, run as the loop parks: notes each detach a glow made by itself as a timeline row, takes each window's retired segments and hands them to a host worker to judge, one worker per window at a time; with no event-loop proxy (a test app) it judges them in place.
+    pub(crate) fn aos_watch(&mut self) {
+        for ws in self.windows.values_mut() {
+            if let Some(why) = ws.fx.cursor_mut().momentum.aos_take_detached() {
+                ws.aos.epoch = None;
+                #[cfg(debug_assertions)]
+                {
+                    ws.aos.published = None;
+                }
+                ws.aos.timeline.push(Row::Detached { why });
+            }
+        }
+        let due: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, ws)| {
+                !ws.aos.watching
+                    && (!ws.aos.orphans.is_empty()
+                        || ws.fx.cursor().momentum.aos_retired_waiting() > 0)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in due {
+            let Some(ws) = self.windows.get_mut(&id) else {
+                continue;
+            };
+            let mut segments = std::mem::take(&mut ws.aos.orphans);
+            segments.extend(ws.fx.cursor_mut().momentum.aos_take_retired());
+            let Some(proxy) = self.proxy.clone() else {
+                let judged = segments.into_iter().map(Segment::judge).collect();
+                self.aos_watch_fold(id, judged);
+                continue;
+            };
+            ws.aos.watching = true;
+            let spawned = std::thread::Builder::new()
+                .name("aterm-aos-watch".into())
+                .spawn(move || {
+                    crate::qos::set_self(crate::qos::Role::Background);
+                    let judged = segments.into_iter().map(Segment::judge).collect();
+                    let _ = proxy.send_event(crate::Wake::AosWorked(Box::new(Worked::Watch {
+                        window: id,
+                        judged,
+                    })));
+                });
+            if spawned.is_err() {
+                ws.aos.watching = false;
+                ws.aos.timeline.push(Row::Detached {
+                    why: "the watcher's host worker did not run",
+                });
+            }
+        }
+    }
+
+    /// Adds window `id`'s judged segments to its timeline, keeping each failing one as a fault (the oldest dropped past [`KEPT_CAP`]); no alert is raised.
+    pub(crate) fn aos_watch_fold(&mut self, id: WindowId, judged: Vec<SegmentJudgement>) {
+        let Some(ws) = self.windows.get_mut(&id) else {
+            return;
+        };
+        let aos = &mut ws.aos;
+        aos.watching = false;
+        for j in judged {
+            let kept = j.fault.map(|trace| {
+                let kid = aos.next_kept;
+                aos.next_kept = aos.next_kept.saturating_add(1);
+                if aos.kept.len() >= KEPT_CAP {
+                    aos.kept.pop_front();
+                }
+                aos.kept.push_back(Kept {
+                    id: kid,
+                    log_epoch: j.log_epoch,
+                    trace,
+                });
+                kid
+            });
+            aos.timeline.push(Row::Segment {
+                cause: j.cause,
+                code: j.code.to_owned(),
+                log_epoch: j.log_epoch,
+                from: j.from,
+                to: j.to,
+                judged: j.judged,
+                kept,
+            });
+        }
+    }
+
+    /// `aos ls`: every window's hosted task with its timeline, from the pure registry.
+    pub(crate) fn aos_ls_now(&self) -> Vec<String> {
+        let mut reg = Registry::new();
+        for (id, ws) in &self.windows {
+            let m = &ws.fx.cursor().momentum;
+            let s = m.aos_status();
+            reg.insert(Listing {
+                slot: id.0,
+                kind: TaskKind::Effect,
+                task: TASK_NAME.to_owned(),
+                code: s.code.to_owned(),
+                attached: s.attached,
+                paused: s.paused,
+                revision: s.revision,
+                log_epoch: s.log_epoch,
+                log_len: s.log_len,
+                waiting: m.aos_retired_waiting() + ws.aos.orphans.len(),
+                kept: ws.aos.kept.len(),
+                timeline: ws.aos.timeline.clone(),
+            });
+        }
+        reg.lines()
+    }
+
+    /// `aos export [kept=<n>]`'s main-thread half: the front window's live trace, or its kept fault `kept`, as a trace file's bytes.
+    pub(crate) fn aos_export_now(&self, kept: Option<u64>) -> Result<Exported, AosRefusal> {
+        let id = self.aos_front()?;
+        let ws = self.windows.get(&id).ok_or(AosRefusal::NoWindow)?;
+        let (log_epoch, trace) = match kept {
+            Some(n) => ws
+                .aos
+                .kept
+                .iter()
+                .find(|k| k.id == n)
+                .map(|k| (k.log_epoch, k.trace.clone()))
+                .ok_or(AosRefusal::NoKept(n))?,
+            None => {
+                let (summary, trace) = self.aos_trace_export()?;
+                (summary.log_epoch, trace)
+            }
+        };
+        Ok(Exported {
+            window: id,
+            kept,
+            log_epoch,
+            identity: trace.identity.digest(),
+            bytes: trace.encode(),
+        })
+    }
+
+    /// Stops recording every window's glow for privacy (`why` names the no-echo key or Secure Keyboard Entry), each detach a timeline row whose recording's retired segments go to the watcher.
+    pub(crate) fn aos_privacy_detach_all(&mut self, why: &'static str) {
+        for ws in self.windows.values_mut() {
+            privacy_detach(ws, why);
         }
     }
 
@@ -308,7 +746,9 @@ impl App {
         if !momentum.aos_attached() {
             return Err(PublishRefusal::NotAttached.into());
         }
+        let retired = momentum.aos_take_retired();
         momentum.aos_detach();
+        ws.aos.orphans.extend(retired);
         let status = momentum.aos_status();
         ws.aos.epoch = None;
         #[cfg(debug_assertions)]
@@ -443,6 +883,7 @@ impl App {
         };
         let answer = match asked {
             Asked::Status => self.aos_status_now().map(|(id, s)| status_line(id.0, &s)),
+            Asked::Ls => Ok(self.aos_ls_now().join("\n")),
             Asked::Attach(code) => self
                 .aos_attach_at(code, now)
                 .map(|(id, s)| status_line(id.0, &s)),
@@ -463,5 +904,35 @@ impl App {
                 .map(|(t, file)| trace_file_line(&t, &file)),
         };
         answer.map_err(|refusal| refusal.to_string())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether a test turned the privacy detach off, the negative control's switch.
+    pub(crate) static PRIVACY_DETACH_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Stops recording `ws`'s glow for privacy before the press `why` names reaches it, so no event of the press is logged: a timeline row, and the recording's retired segments go to the watcher.
+pub(crate) fn privacy_detach(ws: &mut crate::WindowState, why: &'static str) {
+    #[cfg(test)]
+    if PRIVACY_DETACH_OFF.with(std::cell::Cell::get) {
+        return;
+    }
+    let momentum = &mut ws.fx.cursor_mut().momentum;
+    if !momentum.aos_attached() {
+        return;
+    }
+    let retired = momentum.aos_take_retired();
+    momentum.aos_detach();
+    ws.aos.orphans.extend(retired);
+    ws.aos.epoch = None;
+    #[cfg(debug_assertions)]
+    {
+        ws.aos.published = None;
+    }
+    ws.aos.timeline.push(Row::Detached { why });
+    if let Some(w) = ws.os_window.as_ref() {
+        w.request_redraw();
     }
 }

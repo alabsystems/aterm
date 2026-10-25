@@ -4,6 +4,7 @@
 //! Pure supervisor turn-end policy decider (`TurnEndState`, `TurnEndReading`, `TurnEndDecision`).
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use aterm_phase::phase::{Phase, is_done_row, last_said_row, status_line};
@@ -3162,24 +3163,286 @@ fn open_work_read(tail: &str, land: Option<&[LandFamily]>) -> Vec<&'static str> 
 }
 
 fn open_work_read_as(tail: &str, land: Option<&[LandFamily]>, defense: bool) -> Vec<&'static str> {
+    once(open_work_found(tail, land, defense))
+}
+
+/// Each found word once, in the order found.
+fn once(found: Vec<Found>) -> Vec<&'static str> {
+    let mut once: Vec<&'static str> = Vec::with_capacity(found.len());
+    for word in found.into_iter().map(|f| f.word) {
+        if !once.contains(&word) {
+            once.push(word);
+        }
+    }
+    once
+}
+
+/// A piece of open work a report names: the reader's word for it, and the sentence it stood in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    /// The reader's word, as [`open_work`] and [`open_work_strict`] name it.
+    pub word: &'static str,
+    /// The sentence the word stood in, in the agent's own words, with markdown's emphasis, code
+    /// ticks and the marks the reader dropped left out and its spaces closed up; for a head
+    /// over items `<head>: <first item>`, for an unticked line `to do: <item>`, and for a word
+    /// a code block reads, the block's line that held it. At most [`SAID_CAP`] bytes: a longer
+    /// one is cut around its match, which it keeps whole, with `…` at each cut end.
+    pub said: String,
+    /// The bytes of `said` that matched: the phrase, the head, `to do`, a count beside none
+    /// with the word that places it, or a code block's whole line.
+    pub matched: Range<usize>,
+}
+
+/// The most bytes a [`Found::said`] holds.
+pub const SAID_CAP: usize = 160;
+
+/// What a [`Found::said`] leads an unticked line with.
+const TO_DO: &str = "to do";
+
+impl Found {
+    /// `word`, matched at `matched` in the sentence `held` of `line`'s words.
+    fn of(
+        line: &ReportLine,
+        held: Range<usize>,
+        word: &'static str,
+        matched: Range<usize>,
+    ) -> Self {
+        let (said, matched) = line.said(held, matched);
+        Self::cut(word, &said, matched)
+    }
+
+    /// An unticked line: `to do: <item>`.
+    fn to_do(line: &ReportLine) -> Self {
+        let (item, _) = line.said(0..line.words.len(), 0..0);
+        let said = if item.is_empty() {
+            TO_DO.to_string()
+        } else {
+            format!("{TO_DO}: {item}")
+        };
+        Self::cut(UNCHECKED, &said, 0..TO_DO.len())
+    }
+
+    /// A head over items: `<head>: <first item>`, the first item that is not a nil one.
+    fn over(
+        line: &ReportLine,
+        held: Range<usize>,
+        word: &'static str,
+        head: Range<usize>,
+        item: &ReportLine,
+    ) -> Self {
+        let (lead, matched) = line.said(held, head);
+        let lead = lead.trim_end_matches(|c: char| c == ':' || c.is_whitespace());
+        let matched = matched.start.min(lead.len())..matched.end.min(lead.len());
+        let (item, _) = item.said(0..item.words.len(), 0..0);
+        let said = if item.is_empty() {
+            lead.to_string()
+        } else {
+            format!("{lead}: {item}")
+        };
+        Self::cut(word, &said, matched)
+    }
+
+    fn cut(word: &'static str, said: &str, matched: Range<usize>) -> Self {
+        let (said, matched) = cut_around(said, matched, SAID_CAP);
+        Self {
+            word,
+            said,
+            matched,
+        }
+    }
+}
+
+impl ReportLine {
+    /// The agent's own words for `words[held]`, with where `words[matched]` stands in them.
+    fn said(&self, held: Range<usize>, matched: Range<usize>) -> (String, Range<usize>) {
+        if self.block {
+            // A block is quoted by its lines: a match by the line that held it, which is the
+            // match, and an item by the block's first line.
+            let line = if matched.is_empty() {
+                0
+            } else {
+                self.from.get(matched.start).copied().unwrap_or(0)
+            };
+            let line = self.shown.get(line..).unwrap_or("");
+            let line = line.split('\n').next().unwrap_or("");
+            let (said, _) = plain(line, 0..line.len(), 0..0, None);
+            let at = if matched.is_empty() {
+                0..0
+            } else {
+                0..said.len()
+            };
+            return (said, at);
+        }
+        let (said, at) = plain(
+            &self.shown,
+            self.shown_at(held.clone()),
+            self.shown_match(matched),
+            Some(&self.from[..]),
+        );
+        if said.is_empty() {
+            // Nothing the agent wrote stands for it (a lone tick): the words read do, but for a
+            // code span's placeholder, which the agent never wrote.
+            let words: Vec<&str> = self.words[held]
+                .split_whitespace()
+                .filter(|w| *w != CODE)
+                .collect();
+            return (words.join(" "), 0..0);
+        }
+        (said, at)
+    }
+}
+
+/// `shown[range]` as said: markdown's emphasis and code ticks dropped and its spaces closed up,
+/// with where `matched`, bytes of `shown`, stands in it. Given `from` (for each byte the reader
+/// read, the byte of `shown` it came from), the underscores and box marks outside code that
+/// the reader dropped go too.
+fn plain(
+    shown: &str,
+    range: Range<usize>,
+    matched: Range<usize>,
+    from: Option<&[usize]>,
+) -> (String, Range<usize>) {
+    let dropped = |at: usize, len: usize| {
+        from.is_some_and(|from| {
+            let first = from.partition_point(|&f| f < at);
+            from.get(first).is_none_or(|&f| f >= at + len)
+        })
+    };
+    let mut code = shown[..range.start].matches('`').count() % 2 == 1;
+    let mut out = String::with_capacity(range.len());
+    let (mut start, mut end) = (None, None);
+    let mut space = false;
+    let mut past = range.start;
+    for (at, c) in shown[range.clone()].char_indices() {
+        let at = range.start + at;
+        if at < past {
+            continue;
+        }
+        if c == '`' {
+            code = !code;
+            continue;
+        }
+        if c == '*' && !code {
+            continue;
+        }
+        if !code && from.is_some() {
+            let mark = if c == '_' {
+                Some(1)
+            } else if c == '[' || !c.is_ascii() {
+                UNCHECKED_BOXES
+                    .iter()
+                    .chain(CHECKED_BOXES)
+                    .filter(|b| shown[at..].starts_with(**b))
+                    .map(|b| b.len())
+                    .max()
+            } else {
+                None
+            };
+            if let Some(len) = mark.filter(|&len| dropped(at, len)) {
+                past = at + len;
+                continue;
+            }
+        }
+        if c.is_whitespace() {
+            space = !out.is_empty();
+            continue;
+        }
+        if std::mem::take(&mut space) {
+            out.push(' ');
+        }
+        if matched.contains(&at) {
+            start.get_or_insert(out.len());
+            end = Some(out.len() + c.len_utf8());
+        }
+        out.push(c);
+    }
+    let at = start.zip(end).map_or(0..0, |(s, e)| s..e);
+    (out, at)
+}
+
+/// `said` cut to at most `cap` bytes around `matched`, which it keeps whole, at a word's edge
+/// where one stands outside the match, with `…` at each cut end. A match longer than the room
+/// keeps its start and as many of its whole words as fit.
+fn cut_around(said: &str, matched: Range<usize>, cap: usize) -> (String, Range<usize>) {
+    const CUT: &str = "…";
+    let matched = matched.start.min(said.len())..matched.end.min(said.len());
+    if said.len() <= cap {
+        return (said.to_string(), matched);
+    }
+    let room = cap.saturating_sub(CUT.len());
+    let (from, to) = if matched.end <= room {
+        (0, room)
+    } else if said.len() - matched.start <= room {
+        (said.len() - room, said.len())
+    } else {
+        let room = cap.saturating_sub(2 * CUT.len());
+        let spare = room.saturating_sub(matched.len());
+        let from = matched.start - (spare / 2).min(matched.start);
+        (from, (from + room).min(said.len()))
+    };
+    let mut from = from;
+    while !said.is_char_boundary(from) {
+        from += 1;
+    }
+    let mut to = to;
+    while !said.is_char_boundary(to) {
+        to -= 1;
+    }
+    if from > 0
+        && let Some(space) = said[from..matched.start.max(from)].find(' ')
+    {
+        from += space + 1;
+    }
+    // The cut's end goes back to a word's edge: past a match that fits, and inside one that
+    // does not, which then keeps its start and whole words of it.
+    let (floor, inside) = if matched.end <= to {
+        (matched.end, false)
+    } else {
+        (matched.start.max(from), true)
+    };
+    if to < said.len()
+        && let Some(space) = said
+            .get(floor..to)
+            .and_then(|s| s.rfind(' '))
+            .filter(|&s| !inside || s > 0)
+    {
+        to = floor + space;
+    }
+    let mut out = String::with_capacity(cap);
+    if from > 0 {
+        out.push_str(CUT);
+    }
+    let shift = out.len();
+    out.push_str(&said[from..to]);
+    if to < said.len() {
+        out.push_str(CUT);
+    }
+    let start = (matched.start.max(from) - from + shift).min(out.len());
+    let end = (matched.end.min(to).max(from) - from + shift).clamp(start, out.len());
+    (out, start..end)
+}
+
+/// What a report's own words leave open, each with the sentence it stood in, in the order found.
+fn open_work_found(tail: &str, land: Option<&[LandFamily]>, defense: bool) -> Vec<Found> {
     let lines = report_lines(tail, land.is_some());
     let said_main = land.is_some()
         && (!defense
             || lines
                 .iter()
                 .any(|l| main_named(&l.words) || main_claimed(&l.words)));
-    let mut found: Vec<&'static str> = Vec::new();
+    let mut found: Vec<Found> = Vec::new();
     let mut i = 0;
     while let Some(line) = lines.get(i) {
         if line.unchecked {
-            found.push(UNCHECKED);
+            found.push(Found::to_do(line));
         }
         let words = line.words.as_str();
         let starts = sentence_starts(words);
         let end = |k: usize| starts.get(k + 1).copied().unwrap_or(words.len());
         let mut next = i + 1;
         for k in 0..starts.len() {
-            let sentence = &words[starts[k]..end(k)];
+            let held = starts[k]..end(k);
+            let sentence = &words[held.clone()];
             let head = open_head(sentence)
                 .or_else(|| land.and_then(|_| head_in(sentence, LAND_HEADS)))
                 .or_else(|| {
@@ -3188,18 +3451,20 @@ fn open_work_read_as(tail: &str, land: Option<&[LandFamily]>, defense: bool) -> 
                         .flatten()
                 });
             let Some((head, rest)) = head else {
-                let (line, len) = (&words[starts[k]..], end(k) - starts[k]);
-                let word = match land {
-                    None => open_status(line, len, &STATUS_PHRASES),
+                let (line_on, len) = (&words[starts[k]..], end(k) - starts[k]);
+                let hit = match land {
+                    None => open_status(line_on, len, &STATUS_PHRASES),
                     Some(families) => {
-                        land_status(line, len, &words[..starts[k]], families, said_main)
+                        land_status(line_on, len, &words[..starts[k]], families, said_main)
                     }
                 };
-                if let Some(word) = word {
-                    found.push(word);
+                if let Some(hit) = hit {
+                    let at = starts[k] + hit.at..starts[k] + hit.at + hit.len;
+                    found.push(Found::of(line, held, hit.word, at));
                 }
                 continue;
             };
+            let head_at = starts[k]..starts[k] + head.len();
             let nil = |item: &str| {
                 if land.is_some() {
                     nil_list(item)
@@ -3212,13 +3477,13 @@ fn open_work_read_as(tail: &str, land: Option<&[LandFamily]>, defense: bool) -> 
             let one_sentence = sentence_starts(inline).len() == 1;
             if inline.is_empty() || (one_sentence && inline.ends_with(':')) {
                 let mut j = i + 1;
-                let mut items: Vec<&str> = Vec::new();
+                let mut items: Vec<&ReportLine> = Vec::new();
                 while let Some(under) = lines.get(j) {
                     if under.block {
                         // Land's reading: a code block right under a bare
                         // head is its item (`Still to do:` over a command).
                         if items.is_empty() {
-                            items.push(&under.words);
+                            items.push(under);
                         }
                         break;
                     }
@@ -3228,38 +3493,35 @@ fn open_work_read_as(tail: &str, land: Option<&[LandFamily]>, defense: bool) -> 
                     {
                         break;
                     }
-                    items.push(&under.words);
+                    items.push(under);
                     j += 1;
                 }
                 next = j;
-                if !cleared && items.iter().any(|item| !nil(item)) {
-                    found.push(head);
+                if !cleared && let Some(first) = items.iter().find(|item| !nil(&item.words)) {
+                    found.push(Found::over(line, held, head, head_at, first));
                 }
                 if let Some(families) = land {
-                    found.extend(
-                        items
-                            .iter()
-                            .filter_map(|item| aside_status(item, families, said_main)),
-                    );
+                    found.extend(items.iter().filter_map(|item| {
+                        let hit = aside_status(&item.words, families, said_main)?;
+                        Some(Found::of(item, 0..item.words.len(), hit.word, hit.range()))
+                    }));
                 }
                 break;
             }
             if !cleared && !nil(inline) {
-                found.push(head);
+                found.push(Found::of(line, held.clone(), head, head_at));
             }
-            if let Some(families) = land {
-                found.extend(aside_status(inline, families, said_main));
+            if let Some(families) = land
+                && let Some(hit) = aside_status(inline, families, said_main)
+            {
+                let base = starts[k] + offset_in(sentence, inline);
+                let at = base + hit.at..base + hit.at + hit.len;
+                found.push(Found::of(line, held, hit.word, at));
             }
         }
         i = next;
     }
-    let mut once: Vec<&'static str> = Vec::with_capacity(found.len());
-    for word in found {
-        if !once.contains(&word) {
-            once.push(word);
-        }
-    }
-    once
+    found
 }
 
 const UNCHECKED_BOXES: &[&str] = &[
@@ -3454,6 +3716,12 @@ struct ReportLine {
     heading: bool,
     capital: bool,
     words: String,
+    /// The line as the agent wrote it, past its marks (the quote, the bullet, the box, the
+    /// heading's hashes): the text `words` was read from. A code block's is its first line and
+    /// then each line it read a word in, a `\n` before each.
+    shown: String,
+    /// For each byte of `words`, the byte of `shown` it was read from; never decreasing.
+    from: Vec<usize>,
 }
 
 impl ReportLine {
@@ -3486,14 +3754,18 @@ impl ReportLine {
             .chars()
             .find(|&c| c != '*' && c != '_')
             .is_some_and(char::is_uppercase);
+        // Each step keeps, beside its text, the byte of `t` each of its bytes came from.
         let mut flat = String::with_capacity(t.len());
+        let mut flat_from: Vec<usize> = Vec::with_capacity(t.len());
         let mut code = false;
         let mut span = String::new();
+        let mut span_at = 0;
         for (i, c) in t.char_indices() {
             match c {
                 '`' => {
                     if code && land {
                         flat.push(' ');
+                        flat_from.resize(flat.len(), span_at);
                         let named = t[i + 1..]
                             .split_whitespace()
                             .next()
@@ -3502,10 +3774,15 @@ impl ReportLine {
                         let words = code_words(&span);
                         if named && SPAN_STATUS.iter().any(|(_, w)| *w == words) {
                             flat.push_str(CODE);
+                            flat_from.resize(flat.len(), span_at);
                         } else {
                             flat.push_str(&words);
+                            flat_from.extend(span_words_from(&span, span_at, &words));
                         }
                         span.clear();
+                    }
+                    if !code {
+                        span_at = i;
                     }
                     code = !code;
                     flat.push(' ');
@@ -3515,9 +3792,14 @@ impl ReportLine {
                 '’' => flat.push('\''),
                 c => flat.extend(c.to_lowercase()),
             }
+            flat_from.resize(flat.len(), i);
         }
         if land {
             let mut padded = format!(" {flat} ");
+            let mut padded_from = Vec::with_capacity(padded.len());
+            padded_from.push(0);
+            padded_from.append(&mut flat_from);
+            padded_from.push(t.len());
             for b in UNCHECKED_BOXES.iter().chain(CHECKED_BOXES) {
                 let mark = format!(" {}", b.to_lowercase());
                 let mut from = 0;
@@ -3526,41 +3808,63 @@ impl ReportLine {
                     if padded[past..].starts_with([' ', '.', ',', ';', ':', ')', '!']) {
                         unchecked |= UNCHECKED_BOXES.contains(b);
                         padded.replace_range(found..past, " ");
+                        padded_from.drain(found + 1..past);
                         from = found;
                     } else {
                         from = past;
                     }
                 }
             }
-            flat = padded.replace("#[ignore]", " check ignored ");
+            (flat, flat_from) = replaced(&padded, &padded_from, "#[ignore]", " check ignored ");
         }
+        let (flat, flat_from) = without_underscore_emphasis(&flat, &flat_from);
         let mut words = String::with_capacity(flat.len());
+        let mut from: Vec<usize> = Vec::with_capacity(flat.len());
         let mut after_not = false;
-        for token in without_underscore_emphasis(&flat).split_whitespace() {
+        let mut gap = 0;
+        for (at, token) in tokens_at(&flat) {
             if after_not && matches!(token, "yet" | "been") {
                 continue;
             }
             if !words.is_empty() {
                 words.push(' ');
+                from.push(gap);
             }
+            let source = &flat_from[at..at + token.len()];
             let spelled = token.split_once("n't").filter(|(verb, rest)| {
                 CONTRACTED.contains(verb) && !rest.contains(char::is_alphanumeric)
             });
             if let Some((verb, rest)) = spelled {
                 words.push_str(verb);
+                from.extend_from_slice(&source[..verb.len()]);
                 words.push_str(" not");
+                from.resize(words.len(), source[verb.len()]);
                 words.push_str(rest);
+                from.extend_from_slice(&source[verb.len() + "n't".len()..]);
                 after_not = rest.is_empty();
             } else if let Some((n, m)) = land.then(|| ratio(token)).flatten() {
                 words.push_str(&format!("{n} of {m}"));
-                words.push_str(
-                    &token[token.trim_end_matches(|c: char| !c.is_ascii_digit()).len()..],
-                );
+                from.resize(words.len(), source[0]);
+                let digits = token.trim_end_matches(|c: char| !c.is_ascii_digit()).len();
+                words.push_str(&token[digits..]);
+                from.extend_from_slice(&source[digits..]);
                 after_not = false;
             } else {
                 words.push_str(token);
+                from.extend_from_slice(source);
                 after_not = token == "not";
             }
+            gap = flat_from.get(at + token.len()).copied().unwrap_or(t.len());
+        }
+        let mut shown = t.to_string();
+        if from.len() != words.len() {
+            // A byte the steps above lost would misplace every quote after it. The tests read
+            // every corpus row with this held; a build quotes such a line in the words it read.
+            if cfg!(test) {
+                panic!("{t:?} reads {words:?} from {from:?}");
+            }
+            shown.clone_from(&words);
+            from = (0..words.len()).collect();
         }
         Self {
             separated: false,
@@ -3570,12 +3874,145 @@ impl ReportLine {
             heading,
             capital,
             words,
+            shown,
+            from,
         }
+    }
+
+    /// The bytes of `shown` that `words[range]` was read from.
+    fn shown_at(&self, range: Range<usize>) -> Range<usize> {
+        let at = |b: usize| {
+            let mut at = self
+                .from
+                .get(b)
+                .copied()
+                .unwrap_or(self.shown.len())
+                .min(self.shown.len());
+            while !self.shown.is_char_boundary(at) {
+                at -= 1;
+            }
+            at
+        };
+        let start = at(range.start);
+        start..at(range.end).max(start)
+    }
+
+    /// The bytes of `shown` that the match `words[range]` was read from: from its first byte's
+    /// source to one character past its last byte's, so a mark the reader dropped after it
+    /// (`_still open_`) stays out. Where its last word stands for a token of the agent's that
+    /// reads otherwise (`3/5` read as `3 of 5`, `n't` as `not`, a code span as its status),
+    /// the match runs to that token's end.
+    fn shown_match(&self, range: Range<usize>) -> Range<usize> {
+        let at = self.shown_at(range.clone());
+        let last = self
+            .words
+            .get(range.clone())
+            .and_then(|m| m.char_indices().next_back());
+        let Some((last, read)) = last.map(|(b, c)| (range.start + b, c)) else {
+            return at;
+        };
+        let source = self.shown_at(last..last).start;
+        let Some(said) = self.shown[source..].chars().next() else {
+            return at;
+        };
+        let rewritten = !(said.to_lowercase().any(|c| c == read) || (said == '’' && read == '\''))
+            || (last > range.start && self.from.get(last - 1) == self.from.get(last));
+        let end = if !rewritten {
+            source + said.len_utf8()
+        } else if said == '`' {
+            // A code span read as a word it does not hold: the whole span.
+            self.shown[source + 1..]
+                .find('`')
+                .map_or(self.shown.len(), |close| source + close + 2)
+        } else {
+            let token = &self.shown[source..];
+            let token = &token[..token.find(char::is_whitespace).unwrap_or(token.len())];
+            source
+                + token
+                    .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '_', '*'])
+                    .len()
+        };
+        at.start..end.max(at.start)
+    }
+
+    /// Joins `line`, which carries this one on, to this one.
+    fn join(&mut self, line: Self) {
+        self.unchecked |= line.unchecked;
+        self.words.push(' ');
+        self.words.push_str(&line.words);
+        self.from.push(self.shown.len());
+        self.shown.push(' ');
+        let base = self.shown.len();
+        self.shown.push_str(&line.shown);
+        self.from.extend(line.from.iter().map(|f| f + base));
     }
 }
 
-fn without_underscore_emphasis(text: &str) -> String {
+/// Where each byte of the words a code span read ([`code_words`]) stands in its line: a word
+/// the span holds where it holds it, and any other (`codespan`, `skipped`) at the opening `tick`.
+fn span_words_from(span: &str, tick: usize, words: &str) -> Vec<usize> {
+    let lower = span.to_lowercase();
+    let mut from = Vec::with_capacity(words.len());
+    let (mut past, mut last) = (0, tick);
+    for (at, token) in tokens_at(words) {
+        from.resize(at, last);
+        let held = (lower.len() == span.len())
+            .then(|| lower[past..].find(token))
+            .flatten();
+        if let Some(p) = held {
+            let start = tick + 1 + past + p;
+            from.extend(start..start + token.len());
+            past += p + token.len();
+            last = start + token.len();
+        } else {
+            from.resize(at + token.len(), last);
+        }
+    }
+    from.resize(words.len(), last);
+    from
+}
+
+/// `text`'s whitespace-separated tokens, as `split_whitespace` gives them, each with its byte.
+fn tokens_at(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut past = 0;
+    std::iter::from_fn(move || {
+        let rest = &text[past..];
+        let start = past + (rest.len() - rest.trim_start().len());
+        if start >= text.len() {
+            return None;
+        }
+        let len = text[start..]
+            .find(char::is_whitespace)
+            .unwrap_or(text.len() - start);
+        past = start + len;
+        Some((start, &text[start..past]))
+    })
+}
+
+/// `str::replace` that keeps, for each byte, where it came from.
+fn replaced(text: &str, from: &[usize], pattern: &str, with: &str) -> (String, Vec<usize>) {
     let mut out = String::with_capacity(text.len());
+    let mut out_from = Vec::with_capacity(from.len());
+    let mut kept = 0;
+    for (at, _) in text.match_indices(pattern) {
+        out.push_str(&text[kept..at]);
+        out_from.extend_from_slice(&from[kept..at]);
+        out.push_str(with);
+        out_from.resize(out.len(), from[at]);
+        kept = at + pattern.len();
+    }
+    out.push_str(&text[kept..]);
+    out_from.extend_from_slice(&from[kept..]);
+    (out, out_from)
+}
+
+fn without_underscore_emphasis(text: &str, from: &[usize]) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(text.len());
+    let mut out_from = Vec::with_capacity(from.len());
+    let mut keep = |range: Range<usize>| {
+        out.push_str(&text[range.clone()]);
+        out_from.extend_from_slice(&from[range]);
+    };
     let mut kept = 0;
     let mut cursor = 0;
     let mut open = None;
@@ -3591,8 +4028,8 @@ fn without_underscore_emphasis(text: &str) -> String {
             && marks == width
             && closes
         {
-            out.push_str(&text[kept..start]);
-            out.push_str(&text[start + marks..at]);
+            keep(kept..start);
+            keep(start + marks..at);
             kept = cursor;
             open = None;
         } else if open.is_none()
@@ -3602,8 +4039,8 @@ fn without_underscore_emphasis(text: &str) -> String {
             open = Some((at, width));
         }
     }
-    out.push_str(&text[kept..]);
-    out
+    keep(kept..text.len());
+    (out, out_from)
 }
 
 fn ratio(token: &str) -> Option<(u32, u32)> {
@@ -3618,13 +4055,13 @@ fn ratio(token: &str) -> Option<(u32, u32)> {
 }
 
 fn table_header(raw: &str, next: Option<&str>) -> bool {
-    raw.trim_start().starts_with('|')
-        && next.is_some_and(|n| {
-            let t = n.trim();
-            t.starts_with('|')
-                && t.contains('-')
-                && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
-        })
+    raw.trim_start().starts_with('|') && next.is_some_and(table_rule)
+}
+
+/// A table's rule row (`|---|:--|`).
+fn table_rule(raw: &str) -> bool {
+    let t = raw.trim();
+    t.starts_with('|') && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
 }
 
 fn report_lines(tail: &str, land: bool) -> Vec<ReportLine> {
@@ -3639,10 +4076,25 @@ fn report_lines(tail: &str, land: bool) -> Vec<ReportLine> {
             {
                 fence = None;
             } else if let Some(block) = out.last_mut().filter(|b| land && b.block) {
+                // A block shows its first line, and then, a line apiece, each line it reads a
+                // word in: the word maps to its line, which is what a find of it quotes.
+                let text = raw.trim();
+                let first = block.shown.is_empty();
+                if first {
+                    text.clone_into(&mut block.shown);
+                }
+                let mut held = first.then_some(0);
                 for word in code_work(raw).into_iter().chain(output_status(raw)) {
                     if !block.words.split(' ').any(|w| w == word) {
+                        let at = *held.get_or_insert_with(|| {
+                            block.shown.push('\n');
+                            let at = block.shown.len();
+                            block.shown.push_str(text);
+                            at
+                        });
                         block.words.push(' ');
                         block.words.push_str(word);
+                        block.from.resize(block.words.len(), at);
                     }
                 }
             }
@@ -3655,6 +4107,8 @@ fn report_lines(tail: &str, land: bool) -> Vec<ReportLine> {
                 let mut block = ReportLine::of(CODE, true);
                 block.block = true;
                 block.separated = true;
+                block.shown.clear();
+                block.from.fill(0);
                 out.push(block);
             }
             continue;
@@ -3666,13 +4120,15 @@ fn report_lines(tail: &str, land: bool) -> Vec<ReportLine> {
         if line.words.is_empty() && !line.unchecked {
             continue;
         }
+        if land && table_rule(raw) {
+            // A table's rule reads as words but shows none, so a quote across it keeps to the
+            // rows.
+            line.shown.clear();
+            line.from.fill(0);
+        }
         line.separated = std::mem::take(&mut separated);
         match out.last_mut() {
-            Some(above) if !line.separated && !line.item && !line.capital => {
-                above.unchecked |= line.unchecked;
-                above.words.push(' ');
-                above.words.push_str(&line.words);
-            }
+            Some(above) if !line.separated && !line.item && !line.capital => above.join(line),
             _ => out.push(line),
         }
     }
@@ -3876,23 +4332,46 @@ fn negated(item: &str) -> bool {
         || item.starts_with("n/a")
 }
 
-fn open_status(line: &str, len: usize, phrases: &Phrases) -> Option<&'static str> {
+/// Where a reader found open work in a sentence: its word, and the bytes that matched.
+#[derive(Clone, Copy, Debug)]
+struct Hit {
+    word: &'static str,
+    at: usize,
+    len: usize,
+}
+
+impl Hit {
+    const fn range(self) -> Range<usize> {
+        self.at..self.at + self.len
+    }
+}
+
+fn open_status(line: &str, len: usize, phrases: &Phrases) -> Option<Hit> {
     let sentence = &line[..len];
     let stands: Vec<(usize, &'static str)> = phrases_in(sentence, phrases).collect();
-    phrases.table.iter().copied().find(|&word| {
-        stands.iter().filter(|&&(_, w)| w == word).any(|&(at, _)| {
-            let clause = sentence[..at]
-                .rsplit([',', ';', ':', '(', ')', '—', '–'])
-                .next()
-                .unwrap_or("");
-            let before: Vec<&str> = clause.split_whitespace().collect();
-            let prev = before.last().copied();
-            !before.iter().any(|w| OPEN_NEGATIONS.contains(w))
-                && !(word.starts_with("not ") && prev.is_some_and(|p| OPEN_MODALS.contains(&p)))
-                && !(word == "skipped" && prev.is_some_and(|p| ["is", "are", "be"].contains(&p)))
-                && !quoted(sentence, at)
-                && !nothing_to_do(&line[at + word.len()..])
-        })
+    phrases.table.iter().copied().find_map(|word| {
+        stands
+            .iter()
+            .filter(|&&(_, w)| w == word)
+            .find(|&&(at, _)| {
+                let clause = sentence[..at]
+                    .rsplit([',', ';', ':', '(', ')', '—', '–'])
+                    .next()
+                    .unwrap_or("");
+                let before: Vec<&str> = clause.split_whitespace().collect();
+                let prev = before.last().copied();
+                !before.iter().any(|w| OPEN_NEGATIONS.contains(w))
+                    && !(word.starts_with("not ") && prev.is_some_and(|p| OPEN_MODALS.contains(&p)))
+                    && !(word == "skipped"
+                        && prev.is_some_and(|p| ["is", "are", "be"].contains(&p)))
+                    && !quoted(sentence, at)
+                    && !nothing_to_do(&line[at + word.len()..])
+            })
+            .map(|&(at, _)| Hit {
+                word,
+                at,
+                len: word.len(),
+            })
     })
 }
 
@@ -3939,7 +4418,7 @@ fn land_status(
     prior: &str,
     families: &[LandFamily],
     said_main: bool,
-) -> Option<&'static str> {
+) -> Option<Hit> {
     let s = &line[..len];
     let rank =
         |table: &[&str], word: &str| table.iter().position(|w| *w == word).unwrap_or(usize::MAX);
@@ -3976,7 +4455,11 @@ fn land_status(
     let open = stands
         .iter()
         .find(|st| land_open(line, s, (prior, said_main), st, &stands))
-        .map(|st| st.family.and_then(|f| f.says).unwrap_or(st.word));
+        .map(|st| Hit {
+            word: st.family.and_then(|f| f.says).unwrap_or(st.word),
+            at: st.at,
+            len: st.len,
+        });
     if !asks(s) {
         return open;
     }
@@ -3986,7 +4469,14 @@ fn land_status(
         }
         _ => open.is_some(),
     };
-    question_open(s, &line[len..], leftover).then(|| open.unwrap_or(QUESTION))
+    let mark = s.trim_end().len() - 1;
+    question_open(s, &line[len..], leftover).then(|| {
+        open.unwrap_or(Hit {
+            word: QUESTION,
+            at: mark,
+            len: 1,
+        })
+    })
 }
 
 fn stated(s: &str) -> Option<String> {
@@ -5217,7 +5707,7 @@ fn nil_item(s: &str, at: usize, end: usize) -> bool {
 }
 
 fn nil_list(item: &str) -> bool {
-    if nil_aside(item).is_some_and(|(_, inner)| placed_count(inner)) {
+    if nil_aside(item).is_some_and(|(_, inner)| placed_count(inner).is_some()) {
         return false;
     }
     let item = nil_aside(item).map_or(item, |(nil, _)| nil);
@@ -5263,15 +5753,30 @@ fn nil_aside(item: &str) -> Option<(&str, &str)> {
     t.strip_suffix(')')?.split_once('(')
 }
 
-fn placed_count(inner: &str) -> bool {
-    let words: Vec<&str> = inner
-        .split_whitespace()
-        .map(bare)
-        .filter(|w| !w.is_empty())
+/// Where a `none (…)` aside opens on a count, the bytes of `inner` that hold it and the word
+/// that places it (`3 open`).
+fn placed_count(inner: &str) -> Option<Range<usize>> {
+    let words: Vec<(usize, &str)> = tokens_at(inner)
+        .map(|(at, raw)| {
+            let word = bare(raw);
+            (at + offset_in(raw, word), word)
+        })
+        .filter(|(_, w)| !w.is_empty())
         .collect();
-    matches!(words.as_slice(), [n, rest @ ..]
-        if (count(n).is_some_and(|c| c > 0) || matches!(*n, "some" | "few"))
-            && rest.first().is_none_or(|w| ELSEWHERE.contains(w) || CHANGE_NOUNS.contains(w)))
+    match words.as_slice() {
+        [(at, n), rest @ ..]
+            if (count(n).is_some_and(|c| c > 0) || matches!(*n, "some" | "few"))
+                && rest
+                    .first()
+                    .is_none_or(|(_, w)| ELSEWHERE.contains(w) || CHANGE_NOUNS.contains(w)) =>
+        {
+            let end = rest
+                .first()
+                .map_or(at + n.len(), |(next, w)| next + w.len());
+            Some(*at..end)
+        }
+        _ => None,
+    }
 }
 
 const ELSEWHERE: &[&str] = &[
@@ -5293,15 +5798,34 @@ const ELSEWHERE: &[&str] = &[
     "there",
 ];
 
-fn aside_status(item: &str, families: &[LandFamily], said_main: bool) -> Option<&'static str> {
+/// An item's `none (…)` aside that leaves work open; the hit stands in `item`.
+fn aside_status(item: &str, families: &[LandFamily], said_main: bool) -> Option<Hit> {
     let (nil, inner) = nil_aside(item)?;
     if !nil_list(nil) {
         return None;
     }
-    if placed_count(inner) {
-        return Some(COUNT_BESIDE_NONE);
+    let base = offset_in(item, inner);
+    if let Some(count) = placed_count(inner) {
+        return Some(Hit {
+            word: COUNT_BESIDE_NONE,
+            at: base + count.start,
+            len: count.len(),
+        });
     }
-    land_status(inner, inner.len(), "", families, said_main)
+    land_status(inner, inner.len(), "", families, said_main).map(|hit| Hit {
+        at: base + hit.at,
+        ..hit
+    })
+}
+
+/// Where `inner`, a slice of `outer`, starts in it.
+fn offset_in(outer: &str, inner: &str) -> usize {
+    let at = inner.as_ptr().addr().wrapping_sub(outer.as_ptr().addr());
+    debug_assert!(
+        at + inner.len() <= outer.len(),
+        "{inner:?} is not in {outer:?}"
+    );
+    at.min(outer.len())
 }
 
 fn behind(before: &[&str]) -> bool {
@@ -8074,12 +8598,19 @@ pub fn clean_defense(tail: Option<&str>) -> bool {
 }
 
 fn land_open_words(tail: Option<&str>) -> Vec<&'static str> {
+    once(land_open_found(tail))
+}
+
+/// What Land's reading of the reply `tail` finds open at a land act's yield, each with the
+/// sentence it stood in ([`Found`]), in the order found: the words a hold names.
+#[must_use]
+pub fn land_open_found(tail: Option<&str>) -> Vec<Found> {
     match tail {
         Some(t) if needs::defense_line(t).is_some() => {
-            open_work_strict(Some(&needs::defense_body(t)))
+            open_work_found(&needs::defense_body(t), Some(&LAND_FAMILIES), true)
         }
         Some(t) if says_done(Some(t)) => {
-            open_work_read_as(&needs::without_needs(t), Some(&LAND_FAMILIES), false)
+            open_work_found(&needs::without_needs(t), Some(&LAND_FAMILIES), false)
         }
         _ => Vec::new(),
     }
@@ -12168,13 +12699,13 @@ impl TurnEndState {
         &self.open
     }
 
-    /// What the session's repository held that no remote main has at the current point's done claim ([`Self::repo`]; `None`: nothing found, or the probe did not finish, [`Self::repo_unread`]).
+    /// What the session's repository held that no remote main has at the current point's done claim ([`Self::repo`]; `None`: nothing found, or the probe could not read the repository, [`Self::repo_unread`]).
     #[must_use]
     pub const fn repo_owed(&self) -> Option<&crate::harness::repo_work::RepoWork> {
         self.repo.found()
     }
 
-    /// Whether the repository probe at the current point's done claim did not finish ([`crate::harness::repo_work::RepoRead::Unread`]).
+    /// Whether the repository probe at the current point's done claim could not read the repository ([`crate::harness::repo_work::RepoRead::Unread`]).
     #[must_use]
     pub const fn repo_unread(&self) -> bool {
         self.repo.is_unread()
@@ -13155,9 +13686,40 @@ impl TurnEndState {
             && !self.account_startup
     }
 
-    /// The point the host is asked about ([`AccountPoint`]).
+    /// The point the host is asked about ([`AccountPoint`]): where no move or follow is asked
+    /// here, a roster row's own lost login still is (`login_end_told`).
     #[must_use]
     pub fn account_point(
+        &self,
+        reading: &TurnEndReading,
+        cfg: &SupervisorConfig,
+    ) -> Option<AccountPoint> {
+        self.account_point_moving(reading, cfg).or_else(|| {
+            self.login_end_told(reading, cfg)
+                .then_some(AccountPoint::LoginEnded)
+        })
+    }
+
+    /// A ROSTER ROW'S OWN LOST LOGIN, TOLD THE HOST WHATEVER HOLDS THE TAB'S MOVE OFF IT: the
+    /// login wall of a session whose login is a roster row's (`login_label`, `logins` on) is
+    /// [`AccountPoint::LoginEnded`] though no relaunch reaches the tab, a draft stands, the tab
+    /// has no task or its task is done, so the host marks the row signed out and aterm's sign-in
+    /// ladder signs it in (`crate::harness::accounts_sync`'s tier 0) — the one route that asks no
+    /// person. Not over a move whose wall the session left, an answer still awaited, a login back
+    /// in another tab, or an upgrade's restart.
+    fn login_end_told(&self, reading: &TurnEndReading, cfg: &SupervisorConfig) -> bool {
+        cfg.logins
+            && reading.login_label.is_some()
+            && moves_accounts(reading.program)
+            && reading.wall == Some(WallKind::Auth)
+            && reading.at_point(self.stale_input)
+            && !reading.upgrading
+            && !self.login_left(reading)
+            && !self.account_answer_awaited(reading)
+            && !login_back_elsewhere(self, reading)
+    }
+
+    fn account_point_moving(
         &self,
         reading: &TurnEndReading,
         cfg: &SupervisorConfig,
@@ -15643,7 +16205,7 @@ fn repo_said(summary: &str) -> String {
 const REPO_BARE: &str = "Your repository still holds work no remote main has: commit, merge \
                          and push it to the remote main first.";
 
-/// THE REPOSITORY SUFFIX WHERE THE PROBE DID NOT FINISH ([`crate::harness::repo_work::RepoRead::Unread`]).
+/// THE REPOSITORY SUFFIX WHERE THE PROBE COULD NOT READ THE REPOSITORY ([`crate::harness::repo_work::RepoRead::Unread`]).
 pub const REPO_UNREAD: &str = "Your repository could not be read: show its git status yourself \
                                and land what it holds first.";
 
@@ -17111,12 +17673,6 @@ pub(super) const fn relaunch_on(reading: &TurnEndReading, cfg: &SupervisorConfig
     cfg.relaunch && !reading.relaunch_off
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RenewStep {
-    Draft,
-    ByHand(&'static str),
-}
-
 fn renewed_draft_reason(composer: &Composer) -> String {
     let what = match composer {
         Composer::Own => "aterm's own words stand unsent in the prompt: clear them",
@@ -17129,29 +17685,18 @@ fn renewed_draft_reason(composer: &Composer) -> String {
     format!("the login was renewed; {what}, and the tab moves onto the new login")
 }
 
-pub(super) fn renew_step(reading: &TurnEndReading, cfg: &SupervisorConfig) -> Option<RenewStep> {
-    reading.login_label.as_ref().filter(|_| cfg.logins)?;
-    if !reading.login_superseded {
-        return None;
-    }
-    Some(if relaunch_reaches(reading, cfg) {
-        // With the composer empty the relaunch follows by itself where the
-        // host advises it; advising nothing, the renewed login ended too,
-        // and it is signed in where it stands as any other.
-        if !reading.composer.drafted() {
-            return None;
-        }
-        RenewStep::Draft
-    } else if !relaunch_on(reading, cfg) {
-        RenewStep::ByHand(BY_HAND_WHYS[0])
-    } else if !cfg.resume_limits {
-        RenewStep::ByHand(BY_HAND_WHYS[1])
-    } else {
-        RenewStep::ByHand(BY_HAND_WHYS[2])
-    })
+/// WHETHER ONLY A DRAFT HOLDS A RENEWED ROSTER LOGIN'S MOVE: the session's row was signed in again
+/// (`login_superseded`), the relaunch onto it reaches the tab, and the composer holds words a
+/// relaunch would lose. With the composer empty the relaunch follows by itself where the host
+/// advises it, and advising nothing, the renewed login ended too; where no relaunch reaches the
+/// tab, the tab waits on the row's own sign-in, naming what holds the move ([`login_wall_waits`]).
+pub(super) fn renewed_draft_holds(reading: &TurnEndReading, cfg: &SupervisorConfig) -> bool {
+    reading.login_label.is_some()
+        && cfg.logins
+        && reading.login_superseded
+        && relaunch_reaches(reading, cfg)
+        && reading.composer.drafted()
 }
-
-use super::notice::BY_HAND_WHYS;
 
 fn login_move(
     state: &TurnEndState,
@@ -17275,6 +17820,19 @@ fn login_left_renewed(state: &TurnEndState, reading: &TurnEndReading) -> bool {
         && reading.login_superseded
 }
 
+/// THE WAIT AT A LOST LOGIN THAT ANOTHER LOGIN ENDS, in place of the `/login` the wall would
+/// have typed: a move the roster made (`moved`), the renewal of the session's own roster row, and
+/// that row's own sign-in to come (`signs_in`: a row with an email, which aterm's sign-in ladder,
+/// `crate::harness::sign_in_ladder`, signs in again by itself, headless, after which the tab moves
+/// onto the login it made). `/login` in the tab would open a browser sign-in on the desk that only
+/// a person can finish, so a roster row's lost login never types it: where the relaunch reaches
+/// the tab the wait is the move's, and where nothing moves the tab yet (no relaunch reaches it, a
+/// restart onto the row was not made, or a draft stands before the row is renewed) the wait is
+/// the row's own sign-in's, its reason naming what holds the move ([`move_held`]) — the record
+/// that stands where no route can finish. A renewed row's draft is [`renewed_draft_holds`]'s; a
+/// login back in another tab, no renewal behind it, is continued from as that tab's, and a
+/// person's own `/login` left at the wall is theirs (`TurnEndState::login_cancelled`), told as
+/// before.
 pub(super) fn login_wall_waits(
     state: &TurnEndState,
     reading: &TurnEndReading,
@@ -17282,16 +17840,52 @@ pub(super) fn login_wall_waits(
     now: Instant,
 ) -> Option<TurnEndAction> {
     let moved = state.account.is_some() && cfg.accounts != crate::harness::accounts::Mode::Off;
-    let renewed = reading.login_label.is_some() && cfg.logins && reading.login_superseded;
+    let signs_in = reading.login_label.is_some()
+        && cfg.logins
+        && (reading.login_superseded || !login_back_elsewhere(state, reading));
     if reading.wall != Some(WallKind::Auth)
-        || !(moved || renewed)
+        || !(moved || signs_in)
         || state.login_left(reading)
-        || !relaunch_reaches(reading, cfg)
-        || state.account_unmade.is_some()
+        || state.login_cancelled()
         || state.wall_attempts(WallKind::Auth).unwrap_or(0) > 0
-        || reading.composer.drafted()
     {
         return None;
+    }
+    let backoff = later(
+        now,
+        state
+            .timing
+            .restart_backoff
+            .last()
+            .copied()
+            .unwrap_or(ACCOUNT_WAIT_FLOOR),
+    );
+    let wait = |until: Instant, why: String| TurnEndAction::WaitUntil {
+        until: until.max(later(now, ACCOUNT_WAIT_FLOOR)),
+        why: format!("the login is gone: {why}"),
+        wait: WaitKind::Other,
+    };
+    let held = move_held(state, reading, cfg);
+    if held.is_some() || reading.composer.drafted() {
+        let label = reading.login_label.as_deref().filter(|_| signs_in)?;
+        return match (reading.login_superseded, held) {
+            (true, None) => None,
+            (true, Some(held)) => Some(wait(
+                backoff,
+                format!("{label} is signed in again, and the tab cannot move onto it: {held}"),
+            )),
+            (false, Some(held)) => Some(wait(
+                backoff,
+                format!(
+                    "aterm signs {label} in again by itself, and the tab cannot move onto it: \
+                     {held}"
+                ),
+            )),
+            (false, None) => Some(wait(
+                backoff,
+                format!("aterm signs {label} in again by itself"),
+            )),
+        };
     }
     let (n, free) = state.account_moves_of(now);
     let (until, why) = match (reading.advised(), free) {
@@ -17308,26 +17902,51 @@ pub(super) fn login_wall_waits(
                 state.timing.window.as_secs() / 60
             ),
         ),
-        (None, _) if state.account_point(reading, cfg).is_some() => return None,
+        (None, _) if !signs_in && state.account_point(reading, cfg).is_some() => return None,
         _ => (
-            later(
-                now,
-                state
-                    .timing
-                    .restart_backoff
-                    .last()
-                    .copied()
-                    .unwrap_or(ACCOUNT_WAIT_FLOOR),
-            ),
-            "no move can be made yet".to_string(),
+            backoff,
+            match reading
+                .login_label
+                .as_deref()
+                .filter(|_| signs_in && !moved)
+            {
+                Some(label) => format!("aterm signs {label} in again by itself"),
+                None => "no move can be made yet".to_string(),
+            },
         ),
     };
-    Some(TurnEndAction::WaitUntil {
-        until: until.max(later(now, ACCOUNT_WAIT_FLOOR)),
-        why: format!("the login is gone: {why}"),
-        wait: WaitKind::Other,
-    })
+    Some(wait(until, why))
 }
+
+/// WHAT HOLDS A TAB'S MOVE ONTO ITS ROSTER ROW'S LOGIN, where something does: `relaunch` or
+/// `resume_limits` off, no host that relaunches this agent, or a restart onto an account this
+/// host asked for and did not make (asked again at the accounts' next news,
+/// [`TurnEndState::account_news`]).
+fn move_held(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    cfg: &SupervisorConfig,
+) -> Option<&'static str> {
+    if !relaunch_on(reading, cfg) {
+        Some(MOVE_HELD_WHYS[0])
+    } else if !cfg.resume_limits {
+        Some(MOVE_HELD_WHYS[1])
+    } else if !relaunch_lane(reading) {
+        Some(MOVE_HELD_WHYS[2])
+    } else if state.account_unmade.is_some() {
+        Some(MOVE_HELD_WHYS[3])
+    } else {
+        None
+    }
+}
+
+/// Every clause [`move_held`] names.
+pub(crate) const MOVE_HELD_WHYS: [&str; 4] = [
+    "relaunch is off in aterm.toml",
+    "resume_limits is off in aterm.toml",
+    "aterm cannot restart this Claude Code",
+    "the restart aterm asked for here was not made",
+];
 
 #[allow(clippy::too_many_arguments)]
 fn wall_action(
@@ -17661,14 +18280,8 @@ fn wall_own_act(
             if (attempts > 0 || track.is_some_and(|t| t.login.cancelled)) && !back {
                 return login_opening_wait(state, now).unwrap_or(TurnEndAction::Nothing);
             }
-            match renew_step(reading, cfg) {
-                Some(RenewStep::Draft) => return esc(renewed_draft_reason(&reading.composer)),
-                Some(RenewStep::ByHand(why)) => {
-                    return esc(format!(
-                        "the login was renewed, but {why}: type /login in the tab and sign in"
-                    ));
-                }
-                None => {}
+            if renewed_draft_holds(reading, cfg) {
+                return esc(renewed_draft_reason(&reading.composer));
             }
             match &reading.login_shared {
                 Some(LoginShared::Back { .. }) if back => {

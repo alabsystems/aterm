@@ -216,9 +216,14 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn last_turn(&self) -> Option<crate::harness::upgrade::LastTurn> {
         None
     }
-    /// Repository work, or an unfinished deadline-limited probe.
-    fn repo_work(&self) -> crate::harness::repo_work::RepoRead {
-        crate::harness::repo_work::RepoRead::Clean
+    /// What the session's repository holds that no remote main has
+    /// ([`crate::harness::repo_work::probe`]), or `None` while the probe still
+    /// reads: a host that reads on its own thread waits a bounded time for the
+    /// answer ([`crate::harness::repo_work::Probing`]), so the loop, asking
+    /// again, renews its claim and sees a stop between asks however long the
+    /// reads take.
+    fn repo_work(&self) -> Option<crate::harness::repo_work::RepoRead> {
+        Some(crate::harness::repo_work::RepoRead::Clean)
     }
     fn lifted_off(&self) -> bool {
         false
@@ -228,6 +233,11 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     }
     fn turn_ran(&self) {}
     fn usage_tap(&self) {}
+    /// The agent is mid-turn (a busy read): its usage tap's newest reading may be recorded,
+    /// as at a decided idle turn end ([`Self::usage_tap`]) but never judged silent, so what
+    /// the accounts store holds keeps up with a turn that runs for hours. The host bounds
+    /// how often it reads.
+    fn busy_tap(&self) {}
     fn tap_window(
         &self,
         window: crate::supervise::tap_clock::UsageWindow,

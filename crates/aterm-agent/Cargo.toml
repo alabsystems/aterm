@@ -103,6 +103,12 @@ aterm-toolchain = { workspace = true }
 # environment block) instead of forking two `lsof`s per agent it inspects.
 # Not a new edge in the shipped graph — aterm-gui already links it.
 aterm-sysprobe = { workspace = true }
+# The volume's lines (warning, floor, emergency, the room's bounds): one
+# definition the disk watch and every tool that admits a disk need read
+# (`aterm_capacity::floor`, docs/DESIGN-adaptive-build-2026-10-24.md CAP-1).
+# Workspace crate over aterm-sysprobe, aterm-toolchain, aterm-json and
+# aterm-time, which this crate links already.
+aterm-capacity = { workspace = true }
 # `aterm_primer::CLAUDE_TOP_EFFORT_KEY`: the one spelling of Claude Code's top-effort
 # mode. The publication baseline bans the joined word in exported files, so the
 # source spells it once, from parts, in the crate that writes the key.

@@ -1232,6 +1232,7 @@ impl App {
             crate::claude_lights::ChipFace::of(view, &glass),
             &glass,
             hold.as_ref(),
+            false,
         )
     }
 
@@ -1912,12 +1913,16 @@ pub(crate) fn harness_need_hover(ask: &crate::needs::HarnessAsk) -> Vec<String> 
     lines
 }
 
-/// WHO DRIVES, IN THE CHIP'S OWN WORDS (§12.4.1; §12.4.3, item 1).
+/// WHO DRIVES, IN THE CHIP'S OWN WORDS (§12.4.1; §12.4.3, item 1). `landed_said`: the row these
+/// words end already says `landed` (the Overview's `task landed 17m`), so a landed chip says only
+/// `land` there; the tab's hover, which has no task words, passes `false` and keeps `land, landed`
+/// (§14.6).
 #[must_use]
 pub(crate) fn driven_words(
     face: crate::claude_lights::ChipFace,
     glass: &crate::claude_lights::ChipGlass,
     hold: Option<&crate::harness_glass::HeldGlass>,
+    landed_said: bool,
 ) -> Option<String> {
     use crate::claude_lights::ChipFace;
     let words = match face {
@@ -1940,6 +1945,7 @@ pub(crate) fn driven_words(
             Some(why) => format!("land: {why}"),
             None => "land".to_owned(),
         },
+        ChipFace::Landed if landed_said => "land".to_owned(),
         ChipFace::Landed | ChipFace::Theirs => format!("land, {}", face.word()?),
         ChipFace::Off | ChipFace::MasterOff | ChipFace::AgentOff(_) | ChipFace::Unhosted => {
             return None;

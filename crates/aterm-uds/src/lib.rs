@@ -87,6 +87,9 @@ pub mod listener;
 /// Local interface addresses for retry decisions, read without connecting a socket.
 #[cfg(unix)]
 pub mod network;
+/// Unix-only: paths read without following a link anywhere on them (macOS's `O_NOFOLLOW_ANY`): what is at one, an event-only watch descriptor and the kqueue that hears it, and a reader of a regular file alone that never blocks on a FIFO; off macOS, `Unsupported`.
+#[cfg(unix)]
+pub mod nofollow;
 /// Captured subprocess output, optionally delegated to a caller-owned executor.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod output;

@@ -2125,6 +2125,17 @@ mod tests {
         );
     }
 
+    /// A child killed and reaped when it drops, so a failed assertion or a hang detector leaves
+    /// nothing running (`top -l 0` samples forever).
+    struct KilledOnDrop(crate::spawnfd::Child);
+
+    impl Drop for KilledOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// A process of this user's that becomes a set-user-ID program after a scan lists it
     /// (`/bin/ps` run from a shell, measured leaving every scan unknown under a `ps` loop) is
     /// outside the scan, as it is once listed so; `top` is one that stays to be read.
@@ -2138,14 +2149,16 @@ mod tests {
         let tmp = aterm_tempfile::tempdir().expect("tempdir");
         let sought = tmp.path().join("sought");
         std::fs::write(&sought, b"sought").expect("write");
-        let mut top = crate::spawnfd::command("/usr/bin/top")
-            .args(["-l", "0", "-s", "60"])
-            .stdin(crate::spawnfd::Stdio::null())
-            .stdout(crate::spawnfd::Stdio::null())
-            .stderr(crate::spawnfd::Stdio::null())
-            .spawn()
-            .expect("spawn top");
-        let pid = top.id();
+        let top = KilledOnDrop(
+            crate::spawnfd::command("/usr/bin/top")
+                .args(["-l", "0", "-s", "60"])
+                .stdin(crate::spawnfd::Stdio::null())
+                .stdout(crate::spawnfd::Stdio::null())
+                .stderr(crate::spawnfd::Stdio::null())
+                .spawn()
+                .expect("spawn top"),
+        );
+        let pid = top.0.id();
         let started = Instant::now();
         while crate::process::read_short_info(i32::try_from(pid).expect("a pid"))
             .is_none_or(|info| info.pbsi_uid == me)
@@ -2156,8 +2169,7 @@ mod tests {
         let key = file_key(&sought);
         let read = super::read_table(pid, &[key], Lookup::BY_FILE);
         let asked = super::process_holds_rdev(pid, u64::from(u32::MAX - 1));
-        let _ = top.kill();
-        let _ = top.wait();
+        drop(top);
         assert_eq!(read, [TableRead::Left], "outside this user's scan");
         assert_eq!(asked, None, "asked of that process alone, unknown");
     }

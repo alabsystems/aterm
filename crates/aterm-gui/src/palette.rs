@@ -255,6 +255,8 @@ pub(crate) struct PaletteLive {
     pub maximized: bool,
     /// Whether the front tab is split (Close Pane vs Close Tab).
     pub front_tab_split: bool,
+    /// Whether the focused pane records its screen, so Rewind can open on it.
+    pub can_rewind: bool,
     /// Whether the front window has more than one tab.
     pub multi_tab: bool,
     /// Whether the active tab is a native app rather than a terminal pane tree.
@@ -342,10 +344,10 @@ impl PaletteState {
                     });
                 }
             }
-            if section.title == crate::menu::PALETTE_ONLY_SECTION {
-                for (label, action) in crate::menu::PALETTE_ONLY {
+            for (group, label, action) in crate::menu::PALETTE_ONLY {
+                if *group == section.title && action.offered_on_this_platform() {
                     rows.push(PaletteRow {
-                        section: Cow::Borrowed(crate::menu::PALETTE_ONLY_SECTION),
+                        section: Cow::Borrowed(group),
                         label: Cow::Borrowed(label),
                         action: PaletteTarget::Menu(*action),
                         menu_alias: None,
@@ -653,6 +655,7 @@ impl PaletteState {
                             == action.deck_size_pref().unwrap_or_default(),
                     );
                 }
+                MenuAction::RewindPane => row.enabled = live.terminal_front && live.can_rewind,
                 MenuAction::ToggleStatsLens => {
                     row.enabled = live
                         .stats_bars
@@ -1850,7 +1853,11 @@ mod tests {
             .flat_map(crate::menu::MenuEntry::items)
             .filter(|(_, action, _, _)| action.offered_on_this_platform())
             .count();
-        assert_eq!(s.rows.len(), model_items + crate::menu::PALETTE_ONLY.len());
+        let palette_only = crate::menu::PALETTE_ONLY
+            .iter()
+            .filter(|(_, _, action)| action.offered_on_this_platform())
+            .count();
+        assert_eq!(s.rows.len(), model_items + palette_only);
         let mut chips: Vec<&str> = s.rows.iter().map(|r| r.section.as_ref()).collect();
         chips.dedup();
         let mut bar = vec![
@@ -1860,14 +1867,16 @@ mod tests {
             bar.rotate_left(1);
         }
         assert_eq!(chips, bar);
-        for (_, action) in crate::menu::PALETTE_ONLY {
-            let row = s
-                .rows
-                .iter()
-                .find(|r| r.action == *action)
-                .unwrap_or_else(|| panic!("{action:?} has a palette row"));
-            assert_eq!(row.section, crate::menu::PALETTE_ONLY_SECTION);
-            assert_eq!(s.action_by_name(&format!("{action:?}")), Ok(*action));
+        for (section, _, action) in crate::menu::PALETTE_ONLY {
+            let rows: Vec<_> = s.rows.iter().filter(|r| r.action == *action).collect();
+            if action.offered_on_this_platform() {
+                assert_eq!(rows.len(), 1, "{action:?} has one palette row");
+                assert_eq!(rows[0].section, *section);
+                assert_eq!(s.action_by_name(&format!("{action:?}")), Ok(*action));
+            } else {
+                assert!(rows.is_empty(), "{action:?} is not offered");
+                assert!(s.action_by_name(&format!("{action:?}")).is_err());
+            }
         }
     }
 
@@ -2766,7 +2775,8 @@ mod tests {
         assert!(s.rows.iter().any(|r| r.action == MenuAction::ApplyUpdate));
     }
 
-    /// "Check for Updates…" is listed, and enabled, here exactly where the `chrome` verb's menu lines list it: both read [`MenuAction::offered_on_this_platform`].
+    /// Update commands remain available in the palette and control interface
+    /// where the platform has an updater, without a separate menu-bar row.
     #[test]
     fn update_rows_follow_the_platform_updater_on_every_surface() {
         let mut s = PaletteState::new();
@@ -2804,10 +2814,7 @@ mod tests {
             !chrome.iter().any(|line| line.contains("Install")),
             "nothing staged: `chrome` lists no install row either: {chrome:?}"
         );
-        assert_eq!(
-            chrome_offers, enabled,
-            "`chrome` lists the row exactly where `controls menu` enables it"
-        );
+        assert!(!chrome_offers, "updates live inside Settings: {chrome:?}");
         assert_eq!(
             s.controls_lines()
                 .iter()

@@ -1541,6 +1541,19 @@ mod writes_tests {
         })
     }
 
+    /// A child killed and reaped when it drops, so a failed assertion or a hang detector leaves
+    /// nothing running (`top -l 0` samples forever).
+    #[cfg(target_vendor = "apple")]
+    struct KilledOnDrop(crate::spawnfd::Child);
+
+    #[cfg(target_vendor = "apple")]
+    impl Drop for KilledOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// A process of this user's that became a set-user-ID program after the listing (`/bin/ps`
     /// run from a shell, measured refusing the disk sweep's scan under a `ps` loop) is outside
     /// the scan, not unread; `top` is one that stays to be read, handed to the scan as the
@@ -1553,14 +1566,16 @@ mod writes_tests {
         assert_ne!(me, 0, "a scan as root reads every process");
         let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
         let dir = tmp.path().canonicalize().expect("canonical scratch dir");
-        let mut top = crate::spawnfd::command("/usr/bin/top")
-            .args(["-l", "0", "-s", "60"])
-            .stdin(crate::spawnfd::Stdio::null())
-            .stdout(crate::spawnfd::Stdio::null())
-            .stderr(crate::spawnfd::Stdio::null())
-            .spawn()
-            .expect("spawn top");
-        let pid = top.id();
+        let top = KilledOnDrop(
+            crate::spawnfd::command("/usr/bin/top")
+                .args(["-l", "0", "-s", "60"])
+                .stdin(crate::spawnfd::Stdio::null())
+                .stdout(crate::spawnfd::Stdio::null())
+                .stderr(crate::spawnfd::Stdio::null())
+                .spawn()
+                .expect("spawn top"),
+        );
+        let pid = top.0.id();
         let started = std::time::Instant::now();
         while crate::process::read_short_info(i32::try_from(pid).expect("a pid"))
             .is_none_or(|info| info.pbsi_uid == me)
@@ -1572,8 +1587,7 @@ mod writes_tests {
             std::thread::yield_now();
         }
         let scan = super::scan_path_users_of(&[pid], std::slice::from_ref(&dir), &[]);
-        let _ = top.kill();
-        let _ = top.wait();
+        drop(top);
         let scan = scan.expect("scan");
         assert_eq!(scan.scanned, 1, "{scan:?}");
         assert!(

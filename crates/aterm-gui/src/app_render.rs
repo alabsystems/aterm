@@ -2986,7 +2986,7 @@ fn unlifted_rail_h(want: u16, room: (usize, usize)) -> Option<u16> {
         .find(|&h| aterm_render::chrome_fit(&find_rail(0, 0..1, [0; 3], h), room).0 == 0)
 }
 
-fn clear_find_row_lists(input: &mut RenderInput, frame_row: usize) {
+pub(crate) fn clear_find_row_lists(input: &mut RenderInput, frame_row: usize) {
     if let Some(c) = input.clusters.get_mut(frame_row) {
         c.clear();
     }
@@ -3010,7 +3010,7 @@ fn clear_find_row_lists(input: &mut RenderInput, frame_row: usize) {
     }
 }
 
-fn splice_find_row_span(
+pub(crate) fn splice_find_row_span(
     input: &mut RenderInput,
     frame_row: usize,
     col0: usize,
@@ -4695,6 +4695,28 @@ struct FocusedComposedCursorEffects<'a> {
     trail_color: u32,
     active_cursor_fill: Option<u32>,
     fx_layers: &'a [aterm_core::render::FxLayer],
+    /// The focused pane's text holds the GPU's bloom ([`RenderInput::bloom_gate`]).
+    bloom_held: bool,
+    /// The pet's veil its last pet tick laid ([`aterm_effects::cursor_glow::CursorGlow::pet_veil`]),
+    /// projected with the under stream on a frame that runs no pet tick (empty
+    /// on a full frame, whose word publish lays it afresh).
+    pet_veil: &'a [aterm_core::render::GlowQuad],
+}
+
+/// Keep `quads` to the composed pane `clip` ([`project_focused_composed_cursor_effects`]).
+fn clip_glow_quads(quads: &mut Vec<aterm_core::render::GlowQuad>, clip: &ComposedCursorEffectClip) {
+    quads.retain_mut(|quad| {
+        let x0 = quad.x.max(clip.x0);
+        let y0 = quad.y.max(clip.y0);
+        let x1 = quad.x.saturating_add(quad.w).min(clip.x1);
+        let y1 = quad.y.saturating_add(quad.h).min(clip.y1);
+        if x1 > x0 && y1 > y0 {
+            (quad.x, quad.y, quad.w, quad.h) = (x0, y0, x1 - x0, y1 - y0);
+            true
+        } else {
+            false
+        }
+    });
 }
 
 fn project_focused_composed_cursor_effects(
@@ -4712,6 +4734,7 @@ fn project_focused_composed_cursor_effects(
     dst.fire_halo.clear();
     dst.cursor_trail.clear();
     dst.cursor_effect_style_override = None;
+    dst.bloom_gate = aterm_core::render::BloomGate::of(effects.bloom_held);
 
     let Some(clip) = clip else {
         withdraw_fx_layers(&mut dst.fx_layers, effects.fx_layers);
@@ -4725,6 +4748,7 @@ fn project_focused_composed_cursor_effects(
     dst.glow_halo.extend_from_slice(effects.glow_halo);
     dst.fire_patch.extend_from_slice(effects.fire_patch);
     dst.glow_under.extend_from_slice(effects.glow_under);
+    dst.glow_under.extend_from_slice(effects.pet_veil);
     dst.char_fg.extend_from_slice(effects.char_fg);
     dst.fire_halo.extend_from_slice(effects.fire_halo);
     dst.cursor_trail.extend_from_slice(effects.trail);
@@ -4748,14 +4772,7 @@ fn project_focused_composed_cursor_effects(
             }
             None => false,
         });
-    dst.glow_under
-        .retain_mut(|quad| match clip_quad(quad.x, quad.y, quad.w, quad.h) {
-            Some((x, y, w, h)) => {
-                (quad.x, quad.y, quad.w, quad.h) = (x, y, w, h);
-                true
-            }
-            None => false,
-        });
+    clip_glow_quads(&mut dst.glow_under, &clip);
     dst.glow_halo
         .retain_mut(|quad| match clip_quad(quad.x, quad.y, quad.w, quad.h) {
             Some((x, y, w, h)) => {
@@ -6656,7 +6673,7 @@ fn delivery_for_window(
 fn send_window_reports(s: &crate::Session, reports: Option<Vec<u8>>) {
     if let Some(report) = reports {
         crate::app_input::write_ui_report(
-            &s.term,
+            s.live_term(),
             &s.ctx.modes,
             &s.ctx.sink,
             &crate::input::InputEvent::KeySequence(report),
@@ -6784,7 +6801,7 @@ impl App {
             if let Some((term, ui_waiting)) = self
                 .pool
                 .get(id)
-                .map(|s| (s.term.clone(), s.ctx.ui_waiting.clone()))
+                .map(|s| (s.live_term().clone(), s.ctx.ui_waiting.clone()))
             {
                 let gliding: Vec<WindowId> = self
                     .windows
@@ -6811,7 +6828,7 @@ impl App {
             let policy = pty_resize_policy(s.master);
             let (pending, journal, cast_stamp) = {
                 let site = crate::metrics::TermWaitSite::Redraw;
-                let mut term = crate::term_lock_ui(&s.term, &s.ctx.ui_waiting, site);
+                let mut term = crate::term_lock_ui(s.live_term(), &s.ctx.ui_waiting, site);
                 if let Some((cw, ch)) = pane_cell_px {
                     term.set_cell_pixel_size(cw, ch);
                     s.ctx.crash_journal.host_settings(&term, None);
@@ -6845,7 +6862,7 @@ impl App {
             if let Some((pending, rewrap)) = pending {
                 let job = std::sync::Arc::new(std::sync::Mutex::new(Some((
                     pending,
-                    s.term.clone(),
+                    s.live_term().clone(),
                     reflow_wake_proxy.clone(),
                     rewrap,
                 ))));
@@ -7069,7 +7086,7 @@ impl App {
             if let Some(s) = self.pool.get(id) {
                 let (grid, pulse_holds, reports) = {
                     let site = crate::metrics::TermWaitSite::Redraw;
-                    let mut term = crate::term_lock_ui(&s.term, &s.ctx.ui_waiting, site);
+                    let mut term = crate::term_lock_ui(s.live_term(), &s.ctx.ui_waiting, site);
                     term.set_cell_pixel_size(px.0, px.1);
                     s.ctx.crash_journal.host_settings(&term, None);
                     (
@@ -7133,7 +7150,7 @@ impl App {
             return;
         };
         let term = crate::term_lock_ui(
-            &s.term,
+            s.live_term(),
             &s.ctx.ui_waiting,
             crate::metrics::TermWaitSite::Redraw,
         );
@@ -8097,6 +8114,7 @@ impl App {
             glow_scratch,
             glow: cursor_glow,
             trail_scratch,
+            bloom_held,
             ..
         } = fx.cursor();
         if valid {
@@ -8113,6 +8131,8 @@ impl App {
                     trail_color,
                     active_cursor_fill,
                     fx_layers: &[],
+                    bloom_held: *bloom_held,
+                    pet_veil: cursor_glow.pet_veil(),
                 },
                 clip,
                 cursor_override,
@@ -8132,6 +8152,8 @@ impl App {
                     trail_color: 0,
                     active_cursor_fill: None,
                     fx_layers: &[],
+                    bloom_held: *bloom_held,
+                    pet_veil: &[],
                 },
                 None,
                 cursor_override,
@@ -8179,10 +8201,17 @@ impl App {
             }
             return self.project_retained_composed_cursor_effects(wid, None, None);
         };
+        if self.pool.is_rewound(terminal_view.session) {
+            if let Some(window) = self.windows.get_mut(&wid) {
+                window.composed_cursor_effect_valid = false;
+                window.composed_cursor_effect_session = None;
+            }
+            return self.project_retained_composed_cursor_effects(wid, None, None);
+        }
         let Some((term, ui_waiting)) = self
             .pool
-            .get(terminal_view.session)
-            .map(|s| (s.term.clone(), s.ctx.ui_waiting.clone()))
+            .shown(terminal_view.session)
+            .map(|(term, s)| (term, s.ctx.ui_waiting.clone()))
         else {
             return false;
         };
@@ -9354,9 +9383,9 @@ impl App {
                     else {
                         return None;
                     };
-                    let session = self.pool.get(terminal_view.session)?;
+                    let (term, session) = self.pool.shown(terminal_view.session)?;
                     let site = crate::metrics::TermWaitSite::Redraw;
-                    let term = crate::term_lock_ui(&session.term, &session.ctx.ui_waiting, site);
+                    let term = crate::term_lock_ui(&term, &session.ctx.ui_waiting, site);
                     Some(SyncObservation {
                         terminal_id: term.render_identity(),
                         active: term.modes().synchronized_output(),
@@ -9453,8 +9482,8 @@ impl App {
                 crate::tab_model::View::Terminal(terminal_view) => {
                     let Some((term, ui_waiting)) = self
                         .pool
-                        .get(terminal_view.session)
-                        .map(|s| (s.term.clone(), s.ctx.ui_waiting.clone()))
+                        .shown(terminal_view.session)
+                        .map(|(term, s)| (term, s.ctx.ui_waiting.clone()))
                     else {
                         abandoned = true;
                         break;
@@ -10808,7 +10837,7 @@ impl App {
                 return;
             }
         };
-        let Some(front_terminal) = self.front_terminal_mirror(id) else {
+        let Some(front_terminal) = self.shown_front(id) else {
             return;
         };
         if self.windows.get(&id).is_some_and(|ws| ws.panes_stale) {
@@ -10913,7 +10942,9 @@ impl App {
                         .allows(crate::motion::SeriousEffect::CursorCat),
                 pet_glow.style,
             );
-            let rain_session_on = self.session_rain_enabled(front_terminal.session);
+            let rewound = self.pool.is_rewound(front_terminal.session);
+            let rewind_fp = if rewound { self.rewind_frame_fp(id) } else { 0 };
+            let rain_session_on = self.session_rain_enabled(front_terminal.session) && !rewound;
             let overlay_inputs = self.pane_overlay_inputs(id, false);
             let question = self.question_key(id);
             let Some(ws) = self.windows.get_mut(&id) else {
@@ -10969,8 +11000,9 @@ impl App {
             let cursor_recoloured = term.cursor_color_recoloured();
             let epoch = term.damage_epoch();
             let content_seq = term.content_seq();
-            let cmd_done = term
-                .last_completed_command()
+            let cmd_done = (!rewound)
+                .then(|| term.last_completed_command())
+                .flatten()
                 .and_then(|m| Some((term.completed_command_seq(), m.exit_code?)));
             let cmd_dur_ms = term
                 .last_completed_command()
@@ -10996,6 +11028,7 @@ impl App {
                 return;
             }
             let display_offset = term.grid().display_offset();
+            let live_view = display_offset == 0 && !rewound;
             let scrollback_lines = term.grid().scrollback_lines();
             let content_scroll_state = term.content_scroll_state();
             sync_cursor_effect_coordinate_space(ws, terminal_id, is_alt);
@@ -11023,7 +11056,7 @@ impl App {
                 ws.fx.cursor_mut().glow.drop_row_probe();
             }
             let mut row_probe_neighbors = None;
-            let row_probe = if cursor_fx_live && display_offset == 0 && !scroll_change.changed() {
+            let row_probe = if cursor_fx_live && live_view && !scroll_change.changed() {
                 let reads_neighbor_rows = ws.fx.cursor_mut().glow.reads_neighbor_rows();
                 let (_, neighbor_above, neighbor_below) = ws.single_pane_row_probe_cache.sample(
                     &term,
@@ -11063,7 +11096,7 @@ impl App {
                 Some((cpos.row, cpos.col, probe_trust))
             } else {
                 ws.single_pane_row_probe_cache.invalidate();
-                if cursor_fx_live && display_offset == 0 && scroll_change.translated_only() {
+                if cursor_fx_live && live_view && scroll_change.translated_only() {
                     let glow = &mut ws.fx.cursor_mut().glow;
                     glow.capture_ribbon_row(cpos.row, |cols| {
                         term.row_cols_into(usize::from(cpos.row), cols);
@@ -11088,7 +11121,7 @@ impl App {
                     .sparkle
                     .as_ref()
                     .is_some_and(|rs| rs.cfg.suppress_in_alt_screen);
-            let deco_suspend = deco_suppress_alt || load_shed;
+            let deco_suspend = deco_suppress_alt || load_shed || rewound;
             let rain_suppress_alt = is_alt && rain_cfg.is_some_and(|c| c.suppress_in_alt_screen);
             let rain_suspend = rain_suppress_alt || load_shed || !rain_session_on;
             if rain_cfg.is_some() && !rain_suspend && !sync_hold {
@@ -11126,10 +11159,12 @@ impl App {
             let pet_world_facts = pet_console_owned.then(|| {
                 aterm_effects::pet_world::PetWorldFacts::read(&term, front_terminal.session)
             });
-            ws.fx.look_mut().resolve_claim(
-                front_terminal.session,
-                term.current_block().or_else(|| term.all_blocks().last()),
-            );
+            if !rewound {
+                ws.fx.look_mut().resolve_claim(
+                    front_terminal.session,
+                    term.current_block().or_else(|| term.all_blocks().last()),
+                );
+            }
             let pred_no_echo = is_alt || term.kitty_suppresses_predictive_echo();
             let pred_coords = content_scroll_state.coordinate_generation();
             let pred_blank = terminal_blank_cell(&term);
@@ -11138,8 +11173,8 @@ impl App {
             #[cfg(test)]
             redraw_hold_hook::after_terminal_hold();
             single_pane_ime_caret = Some(((cpos.row, cpos.col), cursor_visible));
-            single_pane_pred_sample = Some((display_offset != 0, pred_blank));
-            let cur = (display_offset == 0).then_some((cpos.row, cpos.col));
+            single_pane_pred_sample = Some((!live_view, pred_blank));
+            let cur = live_view.then_some((cpos.row, cpos.col));
             let cur_drawn = cursor_visible;
             let Some(fx) = self.cursor_frame_for_present(
                 id,
@@ -11149,7 +11184,7 @@ impl App {
                     rows,
                     cols,
                     cur,
-                    live_viewport: display_offset == 0,
+                    live_viewport: live_view,
                     cursor_visible,
                     hidden_withheld,
                     cursor_style,
@@ -11160,10 +11195,8 @@ impl App {
                     default_fg: default_fg_u32,
                     row_probe,
                     row_probe_neighbors,
-                    print_anchor: (display_offset == 0).then_some(print_anchor).flatten(),
-                    print_anchor_glyph: (display_offset == 0)
-                        .then_some(print_anchor_glyph)
-                        .flatten(),
+                    print_anchor: live_view.then_some(print_anchor).flatten(),
+                    print_anchor_glyph: live_view.then_some(print_anchor_glyph).flatten(),
                     pane_text: None,
                 },
             ) else {
@@ -11235,7 +11268,7 @@ impl App {
             let words_presentable = sparkle_words_presentable(word_focus, deco_suspend);
             let cursor_companion_presentable = cursor_companion_presentable(
                 shed_companion_presentable(cursor_companions_allowed && win_focused, shed_envelope),
-                display_offset == 0,
+                live_view,
             );
             ws.fx
                 .companions_mut()
@@ -11388,7 +11421,7 @@ impl App {
                     sync_end_seq,
                     sync_end_caret,
                     display_offset: i32::try_from(display_offset).unwrap_or(i32::MAX),
-                    live_viewport: display_offset == 0,
+                    live_viewport: live_view,
                     content_seq,
                     wrap_serial,
                     scrolled: scroll_change.changed(),
@@ -11417,7 +11450,7 @@ impl App {
                     flying_alpha,
                 },
                 focused: win_focused,
-                obscured: ws.overlay_open() || ws.tab_menu.is_some(),
+                obscured: ws.overlay_open() || ws.tab_menu.is_some() || rewound,
                 pane: None,
                 room: Some(room_facts(
                     self.pool.get(front_terminal.session),
@@ -11502,7 +11535,7 @@ impl App {
                             epoch,
                             rescan: deco_rescan.then_some(aterm_effects::pipeline::WordRescan {
                                 birth: frame_started,
-                                cursor: (display_offset == 0).then_some((cpos.row, cpos.col)),
+                                cursor: live_view.then_some((cpos.row, cpos.col)),
                             }),
                             companion_at,
                             sel: crate::word_decorations::SelView {
@@ -11670,7 +11703,7 @@ impl App {
                 s_enabled,
                 motion.animate(crate::motion::MotionEffect::OutputStreak),
                 s_intensity,
-                is_alt || display_offset != 0,
+                is_alt || !live_view,
             );
             let streak = ws.fx.streak_grid(
                 (!streak_inert)
@@ -11907,6 +11940,7 @@ impl App {
                 system_dark: repaint_system_dark(self.os_appearance),
                 link_caption: ws.link_hover,
                 claude_footer_fp,
+                rewind_fp,
             };
             if !deco_rescan
                 && !rain_refresh
@@ -12181,7 +12215,7 @@ impl App {
                         meta.presentation_value_into("title", slot)
                     };
                     if !has_user_title {
-                        let term = match s.term.try_lock() {
+                        let term = match s.live_term().try_lock() {
                             Ok(t) => t,
                             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
                             Err(std::sync::TryLockError::WouldBlock) => {
@@ -13192,7 +13226,7 @@ impl App {
                 else {
                     return None;
                 };
-                let term = self.pool.get(terminal.session)?.term.clone();
+                let term = self.pool.shown_term(terminal.session)?;
                 let row = leaf.rect.origin.y.round().max(0.0) as usize;
                 let col = leaf.rect.origin.x.round().max(0.0) as usize;
                 let pane_rows = (leaf.rect.size.height.round() as usize).max(1);
@@ -13307,7 +13341,7 @@ impl App {
                     content_seq,
                 });
                 let display_offset = term.grid().display_offset();
-                let live_viewport = display_offset == 0;
+                let live_viewport = display_offset == 0 && !self.pool.is_rewound(*session);
                 let cursor = term.cursor();
                 let focus = TerminalCaptureFocus {
                     view: *view,
@@ -13519,7 +13553,7 @@ impl App {
                 ws.input_scratch.history_renumber_epoch = ws.pane_scratch.history_renumber_epoch;
                 focused_cursor_rgb = Some(terminal_cursor_rgb(&term));
                 let display_offset = term.grid().display_offset();
-                let live_viewport = display_offset == 0;
+                let live_viewport = display_offset == 0 && !self.pool.is_rewound(session);
                 capture_focus = Some(TerminalCaptureFocus {
                     view,
                     session,
@@ -13686,9 +13720,11 @@ impl App {
             return 0;
         };
         ws.fx.retain_streak_panes(|session, pane_index| {
-            ctx.panes
-                .get(pane_index)
-                .is_some_and(|(pane, _)| pane.session == session)
+            !pool.is_rewound(session)
+                && ctx
+                    .panes
+                    .get(pane_index)
+                    .is_some_and(|(pane, _)| pane.session == session)
         });
         if resolved.inert() {
             ws.fx.clear_streak_panes();
@@ -13702,6 +13738,9 @@ impl App {
             &ws.unfocused_pane_scratch,
         );
         for (index, (r, _)) in ctx.panes.iter().enumerate() {
+            if pool.is_rewound(r.session) {
+                continue;
+            }
             let place = PanePlace {
                 row_off: r.row_off,
                 col_off: r.col_off,
@@ -13888,12 +13927,14 @@ impl App {
         let tick_cfg = reduced_cfg.as_ref().unwrap_or(deco_cfg);
         let kitty_log = &mut self.kitty_log;
         let trail_audio = &mut self.trail_audio;
+        let pool = &self.pool;
         let Some(ws) = self.windows.get_mut(&wid) else {
             return 0;
         };
         ws.fx.open_words();
-        ws.fx
-            .retain_word_panes(|s| ctx.panes.iter().any(|(r, _)| r.session == s));
+        ws.fx.retain_word_panes(|s| {
+            !pool.is_rewound(s) && ctx.panes.iter().any(|(r, _)| r.session == s)
+        });
         let companion_at =
             companion_focus_place.and_then(|_| routed.on_glass(ctx.escort_caret, ctx.pet.body_px));
         let resize_quiet = ws.resize_sound_quiet(ctx.now);
@@ -13903,33 +13944,38 @@ impl App {
             &ws.unfocused_pane_scratch,
         );
         let mut wince_hits = 0u8;
-        let panes = ctx.panes.iter().enumerate().map(|(index, (r, _))| {
-            let focused = index == ctx.focus_index;
-            let snapshot = if focused {
-                Some(focus_snapshot)
-            } else {
-                background_snapshots.get(&index)
-            };
-            aterm_effects::pipeline::WordPane {
-                session: r.session,
-                focused,
-                place: place_of(r),
-                grid: snapshot.map(|snapshot| aterm_effects::pipeline::PaneGrid {
-                    cells: &snapshot.cells,
-                    line_sizes: &snapshot.line_sizes,
-                    base_y: snapshot.base_y,
-                    default_bg: snapshot.default_bg,
-                    epoch: snapshot.snapshot_seq,
-                    alt: snapshot.engine_alt,
-                    display_offset: snapshot.display_offset,
-                    cursor: (
-                        u16::try_from(snapshot.cursor_row).unwrap_or(u16::MAX),
-                        u16::try_from(snapshot.cursor_col).unwrap_or(u16::MAX),
-                    ),
-                    sel: &snapshot.selection,
-                }),
-            }
-        });
+        let panes = ctx
+            .panes
+            .iter()
+            .enumerate()
+            .filter(|(_, (r, _))| !pool.is_rewound(r.session))
+            .map(|(index, (r, _))| {
+                let focused = index == ctx.focus_index;
+                let snapshot = if focused {
+                    Some(focus_snapshot)
+                } else {
+                    background_snapshots.get(&index)
+                };
+                aterm_effects::pipeline::WordPane {
+                    session: r.session,
+                    focused,
+                    place: place_of(r),
+                    grid: snapshot.map(|snapshot| aterm_effects::pipeline::PaneGrid {
+                        cells: &snapshot.cells,
+                        line_sizes: &snapshot.line_sizes,
+                        base_y: snapshot.base_y,
+                        default_bg: snapshot.default_bg,
+                        epoch: snapshot.snapshot_seq,
+                        alt: snapshot.engine_alt,
+                        display_offset: snapshot.display_offset,
+                        cursor: (
+                            u16::try_from(snapshot.cursor_row).unwrap_or(u16::MAX),
+                            u16::try_from(snapshot.cursor_col).unwrap_or(u16::MAX),
+                        ),
+                        sel: &snapshot.selection,
+                    }),
+                }
+            });
         let out = fx.word_panes(
             &aterm_effects::pipeline::WordPanes {
                 now: ctx.now,
@@ -14477,7 +14523,7 @@ impl App {
         let mut rain_suspend = true;
         let panes: Vec<(pane::PaneRect, Arc<Mutex<Terminal>>)> = rects
             .iter()
-            .map(|r| self.pool.get(r.session).map(|s| (*r, s.term.clone())))
+            .map(|r| self.pool.shown_term(r.session).map(|term| (*r, term)))
             .collect::<Option<_>>()?;
         {
             let ws = self.windows.get_mut(&wid)?;
@@ -14517,7 +14563,8 @@ impl App {
             metrics::note_redraw_sync_hold();
             return None;
         }
-        let rain_session_on = self.session_rain_enabled(focus);
+        let focus_rewound = self.pool.is_rewound(focus);
+        let rain_session_on = self.session_rain_enabled(focus) && !focus_rewound;
         let load_shed = self.load_shed_active();
         let rain_cfg = self.rain.filter(|_| {
             rain_session_on
@@ -14624,12 +14671,14 @@ impl App {
                     focus_snapshot_valid = true;
                     focus_world_facts = pet_console_owned
                         .then(|| aterm_effects::pet_world::PetWorldFacts::read(&term, focus));
-                    ws.fx.look_mut().resolve_claim(
-                        focus,
-                        term.current_block().or_else(|| term.all_blocks().last()),
-                    );
+                    if !focus_rewound {
+                        ws.fx.look_mut().resolve_claim(
+                            focus,
+                            term.current_block().or_else(|| term.all_blocks().last()),
+                        );
+                    }
                     let d_off = term.grid().display_offset();
-                    focus_scrolled = d_off != 0;
+                    focus_scrolled = d_off != 0 || focus_rewound;
                     focus_no_echo =
                         term.is_alternate_screen() || term.kitty_suppresses_predictive_echo();
                     let content_scroll_state = term.content_scroll_state();
@@ -14661,7 +14710,7 @@ impl App {
                         .last_blink_at
                         .is_some_and(|t| now.saturating_duration_since(t) <= BLINK_RECENT_MAX);
                     let pane_probe_trust = row_probe_trust(pane_alt, blink_recent);
-                    focus_probe = if d_off == 0 && !scroll_change.changed() {
+                    focus_probe = if !focus_scrolled && !scroll_change.changed() {
                         let _fill = term.row_cols_into(cp.row as usize, &mut ws.poof_row_buf);
                         (focus_probe_above, focus_probe_below) = capture_cursor_neighbor_rows(
                             &term,
@@ -14677,7 +14726,7 @@ impl App {
                     };
                     let (anchor, anchor_glyph) = aterm_effects::host::motion_print_anchor(&term);
                     focus_print_anchor =
-                        (d_off == 0)
+                        (!focus_scrolled)
                             .then_some(anchor)
                             .flatten()
                             .map(|(ar, ac, seq)| {
@@ -14687,14 +14736,15 @@ impl App {
                                     seq,
                                 )
                             });
-                    focus_print_anchor_glyph = (d_off == 0).then_some(anchor_glyph).flatten();
+                    focus_print_anchor_glyph = (!focus_scrolled).then_some(anchor_glyph).flatten();
                     focus_scrolled_rows = usize::from(scroll_change.translated_rows)
                         + usize::from(scroll_change.invalidated)
                         + usize::from(scroll_change.band_moves);
                     focus_epoch = term.damage_epoch();
                     focus_content_seq = term.content_seq();
-                    focus_cmd_done = term
-                        .last_completed_command()
+                    focus_cmd_done = (!focus_rewound)
+                        .then(|| term.last_completed_command())
+                        .flatten()
                         .and_then(|m| Some((term.completed_command_seq(), m.exit_code?)));
                     focus_cmd_dur_ms = term
                         .last_completed_command()
@@ -14742,6 +14792,7 @@ impl App {
                 );
                 metrics::note_frame_refill(refill);
                 if staged_seq != 0
+                    && !self.pool.is_rewound(r.session)
                     && aterm_effects::companion::pet_output_burst(
                         false,
                         staged.content_seq > staged_seq,
@@ -15081,7 +15132,7 @@ impl App {
                     flying_alpha,
                 },
                 focused,
-                obscured: ws.overlay_open() || ws.tab_menu.is_some(),
+                obscured: ws.overlay_open() || ws.tab_menu.is_some() || focus_rewound,
                 pane: Some((
                     focus,
                     (
@@ -15304,6 +15355,7 @@ impl App {
             system_dark: repaint_system_dark(self.os_appearance),
             link_caption: self.windows.get(&wid).and_then(|ws| ws.link_hover),
             claude_footer_fp: self.claude_footer_fp(wid, plan),
+            rewind_fp: self.rewind_frame_fp(wid),
         };
         let recovery_redraw_outstanding = self
             .windows
@@ -15580,6 +15632,8 @@ impl App {
                 trail_color,
                 active_cursor_fill,
                 fx_layers: &[],
+                bloom_held: cursor_fx.bloom_held,
+                pet_veil: &[],
             },
             pane_clip,
             cursor_override,
@@ -15596,7 +15650,14 @@ impl App {
         ws.composed_cursor_style_override = body_style_override;
         ws.composed_cursor_trail_color = trail_color;
         ws.fx.publish_rain(&mut ws.input_scratch);
+        let under_from = ws.input_scratch.glow_under.len();
         ws.fx.publish_words(&mut ws.input_scratch);
+        // The pet's veil the word publish laid keeps to the focused pane as
+        // the trail's streams do, and goes where they were withdrawn.
+        match &pane_clip {
+            Some(clip) => clip_glow_quads(&mut ws.input_scratch.glow_under, clip),
+            None => ws.input_scratch.glow_under.truncate(under_from),
+        }
         if let Some((pr, pc)) = focus_pred_cursor {
             ws.input_scratch.cursor_row = focus_off.0 as usize + usize::from(pr);
             ws.input_scratch.cursor_col =
@@ -17198,8 +17259,8 @@ impl App {
             };
             let Some((term, ui_waiting)) = self
                 .pool
-                .get(session)
-                .map(|entry| (entry.term.clone(), entry.ctx.ui_waiting.clone()))
+                .shown(session)
+                .map(|(term, entry)| (term, entry.ctx.ui_waiting.clone()))
             else {
                 continue;
             };
@@ -17458,7 +17519,7 @@ impl App {
         if let Some(scroll_state) = self
             .focused_session_id(wid)
             .and_then(|id| self.session_by_id(id))
-            .map(|s| term_lock(&s.term).content_scroll_state())
+            .map(|s| term_lock(s.live_term()).content_scroll_state())
             && let Some(ws) = self.windows.get_mut(&wid)
         {
             ws.fx.set_scroll_baseline(Some(scroll_state));

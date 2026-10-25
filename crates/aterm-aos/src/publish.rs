@@ -169,6 +169,10 @@ pub struct Stats {
     pub breaks: u64,
     /// Restores.
     pub restores: u64,
+    /// Recordings moved into the retired ring.
+    pub retired: u64,
+    /// Retired recordings the full ring dropped, oldest first, before a drain took them.
+    pub retired_dropped: u64,
 }
 
 /// Why a boundary operation was refused.
@@ -352,6 +356,73 @@ impl<S: Schema> Clone for Recording<S> {
     }
 }
 
+/// The most retired recordings a boundary holds before it drops the oldest.
+pub const RETIRED_CAP: usize = 4;
+
+/// Why a boundary retired a recording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Retire {
+    /// The log was full, and a re-anchor replaced it.
+    Full,
+    /// The log was broken, and a re-anchor replaced it.
+    Broken,
+    /// A restore replaced it.
+    Restored,
+    /// A commit replaced it, with the code it replaced.
+    Committed,
+}
+
+impl Retire {
+    /// The cause as one word.
+    #[inline]
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Retire::Full => "full",
+            Retire::Broken => "broken",
+            Retire::Restored => "restored",
+            Retire::Committed => "committed",
+        }
+    }
+}
+
+/// A recording the boundary replaced, with the code that ran it and the state it ended in.
+pub struct Retired<S: Schema, C> {
+    /// Why it was replaced.
+    pub cause: Retire,
+    /// The code that ran its inputs.
+    pub code: C,
+    /// Its ancestor checkpoint.
+    pub checkpoint: Checkpoint,
+    /// Its log.
+    pub log: EventLog<S>,
+    /// The digest of the live state when it was replaced.
+    pub end_state: Digest,
+}
+
+impl<S: Schema, C: Clone> Clone for Retired<S, C> {
+    fn clone(&self) -> Self {
+        Retired {
+            cause: self.cause,
+            code: self.code.clone(),
+            checkpoint: self.checkpoint.clone(),
+            log: self.log.clone(),
+            end_state: self.end_state,
+        }
+    }
+}
+
+impl<S: Schema, C: Code<S>> fmt::Debug for Retired<S, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Retired")
+            .field("cause", &self.cause)
+            .field("code", self.code.id())
+            .field("log", &self.log)
+            .field("end_state", &self.end_state)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Everything a commit or restore replaces, held in one value so that replacing it is one
 /// assignment: the pair, the identity, the recording, and whether the head's state digest is
 /// current.
@@ -461,6 +532,7 @@ pub struct Boundary<S: Schema, C: Code<S> + Clone, K: Contract<S>> {
     next_branch: u64,
     stats: Stats,
     last_delivered: Vec<Result<S::Observation, StepRefusal>>,
+    retired: VecDeque<Retired<S, C>>,
 }
 
 impl<S: Schema + Clone, C: Code<S> + Clone, K: Contract<S> + Clone> Clone for Boundary<S, C, K> {
@@ -477,6 +549,7 @@ impl<S: Schema + Clone, C: Code<S> + Clone, K: Contract<S> + Clone> Clone for Bo
             next_branch: self.next_branch,
             stats: self.stats,
             last_delivered: self.last_delivered.clone(),
+            retired: self.retired.clone(),
         }
     }
 }
@@ -489,6 +562,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> fmt::Debug for Boundary<S, C
             .field("attached", &self.live.recording.is_some())
             .field("paused", &self.is_paused())
             .field("queued", &self.queued())
+            .field("retired", &self.retired.len())
             .field("stats", &self.stats)
             .finish_non_exhaustive()
     }
@@ -534,6 +608,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
             next_branch: 1,
             stats: Stats::default(),
             last_delivered: Vec::new(),
+            retired: VecDeque::new(),
         }
     }
 
@@ -966,6 +1041,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
             state,
             witness,
         } = prepared;
+        let end_state = witness.head().state_digest;
         let new_live = Live {
             pair: Pair {
                 code: candidate,
@@ -979,7 +1055,10 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         gate.store()?;
         self.next_revision = next.revision_after;
         gate.store()?;
-        self.live = new_live;
+        let old = core::mem::replace(&mut self.live, new_live);
+        if let Some(rec) = old.recording {
+            self.retire(Retire::Committed, old.pair.code, rec, end_state);
+        }
         gate.store()?;
         bump(&mut self.stats.publications);
         gate.store()?;
@@ -1201,16 +1280,36 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         };
         let code = self.live.pair.code.clone();
         let restored = head.clone();
+        self.refresh_digest();
+        let end_state = self.live.pair.head.state_digest;
         self.next_revision = rev_after;
         self.next_branch = branch_after;
-        self.live = Live {
-            pair: Pair { code, state, head },
-            identity,
-            recording,
-            digest_fresh: true,
-        };
+        let old = core::mem::replace(
+            &mut self.live,
+            Live {
+                pair: Pair { code, state, head },
+                identity,
+                recording,
+                digest_fresh: true,
+            },
+        );
+        if let Some(rec) = old.recording {
+            self.retire(Retire::Restored, old.pair.code, rec, end_state);
+        }
         bump(&mut self.stats.restores);
         Ok(restored)
+    }
+
+    /// Takes every retired recording, oldest first.
+    pub fn drain_retired(&mut self) -> Vec<Retired<S, C>> {
+        self.retired.drain(..).collect()
+    }
+
+    /// How many retired recordings wait for [`Boundary::drain_retired`].
+    #[inline]
+    #[must_use]
+    pub fn retired_len(&self) -> usize {
+        self.retired.len()
     }
 
     /// What the boundary has done.
@@ -1280,14 +1379,18 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
 
     /// Before an input is recorded: a broken or full log is replaced by a fresh checkpoint
     /// of the current state (a true boundary) and an empty log of the next epoch, whose
-    /// parent is the checkpoint it replaces.
+    /// parent is the checkpoint it replaces, and the replaced recording is retired.
     fn ensure_room(&mut self) {
         let Some(rec) = &self.live.recording else {
             return;
         };
-        if rec.log.broken().is_none() && rec.log.len() < rec.log.max_events() {
+        let cause = if rec.log.broken().is_some() {
+            Retire::Broken
+        } else if rec.log.len() < rec.log.max_events() {
             return;
-        }
+        } else {
+            Retire::Full
+        };
         let (parent, epoch) = (
             rec.checkpoint.digest(),
             rec.log.header().log_epoch.checked_add(1),
@@ -1297,8 +1400,28 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
             return;
         };
         let rec = self.fresh_recording(epoch, Some(parent));
-        self.live.recording = Some(rec);
+        let end_state = rec.checkpoint.state_digest();
+        if let Some(old) = self.live.recording.replace(rec) {
+            let code = self.live.pair.code.clone();
+            self.retire(cause, code, old, end_state);
+        }
         bump(&mut self.stats.reanchors);
+    }
+
+    /// Moves a replaced recording into the retired ring, dropping the oldest when it is full.
+    fn retire(&mut self, cause: Retire, code: C, rec: Recording<S>, end_state: Digest) {
+        if self.retired.len() >= RETIRED_CAP {
+            self.retired.pop_front();
+            bump(&mut self.stats.retired_dropped);
+        }
+        self.retired.push_back(Retired {
+            cause,
+            code,
+            checkpoint: rec.checkpoint,
+            log: rec.log,
+            end_state,
+        });
+        bump(&mut self.stats.retired);
     }
 
     /// Delivers one input the boundary holds (queued or overflowing) to the live pair through

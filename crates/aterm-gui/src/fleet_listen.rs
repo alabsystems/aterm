@@ -17,7 +17,7 @@ use crate::app_config::FleetConfig;
 
 /// How often a bind refused `EADDRINUSE` or `EADDRNOTAVAIL`, or a key that cannot be used, is
 /// tried again, and how often a served key is read again.
-pub(crate) const RETRY: Duration = Duration::from_secs(2);
+pub(crate) const RETRY: Duration = aterm_net::fleet::KEY_READ_EVERY;
 
 const RETRY_SEAM: &str = "ATERM_DEBUG_FLEET_RETRY_MS";
 
@@ -290,6 +290,8 @@ struct FleetDesk {
     configured: bool,
     started: bool,
     standing: Standing,
+    /// The line that said where it stands ([`noted_move`]).
+    said: String,
     /// The serving generation's flag: cleared to stop it.
     stop: Option<Arc<AtomicBool>>,
 }
@@ -300,6 +302,7 @@ static FLEET_DESK: Mutex<FleetDesk> = Mutex::new(FleetDesk {
     configured: false,
     started: false,
     standing: Standing::Off,
+    said: String::new(),
     stop: None,
 });
 
@@ -484,18 +487,11 @@ fn serve_fleet_port(
                     std::io::ErrorKind::AddrInUse | std::io::ErrorKind::AddrNotAvailable
                 ) =>
             {
-                let why = if error.kind() == std::io::ErrorKind::AddrInUse {
-                    "is held by another process"
-                } else {
-                    "is not an address of this machine yet"
-                };
+                let state = aterm_types::dirs::state_dir();
                 stand_fleet(
                     generation,
                     Standing::Retrying,
-                    &format!(
-                        "fleet listener: {addr} {why}; tried again every {:?}",
-                        retry()
-                    ),
+                    &unbound_line(addr, error.kind(), state.as_deref()),
                 );
                 if wait_fleet_unchanged(generation) {
                     continue;
@@ -805,6 +801,28 @@ fn registration_note(
     }
 }
 
+/// The listener's line for a bind refused `kind` at `addr`: a place another process holds names
+/// the act that moves this listener ([`aterm_net::fleet_member::moves_listener`]).
+#[cfg(unix)]
+fn unbound_line(
+    addr: SocketAddr,
+    kind: std::io::ErrorKind,
+    state: Option<&std::path::Path>,
+) -> String {
+    let why = match (kind, state) {
+        (std::io::ErrorKind::AddrInUse, Some(state)) => format!(
+            "is held by another process (another node's listener, or another program): {}",
+            aterm_net::fleet_member::moves_listener(state)
+        ),
+        (std::io::ErrorKind::AddrInUse, None) => "is held by another process".to_owned(),
+        _ => "is not an address of this machine yet".to_owned(),
+    };
+    format!(
+        "fleet listener: {addr} {why}; tried again every {:?}",
+        retry()
+    )
+}
+
 /// This machine's fleet secret, from `<state>/fleet.key`.
 #[cfg(unix)]
 fn read_fleet_key() -> Result<aterm_net::fleet::FleetSecret, aterm_net::fleet::KeyFileError> {
@@ -919,9 +937,7 @@ fn stand_fleet(generation: u64, standing: Standing, line: &str) {
         if desk.generation != generation {
             return;
         }
-        let moved = desk.standing != standing;
-        desk.standing = standing;
-        moved
+        noted_move(&mut desk, standing, line)
     };
     if moved {
         note_fleet(
@@ -929,6 +945,17 @@ fn stand_fleet(generation: u64, standing: Standing, line: &str) {
             !matches!(standing, Standing::Off | Standing::Listening),
         );
     }
+}
+
+/// Whether the listener, `standing` as `line` says, moved from where `desk` last stood: another
+/// kind, or another place or level (a bind tried again, or a rekey where it was, says nothing new).
+fn noted_move(desk: &mut FleetDesk, standing: Standing, line: &str) -> bool {
+    let moved = desk.standing != standing || desk.said != line;
+    desk.standing = standing;
+    if moved {
+        line.clone_into(&mut desk.said);
+    }
+    moved
 }
 
 fn fleet_event(event: FleetEvent) {
@@ -1025,6 +1052,81 @@ mod tests {
             registration_note(Recorded::New, &member),
             registration_note(Recorded::Updated, &member)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_place_names_the_act_that_moves_the_listener() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 58733));
+        let dir = aterm_tempfile::tempdir().expect("scratch folder");
+        let state = dir.path().join("state");
+        aterm_uds::private_file::ensure_private_dir(&state).unwrap();
+        let held = unbound_line(addr, std::io::ErrorKind::AddrInUse, Some(&state));
+        assert!(
+            held.starts_with("fleet listener: 127.0.0.1:58733 is held by another process")
+                && held.contains(": `aterm fleet join --port <n>` moves it; tried again every"),
+            "{held}"
+        );
+        aterm_uds::private_file::write_private(
+            &state,
+            aterm_net::fleet_member::CODE_FILE,
+            b"code\n",
+        )
+        .unwrap();
+        let issuer = unbound_line(addr, std::io::ErrorKind::AddrInUse, Some(&state));
+        assert!(
+            issuer.contains(": `aterm fleet init --rotate --port <n>` moves it (every member"),
+            "{issuer}"
+        );
+        let absent = unbound_line(addr, std::io::ErrorKind::AddrNotAvailable, Some(&state));
+        assert!(
+            absent.contains("is not an address of this machine yet") && !absent.contains("moves"),
+            "{absent}"
+        );
+    }
+
+    #[test]
+    fn every_move_of_the_listener_is_noted() {
+        let mut desk = FleetDesk {
+            wanted: None,
+            generation: 0,
+            configured: false,
+            started: false,
+            standing: Standing::Off,
+            said: String::new(),
+            stop: None,
+        };
+        let at = |place: &str, level: &str| format!("fleet listening on {place} (serving {level})");
+        assert!(noted_move(
+            &mut desk,
+            Standing::Listening,
+            &at("127.0.0.1:52510", "facts")
+        ));
+        assert!(
+            !noted_move(
+                &mut desk,
+                Standing::Listening,
+                &at("127.0.0.1:52510", "facts")
+            ),
+            "a rekey where it was"
+        );
+        assert!(noted_move(
+            &mut desk,
+            Standing::Listening,
+            &at("127.0.0.1:52506", "facts")
+        ));
+        assert!(noted_move(
+            &mut desk,
+            Standing::Listening,
+            &at("0.0.0.0:52506", "content")
+        ));
+        let held = "fleet listener: 0.0.0.0:52506 is held by another process";
+        assert!(noted_move(&mut desk, Standing::Retrying, held));
+        assert!(
+            !noted_move(&mut desk, Standing::Retrying, held),
+            "tried again"
+        );
+        assert_eq!(desk.standing, Standing::Retrying);
     }
 
     #[test]

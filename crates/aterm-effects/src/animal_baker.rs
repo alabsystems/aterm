@@ -153,8 +153,17 @@ impl AnimalBaker {
     #[inline]
     #[must_use]
     pub const fn aspect(species: AnimalGlyphId) -> f32 {
-        let a = (ANIMAL_GLYPHS[species as usize].aspect_x1000 as f32) / 1000.0;
-        if a > 0.001 { a } else { 0.001 }
+        const SPECIES_ASPECTS: [f32; ANIMAL_GLYPHS.len()] = {
+            let mut out = [0.0f32; ANIMAL_GLYPHS.len()];
+            let mut i = 0;
+            while i < ANIMAL_GLYPHS.len() {
+                let a = (ANIMAL_GLYPHS[i].aspect_x1000 as f32) / 1000.0;
+                out[i] = if a > 0.001 { a } else { 0.001 };
+                i += 1;
+            }
+            out
+        };
+        SPECIES_ASPECTS[species as usize]
     }
 }
 

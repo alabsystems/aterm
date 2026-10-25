@@ -17,6 +17,8 @@ pub mod history;
 pub mod journal;
 pub mod membership;
 pub mod node;
+mod observation;
+pub use observation::{Observation, Unavailable};
 #[cfg(unix)]
 pub mod roster;
 
@@ -126,7 +128,15 @@ impl Snapshot {
 /// or a malformed/ambiguous control audience. A plaintext source never qualifies.
 #[cfg(unix)]
 pub fn cached(paths: &crate::client::Paths) -> crate::Result<Option<Snapshot>> {
-    crate::client::cached_commons(paths)
+    observe(paths).map(Observation::into_snapshot)
+}
+
+/// Explain an unavailable offline control observation without creating state or
+/// contacting the vault. Missing visibility never authorizes a fresh network.
+/// Corrupt or ambiguous authenticated state remains an error.
+#[cfg(unix)]
+pub fn observe(paths: &crate::client::Paths) -> crate::Result<Observation> {
+    crate::client::observe_commons(paths)
 }
 
 #[cfg(test)]

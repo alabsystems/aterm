@@ -1663,9 +1663,12 @@ impl App {
         }
     }
 
-    /// Run one [`FindAction`] against the front window's find bar and report the state it left; `None` with no front window.
+    /// Run one [`FindAction`] against the front window's terminal find bar; native apps remain unchanged and report closed. `None` with no front window.
     pub(crate) fn find_cmd(&mut self, action: FindAction) -> Option<FindStatus> {
         let wid = self.frontmost_window?;
+        if self.front_terminal(wid).is_none() {
+            return Some(FindStatus::CLOSED);
+        }
         match action {
             FindAction::Open => self.find_requested(),
             FindAction::Type(text) => self.search_edit_in(wid, SearchEdit::Insert(text)),
@@ -1704,7 +1707,7 @@ impl App {
 /// One step the `find` verb drives the find bar through; [`App::find_cmd`] runs the function its keystroke runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FindAction {
-    /// Edit ▸ Find ▸ Find… (⌘F).
+    /// Open the terminal find bar (⌘F in a terminal).
     Open,
     /// Insert text at the caret — a printable keypress, or an IME commit.
     Type(String),
@@ -1810,6 +1813,166 @@ mod tests {
             return Vec::new();
         }
         bytes[..read as usize].to_vec()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_scope_find_control_does_not_open_native_search() {
+        use crate::native_app::{AppEvent, AppKind, AppViewState, TextInputEvent};
+        use crate::native_editor::EditorCommand;
+
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("find-control.md");
+        let source = "# needle\n\nA second needle.\n";
+        std::fs::write(&path, source).unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let mut changed = Vec::new();
+        for (kind, prompt) in [
+            (AppKind::Editor, "idle"),
+            (AppKind::Editor, "search"),
+            (AppKind::Editor, "goto"),
+            (AppKind::Settings, "idle"),
+            (AppKind::Settings, "search"),
+            (AppKind::Markdown, "idle"),
+        ] {
+            let (mut app, pipe) = app_observing_pty();
+            let wid = WindowId(0);
+            let hidden = app.front_terminal(wid).unwrap().term.clone();
+            term_lock(&hidden).process(b"hidden needle\r\nsecond needle");
+            let hidden_before = {
+                let terminal = term_lock(&hidden);
+                (
+                    terminal.content_seq(),
+                    terminal.cursor().row,
+                    terminal.cursor().col,
+                )
+            };
+            if kind == AppKind::Settings {
+                assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+            } else {
+                app.open_document_tab(kind, &uri).unwrap();
+            }
+            if prompt == "search" {
+                app.find_requested_in(wid);
+                app.dispatch_native_event(
+                    wid,
+                    AppEvent::TextInput(TextInputEvent::Commit("needle".into())),
+                )
+                .unwrap();
+            } else if prompt == "goto" {
+                app.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::GotoLine))
+                    .unwrap();
+                app.dispatch_native_event(
+                    wid,
+                    AppEvent::TextInput(TextInputEvent::Commit("2".into())),
+                )
+                .unwrap();
+            }
+            let (instance, view) = app.active_native_view(wid).unwrap();
+            let document = app.native_runtime.document_id(instance);
+            let before_document = document.map(|id| app.document_store.snapshot(id).unwrap());
+            let state = app.native_runtime.view_state(view).unwrap();
+            let before_common = state.common().clone();
+            let before_editor = match state {
+                AppViewState::Editor(state) => Some(state.clone()),
+                _ => None,
+            };
+            let before_markdown = match state {
+                AppViewState::Markdown(state) => Some(state.clone()),
+                _ => None,
+            };
+            let before_settings = match state {
+                AppViewState::Settings(state) => Some((
+                    state.route,
+                    state.search.clone(),
+                    state.search_input.clone(),
+                    state.editing_field.clone(),
+                )),
+                _ => None,
+            };
+            for action in [
+                FindAction::Open,
+                FindAction::Type("control query".into()),
+                FindAction::Edit(SearchEdit::MoveStart),
+                FindAction::Step { forward: true },
+                FindAction::Step { forward: false },
+                FindAction::ToggleCase,
+                FindAction::ToggleRegex,
+                FindAction::Accept,
+                FindAction::Cancel,
+                FindAction::Status,
+            ] {
+                let action_name = format!("{action:?}");
+                assert_eq!(app.find_cmd(action), Some(super::FindStatus::CLOSED));
+                let state = app.native_runtime.view_state(view).unwrap();
+                let unchanged = state.common() == &before_common
+                    && match state {
+                        AppViewState::Editor(state) => Some(state) == before_editor.as_ref(),
+                        AppViewState::Markdown(state) => Some(state) == before_markdown.as_ref(),
+                        AppViewState::Settings(state) => before_settings.as_ref().is_some_and(
+                            |(route, search, input, editing)| {
+                                state.route == *route
+                                    && state.search == *search
+                                    && state.search_input == *input
+                                    && state.editing_field == *editing
+                            },
+                        ),
+                        _ => unreachable!(),
+                    };
+                if !unchanged {
+                    changed.push(format!("{kind:?}/{prompt}: {action_name}"));
+                }
+            }
+            assert!(app.windows[&wid].search.is_none());
+            if let Some((id, before)) = document.zip(before_document) {
+                let after = app.document_store.snapshot(id).unwrap();
+                assert_eq!((after.seq, after.text), (before.seq, before.text));
+                assert_eq!(app.document_store.dirty(id), Some(false));
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+            let terminal = term_lock(&hidden);
+            assert_eq!(
+                (
+                    terminal.content_seq(),
+                    terminal.cursor().row,
+                    terminal.cursor().col
+                ),
+                hidden_before
+            );
+            drop(terminal);
+            assert!(drained(pipe).is_empty(), "{kind:?}/{prompt}: no PTY input");
+            drop(app);
+            // SAFETY: app_observing_pty created both descriptors for this test.
+            // The app's sink borrowed the write end and has been dropped; neither
+            // descriptor has been closed, and no reader or writer still uses it.
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+        }
+
+        let (mut app, pipe) = app_observing_pty();
+        let wid = WindowId(0);
+        term_lock(&app.front_terminal(wid).unwrap().term).process(b"needle one needle two");
+        assert!(app.find_cmd(FindAction::Open).unwrap().open);
+        let found = app.find_cmd(FindAction::Type("needle".into())).unwrap();
+        assert_eq!(found.query, "needle");
+        assert_eq!(found.matches, 2);
+        let next = app.find_cmd(FindAction::Step { forward: true }).unwrap();
+        assert_ne!(next.current, found.current);
+        assert!(!app.find_cmd(FindAction::Cancel).unwrap().open);
+        assert!(
+            drained(pipe).is_empty(),
+            "terminal control stays out of the PTY"
+        );
+        drop(app);
+        // SAFETY: these are this test's still-open pipe descriptors. The app's
+        // borrowing sink has been dropped, and no other reader or writer uses them.
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        assert!(changed.is_empty(), "native state changed: {changed:?}");
     }
 
     /// The `find` verb never puts a byte on the PTY: with the bar closed every editing

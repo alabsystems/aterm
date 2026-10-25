@@ -2,9 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::table::store::Capacity;
 use crate::{crypto, table::conflict::Conflict};
 use astream_wire::sync::Actor;
 use aterm_spec::interp::State;
+use std::collections::BTreeSet;
 
 fn packet(a: &[u8], b: &[u8]) -> Vec<u8> {
     let mut wire = b"ACTF1".to_vec();
@@ -13,6 +15,406 @@ fn packet(a: &[u8], b: &[u8]) -> Vec<u8> {
         wire.extend_from_slice(source);
     }
     wire
+}
+
+#[test]
+fn discarded_source_proof_restricts_without_importing_its_payload() {
+    let f = Fixture::new(false, false, true);
+    let a = f.lab.bootstrap(0);
+    {
+        let session = Session::open(&a).unwrap();
+        assert!(Conflict::from_discarded(&session, f.scope, &f.wire).is_err());
+    }
+    f.recover();
+    let b = f.lab.bootstrap(1);
+    let wire = {
+        let session = Session::open(&b).unwrap();
+        let before = std::fs::read(f.dirs[1].join("table.astream")).unwrap();
+        let store = Store::open_capacity(
+            &session,
+            &f.dirs[1],
+            f.scope,
+            false,
+            Capacity {
+                conflicts: 0,
+                ..Capacity::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            store.conflicts.is_empty(),
+            "opening quarantine must not append a proof"
+        );
+        let proof = store
+            .conflict_wire(&session, &session.actor())
+            .unwrap()
+            .unwrap();
+        assert!(proof.starts_with(b"ACTQ1"));
+        assert_eq!(
+            std::fs::read(f.dirs[1].join("table.astream")).unwrap(),
+            before
+        );
+        proof
+    };
+    let session = Session::open(&a).unwrap();
+    let proof = Conflict::authenticate(&session, f.scope, &wire).unwrap();
+    assert_eq!(proof.headers().len(), 1);
+    assert_eq!(proof.headers()[0].id, f.receipt.id);
+    let actor = proof.actor();
+    let mut store = Store::open(&session, &f.dirs[0], f.scope).unwrap();
+    let receipt = store.ingest_conflict(&session, &wire).unwrap();
+    assert_eq!(store.ingest_conflict(&session, &wire).unwrap(), receipt);
+    assert_eq!(store.inventory(&session).unwrap().count(), 0);
+    assert_eq!(
+        store.conflict_inventory(&session).unwrap(),
+        BTreeSet::from([actor])
+    );
+    let foreign = Scope::new(f.scope.trust(), *f.scope.table(), 2).unwrap();
+    assert!(Conflict::authenticate(&session, foreign, &wire).is_err());
+    for mutation in [0, 5, 37, wire.len() - 1] {
+        let mut bad = wire.clone();
+        bad[mutation] ^= 1;
+        assert!(store.ingest_conflict(&session, &bad).is_err());
+    }
+    let mut trailing = wire.clone();
+    trailing.push(0);
+    assert!(store.ingest_conflict(&session, &trailing).is_err());
+    assert!(
+        store
+            .ingest_conflict(&session, &wire[..wire.len() - 1])
+            .is_err()
+    );
+    drop(store);
+    let store = Store::open(&session, &f.dirs[0], f.scope).unwrap();
+    assert_eq!(
+        store.conflict_wire(&session, &actor).unwrap().unwrap(),
+        wire
+    );
+    assert_eq!(store.inventory(&session).unwrap().count(), 0);
+}
+
+fn reselection_trace(corrupt_payload: bool) -> Vec<State> {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let a = lab.bootstrap(0);
+    let b = lab.bootstrap(1);
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let grants = || {
+        vec![
+            Grant::recorded("m1", a.request().unwrap().binding().clone(), Role::Writer),
+            Grant::recorded("m2", b.request().unwrap().binding().clone(), Role::Writer),
+        ]
+    };
+    let journal = Journal::open_existing(a.journal_dir(), a.trust()).unwrap();
+    let left = admin.prepare_commons_rotation(&journal, grants()).unwrap();
+    let right = admin.prepare_commons_rotation(&journal, grants()).unwrap();
+    drop(journal);
+    ingest(&lab, &left);
+    let session = Session::open(&a).unwrap();
+    let scope = session.scope().unwrap();
+    let mut source = session
+        .seal(
+            scope,
+            Causal {
+                sequence: 1,
+                previous: None,
+                parents: &[],
+            },
+            b"selected again",
+        )
+        .unwrap();
+    if corrupt_payload {
+        let at = source.len() - 65;
+        source[at] ^= 1;
+        crate::table::tests::resign(&a, &mut source);
+    }
+    drop(session);
+    let journal = Journal::open_existing(a.journal_dir(), a.trust()).unwrap();
+    let left_child = admin.prepare_commons_rotation(&journal, grants()).unwrap();
+    drop(journal);
+    let bad = admin
+        .seal_commons_restricted(
+            a.trust().network,
+            Edit::Recover {
+                heads: &[left.id(), right.id()],
+                selected: right.id(),
+            },
+            &[],
+        )
+        .unwrap();
+    ingest(&lab, &right);
+    ingest(&lab, &bad);
+    lab.rotate(&[Role::Writer, Role::Writer]);
+    let journal = Journal::open_existing(a.journal_dir(), a.trust()).unwrap();
+    let bad_child = match journal.state() {
+        aterm_secrets::commons::journal::State::Ready { head, .. } => head,
+        _ => panic!("ready recovery"),
+    };
+    drop(journal);
+    let session = Session::open(&a).unwrap();
+    let proof = Conflict::from_discarded(&session, scope, &source)
+        .unwrap()
+        .wire()
+        .to_vec();
+    let dir = lab._home.path().join("selected-again");
+    let mut store = Store::join(&session, &dir, scope).unwrap();
+    store.ingest_conflict(&session, &proof).unwrap();
+    assert!(store.liability_evidence(&session).is_err());
+    let writable = store
+        .commit_catalog(&session, b"cannot skip quarantined source")
+        .is_ok();
+    let mut trace = vec![reselection_state(0, &store, &session, writable)];
+    drop((store, session));
+    ingest(&lab, &left_child);
+    let good = admin
+        .seal_commons_restricted(
+            a.trust().network,
+            Edit::Recover {
+                heads: &[bad_child, left_child.id()],
+                selected: left_child.id(),
+            },
+            &[],
+        )
+        .unwrap();
+    ingest(&lab, &good);
+    lab.rotate(&[Role::Writer, Role::Writer]);
+    let session = Session::open(&a).unwrap();
+    assert!(!session.discarded_source(&session.envelope(scope, &source).unwrap()));
+    assert!(Conflict::authenticate(&session, scope, &proof).is_err());
+    assert!(!Conflict::restore(&session, scope, &proof).unwrap().active());
+    let mut store = Store::open(&session, &dir, scope).unwrap();
+    assert!(store.proof_inventory(&session).unwrap().is_empty());
+    assert!(
+        store.catalog(&session).unwrap().is_empty(),
+        "a negative proof never admits payload"
+    );
+    let writable = store
+        .commit_catalog(&session, b"cannot skip known source")
+        .is_ok();
+    trace.push(reselection_state(1, &store, &session, writable));
+    if corrupt_payload {
+        assert!(store.ingest(&session, &source).is_err());
+        assert!(store.metadata_evidence(&session).unwrap().is_empty());
+        assert!(store.liability_evidence(&session).unwrap().is_empty());
+        return trace;
+    }
+    assert!(
+        store.liability_evidence(&session).is_err(),
+        "a valid outstanding source must not silently refund a liability"
+    );
+    store.ingest(&session, &source).unwrap();
+    assert_eq!(store.catalog(&session).unwrap().len(), 1);
+    assert_eq!(store.liability_evidence(&session).unwrap().len(), 1);
+    let writable = store
+        .commit_catalog(&session, b"can extend authenticated history")
+        .is_ok();
+    trace.push(reselection_state(2, &store, &session, writable));
+    trace
+}
+
+fn reselection_state(phase: i64, store: &Store, session: &Session<'_>, writable: bool) -> State {
+    State::from([
+        ("phase", phase),
+        ("stored", i64::from(!store.conflicts.is_empty())),
+        (
+            "active",
+            i64::from(!store.quarantined(session).unwrap().is_empty()),
+        ),
+        (
+            "positive",
+            i64::from(store.inventory(session).unwrap().next().is_some()),
+        ),
+        ("writable", i64::from(writable)),
+        (
+            "liability",
+            i64::from(store.liability_evidence(session).is_ok()),
+        ),
+    ])
+}
+
+pub(crate) fn reselection_transition(state: &State, action: &str) -> State {
+    let trace = reselection_trace(false);
+    let index = match action {
+        "Reselect" => 0,
+        "Admit" => 1,
+        _ => panic!("unknown reselection action"),
+    };
+    assert_eq!(*state, trace[index]);
+    trace[index + 1].clone()
+}
+
+#[test]
+fn reselected_invalid_ciphertext_does_not_permanently_freeze_liabilities() {
+    reselection_trace(true);
+}
+
+#[test]
+fn an_overruled_recovery_cannot_restrict_a_selected_source() {
+    let model = aterm_models_db::source_reselection_model();
+    aterm_spec::interp::prove_and_catch(&model);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = reselection_transition(&state, action.name);
+                assert!(model.successors(action.name, &state).contains(&next));
+                let mut wrong = next;
+                wrong.insert("stored", 0);
+                assert!(!model.check_invariant("RetainedEvidence", &wrong));
+                assert!(!model.successors(action.name, &state).contains(&wrong));
+            }
+        }
+    }
+}
+
+fn repair_fixture(f: &Fixture, repairs: &mut [crate::control::Repair; 2]) {
+    use crate::control::{Endpoint, Side};
+    use aterm_net::lan::{Connection, Scope as LinkScope};
+    use std::{net::TcpListener, thread, time::Duration};
+    let endpoints: Vec<_> = (0..2)
+        .map(|n| {
+            Endpoint::from_bootstrap(&f.lab.bootstrap(n))
+                .unwrap()
+                .unwrap()
+                .with_tables(f.lab.paths[n].clone(), vec![(f.scope, f.dirs[n].clone())])
+                .unwrap()
+        })
+        .collect();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let [ra, rb] = repairs;
+    thread::scope(|threads| {
+        let server = threads.spawn(|| {
+            endpoints[1].exchange(
+                Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap(),
+                Side::Responder,
+                rb,
+            )
+        });
+        endpoints[0]
+            .exchange(
+                Connection::connect(address, LinkScope::Loopback, Duration::from_secs(60)).unwrap(),
+                Side::Initiator,
+                ra,
+            )
+            .unwrap();
+        server.join().unwrap().unwrap();
+    });
+    assert!(
+        ra.application().is_some() && rb.application().is_some(),
+        "{ra:?}\n{rb:?}"
+    );
+}
+
+#[test]
+fn an_existing_quarantine_proof_does_not_hide_a_later_fork() {
+    let f = Fixture::new(true, false, false);
+    f.recover();
+    let mut repairs = [
+        crate::control::Repair::default(),
+        crate::control::Repair::default(),
+    ];
+    repair_fixture(&f, &mut repairs);
+    let b = f.lab.bootstrap(1);
+    let sb = Session::open(&b).unwrap();
+    let target = Store::open(&sb, &f.dirs[1], f.scope).unwrap();
+    let source = &target.metadata_evidence(&sb).unwrap()[0];
+    assert!(!source.catalog_eligible && source.record.is_none());
+    assert_eq!(source.header.id, f.receipt.id);
+    assert_ne!(
+        source.receipt.id, source.header.id,
+        "receipt identifies the negative certificate"
+    );
+    assert!(
+        target
+            .proof_inventory(&sb)
+            .unwrap()
+            .iter()
+            .all(|key| key[48] == 0)
+    );
+    drop((target, sb));
+    let a = f.lab.bootstrap(0);
+    let sa = Session::open(&a).unwrap();
+    let mut source = Store::open(&sa, &f.dirs[0], f.scope).unwrap();
+    let fork = sa
+        .seal(
+            f.scope,
+            Causal {
+                sequence: 1,
+                previous: None,
+                parents: &[],
+            },
+            b"new fork",
+        )
+        .unwrap();
+    source.ingest(&sa, &fork).unwrap();
+    assert!(
+        source
+            .proof_inventory(&sa)
+            .unwrap()
+            .iter()
+            .all(|key| key[48] == 1)
+    );
+    drop((source, sa));
+    repair_fixture(&f, &mut repairs);
+    assert_eq!(repairs[1].application().unwrap().conflicts_received, 1);
+    let sb = Session::open(&b).unwrap();
+    let mut target = Store::open(&sb, &f.dirs[1], f.scope).unwrap();
+    assert!(
+        target
+            .proof_inventory(&sb)
+            .unwrap()
+            .iter()
+            .all(|key| key[48] == 1)
+    );
+    assert!(
+        target.inventory(&sb).unwrap().next().is_none(),
+        "proofs do not admit payload"
+    );
+    target
+        .commit_catalog(&sb, b"independent writer remains available")
+        .unwrap();
+}
+
+#[test]
+fn discarded_sources_cannot_consume_reserved_fork_capacity() {
+    let f = Fixture::new(false, false, true);
+    f.recover();
+    let a = f.lab.bootstrap(0);
+    let b = f.lab.bootstrap(1);
+    let sa = Session::open(&a).unwrap();
+    let sb = Session::open(&b).unwrap();
+    let q = Conflict::from_discarded(&sa, f.scope, &f.wire).unwrap();
+    let forked = sb
+        .seal(
+            f.scope,
+            Causal {
+                sequence: 1,
+                previous: None,
+                parents: &[],
+            },
+            b"fork",
+        )
+        .unwrap();
+    let fork = Conflict::from_pair(&sa, f.scope, &f.wire, &forked).unwrap();
+    let capacity = Capacity {
+        operations: 1,
+        bytes: f.wire.len(),
+        conflicts: 1,
+    };
+    let mut store = Store::open_capacity(&sa, &f.dirs[0], f.scope, false, capacity).unwrap();
+    store.ingest_conflict(&sa, q.wire()).unwrap();
+    store.ingest_conflict(&sa, fork.wire()).unwrap();
+    assert_eq!(store.conflicts.len(), 2);
+    assert_eq!(
+        store.proof_inventory(&sa).unwrap(),
+        BTreeSet::from([fork.key()])
+    );
+    assert_eq!(store.inventory(&sa).unwrap().count(), 0);
+    drop(store);
+    let store = Store::open_capacity(&sa, &f.dirs[0], f.scope, false, capacity).unwrap();
+    assert_eq!(
+        store.proof_inventory(&sa).unwrap(),
+        BTreeSet::from([fork.key()])
+    );
 }
 
 struct Evidence {
@@ -379,8 +781,10 @@ fn tls_transition(state: &State) -> State {
         .unwrap();
         server.join().unwrap().unwrap();
     });
-    assert_eq!(ra.application().unwrap().conflicts_sent, 1);
-    assert_eq!(rb.application().unwrap().conflicts_received, 1);
+    // The discarded source's proof and the dependent writer's fork are both
+    // permanent restrictions, transferred before any positive operation.
+    assert_eq!(ra.application().unwrap().conflicts_sent, 2);
+    assert_eq!(rb.application().unwrap().conflicts_received, 2);
     assert_eq!(ra.application().unwrap().sent, 0);
     let sb = Session::open(&b).unwrap();
     let mut target = Store::open(&sb, &f.dirs[1], f.scope).unwrap();
@@ -395,7 +799,7 @@ fn tls_transition(state: &State) -> State {
         .commit_catalog(&sb, b"restart the conflicted identity")
         .is_ok();
     assert!(!writable);
-    assert_eq!(target.conflict_inventory(&sb).unwrap().len(), 1);
+    assert_eq!(target.conflict_inventory(&sb).unwrap().len(), 2);
     let mut next = measure(state.clone(), &target, &sb, writable);
     next.insert("scenario", 9);
     next.insert(

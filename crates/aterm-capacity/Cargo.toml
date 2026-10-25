@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# THE MACHINE'S CAPACITY, ONE READER AND ONE LEDGER
+# (docs/DESIGN-adaptive-build-2026-10-24.md, CAP-1): what this Mac has free now
+# (cores, load, available memory, swap, free disk above the volume's floor), and
+# the claims every session's heavy or timing-sensitive work holds on it. A tool
+# waits for room before it starts; it is refused at once only when its need can
+# never fit here.
+
+[package]
+name = "aterm-capacity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "aterm's host-capacity reader (cores, load, available and physical memory, swap, free disk and the volume's floor) and the per-user admission ledger every heavy or timing-sensitive tool takes a claim in before it starts"
+
+[dependencies]
+# The machine's readers: the load average, available and physical memory, swap,
+# the cluster layout, one volume's free space, and the process sweep (each
+# process's parent, footprint and bytes written) a claim's own use is read from.
+# Workspace crate; aterm-json and libc only.
+aterm-sysprobe = { workspace = true }
+# `record_lock::RecordLock`: a claim is a flock on a file whose record (pid,
+# start, checkout, what, need) other processes read; the kernel lets the lock
+# go when its holder dies, however it dies. Workspace crate, std only.
+aterm-toolchain = { workspace = true }
+# A claim's record is one JSON object a line. First-party; aterm-sysprobe
+# already links it.
+aterm-json = { workspace = true }
+# The workspace's one epoch-clock read (`aterm_time::unix_millis`), for a
+# claim's start. No dependencies.
+aterm-time = { workspace = true }
+# The floor is the window's disk watch's own: `dirs::state_dir` places the room
+# file the watch keeps, and `dirs::aterm_config_path` the aterm.toml whose
+# `[disk]` knobs it reads. Workspace crate; first-party dependencies only.
+aterm-types = { workspace = true }
+# Reads those `[disk]` knobs. First-party TOML; serde only.
+aterm-toml = { workspace = true }
+# The room file is written as the watch always wrote it: staged in a private
+# folder beside it (aterm-tempfile), ordered to disk (`aterm_durable::ordered`),
+# then renamed over it. Workspace crates; aterm-types already links both.
+aterm-tempfile = { workspace = true }
+aterm-durable = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# The ledger lives under the account database's home (`account::home`), not
+# `$HOME`, so a tool run under a scratch home claims in the one ledger.
+# Workspace crate; aterm-types already links it.
+aterm-uds = { workspace = true }
+
+[dev-dependencies]
+# The stand-in holder dies by `kill_self_now()`, and is started by
+# `spawnfd::command`; the one-minute hang detector (`aterm_spec::wait`).
+aterm-uds = { workspace = true }
+aterm-spec = { workspace = true }
+
+[lints]
+workspace = true

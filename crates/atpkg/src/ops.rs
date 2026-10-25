@@ -136,11 +136,17 @@ pub fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u64)> {
 /// the folder a build laid aside lives in ([`aterm_toolchain::layout`]), which a canonical
 /// path (a running image, a compiler's sysroot) names.
 fn build_in_path(name: &std::ffi::OsStr) -> Option<u64> {
+    build_dir_name(name)?.parse::<u64>().ok()
+}
+
+/// The build name a store build's directory `name` spells, `<build>` or the laid-aside
+/// `<build>.noindex` read as `<build>` ([`build_in_path`], [`crate::shim_env::of_store_binary`]).
+pub(crate) fn build_dir_name(name: &std::ffi::OsStr) -> Option<&str> {
     let name = name.to_str()?;
-    name.strip_suffix(aterm_toolchain::build_cache::NOINDEX)
-        .unwrap_or(name)
-        .parse::<u64>()
-        .ok()
+    Some(
+        name.strip_suffix(aterm_toolchain::build_cache::NOINDEX)
+            .unwrap_or(name),
+    )
 }
 
 #[must_use]

@@ -5566,6 +5566,10 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                     task: rec.task.clone(),
                     autopilot_end: rec.autopilot_end.clone(),
                     wakes: rec.wakes.clone(),
+                    box_receipt: rec
+                        .status_seen
+                        .as_deref()
+                        .and_then(|row| crate::status_item::StatusCarry::parse(row).box_receipt),
                 },
             })
         })

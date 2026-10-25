@@ -49,8 +49,10 @@ Per instance <name> = <style-slug>-<theme>[-<scenario>] (typing has no suffix): 
 <name>.dims.txt, .status.txt, .status-end.txt (`trail status`), .admissions.txt (`trail 40`), .gui.log; and
 gallery.pids. Each terminal frame also keeps its .status.txt and image metadata. The open `redraw-stall`
 frame has .read-notes.txt instead of cursor/text reads, which would wait for the very frame the fixture
-has not yet closed. Its restored frame reports whether an enabled rainbow ribbon was still live;
-an inconclusive return is retained and exits 1, not counted as a continuity pass.
+has not yet closed. Its restored frame judges the final instance configuration (including --extra):
+a requested rainbow that becomes unavailable is inconclusive, not a skip. Deliberately disabled
+or other trails are not applicable. An inconclusive return is retained and exits 1, not counted
+as a continuity pass.
 
 exit: 0 every frame taken and every instance ended; 1 a frame or an instance failed, a redraw return was
 inconclusive, or an instance outlived the run;
@@ -772,7 +774,46 @@ enum ReturnMeasurement {
     Inconclusive,
 }
 
-fn return_measurement(status: &Reply) -> Result<ReturnMeasurement, String> {
+/// Whether this instance's final config asks to measure a live rainbow ribbon.
+fn expects_rainbow(config: &[String]) -> Result<bool, String> {
+    use aterm_effects::cursor_glow::{GlowStyle, spellings};
+    use aterm_effects::motion::MotionMode;
+    use aterm_toml::Value;
+
+    let config: Value = aterm_toml::from_str(&config.join("\n"))
+        .map_err(|error| format!("invalid gallery config: {error}"))?;
+    let string = |key: &str| match config.get(key) {
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(_) => Err(format!("gallery config {key} must be a string")),
+        None => Ok(None),
+    };
+    let boolean = |key: &str| match config.get(key) {
+        Some(Value::Boolean(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("gallery config {key} must be a boolean")),
+        None => Ok(None),
+    };
+    let raw = string("cursor_trail_style")?.ok_or("gallery config has no cursor_trail_style")?;
+    let style =
+        spellings::row(raw).ok_or_else(|| format!("unknown gallery cursor trail style {raw:?}"))?;
+    let master = boolean("cursor_trail")?;
+    let serious = boolean("serious_mode")?.unwrap_or(false);
+    let motion = string("motion")?.map_or(MotionMode::Auto, MotionMode::parse);
+    let intensity = match config.get("cursor_trail_intensity") {
+        Some(Value::Float(value)) => Some(*value as f32),
+        Some(Value::Integer(value)) => Some(*value as f32),
+        Some(_) => return Err("gallery config cursor_trail_intensity must be a number".into()),
+        None => None,
+    };
+    // These explicit choices suppress the trail in the app. Runtime focus,
+    // shedding or a missing ribbon cannot turn a requested measurement into a skip.
+    Ok(style.style == Some(GlowStyle::RainbowKitty)
+        && master != Some(false)
+        && !serious
+        && motion != MotionMode::Reduced
+        && intensity.is_none_or(|value| value.is_finite() && value > 0.0))
+}
+
+fn return_measurement(rainbow_expected: bool, status: &Reply) -> Result<ReturnMeasurement, String> {
     if status.code != 0 {
         return Err(format!(
             "could not read the returning frame's trail: {}",
@@ -795,6 +836,13 @@ fn return_measurement(status: &Reply) -> Result<ReturnMeasurement, String> {
         _ => Err(format!("trail status has invalid {key}")),
     };
     let resolved = field("resolved")?;
+    if resolved != "off"
+        && !aterm_effects::cursor_glow::spellings::TRAIL_STYLES
+            .iter()
+            .any(|row| row.style.is_some_and(|style| style.label() == resolved))
+    {
+        return Err("trail status has invalid resolved style".into());
+    }
     let enabled = boolean("config_enabled")?;
     let effective = boolean("effective")?;
     let intensity = field("intensity")?
@@ -802,9 +850,6 @@ fn return_measurement(status: &Reply) -> Result<ReturnMeasurement, String> {
         .ok()
         .filter(|n| n.is_finite() && *n >= 0.0)
         .ok_or("trail status has invalid intensity")?;
-    if resolved != "rainbow-kitty" || !enabled || !effective || intensity == 0.0 {
-        return Ok(ReturnMeasurement::NotApplicable);
-    }
     let count = |key| {
         field(key)?
             .parse::<u64>()
@@ -812,7 +857,15 @@ fn return_measurement(status: &Reply) -> Result<ReturnMeasurement, String> {
     };
     let segments = count("ribbon_segments")?;
     let drawn = count("ribbon_drawn")?;
-    Ok(if segments > 0 && drawn > 0 {
+    Ok(if !rainbow_expected {
+        ReturnMeasurement::NotApplicable
+    } else if resolved == "rainbow-kitty"
+        && enabled
+        && effective
+        && intensity > 0.0
+        && segments > 0
+        && drawn > 0
+    {
         ReturnMeasurement::LiveRibbon
     } else {
         ReturnMeasurement::Inconclusive
@@ -830,6 +883,7 @@ struct Shot<'a> {
     start: Instant,
     mark: Instant,
     terminal: bool,
+    rainbow_expected: bool,
     columns: u32,
     clean: bool,
     frames: u32,
@@ -986,9 +1040,9 @@ impl Shot<'_> {
             self.keep(&format!("{frame}.text.txt"), &reply);
         }
         if matches!(phase, FrameRead::Returned) {
-            let note = match return_measurement(&evidence.status) {
+            let note = match return_measurement(self.rainbow_expected, &evidence.status) {
                 Ok(ReturnMeasurement::NotApplicable) => {
-                    "not applicable: no effective enabled rainbow ribbon was requested"
+                    "not applicable: this instance's config did not request a live rainbow ribbon"
                 }
                 Ok(ReturnMeasurement::LiveRibbon) => {
                     "measurable: a live ribbon remains at return capture; continuity has not been judged"
@@ -1397,6 +1451,8 @@ impl Gallery {
             a.font_px.unwrap_or(f),
         );
         let config = config_lines(style, theme, &a.extras);
+        let rainbow_expected =
+            scenario == Scenario::RedrawStall && expects_rainbow(&config).map_err(usage)?;
         match self.launch(&name, scenario, theme, grid, &config) {
             Err(e) => {
                 eprintln!("trail-gallery: [{name}] {e}");
@@ -1409,7 +1465,9 @@ impl Gallery {
                         eprintln!("trail-gallery: [{name}] {}", f.msg.unwrap_or_default());
                         self.fails += 1;
                     }
-                    Ok(()) => self.capture(&live.inst, &name, scenario, grid.0)?,
+                    Ok(()) => {
+                        self.capture(&live.inst, &name, scenario, grid.0, rainbow_expected)?;
+                    }
                 }
                 self.end(live, &name);
             }
@@ -1430,6 +1488,7 @@ impl Gallery {
         name: &str,
         scenario: Scenario,
         columns: u32,
+        rainbow_expected: bool,
     ) -> Result<(), Stopped> {
         let tsv_path = self.out.join(format!("{name}.frames.tsv"));
         let tsv = File::create(&tsv_path);
@@ -1446,6 +1505,7 @@ impl Gallery {
             start: now,
             mark: now,
             terminal: scenario.terminal(),
+            rainbow_expected,
             columns,
             clean: self.clean,
             frames: 0,

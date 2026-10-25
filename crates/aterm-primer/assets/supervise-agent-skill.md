@@ -63,7 +63,9 @@ and old news never fires twice.
 - `done`: the worker's work LANDED: a reply starting `Nothing left:` defended that all of
   it is on the remote main branch and named no open, skipped or deferred work and no
   `NEEDS YOU:` line, and `git` found nothing uncommitted, untracked, stashed, unpushed or
-  unmerged.
+  unmerged where it could read (it counts nothing unpushed where the repository has no
+  remote, and reads nothing in a folder that is not a repository or one it may not read;
+  codex-alab runs its own check).
 - `exited`: the agent exited and nothing relaunches it.
 - `stalled`: no shell prompt within 20 s (`why=shell`), no composer within 2 minutes
   (`why=startup`), or 2 minutes at a screen the harness could not handle (`why=held`).

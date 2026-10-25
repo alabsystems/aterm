@@ -621,19 +621,6 @@ pub fn untar(archive: &Path, dir: &Path) -> Result<(), String> {
     )
 }
 
-/// Checksum-verified source archive with global PAX metadata and external links.
-pub(super) fn untar_homebrew_bundle(archive: &Path, dir: &Path) -> Result<(), String> {
-    extract_archive(
-        archive,
-        dir,
-        crate::extract::ExtractOptions {
-            strip_components: 0,
-            symlinks: crate::extract::SymlinkPolicy::ExternalLeaf,
-            allow_global_pax: true,
-        },
-    )
-}
-
 fn extract_archive(
     archive: &Path,
     dir: &Path,

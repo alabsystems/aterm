@@ -37,12 +37,12 @@ pub use drift::{CastDriftFn, CastDriftJob, DriftCut, DriftPeer, LocalVerbs};
 mod redial;
 pub use redial::{EXIT_REPLACED, target_sid};
 mod remote;
-pub use remote::{DriveLink, DriveRefused, DriveStream, FleetDriveFn};
+pub use remote::{DriveLink, DriveRefused, DriveStream, FleetDriveFn, Left};
 mod survey;
 pub use survey::{
     DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT, FLEET_WITHIN, FleetAsk,
     FleetRead, FleetSurveyFn, LEFT_OUT_LEAD, NO_ROUTE_NOTE, PeerFault, PeerSurvey,
-    UNANSWERED_REASON_CHARS, agent_word_shown, survey_rank, survey_urgent,
+    UNANSWERED_REASON_CHARS, UNANSWERED_ROOM, agent_word_shown, survey_rank, survey_urgent,
 };
 
 const SYNOPSIS: &str =

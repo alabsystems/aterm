@@ -456,6 +456,13 @@ pub(crate) enum DrawPrim {
     FadePush { y: f32, h: f32, from: f32, to: f32 },
     /// Pop the most recent [`DrawPrim::FadePush`]. Unbalanced pops are ignored.
     FadePop,
+    /// Keep every later prim at its own sub-pixel place until the matching
+    /// [`DrawPrim::SubpixelPop`]: elsewhere the raster puts a panel's and a rounded
+    /// stroke's edges on the device grid, so a rim is whole pixels wherever layout put it;
+    /// marks that glide by fractions of a pixel (the Deck's strips) keep their motion.
+    SubpixelPush,
+    /// Pop the most recent [`DrawPrim::SubpixelPush`]. Unbalanced pops are ignored.
+    SubpixelPop,
     /// One of the message band's drawn icons in a `size`-point square at `(x, y)`,
     /// rasterized at device scale (Settings ▸ Messages' severity column).
     BandIcon {
@@ -579,7 +586,7 @@ impl DrawPrim {
             Self::HsvDisk { cx, cy, r, value } => f32_bits(state, &[*cx, *cy, *r, *value]),
             Self::ClipPush { x, y, w, h } => f32_bits(state, &[*x, *y, *w, *h]),
             Self::FadePush { y, h, from, to } => f32_bits(state, &[*y, *h, *from, *to]),
-            Self::ClipPop | Self::FadePop => {}
+            Self::ClipPop | Self::FadePop | Self::SubpixelPush | Self::SubpixelPop => {}
             Self::BandIcon {
                 x,
                 y,
@@ -790,7 +797,10 @@ pub(crate) fn translate_prims(prims: &mut [DrawPrim], dx: f32, dy: f32) {
                 *cy += dy;
             }
             DrawPrim::FadePush { y, .. } => *y += dy,
-            DrawPrim::ClipPop | DrawPrim::FadePop => {}
+            DrawPrim::ClipPop
+            | DrawPrim::FadePop
+            | DrawPrim::SubpixelPush
+            | DrawPrim::SubpixelPop => {}
         }
     }
 }
@@ -1066,6 +1076,8 @@ mod tests {
                 to: 0.25,
             },
             DrawPrim::FadePop,
+            DrawPrim::SubpixelPush,
+            DrawPrim::SubpixelPop,
             DrawPrim::BandIcon {
                 x: 2.0,
                 y: 3.0,
@@ -1270,7 +1282,10 @@ mod tests {
             DrawPrim::FadePush { .. } => nudged!(p, FadePush(y, h, from, to)),
             DrawPrim::BandIcon { .. } => nudged!(p, BandIcon(x, y, size, icon, color)),
             DrawPrim::Image { .. } => nudged!(p, Image(x, y, w, h, art)),
-            DrawPrim::ClipPop | DrawPrim::FadePop => Vec::new(),
+            DrawPrim::ClipPop
+            | DrawPrim::FadePop
+            | DrawPrim::SubpixelPush
+            | DrawPrim::SubpixelPop => Vec::new(),
         }
     }
 

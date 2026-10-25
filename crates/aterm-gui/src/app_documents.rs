@@ -939,7 +939,7 @@ impl App {
         self.ensure_and_open_config_editor_at_in_window(wid, None)
     }
 
-    /// The App menu's "Open aterm.toml".
+    /// The command palette's "Open aterm.toml".
     pub(crate) fn open_config_editor_in_front(&mut self) -> Result<String, String> {
         let wid = self
             .frontmost_window

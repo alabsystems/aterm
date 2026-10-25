@@ -40,6 +40,8 @@ mod codex_alab_model;
 #[cfg(target_os = "macos")]
 mod codex_alab_proof;
 #[cfg(target_os = "macos")]
+mod codex_measure;
+#[cfg(target_os = "macos")]
 mod codex_proof;
 #[cfg(target_os = "macos")]
 mod codex_rig;
@@ -99,6 +101,8 @@ mod linux_driver;
 mod linux_edges;
 #[cfg(target_os = "macos")]
 mod linux_gone;
+#[cfg(target_os = "macos")]
+mod linux_gpu;
 #[cfg(target_os = "macos")]
 mod linux_guest;
 #[cfg(target_os = "macos")]
@@ -463,13 +467,23 @@ Outside any lab (no jail, no stub):
                [--rounds N] [--no-split] [--out DIR]
                                  OPENS A WINDOW (with --window): verify predictive editing over a simulated RTT `link` in
                                  single and split panes (defaults: both shells, 100 ms, both modes, 2 rounds)
-  codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH]
+  codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--expect-rollout bound|unmeasured]
                    [--policy-only|--upgrade-only|--raw-upgrade-only]
                                  end-to-end native harness proof on the real codex-alab package against a loopback fake
                                  model (~11 min; --policy-only: the cybersecurity-refusal leg alone; --upgrade-only: one
                                  live handoff; --raw-upgrade-only: started through the produced primary with its managed
                                  entry absent, automatic crash repair, then a live handoff); its scratch world is always
-                                 kept
+                                 kept; the rollout leg expects what --expect-rollout says, else what the lab's compiled
+                                 CODEX_MEASURED_BUILDS says of the package's build; one proof at a time on this Mac (it
+                                 waits up to 20 min for another to end, then is NOT RUN)
+  codex-measure [--package DIR] [--keep]
+                                 measure a codex-alab build for the rollout tap, in a clean checkout (~25 min): the proof
+                                 in process expecting it unmeasured, its six legs' rollouts reduced to a fixed point and
+                                 written to aterm-agent's step testdata (which lists the build), the standing tests, the
+                                 proof again expecting it bound, then a docs/measured note; or a refusal by class (STEM KEY
+                                 ROLLOUTS FIXED-POINT NEW-KEY GONE PROOF-RED STANDING NOT-BOUND) that leaves the checkout
+                                 as it was and keeps the worlds; exit 0, writing nothing, for a build whose six legs HEAD
+                                 holds; NOT RUN for a codex reduction HEAD does not hold (a killed run's leftover)
   seamless --baseline PATH [--aterm PATH] [--runs N] [--keep]
                                  OPENS A WINDOW, one at a time: one instance of a debug or dev-seams aterm across a real
                                  seamless update (ATERM_DEBUG_SEAMLESS_REEXEC=1, `update apply`), legs gap, topics,
@@ -485,8 +499,9 @@ Outside any lab (no jail, no stub):
                                  run <cmd> behind a PTY delaying chunks by RTT/2 each way (default 100 ms)
   mac dmg [--image REF] [--fda] [--keep]
                                  run dmg_acceptance benches inside a fresh SIP-enabled macOS tart VM (`mac help`)
-  linux up|down|status|exec|proof|baseline|gone|cpu|a11y|edges|deck|browser|vz-agent|clean|destroy
-                                 manage and run the Ubuntu 24.04 Lima VM runtime lane on aarch64 and Rosetta x86_64 (`linux help`)
+  linux [--gpu] up|down|status|exec|proof|baseline|gone|cpu|a11y|edges|deck|browser|gpu-host|vz-agent|clean|destroy
+                                 manage and run the Ubuntu 24.04 Lima VM runtime lane on aarch64 and Rosetta x86_64, or with
+                                 --gpu its krunkit instance on this Mac's GPU (`linux help`)
   windows up|down|status|exec|smoke|window|destroy
                                  manage and run the Windows 11 arm64 QEMU VM runtime lane on aarch64 and Prism x86_64 (`windows help`)
 
@@ -689,6 +704,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "meta-keys" => meta_keys::cmd_meta_keys(args),
         "predict-live" => predict_live::cmd_predict_live(args),
         "codex-alab-proof" => codex_alab_proof::cmd_codex_alab_proof(args),
+        "codex-measure" => codex_measure::cmd_codex_measure(args),
         "seamless" => seamless::cmd_seamless(args),
         "linux" => linux::cmd_linux(args),
         "windows" => windows::cmd_windows(args),

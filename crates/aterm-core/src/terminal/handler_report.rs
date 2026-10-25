@@ -413,6 +413,47 @@ mod color_scheme_tests {
         assert!(term.take_response().is_none(), "unchanged scheme = no push");
     }
 
+    /// A program's replies drain the response limit and its 2031 push latches the scheme only once the clocks its slices were parsed at refilled it, however slowly or fast the slices are folded, under the engine's own limit and the policy's.
+    #[test]
+    fn the_2031_push_is_admitted_by_the_slices_clocks() {
+        use crate::terminal::ClockReading;
+        use std::time::Duration;
+        let at = |base: ClockReading, ms: u64| ClockReading {
+            monotonic: base.monotonic + Duration::from_millis(ms),
+            wall_ms: base.wall_ms.map(|w| w + ms),
+        };
+        let mut drain_bucket = b"\x1b[?2031h".to_vec();
+        for _ in 0..20_000 {
+            drain_bucket.extend_from_slice(b"\x1b[6n");
+        }
+        for _ in 0..8 {
+            drain_bucket.extend_from_slice(b"\x1b[5n");
+        }
+        for policy in [false, true] {
+            for (gap_ms, pause, admitted) in [
+                (0, Duration::from_millis(150), false),
+                (2_000, Duration::ZERO, true),
+            ] {
+                let mut term = Terminal::new(24, 80);
+                if policy {
+                    term.apply_policy_engine(aterm_policy::engine::PolicyEngine::new(
+                        aterm_policy::profiles::standard(),
+                    ));
+                }
+                let base = ClockReading::now();
+                term.process_at(&drain_bucket, base);
+                let _ = drain(&mut term);
+                std::thread::sleep(pause);
+                term.process_at(b"\x1b]11;#ffffff\x07", at(base, gap_ms));
+                assert_eq!(
+                    term.modes().color_scheme == Appearance::Light,
+                    admitted,
+                    "policy: {policy}, {gap_ms} ms later by the slices' clocks, {pause:?} later by the system's"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_2031_push_is_a_report_and_the_996_answer_a_reply() {
         let mut term = Terminal::new(24, 80);

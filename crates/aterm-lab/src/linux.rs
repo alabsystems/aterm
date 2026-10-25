@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use aterm_toolchain::named_lock::{self, Refused, Wait};
 use aterm_uds::spawnfd::Stdio;
 
 use crate::linux_driver::{Driver, Kind};
@@ -42,10 +43,16 @@ pub const NOT_RUN: i32 = 3;
 
 /// The verbs, as `linux help` prints them.
 pub const USAGE: &str = "\
-targo --unverified lab linux [--driver lima|vz] <verb> — the Linux runtime lane: an Ubuntu 24.04 aarch64 VM (Rosetta for
-x86_64), lima's by default; --driver vz or LAB_LINUX_DRIVER=vz runs every verb on the lane's own VM instead (aterm-vz-host,
-the guest agent, the state in LAB_VZ_STATE or ~/Library/Caches/aterm/vz.noindex; it needs a console session, since the
-framework's VM process opens a WindowServer connection at each boot)
+targo --unverified lab linux [--driver lima|vz] [--gpu] [--no-wait] <verb> — the Linux runtime lane: an Ubuntu 24.04
+aarch64 VM (Rosetta for x86_64), lima's by default; --driver vz or LAB_LINUX_DRIVER=vz runs every verb on the lane's own VM
+instead (aterm-vz-host, the guest agent, the state in LAB_VZ_STATE or ~/Library/Caches/aterm/vz.noindex; it needs a console
+session, since the framework's VM process opens a WindowServer connection at each boot); --gpu runs every verb on the lane's
+GPU instance instead, lima's aterm-linux-gpu on krunkit (krunkit from Homebrew's slp/krun tap, KosmicKrisp placed by
+`gpu-host`): the lane's provisioning for aarch64 (krunkit has no Rosetta, so --arch x86_64 is refused), then the mainline
+7.2.6 kernel and Mesa 26.3's Venus, and before any verb runs the guest's Vulkan must be Venus on this Mac's GPU and its GL zink
+over it (else NOT RUN); cargo and aterm-gui run with Venus as the only Vulkan driver and zink as GL (the display servers stay
+on llvmpipe). One run holds a VM at a time: a verb that finds it held waits for that run to end, naming it (pid, verb,
+checkout, since when) as the wait starts and once a minute; --no-wait answers NOT RUN at once instead, naming it
   up                       make the VM on first use, mount this checkout read-only, boot, provision; leaves it running
   down                     remove the guest's build output and stop the VM (it is kept; the next run boots it in ~10 s)
   status                   lima, the VM, its mount, provisioning and disk use (guest and host)
@@ -157,6 +164,9 @@ framework's VM process opens a WindowServer connection at each boot)
                            signal, not started), stdin, the merged order, the lane user's environment, copy_out,
                            copy_dir_out and copy_dir_in, the read-only checkout, a share swap and rebind, and Rosetta's
                            registration and translation cache. Exit 0 pass, 1 a check failed, 3 NOT RUN
+  gpu-host                 place the LunarG Vulkan SDK's loader and KosmicKrisp (1.4.363.0, held to its sha256, installed
+                           headless into a scratch root that is then removed) under ~/Library/Caches/aterm/tooling.noindex,
+                           where --gpu's krunkit loads them in place of MoltenVK, which lacks zink's nullDescriptor
   clean                    remove the guest's build output and trim the VM disk (its blocks go back to this Mac)
   destroy                  delete the VM and its disk (`limactl delete`; vz: Stop, then the live and baked disks, base
                            kept); the next `up` makes it again
@@ -166,20 +176,39 @@ framework's VM process opens a WindowServer connection at each boot)
 /// # Errors
 /// A usage error, or a step that failed.
 pub fn cmd_linux(args: &[String]) -> Res {
-    let args = match args {
-        [flag, word, rest @ ..] if flag == "--driver" => {
-            crate::linux_driver::choose(word)?;
-            rest
+    let mut args = args;
+    let mut wait = Wait::Block;
+    loop {
+        match args {
+            [flag, word, rest @ ..] if flag == "--driver" => {
+                crate::linux_driver::choose(word)?;
+                args = rest;
+            }
+            [flag] if flag == "--driver" => {
+                return Err(Fail::usage(format!(
+                    "linux --driver needs lima or vz ({LAB} linux help)"
+                )));
+            }
+            [flag, rest @ ..] if flag == "--gpu" => {
+                crate::linux_gpu::choose();
+                args = rest;
+            }
+            [flag, rest @ ..] if flag == "--no-wait" => {
+                wait = Wait::No;
+                args = rest;
+            }
+            _ => break,
         }
-        [flag] if flag == "--driver" => {
-            return Err(Fail::usage(format!(
-                "linux --driver needs lima or vz ({LAB} linux help)"
-            )));
-        }
-        _ => args,
-    };
+    }
+    if crate::linux_gpu::on() && crate::linux_driver::kind()? == Kind::Vz {
+        return Err(Fail::usage(
+            "linux --gpu: the GPU instance is lima's (krunkit); the vz arm has no GPU",
+        ));
+    }
     let verb = args.first().map_or("help", String::as_str);
     let rest = args.get(1..).unwrap_or_default();
+    let gpu = if crate::linux_gpu::on() { " --gpu" } else { "" };
+    name_run(format!("lab linux{gpu} {verb}"), wait);
     match verb {
         "up" => cmd_up(),
         "down" => cmd_down(),
@@ -196,6 +225,7 @@ pub fn cmd_linux(args: &[String]) -> Res {
         "vz-agent" => crate::linux_vz::cmd_vz_agent(rest),
         "vz-host" => crate::linux_vz_host::cmd_vz_host(rest),
         "vz-smoke" => crate::linux_vz_driver::cmd_vz_smoke(rest),
+        "gpu-host" => crate::linux_gpu::cmd_gpu_host(rest),
         "clean" => cmd_clean(),
         "destroy" => cmd_destroy(),
         "help" | "-h" | "--help" => {
@@ -474,9 +504,14 @@ pub fn pick_limactl(
     }
 }
 
-/// The `limactl` this Mac has.
+/// The `limactl` this Mac has, and the instance this run drives with it.
 pub struct Lima {
     pub bin: PathBuf,
+    /// The instance: [`VM`], or the GPU instance under `--gpu`.
+    pub vm: &'static str,
+    /// What every `limactl` of the run gets beyond this process's environment (the GPU
+    /// instance's krunkit, [`crate::linux_gpu::lima_env`]).
+    pub env: Vec<(String, String)>,
 }
 
 impl Lima {
@@ -484,12 +519,18 @@ impl Lima {
     /// # Errors
     /// No `limactl`: the lane cannot run here.
     pub fn find() -> Result<Lima, Fail> {
+        let gpu = crate::linux_gpu::on();
+        let env = if gpu {
+            crate::linux_gpu::lima_env()?
+        } else {
+            Vec::new()
+        };
         if !cfg!(target_arch = "aarch64") {
             return Err(not_run(
                 "the lane needs Apple silicon (lima's vz VM with Rosetta for x86_64)",
             ));
         }
-        if !Path::new("/Library/Apple/usr/libexec/oah/RosettaLinux").exists() {
+        if !gpu && !Path::new("/Library/Apple/usr/libexec/oah/RosettaLinux").exists() {
             return Err(not_run(
                 "Rosetta for Linux is not installed (softwareupdate --install-rosetta)",
             ));
@@ -500,12 +541,15 @@ impl Lima {
             .map(|p| p.to_string_lossy().into_owned());
         pick_limactl(named.as_deref(), pinned.as_deref(), crate::sys::executable).map(|bin| Lima {
             bin: PathBuf::from(bin),
+            vm: crate::linux_gpu::vm(),
+            env,
         })
     }
 
     fn command(&self) -> aterm_uds::spawnfd::Command {
         let mut c = aterm_uds::spawnfd::command(&self.bin);
         c.stdin(Stdio::null());
+        c.envs(self.env.iter().map(|(k, v)| (k, v)));
         c
     }
 
@@ -540,6 +584,20 @@ impl Lima {
         }
     }
 
+    /// `limactl stop`, the GPU instance's file systems synced first: krunkit's stop loses what
+    /// the guest had not written back (measured 2026-10-24: a Mesa install and the provisioning
+    /// stamp, written a minute before, were gone at the next boot). The sync is the guest's
+    /// `timeout`'s, so a wedged guest still reaches the stop; the lane's vz VM, whose stop
+    /// keeps its writes, is stopped as it always was.
+    #[must_use]
+    pub fn stop(&self) -> Out {
+        if self.vm == crate::linux_gpu::VM {
+            let sync = ["timeout", "60", "sync"].map(String::from);
+            let _ = self.shell("/", &sync, None);
+        }
+        self.run(&["stop".into(), self.vm.into()])
+    }
+
     /// `limactl --version`'s answer.
     #[must_use]
     pub fn version(&self) -> String {
@@ -554,14 +612,14 @@ impl Lima {
         if !out.ok() {
             return Err(format!("limactl list failed: {}", out.tail(5)));
         }
-        Ok(parse_list(&out.text, VM))
+        Ok(parse_list(&out.text, self.vm))
     }
 
-    fn shell_argv(workdir: &str, argv: &[String]) -> Vec<String> {
+    fn shell_argv(&self, workdir: &str, argv: &[String]) -> Vec<String> {
         let mut a = vec![
             "shell".to_string(),
             format!("--workdir={workdir}"),
-            VM.to_string(),
+            self.vm.to_string(),
             "--".to_string(),
         ];
         a.extend(argv.iter().cloned());
@@ -573,7 +631,7 @@ impl Lima {
     pub fn shell(&self, workdir: &str, argv: &[String], stdin: Option<&str>) -> Out {
         let t0 = Instant::now();
         let mut cmd = self.command();
-        cmd.args(Self::shell_argv(workdir, argv))
+        cmd.args(self.shell_argv(workdir, argv))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if stdin.is_some() {
@@ -635,7 +693,7 @@ impl Lima {
         merged.extend(argv.iter().cloned());
         let mut child = match self
             .command()
-            .args(Self::shell_argv(workdir, &merged))
+            .args(self.shell_argv(workdir, &merged))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -696,7 +754,7 @@ impl Lima {
     pub fn copy_out(&self, guest_path: &str, host_path: &Path) -> Out {
         self.run(&[
             "copy".into(),
-            format!("{VM}:{guest_path}"),
+            format!("{}:{guest_path}", self.vm),
             host_path.to_string_lossy().into_owned(),
         ])
     }
@@ -708,7 +766,7 @@ impl Lima {
             "copy".into(),
             "-r".into(),
             host_dir.to_string_lossy().into_owned(),
-            format!("{VM}:{guest_parent}/"),
+            format!("{}:{guest_parent}/", self.vm),
         ])
     }
 
@@ -718,7 +776,7 @@ impl Lima {
         self.run(&[
             "copy".into(),
             "-r".into(),
-            format!("{VM}:{guest_dir}"),
+            format!("{}:{guest_dir}", self.vm),
             format!("{}/", host_parent.to_string_lossy()),
         ])
     }
@@ -750,18 +808,38 @@ pub fn gib(n: u64) -> String {
     format!("{g:.1} GiB")
 }
 
-/// The one lane run of this Mac: `flock` on [`lane_lock_path`], released by `LOCK_UN` before the file closes (clippy.toml's flock rule).
+/// The one lane run of this Mac: a [`named_lock`] on [`lane_lock_path`], whose file names the
+/// run that holds it, released by `LOCK_UN` before the file closes (clippy.toml's flock rule).
 pub struct LaneLock {
-    file: std::fs::File,
+    held: named_lock::NamedLock,
+}
+
+/// This run as a held lane names it (`lab linux proof`), and whether it waits for a held lane:
+/// set once, by the lane's verb dispatch ([`name_run`]).
+static RUN: OnceLock<(String, Wait)> = OnceLock::new();
+
+/// Name this run for the lane lock it takes: `verb` (`lab linux proof`), waiting for a held lane
+/// unless `wait` is [`Wait::No`] (`--no-wait`).
+pub fn name_run(verb: String, wait: Wait) {
+    let _ = RUN.set((verb, wait));
 }
 
 impl LaneLock {
-    /// Take the lane, or say who holds it.
+    /// How long this run waited for the lane: zero when it was free. A verb's own clock leaves
+    /// it out.
+    #[must_use]
+    pub fn waited(&self) -> std::time::Duration {
+        self.held.waited()
+    }
+
+    /// Take the lane, waiting for the run that holds it ([`LaneLock::at`]).
     /// # Errors
-    /// Another run holds it (NOT RUN), or the lock file cannot be made.
+    /// `--no-wait` and another run holds it (NOT RUN, naming it), an interrupt while waiting, or
+    /// the lock file cannot be made.
     pub fn take() -> Result<LaneLock, Fail> {
         let path = match crate::linux_driver::kind()? {
             Kind::Lima => lane_lock_path(
+                crate::linux_gpu::vm(),
                 std::env::var("LIMA_HOME").ok().as_deref(),
                 paths().need_home().map_err(Fail::die)?,
             ),
@@ -770,52 +848,110 @@ impl LaneLock {
         LaneLock::at(&path, "linux")
     }
 
-    /// Acquire the lane lock at `path` for `lane`.
+    /// Take the lane lock at `path` for `lane` as this run ([`name_run`]; `lab <lane>`, waiting,
+    /// when the dispatch named none), from this checkout.
     /// # Errors
-    /// Another run holds it (NOT RUN), or the lock file cannot be made.
+    /// [`LaneLock::at_as`]'s.
     pub fn at(path: &Path, lane: &str) -> Result<LaneLock, Fail> {
+        let (verb, wait) = RUN
+            .get()
+            .cloned()
+            .unwrap_or_else(|| (format!("lab {lane}"), Wait::Block));
+        let me = named_lock::Holder::me(&verb, Path::new(&repo()));
+        LaneLock::at_as(
+            path,
+            lane,
+            &me,
+            wait,
+            &mut |line| println!("{line}"),
+            &crate::stop::check,
+        )
+    }
+
+    /// Take the lane lock at `path` as `me`. Held by another run: under [`Wait::Block`] the wait
+    /// lasts while that run does, its holder named on `say` as it starts and once a minute, and
+    /// ends at once when `stopped` says an interrupt came; under [`Wait::No`] the lane is NOT RUN
+    /// at once, its holder named.
+    /// # Errors
+    /// NOT RUN under `--no-wait`; NOT RUN for an interrupt that ended a wait, naming the holder
+    /// and carrying the signal (the lane ran nothing, so it decided nothing); or a lock file that
+    /// cannot be made.
+    pub fn at_as(
+        path: &Path,
+        lane: &str,
+        me: &named_lock::Holder,
+        wait: Wait,
+        say: &mut dyn FnMut(&str),
+        stopped: &dyn Fn() -> Result<(), crate::stop::Stopped>,
+    ) -> Result<LaneLock, Fail> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| Fail::die(format!("{}: {e}", dir.display())))?;
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .map_err(|e| Fail::die(format!("{}: {e}", path.display())))?;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the guard's Drop releases by File::unlock before the close"
-        )]
-        let taken = file.try_lock();
+        let taken = named_lock::take(
+            path,
+            me,
+            wait,
+            &mut |holder, waited| {
+                say(&if waited < named_lock::SAY_EVERY {
+                    format!(
+                        "{lane}: waiting for {}, which holds the lane ({})",
+                        holder_name(holder),
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "{lane}: still waiting for {} ({} min)",
+                        holder_name(holder),
+                        waited.as_secs() / 60
+                    )
+                });
+            },
+            &|| stopped().is_err(),
+        );
         match taken {
-            Ok(()) => Ok(LaneLock { file }),
-            Err(std::fs::TryLockError::WouldBlock) => Err(not_run(format!(
-                "another lane run holds the VM ({}); wait for it, or `{LAB} {lane} status`",
+            Ok(held) => Ok(LaneLock { held }),
+            Err(Refused::Held(holder)) => Err(not_run(format!(
+                "{} holds the lane ({}); --no-wait does not wait for it",
+                holder_name(holder.as_ref()),
                 path.display()
             ))),
-            Err(std::fs::TryLockError::Error(e)) => {
-                Err(Fail::die(format!("{}: {e}", path.display())))
-            }
+            Err(Refused::Stopped(holder)) => Err(Fail {
+                stopped: stopped().err().map(|s| s.0),
+                ..not_run(format!(
+                    "interrupted while waiting for {}, which holds the lane ({}); this run took \
+                     no part of it",
+                    holder_name(holder.as_ref()),
+                    path.display()
+                ))
+            }),
+            Err(Refused::Io(e)) => Err(Fail::die(format!("{}: {e}", path.display()))),
         }
     }
 }
 
-impl Drop for LaneLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
+/// Whom a held lane names: its record's run while that pid lives, its clock this Mac's.
+fn holder_name(holder: Option<&named_lock::Holder>) -> String {
+    named_lock::name(
+        holder,
+        |since| {
+            i64::try_from(since)
+                .ok()
+                .and_then(aterm_uds::zone::local_offset_at)
+                .unwrap_or(0)
+        },
+        aterm_uds::process::pid_alive,
+    )
 }
 
-/// The lane lock: one per VM, so beside lima's instances (`$LIMA_HOME`, else `~/.lima`), never in a checkout.
+/// The lane lock of lima's instance `vm`: one per VM, so beside lima's instances (`$LIMA_HOME`, else `~/.lima`), never in a checkout.
 #[must_use]
-pub fn lane_lock_path(lima_home: Option<&str>, home: &str) -> PathBuf {
+pub fn lane_lock_path(vm: &str, lima_home: Option<&str>, home: &str) -> PathBuf {
     let base = match lima_home.filter(|h| !h.is_empty()) {
         Some(h) => PathBuf::from(h),
         None => Path::new(home).join(".lima"),
     };
-    base.join(format!(".{VM}.lane.lock"))
+    base.join(format!(".{vm}.lane.lock"))
 }
 
 /// `$LAB_STATE/linux`, made when missing.
@@ -1033,13 +1169,18 @@ fn bring_up_vz(repo: &str) -> Result<(Driver, bool, Vec<Step>), Fail> {
 /// lima's `create`, `edit` (the mounts), and `start`, unchanged behind the driver.
 fn bring_up_lima(repo: &str) -> Result<(Driver, bool, Vec<Step>), Fail> {
     let lima = Lima::find()?;
+    let vm_name = lima.vm;
     let mut timings = Vec::new();
     let mut state = lima.state().map_err(not_run)?;
     if state.is_none() {
         println!(
-            "linux: making the VM ({CPUS} CPUs, {MEMORY_GIB} GiB, disk <= {DISK_GIB} GiB, {TEMPLATE}) …"
+            "linux: making {vm_name} ({CPUS} CPUs, {MEMORY_GIB} GiB, disk <= {DISK_GIB} GiB, {TEMPLATE}) …"
         );
-        let out = lima.run(&create_args());
+        let out = lima.run(&if crate::linux_gpu::on() {
+            crate::linux_gpu::create_args()
+        } else {
+            create_args()
+        });
         timings.push(Step::done("create", out.secs));
         if !out.ok() {
             return Err(not_run(format!("limactl create failed: {}", out.tail(8))));
@@ -1052,7 +1193,7 @@ fn bring_up_lima(repo: &str) -> Result<(Driver, bool, Vec<Step>), Fail> {
     let mounts = lane_mounts(repo);
     if !mounted_exactly(&vm, &mounts) {
         if vm.status == "Running" {
-            let out = lima.run(&["stop".into(), VM.into()]);
+            let out = lima.stop();
             if !out.ok() {
                 return Err(not_run(format!("limactl stop failed: {}", out.tail(5))));
             }
@@ -1060,7 +1201,7 @@ fn bring_up_lima(repo: &str) -> Result<(Driver, bool, Vec<Step>), Fail> {
         let out = lima.run(&[
             "edit".into(),
             "--tty=false".into(),
-            VM.into(),
+            vm_name.into(),
             "--set".into(),
             mount_expr(&mounts),
         ]);
@@ -1077,8 +1218,8 @@ fn bring_up_lima(repo: &str) -> Result<(Driver, bool, Vec<Step>), Fail> {
     }
     let booted_here = vm.status != "Running";
     if booted_here {
-        println!("linux: booting {VM} (mount: {repo}, read-only) …");
-        let out = lima.run(&["start".into(), "--tty=false".into(), VM.into()]);
+        println!("linux: booting {vm_name} (mount: {repo}, read-only) …");
+        let out = lima.run(&["start".into(), "--tty=false".into(), vm_name.into()]);
         timings.push(Step::done("boot", out.secs));
         if !out.ok() {
             return Err(not_run(format!("limactl start failed: {}", out.tail(8))));
@@ -1120,7 +1261,25 @@ fn finish_bring_up(
             return Err(f);
         }
     }
-    if let Some(step) = reset_rosetta_cache(&up) {
+    if crate::linux_gpu::on() {
+        // krunkit has no Rosetta (no rosettad, no cache to reset); its guest must boot the
+        // kernel Venus needs, and be on this Mac's GPU, before anything runs on it.
+        if let Err(f) = boot_gpu_kernel(&mut up) {
+            up.release();
+            return Err(f);
+        }
+        match crate::linux_gpu::prove(&|argv| up.sh(argv)) {
+            Ok((named, secs)) => {
+                println!("linux: on the GPU: {named}");
+                up.timings
+                    .push(Step::done(&format!("gpu proof ({named})"), secs));
+            }
+            Err(f) => {
+                up.release();
+                return Err(f);
+            }
+        }
+    } else if let Some(step) = reset_rosetta_cache(&up) {
         up.timings.push(step);
     }
     match claim_build_output(&up, repo) {
@@ -1229,8 +1388,61 @@ fn reset_rosetta_cache(up: &Up) -> Option<Step> {
     })
 }
 
+/// The plan this run's instance is provisioned with: the lane's, or under `--gpu` the lane's for
+/// aarch64 alone, then the GPU instance's own steps.
+fn lane_plan() -> Vec<guest::Step> {
+    if crate::linux_gpu::on() {
+        let mut steps = crate::linux_gpu::gpu_first_steps();
+        steps.extend(guest::provision_steps_for(false));
+        steps.extend(crate::linux_gpu::gpu_steps());
+        steps
+    } else {
+        guest::provision_steps()
+    }
+}
+
+/// Under `--gpu`, the guest on [`crate::linux_gpu::KERNEL`]: a guest provisioned onto it but
+/// still on the image's kernel is stopped and started again (krunkit cannot reboot in place).
+fn boot_gpu_kernel(up: &mut Up) -> Result<(), Fail> {
+    let want = crate::linux_gpu::KERNEL.release;
+    let uname = |up: &Up| {
+        let out = up.sh(&["uname".into(), "-r".into()]);
+        out.text.trim().to_string()
+    };
+    if uname(up) == want {
+        return Ok(());
+    }
+    let Driver::Lima(lima) = &up.guest else {
+        return Err(not_run("the GPU instance is lima's"));
+    };
+    println!("linux: booting {} on Linux {want} …", lima.vm);
+    let t0 = Instant::now();
+    for verb in ["stop", "start"] {
+        let out = if verb == "stop" {
+            lima.stop()
+        } else {
+            lima.run(&["start".into(), "--tty=false".into(), lima.vm.into()])
+        };
+        if !out.ok() {
+            return Err(not_run(format!("limactl {verb} failed: {}", out.tail(8))));
+        }
+    }
+    up.booted_here = true;
+    up.timings.push(Step::done(
+        "reboot onto the GPU kernel",
+        t0.elapsed().as_secs_f64(),
+    ));
+    let have = uname(up);
+    if have != want {
+        return Err(not_run(format!(
+            "the GPU instance booted Linux {have}, not {want} (grub's default)"
+        )));
+    }
+    Ok(())
+}
+
 fn provision(up: &Up) -> Result<Option<f64>, Fail> {
-    let steps = guest::provision_steps();
+    let steps = lane_plan();
     let want = guest::fingerprint(&steps);
     let have = up.sh(&["cat".into(), guest::STAMP.into()]);
     if have.ok() && have.text.trim() == want {
@@ -1278,8 +1490,12 @@ fn cmd_up() -> Res {
             Some(why) => println!("linux: {} FAILED: {why}", step.name),
         }
     }
+    let (vm, gpu) = (
+        crate::linux_gpu::vm(),
+        if crate::linux_gpu::on() { " --gpu" } else { "" },
+    );
     println!(
-        "linux: {VM} is up ({}); `{LAB} linux exec -- CMD` runs in it, `{LAB} linux down` cleans and stops it",
+        "linux: {vm} is up ({}); `{LAB} linux{gpu} exec -- CMD` runs in it, `{LAB} linux{gpu} down` cleans and stops it",
         up.guest.kind().name()
     );
     up.keep();
@@ -1293,9 +1509,10 @@ fn cmd_down() -> Res {
     }
     let lima = Lima::find()?;
     let _lock = LaneLock::take()?;
+    let vm_name = lima.vm;
     match lima.state().map_err(Fail::die)? {
-        None => println!("linux: there is no {VM} VM"),
-        Some(vm) if vm.status != "Running" => println!("linux: {VM} is {}", vm.status),
+        None => println!("linux: there is no {vm_name} VM"),
+        Some(vm) if vm.status != "Running" => println!("linux: {vm_name} is {}", vm.status),
         Some(_) => {
             let guest = Driver::Lima(lima);
             match guest_path_var(&guest, "HOME").map(|home| clean_guest_build(&guest, &home)) {
@@ -1306,11 +1523,11 @@ fn cmd_down() -> Res {
             let Driver::Lima(lima) = guest else {
                 unreachable!("lima's down")
             };
-            let out = lima.run(&["stop".into(), VM.into()]);
+            let out = lima.stop();
             if !out.ok() {
                 return Err(Fail::die(format!("limactl stop failed: {}", out.tail(5))));
             }
-            println!("linux: {VM} stopped");
+            println!("linux: {vm_name} stopped");
         }
     }
     Ok(0)
@@ -1322,12 +1539,14 @@ fn cmd_status() -> Res {
     }
     let lima = Lima::find()?;
     println!("limactl   {} ({})", lima.bin.display(), lima.version());
+    let gpu = if crate::linux_gpu::on() { " --gpu" } else { "" };
     let Some(vm) = lima.state().map_err(Fail::die)? else {
-        println!("vm        none (`{LAB} linux up` makes it)");
+        println!("vm        none (`{LAB} linux{gpu} up` makes it)");
         return Ok(0);
     };
     println!(
-        "vm        {VM} {} — {} CPUs, {}, disk <= {}",
+        "vm        {} {} — {} CPUs, {}, disk <= {}",
+        lima.vm,
         vm.status,
         vm.cpus,
         gib(vm.memory),
@@ -1344,7 +1563,7 @@ fn cmd_status() -> Res {
     }
     if vm.status == "Running" {
         let stamp = lima.shell("/", &["cat".into(), guest::STAMP.into()], None);
-        let want = guest::fingerprint(&guest::provision_steps());
+        let want = guest::fingerprint(&lane_plan());
         let have = stamp.text.trim();
         println!(
             "provision {}",
@@ -1436,6 +1655,7 @@ pub fn parse_exec(args: &[String]) -> Result<ExecArgs, Fail> {
 
 fn cmd_exec(args: &[String]) -> Res {
     let ask = parse_exec(args)?;
+    crate::linux_gpu::arches(vec![ask.arch], "exec")?;
     let _lock = LaneLock::take()?;
     let up = bring_up()?;
     let mut env = guest::cargo_env(ask.arch, &format!("{}/target", up.lane_dir()), true);
@@ -1669,19 +1889,19 @@ fn cmd_destroy() -> Res {
     }
     let lima = Lima::find()?;
     if lima.state().map_err(Fail::die)?.is_none() {
-        println!("linux: there is no {VM} VM");
+        println!("linux: there is no {} VM", lima.vm);
         return Ok(0);
     }
     let out = lima.run(&[
         "delete".into(),
         "--force".into(),
         "--tty=false".into(),
-        VM.into(),
+        lima.vm.into(),
     ]);
     if !out.ok() {
         return Err(Fail::die(format!("limactl delete failed: {}", out.tail(5))));
     }
-    println!("linux: {VM} deleted with its disk");
+    println!("linux: {} deleted with its disk", lima.vm);
     Ok(0)
 }
 
@@ -1803,18 +2023,186 @@ mod tests {
         assert_eq!(outside_git_dir(&inner), None);
     }
 
+    /// A wait no interrupt ends.
+    fn go_on() -> Result<(), crate::stop::Stopped> {
+        Ok(())
+    }
+
+    /// An interrupt that ends a wait for a held lane is NOT RUN, naming the holder and carrying
+    /// the signal: the lane ran nothing. Negative control: the holder's own take, with no
+    /// interrupt, has the lane.
+    #[test]
+    fn an_interrupted_wait_is_not_run_naming_the_holder() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("lab-lane-stop-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(".aterm-linux.lane.lock");
+        let holder = named_lock::Holder::me("lab linux proof", Path::new("/checkouts/holder"));
+        let held = LaneLock::at_as(&path, "linux", &holder, Wait::No, &mut |_| {}, &go_on)
+            .unwrap_or_else(|f| panic!("the lane is free: {:?}", f.msg));
+        assert_eq!(held.waited(), std::time::Duration::ZERO);
+        let me = named_lock::Holder::me("lab linux exec", Path::new("/checkouts/waiter"));
+        let refused = LaneLock::at_as(&path, "linux", &me, Wait::Block, &mut |_| {}, &|| {
+            Err(crate::stop::Stopped(libc::SIGTERM))
+        })
+        .err()
+        .expect("an interrupt ends the wait");
+        let why = refused.msg.unwrap_or_default();
+        assert_eq!(
+            (refused.code, refused.stopped),
+            (NOT_RUN, Some(libc::SIGTERM)),
+            "{why}"
+        );
+        assert!(
+            why.starts_with(&format!(
+                "NOT RUN: interrupted while waiting for pid {} (lab linux proof, /checkouts/holder, since ",
+                holder.pid
+            )),
+            "{why}"
+        );
+        drop(held);
+    }
+
+    /// [`a_held_lane_is_waited_for_until_its_holder_dies_by_its_own_hand`]'s holder.
+    const STAND_IN: &str = "linux::tests::a_lane_holder_stand_in";
+    /// The lock file the stand-in takes.
+    const STAND_IN_ENV: &str = "ATERM_LAB_TEST_LANE_HOLDER";
+    /// What the stand-in says once it holds the lane (libtest's own words share its line).
+    const STAND_IN_HOLDS: &str = "the stand-in holds the lane";
+
+    /// Not a test alone: as [`STAND_IN`] it takes the lane at [`STAND_IN_ENV`]'s path, says
+    /// [`STAND_IN_HOLDS`], and at its first line on stdin dies by its own `SIGKILL`.
+    #[test]
+    fn a_lane_holder_stand_in() {
+        let Some(path) = std::env::var_os(STAND_IN_ENV) else {
+            return;
+        };
+        let me = named_lock::Holder::me("lab linux proof", Path::new("/checkouts/holder"));
+        let _held = LaneLock::at_as(
+            Path::new(&path),
+            "linux",
+            &me,
+            Wait::No,
+            &mut |_| {},
+            &go_on,
+        )
+        .unwrap_or_else(|f| panic!("the lane is free: {:?}", f.msg));
+        println!("{STAND_IN_HOLDS}");
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stdin().read_line(&mut String::new());
+        aterm_uds::process::kill_self_now()
+    }
+
+    /// A held lane is waited for with its holder named, and is the waiter's once the holder is
+    /// gone, though the holder died by its own `SIGKILL` and nobody signalled anyone; the waiter
+    /// says how soon it had the lane. Negative control: `--no-wait` is NOT RUN at once, naming
+    /// the same holder.
+    #[test]
+    fn a_held_lane_is_waited_for_until_its_holder_dies_by_its_own_hand() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("lab-lane-wait-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(".aterm-linux.lane.lock");
+        let mut holder = aterm_uds::spawnfd::command(std::env::current_exe().expect("this test"))
+            .args(["--exact", STAND_IN, "--nocapture", "--test-threads=1"])
+            .env(STAND_IN_ENV, &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the stand-in starts");
+        let pid = holder.id();
+        let said = BufReader::new(holder.stdout.take().expect("its stdout"));
+        let (holds, held_now) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in said.lines().map_while(Result::ok) {
+                if line.contains(STAND_IN_HOLDS) {
+                    let _ = holds.send(());
+                }
+            }
+        });
+        // The one-minute hang detector: the stand-in takes a free lane at once.
+        held_now
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the stand-in holds the lane");
+        let me = named_lock::Holder::me("lab linux proof", Path::new("/checkouts/waiter"));
+        let refused = LaneLock::at_as(&path, "linux", &me, Wait::No, &mut |_| {}, &go_on)
+            .err()
+            .expect("--no-wait does not wait");
+        let why = refused.msg.unwrap_or_default();
+        assert_eq!(refused.code, NOT_RUN, "{why}");
+        assert!(
+            why.contains(&format!(
+                "pid {pid} (lab linux proof, /checkouts/holder, since "
+            )),
+            "{why}"
+        );
+
+        let mut stdin = holder.stdin.take().expect("its stdin");
+        let (died, death) = std::sync::mpsc::channel();
+        let reaper = std::thread::spawn(move || {
+            let status = holder.wait().expect("the stand-in is reaped");
+            let _ = died.send(Instant::now());
+            status
+        });
+        let (took, taken) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let mut heard = Vec::new();
+            let held = LaneLock::at_as(
+                &path,
+                "linux",
+                &me,
+                Wait::Block,
+                &mut |line| {
+                    heard.push(line.to_string());
+                    let _ = stdin.write_all(b"die\n");
+                },
+                &go_on,
+            );
+            let _ = took.send(Instant::now());
+            (held.map(|_| ()).map_err(|f| f.msg), heard)
+        });
+        // The one-minute hang detector: the lane frees itself as the holder dies.
+        let had = taken
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the waiter has the lane once its holder is gone");
+        let (held, heard) = waiter.join().expect("the waiter");
+        held.expect("the lane");
+        let status = reaper.join().expect("the reaper");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status}");
+        let gone = death.recv().expect("the death's instant");
+        assert!(
+            heard.first().is_some_and(|l| l.starts_with(&format!(
+                "linux: waiting for pid {pid} (lab linux proof, /checkouts/holder, since "
+            ))),
+            "{heard:?}"
+        );
+        eprintln!(
+            "lane free {} ms after its holder died",
+            had.saturating_duration_since(gone).as_millis()
+        );
+    }
+
     #[test]
     fn every_checkout_takes_the_one_lock_beside_the_vm() {
-        let mine = lane_lock_path(None, "/Users//u");
+        let mine = lane_lock_path(VM, None, "/Users//u");
         assert_eq!(mine, PathBuf::from("/Users//u/.lima/.aterm-linux.lane.lock"));
         assert_eq!(
-            lane_lock_path(Some(""), "/Users//u"),
+            lane_lock_path(VM, Some(""), "/Users//u"),
             mine,
             "an empty LIMA_HOME is unset"
         );
         assert_eq!(
-            lane_lock_path(Some("/v/lima"), "/Users//u"),
+            lane_lock_path(VM, Some("/v/lima"), "/Users//u"),
             PathBuf::from("/v/lima/.aterm-linux.lane.lock")
+        );
+        assert_eq!(
+            lane_lock_path(crate::linux_gpu::VM, None, "/Users//u"),
+            PathBuf::from("/Users//u/.lima/.aterm-linux-gpu.lane.lock"),
+            "the GPU instance's runs never wait on the lane VM's"
         );
     }
 

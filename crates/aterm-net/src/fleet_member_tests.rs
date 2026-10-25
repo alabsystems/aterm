@@ -1378,8 +1378,16 @@ fn rm_takes_one_peer_or_names_the_candidates() {
     let mut book = vec![a.clone(), b.clone(), manual("lab-mini", 7100)];
     let ambiguous = remove(&mut book, &[], "m7").unwrap_err();
     assert!(
-        ambiguous.contains("names 2 peers") && ambiguous.contains("aaaaaaaa"),
+        ambiguous.contains("names 2 peers")
+            && ambiguous.contains("aaaaaaaa")
+            && ambiguous.ends_with("name one by its node id or its address and port"),
         "{ambiguous}"
+    );
+    let moved = joined(0xcc, "m7.lan", [10, 0, 0, 7], 7100);
+    let shared = find(&[a.clone(), moved], "10.0.0.7:7100").unwrap_err();
+    assert!(
+        shared.ends_with("name one by its node id"),
+        "a place two share names neither: {shared}"
     );
     assert_eq!(book.len(), 3, "an ambiguous name removes nothing");
     assert_eq!(remove(&mut book, &[], "m7.lan"), Ok(b));
@@ -2279,6 +2287,51 @@ fn a_member_reads_every_member_its_issuers_book_names() {
         "{:?}",
         reads[2].read
     );
+}
+
+#[test]
+fn a_copy_the_book_keeps_at_its_place_is_listed_as_the_book_has_it_now() {
+    let issuer_state = State::new("fresh-issuer");
+    let other_state = State::new("fresh-other");
+    let other = Issuing::start(secret(5), other_state.dir(), issuer(0x22));
+    let member = joined(0x22, "127.0.0.1", [127, 0, 0, 1], other.port);
+    write_book(
+        issuer_state.dir(),
+        &[Peer {
+            seen_ms: Some(1_760_000_100_000),
+            version: Some("0.96.0".to_owned()),
+            ..member.clone()
+        }],
+    );
+    issue(issuer_state.dir());
+    let issuing = Issuing::start(secret(5), issuer_state.dir(), issuer(0x11));
+    let peers = [issuer_entry(0x11, issuing.port), copy(member)];
+
+    let (reads, book) = read_whole(
+        &peers,
+        &Keyring::of(&peers),
+        Some(&node_of(0xaa)),
+        (&secret(5), None),
+        HANG,
+        "survey",
+    );
+    assert!(matches!(book, BookRead::Fetched(_)), "{book:?}");
+    let read: Vec<(Via, Option<u64>, Option<&str>)> = reads
+        .iter()
+        .map(|read| {
+            (
+                read.peer.via,
+                read.peer.seen_ms,
+                read.peer.version.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read[1..],
+        [(Via::IssuerBook, Some(1_760_000_100_000), Some("0.96.0"))],
+        "the book's entry, not the copy it replaced"
+    );
+    assert!(reads[1].read.is_ok(), "{:?}", reads[1].read);
 }
 
 #[test]
@@ -4193,7 +4246,7 @@ fn a_name_is_looked_up_as_itself_and_a_bare_one_as_dot_local() {
             (&secret(5), None),
             FleetOp::Survey,
             (Instant::now() + HANG, HANG),
-            (&[], resolver),
+            (&[], resolver, &|_, _| None),
         )
     };
     let nowhere: Resolver = |_, _| Vec::new();

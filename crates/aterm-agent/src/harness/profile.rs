@@ -1805,6 +1805,9 @@ fn agy_exe_for(argv: &[String], user_home: &Path) -> Option<PathBuf> {
     None
 }
 
+/// agy's `/usage` doc, read whole within `LAUNCH_READ_BUDGET` ([`super::align::capture_bounded`],
+/// as the quota store reads it): at the budget agy and whatever it started that still holds its
+/// stdout are killed, and there is no doc.
 fn fetch_agy_usage_doc(
     exe: &Path,
     argv: &[String],
@@ -1816,36 +1819,17 @@ fn fetch_agy_usage_doc(
         .arg("--log-file")
         .arg("/dev/null")
         .args(super::agy_quota::USAGE_ARGS)
-        .env("HOME", home)
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stdout(aterm_uds::spawnfd::Stdio::piped())
-        .stderr(aterm_uds::spawnfd::Stdio::null());
+        .env("HOME", home);
     if let Some(cfg) = cfg_var {
         cmd.env("AGY_CLI_CONFIG_DIR", cfg);
     }
-    let mut child = cmd.spawn().ok()?;
-    let stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.take(64 * 1024).read_to_end(&mut buf);
-        buf
-    });
-    let deadline = std::time::Instant::now() + super::agy_quota_store::LAUNCH_READ_BUDGET;
-    let ok = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
-            }
-        }
-    };
-    let bytes = reader.join().ok()?;
-    ok.then_some(bytes)
+    let got = super::align::capture_bounded(
+        cmd,
+        super::agy_quota_store::LAUNCH_READ_BUDGET,
+        super::agy_quota::MAX_STDOUT,
+    )
+    .ok()?;
+    got.success().then_some(got.stdout)
 }
 
 fn agy_quota_store_for(

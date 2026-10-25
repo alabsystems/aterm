@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Automatic sealed control-history repair for approved Commons devices.
-//! This runtime does not implement table-key release, account replication, or
-//! terminal-drive grants; it carries signed sealed control nodes.
+//! Automatic sealed control and declared-table repair for approved Commons
+//! devices. Discovery never activates accounts or grants terminal control.
 //! One local owner serves native LAN attachments; other sessions take over
 //! after it exits. Offline operation needs no peer or central service.
 
-use crate::{Error, Result, control::Endpoint};
+use crate::{Result, control::Endpoint};
 use aterm_net::lan::Listener;
 use aterm_secrets::{
     client::Paths,
@@ -120,26 +119,7 @@ impl Drop for Runtime {
 }
 
 fn enabled(config: &Path) -> Result<bool> {
-    let bytes = aterm_secrets::fsx::read_owned(config, 1024 * 1024)
-        .map_err(|_| Error::new("Commons config cannot be read safely"))?;
-    let Some(bytes) = bytes else {
-        return Ok(true);
-    };
-    let text =
-        std::str::from_utf8(&bytes).map_err(|_| Error::new("Commons config is not UTF-8"))?;
-    let value: aterm_toml::Value =
-        aterm_toml::from_str(text).map_err(|_| Error::new("Commons config is malformed"))?;
-    let Some(commons) = value.get("commons") else {
-        return Ok(true);
-    };
-    if !matches!(commons, aterm_toml::Value::Table(_)) {
-        return Err(Error::new("Commons config must be a table"));
-    }
-    match commons.get("enabled") {
-        None => Ok(true),
-        Some(aterm_toml::Value::Boolean(value)) => Ok(*value),
-        _ => Err(Error::new("Commons enabled must be boolean")),
-    }
+    Ok(crate::catalog::policy::Policy::read(config)?.enabled)
 }
 
 fn serve(
@@ -163,9 +143,14 @@ fn serve(
     let bootstrap = Bootstrap::cached(paths)
         .map_err(|_| Status::Refused)?
         .ok_or(Status::Dormant)?;
-    let endpoint = Endpoint::from_bootstrap(&bootstrap)
-        .map_err(|_| Status::Refused)?
-        .ok_or(Status::Pending)?;
+    let endpoint = match Endpoint::from_bootstrap(&bootstrap).map_err(|_| Status::Refused)? {
+        Some(endpoint) => endpoint
+            .with_commons(paths.clone(), config.to_owned())
+            .map_err(|_| Status::Refused)?,
+        None => Endpoint::pending_from_bootstrap(&bootstrap, paths.clone())
+            .map_err(|_| Status::Refused)?,
+    };
+    let pending = endpoint.pending();
     let custody =
         custody::Custody::capture(paths, bootstrap.journal_dir()).map_err(|_| Status::Refused)?;
     if commons::cached(paths)
@@ -194,12 +179,17 @@ fn serve(
             if snapshot.digest() != &version {
                 return Ok(());
             }
+            if pending && bootstrap.witness().map_err(|_| Status::Refused)?.is_some() {
+                return Ok(());
+            }
             transport.refresh(&addresses()?);
             poll = now + POLL;
         }
         transport.tick(now).map_err(|_| Status::Offline)?;
         report(if transport.interfaces() == 0 {
             Status::Offline
+        } else if pending {
+            Status::Pending
         } else {
             Status::Active {
                 interfaces: transport.interfaces(),

@@ -216,6 +216,38 @@ impl Guards {
             .find_map(|(guard, holds)| (holds && guard != except).then_some(guard))
     }
 
+    /// The first of the guards that hold a fact a host types at an idle point of its own
+    /// (`HostTurn::Fact`, the ask to free disk space: `IdlePoint::held`), in [`Self::each_for`]'s
+    /// order: a person within their grace or another driver's hand ([`Guard::Person`]), the
+    /// person's own exchange ([`Guard::Exchange`]), a manager's wait ([`Guard::Managed`]). The
+    /// host's fenced write judges the halt and a draft itself, and its own seat rule the task and
+    /// the autopilot, so those are not asked here.
+    #[must_use]
+    pub fn held_host_fact(&self) -> Option<Guard> {
+        [
+            (Guard::Person, self.person),
+            (Guard::Exchange, self.exchange),
+            (Guard::Managed, self.managed),
+        ]
+        .into_iter()
+        .find_map(|(guard, holds)| holds.then_some(guard))
+    }
+
+    /// Of [`Self::held_host_fact`]'s guards, the first of those that hold the session for someone
+    /// else for as long as they keep it, not for a grace: the person's own exchange
+    /// ([`Guard::Exchange`], until they hand it back) and a manager's wait ([`Guard::Managed`], for
+    /// the loop's life while its task record stands). A host's own ask of such a session
+    /// (`IdlePoint::theirs`) is given up, not kept owed for a later point.
+    #[must_use]
+    pub fn theirs(&self) -> Option<Guard> {
+        [
+            (Guard::Exchange, self.exchange),
+            (Guard::Managed, self.managed),
+        ]
+        .into_iter()
+        .find_map(|(guard, holds)| holds.then_some(guard))
+    }
+
     /// Each guard past the brake, in [`Self::held`]'s order, with whether it holds a line of
     /// `rule`: what `occupancy why`'s guards line marks (design §6).
     #[must_use]

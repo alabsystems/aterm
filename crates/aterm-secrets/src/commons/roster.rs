@@ -783,14 +783,19 @@ fn prepare(
     mut members: Vec<Member>,
     parent: Option<[u8; 32]>,
     retirements: &[astream_wire::sync::Actor],
+    retired_recipients: &[crate::age::Recipient],
 ) -> Result<(Node, Zeroizing<[u8; 32]>)> {
     let root = authority(seed)?;
     validate_members(network, root, &members)?;
-    if retirements.len() > super::constraints::MAX_FACTS {
+    if retirements.len() > super::constraints::MAX_FACTS
+        || retired_recipients.len() > super::constraints::MAX_FACTS
+    {
         return Err(Error::new("Commons retirement count is out of bounds"));
     }
     let retired: BTreeSet<_> = retirements.iter().copied().collect();
-    if members.len() + 1 + retired.len() > super::constraints::MAX_FACTS {
+    let retired_recipients: BTreeSet<_> = retired_recipients.iter().copied().collect();
+    if members.len() + 1 + retired.len() + retired_recipients.len() > super::constraints::MAX_FACTS
+    {
         return Err(Error::new(
             "Commons retirement and roster exceed the fact bound",
         ));
@@ -837,6 +842,11 @@ fn prepare(
     let facts: Vec<_> = facts(&roster)
         .into_iter()
         .chain(retired.into_iter().map(|actor| Fact::Retire { actor }))
+        .chain(
+            retired_recipients
+                .into_iter()
+                .map(|recipient| Fact::RetireRecipient { recipient }),
+        )
         .collect();
     let edit = match parent {
         Some(parent) => Edit::Update {
@@ -876,7 +886,7 @@ pub(crate) fn create(
             role: enrollment.role,
         });
     }
-    let (node, key) = prepare(seed, network, 1, members, None, &[])?;
+    let (node, key) = prepare(seed, network, 1, members, None, &[], &[])?;
     Constraints::collect(network, root, node.id(), std::iter::once(&node))?.check_key(1, &key)?;
     Ok(node)
 }
@@ -896,6 +906,17 @@ pub(crate) fn rotate_retiring(
     journal: &Journal,
     grants: Vec<Grant>,
     retirements: &[astream_wire::sync::Actor],
+) -> Result<Node> {
+    rotate_retiring_recipients(seed, eligibility, journal, grants, retirements, &[])
+}
+
+pub(crate) fn rotate_retiring_recipients(
+    seed: &[u8; 32],
+    eligibility: &Eligibility,
+    journal: &Journal,
+    grants: Vec<Grant>,
+    retirements: &[astream_wire::sync::Actor],
+    retired_recipients: &[crate::age::Recipient],
 ) -> Result<Node> {
     if grants.is_empty() || grants.len() > MAX_MEMBERS {
         return Err(Error::new("Commons grant count is out of bounds"));
@@ -945,6 +966,7 @@ pub(crate) fn rotate_retiring(
         members,
         Some(constraints.head()),
         retirements,
+        retired_recipients,
     )?;
     let prospective = journal.prospective(&node)?;
     prospective.check_key(generation, &key)?;

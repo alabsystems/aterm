@@ -8,6 +8,7 @@ pub mod checkout;
 pub mod discovery;
 pub mod layout;
 pub mod lease;
+pub mod named_lock;
 pub mod record_lock;
 pub mod rustup;
 

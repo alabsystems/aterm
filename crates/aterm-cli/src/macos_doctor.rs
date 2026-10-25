@@ -15,23 +15,27 @@ use aterm_types::macos_setup::{
 mod accounts_visibility_tests;
 mod initial;
 pub use initial::{
-    InitialSetupAdmission, InitialSetupAuthorization, InitialSetupObservation,
+    BroughtForward, InitialSetupAdmission, InitialSetupAuthorization, InitialSetupObservation,
     InitialSetupObserved, InitialSetupParkMark, InitialSetupRestart, InitialSetupSnapshot,
-    InitialSetupSnapshotError, InitialSetupUpgrade, SetupHooks, SetupNext, SetupUpgrade,
-    StageEvent, alab_mac, apply_initial_setup, apply_initial_setup_observed, automatic_plan,
-    bring_forward_restored_setup, check_initial_setup, check_initial_setup_observed,
-    initial_setup_access_revision, initial_setup_admission, initial_setup_finished,
-    initial_setup_keeps_vault_sync, initial_setup_observation, initial_setup_park_mark,
-    initial_setup_review_revision, initial_setup_revision, initial_setup_snapshot,
-    initial_setup_status, observe_initial_setup, provisional_setup_widens,
-    put_back_held_initial_setup, request_initial_setup_stop, restart_initial_setup,
-    restart_initial_setup_observed, run_initial_setup_pass, upgrade_provisional_setup,
+    InitialSetupSnapshotError, InitialSetupUpgrade, SETUP_BUSY, SetAside, SetupHooks, SetupNext,
+    SetupUpgrade, StageEvent, alab_mac, apply_initial_setup, apply_initial_setup_observed,
+    automatic_plan, bring_forward_restored_setup, bring_forward_restored_setup_observing,
+    check_initial_setup, check_initial_setup_observed, forget_set_aside_setup,
+    initial_setup_access_revision, initial_setup_access_step, initial_setup_admission,
+    initial_setup_finished, initial_setup_keeps_vault_sync, initial_setup_observation,
+    initial_setup_park_mark, initial_setup_review_revision, initial_setup_revision,
+    initial_setup_snapshot, observe_initial_setup, probe_local_network_again,
+    provisional_setup_widens, put_back_held_initial_setup, request_initial_setup_stop,
+    restart_initial_setup, restart_initial_setup_observed, run_initial_setup_pass,
+    set_aside_unreadable_setup, set_aside_unreadable_setup_observing, upgrade_provisional_setup,
     validate_initial_setup_plan, with_initial_setup_vault_sync,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{
     InitialSetupAdmissionFault, InitialSetupAdmissionStopTest, ProvisionalSetupWatchTest,
-    initial_setup_observation_at, initial_setup_snapshot_at, with_initial_setup_vault_sync_at,
+    initial_setup_observation_at, initial_setup_snapshot_at, set_aside_unreadable_setup_at,
+    set_aside_unreadable_setup_at_observing, set_aside_unreadable_setup_at_observing_done_error,
+    with_initial_setup_vault_sync_at,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -207,23 +211,67 @@ pub fn run_observed(action: Action) -> InitialSetupObserved<Report> {
             execute(&mut NativeHost::new(), root, action)
         });
     }
-    initial::observe_person_mutation(
-        Err("another doctor profile pass is running".into()),
-        |root| run_mutation(&mut NativeHost::new(), root, action),
-    )
+    initial::observe_person(|root, before| {
+        mutation_observed(
+            &mut NativeHost::new(),
+            root,
+            before,
+            action,
+            initial::choice_lock_wait(),
+        )
+    })
+}
+
+/// [`run_observed`]'s Apply or Restore at `root`, under the profile lock. A Restore is a
+/// person's press, as a choice is: it waits for the lock another holds for one short write (the
+/// ALab watch widening a plan, a Stop's fold), asking again while `wait` says so, and is refused
+/// in the person's words ([`SETUP_BUSY`]) only past that wait, which System State then queues
+/// (design §3.4). `aterm doctor --apply` is refused at once, as it always was.
+fn mutation_observed(
+    host: &mut dyn Host,
+    root: &Path,
+    before: Option<InitialSetupObservation>,
+    action: Action,
+    wait: impl FnMut() -> bool,
+) -> InitialSetupObserved<Report> {
+    let operation = |root: &Path| run_mutation(host, root, action);
+    if action == Action::Restore {
+        initial::observe_choice_at(root, before, wait, operation)
+    } else {
+        initial::observe_mutation_at(
+            root,
+            before,
+            Err("another doctor profile pass is running".into()),
+            operation,
+        )
+    }
 }
 
 /// The action body after its caller admitted the person and took the profile lock.
 fn run_mutation(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, String> {
-    if action == Action::Apply {
-        initial::save_explicit_workstation_plan(root)?;
-    }
+    let explicit = if action == Action::Apply {
+        Some(initial::save_explicit_workstation_plan(root)?)
+    } else {
+        None
+    };
     let report = execute(host, root, action)?;
-    if action == Action::Apply && !report.needs_attention() {
-        initial::complete_explicit_workstation_plan(root)?;
+    if let Some(run) = explicit
+        && !report.needs_attention()
+    {
+        initial::complete_explicit_workstation_plan(root, run)?;
+    }
+    if action == Action::Restore {
+        // A person's Restore: the note that aterm set its records aside goes with it. One left
+        // only keeps that calm note up.
+        let _ = initial::forget_set_aside_at(root);
     }
     Ok(report)
 }
+
+/// What opens the error of a Restore that cannot read the settings aterm saved before setup
+/// changed them (`original-preferences.json`): pressing Restore again reads the same record,
+/// so System State names `aterm doctor` for why instead of asking for another press.
+pub const BACKUP_UNREAD: &str = "the settings saved before setup changed them cannot be read";
 
 /// The saved checklist, or every box checked when no plan has been authorized.
 pub fn automatic_selection() -> Result<Selection, String> {
@@ -2682,7 +2730,7 @@ fn same_original(a: &PValue, b: &PValue) -> bool {
 fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Report, String> {
     initial::save_restore(root)?;
     save_withheld(root, &Withheld::default())?;
-    let saved = load_backup(&report.backup)?;
+    let saved = load_backup(&report.backup).map_err(|why| format!("{BACKUP_UNREAD}: {why}"))?;
     // What this Restore cannot put back until aterm has Full Disk Access, which a follow-up
     // then puts back by itself ([`finish_waiting_restore`]).
     let waiting: Vec<Target> = saved
@@ -3941,6 +3989,55 @@ mod tests {
         assert_eq!(host.read(&target).unwrap(), Some(PValue::Bool(false)));
         assert_eq!(host.writes, [target]);
         assert_eq!(std::fs::read(note).unwrap(), pending);
+    }
+
+    /// Restore previous settings meets the profile lock another holder has for one short write
+    /// (the ALab watch widening a plan, a Stop's fold): it waits for it as a choice does and
+    /// runs, never refused at once (design §3.4). Past the wait it is refused in the person's
+    /// words, which System State queues.
+    #[test]
+    fn restore_waits_for_a_short_lock_as_a_choice_does() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let target = Target::new("com.apple.AppleMultitouchTrackpad", "TrackpadScroll");
+        save_backup(
+            &root.path().join("original-preferences.json"),
+            &[Saved {
+                target: target.clone(),
+                value: Some(PValue::Bool(false)),
+                granted: true,
+            }],
+        )
+        .unwrap();
+        let holder = HeldLock::take(root.path()).unwrap();
+        let (taken, released) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            let _ = released.recv();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(holder);
+        });
+        let mut host = Fake::default();
+        host.values.insert(target.clone(), PValue::Bool(true));
+        let mut asked = 0;
+        let observed = mutation_observed(&mut host, root.path(), None, Action::Restore, || {
+            asked += 1;
+            if asked == 1 {
+                taken.send(()).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            asked < 400
+        });
+        drop(taken);
+        release.join().unwrap();
+        let report = observed
+            .result
+            .expect("a Restore pressed during a short write runs");
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert!(asked > 1, "the Restore asked for the lock again");
+        assert_eq!(host.read(&target).unwrap(), Some(PValue::Bool(false)));
+
+        let _holder = HeldLock::take(root.path()).unwrap();
+        let refused = mutation_observed(&mut host, root.path(), None, Action::Restore, || false);
+        assert_eq!(refused.result.unwrap_err(), SETUP_BUSY);
     }
 
     #[test]
@@ -6278,7 +6375,18 @@ mod tests {
         );
         assert_eq!(host.values.len(), 1);
         assert_eq!(host.values[&unowned], PValue::Str("right".into()));
-        assert!(first_run_complete(root.path()).expect("restore disables automatic setup"));
+        // Restore ends the preference work; what it leaves for the offer is aterm's own
+        // permissions alone, which no run held here.
+        let staged = initial::initial_setup_snapshot_at(
+            root.path(),
+            aterm_types::macos_setup::Plan::default(),
+        )
+        .expect("snapshot")
+        .plan
+        .selection;
+        let mut permissions = Selection::none();
+        permissions.set(aterm_types::macos_setup::Setting::Permissions, true);
+        assert_eq!(staged, permissions, "restore disables automatic setup");
     }
 
     #[test]
@@ -6327,7 +6435,7 @@ mod tests {
                 )
                 .unwrap();
                 let _profile = HeldLock::take(root.path()).unwrap();
-                initial::save_explicit_workstation_plan(root.path()).unwrap();
+                let explicit = initial::save_explicit_workstation_plan(root.path()).unwrap();
                 let revision = initial::revision_at(root.path()).unwrap();
                 assert_ne!(revision, 0);
                 let mut host = Fake {
@@ -6337,7 +6445,7 @@ mod tests {
                 let report = execute(&mut host, root.path(), Action::Apply).unwrap();
                 assert_eq!(report.needs_attention(), blocked);
                 if !report.needs_attention() {
-                    initial::complete_explicit_workstation_plan(root.path()).unwrap();
+                    initial::complete_explicit_workstation_plan(root.path(), explicit).unwrap();
                 }
                 // A Restore withdrew no permission, so the explicit plan keeps aterm's
                 // permissions, and their stage is the run's one step left; a Cancel's plan

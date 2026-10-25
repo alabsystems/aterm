@@ -87,10 +87,10 @@ impl TerminalHandler<'_> {
         LEGACY_PALETTE_PER_SEQUENCE_MAX
     }
 
-    /// Debit the policy engine's `"palette"` bucket by one response pair.
+    /// Debit the policy engine's `"palette"` bucket by one response pair at the batch's clock.
     #[inline]
     fn palette_rate_limit_consume_one(&mut self) -> bool {
-        let clock = aterm_policy::limits::SystemClock;
+        let clock = super::response_rate_limiter::BatchClock(self.transient.process_now);
         self.policy
             .rate_limit_try_consume("palette", 1, &clock)
             .unwrap_or(true)

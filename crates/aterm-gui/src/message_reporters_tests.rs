@@ -56,7 +56,12 @@ fn a_label_cannot_fault_the_signed_out_entry() {
         Leading,
         Inside,
     }
-    let (title, why, _, _) = entry_words(&signed_out(&["main"]));
+    let (title, why, read, _) = entry_words(&signed_out(&["main"]));
+    assert_eq!(
+        read,
+        aterm_agent::supervise::policy::notice::ACCOUNT_SIGNED_OUT.todo,
+        "the step reads the roster"
+    );
     for (label, where_it_faults) in [
         ("soon", Written::Reason),
         ("retry", Written::Reason),
@@ -70,13 +75,9 @@ fn a_label_cannot_fault_the_signed_out_entry() {
     ] {
         let (t, w, then, more) = entry_words(&signed_out(&[label]));
         assert_eq!(
-            (&t, &w),
-            (&title, &why),
-            "{label}: named outside the action"
-        );
-        assert!(
-            then.ends_with(label),
-            "{label}: the action ends in it: {then}"
+            (&t, &w, &then),
+            (&title, &why, &read),
+            "{label}: named in Details alone"
         );
         assert!(more.iter().any(|l| l.contains(label)), "{label}: {more:?}");
         let (reason, step) = match where_it_faults {
@@ -2746,13 +2747,8 @@ fn the_login_lifecycle_entries_are_showable() {
         .expect("an entry")
         .message()
         .expect("a valid entry");
-    let renew = |labels: &str| {
-        aterm_agent::supervise::policy::notice::RENEWAL_WRONG_ACCOUNT
-            .fill(Some(labels), None)
-            .todo
-    };
     assert!(
-        wrong.detail.iter().any(|l| *l == renew("m7-a")),
+        wrong.detail.iter().any(|l| l == "Wrong account: m7-a"),
         "{:?}",
         wrong.detail
     );
@@ -2786,6 +2782,107 @@ fn the_login_lifecycle_entries_are_showable() {
         );
     }
     assert_eq!(sentence_lines(due.key.as_deref(), &due.detail), 1);
+}
+
+/// Whether a digest entry asks a person to sign a login in: its reason is not a spent automatic
+/// answer (what aterm did, and why that is not enough), or its step renews or signs in by hand.
+fn asks_a_sign_in(msg: &aterm_messages::Message) -> bool {
+    use aterm_messages::need::{LaterWhy, Need, Why};
+    let Need::Later(ask) = msg.need() else {
+        return true;
+    };
+    let step = ask.then().words();
+    !matches!(ask.why(), LaterWhy::Person(Why::Spent { .. }))
+        || [
+            "accounts renew",
+            "accounts login",
+            "/login",
+            "Sign in",
+            "sign in to",
+        ]
+        .iter()
+        .any(|ask| step.contains(ask))
+}
+
+/// NO CLAUDE ACCOUNTS FACT ASKS A PERSON TO SIGN IN (owner, 2026-10-24: sign-in is autonomous):
+/// the signed-out, due, none-soon, wrong-account and no-sign-in entries each say what aterm did
+/// and why it is not enough, their step the read of each route tried, their rows in Details;
+/// another CLI's due entry, which the upkeep renews in the background too, is such a fact, its
+/// step the read of its pool. CONTROL: another CLI's wrong-account entry and a background
+/// sign-in stopped for a person, which still name a sign-in by hand, are caught by the same
+/// reading.
+#[test]
+fn no_claude_accounts_fact_asks_a_person_to_sign_in() {
+    use aterm_agent::harness::accounts::Cli;
+    let labels = |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+    let shown = |entry: Option<Entry>| entry.expect("an entry").message().expect("a valid entry");
+    let facts = [
+        ("signed-out", shown(Some(signed_out(&["m7-a"])))),
+        ("due", shown(super::accounts_due_entry(&labels(&["m7-a"])))),
+        ("none-soon", shown(Some(super::accounts_none_soon_entry()))),
+        (
+            "wrong",
+            shown(super::accounts_wrong_entry(&labels(&["m7-a"]))),
+        ),
+        (
+            "no-sign-in",
+            shown(super::accounts_no_sign_in_entry(&[(
+                "m7-a".to_string(),
+                "mailbox found no code".to_string(),
+            )])),
+        ),
+    ];
+    for (what, msg) in &facts {
+        assert!(!asks_a_sign_in(msg), "{what}: {msg:?}");
+        assert!(
+            msg.detail[0].starts_with("aterm "),
+            "{what}: {:?}",
+            msg.detail
+        );
+        assert!(
+            msg.detail[1].starts_with("Run aterm harness accounts")
+                && !msg.detail[1].contains("m7-a"),
+            "{what}: the step reads the roster: {:?}",
+            msg.detail
+        );
+        if *what != "none-soon" {
+            assert!(
+                msg.detail[2..].iter().any(|l| l.contains("m7-a")),
+                "{what}: the row is in Details: {:?}",
+                msg.detail
+            );
+        }
+    }
+    let pool_due = shown(super::accounts_due_entry_for(
+        Cli::Kimi,
+        &labels(&["kimi-1"]),
+    ));
+    assert!(!asks_a_sign_in(&pool_due), "{pool_due:?}");
+    assert!(
+        pool_due.detail[1].starts_with("Run aterm harness accounts")
+            && pool_due.detail[1].contains("--cli kimi")
+            && !pool_due.detail[1].contains("kimi-1"),
+        "the step reads the pool: {:?}",
+        pool_due.detail
+    );
+    for (cli, entry) in [
+        (
+            Cli::Codex,
+            super::accounts_wrong_entry_for(Cli::Codex, &labels(&["codex-2"])),
+        ),
+        (
+            Cli::Kimi,
+            super::accounts_sign_in_entry_for(
+                Cli::Kimi,
+                &[(
+                    "kimi-1".to_string(),
+                    aterm_agent::harness::accounts::SignInAction::Login,
+                )],
+            ),
+        ),
+    ] {
+        assert!(asks_a_sign_in(&shown(entry)), "the control: {cli:?}");
+    }
 }
 
 #[test]
@@ -3340,7 +3437,12 @@ fn every_tab_notices_step_stands_on_the_band() {
             "disk {cause:?}: {shown:?}"
         );
     }
-    let e = Exception::of_notice(&notice::LIMIT_RENEW, Some(&room), None, "x");
+    let e = Exception::of_notice(
+        &notice::LIMIT_USE,
+        Some(&room),
+        Some(notice::WHY_USE_PIN),
+        "x",
+    );
     let unshort = Exception {
         notice: e.notice.clone().map(|n| notice::Notice {
             short_title: "",
@@ -3352,7 +3454,7 @@ fn every_tab_notices_step_stands_on_the_band() {
     let title = msg.title.clone();
     let row = band_row(msg, BAND_DEFAULT);
     assert!(
-        !title_reads(&row.title.1, &title, notice::LIMIT_RENEW.short_title),
+        !title_reads(&row.title.1, &title, notice::LIMIT_USE.short_title),
         "the control: {row:?}"
     );
     let long = Exception {
@@ -3388,10 +3490,20 @@ fn every_tab_notices_step_stands_on_the_band() {
         "the control: {shown:?}"
     );
     let bare_command = Exception {
-        notice: Exception::of_notice(&notice::LIMIT_RENEW, Some(&room), None, "x")
-            .notice
-            .map(|n| aterm_agent::supervise::policy::notice::Notice { short: None, ..n }),
-        ..Exception::of_notice(&notice::LIMIT_RENEW, Some(&room), None, "x")
+        notice: Exception::of_notice(
+            &notice::LIMIT_USE,
+            Some(&room),
+            Some(notice::WHY_USE_PIN),
+            "x",
+        )
+        .notice
+        .map(|n| aterm_agent::supervise::policy::notice::Notice { short: None, ..n }),
+        ..Exception::of_notice(
+            &notice::LIMIT_USE,
+            Some(&room),
+            Some(notice::WHY_USE_PIN),
+            "x",
+        )
     };
     let shown = narrow(resume_ask("s-1", &spot, &bare_command));
     assert!(
@@ -3481,4 +3593,111 @@ fn another_clis_login_notices_name_its_product_and_claudes_are_unchanged() {
         entry(super::accounts_wrong_entry(&labels(&["m7-a"]))),
         "Claude Code's wrong-account entry is its own"
     );
+}
+
+/// A CONFIG ROW'S NARROW FORM SAYS WHAT IS WRONG (item 87): every config row the
+/// band paints, from 22 to 42 columns, shows its title whole, its short form whole,
+/// or a whole-word cut that keeps more than a count or a lone `Couldn't`. CONTROL:
+/// the count-first and verb-first titles with no short form fail it (`2…`).
+#[test]
+fn a_config_rows_narrow_band_says_what_is_wrong() {
+    use super::{ConfigFamily, ConfigWarnings};
+    let says = |painted: &str, msg: &Message| {
+        let kept = painted.trim_end_matches('\u{2026}');
+        let cut = kept.len() < painted.len();
+        let words: Vec<&str> = kept.split_whitespace().collect();
+        let whole = painted == msg.title || Some(painted) == msg.short_title.as_deref();
+        let from = msg.short_title.as_deref().unwrap_or(&msg.title);
+        whole
+            || (cut
+                && from.starts_with(kept)
+                && words
+                    .iter()
+                    .any(|w| *w != "Couldn't" && !w.chars().all(|c| c.is_ascii_digit())))
+    };
+    let sentence = |family: ConfigFamily, i: usize| match family {
+        ConfigFamily::Keybindings => {
+            format!("config keybindings: skipping \"ctrl+{i}\": unknown action \"foo{i}\"")
+        }
+        ConfigFamily::IgnoredKeys => format!("config line {i}: qqq_frob_{i} is unknown"),
+        _ => format!("config setting_{i}: \"x\" is not accepted; keeping the default"),
+    };
+    let mut rows: Vec<Message> = Vec::new();
+    for family in ConfigFamily::ALL {
+        for n in [1, 3] {
+            let mut warns = ConfigWarnings::default();
+            for i in 0..n {
+                warns.push(family, sentence(family, i));
+            }
+            rows.extend(warns.into_messages());
+        }
+    }
+    for n in [1, 3] {
+        let mut warns = ConfigWarnings::default();
+        for i in 0..n {
+            warns.push(
+                ConfigFamily::IgnoredKeys,
+                format!("config line {i}: windw_padding is unknown \u{2014} did you mean window_padding?"),
+            );
+        }
+        rows.extend(warns.into_messages());
+    }
+    rows.push(super::launch_load_failure(
+        "aterm.toml could not be read at launch (permission denied) \u{2014} every setting is \
+         running at its default",
+    ));
+    rows.push(super::launch_load_failure(
+        "aterm.toml is not a valid configuration (expected a value at line 3) \u{2014} every \
+         setting is running at its default",
+    ));
+    for head in [
+        "Config observation was not valid TOML: expected a value",
+        "Config reconciliation failed; 2 queued changes were not written: disk full",
+        "Manual saved aterm.toml, but the reload failed",
+        "Config publication could not be verified: timeout",
+        "Config was NOT saved: read-only",
+        "Something new went wrong: an unknown head",
+    ] {
+        rows.push(super::config_lane_error(head));
+    }
+    let painted: Vec<&Message> = rows.iter().filter(|m| m.hold != Hold::LogOnly).collect();
+    assert!(painted.len() >= 20, "{} band rows", painted.len());
+    for msg in painted {
+        for cols in 22..=42 {
+            let row = band_row(msg.clone(), cols);
+            assert!(
+                says(&row.title.1, msg),
+                "{:?} (short {:?}) at {cols}: {:?}",
+                msg.title,
+                msg.short_title,
+                row.title.1
+            );
+        }
+        // A short title the narrowest band can hold beside `Edit` (11 cells,
+        // its second clear cell given to the title) stands there whole, never
+        // as its first word (`Font…` for `Font error`).
+        if let Some(short) = msg
+            .short_title
+            .as_deref()
+            .filter(|short| crate::message_band::cell_width(short) <= 11)
+        {
+            assert_eq!(band_row(msg.clone(), 22).title.1, short, "{:?}", msg.title);
+        }
+    }
+    // NEGATIVE CONTROL: the titles as they stood, with no short form.
+    for (title, cols) in [
+        ("2 keybindings skipped", 25),
+        ("Couldn't use a setting's value", 22),
+        ("Couldn't read your settings", 22),
+    ] {
+        let msg = Message::new(tags::CONFIG, Severity::Warn, title)
+            .line("skipping \"ctrl+x\": unknown action")
+            .action(Intent::OpenConfigEditor { line: None });
+        let row = band_row(msg.clone(), cols);
+        assert!(
+            !says(&row.title.1, &msg),
+            "{title} at {cols}: {:?}",
+            row.title.1
+        );
+    }
 }

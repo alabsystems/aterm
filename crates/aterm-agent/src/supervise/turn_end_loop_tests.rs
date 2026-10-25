@@ -11757,14 +11757,14 @@ impl IdleHost for RepoHost {
     fn owns_turn_end(&self) -> bool {
         false
     }
-    fn repo_work(&self) -> RepoRead {
+    fn repo_work(&self) -> Option<RepoRead> {
         self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut found = self.found.lock().unwrap_or_else(PoisonError::into_inner);
-        if found.len() > 1 {
+        Some(if found.len() > 1 {
             found.pop_front().unwrap_or_default()
         } else {
             found.front().cloned().unwrap_or_default()
-        }
+        })
     }
 }
 
@@ -11864,7 +11864,7 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
     assert_eq!(
         unread_said(&journaled),
         1,
-        "the journal names the probe that did not finish, once: {journaled:#?}"
+        "the journal names the probe that could not read the repository, once: {journaled:#?}"
     );
     let (turns, lines, journaled, asked) = run(
         "claim-clean",
@@ -11898,6 +11898,195 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
         "{lines:#?}"
     );
 }
+/// A host whose probe of the session's repository reads on ([`IdleHost::repo_work`]'s
+/// `None`) for its first `reading` asks, each moving the run's clock `step` on, then answers
+/// `found`; with `stop` given, every ask raises that stop and reads on, up to 64 asks.
+#[derive(Debug)]
+struct ReadingHost {
+    clock: Arc<crate::supervise::fx::ScriptedClock>,
+    step: Duration,
+    reading: std::sync::atomic::AtomicUsize,
+    found: RepoRead,
+    stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl ReadingHost {
+    fn new(
+        clock: &Arc<crate::supervise::fx::ScriptedClock>,
+        reading: usize,
+        found: RepoRead,
+    ) -> Self {
+        Self {
+            clock: Arc::clone(clock),
+            step: claim::CLAIM_RENEW + Duration::from_secs(1),
+            reading: std::sync::atomic::AtomicUsize::new(reading),
+            found,
+            stop: None,
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl IdleHost for ReadingHost {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn repo_work(&self) -> Option<RepoRead> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let asked = self.asked.fetch_add(1, SeqCst);
+        if let Some(stop) = &self.stop {
+            if asked >= 64 {
+                return Some(RepoRead::Clean);
+            }
+            stop.store(true, SeqCst);
+        } else if self
+            .reading
+            .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+            .is_err()
+        {
+            return Some(self.found.clone());
+        }
+        self.clock.skip(self.step);
+        None
+    }
+}
+
+/// The screens of a done claim over a repository, and the work its probe finds there.
+fn claim_over_work() -> (Vec<Vec<String>>, RepoWork) {
+    let mut claim = rows(&[
+        "⏺ Built, tested and landed the parser. All done; nothing left to do.",
+        "",
+        "✻ Worked for 12m 2s · done 4:24 PM",
+        "",
+    ]);
+    claim.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+    let dirty = RepoWork {
+        repo: "/Users//a/Developer/parser".to_string(),
+        changed: 1,
+        paths: vec!["src/lexer.rs".to_string()],
+        ..RepoWork::default()
+    };
+    (vec![busy_screen(), claim], dirty)
+}
+
+/// A PROBE THAT READS ON KEEPS THE LOOP'S CLAIM ([`IdleHost::repo_work`],
+/// `Session::repo_asked`): at a done claim whose repository probe reads on for
+/// three asks, each a claim renewal's worth of the run's clock, the loop
+/// renews its claim between the asks, and the done check it types carries
+/// the suffix of what the probe found once it answered. NEGATIVE CONTROL: the
+/// same probe answering at its first ask, the loop makes three renewals fewer.
+#[test]
+fn a_probe_that_reads_on_keeps_the_loops_claim() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (screens, dirty) = claim_over_work();
+    let run = |reading: usize| {
+        let clock = virtual_clock();
+        let host = Arc::new(ReadingHost::new(
+            &clock,
+            reading,
+            RepoRead::Found(dirty.clone()),
+        ));
+        let mut m = Mock::new(screens.clone());
+        m.turn_releases = Some(1);
+        m.vanish_after = Some(2);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..auto(600)
+        };
+        let run = record_watch_on(&mut m, &opts, clock, |_| {});
+        crate::supervise::tape::testing::assert_replays(
+            &run.tape,
+            &run.header,
+            &run.sent,
+            &run.lines,
+        );
+        let renewals = m
+            .claims
+            .iter()
+            .filter(|c| c.contains("meta set supervisor"))
+            .count();
+        let turns: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("turn "))
+            .cloned()
+            .collect();
+        (renewals, turns, run.lines, host.asked.load(SeqCst))
+    };
+    let check = continue_request(&format!("{DONE_CHECK} {}", repo_work_suffix(&dirty)));
+    let (at_once, turns, lines, asked) = run(0);
+    assert!(asked >= 1, "the probe was asked at the claim: {lines:#?}");
+    assert_eq!(turns.first(), Some(&check), "{lines:#?}");
+    let (read_on, turns, lines, asked) = run(3);
+    assert!(asked >= 4, "asked until it answered: {asked}: {lines:#?}");
+    assert_eq!(turns.first(), Some(&check), "{lines:#?}");
+    assert!(
+        read_on >= at_once + 3,
+        "renewed between the asks: {read_on} renewals against {at_once}: {lines:#?}"
+    );
+}
+
+/// A STOP WHILE THE PROBE READS ENDS THE ASKING (`Session::repo_asked`): at a
+/// done claim whose probe reads on and raises the loop's stop at its first
+/// ask, the loop asks it no more and journals no REPO UNREAD, no read of the
+/// repository having failed. NEGATIVE CONTROL: the same probe with no stop,
+/// reading on for one ask, is asked again and its finding typed.
+#[test]
+fn a_stop_while_the_probe_reads_ends_the_asking() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (screens, dirty) = claim_over_work();
+    let run = |tag: &str, stop: bool| {
+        let (dir, journal) = journal_file(tag);
+        let clock = virtual_clock();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut host = ReadingHost::new(&clock, 1, RepoRead::Found(dirty.clone()));
+        host.stop = stop.then(|| Arc::clone(&flag));
+        let host = Arc::new(host);
+        let mut m = Mock::new(screens.clone());
+        m.turn_releases = Some(1);
+        m.vanish_after = Some(2);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            journal: Some(journal.clone()),
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..auto(600)
+        };
+        let run = record_watch_on(&mut m, &opts, clock, |s| {
+            s.stop = Some(Arc::clone(&flag));
+        });
+        crate::supervise::tape::testing::assert_replays(
+            &run.tape,
+            &run.header,
+            &run.sent,
+            &run.lines,
+        );
+        let unread = journal_records(&journal)
+            .0
+            .into_iter()
+            .filter(|r| r.line.starts_with("REPO UNREAD "))
+            .count();
+        let _ = std::fs::remove_dir_all(&dir);
+        let turns = m.requests.iter().filter(|r| r.starts_with("turn ")).count();
+        (host.asked.load(SeqCst), unread, turns, run.lines)
+    };
+    let (asked, unread, turns, lines) = run("probe-stopped", true);
+    assert_eq!(asked, 1, "no ask after the stop: {lines:#?}");
+    assert_eq!(unread, 0, "nothing journaled unread: {lines:#?}");
+    assert_eq!(turns, 0, "nothing typed once stopped: {lines:#?}");
+    let (asked, unread, turns, lines) = run("probe-not-stopped", false);
+    assert!(asked >= 2, "asked again: {lines:#?}");
+    assert_eq!(unread, 0, "{lines:#?}");
+    assert!(turns >= 1, "the check typed: {lines:#?}");
+}
+
 #[test]
 fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
     let greeting = "Hi! What would you like me to work on?";
@@ -13575,8 +13764,12 @@ fn a_lost_login_with_no_account_left_types_login_and_asks_its_sign_in_now() {
     );
 }
 
+/// A ONE-LOGIN MACHINE WHOSE LOGIN IS A ROSTER ROW'S, with `logins` on, types no `/login` (whose
+/// browser sign-in only a person could finish) and tells no one: the loop waits on aterm's own
+/// sign-in of the row and asks the host for it at each wall. CONTROL: with `logins` off it types
+/// `/login` once, and asks the host nothing.
 #[test]
-fn a_one_login_machine_types_login_once_and_asks_its_sign_in_now() {
+fn a_one_login_machine_waits_on_its_rows_sign_in_and_types_no_login() {
     let mut login = rows(&[
         "⏺ Carrying on.",
         "  ⎿  Not logged in · Please run /login",
@@ -13651,17 +13844,23 @@ fn a_one_login_machine_types_login_once_and_asks_its_sign_in_now() {
     let host = AccountHost::scripted(&[None], &["adopted"]);
     *host.login_label.lock().unwrap() = Some("m7-a".to_string());
     let (lines, m, journal, log) = run("one-login-renew", &host, true);
-    assert_eq!(logins(&lines), 1, "`/login` once: {log}");
-    assert_eq!(host.said("notice"), ["notice:2"], "told once: {log}");
-    assert_eq!(
-        host.told(),
-        ["exception:login:now", "exception:none"],
-        "{log}"
+    assert_eq!(logins(&lines), 0, "no `/login`: {log}");
+    assert!(host.told().is_empty(), "told no one: {log}");
+    assert!(
+        !journal.iter().any(|l| l.starts_with("EXCEPTION ")),
+        "no exception: {log}"
     );
     assert!(
-        journal.iter().any(|l| l.starts_with("EXCEPTION ")
-            && l.contains("kind=login when=now notice=login-")),
-        "{log}"
+        journal
+            .iter()
+            .any(|l| l.starts_with("WAITING ") && l.contains("m7-a")),
+        "it waits on the row's own sign-in, naming the row: {log}"
+    );
+    assert!(
+        host.said("account")
+            .iter()
+            .any(|s| s == "account:login-ended"),
+        "the host is asked for the row: {log}"
     );
     assert!(
         !journal.iter().any(|l| l.contains("accounts renew")),
@@ -13672,7 +13871,7 @@ fn a_one_login_machine_types_login_once_and_asks_its_sign_in_now() {
         !m.requests
             .iter()
             .any(|r| r.starts_with("meta set attention")),
-        "no badge beside the notice: {log}"
+        "no badge: {log}"
     );
 
     let host = AccountHost::scripted(&[None], &["adopted"]);
@@ -13937,6 +14136,11 @@ fn the_picker_of_its_own_login_gets_the_method_the_login_is() {
     assert!(keys(&m).is_empty(), "no key without its fence: {log}");
 }
 
+/// A ROSTER ROW'S LOST LOGIN THAT NOTHING RELAUNCHES THE TAB ONTO (`relaunch` off), renewed or
+/// not: no `/login` is typed (its browser sign-in only a person could finish), no notice asks
+/// anyone to sign in and nothing renews it again by hand; the host is told the row's login ended
+/// (its sign-in ladder's cue), and the loop's wait is the record that names the row and what holds
+/// the move. CONTROL: the same lost login on no roster row types `/login` and tells its sign-in.
 #[test]
 fn a_renewed_login_nothing_relaunches_the_tab_onto_is_never_renewed_again() {
     let mut login = rows(&[
@@ -13945,11 +14149,11 @@ fn a_renewed_login_nothing_relaunches_the_tab_onto_is_never_renewed_again() {
         "",
     ]);
     login.extend(composer("  ? for shortcuts"));
-    let run = |tag: &str, superseded: bool| {
+    let run = |tag: &str, label: Option<&str>, superseded: bool| {
         let (dir, ledger) = ledger_at(tag);
         let (journal_dir, path) = journal_file(&format!("te-{tag}"));
         let mut screens = vec![busy_screen(), login.clone(), login.clone()];
-        if !superseded {
+        if label.is_none() {
             screens.push(handoff());
         }
         let mut m = Mock::new(screens);
@@ -13957,7 +14161,7 @@ fn a_renewed_login_nothing_relaunches_the_tab_onto_is_never_renewed_again() {
         m.cursor_on_caret = true;
         m.turn_releases = Some(1);
         let host = AccountHost::scripted(&[None], &["adopted"]);
-        *host.login_label.lock().unwrap() = Some("m7-a".to_string());
+        *host.login_label.lock().unwrap() = label.map(str::to_string);
         host.login_superseded.store(superseded, Ordering::SeqCst);
         let mut opts = SuperviseOpts {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
@@ -13982,55 +14186,60 @@ fn a_renewed_login_nothing_relaunches_the_tab_onto_is_never_renewed_again() {
         );
         (m, journal, host, log)
     };
-    let (m, journal, host, log) = run("renewed-by-hand", true);
-    assert!(
-        host.superseded_asked.load(Ordering::SeqCst) > 0,
-        "asked at the lost login: {log}"
-    );
-    let by_hand = crate::supervise::policy::notice::RENEWED_BY_HAND.id;
-    assert!(
-        journal.iter().any(|l| l.starts_with("EXCEPTION ")
-            && l.contains(&format!("kind=login when=now notice={by_hand}"))),
-        "{log}"
-    );
-    assert!(
-        !m.requests
+    let typed_login = |m: &Mock| {
+        m.requests
             .iter()
-            .any(|r| r.starts_with("meta set attention")),
-        "the notice is the one surface: no badge beside it: {log}"
-    );
-    assert!(
-        journal.iter().any(|l| l.starts_with("NOT ESCALATED ")
-            && l.contains(&format!("the notice {by_hand} stands"))),
-        "the loop's escalation stands down for the notice: {log}"
-    );
-    assert!(
-        !journal.iter().any(|l| l.contains("accounts renew m7-a")),
-        "no renewal asked again: {log}"
-    );
-    assert!(
-        !m.requests
-            .iter()
-            .any(|r| !r.starts_with("meta ") && r.contains("/login")),
-        "no /login: {log}"
-    );
-    assert!(host.said("restart").is_empty(), "nothing relaunched: {log}");
+            .any(|r| !r.starts_with("meta ") && r.contains("/login"))
+    };
+    for (tag, superseded) in [("renewed-by-hand", true), ("renew-by-hand", false)] {
+        let (m, journal, host, log) = run(tag, Some("m7-a"), superseded);
+        assert!(!typed_login(&m), "no /login: {log}");
+        assert!(
+            !journal.iter().any(|l| l.starts_with("EXCEPTION ")),
+            "no one is asked to sign in: {log}"
+        );
+        assert!(
+            host.said("account")
+                .iter()
+                .any(|s| s == "account:login-ended"),
+            "the host is told the row's login ended: {log}"
+        );
+        let held = crate::supervise::policy::turn_end::MOVE_HELD_WHYS[0];
+        assert!(
+            journal
+                .iter()
+                .any(|l| l.starts_with("WAITING ") && l.contains("m7-a") && l.contains(held)),
+            "the wait names the row and what holds the move: {log}"
+        );
+        assert!(
+            !journal.iter().any(|l| l.contains("accounts renew")),
+            "no renewal asked again: {log}"
+        );
+        assert!(
+            !m.requests
+                .iter()
+                .any(|r| r.starts_with("meta set attention")),
+            "no badge: {log}"
+        );
+        assert!(host.said("restart").is_empty(), "nothing relaunched: {log}");
+    }
 
-    let (m, journal, _, log) = run("renew-by-hand", false);
+    let (m, journal, host, log) = run("by-hand-unrostered", None, false);
+    assert!(
+        typed_login(&m),
+        "the control: no roster row, so /login: {log}"
+    );
     assert!(
         journal.iter().any(|l| l.starts_with("EXCEPTION ")
             && l.contains("kind=login when=now notice=login-")),
         "{log}"
     );
     assert!(
-        m.requests
+        !host
+            .said("account")
             .iter()
-            .any(|r| r.starts_with("turn ") && r.ends_with(" /login")),
-        "{log}"
-    );
-    assert!(
-        !journal.iter().any(|l| l.contains("accounts renew m7-a")),
-        "{log}"
+            .any(|s| s == "account:login-ended"),
+        "no row's login to tell: {log}"
     );
 }
 

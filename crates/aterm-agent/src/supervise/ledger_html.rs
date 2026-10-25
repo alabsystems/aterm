@@ -290,7 +290,7 @@ const fn noted_marks(w: Noted) -> &'static str {
         Noted::Note => "watcher: a NOTE line, a reading the loop notes",
         Noted::Sleep => "watcher: a SLEEP line, a sleep the loop could not count",
         Noted::Abandoned => "watcher: an ABANDONED line, a survey left under typed text",
-        Noted::RepoUnread => "watcher: a REPO UNREAD line, a repository probe did not finish",
+        Noted::RepoUnread => "watcher: a REPO UNREAD line, a repository its probe could not read",
         Noted::Unstuck => {
             "watcher: an UNSTUCK line, Esc on a turn the Mac slept through in the vendor's API retry"
         }

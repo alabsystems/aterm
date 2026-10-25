@@ -252,6 +252,8 @@ pub(crate) enum MenuAction {
     DeckSizeFolded,
     /// View ▸ Stats Lens (⌘I).
     ToggleStatsLens,
+    /// View ▸ Rewind Pane (⇧⌘R): freeze the focused pane on its recorded past, or return it to live.
+    RewindPane,
     /// Open Settings at the Packages route.
     Packages,
     /// Open Settings at the Messages route.
@@ -387,6 +389,7 @@ impl MenuAction {
             MenuAction::StatsBarsSill => 85,
             MenuAction::StatsBarsOff => 86,
             MenuAction::ToggleStatsLens => 87,
+            MenuAction::RewindPane => 93,
             MenuAction::DeckSizeAuto => 88,
             MenuAction::DeckSizeFull => 89,
             MenuAction::DeckSizeFolded => 90,
@@ -475,6 +478,7 @@ impl MenuAction {
             90 => MenuAction::DeckSizeFolded,
             91 => MenuAction::Save,
             92 => MenuAction::SystemState,
+            93 => MenuAction::RewindPane,
             _ => return None,
         })
     }
@@ -536,6 +540,7 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             | MenuAction::ResetTerminal
             | MenuAction::ChooseTabTheme
             | MenuAction::ClearTabTheme
+            | MenuAction::RewindPane
     )
 }
 
@@ -769,6 +774,9 @@ pub(crate) fn native_item_tip(action: MenuAction) -> Option<String> {
         MenuAction::SummarizeFleet => agents_live()
             .summarize_block
             .map(|why| format!("{} {why}", action.help())),
+        MenuAction::RewindPane if !menu_live().can_rewind => {
+            Some(crate::rewind::REWIND_OFF_TIP.to_string())
+        }
         _ => None,
     }
 }
@@ -813,6 +821,8 @@ pub(crate) struct MenuLive {
     pub kitty_favourited: bool,
     /// The front tab is split, so ⌘W closes a pane (the row's title).
     pub front_tab_split: bool,
+    /// The focused pane records its screen, so Rewind can open on it.
+    pub can_rewind: bool,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -830,6 +840,7 @@ impl MenuLive {
         rain_on: false,
         kitty_favourited: false,
         front_tab_split: false,
+        can_rewind: false,
     };
 
     const fn bits(self) -> u16 {
@@ -844,6 +855,7 @@ impl MenuLive {
             | (self.can_save as u16) << 8
             | (self.can_find as u16) << 9
             | (self.can_find_again as u16) << 10
+            | (self.can_rewind as u16) << 11
     }
 
     const fn from_bits(b: u16) -> MenuLive {
@@ -859,6 +871,7 @@ impl MenuLive {
             rain_on: b & (1 << 5) != 0,
             kitty_favourited: b & (1 << 6) != 0,
             front_tab_split: b & (1 << 7) != 0,
+            can_rewind: b & (1 << 11) != 0,
         }
     }
 }
@@ -956,6 +969,7 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
         MenuAction::NextTab | MenuAction::PrevTab => live.multi_tab,
         MenuAction::ReopenClosedTab => live.can_reopen_closed_tab,
         MenuAction::ReopenClosedView => live.can_reopen_closed_view,
+        MenuAction::RewindPane => live.can_rewind,
         _ => true,
     };
     precondition
@@ -1060,6 +1074,7 @@ impl MenuAction {
             | MenuAction::ResetTerminal
             | MenuAction::ChooseTabTheme
             | MenuAction::ClearTabTheme
+            | MenuAction::RewindPane
             | MenuAction::Minimize
             | MenuAction::Zoom
             | MenuAction::NextTab
@@ -1079,7 +1094,8 @@ impl MenuAction {
             | MenuAction::DeckSizeAuto
             | MenuAction::DeckSizeFull
             | MenuAction::DeckSizeFolded
-            | MenuAction::ToggleStatsLens => false,
+            | MenuAction::ToggleStatsLens
+            | MenuAction::RewindPane => false,
             MenuAction::About
             | MenuAction::SoftwareUpdate
             | MenuAction::Version
@@ -1296,6 +1312,10 @@ impl MenuAction {
                 "Open the stats bars' close-up, or close it: arrows move between instruments \
                  and bars, Escape closes."
             }
+            MenuAction::RewindPane => {
+                "Show this pane's recent past, read-only: Left and Right step through it, Esc \
+                 returns to live."
+            }
             MenuAction::Help => "Open the aterm guide.",
         }
     }
@@ -1384,6 +1404,7 @@ impl MenuAction {
             "DeckSizeFull" => Some(MenuAction::DeckSizeFull),
             "DeckSizeFolded" => Some(MenuAction::DeckSizeFolded),
             "ToggleStatsLens" => Some(MenuAction::ToggleStatsLens),
+            "RewindPane" => Some(MenuAction::RewindPane),
             "ResetTerminal" => Some(MenuAction::ResetTerminal),
             "ChooseTabTheme" => Some(MenuAction::ChooseTabTheme),
             "ClearTabTheme" => Some(MenuAction::ClearTabTheme),
@@ -1483,39 +1504,14 @@ const APP_MENU: &[MenuEntry] = &[
     },
     Separator,
     Item {
-        label: "Check for Updates…",
-        action: MenuAction::SoftwareUpdate,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Separator,
-    Item {
         label: "Settings…",
         action: MenuAction::ToggleSettings,
         key: ",",
         mods: MenuMods::Command,
     },
     Item {
-        label: "Packages…",
-        action: MenuAction::Packages,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "Messages…",
-        action: MenuAction::Messages,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
         label: "System State…",
         action: MenuAction::SystemState,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "Open aterm.toml",
-        action: MenuAction::Preferences,
         key: "",
         mods: MenuMods::None,
     },
@@ -1656,17 +1652,17 @@ const AGENTS_MENU: &[MenuEntry] = &[
     },
 ];
 
-/// The palette-only rows: commands with no bar item.
-pub(crate) const PALETTE_ONLY: &[(&str, MenuAction)] = &[
-    ("Message Bus: Status", MenuAction::FabricStatus),
-    ("Message Bus: Turn On…", MenuAction::FabricOn),
-    ("Message Bus: Turn Off…", MenuAction::FabricOff),
-    ("Fleet Machines", MenuAction::FleetMachines),
+/// Commands with no bar item, grouped under the menu whose matter they are.
+pub(crate) const PALETTE_ONLY: &[(&str, &str, MenuAction)] = &[
+    ("aterm", "Check for Updates…", MenuAction::SoftwareUpdate),
+    ("aterm", "Packages…", MenuAction::Packages),
+    ("aterm", "Messages…", MenuAction::Messages),
+    ("aterm", "Open aterm.toml", MenuAction::Preferences),
+    ("Agents", "Message Bus: Status", MenuAction::FabricStatus),
+    ("Agents", "Message Bus: Turn On…", MenuAction::FabricOn),
+    ("Agents", "Message Bus: Turn Off…", MenuAction::FabricOff),
+    ("Agents", "Fleet Machines", MenuAction::FleetMachines),
 ];
-
-/// The palette section the [`PALETTE_ONLY`] rows sit in: the menu whose
-/// matter they are.
-pub(crate) const PALETTE_ONLY_SECTION: &str = "Agents";
 
 const FIND_MENU: &[MenuEntry] = &[
     Item {
@@ -1810,6 +1806,13 @@ const VIEW_MENU: &[MenuEntry] = &[
         action: MenuAction::ToggleStatsLens,
         key: "i",
         mods: MenuMods::Command,
+    },
+    Separator,
+    Item {
+        label: "Rewind Pane",
+        action: MenuAction::RewindPane,
+        key: "r",
+        mods: MenuMods::CommandShift,
     },
     Separator,
     Item {
@@ -3347,8 +3350,9 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::{
-        MENU_MODEL, MenuAction, MenuEntry, menu_chrome_lines, native_menu_action_enabled,
-        set_active_tab_is_terminal, staged_apply_label, version_menu_bar_title,
+        MENU_MODEL, MenuAction, MenuEntry, menu_chrome_lines, native_item_tip,
+        native_menu_action_enabled, set_active_tab_is_terminal, staged_apply_label,
+        version_menu_bar_title,
     };
 
     #[test]
@@ -3402,7 +3406,7 @@ mod tests {
     }
 
     fn palette_only_actions() -> Vec<MenuAction> {
-        super::PALETTE_ONLY.iter().map(|(_, a)| *a).collect()
+        super::PALETTE_ONLY.iter().map(|(_, _, a)| *a).collect()
     }
 
     fn offered_actions() -> Vec<MenuAction> {
@@ -3624,7 +3628,10 @@ mod tests {
                 "{action:?}"
             );
         }
-        for (_, action) in super::PALETTE_ONLY {
+        for (_, _, action) in super::PALETTE_ONLY
+            .iter()
+            .filter(|(section, ..)| *section == "Agents")
+        {
             assert!(
                 !model_items().iter().any(|(_, a, _, _)| a == action),
                 "{action:?} is palette-only"
@@ -3772,10 +3779,23 @@ mod tests {
             rain_on: true,
             kitty_favourited: true,
             front_tab_split: true,
+            can_rewind: false,
         };
         set_menu_live(idle);
         assert_eq!(menu_live(), idle, "every bit round-trips");
         assert!(!native_menu_action_enabled(MenuAction::Save));
+        assert!(!native_menu_action_enabled(MenuAction::RewindPane));
+        assert_eq!(
+            native_item_tip(MenuAction::RewindPane).as_deref(),
+            Some(crate::rewind::REWIND_OFF_TIP),
+            "a pane that keeps no history says what turns Rewind on"
+        );
+        set_menu_live(MenuLive {
+            can_rewind: true,
+            ..idle
+        });
+        assert!(menu_live().can_rewind, "the Rewind bit round-trips");
+        assert_eq!(native_item_tip(MenuAction::RewindPane), None);
         set_menu_live(MenuLive {
             can_save: true,
             ..idle
@@ -4052,7 +4072,7 @@ mod tests {
             updater
         );
         assert_eq!(MenuAction::ApplyUpdate.offered_on_this_platform(), updater);
-        assert_eq!(offered("Check for Updates…"), updater);
+        assert!(!offered("Check for Updates…"));
         assert!(!offered("Install"), "{:?}", menu_chrome_lines(None, false));
         for section in MENU_MODEL {
             for (_, action, _, _) in section.entries.iter().flat_map(MenuEntry::items) {
@@ -4139,7 +4159,6 @@ mod tests {
             item(MenuAction::ToggleSettings),
             (",", super::MenuMods::Command)
         );
-        assert_eq!(item(MenuAction::Preferences), ("", super::MenuMods::None));
         assert_eq!(
             item(MenuAction::OpenEditor),
             ("o", super::MenuMods::Command)

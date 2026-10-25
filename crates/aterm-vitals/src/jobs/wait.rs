@@ -157,6 +157,9 @@ pub struct JobFacts {
     pub queue_empty: bool,
     /// The detached job's consumer (its leader's parent).
     pub consumer: Option<u32>,
+    /// Each leaf of the job made the group in front or the next group down the groups it runs
+    /// under: it waits on the command in front (a shell nested in the tab's, vim under its `:sh`).
+    pub behind: bool,
 }
 
 /// Classifies the wait of a job from its waiting `leaves` and `shell`.
@@ -185,6 +188,9 @@ pub fn name_job(
     if let Some(w) = best.as_ref().filter(|w| w.name == WaitName::ProgramCheck) {
         // A held leaf is not reading the terminal, whatever mode its program left it in.
         return w.clone();
+    }
+    if job.behind {
+        return Wait::bare(WaitName::Children, Standing::Legit, first.0, &first.1);
     }
     // A shell's line read, while no leaf names a wait of its own (a REPL blocked on its socket,
     // a `cd` into a dead share, a background job hung on its peer): the reader's own event loop
@@ -224,8 +230,7 @@ pub fn reads_line(scene: &Scene<'_>, consumer: Option<u32>, pid: u32, name: &str
 /// Whether `pid`'s sleeping event queues may hold its terminal: one lists a read of a terminal
 /// it holds, or one lists no entries (macOS without lane L6), or none sleeps on one (Linux's
 /// `select`, by its wait channel).
-#[must_use]
-pub fn reads_terminal(scene: &Scene<'_>, pid: u32) -> bool {
+fn reads_terminal(scene: &Scene<'_>, pid: u32) -> bool {
     let Some(p) = scene.procs.get(&pid) else {
         return false;
     };
@@ -420,6 +425,47 @@ pub fn peers(scene: &Scene<'_>, w: &Wait) -> Vec<u32> {
     w.pipe.map_or_else(Vec::new, |(this, peer)| {
         holders(scene, peer, this, w.name == WaitName::Pipe, w.leaf)
     })
+}
+
+/// The writers of the pipes a leaf sleeping in an event wait reads (asyncio or `selectors` reading
+/// its piped input, a `select.select([sys.stdin], …)` loop on Linux, by its wait channel), whatever
+/// its wait is named (a loader's `select` beside an idle database connection names the
+/// connection): of every pipe it holds that is no write end.
+#[must_use]
+pub fn loop_feeders(scene: &Scene<'_>, w: &Wait) -> Vec<u32> {
+    let Some(p) = scene.procs.get(&w.leaf).filter(|p| {
+        p.wchan.as_deref().is_some_and(is_event_wchan)
+            || p.fds.as_deref().unwrap_or(&[]).iter().any(|f| {
+                matches!(
+                    f.kind,
+                    FdKind::EventQueue {
+                        sleeping: Some(true),
+                        ..
+                    }
+                )
+            })
+    }) else {
+        return Vec::new();
+    };
+    let mut found: Vec<u32> = p
+        .fds
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|f| match &f.kind {
+            FdKind::Pipe {
+                handle,
+                peer,
+                write_end,
+                ..
+            } if *write_end != Some(true) => Some(holders(scene, *peer, *handle, true, w.leaf)),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    found
 }
 
 fn holder(scene: &Scene<'_>, peer: u64, this: u64, want_write: bool, not: u32) -> Option<u32> {

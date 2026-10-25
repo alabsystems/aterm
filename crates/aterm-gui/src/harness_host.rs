@@ -1696,9 +1696,12 @@ type HoldFn = dyn Fn(&str, u64) -> bool + Send + Sync;
 /// Type a text into a tab, the step's word back ([`Acts::disk_resume`]): `(sid, text)`.
 type DiskResumeFn = dyn Fn(&str, &str) -> String + Send + Sync;
 /// Type or release the `disk-free@v1` line owed a tab, the step's word back ([`Acts::disk_free`]):
-/// `(sid, owed, unfit)`, `unfit` naming why the session may not be asked.
+/// `(sid, owed, unfit, held)`, `unfit` naming why the session may not be asked, `held` what holds
+/// the line at this turn break ([`IdlePoint::held`]'s word: a wait, the line kept owed).
 type DiskFreeFn =
-    dyn Fn(&str, &crate::disk_board::AskOwed, Option<&'static str>) -> String + Send + Sync;
+    dyn Fn(&str, &crate::disk_board::AskOwed, AskWord, AskWord) -> String + Send + Sync;
+/// A word [`DiskFreeFn`] is handed: why a session may not be asked, or what holds its line.
+type AskWord = Option<&'static str>;
 type SnapshotFn = dyn Fn(&str) -> Option<Snapshot> + Send + Sync;
 /// The occupancy facts board as session `sid`'s host reads it ([`Acts::occupancy`]).
 type OccupancyFn =
@@ -1991,21 +1994,22 @@ pub(crate) enum AccountsSaid {
     LoginsUnread,
     /// The roster admits (or, with none and `[harness] usage_notes` on, the machine's own row stands for it).
     Listed {
-        /// The signed-out line: accounts whose login is known signed out.
+        /// The signed-out line: accounts with no email whose login is known signed out
+        /// (`accounts::signed_out`), which no sign-in route can sign in.
         signed_out: Vec<String>,
         /// The credits line: accounts usage credits carry (`accounts::credits_noted`).
         credits: Vec<String>,
         /// The week's line: accounts whose week is nearly used with no credits.
         window_full: Vec<(String, String)>,
-        /// The due line: renewable logins due or ended (`accounts::renew_due`), the machine's batch to renew.
+        /// The due line: renewable logins due or ended (`accounts::renew_due`), which the upkeep renews by itself.
         due: Vec<String>,
         /// The warning that no renewable login is left working within a day (`accounts::none_working_within`).
         none_soon: bool,
         /// The line of renewals that answered another account (`accounts::wrong_accounts`).
         wrong: Vec<String>,
-        /// The rows whose automatic sign-in failed and that still have no login to run on, each
-        /// with the routes it tried (`accounts::failing_sign_ins`): a fact for later, since aterm
-        /// tries each again by itself.
+        /// The rows whose automatic sign-in failed and that still need one (no login to run on,
+        /// or one due for renewal), each with the routes it tried (`accounts::failing_sign_ins`):
+        /// a fact for later, since aterm tries each again by itself.
         no_sign_in: Vec<(String, String)>,
     },
 }
@@ -2313,10 +2317,15 @@ pub(crate) struct WalledAgent<'a> {
     pub(crate) own: bool,
 }
 
-/// Stop one worker: its flag, then its connection's cut.
-fn request_stop(stop: &AtomicBool, left: &ExitWord, interrupt: &Mutex<Option<Interrupter>>) {
+/// Mark a stop without waking the worker or invoking its connection callback.
+fn mark_stop(stop: &AtomicBool, left: &ExitWord) {
     left.stop();
     stop.store(true, Ordering::SeqCst);
+}
+
+/// Stop one worker: its flag, then its connection's cut.
+fn request_stop(stop: &AtomicBool, left: &ExitWord, interrupt: &Mutex<Option<Interrupter>>) {
+    mark_stop(stop, left);
     ring();
     if let Some(cut) = interrupt
         .lock()
@@ -2324,6 +2333,18 @@ fn request_stop(stop: &AtomicBool, left: &ExitWord, interrupt: &Mutex<Option<Int
         .as_ref()
     {
         cut();
+    }
+}
+
+/// Preserve the worker's exit custody when a seamless Commit stops it.
+#[cfg(any(unix, test))]
+fn mark_commit_stop(kept: &mut Kept, left: &ExitWord, left_at_commit: &AtomicBool) {
+    let word = left.read();
+    if word != Word::Stopped {
+        kept.commit = Committed::Stopped;
+        if word == Word::Left {
+            left_at_commit.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -3161,6 +3182,8 @@ pub(crate) struct WorkerIdle {
     beside: Arc<Mutex<Option<String>>>,
     /// Which of the loop's told waits this worker last told the window ([`Told`], as a byte).
     told: AtomicU8,
+    /// The session's repository probe, read on its own thread ([`IdleHost::repo_work`]).
+    repo_probe: aterm_agent::harness::repo_work::Probing,
 }
 
 /// Which told wait a worker last handed the window ([`WorkerIdle::told`]).
@@ -3254,7 +3277,25 @@ pub(crate) struct TapKept {
     served: Option<u32>,
     /// The windows this worker last recorded, and when.
     noted: Option<(Option<tap::Window>, Option<tap::Window>, i64)>,
+    /// When a busy read last took the tap's reading ([`TapAt::Busy`]).
+    busy_at: Option<i64>,
 }
+
+/// Where a usage tap's reading is taken ([`WorkerIdle::tap_step`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TapAt {
+    /// A decided idle turn end ([`IdleHost::usage_tap`]): the silent-tap rule judges it too.
+    Point,
+    /// A busy read mid-turn ([`IdleHost::busy_tap`]), once per [`BUSY_TAP_S`] at most: the
+    /// reading alone, since a turn still running owes no reading yet.
+    Busy,
+}
+
+/// How often a busy read takes the usage tap's reading ([`TapAt::Busy`]). The tap writes every
+/// [`tap::TAP_REFRESH_S`] seconds while the agent works, so the accounts store's figures, the
+/// `aterm harness accounts` line, an untapped tab's footer and another machine's read of this
+/// one stay within a minute of it.
+const BUSY_TAP_S: i64 = 60;
 
 impl std::fmt::Debug for WorkerIdle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3791,8 +3832,15 @@ impl IdleHost for WorkerIdle {
 
     /// The usage tap at a decided idle turn end.
     fn usage_tap(&self) {
-        if let Some(word) = self.tap_step() {
+        if let Some(word) = self.tap_step(TapAt::Point) {
             aterm_log::info!("harness @{}: usage tap: {word}", self.sid);
+        }
+    }
+
+    /// The usage tap at a busy read, once per [`BUSY_TAP_S`] at most.
+    fn busy_tap(&self) {
+        if let Some(word) = self.tap_step(TapAt::Busy) {
+            aterm_log::info!("harness @{}: usage tap mid-turn: {word}", self.sid);
         }
     }
 
@@ -3870,10 +3918,19 @@ impl IdleHost for WorkerIdle {
         (self.hooks.acts.finished)(&self.sid, &snap, &mut memo)
     }
 
-    /// What the session's repository holds that no remote has ([`IdleHost::repo_work`]).
-    fn repo_work(&self) -> aterm_agent::harness::repo_work::RepoRead {
-        self.followed_kept()
-            .map_or_else(Default::default, |snap| (self.hooks.acts.repo_work)(&snap))
+    /// What the session's repository holds that no remote has ([`IdleHost::repo_work`]): read on
+    /// the probe's own thread, each ask waiting [`aterm_agent::harness::repo_work::PROBE_ASK`] at
+    /// most, or until the worker is stopped.
+    fn repo_work(&self) -> Option<aterm_agent::harness::repo_work::RepoRead> {
+        self.repo_probe.ask(
+            || {
+                let snap = self.followed_kept();
+                let read = Arc::clone(&self.hooks.acts.repo_work);
+                move || snap.map_or_else(Default::default, |snap| read(&snap))
+            },
+            aterm_agent::harness::repo_work::PROBE_ASK,
+            &self.stop,
+        )
     }
 
     /// The turn the conversation ends on, by every key that names it.
@@ -4380,21 +4437,36 @@ impl WorkerIdle {
         Some((roster, look, label))
     }
 
-    /// [`IdleHost::usage_tap`]'s work, and its word for the log (`None`: nothing to say).
-    fn tap_step(&self) -> Option<&'static str> {
+    /// [`IdleHost::usage_tap`]'s work (`at` [`TapAt::Point`]) or [`IdleHost::busy_tap`]'s
+    /// ([`TapAt::Busy`]), and its word for the log (`None`: nothing to say).
+    fn tap_step(&self, at: TapAt) -> Option<&'static str> {
         if !accounts_for(self.agent) {
             return None;
         }
+        if at == TapAt::Busy {
+            let now = (self.hooks.acts.account_seat)()?.now;
+            let mut kept = self.tap.lock().unwrap_or_else(PoisonError::into_inner);
+            // A clock set back makes the next busy read due rather than holding it off.
+            if kept
+                .busy_at
+                .is_some_and(|then| (0..BUSY_TAP_S).contains(&now.saturating_sub(then)))
+            {
+                return None;
+            }
+            kept.busy_at = Some(now);
+        }
         let snap = with_kept_of(&self.kept, |k| k.snapshot.clone())?;
         if !tap::carried_by(&snap.argv) {
-            let heard = self
-                .tap
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .silence
-                .untapped(snap.pid);
-            if heard == tap::Heard::Again {
-                self.tap_heard();
+            if at == TapAt::Point {
+                let heard = self
+                    .tap
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .silence
+                    .untapped(snap.pid);
+                if heard == tap::Heard::Again {
+                    self.tap_heard();
+                }
             }
             return None;
         }
@@ -4408,13 +4480,16 @@ impl WorkerIdle {
         let (heard, before) = {
             let mut kept = self.tap.lock().unwrap_or_else(PoisonError::into_inner);
             let served = kept.served == Some(snap.pid);
-            let heard = kept.silence.step(
-                seat.now,
-                snap.pid,
-                seat.now.saturating_sub(born),
-                served,
-                age,
-            );
+            let heard = match at {
+                TapAt::Point => kept.silence.step(
+                    seat.now,
+                    snap.pid,
+                    seat.now.saturating_sub(born),
+                    served,
+                    age,
+                ),
+                TapAt::Busy => tap::Heard::Same,
+            };
             let before = kept.fresh.clone();
             let fresh = read.as_ref().is_some_and(|(r, _)| kept.fresh.admit(r));
             (heard, fresh.then_some(before))
@@ -4592,15 +4667,28 @@ impl WorkerIdle {
         self.park.store(false, Ordering::SeqCst);
         drop(look);
         with_kept_of(&self.kept, |k| k.carry_asked = false);
+        // The resume is a carry-on: the loop types none into the person's own exchange, and none
+        // while a person is at the session (their grace, or another driver's hand). A person's
+        // grace keeps it owed for a later point; an exchange gives it up, as the conversation is
+        // theirs until they hand it back.
         let owed = disk_owed(self.hooks.acts.disk_board, &self.sid);
         if owed.is_some()
-            && let Some(why) = self.disk_resume_unowed()
+            && let Some(why) = self.disk_resume_unowed().or_else(|| {
+                (point.theirs == Some(Guard::Exchange)).then_some(Guard::Exchange.word())
+            })
         {
             disk_resume_stepped(self.hooks.acts.disk_board, &self.sid, true);
             aterm_log::info!(
                 "harness @{}: {} step=done:{why}: nothing typed",
                 self.sid,
                 aterm_agent::harness::disk::RULE_DISK_RESUME
+            );
+        } else if owed.is_some() && point.held == Some(Guard::Person) {
+            aterm_log::info!(
+                "harness @{}: {} step=wait:{}: nothing typed, still owed",
+                self.sid,
+                aterm_agent::harness::disk::RULE_DISK_RESUME,
+                Guard::Person.word()
             );
         } else if let Some(text) = owed {
             let step = (self.hooks.acts.disk_resume)(&self.sid, &text);
@@ -4624,11 +4712,18 @@ impl WorkerIdle {
             }
         }
         // Whether the ask to free space may seat this session, as of this turn break: the look
-        // nominates none the board names unfit, and one owed a line is released.
-        let unfit = self.disk_free_unfit();
+        // nominates none the board names unfit, and one owed a line is released, at no
+        // election's cost. A session the loop's own guards hold for someone else for as long as
+        // they keep it (the person's own exchange, a manager's wait: `IdlePoint::theirs`) is
+        // unfit too, as no later turn break of theirs would take the line; one a person's grace
+        // alone holds keeps its line owed for a later turn break, as the occupancy door's does.
+        let unfit = self
+            .disk_free_unfit()
+            .or_else(|| point.theirs.map(Guard::word));
         disk_ask_fit(self.hooks.acts.disk_board, &self.sid, unfit);
         if let Some(owed) = disk_ask_owed(self.hooks.acts.disk_board, &self.sid) {
-            let step = (self.hooks.acts.disk_free)(&self.sid, &owed, unfit);
+            let held = point.held.map(Guard::word);
+            let step = (self.hooks.acts.disk_free)(&self.sid, &owed, unfit, held);
             if !step.starts_with("wait:") {
                 disk_ask_stepped(self.hooks.acts.disk_board, &self.sid);
             }
@@ -8640,6 +8735,12 @@ const _: () = {
         lost_mib(DISK_FIRST_LOOK) < margin_mib,
         "the first disk look loses more than a pass's margin above the floor"
     );
+    assert!(
+        (DISK_FIRST_LOOK.as_millis() + DISK_TICK.as_millis())
+            <= aterm_agent::harness::disk::ask::ADOPT_MS as u128,
+        "a seamless update's successor looks, and adopts its sessions' pick, before other \
+         hosts hand it on (disk-free@v1)"
+    );
 };
 /// The startup deadline ([`look_at_startups`]).
 pub(crate) const STARTUP_DEADLINE: Duration = Duration::from_secs(120);
@@ -9276,18 +9377,45 @@ impl HostHandle {
         state.suspended = true;
         for worker in &state.stops {
             with_kept_of(&worker.kept, |k| {
-                let word = worker.left.read();
-                if word != Word::Stopped {
-                    k.commit = Committed::Stopped;
-                    if word == Word::Left {
-                        worker.left_at_commit.store(true, Ordering::SeqCst);
-                    }
-                }
+                mark_commit_stop(k, &worker.left, &worker.left_at_commit);
             });
             request_stop(&worker.stop, &worker.left, &worker.interrupt);
         }
         drop(state);
         ring();
+    }
+
+    /// Stop at the Commit write while session claim guards are held. Acquire every
+    /// host/kept lock without waiting before changing any state, and retain them
+    /// through `write`. Callbacks and wakes wait until a failed Commit has released
+    /// those guards and calls [`Self::suspend`].
+    #[cfg(any(unix, test))]
+    pub(crate) fn with_suspended_at_commit<R>(&self, write: impl FnOnce() -> R) -> Option<R> {
+        fn try_guard<T>(lock: &Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
+            match lock.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(std::sync::TryLockError::Poisoned(poison)) => Some(poison.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            }
+        }
+
+        let mut state = try_guard(&self.shared.state)?;
+        let State {
+            stops, suspended, ..
+        } = &mut *state;
+        let mut kept = stops
+            .iter()
+            .map(|worker| try_guard(&worker.kept))
+            .collect::<Option<Vec<_>>>()?;
+        *suspended = true;
+        for (worker, kept) in stops.iter().zip(&mut kept) {
+            mark_commit_stop(kept, &worker.left, &worker.left_at_commit);
+            mark_stop(&worker.stop, &worker.left);
+        }
+        let result = write();
+        drop(kept);
+        drop(state);
+        Some(result)
     }
 
     /// A newer agent build may be installed (atpkg's activation notice, or Claude's own native updater repointing its link).
@@ -12889,6 +13017,7 @@ fn start_worker(
         lifted_off,
         beside: Arc::clone(&beside),
         told: AtomicU8::new(0),
+        repo_probe: Default::default(),
     });
     if let Some(seat) = (hooks.acts.account_seat)() {
         tap::sweep(
@@ -13704,8 +13833,8 @@ fn live_acts(store: Store, sock: String) -> Acts {
                 ),
             )
         }),
-        disk_free: Arc::new(move |sid, owed, unfit| {
-            disk_ask::act(&free_store, &free_sock, sid, owed, unfit)
+        disk_free: Arc::new(move |sid, owed, unfit, held| {
+            disk_ask::act(&free_store, &free_sock, sid, owed, unfit, held)
         }),
         disk_board: &crate::disk_board::SHELF,
         jobs_board: &crate::vitals_jobs::BOARD,
@@ -18223,7 +18352,7 @@ impl Acts {
             resume: Arc::new(|_, _, _| "current".to_string()),
             settle: Arc::new(|_| "current".to_string()),
             disk_resume: Arc::new(|_, _| "wait:inert".to_string()),
-            disk_free: Arc::new(|_, _, _| "wait:inert".to_string()),
+            disk_free: Arc::new(|_, _, _, _| "wait:inert".to_string()),
             disk_board: {
                 static INERT: Shelf = Shelf::new();
                 &INERT

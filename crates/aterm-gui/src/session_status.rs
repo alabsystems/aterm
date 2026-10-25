@@ -2252,9 +2252,23 @@ impl StatusObserver {
 }
 
 impl crate::App {
+    /// Disabled projection cannot keep a box marker or later revive its pending receipt.
+    fn clear_box_banner_receipts(&mut self) {
+        for session in self.pool.iter() {
+            session.ctx.box_banner.shown(None);
+        }
+        for carry in self.status_carry.values_mut() {
+            carry.box_receipt = None;
+        }
+        for adopted in &mut self.seamless_adopt {
+            adopted.box_receipt = None;
+        }
+    }
+
     /// Sweeps all due sessions under `try_lock`, returning the IDs whose published status or chrome changed.
     pub(crate) fn observe_session_statuses(&mut self, now: std::time::Instant) -> Vec<u64> {
         if !self.config.tab_status_or_default() {
+            self.clear_box_banner_receipts();
             drop(self.session_factory.edge_inbox.take());
             return Vec::new();
         }
@@ -2465,27 +2479,27 @@ impl crate::App {
             if turn_begun {
                 turns_moved.push(id);
             }
+            let shown = self
+                .session_status
+                .program_state(id)
+                .map(|(state, _)| state);
+            // An inherited marker can precede this gate's first projection. Keep its
+            // custody synchronized even when the projection is already None.
+            session.ctx.box_banner.shown(
+                shown
+                    .filter(|state| {
+                        state.state
+                            == aterm_core::terminal::program_state::ProgramStateWord::Blocked
+                    })
+                    .map(|_| program_report.began),
+            );
             if program_state_moved {
-                let shown = self
-                    .session_status
-                    .program_state(id)
-                    .map(|(state, _)| state);
                 session
                     .ctx
                     .timeline
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .note_program_state(shown, program_report.began);
-                // The herald's mark on a box stands only while the GUI shows that box
-                // (`box_banner`): a move off it, a foreground move's floor included, lifts it.
-                session.ctx.box_banner.shown(
-                    shown
-                        .filter(|state| {
-                            state.state
-                                == aterm_core::terminal::program_state::ProgramStateWord::Blocked
-                        })
-                        .map(|_| program_report.began),
-                );
                 if shown.is_some_and(|state| {
                     state.state == aterm_core::terminal::program_state::ProgramStateWord::Done
                 }) {
@@ -2821,6 +2835,7 @@ impl crate::App {
     /// Reconfigures `status_observer` after `self.config` updates `tab_status*` settings.
     pub(crate) fn reconfigure_session_status(&mut self) {
         let now = std::time::Instant::now();
+        self.session_factory.tab_status = self.config.tab_status_or_default();
         let moved = if self.config.tab_status_or_default() {
             self.session_status.reconfigure(
                 self.config.tab_status_policy(),
@@ -2828,6 +2843,7 @@ impl crate::App {
                 now,
             )
         } else {
+            self.clear_box_banner_receipts();
             let cleared = self.session_status.clear();
             let mut footers = false;
             for session in self.pool.iter() {

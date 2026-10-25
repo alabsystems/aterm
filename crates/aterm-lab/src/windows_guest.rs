@@ -635,11 +635,14 @@ pub fn provision_steps() -> Vec<Step> {
         languages_step(),
         display_step(),
         desktop_step(),
+        japanese_installed_step(),
         wsl_distro_step(),
     ]
 }
 
-/// The Japanese IME made usable ([`JA_CAPABILITY`]).
+/// The Japanese IME made usable ([`JA_CAPABILITY`]). On a new install Windows leaves the
+/// capability `InstallPending` until it restarts, which [`desktop_step`] does; the step accepts that
+/// state and [`japanese_installed_step`] requires `Installed` after the restart.
 #[must_use]
 pub fn japanese_step() -> Step {
     let log = format!("{TASKS}\\capability.log");
@@ -650,7 +653,7 @@ pub fn japanese_step() -> Step {
     );
     let script = format!(
         "{PREAMBLE}$cap = {cap}\n\
-         if ((Get-WindowsCapability -Online -Name $cap).State -ne 'Installed') {{\n\
+         if ((Get-WindowsCapability -Online -Name $cap).State -notin 'Installed', 'InstallPending') {{\n\
          $name = 'aterm-lane-capability'\n\
          $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument {argument}\n\
          $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest\n\
@@ -669,7 +672,7 @@ pub fn japanese_step() -> Step {
          Unregister-ScheduledTask -TaskName $name -Confirm:$false\n\
          Remove-Item -Force -ErrorAction SilentlyContinue {qlog}\n}}\n}}\n\
          $state = (Get-WindowsCapability -Online -Name $cap).State\n\
-         if ($state -ne 'Installed') {{ throw \"$cap is $state\" }}\n\
+         if ($state -notin 'Installed', 'InstallPending') {{ throw \"$cap is $state\" }}\n\
          \"${{cap}}: $state\"\n",
         cap = ps_quote(JA_CAPABILITY),
         argument = ps_quote(&format!(
@@ -680,6 +683,24 @@ pub fn japanese_step() -> Step {
     );
     Step {
         label: "the Japanese IME's language capability",
+        script,
+        runner: false,
+        reboot: false,
+    }
+}
+
+/// [`JA_CAPABILITY`] installed, after the restart that completes a pending install ([`japanese_step`]).
+#[must_use]
+pub fn japanese_installed_step() -> Step {
+    let script = format!(
+        "{PREAMBLE}$cap = {cap}\n\
+         $state = (Get-WindowsCapability -Online -Name $cap).State\n\
+         if ($state -ne 'Installed') {{ throw \"$cap is $state after the restart\" }}\n\
+         \"${{cap}}: $state\"\n",
+        cap = ps_quote(JA_CAPABILITY),
+    );
+    Step {
+        label: "the Japanese IME's language capability, installed after the restart",
         script,
         runner: false,
         reboot: false,
@@ -1277,7 +1298,10 @@ mod tests {
         let desktop = &steps[at];
         assert!(desktop.reboot && !desktop.runner);
         assert_eq!(steps.iter().filter(|s| s.reboot).count(), 1);
-        assert_eq!(&steps[at + 1..], &[wsl_distro_step()]);
+        assert_eq!(
+            &steps[at + 1..],
+            &[japanese_installed_step(), wsl_distro_step()]
+        );
         assert!(desktop.script.contains("AutoAdminLogon -Value '1'"));
         assert!(
             desktop
@@ -1362,6 +1386,12 @@ mod tests {
             ja.script
                 .contains(&format!("AddSeconds({CAPABILITY_WITHIN_SECS})"))
         );
+        let installed = japanese_installed_step();
+        assert!(!installed.runner && installed.script.contains(&ps_quote(JA_CAPABILITY)));
+        let pending = "-notin 'Installed', 'InstallPending'";
+        assert_eq!(ja.script.matches(pending).count(), 2);
+        assert!(installed.script.contains("-ne 'Installed'"));
+        assert!(!installed.script.contains("InstallPending"));
         assert!(languages_step().runner);
         let display = display_step();
         assert!(!display.runner);

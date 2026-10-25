@@ -10753,39 +10753,7 @@ fn open_work_reads_work_left_mid_sentence_and_a_blocker_named_after_it() {
 
 #[test]
 fn open_work_reads_three_rounds_of_real_reports_as_labelled() {
-    let corpus = include_str!("fixtures/open-work-corpus.txt");
-    let mut reports: Vec<(&str, Vec<(bool, String)>)> = Vec::new();
-    let mut excerpt: Option<(bool, String)> = None;
-    for line in corpus.lines().skip_while(|l| !l.starts_with("=== ")) {
-        if (line.starts_with("=== ") || line.starts_with("--- "))
-            && let (Some(done), Some((_, excerpts))) = (excerpt.take(), reports.last_mut())
-        {
-            excerpts.push(done);
-        }
-        if let Some(name) = line.strip_prefix("=== ") {
-            reports.push((name, Vec::new()));
-        } else if let Some(mark) = line.strip_prefix("--- ") {
-            let (label, known) = mark.split_once(", ").unwrap_or((mark, ""));
-            let open = match label {
-                "open" => true,
-                "clear" => false,
-                _ => panic!("no label: {mark:?}"),
-            };
-            let reads_open = match known.split_once(':').map(|(k, _)| k) {
-                None => open,
-                Some("missed") if open => false,
-                Some("flagged") if !open => true,
-                _ => panic!("a mark that contradicts its label: {mark:?}"),
-            };
-            excerpt = Some((reads_open, String::new()));
-        } else if let Some((_, text)) = excerpt.as_mut() {
-            text.push_str(line);
-            text.push('\n');
-        }
-    }
-    if let (Some(done), Some((_, excerpts))) = (excerpt, reports.last_mut()) {
-        excerpts.push(done);
-    }
+    let reports = corpora::open_work_reports();
     let reads = |text: &str| !open_work(Some(&format!("{text}{FINISHED}"))).is_empty();
     let mut wrong: Vec<String> = Vec::new();
     for (name, excerpts) in &reports {
@@ -14502,9 +14470,73 @@ fn a_starved_repository_probe_never_ends_land() {
         repo: probe(0),
         ..idle(DEFENSE, Some(3 * MIN))
     });
-    assert_eq!(r.repo, RepoRead::Clean, "pushed, the probe finished");
+    assert!(
+        r.repo.is_clean() && r.repo.checked().is_some(),
+        "pushed, the probe finished and named its HEAD: {:?}",
+        r.repo
+    );
     assert_eq!(at(&mut st, &r, now), TurnEndAction::Nothing);
     assert!(st.landed() && st.task_done());
+}
+
+/// A CHECKED READING DECIDES AS A CLEAN ONE (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §14.9, slice 9a: no decision moves): Land's yield with a clean defense, read once
+/// [`RepoRead::Clean`] and once [`RepoRead::Checked`] (naming `HEAD`, `origin/main` and a
+/// remote, and once naming no remote), decides the same landing, face and hold; a Cruise
+/// done claim over each gets the same done check. NEGATIVE CONTROL (a mutant, run by hand):
+/// [`RepoRead::is_clean`] false for a checked reading decides Land's nudge there, not the
+/// landing.
+#[test]
+fn a_checked_reading_decides_as_clean() {
+    use crate::harness::repo_work::CleanAt;
+    let at_head = |remote: bool| {
+        RepoRead::Checked(CleanAt {
+            repo: "/Users//a/Developer/parser".to_string(),
+            head: "3f9a1c2e4b7d".repeat(4)[..40].to_string(),
+            main_ref: if remote { "origin/main" } else { "" }.to_string(),
+            remote,
+        })
+    };
+    let land_yield = |repo: RepoRead| {
+        let mut st = TurnEndState::default();
+        assert_eq!(
+            act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t0()),
+            land_instruction()
+        );
+        let r = land(TurnEndReading {
+            repo,
+            ..idle(DEFENSE, Some(3 * MIN))
+        });
+        let (a, _) = past_backoff(&mut st, &r, t0() + 3 * MIN);
+        (a, st.landed(), st.task_done(), st.face(), st.land_held())
+    };
+    let cruise_claim = |repo: RepoRead| {
+        let mut st = TurnEndState::default();
+        act(&mut st, &idle("Stage 1 landed.", Some(3 * MIN)), t0());
+        let r = TurnEndReading {
+            repo,
+            ..idle(
+                "Built, tested and landed the parser. All done; nothing left to do.",
+                Some(3 * MIN),
+            )
+        };
+        past_backoff(&mut st, &r, t0() + 3 * MIN).0
+    };
+    let clean = land_yield(RepoRead::Clean);
+    assert_eq!(
+        (&clean.0, clean.1, clean.2, clean.3),
+        (&TurnEndAction::Nothing, true, true, TaskFace::Landed),
+        "the clean reading lands"
+    );
+    assert_eq!(cruise_claim(RepoRead::Clean), checked(), "Cruise checks");
+    for read in [at_head(true), at_head(false)] {
+        assert_eq!(land_yield(read.clone()), clean, "Land over {read:?}");
+        assert_eq!(
+            cruise_claim(read.clone()),
+            checked(),
+            "Cruise over {read:?}"
+        );
+    }
 }
 
 #[test]
@@ -15713,8 +15745,14 @@ fn renewable(r: &TurnEndReading, label: &str) -> TurnEndReading {
     }
 }
 
+/// A roster row's lost login is signed in by aterm itself: the tab types no `/login` (whose
+/// browser sign-in only a person could finish) and tells no one; it waits on the row's own
+/// sign-in and is moved onto the login it made, even where nothing can move it yet (`relaunch`
+/// off). `/login` is typed only over a login the roster names no row of, and where the roster
+/// names the row by the time its browser hand-off shows, the sign-in is told as that row's own
+/// account.
 #[test]
-fn a_renewable_logins_end_is_signed_in_where_it_stands() {
+fn a_renewable_logins_end_waits_on_its_rows_own_sign_in() {
     use super::super::exception::{Urgency, exception_for};
     use super::super::outlook::ExceptionKind;
     let t = t0();
@@ -15740,32 +15778,77 @@ fn a_renewable_logins_end_is_signed_in_where_it_stands() {
             "the host is asked about the login's own end"
         );
         let a = decide_turn_end(&st, &ended, &under, t + MIN);
-        assert_eq!(a, login);
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("m7-a")),
+            "no /login: the row's own sign-in is waited on: {a:?}"
+        );
         st.acted(&a, &ended, t + MIN);
-        assert_eq!(st.login_track(), Some(1), "one attempt");
-        let handoff = TurnEndReading {
-            login_label: Some("m7-a".to_string()),
-            ..real_point(aterm_phase::prompt::fixtures::LOGIN_HANDOFF)
+        assert_eq!(st.login_track(), Some(0), "nothing typed");
+        assert_eq!(
+            exception_for(&st, &ended, &under, t + 2 * MIN),
+            None,
+            "no one is asked to sign in"
+        );
+        let renewed = TurnEndReading {
+            login_superseded: true,
+            account: Some(AccountAdvice::Move {
+                to: "m7-a".to_string(),
+            }),
+            ..ended.clone()
         };
-        st.observe(&handoff, t + MIN + Duration::from_secs(5));
-        let e = exception_for(&st, &handoff, &under, t + 2 * MIN).expect("the owner is needed now");
-        assert_eq!(
-            (e.kind, e.when, e.escalated),
-            (ExceptionKind::Login, Urgency::Now, false)
-        );
-        let n = e.notice.as_ref().expect("a notice");
-        assert_eq!(
-            n.id,
-            crate::supervise::policy::notice::LOGIN_SIGN_IN_AS.id,
-            "the sign-in is the owner's, as the row's own account: {e:?}"
-        );
-        assert!(e.action.contains("m7-a"), "{e:?}");
-        assert_eq!(
-            at_under(&mut st, &ended, t + 3 * MIN, &under),
-            TurnEndAction::Nothing,
-            "`/login` once"
+        let a = at_under(&mut st, &renewed, t + 3 * MIN, &under);
+        assert!(
+            restarts(
+                &a,
+                &Restart::Account {
+                    to: "m7-a".to_string(),
+                    at: AccountAt::Wall,
+                },
+                RULE_ACCOUNT
+            ),
+            "the tab moves onto the login the sign-in made: {a:?}"
         );
     }
+    let mut by_hand = cfg();
+    by_hand.relaunch = false;
+    let mut st = TurnEndState::default();
+    let a = at_under(&mut st, &ended, t + MIN, &by_hand);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("m7-a")),
+        "nothing can move the tab, and still no `/login`: {a:?}"
+    );
+    assert_eq!(
+        st.account_point(&ended, &by_hand),
+        Some(AccountPoint::LoginEnded)
+    );
+    assert_eq!(exception_for(&st, &ended, &by_hand, t + MIN), None);
+    let mut st = TurnEndState::default();
+    let a = at_under(&mut st, &gone, t + MIN, &by_hand);
+    assert_eq!(a, login, "the control: no roster row, so `/login`");
+    st.acted(&a, &gone, t + MIN);
+    assert_eq!(st.login_track(), Some(1), "one attempt");
+    let handoff = TurnEndReading {
+        login_label: Some("m7-a".to_string()),
+        ..real_point(aterm_phase::prompt::fixtures::LOGIN_HANDOFF)
+    };
+    st.observe(&handoff, t + MIN + Duration::from_secs(5));
+    let e = exception_for(&st, &handoff, &by_hand, t + 2 * MIN).expect("the owner is needed now");
+    assert_eq!(
+        (e.kind, e.when, e.escalated),
+        (ExceptionKind::Login, Urgency::Now, false)
+    );
+    let n = e.notice.as_ref().expect("a notice");
+    assert_eq!(
+        n.id,
+        crate::supervise::policy::notice::LOGIN_SIGN_IN_AS.id,
+        "the sign-in is the owner's, as the row's own account: {e:?}"
+    );
+    assert!(e.action.contains("m7-a"), "{e:?}");
+    assert_eq!(
+        at_under(&mut st, &ended, t + 3 * MIN, &by_hand),
+        TurnEndAction::Nothing,
+        "`/login` once"
+    );
     assert_eq!(
         at(&mut TurnEndState::default(), &gone, t + MIN),
         login,
@@ -15780,8 +15863,13 @@ fn a_renewable_logins_end_is_signed_in_where_it_stands() {
     );
     let mut drafted = ended.clone();
     drafted.composer = Composer::Typed;
-    let a = at(&mut TurnEndState::default(), &drafted, t + MIN);
-    assert_ne!(a, login, "a draft is the person's: {a:?}");
+    let mut st = TurnEndState::default();
+    let a = at(&mut st, &drafted, t + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("m7-a")),
+        "a draft holds no sign-in of the row's: {a:?}"
+    );
+    assert_eq!(exception_for(&st, &drafted, &cfg(), t + MIN), None);
 }
 
 #[test]
@@ -15824,6 +15912,14 @@ fn a_lost_login_is_its_logins_own_end_only_with_no_move_behind_it() {
     );
 }
 
+/// A ROSTER ROW'S LOST LOGIN WHERE NOTHING MOVES THE TAB YET: no relaunch reaches it (`relaunch`
+/// or `resume_limits` off, no restart this host can make, a restart onto an account not made) or
+/// a draft stands (a person's, aterm's own words, one under Claude Code's menu). The tab types no
+/// `/login` and nobody is asked to sign in: the host is told the row's login ended (the sign-in
+/// ladder's cue), and the wait names the row and what holds the move. Once the row is renewed, a
+/// draft is the one thing told (send or clear it), after which the move follows; where no relaunch
+/// reaches the tab, the wait names what holds it and still asks no one. CONTROL: the same readings
+/// on no roster row type `/login`, or hold it behind the draft, as before.
 #[test]
 fn a_renewed_login_is_followed_and_a_renewable_one_signed_in() {
     use super::super::exception::{Urgency, exception_for};
@@ -15852,115 +15948,157 @@ fn a_renewed_login_is_followed_and_a_renewable_one_signed_in() {
         composer: Composer::Diverted,
         ..gone.clone()
     };
-    let cases = [
-        (&gone, &no_relaunch),
-        (&gone, &no_resume),
-        (&unrestartable, &cfg()),
-        (&drafted, &cfg()),
-        (&own, &cfg()),
-        (&diverted, &cfg()),
-    ];
-    for (shown, under) in cases {
-        let ended = renewable(shown, "m7-a");
-        let a = at_under(&mut TurnEndState::default(), &ended, t + MIN, under);
-        let plain = at_under(&mut TurnEndState::default(), shown, t + MIN, under);
-        assert_eq!(a, plain);
-        let signs_in = matches!(&a, TurnEndAction::TypeCommand { command, .. } if command == "/login")
-            || is_escalate(&a, "sign in with /login");
-        assert!(signs_in, "{a:?}");
+    let [relaunch_off, resume_off, cannot_restart, not_made] = MOVE_HELD_WHYS;
+    // The restart not made is the one hold a state carries: a move this host could not make.
+    let start = |held: Option<&str>| {
         let mut st = TurnEndState::default();
+        if held == Some(not_made) {
+            st.seed_account_unmade(Unmade::Again, None);
+        }
+        st
+    };
+    let cases = [
+        (&gone, &no_relaunch, Some(relaunch_off)),
+        (&gone, &no_resume, Some(resume_off)),
+        (&unrestartable, &cfg(), Some(cannot_restart)),
+        (&gone, &cfg(), Some(not_made)),
+        (&drafted, &cfg(), None),
+        (&own, &cfg(), None),
+        (&diverted, &cfg(), None),
+    ];
+    let waits_on = |a: &TurnEndAction, held: Option<&str>| {
+        matches!(a, TurnEndAction::WaitUntil { why, .. }
+            if why.contains("m7-a") && held.is_none_or(|held| why.contains(held)))
+    };
+    for (shown, under, held) in cases {
+        let plain = at_under(&mut start(held), shown, t + MIN, under);
+        let typed_login = matches!(&plain, TurnEndAction::TypeCommand { command, .. } if command == "/login")
+            || is_escalate(&plain, "sign in with /login");
+        assert!(typed_login, "the control, on no roster row: {plain:?}");
+        let ended = renewable(shown, "m7-a");
+        let mut st = start(held);
+        let a = at_under(&mut st, &ended, t + MIN, under);
+        assert!(waits_on(&a, held), "{:?} {held:?}: {a:?}", shown.composer);
+        assert_eq!(
+            st.account_point(&ended, under),
+            Some(AccountPoint::LoginEnded),
+            "the host is told the row's login ended: {:?} {held:?}",
+            shown.composer
+        );
+        assert_eq!(
+            exception_for(&st, &ended, under, t + MIN),
+            None,
+            "no one is asked to sign in: {:?} {held:?}",
+            shown.composer
+        );
+        let mut st = start(held);
         let after = TurnEndReading {
             login_superseded: true,
             ..ended.clone()
         };
         let a = at_under(&mut st, &after, t + 2 * MIN, under);
-        assert!(
-            matches!(&a, TurnEndAction::Escalate { reason } if !reason.contains("renew it")),
-            "no renewal reaches this process: {a:?}"
-        );
-        let e = exception_for(&st, &after, under, t + 2 * MIN).expect("the owner is needed now");
+        let e = exception_for(&st, &after, under, t + 2 * MIN);
+        if let Some(held) = held {
+            assert!(waits_on(&a, Some(held)), "{held}: {a:?}");
+            assert_eq!(e, None, "the renewed row's move held asks no one: {held}");
+            continue;
+        }
+        use super::super::notice::RENEWED_DRAFT;
+        let e = e.expect("the draft is the one thing told");
         assert_eq!(
             (e.kind, e.when, e.escalated),
             (ExceptionKind::Login, Urgency::Now, false)
         );
-        let id = e.notice.as_ref().map(|n| n.id);
-        assert!(
-            e.notice
-                .as_ref()
-                .is_some_and(|n| [&n.did, &n.expect, &e.action]
-                    .iter()
-                    .any(|part| part.contains("m7-a"))),
-            "the login named: {e:?}"
+        assert_eq!(
+            e.notice.as_ref().map(|n| n.id),
+            Some(RENEWED_DRAFT.id),
+            "{:?}: {e:?}",
+            shown.composer
         );
-        if shown.composer.drafted() {
-            use super::super::notice::RENEWED_DRAFT;
-            let reason = match shown.composer {
-                Composer::Own => "clear them, and the tab moves",
-                Composer::Diverted => "close the menu",
-                _ => "send or clear it",
-            };
-            assert!(is_escalate(&a, reason), "{:?}: {a:?}", shown.composer);
-            assert!(
-                matches!(&a, TurnEndAction::Escalate { reason }
-                    if reason.contains("send") == (shown.composer != Composer::Own)),
-                "{:?}: {a:?}",
-                shown.composer
-            );
-            assert_eq!(id, Some(RENEWED_DRAFT.id), "{:?}: {e:?}", shown.composer);
-            assert_eq!(
-                e.action.to_lowercase().contains("send"),
-                shown.composer != Composer::Own,
-                "{:?}: {e:?}",
-                shown.composer
-            );
-            assert_eq!(
-                e.action.contains("menu"),
-                shown.composer == Composer::Diverted,
-                "{:?}: {e:?}",
-                shown.composer
-            );
-            assert_eq!(
-                e.action == RENEWED_DRAFT.todo,
-                shown.composer == Composer::Typed,
-                "{:?}: {e:?}",
-                shown.composer
-            );
-            let sent = advised(
-                &TurnEndReading {
-                    composer: gone.composer.clone(),
-                    ..after.clone()
-                },
-                "m7-a",
-            );
-            let a = at_under(&mut st, &sent, t + 3 * MIN, under);
-            assert!(
-                restarts(&a, &to_account("m7-a", AccountAt::Wall), RULE_ACCOUNT),
-                "{a:?}"
-            );
-        } else {
-            let why = if !under.relaunch {
-                super::super::notice::BY_HAND_WHYS[0]
-            } else if !under.resume_limits {
-                super::super::notice::BY_HAND_WHYS[1]
-            } else {
-                super::super::notice::BY_HAND_WHYS[2]
-            };
-            assert!(
-                is_escalate(
-                    &a,
-                    &format!(
-                        "the login was renewed, but {why}: type /login in the tab and sign in"
-                    )
-                ),
-                "{a:?}"
-            );
-            assert_eq!(id, Some(super::super::notice::RENEWED_BY_HAND.id), "{e:?}");
-            assert!(
-                e.notice.as_ref().is_some_and(|n| n.did.contains(why)),
-                "what holds the move is named: {e:?}"
-            );
-            assert!(e.action.contains("/login"), "{e:?}");
-        }
+        assert!(
+            !e.action.contains("/login") && !e.action.to_lowercase().contains("sign in"),
+            "the draft's step names no sign-in: {e:?}"
+        );
+        let reason = match shown.composer {
+            Composer::Own => "clear them, and the tab moves",
+            Composer::Diverted => "close the menu",
+            _ => "send or clear it",
+        };
+        assert!(is_escalate(&a, reason), "{:?}: {a:?}", shown.composer);
+        assert_eq!(
+            e.action.to_lowercase().contains("send"),
+            shown.composer != Composer::Own,
+            "{:?}: {e:?}",
+            shown.composer
+        );
+        assert_eq!(
+            e.action.contains("menu"),
+            shown.composer == Composer::Diverted,
+            "{:?}: {e:?}",
+            shown.composer
+        );
+        let sent = advised(
+            &TurnEndReading {
+                composer: gone.composer.clone(),
+                ..after.clone()
+            },
+            "m7-a",
+        );
+        let a = at_under(&mut st, &sent, t + 3 * MIN, under);
+        assert!(
+            restarts(&a, &to_account("m7-a", AccountAt::Wall), RULE_ACCOUNT),
+            "{a:?}"
+        );
+    }
+}
+
+/// A TASKLESS TAB, OR ONE WHOSE TASK IS DONE, ON A ROSTER ROW WHOSE LOGIN ENDED: nothing is typed
+/// into it, but the host is still told the row's login ended, so the row is marked signed out and
+/// aterm's sign-in ladder signs it in. CONTROL: on no roster row, or with `logins` off, the host is
+/// asked nothing.
+#[test]
+fn a_taskless_tabs_roster_login_end_is_still_told() {
+    let t = t0();
+    let gone = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(Duration::from_secs(2)),
+    );
+    let taskless = TurnEndReading {
+        taskless: true,
+        ..gone.clone()
+    };
+    let mut no_logins = cfg();
+    no_logins.logins = false;
+    let mut done = TurnEndState::default();
+    assert!(done.seed_task_done());
+    for (shown, start) in [(&taskless, TurnEndState::default()), (&gone, done)] {
+        let ended = renewable(shown, "m7-a");
+        let mut st = start.clone();
+        let a = at_under(&mut st, &ended, t + MIN, &cfg());
+        assert!(
+            !matches!(&a, TurnEndAction::TypeCommand { .. }),
+            "nothing typed: {a:?}"
+        );
+        assert_eq!(
+            st.account_point(&ended, &cfg()),
+            Some(AccountPoint::LoginEnded),
+            "the row's login end is told: {a:?}"
+        );
+        assert_eq!(
+            super::super::exception::exception_for(&st, &ended, &cfg(), t + MIN),
+            None
+        );
+        let mut st = start.clone();
+        st.observe(shown, t + MIN);
+        assert_eq!(st.account_point(shown, &cfg()), None, "the control: no row");
+        let mut st = start.clone();
+        st.observe(&ended, t + MIN);
+        assert_eq!(
+            st.account_point(&ended, &no_logins),
+            None,
+            "the control: logins off"
+        );
     }
 }
 
@@ -16039,9 +16177,14 @@ fn a_superseded_logins_held_follow_is_waited_for_and_asks_nothing() {
         "{a:?}"
     );
     assert_eq!(exception_for(&st, &followed, &cfg(), ends), None);
+    // Advising nothing, the renewed login ended too: the row is signed in again by aterm, and
+    // the tab waits on that sign-in rather than typing `/login`.
     let mut st = TurnEndState::default();
     let a = at(&mut st, &superseded, t + MIN);
-    assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("m7-a")),
+        "{a:?}"
+    );
     assert_eq!(exception_for(&st, &superseded, &cfg(), t + MIN), None);
 }
 
@@ -16713,6 +16856,20 @@ mod agy_messages {
     include!("turn_end_agy_message_tests.rs");
 }
 
+mod corpora {
+    include!("turn_end_corpora_tests.rs");
+}
+
+mod found {
+    use super::*;
+    include!("turn_end_found_tests.rs");
+}
+
+mod reader_measure {
+    use super::*;
+    include!("turn_end_reader_measure_tests.rs");
+}
+
 #[test]
 fn unknown_composer_evidence_is_not_a_free_point_or_a_draft_to_submit() {
     let rows = screen(END_OFFER);
@@ -17135,13 +17292,24 @@ fn a_renewal_made_while_the_login_was_up_is_followed_once_it_is_left() {
         }),
         ..renewable(&real_point(LOGIN_INTERRUPTED), "m7-a")
     };
+    let a = act(&mut TurnEndState::default(), &wall, t);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("m7-a")),
+        "where the relaunch reaches the tab, aterm types no /login: {a:?}"
+    );
+    // The `/login` aterm typed before the roster named the login's row: over a row it names, it
+    // types none.
+    let typed_wall = TurnEndReading {
+        login_label: None,
+        ..wall.clone()
+    };
     let mut landed = TurnEndState::default();
     assert!(landed.seed_task_done());
-    let a = act(&mut landed, &wall, t);
+    let a = act(&mut landed, &typed_wall, t);
     assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
     assert!(!landed.task_done(), "the lost login reopens the landing");
     let mut st = TurnEndState::default();
-    let a = act(&mut st, &wall, t);
+    let a = act(&mut st, &typed_wall, t);
     assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
     let gone = left(true);
     assert!(gone.login_interrupted && gone.login_screen.is_none());
@@ -17156,7 +17324,7 @@ fn a_renewal_made_while_the_login_was_up_is_followed_once_it_is_left() {
         "no sign-in asked again"
     );
     let mut st = TurnEndState::default();
-    let a = act(&mut st, &wall, t);
+    let a = act(&mut st, &typed_wall, t);
     assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
     let gone = left(false);
     let a = at(&mut st, &gone, t + MIN);
@@ -17191,6 +17359,17 @@ fn a_renewal_over_a_landings_lost_login_is_asked_for_once_its_login_is_left() {
     let aged = TurnEndReading {
         person: Some(key + past),
         ..wall.clone()
+    };
+    let a = decide_turn_end(&st, &aged, &cfg(), now);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("m7-a")),
+        "where the relaunch reaches the tab, aterm types no /login: {a:?}"
+    );
+    // The `/login` aterm typed before the roster named the login's row: over a row it names, it
+    // types none.
+    let aged = TurnEndReading {
+        login_label: None,
+        ..aged
     };
     let a = decide_turn_end(&st, &aged, &cfg(), now);
     assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
@@ -17252,9 +17431,15 @@ fn a_dialog_over_a_renewed_login_is_told_to_be_closed() {
             "m7-a",
         )
     };
+    // The `/login` aterm typed before the roster named the login's row: over a row it names, it
+    // types none.
+    let typed_wall = TurnEndReading {
+        login_label: None,
+        ..wall.clone()
+    };
     let typed = || {
         let mut st = TurnEndState::default();
-        let a = act(&mut st, &wall, t);
+        let a = act(&mut st, &typed_wall, t);
         assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
         st
     };

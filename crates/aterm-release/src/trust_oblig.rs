@@ -3,6 +3,10 @@
 
 //! Per-obligation Trust verification records ([`Record`], [`REPORT_SCHEMA`], [`write_record`],
 //! [`reduce`], [`Obligation::file`], [`anchor_of`]).
+//!
+//! Each row keeps what stopped its obligation ([`Obligation::stop`]): the judge credits a
+//! shortfall only with obligations a backstop stopped in this run and not in the run that set
+//! the floor ([`Obligation::key`], `crate::trust_facts`), so a lapse every run has is the code's.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -15,13 +19,22 @@ use serde::Deserialize;
 use crate::trust_facts::{hex, one_line};
 
 /// The record's first line.
-pub const RECORD_MAGIC: &str = "# aterm trust obligations 1";
+pub const RECORD_MAGIC: &str = "# aterm trust obligations 2";
 /// The one report schema [`reduce`] reads.
 pub const REPORT_SCHEMA: &str = "trust.report.ndjson.v2";
 /// The file of an obligation the report gives no location.
 pub const NO_LOCATION: &str = "@none";
 /// What the record of `<spec>.log` is called, beside it.
 pub const RECORD_SUFFIX: &str = ".oblig.tsv";
+/// The stop of an obligation nothing stopped early, or whose report named no stop.
+pub const NO_STOP: &str = "-";
+
+/// Whether `stop` is one of the prover's backstops: its wall clocks' (`wall-backstop`) or its
+/// RSS reading's (`rss-backstop`), which a busier machine hits more often.
+#[must_use]
+pub fn is_backstop(stop: &str) -> bool {
+    stop.ends_with("-backstop")
+}
 
 /// The standard library's crates, as a toolchain prints their sources.
 const SYSROOT: &[&str] = &[
@@ -71,6 +84,9 @@ pub struct Obligation {
     pub span: Span,
     /// The report's `outcome.status`; only `proved` is proved.
     pub status: String,
+    /// What stopped it, as the report's `[stop:…]` tag names it (`wall-backstop` for a
+    /// `timeout` that names none), or [`NO_STOP`].
+    pub stop: String,
     /// The span's source text ([`anchor_of`]); `-` out of the tree.
     pub anchor: String,
     /// The report's description, whitespace collapsed.
@@ -82,9 +98,44 @@ impl Obligation {
     pub fn proved(&self) -> bool {
         self.status == "proved"
     }
+
+    /// Left unproved because a backstop stopped it ([`is_backstop`]).
+    #[must_use]
+    pub fn backstopped(&self) -> bool {
+        !self.proved() && is_backstop(&self.stop)
+    }
+
+    /// Its name across runs: its function, kind, file, anchor and description (a MIR local and
+    /// an interned hash erased), never its line, which an edit above it moves. Look-alikes
+    /// share a key, so runs are compared as multisets of keys.
+    #[must_use]
+    pub fn key(&self) -> String {
+        let material = format!(
+            "{}\0{}\0{}\0{}\0{}",
+            self.function,
+            self.kind,
+            self.file,
+            self.anchor,
+            norm_desc(&self.desc)
+        );
+        hex(&Sha256::digest(material.as_bytes()))[..16].to_string()
+    }
+
+    /// One line a reader finds it by: its function, kind, file and line, and its anchor in
+    /// backquotes.
+    #[must_use]
+    pub fn said(&self) -> String {
+        one_line(&format!(
+            "{} {} {}:{} `{}`",
+            self.function, self.kind, self.file, self.span.l0, self.anchor
+        ))
+    }
 }
 
-/// One check's obligations, as the lane recorded them beside its log — tab-separated lines:.
+/// One check's obligations, as the lane recorded them beside its log, in tab-separated lines:
+/// a header (`package`, `unit`, `functions`, `total`, `proved`), one
+/// `o <function> <kind> <file> <l0> <c0> <l1> <c1> <status> <stop> <anchor> <description>`
+/// row per obligation, and `end <total>`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Record {
     pub package: String,
@@ -116,7 +167,7 @@ impl Record {
         );
         for o in &self.rows {
             out.push_str(&format!(
-                "o\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "o\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 o.function,
                 o.kind,
                 o.file,
@@ -125,6 +176,7 @@ impl Record {
                 o.span.l1,
                 o.span.c1,
                 o.status,
+                o.stop,
                 o.anchor,
                 o.desc
             ));
@@ -132,6 +184,123 @@ impl Record {
         out.push_str(&format!("end\t{}\n", self.total()));
         out
     }
+
+    /// Read a record ([`Record::to_text`]), held to its shape: every field in its form, the
+    /// header's counts the rows', and an `end` line (a record cut short has none).
+    ///
+    /// # Errors
+    /// Why the record cannot be used, in one line.
+    pub fn parse(text: &str) -> std::result::Result<Record, String> {
+        let mut lines = text.lines().enumerate().map(|(i, l)| (i + 1, l));
+        match lines.next() {
+            Some((_, l)) if l == RECORD_MAGIC => {}
+            _ => return Err(format!("its first line is not `{RECORD_MAGIC}`")),
+        }
+        let mut head = |want: &str| -> std::result::Result<String, String> {
+            match lines.next() {
+                Some((_, l)) => match l.split_once('\t') {
+                    Some((k, v)) if k == want && !v.is_empty() && !v.contains('\t') => {
+                        Ok(v.to_string())
+                    }
+                    _ => Err(format!("its `{want}` line is missing or malformed")),
+                },
+                None => Err(format!("it ends before its `{want}` line")),
+            }
+        };
+        let package = head("package")?;
+        let unit = head("unit")?;
+        let number = |s: &str, what: &str| {
+            s.parse::<u64>()
+                .map_err(|_| format!("its `{what}` line is not a count"))
+        };
+        let functions = number(&head("functions")?, "functions")?;
+        let total = number(&head("total")?, "total")?;
+        let proved = number(&head("proved")?, "proved")?;
+        let mut rows = Vec::new();
+        let mut end = None;
+        for (n, line) in lines {
+            if end.is_some() {
+                return Err(format!("line {n} follows its `end` line"));
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            match f.first().copied() {
+                Some("o") if f.len() == 12 => {
+                    rows.push(row_of(&f[1..]).map_err(|why| format!("line {n}: {why}"))?);
+                }
+                Some("end") if f.len() == 2 => end = Some(number(f[1], "end")?),
+                _ => return Err(format!("line {n} is not a row of a record")),
+            }
+        }
+        let rec = Record {
+            package,
+            unit,
+            functions,
+            rows,
+        };
+        match end {
+            None => Err("it has no `end` line: it was cut short".into()),
+            Some(e) if e != rec.total() || total != rec.total() => Err(format!(
+                "it says {total} obligations (end {e}) and holds {}",
+                rec.total()
+            )),
+            Some(_) if proved != rec.proved() => Err(format!(
+                "it says {proved} proved and holds {} proved rows",
+                rec.proved()
+            )),
+            Some(_) => Ok(rec),
+        }
+    }
+}
+
+/// One `o` row's eleven fields, held to their forms.
+fn row_of(f: &[&str]) -> std::result::Result<Obligation, String> {
+    let [
+        function,
+        kind,
+        file,
+        l0,
+        c0,
+        l1,
+        c1,
+        status,
+        stop,
+        anchor,
+        desc,
+    ] = f
+    else {
+        return Err("not eleven fields".into());
+    };
+    let n = |s: &str, what: &str| {
+        s.parse::<u32>()
+            .map_err(|_| format!("its {what} `{s}` is not a number"))
+    };
+    let span = Span {
+        l0: n(l0, "start line")?,
+        c0: n(c0, "start column")?,
+        l1: n(l1, "end line")?,
+        c1: n(c1, "end column")?,
+    };
+    valid_function(function)?;
+    valid_kind(kind)?;
+    valid_file(file)?;
+    valid_span(span, file)?;
+    valid_status(status)?;
+    valid_stop(stop)?;
+    for (what, v) in [("anchor", anchor), ("description", desc)] {
+        if v.is_empty() {
+            return Err(format!("its {what} is empty"));
+        }
+    }
+    Ok(Obligation {
+        function: (*function).into(),
+        kind: (*kind).into(),
+        file: (*file).into(),
+        span,
+        status: (*status).into(),
+        stop: (*stop).into(),
+        anchor: (*anchor).into(),
+        desc: (*desc).into(),
+    })
 }
 
 /// A function path: non-empty, one line, no tab.
@@ -234,6 +403,17 @@ fn valid_status(s: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// A stop: [`NO_STOP`], or the word of a `[stop:…]` tag (`[a-z-]+`).
+fn valid_stop(s: &str) -> std::result::Result<(), String> {
+    if s != NO_STOP && (s.is_empty() || !s.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')) {
+        return Err(format!(
+            "the stop `{}` is of no form this gate knows",
+            one_line(s)
+        ));
+    }
+    Ok(())
+}
+
 /// One line of `report.ndjson`, only what the record keeps.
 #[derive(Deserialize)]
 struct RawRecord {
@@ -268,7 +448,7 @@ struct RawObligation {
     description: String,
     #[serde(default)]
     location: Option<RawLocation>,
-    outcome: RawOutcome,
+    outcome: aterm_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -280,9 +460,58 @@ struct RawLocation {
     col_end: u32,
 }
 
-#[derive(Deserialize)]
+/// An obligation's `outcome`: its `status`, and the text that says why it stopped (`note`,
+/// `reason`, …), searched whole for `[stop:…]`.
 struct RawOutcome {
     status: String,
+    all: aterm_json::Value,
+}
+
+impl RawOutcome {
+    fn of(v: aterm_json::Value) -> std::result::Result<RawOutcome, String> {
+        let status = v
+            .get("status")
+            .and_then(aterm_json::Value::as_str)
+            .ok_or("an outcome with no status")?
+            .to_string();
+        Ok(RawOutcome { status, all: v })
+    }
+}
+
+/// What stopped an obligation: the `[stop:<word>]` tag its outcome's text carries (a backstop's
+/// first, when it carries several), `wall-backstop` for a `timeout` that names none (a
+/// per-obligation clock ran out), else [`NO_STOP`].
+fn stop_of(o: &RawOutcome) -> String {
+    fn tags(v: &aterm_json::Value, out: &mut Vec<String>) {
+        match v {
+            aterm_json::Value::String(s) => {
+                let mut rest = s.as_str();
+                while let Some(at) = rest.find("[stop:") {
+                    rest = &rest[at + "[stop:".len()..];
+                    let n = rest
+                        .bytes()
+                        .take_while(|b| b.is_ascii_lowercase() || *b == b'-')
+                        .count();
+                    if n > 0 && rest.as_bytes().get(n) == Some(&b']') {
+                        out.push(rest[..n].to_string());
+                    }
+                }
+            }
+            aterm_json::Value::Array(a) => a.iter().for_each(|v| tags(v, out)),
+            aterm_json::Value::Object(m) => m.values().for_each(|v| tags(v, out)),
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    tags(&o.all, &mut found);
+    if let Some(b) = found.iter().find(|t| is_backstop(t)) {
+        return b.clone();
+    }
+    match found.pop() {
+        Some(t) => t,
+        None if o.status == "timeout" => "wall-backstop".into(),
+        None => NO_STOP.into(),
+    }
 }
 
 /// The `package="…"` of a report's `cargo-target(…)` unit.
@@ -444,6 +673,41 @@ fn collapse(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// A description as [`Obligation::key`] compares it: whitespace collapsed, a MIR local
+/// (`` `_7` ``) as `` `_` ``, an interned hash (`@` and 8 or more hex) as `@#`.
+#[must_use]
+pub fn norm_desc(d: &str) -> String {
+    let d = collapse(d);
+    let b = d.as_bytes();
+    let mut out = String::with_capacity(d.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'`' && b.get(i + 1) == Some(&b'_') {
+            let digits = b[i + 2..].iter().take_while(|c| c.is_ascii_digit()).count();
+            if digits > 0 && b.get(i + 2 + digits) == Some(&b'`') {
+                out.push_str("`_`");
+                i += 3 + digits;
+                continue;
+            }
+        }
+        if b[i] == b'@' {
+            let run = b[i + 1..]
+                .iter()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .count();
+            if run >= 8 {
+                out.push_str("@#");
+                i += 1 + run;
+                continue;
+            }
+        }
+        let ch = d[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// The anchor: the source text of an in-tree span.
 ///
 /// # Errors
@@ -585,7 +849,10 @@ pub fn reduce(
                 let obligations = raw.obligations.unwrap_or_default();
                 let proved = obligations
                     .iter()
-                    .filter(|o| o.outcome.status == "proved")
+                    .filter(|o| {
+                        o.outcome.get("status").and_then(aterm_json::Value::as_str)
+                            == Some("proved")
+                    })
                     .count() as u64;
                 match raw.summary {
                     Some(RawSummary {
@@ -661,7 +928,9 @@ fn obligation(
     src: &mut Sources<'_>,
 ) -> std::result::Result<Obligation, String> {
     valid_kind(&o.kind)?;
-    valid_status(&o.outcome.status)?;
+    let outcome = RawOutcome::of(o.outcome)?;
+    valid_status(&outcome.status)?;
+    let stop = stop_of(&outcome);
     let Some(loc) = o.location else {
         return Ok(Obligation {
             function: function.to_string(),
@@ -673,7 +942,8 @@ fn obligation(
                 l1: 0,
                 c1: 0,
             },
-            status: o.outcome.status,
+            status: outcome.status,
+            stop,
             anchor: "-".into(),
             desc: kept_desc(&o.description),
         });
@@ -696,7 +966,8 @@ fn obligation(
         kind: o.kind,
         file,
         span,
-        status: o.outcome.status,
+        status: outcome.status,
+        stop,
         anchor,
         desc: kept_desc(&o.description),
     })
@@ -1028,11 +1299,13 @@ mod tests {
                 "2",
                 "29",
                 "proved",
+                "-",
                 "a + 1",
                 "arithmetic overflow (Add)",
             ]
         );
         assert_eq!(lines.last().copied(), Some("end\t3"));
+        assert_eq!(Record::parse(&text), Ok(rec.clone()));
         let none = probe_report().replacen(
             r#""location":{"file":"src/lib.rs","line_start":3,"col_start":4,"line_end":3,"col_end":9},"#,
             "",
@@ -1042,6 +1315,102 @@ mod tests {
         let o = &rec.rows[1];
         assert_eq!((o.file.as_str(), o.anchor.as_str()), ("@none", "-"));
         assert_eq!(o.span.to_string(), "0:0-0:0");
+    }
+
+    #[test]
+    fn a_rows_stop_is_the_reports_own_word() {
+        let d = checkout();
+        let five: Vec<Obl<'_>> = (0..5)
+            .map(|_| {
+                (
+                    "arithmetic_overflow_add",
+                    "unknown",
+                    "src/lib.rs",
+                    3,
+                    4,
+                    3,
+                    9,
+                    "arithmetic overflow (Add)",
+                )
+            })
+            .collect();
+        let plain = r#""outcome":{"status":"unknown"}"#;
+        let text = report(&[function_line("d27probe::twice", &five)])
+            .replacen(
+                plain,
+                r#""outcome":{"status":"runtime_checked","note":"solver timed out [stop:wall-backstop]"}"#,
+                1,
+            )
+            .replacen(plain, r#""outcome":{"status":"timeout","timeout_ms":5000}"#, 1)
+            .replacen(
+                plain,
+                r#""outcome":{"status":"unknown","reason":"the solver returned unknown [stop:unclassified]; RSS high [stop:rss-backstop]"}"#,
+                1,
+            )
+            .replacen(
+                plain,
+                r#""outcome":{"status":"unknown","note":"[stop:unclassified]"}"#,
+                1,
+            );
+        let rec = reduce_text(&text, d.path()).unwrap();
+        let stops: Vec<(&str, bool)> = rec
+            .rows
+            .iter()
+            .map(|o| (o.stop.as_str(), o.backstopped()))
+            .collect();
+        assert_eq!(
+            stops,
+            [
+                ("wall-backstop", true),
+                ("wall-backstop", true),
+                ("rss-backstop", true),
+                ("unclassified", false),
+                ("-", false),
+            ]
+        );
+        assert_eq!(Record::parse(&rec.to_text()), Ok(rec.clone()));
+        let key = rec.rows[0].key();
+        assert_eq!(key.len(), 16);
+        let mut moved = rec.rows[0].clone();
+        moved.span.l0 += 40;
+        moved.span.l1 += 40;
+        moved.status = "proved".into();
+        assert_eq!(
+            moved.key(),
+            key,
+            "a line or a verdict is no part of the key"
+        );
+        let mut local = rec.rows[0].clone();
+        local.desc = "arithmetic   overflow (Add)".into();
+        assert_eq!(local.key(), key);
+        local.anchor = "x + y".into();
+        assert_ne!(local.key(), key, "another anchor is another obligation");
+        assert_eq!(
+            norm_desc("unbounded allocation (count `_17`) at @f3f39371aeb0 `_x`"),
+            "unbounded allocation (count `_`) at @# `_x`"
+        );
+        for (bad, said) in [
+            (
+                rec.to_text().replacen("\twall-backstop\t", "\tWall!\t", 1),
+                "the stop `Wall!`",
+            ),
+            (
+                rec.to_text().replacen("\twall-backstop\t", "\t", 1),
+                "is not a row of a record",
+            ),
+            (
+                rec.to_text()
+                    .replace(RECORD_MAGIC, "# aterm trust obligations 1"),
+                "its first line",
+            ),
+            (
+                rec.to_text().replace("total\t5", "total\t6"),
+                "it says 6 obligations",
+            ),
+        ] {
+            let why = Record::parse(&bad).expect_err(said);
+            assert!(why.contains(said), "{said}: {why}");
+        }
     }
 
     #[test]

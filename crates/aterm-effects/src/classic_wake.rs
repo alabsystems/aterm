@@ -63,6 +63,8 @@ pub struct ClassicWake {
     comet_runs: Vec<Vec<CometSample>>,
     comet_live: usize,
     light_verts: Vec<BeamVertex>,
+    /// [`tracer_on_caret_row`]'s resident vertices.
+    light_dense: Vec<BeamVertex>,
     spawned: Option<((u16, u16), (u16, u16))>,
     bed_scratch: BedScratch,
     air_runs: Vec<Vec<CometSample>>,
@@ -77,6 +79,20 @@ pub struct ClassicWake {
     /// Test-only: lay the light-ground landing veil unbounded by the caret's cell and row.
     #[cfg(test)]
     pub(crate) veil_unbound: bool,
+    /// Test-only: lay a paper Enter's tracer across the rows it crosses, as
+    /// it was (looks7 M8's negative control).
+    #[cfg(test)]
+    pub(crate) tracer_over_letters: bool,
+    /// Test-only: the span a paper Enter's tracer fades out over leaving the
+    /// caret's row, px, in place of [`TRACER_LEAVE_SHARE`] of the row
+    /// (looks7 round 2's control: a cut).
+    #[cfg(test)]
+    pub(crate) tracer_leave_px: Option<f32>,
+    /// Test-only: a paper tracer kept to the caret's row eases in from the
+    /// row's top whichever edge it enters by, as it did (looks7 round 3's
+    /// review's control: a run from below is cut at the row's bottom).
+    #[cfg(test)]
+    pub(crate) tracer_top_only: bool,
 }
 
 impl Default for ClassicWake {
@@ -92,6 +108,131 @@ pub(crate) struct WakeInk<'a> {
     pub(crate) text: TextView<'a>,
     /// The frame's over-ink account.
     pub(crate) ledger: &'a mut InkLedger,
+}
+
+/// The share of a cell's height over which a paper Enter's tracer fades out
+/// as it leaves the caret's row ([`tracer_on_caret_row`]).
+const TRACER_LEAVE_SHARE: f32 = 0.6;
+
+/// How near a lettered cell off the caret's row a paper tracer may pass,
+/// px past its stroke's half width, and still be drawn whole.
+const TRACER_CLEAR_PX: f32 = 3.0;
+
+/// The longest step between a paper Enter's tracer's vertices once kept to
+/// the caret's row, px: its fade eases over a few px, not over a cell's run
+/// between two samples.
+const TRACER_STEP_PX: f32 = 2.0;
+
+/// A paper tracer across rows (`verts`, the run from the old caret to the
+/// new one) that would pass a lettered cell off the caret's row `caret_row`
+/// keeps to the caret's row. Laid straight across the rows at the
+/// baseline's drop, an Enter's tracer struck through the printed line
+/// (`brown fox` in the gallery's `enter-bottom`, looks7 M8); passed behind
+/// each lettered row instead, it broke into a stub at the caret and a dash
+/// floating past the printed line's end (looks7 round 2). Each vertex, the
+/// line cut to [`TRACER_STEP_PX`] steps, keeps its light on the caret's row
+/// only, its stroke's `half` width inside the row, easing in from the edge
+/// the run enters the row by (its top for a run from above, as an Enter's;
+/// its bottom for one from below, as a move up a page) over `leave` px, or
+/// over the room between that edge and the caret's stroke where that is
+/// less: one tail rising from the new caret toward the line it left, which
+/// fades out before it leaves the row. Eased in from the top alone, a run
+/// from below kept a full stub at the caret cut at the row's bottom (looks7
+/// round 3's review). A run whose rows are clear of letters is drawn whole,
+/// one stroke across them; without a caret, a run that crosses letters
+/// keeps no light.
+fn tracer_on_caret_row(
+    (verts, dense): (&mut Vec<BeamVertex>, &mut Vec<BeamVertex>),
+    text: TextView<'_>,
+    geom: Geom,
+    caret_row: Option<i32>,
+    (half, leave, top_only): (f32, f32, bool),
+) {
+    if verts.len() < 2 {
+        return;
+    }
+    let (ox, oy) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
+    let (cw, ch) = (geom.cw as f32, geom.ch as f32);
+    dense.clear();
+    for w in verts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let n = ((b.x - a.x).hypot(b.y - a.y) * (1.0 / TRACER_STEP_PX))
+            .ceil()
+            .max(1.0) as u32;
+        let inv_n = 1.0 / n as f32;
+        for i in 0..n {
+            let t = i as f32 * inv_n;
+            dense.push(BeamVertex {
+                x: a.x + (b.x - a.x) * t,
+                y: a.y + (b.y - a.y) * t,
+                color: lerp_rgb(a.color, b.color, t),
+                cov: (f32::from(a.cov) + (f32::from(b.cov) - f32::from(a.cov)) * t).round() as u8,
+            });
+        }
+    }
+    dense.extend(verts.last().copied());
+    let reach = half + TRACER_CLEAR_PX;
+    let reach2 = reach * reach;
+    let (inv_cw, inv_ch) = (1.0 / cw, 1.0 / ch);
+    let crosses = dense.iter().any(|v| {
+        let (row, col) = (
+            ((v.y - oy) * inv_ch).floor() as i32,
+            ((v.x - ox) * inv_cw).floor() as i32,
+        );
+        (row - 1..=row + 1)
+            .filter(|&r| Some(r) != caret_row)
+            .any(|r| {
+                (col - 1..=col + 1).any(|c| {
+                    if !(text.covers_cell(r, c) || text.covers_cell(r, c - 1)) {
+                        return false;
+                    }
+                    let (x0, y0) = (ox + c as f32 * cw, oy + r as f32 * ch);
+                    let dx = (x0 - v.x).max(v.x - (x0 + cw)).max(0.0);
+                    let dy = (y0 - v.y).max(v.y - (y0 + ch)).max(0.0);
+                    dx * dx + dy * dy < reach2
+                })
+            })
+    });
+    if !crosses {
+        return;
+    }
+    let Some(row) = caret_row else {
+        for v in dense.iter_mut() {
+            v.cov = 0;
+        }
+        std::mem::swap(verts, dense);
+        return;
+    };
+    let (top, bottom) = (oy + row as f32 * ch, oy + (row + 1) as f32 * ch);
+    let out_of_row = |v: &BeamVertex| v.y - half < top || v.y + half > bottom;
+    // The edge the run enters the caret's row by: where it lies walking back
+    // from the caret, the run's last vertex.
+    let from_below = !top_only
+        && dense
+            .iter()
+            .rev()
+            .find(|v| out_of_row(v))
+            .is_some_and(|v| v.y + half > bottom);
+    let inside = |v: &BeamVertex| {
+        if from_below {
+            bottom - (v.y + half)
+        } else {
+            v.y - half - top
+        }
+    };
+    let room = dense.last().map_or(leave, inside);
+    let span = leave.min(room).max(1.0);
+    let inv_span = 1.0 / span;
+    for v in dense.iter_mut() {
+        let k = if out_of_row(v) {
+            0.0
+        } else {
+            let u = (inside(v) * inv_span).clamp(0.0, 1.0);
+            u * u * (3.0 - 2.0 * u)
+        };
+        v.cov = (f32::from(v.cov) * k).round() as u8;
+    }
+    std::mem::swap(verts, dense);
 }
 
 /// Returns the comet colour at path position `pos` (`0` tail to `1` head).
@@ -137,6 +278,7 @@ impl ClassicWake {
             comet_runs: Vec::new(),
             comet_live: 0,
             light_verts: Vec::new(),
+            light_dense: Vec::new(),
             spawned: None,
             bed_scratch: BedScratch::EMPTY,
             air_runs: Vec::new(),
@@ -148,6 +290,12 @@ impl ClassicWake {
             light_unsolved: false,
             #[cfg(test)]
             veil_unbound: false,
+            #[cfg(test)]
+            tracer_over_letters: false,
+            #[cfg(test)]
+            tracer_leave_px: None,
+            #[cfg(test)]
+            tracer_top_only: false,
         }
     }
 
@@ -191,10 +339,25 @@ impl ClassicWake {
 
     /// Returns the `(first, last)` row range spanned by live sparks.
     #[inline]
-    pub(crate) fn row_range(&self) -> Option<(u16, u16)> {
-        let mut iter = self.sparks.iter().map(|s| s.row);
-        let first = iter.next()?;
-        Some(iter.fold((first, first), |(lo, hi), r| (lo.min(r), hi.max(r))))
+    pub(crate) const fn row_range(&self) -> Option<(u16, u16)> {
+        let sparks = self.sparks.as_slice();
+        if sparks.is_empty() {
+            return None;
+        }
+        let mut lo = sparks[0].row;
+        let mut hi = lo;
+        let mut i = 1;
+        while i < sparks.len() {
+            let r = sparks[i].row;
+            if r < lo {
+                lo = r;
+            }
+            if r > hi {
+                hi = r;
+            }
+            i += 1;
+        }
+        Some((lo, hi))
     }
 
     /// Returns the landing ring's cell.
@@ -355,7 +518,7 @@ impl ClassicWake {
             out.truncate(Self::MAX_QUADS);
         } else {
             self.emit_light_crown(now, cfg, geom, cur, under);
-            self.emit_light_comet(now, cfg, geom, cur, under);
+            self.emit_light_comet(now, cfg, geom, cur, under, ink.text);
             under.truncate(Self::MAX_QUADS);
             if let Some(ring) = &mut self.ring
                 && let Some(at) =
@@ -644,19 +807,33 @@ impl ClassicWake {
         let (ink, page) = CursorGlow::bed_pair(cfg);
         let budget = crate::cursor_glow::dark_bed_budget(ink);
         let shape = Self::MONO_BED;
+        let air = crate::cursor_glow::AirLight::of(page, budget, shape);
+        let chf = geom.ch as f32;
+        let lit_page = crate::cursor_glow::page_lit(page, budget);
+        let shape = if lit_page { shape.on_lit_page() } else { shape };
         let mut scratch = std::mem::take(&mut self.bed_scratch);
         scratch.inks.clear();
         scratch.rails.clear();
-        let mut last: Option<(u32, u32, u32)> = None;
+        scratch.rail_drop = if lit_page {
+            crate::cursor_glow::lit_rail_drop(chf)
+        } else {
+            0.0
+        };
+        let mut last: Option<(u32, bool, u32, u32)> = None;
+        let mut lit = std::mem::take(&mut scratch.air);
         for run in &self.comet_runs[..live] {
-            for s in run {
+            crate::cursor_glow::air_lit(run, geom, &text, (air.is_some(), false), &mut lit);
+            for (s, &in_air) in run.iter().zip(&lit) {
                 let rgb = self.comet_color(cfg, s.pos);
                 let (bed_c, rail_c) = match last {
-                    Some((prev, b, r)) if prev == rgb => (b, r),
+                    Some((prev, was_air, b, r)) if prev == rgb && was_air == in_air => (b, r),
                     _ => {
-                        let b = crate::cursor_glow::dark_bed_ink(rgb, page, budget, shape.sat);
+                        let b = match air {
+                            Some(air) if in_air => air.ink(rgb, page, shape.sat),
+                            _ => crate::cursor_glow::dark_bed_ink(rgb, page, budget, shape.sat),
+                        };
                         let r = crate::rainbow_kitty::ribbon::rail_ink(rgb & 0x00FF_FFFF);
-                        last = Some((rgb, b, r));
+                        last = Some((rgb, in_air, b, r));
                         (b, r)
                     }
                 };
@@ -664,6 +841,7 @@ impl ClassicWake {
                 scratch.rails.push(rail_c);
             }
         }
+        scratch.air = lit;
         lay_dark_bed(
             &self.comet_runs[..live],
             geom,
@@ -747,12 +925,27 @@ impl ClassicWake {
         geom: Geom,
         cur: Option<(u16, u16)>,
         under: &mut Vec<GlowQuad>,
+        text: TextView<'_>,
     ) {
+        #[cfg(test)]
+        let kept = !self.tracer_over_letters;
+        #[cfg(not(test))]
+        let kept = true;
+        let caret_row = cur.map(|(r, _)| i32::from(r));
         let live = self.build_runs(now, cfg, geom, cur);
         if live == 0 {
             return;
         }
+        let mut dense = std::mem::take(&mut self.light_dense);
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
+        #[cfg(test)]
+        let leave = self.tracer_leave_px.unwrap_or(chf * TRACER_LEAVE_SHARE);
+        #[cfg(not(test))]
+        let leave = chf * TRACER_LEAVE_SHARE;
+        #[cfg(test)]
+        let top_only = self.tracer_top_only;
+        #[cfg(not(test))]
+        let top_only = false;
         let drop = chf * Self::LIGHT_STROKE_DROP;
         let thick = (chf * Self::LIGHT_STROKE_THICK).max(1.5);
         let clip = geom.beam_clip();
@@ -811,11 +1004,21 @@ impl ClassicWake {
                         }
                         verts.push(v);
                     }
+                    if across_rows && kept {
+                        tracer_on_caret_row(
+                            (&mut verts, &mut dense),
+                            text,
+                            geom,
+                            caret_row,
+                            (0.5 * thick, leave, top_only),
+                        );
+                    }
                 }
             }
             comet_beam_over(under, clip, &verts, thick, 1, 0.0);
         }
         self.light_verts = verts;
+        self.light_dense = dense;
     }
 
     #[inline]
@@ -1131,6 +1334,7 @@ mod tests {
         halos: Vec<RainHalo>,
         under: Vec<GlowQuad>,
         ledger: InkLedger,
+        spans: crate::cursor_glow::TextSpans,
     }
 
     impl Rig {
@@ -1144,10 +1348,7 @@ mod tests {
                 &mut self.halos,
                 &mut self.under,
                 WakeInk {
-                    text: crate::cursor_glow::TextView::new(
-                        crate::cursor_glow::TextSpans::default(),
-                        None,
-                    ),
+                    text: crate::cursor_glow::TextView::new(self.spans, None),
                     ledger: &mut self.ledger,
                 },
             )
@@ -2037,6 +2238,178 @@ mod tests {
         assert!(
             gaps(&rail_quads) > 0,
             "control: per-cell rails leave gaps between rows"
+        );
+    }
+
+    /// looks7 M8: on paper an Enter's tracer ran straight from the old
+    /// line's end to the new line's start at the baseline's drop, across the
+    /// printed line's letters: a strike-through through `brown fox` in the
+    /// gallery's `enter-bottom`; passed behind each lettered row, it broke
+    /// into a stub at the caret and a dash floating past the printed line's
+    /// end (round 2). It keeps to the caret's row, for an Enter (a run from
+    /// above) and for a move up a page across lettered rows (a run from
+    /// below, round 3's review: eased in from the row's top alone it was a
+    /// full stub cut at the row's bottom): no pixel of another row takes its
+    /// ink, the caret's row shows it, and it fades in from the edge it
+    /// enters by, no row of pixels lifting by more than half its brightest
+    /// toward the caret, and walking its tail away from the caret no column
+    /// drops by more than a quarter of its brightest. Laid across the rows
+    /// (the first negative control) it strikes the lines it crosses; faded
+    /// over a pixel (the second) it is cut at the row's edge. Across rows
+    /// clear of letters it stays one stroke
+    /// (`a_vertical_jump_on_light_is_one_connected_stroke`).
+    #[test]
+    fn a_paper_enter_s_tracer_keeps_to_the_caret_s_row() {
+        let (g, c) = (geom(), light_cfg());
+        let (cw, ch) = (g.cw as i32, g.ch as i32);
+        // The echo on row 2 to column 26, the printed line on row 3 to 19.
+        let lines = [(2, 0, 26), (3, 0, 19)];
+        let held = |x: i32, y: i32| {
+            let (row, col) = (y.div_euclid(ch), x.div_euclid(cw));
+            lines
+                .iter()
+                .any(|&(r, first, end)| r == row && col >= first && col <= end)
+        };
+        struct Laid {
+            struck: usize,
+            off_row: usize,
+            shown: usize,
+            lift: f32,
+            drop: f32,
+        }
+        // An Enter from the echo's end to the next prompt (from above), and
+        // a move up from below the printed line across both lines.
+        let enter = ((2u16, 26u16), (4u16, 2u16));
+        let up = ((4u16, 20u16), (1u16, 2u16));
+        let laid = |(from, to): ((u16, u16), (u16, u16)),
+                    over: bool,
+                    leave: Option<f32>,
+                    top_only: bool|
+         -> Laid {
+            let t0 = Instant::now();
+            let mut rig = Rig {
+                spans: crate::cursor_glow::TextSpans::of_lines(&lines),
+                ..Rig::default()
+            };
+            rig.w.tracer_over_letters = over;
+            rig.w.tracer_leave_px = leave;
+            rig.w.tracer_top_only = top_only;
+            rig.tick(Some(from), t0, &c, g);
+            let ww = usize::from(g.win_w);
+            let caret_row = i32::from(to.0);
+            let mut most = vec![0u32; ch as usize];
+            let mut cols = vec![0u32; ww];
+            let (mut struck, mut off_row, mut shown) = (0usize, 0usize, 0usize);
+            for at in [16u64, 40, 80, 140] {
+                rig.tick(Some(to), ms(t0, at), &c, g);
+                let mut ink = vec![0u32; ww * usize::from(g.win_h)];
+                for q in &rig.under {
+                    let w = u32::from(q.w.max(1));
+                    for y in i32::from(q.y)..i32::from(q.y) + i32::from(q.h) {
+                        for x in i32::from(q.x)..i32::from(q.x) + i32::from(q.w) {
+                            let i = (x - i32::from(q.x)) as u32;
+                            let a = (u32::from(q.alpha) * (2 * w - (2 * i + 1))
+                                + u32::from(q.alpha2) * (2 * i + 1)
+                                + w)
+                                / (2 * w);
+                            let slot = &mut ink[y as usize * ww + x as usize];
+                            *slot = (*slot).max(a);
+                        }
+                    }
+                }
+                for (i, &a) in ink.iter().enumerate() {
+                    let (x, y) = ((i % ww) as i32, (i / ww) as i32);
+                    let row = y.div_euclid(ch);
+                    if row == caret_row {
+                        let m = &mut most[y.rem_euclid(ch) as usize];
+                        *m = (*m).max(a);
+                        let m = &mut cols[x as usize];
+                        *m = (*m).max(a);
+                    }
+                    if a <= 16 {
+                        continue;
+                    }
+                    if held(x, y) {
+                        struck += 1;
+                    }
+                    if row == caret_row {
+                        shown += 1;
+                    } else {
+                        off_row += 1;
+                    }
+                }
+            }
+            let peak = most.iter().copied().max().unwrap_or(0).max(1) as f32;
+            // Toward the caret from the edge the run enters by.
+            if from.0 > to.0 {
+                most.reverse();
+            }
+            let lift = most
+                .windows(2)
+                .map(|w| w[1].saturating_sub(w[0]) as f32 / peak)
+                .fold(0.0, f32::max);
+            // Along the tail, from the caret's column toward the one it left.
+            let caret_x = (i32::from(to.1) * cw + cw / 2) as usize;
+            let tail: Vec<u32> = if from.1 > to.1 {
+                cols[caret_x..].to_vec()
+            } else {
+                cols[..=caret_x].iter().rev().copied().collect()
+            };
+            let drop = tail
+                .windows(2)
+                .map(|w| w[0].saturating_sub(w[1]) as f32 / peak)
+                .fold(0.0, f32::max);
+            Laid {
+                struck,
+                off_row,
+                shown,
+                lift,
+                drop,
+            }
+        };
+        for (name, run) in [("Enter", enter), ("up", up)] {
+            let kept = laid(run, false, None, false);
+            assert_eq!(
+                (kept.struck, kept.off_row),
+                (0, 0),
+                "{name}: pixels of the lines the tracer crosses, and of the rows off the caret's, take its ink"
+            );
+            assert!(
+                kept.shown > 0,
+                "{name}: fixture: the tracer is drawn on the caret's row"
+            );
+            assert!(
+                kept.drop <= 0.25,
+                "{name}: the tracer's tail drops by {:.2} of its brightest from one column to the next",
+                kept.drop
+            );
+            let over = laid(run, true, None, false);
+            assert!(
+                over.struck > 0 && over.off_row > 0,
+                "{name}: control: laid across the rows, the tracer strikes nothing"
+            );
+        }
+        // An Enter crosses most of the caret's row from its top: the rise is
+        // gentle down the row too. A run from below crosses only the room
+        // between the row's bottom and the caret's baseline, a few px, in
+        // which its taper rises faster, so it is judged along its tail.
+        let kept = laid(enter, false, None, false);
+        assert!(
+            kept.lift <= 0.5,
+            "Enter: the tracer lifts by {:.2} of its brightest from one row of pixels to the next",
+            kept.lift
+        );
+        let cut = laid(enter, false, Some(0.0), false);
+        assert!(
+            cut.lift > 0.5,
+            "control: faded over a pixel, the Enter's tracer lifts by only {:.2}",
+            cut.lift
+        );
+        let top_only = laid(up, false, None, true);
+        assert!(
+            top_only.drop > 0.25,
+            "control: eased in from the row's top alone, the tail from below drops by only {:.2}",
+            top_only.drop
         );
     }
 

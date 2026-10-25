@@ -2240,10 +2240,22 @@ struct SparseRow<'a, T> {
 
 impl<'a, T> SparseRow<'a, T> {
     #[inline]
-    fn new(items: Option<&'a Vec<(usize, T)>>) -> Self {
-        let items = items.map_or([].as_slice(), Vec::as_slice);
+    const fn new(items: Option<&'a Vec<(usize, T)>>) -> Self {
+        let items: &[(usize, T)] = match items {
+            Some(v) => v.as_slice(),
+            None => &[],
+        };
+        let mut ordered = true;
+        let mut i = 1;
+        while i < items.len() {
+            if items[i - 1].0 >= items[i].0 {
+                ordered = false;
+                break;
+            }
+            i += 1;
+        }
         Self {
-            ordered: items.windows(2).all(|w| w[0].0 < w[1].0),
+            ordered,
             items,
             cursor: 0,
         }
@@ -2288,31 +2300,91 @@ impl<'a> RowScan<'a> {
         matches!(self.line, LineRow::Uniform(LineSize::SingleWidth))
     }
     #[inline]
-    fn new(input: &'a RenderInput, row: usize) -> Self {
-        let bg = match input.default_bg_spans.get(row).map(Vec::as_slice) {
-            None | Some([]) => BgRow::Uniform(input.default_bg),
-            Some(spans) if spans.windows(2).all(|w| w[0].end_col <= w[1].end_col) => {
-                BgRow::Spans { spans, cursor: 0 }
+    const fn new(input: &'a RenderInput, row: usize) -> Self {
+        let bg_spans = input.default_bg_spans.as_slice();
+        let bg = if row < bg_spans.len() {
+            let spans = bg_spans[row].as_slice();
+            if spans.is_empty() {
+                BgRow::Uniform(input.default_bg)
+            } else {
+                let mut ordered = true;
+                let mut i = 1;
+                while i < spans.len() {
+                    if spans[i - 1].end_col > spans[i].end_col {
+                        ordered = false;
+                        break;
+                    }
+                    i += 1;
+                }
+                if ordered {
+                    BgRow::Spans { spans, cursor: 0 }
+                } else {
+                    BgRow::Unordered
+                }
             }
-            Some(_) => BgRow::Unordered,
+        } else {
+            BgRow::Uniform(input.default_bg)
         };
-        let line = match input.line_size_spans.get(row).map(Vec::as_slice) {
-            None | Some([]) => {
-                LineRow::Uniform(input.line_sizes.get(row).copied().unwrap_or_default())
+        let line_spans = input.line_size_spans.as_slice();
+        let line = if row < line_spans.len() {
+            let spans = line_spans[row].as_slice();
+            if spans.is_empty() {
+                let line_sizes = input.line_sizes.as_slice();
+                LineRow::Uniform(if row < line_sizes.len() {
+                    line_sizes[row]
+                } else {
+                    LineSize::SingleWidth
+                })
+            } else {
+                let mut ordered = true;
+                let mut i = 1;
+                while i < spans.len() {
+                    if spans[i - 1].start_col >= spans[i].start_col {
+                        ordered = false;
+                        break;
+                    }
+                    i += 1;
+                }
+                if ordered {
+                    LineRow::Runs { spans, cursor: 0 }
+                } else {
+                    LineRow::Unordered
+                }
             }
-            Some(spans) if spans.windows(2).all(|w| w[0].start_col < w[1].start_col) => {
-                LineRow::Runs { spans, cursor: 0 }
-            }
-            Some(_) => LineRow::Unordered,
+        } else {
+            let line_sizes = input.line_sizes.as_slice();
+            LineRow::Uniform(if row < line_sizes.len() {
+                line_sizes[row]
+            } else {
+                LineSize::SingleWidth
+            })
+        };
+        let clusters_rows = input.clusters.as_slice();
+        let clusters = SparseRow::new(if row < clusters_rows.len() {
+            Some(&clusters_rows[row])
+        } else {
+            None
+        });
+        let combining_rows = input.combining.as_slice();
+        let combining = SparseRow::new(if row < combining_rows.len() {
+            Some(&combining_rows[row])
+        } else {
+            None
+        });
+        let image_rows = input.images.as_slice();
+        let images = if row < image_rows.len() {
+            image_rows[row].as_slice()
+        } else {
+            &[]
         };
         Self {
             input,
             row,
             bg,
             line,
-            clusters: SparseRow::new(input.clusters.get(row)),
-            combining: SparseRow::new(input.combining.get(row)),
-            images: input.images.get(row).map_or(&[], Vec::as_slice),
+            clusters,
+            combining,
+            images,
         }
     }
 
@@ -2390,10 +2462,26 @@ const fn is_single_braille_dot(ch: char) -> bool {
 #[inline]
 const fn exclusion_span(rect: PetRect, row: usize, limit: usize) -> Option<(usize, usize)> {
     let row_f = row as f32;
-    if !(rect.row < row_f + 1.0 && rect.row + rect.rows > row_f) {
+    if limit == 0 || !(rect.row < row_f + 1.0 && rect.row + rect.rows > row_f) {
         return None;
     }
     let rect_right = rect.col + rect.cols;
+    if limit <= (1 << 23) {
+        if !(rect.col < limit as f32 && rect_right > 0.0) {
+            return None;
+        }
+        let lo = if rect.col <= 0.0 {
+            0
+        } else {
+            rect.col.floor() as usize
+        };
+        let hi = if rect_right > (limit - 1) as f32 {
+            limit
+        } else {
+            rect_right.ceil() as usize
+        };
+        return if lo < hi { Some((lo, hi)) } else { None };
+    }
     let (mut a, mut b) = (0, limit);
     while a < b {
         let mid = a + (b - a) / 2;

@@ -17,7 +17,7 @@ use rustls::ClientConnection;
 
 use crate::fleet::{
     Dialed, DriveGrant, FleetError, FleetMark, FleetOp, FleetScope, FleetSecret, KEY_FILE,
-    NodeIdentity, NodeKey, NodeProof, REPLY_MAX, Served, client_handshake_as,
+    NodeIdentity, NodeKey, NodeProof, REPLY_MAX, Served, Undialed, client_handshake_by,
 };
 use crate::slots::{Claim, HandshakeWatchdog};
 use crate::tls::TlsTransport;
@@ -120,6 +120,17 @@ pub fn node_id(dir: &Path) -> io::Result<String> {
 }
 
 const CODE_FILE_MAX: usize = 4096;
+
+/// The act that moves this machine's fleet listener to a port of its own: the issuer's rotate
+/// (its join code names the port), or a member's join again.
+#[must_use]
+pub fn moves_listener(dir: &Path) -> &'static str {
+    if std::fs::symlink_metadata(dir.join(CODE_FILE)).is_ok() {
+        "`aterm fleet init --rotate --port <n>` moves it (every member joins again)"
+    } else {
+        "`aterm fleet join --port <n>` moves it"
+    }
+}
 
 /// The join code this machine issued, as [`CODE_FILE`] in `dir` holds it: the secret, and
 /// the host and port members dial.
@@ -1391,7 +1402,7 @@ pub fn find(peers: &[Peer], what: &str) -> Result<Option<usize>, String> {
         [] => Ok(None),
         [at] => Ok(Some(*at)),
         many => Err(format!(
-            "`{shown}` names {} peers ({}): name one by its node id or its address and port",
+            "`{shown}` names {} peers ({}): name one by its node id{}",
             many.len(),
             many.iter()
                 .filter_map(|at| peers.get(*at))
@@ -1403,7 +1414,17 @@ pub fn find(peers: &[Peer], what: &str) -> Result<Option<usize>, String> {
                     peer.target()
                 ))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            // A place two of them share names neither.
+            if many.iter().enumerate().all(|(i, a)| {
+                many[i + 1..]
+                    .iter()
+                    .all(|b| peers[*a].target() != peers[*b].target())
+            }) {
+                " or its address and port"
+            } else {
+                ""
+            }
         )),
     }
 }
@@ -2322,7 +2343,13 @@ fn fetch_book_in<'a>(
                 Some((at, opened)) if at == to => Some(opened),
                 _ => held.and_then(|held| held.enter_after(to, deadline)),
             };
-            let reached = reach(to, (secret, me), FleetOp::Book, (deadline, within));
+            let reached = reach(
+                to,
+                (secret, me),
+                FleetOp::Book,
+                (deadline, within),
+                &|_, _| None,
+            );
             if let Some(mut mine) = mine {
                 match &reached {
                     AtAddr::Reached(_) => holding = Some(mine),
@@ -3213,11 +3240,15 @@ pub fn dial(
         (secret, me),
         op,
         (Instant::now() + within, within),
-        (&[], resolve),
+        (&[], resolve, &|_, _| None),
     )
 }
 
 type Resolver = fn(&str, u16) -> Vec<SocketAddr>;
+
+/// What a refusal the listener proved its node beside says of the dial ([`reach`]): why it ends
+/// there when that node is not the one dialled, else `None`, and the refusal stands.
+type RefusedBy<'a> = &'a dyn Fn(SocketAddr, &NodeProof) -> Option<Unreached>;
 
 fn dial_avoiding(
     host: &str,
@@ -3226,13 +3257,13 @@ fn dial_avoiding(
     (secret, me): (&FleetSecret, Option<&NodeIdentity>),
     op: FleetOp,
     (deadline, within): (Instant, Duration),
-    (avoid, resolver): (&[SocketAddr], Resolver),
+    (avoid, resolver, refused): (&[SocketAddr], Resolver, RefusedBy<'_>),
 ) -> Result<Reached, Unreached> {
     walk(
         (host, addr, port),
         (deadline, within),
         (avoid, resolver),
-        |to| reach(to, (secret, me), op, (deadline, within)),
+        |to| reach(to, (secret, me), op, (deadline, within), refused),
     )
 }
 
@@ -3310,12 +3341,14 @@ fn walk<R>(
     Err(first.unwrap_or_else(|| Unreached::Resolve(host.to_owned())))
 }
 
-/// One address of a dial: a connect to `to`, then the proof of `op` there, by `deadline`.
+/// One address of a dial: a connect to `to`, then the proof of `op` there, by `deadline`; a
+/// refusal by a node the listener proved is judged by `refused` first.
 fn reach(
     to: SocketAddr,
     (secret, me): (&FleetSecret, Option<&NodeIdentity>),
     op: FleetOp,
     (deadline, within): (Instant, Duration),
+    refused: RefusedBy<'_>,
 ) -> AtAddr<Reached> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
@@ -3324,7 +3357,7 @@ fn reach(
     match TcpStream::connect_timeout(&to, left.min(CONNECT_WITHIN)) {
         Ok(tcp) => {
             let left = deadline.saturating_duration_since(Instant::now());
-            match client_handshake_as(tcp, secret, me, op, left) {
+            match client_handshake_by(tcp, secret, me, op, left) {
                 Ok(Dialed {
                     transport,
                     scope,
@@ -3335,11 +3368,18 @@ fn reach(
                     addr: to,
                     peer,
                 }),
-                Err(FleetError::Timeout(_)) => {
-                    AtAddr::Ended(Unreached::Deadline(Stage::Handshake, within))
+                Err(Undialed { error, refused_by }) => {
+                    if let Some(other) = refused_by.and_then(|by| refused(to, &by)) {
+                        return AtAddr::Ended(other);
+                    }
+                    match error {
+                        FleetError::Timeout(_) => {
+                            AtAddr::Ended(Unreached::Deadline(Stage::Handshake, within))
+                        }
+                        e @ FleetError::UnknownOp(_) => AtAddr::Ended(Unreached::Handshake(to, e)),
+                        e => AtAddr::Passed(Unreached::Handshake(to, e)),
+                    }
                 }
-                Err(e @ FleetError::UnknownOp(_)) => AtAddr::Ended(Unreached::Handshake(to, e)),
-                Err(e) => AtAddr::Passed(Unreached::Handshake(to, e)),
             }
         }
         Err(e) => AtAddr::Passed(Unreached::Connect(to, e)),
@@ -4081,6 +4121,15 @@ fn queue_book(queued: &mut Queue, given: usize, book: &Book, own: Option<&str>) 
         })
         .collect();
     queued.skip.extend(&dropped);
+    // A copy the book keeps at its place is listed as the book has it now (its seen_ms, its
+    // version): the dial it makes is the same.
+    for at in 0..given {
+        if let Some(copy) = fresh.iter().find(|copy| {
+            queued.peers[at].via == Via::IssuerBook && same_target(copy, &queued.peers[at])
+        }) {
+            queued.peers[at] = copy.clone();
+        }
+    }
     for refused in again {
         if !queued.skip.contains(&refused.at) {
             queued.again_by(refused.at, refused.by);
@@ -4279,6 +4328,8 @@ fn node_at(
     deadline: (Instant, Duration),
     avoid: &[SocketAddr],
 ) -> Result<(Reached, String), Unreached> {
+    // A refusal by another node at the place is that node's answer, not the target's.
+    let refused = |at: SocketAddr, by: &NodeProof| answered_as(target, keys, at, Some(by)).err();
     let reached = dial_avoiding(
         &target.host,
         addr,
@@ -4286,7 +4337,7 @@ fn node_at(
         (secret, Some(me)),
         op,
         deadline,
-        (avoid, resolve),
+        (avoid, resolve, &refused),
     )?;
     let at = reached.addr;
     match answered_as(target, keys, at, reached.peer.as_ref())? {
@@ -4347,7 +4398,15 @@ fn ask_at(
             held.ask(
                 to,
                 (deadline, within),
-                || reach(to, (secret, me), FleetOp::Survey, (deadline, within)),
+                || {
+                    reach(
+                        to,
+                        (secret, me),
+                        FleetOp::Survey,
+                        (deadline, within),
+                        &|_, _| None,
+                    )
+                },
                 |peer| answered_as(target, keys, to, peer),
                 |transport| {
                     ask_lines(transport, Some(request), deadline, reply_head)

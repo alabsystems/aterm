@@ -99,8 +99,48 @@ impl<T> InitialSetupObserved<T> {
     }
 }
 
+/// Observations taken before one says the records are changing. A write can land in the
+/// middle of one: a reader that holds no profile lock (System State's status read) meets any
+/// pass saving its progress, this process's own included, and one that holds it still meets a
+/// Stop, which saves its request under a lock of its own. Each publishes by a rename, over in a
+/// moment, so a read that met one is taken again ([`REREAD`] later) rather than handed on as a
+/// change under way.
+pub(super) const READS: usize = 5;
+
+/// The pause before an observation that met a write is taken again.
+const REREAD: std::time::Duration = std::time::Duration::from_millis(10);
+
 pub(super) fn at(root: &Path) -> Result<InitialSetupObservation, InitialSetupSnapshotError> {
-    with(root, || Records::read(root))
+    at_with(root, &mut std::thread::sleep, || Records::read(root))
+}
+
+/// [`at`], reading the records with `read` and pausing with `pause`.
+fn at_with(
+    root: &Path,
+    pause: &mut dyn FnMut(std::time::Duration),
+    mut read: impl FnMut() -> Result<Records, String>,
+) -> Result<InitialSetupObservation, InitialSetupSnapshotError> {
+    settled(READS, pause, || with(root, &mut read))
+}
+
+/// Take `observe` until it meets no write, at most `reads` times, with `pause` between: the last
+/// [`InitialSetupSnapshotError::Updating`] when every one met one. A read that failed is handed
+/// on at once.
+pub(super) fn settled<T>(
+    reads: usize,
+    pause: &mut dyn FnMut(std::time::Duration),
+    mut observe: impl FnMut() -> Result<T, InitialSetupSnapshotError>,
+) -> Result<T, InitialSetupSnapshotError> {
+    let mut left = reads;
+    loop {
+        match observe() {
+            Err(InitialSetupSnapshotError::Updating) if left > 1 => {
+                left -= 1;
+                pause(REREAD);
+            }
+            result => return result,
+        }
+    }
 }
 
 fn with(
@@ -153,5 +193,51 @@ mod tests {
         });
         assert!(matches!(result, Err(InitialSetupSnapshotError::Updating)));
         assert_eq!(progress(root.path()).unwrap().unwrap(), original);
+    }
+
+    /// A read that met a write is taken again, and the one after the write is the observation:
+    /// the same records a read with no write gives.
+    #[test]
+    fn an_observation_that_met_a_write_is_taken_again() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(root.path(), &Plan::default()).unwrap();
+        let original = progress(root.path()).unwrap().unwrap();
+        let mut running = original;
+        running.running = Some(Stage::Secrets);
+        let (mut writes, mut pauses) = (0, Vec::new());
+        let observed = at_with(root.path(), &mut |pause| pauses.push(pause), || {
+            let records = Records::read(root.path())?;
+            if writes == 0 {
+                writes += 1;
+                let _writer = HeldLock::take(root.path())?;
+                save_progress(root.path(), running)?;
+            }
+            Ok(records)
+        })
+        .unwrap();
+        assert_eq!((writes, pauses), (1, vec![REREAD]));
+        assert!(observed == at(root.path()).unwrap());
+        assert_eq!(observed.records.progress, Some(running));
+    }
+
+    /// Records that keep changing say so after [`READS`] observations; a read that failed is not
+    /// taken again.
+    #[test]
+    fn records_that_keep_changing_say_so_and_a_failed_read_is_not_taken_again() {
+        let mut taken = 0;
+        let mut pauses = 0;
+        let result: Result<(), _> = settled(READS, &mut |_| pauses += 1, || {
+            taken += 1;
+            Err(InitialSetupSnapshotError::Updating)
+        });
+        assert!(matches!(result, Err(InitialSetupSnapshotError::Updating)));
+        assert_eq!((taken, pauses), (READS, READS - 1));
+        let mut taken = 0;
+        let result: Result<(), _> = settled(READS, &mut |_| panic!("no pause"), || {
+            taken += 1;
+            Err(InitialSetupSnapshotError::Read("unreadable".into()))
+        });
+        assert!(matches!(result, Err(InitialSetupSnapshotError::Read(_))));
+        assert_eq!(taken, 1);
     }
 }

@@ -312,7 +312,10 @@ pub fn drain_curse_bonk_cues(
     let mut result = CurseDrain::default();
     let mut seen = [u32::MAX; 16];
     let mut seen_len = 0usize;
-    let last_col = (cols > 1).then(|| (cols - 1) as f32);
+    let last_col = (cols > 1).then(|| {
+        let last = (cols - 1) as f32;
+        (last, 1.0 / last)
+    });
     for cue in decos.drain_curse_cues() {
         let location = u32::from(cue.row) << 16 | u32::from(cue.col);
         if !seen[..seen_len].contains(&location) {
@@ -333,7 +336,7 @@ pub fn drain_curse_bonk_cues(
             voice,
             kind: crate::trail_sound::SoundGesture::Words(crate::trail_sound::WordGesture::Bonk),
             pan: match last_col {
-                Some(last) => ((cue.col as f32).min(last) / last) * 2.0 - 1.0,
+                Some((last, inv_last)) => ((cue.col as f32).min(last) * inv_last) * 2.0 - 1.0,
                 None => 0.0,
             },
             heat: 0.0,

@@ -757,11 +757,13 @@ impl Drawn {
     }
 }
 
-/// Mutable claim, hold, and Autopilot fields of a session sampled at handoff park.
+/// Mutable claim, hold, Autopilot and box-receipt state sampled at handoff park.
 #[cfg(unix)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CarriedClaims {
     pub local_id: u64,
+    meta: crate::session_timeline::SessionMeta,
+    banner: crate::box_banner::Snapshot,
     topics: Vec<String>,
     attention_owners: Vec<String>,
     supervisor: Option<String>,
@@ -773,6 +775,13 @@ pub(crate) struct CarriedClaims {
 
 #[cfg(unix)]
 impl CarriedClaims {
+    /// The actual box-notification receipt state beside the parked record.
+    #[must_use]
+    pub(crate) const fn with_banner(mut self, banner: crate::box_banner::Snapshot) -> Self {
+        self.banner = banner;
+        self
+    }
+
     /// These claims with session's self-claim face `face` beside them.
     #[must_use]
     pub(crate) const fn with_self_face(
@@ -788,6 +797,18 @@ impl CarriedClaims {
     pub(crate) fn of_record(record: &SessionRecord) -> Self {
         Self {
             local_id: record.local_id,
+            banner: Default::default(),
+            meta: crate::session_timeline::SessionMeta {
+                user_title: record.user_title.clone(),
+                description: record.description.clone(),
+                icon: record.icon.clone(),
+                role: record.role.clone(),
+                attention: record.attention.clone(),
+                questions: record.questions.clone(),
+                autopilot: record.autopilot.clone(),
+                land_at: record.land_at,
+                ..Default::default()
+            },
             topics: record.topics.clone(),
             attention_owners: record.attention_owners.clone(),
             supervisor: record.supervisor.as_deref().map(lease_holder),
@@ -808,12 +829,47 @@ impl CarriedClaims {
         let drawn = Drawn::of(ctx, now_us, own_holder);
         Self {
             local_id,
+            meta: drawn.meta,
+            banner: ctx.box_banner.snapshot(),
             topics: drawn.topics,
             attention_owners: drawn.attention_owners,
             supervisor: drawn.supervisor.as_deref().map(lease_holder),
             claim_known: drawn.claim_known,
             task: drawn.task,
             self_face: None,
+        }
+    }
+
+    /// Project the final Commit while its caller holds the session and box-receipt locks.
+    /// Topics were sampled under the fabric hold fence before those locks were acquired.
+    #[must_use]
+    pub(crate) fn of_guarded(
+        local_id: u64,
+        meta: &crate::session_timeline::SessionMeta,
+        timeline: &crate::session_timeline::SessionTimeline,
+        topics: Vec<String>,
+        banner: crate::box_banner::Snapshot,
+        now_us: u64,
+        own_holder: &str,
+    ) -> Self {
+        let (supervisor, claim_known) = meta.handoff_supervisor(now_us, own_holder);
+        let reexec = timeline.in_self_reexec(now_us);
+        let carried = timeline.carried_task_face();
+        let self_face = if meta.supervisor_proven(now_us) || reexec {
+            timeline.task_face().or(carried)
+        } else {
+            carried
+        };
+        Self {
+            local_id,
+            meta: meta.sanitized(),
+            banner,
+            topics,
+            attention_owners: meta.handoff_attention_owners(),
+            claim_known: claim_known && !(supervisor.is_none() && reexec),
+            supervisor: supervisor.as_deref().map(lease_holder),
+            task: timeline.task_carry_row(),
+            self_face,
         }
     }
 }

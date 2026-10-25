@@ -51,6 +51,9 @@ pub(crate) enum Cause {
     /// sized in the form it no longer takes re-gridded its tabs at attach
     /// (`App::regrid_to_attach_frame`).
     Deck,
+    /// A session restore placed every tab, and each pane took its window's grid
+    /// (`App::regrid_restored_windows`): a handed-off shell keeps the grid its engine was parked at.
+    Restore,
 }
 
 impl Cause {
@@ -63,6 +66,7 @@ impl Cause {
             Self::Pass => "pass",
             Self::Redraw => "redraw",
             Self::Deck => "deck",
+            Self::Restore => "restore",
         }
     }
 }

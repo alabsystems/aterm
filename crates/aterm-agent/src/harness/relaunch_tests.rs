@@ -3373,6 +3373,302 @@ fn a_workers_first_line_hands_the_task_over_as_one_argument() {
     );
 }
 
+/// A LINE THAT TYPES A STORE BINARY GIVES IT WHAT ITS SHIM EXPORTS ([`upgrade::with_shim_env`]):
+/// atpkg's managed `claude` exports `DISABLE_AUTOUPDATER=1` before it execs its store build, and a
+/// relaunch types that build's binary by its own path, so the line reads atpkg's record of the
+/// build's shim env (`<build>.shim-env`, [`atpkg::shim_env::of_store_binary`]) and exports each
+/// pair the line does not already name, quoted so the shell runs none of it. The stand-in each
+/// shell starts sees those values; the relaunch's own survey switch is exported once; a removal
+/// the line names wins over the record; the worker's first line and another vendor's line (agy's
+/// switch) carry theirs; and a build with no record, or a binary outside any store, gets exactly
+/// the line it got before.
+#[cfg(unix)]
+#[test]
+fn a_store_binarys_line_exports_its_shims_env_and_a_bare_build_adds_nothing() {
+    const SESSION: &str = "0badf00d-1111-2222-3333-4444555566aa";
+    const BUILD: &str = "1000002000001000310";
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-shim-env-line")
+        .tempdir()
+        .expect("scratch dir");
+    let store = tmp.path().join("pkg").join("store");
+    let stand_in = |program: &str, build: &str| {
+        let exe = store.join(program).join(build).join("bin").join(program);
+        std::fs::create_dir_all(exe.parent().expect("bin")).expect("the build's bin");
+        std::fs::write(
+            &exe,
+            concat!(
+                "#!/bin/sh\n",
+                "{ printf 'DISABLE_AUTOUPDATER=%s\\n' \"${DISABLE_AUTOUPDATER-unset}\"; ",
+                "printf 'SURVEY=%s\\n' \"${CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY-unset}\"; ",
+                "printf 'PROBE=%s\\n' \"${ATERM_SHIM_PROBE-unset}\"; } > \"$ENV_OUT\"\n",
+            ),
+        )
+        .expect("write the stand-in");
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        aterm_spec::wait::first_exec(&exe, &[]);
+        exe
+    };
+    let record = |program: &str, build: &str, entries: &[String]| {
+        let env = atpkg::shim_env::ShimEnv::admit(entries).expect("an admissible record");
+        std::fs::write(
+            store.join(program).join(format!("{build}.shim-env")),
+            env.to_lines(),
+        )
+        .expect("write the record");
+        env
+    };
+    let exe = stand_in("claude", BUILD);
+    let probe = "$(touch $ENV_OUT.ran) `touch $ENV_OUT.ran` it's";
+    let recorded = record(
+        "claude",
+        BUILD,
+        &[
+            "DISABLE_AUTOUPDATER=1".to_string(),
+            "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1".to_string(),
+            format!("ATERM_SHIM_PROBE={probe}"),
+        ],
+    );
+    assert_eq!(
+        atpkg::shim_env::of_store_binary(&exe),
+        recorded,
+        "atpkg reads the record this test wrote"
+    );
+    let bare = stand_in("claude", "1000002000001000311");
+    let elsewhere = tmp.path().join("opt").join("claude");
+
+    let relaunch = |dialect: Dialect, exe: &Path| {
+        let argv = words(&[
+            exe.to_str().expect("a UTF-8 path"),
+            "--dangerously-skip-permissions",
+        ]);
+        line_tapped_clear(
+            dialect,
+            None,
+            None,
+            exe,
+            &argv,
+            Some(SESSION),
+            None,
+            None,
+            &[],
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| panic!("{dialect:?}: a relaunch line for {}", exe.display()))
+    };
+    let q = |word: &str| upgrade::quote(Dialect::Zsh, word);
+    let tail = format!("'--dangerously-skip-permissions' '--resume' '{SESSION}'");
+    assert_eq!(
+        relaunch(Dialect::Zsh, &exe),
+        format!(
+            " CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 DISABLE_AUTOUPDATER=1 ATERM_SHIM_PROBE={} {} \
+             {tail}",
+            q(probe),
+            q(&exe.to_string_lossy())
+        ),
+        "the record's pairs follow the line's own, the survey switch once"
+    );
+    for other in [&bare, &elsewhere] {
+        assert_eq!(
+            relaunch(Dialect::Zsh, other),
+            format!(
+                " CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 {} {tail}",
+                q(&other.to_string_lossy())
+            ),
+            "{}: no record, nothing added",
+            other.display()
+        );
+    }
+    let fish = relaunch(Dialect::Fish, &exe);
+    assert!(
+        fish.starts_with(" env CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 DISABLE_AUTOUPDATER=1 "),
+        "{fish}"
+    );
+
+    let mut shells = vec![(Dialect::Zsh, "/bin/zsh"), (Dialect::Bash, "/bin/bash")];
+    if !cfg!(target_os = "macos") {
+        shells.retain(|(_, sh)| Path::new(sh).exists());
+    }
+    let run = |dialect: Dialect, shell: &str, line: &str| {
+        let env_out = tmp.path().join(format!("env-{}", dialect.hook_ext()));
+        let ran = tmp.path().join(format!("env-{}.ran", dialect.hook_ext()));
+        let _ = std::fs::remove_file(&env_out);
+        let out = aterm_uds::deadline::output_until(
+            aterm_uds::spawnfd::command(shell)
+                .args(["-f", "-c", line])
+                .env_remove("DISABLE_AUTOUPDATER")
+                .env_remove("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY")
+                .env_remove("ATERM_SHIM_PROBE")
+                .env("ENV_OUT", &env_out),
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap_or_else(|e| panic!("{shell} within the hang detector: {e}"));
+        assert!(
+            out.status.success(),
+            "{shell}: {line}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!ran.exists(), "{shell} ran the record's value: {line}");
+        std::fs::read_to_string(&env_out).expect("the stand-in ran")
+    };
+    for (dialect, shell) in shells {
+        assert_eq!(
+            run(dialect, shell, &relaunch(dialect, &exe)),
+            format!("DISABLE_AUTOUPDATER=1\nSURVEY=1\nPROBE={probe}\n"),
+            "{shell}: the relaunched program runs with its shim's env"
+        );
+        assert_eq!(
+            run(dialect, shell, &relaunch(dialect, &bare)),
+            "DISABLE_AUTOUPDATER=unset\nSURVEY=1\nPROBE=unset\n",
+            "{shell}: a build with no record runs with the line's own env only"
+        );
+        let worker = task_launch_line(dialect, &exe, None, None, None, None)
+            .unwrap_or_else(|e| panic!("{shell}: {e}"));
+        assert!(
+            worker.contains(" DISABLE_AUTOUPDATER=1 ") && worker.ends_with(upgrade::TASK_OPERAND),
+            "{shell}: the worker's first line: {worker}"
+        );
+    }
+
+    let exact = upgrade::relaunch_line_env_clear(
+        Dialect::Zsh,
+        None,
+        None,
+        &[("CLAUDE_CODE_CUSTOM_OAUTH_URL", "")],
+        &[accounts::HOME_ENV, "DISABLE_AUTOUPDATER"],
+        &exe,
+        &[],
+    )
+    .expect("a removal the line names is no conflict with the record");
+    assert_eq!(
+        exact,
+        format!(
+            " '/usr/bin/env' -u 'CLAUDE_CONFIG_DIR' -u 'DISABLE_AUTOUPDATER' \
+             'CLAUDE_CODE_CUSTOM_OAUTH_URL=' 'CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1' {} {}",
+            q(&format!("ATERM_SHIM_PROBE={probe}")),
+            q(&exe.to_string_lossy())
+        ),
+        "the exact form carries the record too, minus what it removes"
+    );
+
+    let agy = stand_in("agy", "1000001000004000007");
+    record(
+        "agy",
+        "1000001000004000007",
+        &["AGY_CLI_DISABLE_AUTO_UPDATE=true".to_string()],
+    );
+    assert_eq!(
+        upgrade::relaunch_line_env(Dialect::Zsh, None, None, &[], &agy, &[]),
+        Ok(format!(
+            " AGY_CLI_DISABLE_AUTO_UPDATE=true {}",
+            q(&agy.to_string_lossy())
+        )),
+        "another vendor's store binary carries its own switch"
+    );
+}
+
+/// A STORE BINARY'S LONG LINE DROPS ITS RECORD'S SURVEY SWITCH BEFORE IT IS REFUSED, NEVER ITS
+/// UPDATER SWITCH ([`upgrade::with_store_env`]): the record of Claude Code's build carries
+/// `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1` beside `DISABLE_AUTOUPDATER=1`, so a relaunch that fits
+/// only without the survey switch is still made, with the updater switch and no survey switch,
+/// and one byte more is refused rather than made without the updater switch. A worker's first
+/// line ([`upgrade::task_line_env`], what the worker's own fallback calls) is cut the same way.
+#[test]
+fn a_store_binarys_long_line_drops_the_survey_switch_and_keeps_the_updater_switch() {
+    const SESSION: &str = "0badf00d-1111-2222-3333-4444555566ab";
+    const BUILD: &str = "1000002000001000310";
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-shim-env-long")
+        .tempdir()
+        .expect("scratch dir");
+    let claude = tmp.path().join("pkg").join("store").join("claude");
+    std::fs::create_dir_all(&claude).expect("the program's store");
+    std::fs::write(
+        claude.join(format!("{BUILD}.shim-env")),
+        "DISABLE_AUTOUPDATER=1\nCLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1\n",
+    )
+    .expect("write the record");
+    let exe = claude.join(BUILD).join("bin").join("claude");
+    let bare = claude
+        .join("1000002000001000311")
+        .join("bin")
+        .join("claude");
+    let padded = |pad: usize| {
+        args(&["claude", "--add-dir"])
+            .into_iter()
+            .chain([format!("/{}", "d".repeat(pad))])
+            .collect::<Vec<_>>()
+    };
+    let line = |pad: usize| {
+        line_tapped_clear(
+            Dialect::Bash,
+            None,
+            None,
+            &exe,
+            &padded(pad),
+            Some(SESSION),
+            None,
+            None,
+            &[],
+            None,
+            None,
+        )
+    };
+    let base = |pad: usize| {
+        let flags = upgrade::rewrite_argv(&padded(pad), SESSION).expect("flags");
+        upgrade::relaunch_line_env(Dialect::Bash, None, None, &[], &bare, &flags)
+            .expect("a bare build's line")
+            .len()
+    };
+    let switch = "DISABLE_AUTOUPDATER=1 ".len();
+    let survey = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 ".len();
+    let fits_both = upgrade::MAX_LINE - switch - survey - base(1) + 1;
+    assert_eq!(base(fits_both) + switch + survey, upgrade::MAX_LINE);
+    let roomy = line(fits_both).unwrap_or_else(|_| panic!("a line with both switches"));
+    assert!(
+        roomy.starts_with(" CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 DISABLE_AUTOUPDATER=1 '"),
+        "{roomy}"
+    );
+    let cut = line(fits_both + 1).unwrap_or_else(|_| panic!("a line without the survey switch"));
+    assert!(
+        cut.starts_with(" DISABLE_AUTOUPDATER=1 '") && !cut.contains("FEEDBACK_SURVEY"),
+        "{cut}"
+    );
+    let fits_switch = upgrade::MAX_LINE - switch - base(1) + 1;
+    assert_eq!(base(fits_switch) + switch, upgrade::MAX_LINE);
+    let tight = line(fits_switch).unwrap_or_else(|_| panic!("a line on the updater switch"));
+    assert_eq!(tight.len(), upgrade::MAX_LINE);
+    assert!(
+        tight.starts_with(" DISABLE_AUTOUPDATER=1 '") && !tight.contains("FEEDBACK_SURVEY"),
+        "{tight}"
+    );
+    assert!(
+        line(fits_switch + 1).is_err(),
+        "no line drops the updater switch to fit"
+    );
+
+    let task = |exe: &Path, pad: usize| {
+        upgrade::task_line_env(
+            Dialect::Bash,
+            &[],
+            exe,
+            &padded(pad)[1..],
+            upgrade::TASK_OPERAND,
+        )
+    };
+    let task_base = |pad: usize| task(&bare, pad).expect("a bare build's worker line").len();
+    let task_fits = upgrade::MAX_LINE - switch - task_base(1) + 1;
+    assert_eq!(task_base(task_fits) + switch, upgrade::MAX_LINE);
+    let worker = task(&exe, task_fits).expect("a worker's line without the survey switch");
+    assert!(
+        worker.starts_with(" DISABLE_AUTOUPDATER=1 '") && !worker.contains("FEEDBACK_SURVEY"),
+        "{worker}"
+    );
+    assert!(task(&exe, task_fits + 1).is_err());
+}
+
 #[test]
 fn a_workers_first_line_is_written_per_dialect_and_refuses_what_it_cannot_carry() {
     let exe = Path::new("/opt/claude");

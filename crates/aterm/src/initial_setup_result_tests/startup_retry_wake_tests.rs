@@ -15,6 +15,7 @@ fn startup() -> LiveSetupStartup<impl FnMut(Plan, StartupHandoff) -> aterm_gui::
         vault_typed: false,
         sent: StartupSent::default(),
         retry_seen: SETUP_WAKES.count(),
+        recovered: false,
     }
 }
 

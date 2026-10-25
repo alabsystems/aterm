@@ -108,13 +108,19 @@ enum Back {
     Short,
     /// The field still empty: the text not taken, or not read.
     Empty,
+    /// No dialog of the question it was written into: one gone or changed, or a frame caught
+    /// half drawn.
+    Gone,
     /// Anything else.
     Other(&'static str),
 }
 
+/// Why a [`Back::Gone`] read is judged a text not read back as written.
+const GONE: &str = "the dialog is no longer the question it was written into";
+
 fn read_back(rows: &[String], first: &QuestionDialog, text: &str) -> Back {
     let Some(dialog) = dialog_of(rows).filter(|d| d.same_question(first)) else {
-        return Back::Other("the dialog is no longer the question it was written into");
+        return Back::Gone;
     };
     let Some((field, pristine, checked)) = field_of(&dialog) else {
         return Back::Other("the dialog has no free-text row");
@@ -136,6 +142,16 @@ fn read_back(rows: &[String], first: &QuestionDialog, text: &str) -> Back {
     } else {
         Back::Other("the free-text row holds other text")
     }
+}
+
+/// How long a read-back may still wait on a text written at `written` ([`Session::text_undrawn`]),
+/// `None` once [`super::turn_end_loop::UNDRAWN_INPUT_HANG`] has passed.
+fn text_hang_left(now: Instant, written: Instant) -> Option<Duration> {
+    Some(
+        super::turn_end_loop::UNDRAWN_INPUT_HANG
+            .saturating_sub(now.saturating_duration_since(written)),
+    )
+    .filter(|left| !left.is_zero())
 }
 
 fn latched_for(waited: Wait, ms: &str) -> Option<Duration> {
@@ -438,6 +454,7 @@ impl<C: Ctl> Session<'_, C> {
             }
         };
         self.question_pending(&now, QuestionFocus::FreeText, PendingKind::Text, false);
+        let written = self.fx.mono();
         self.wait(
             &["seq", &at.to_string()],
             super::turn_end_loop::REACTION_WAIT,
@@ -445,15 +462,33 @@ impl<C: Ctl> Session<'_, C> {
         let mut still = latched_for(self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?, SETTLE_MS);
         let mut back = self.screen()?;
         let mut waited = false;
+        let mut looked = at;
         loop {
             let reading = read_back(&back.rows, &first, text);
+            let last_look = std::mem::replace(&mut looked, back.seq);
+            if !matches!(reading, Back::Exact)
+                && let Some(left) = self.text_undrawn(back.seq, written)?
+            {
+                self.wait(&["seq", &back.seq.to_string()], left.min(WAIT_STEP))?;
+                still = latched_for(self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?, SETTLE_MS);
+                back = self.screen()?;
+                continue;
+            }
+            if reading == Back::Gone
+                && (back.seq != last_look || back.rows.iter().all(|r| r.trim().is_empty()))
+                && let Some(left) = text_hang_left(self.fx.mono(), written)
+            {
+                still = latched_for(self.wait(&["idle", IDLE_MS], left.min(WAIT_STEP))?, IDLE_MS);
+                back = self.screen()?;
+                continue;
+            }
             match reading {
                 Back::Exact => {
                     self.question.pending = None;
                     self.read_back = still.map(|still| (back.clone(), still));
                     return Ok(Pressing::Done(Press::Typed { seq: back.seq }));
                 }
-                Back::Short | Back::Empty | Back::Other(_) if !waited => {
+                Back::Short | Back::Empty | Back::Gone | Back::Other(_) if !waited => {
                     waited = true;
                     still = latched_for(self.wait(&["idle", IDLE_MS], WAIT_STEP)?, IDLE_MS);
                     back = self.screen()?;
@@ -469,7 +504,11 @@ impl<C: Ctl> Session<'_, C> {
                         "the dialog did not take the policy text: a text is never written twice",
                     );
                 }
-                Back::Other(why) => {
+                Back::Gone | Back::Other(_) => {
+                    let why = match reading {
+                        Back::Other(why) => why,
+                        _ => GONE,
+                    };
                     return unconfirmed(&format!(
                         "the policy text did not read back as written ({why}): a text is never \
                          written twice"
@@ -477,6 +516,30 @@ impl<C: Ctl> Session<'_, C> {
                 }
             }
         }
+    }
+
+    /// A POLICY TEXT THE WORKER HAS NOT DRAWN IS NOT READ BACK AS REFUSED. A text read back short
+    /// or missing is judged only once the worker has drawn what was written: while `status` reads
+    /// its input unread (`input=pending|typeahead`), or the screen stands where the text was
+    /// written or last seen unread ([`Session::question_key_undrawn`]), the read-back waits for
+    /// the screen to move instead of handing the dialog over, since a starved worker draws a text
+    /// late and a hand-over then raises a person for a question the loop answered. A read that
+    /// shows no dialog of the question ([`Back::Gone`]) on a screen that moved since the last
+    /// look, or on a blank screen, is a frame caught in the drawing (a worker that clears its
+    /// screen and is starved before it draws again), and the read-back waits for the screen to
+    /// hold still on something drawn. Both waits end
+    /// [`super::turn_end_loop::UNDRAWN_INPUT_HANG`] after the write, a hang detector, and the
+    /// text is judged as it stands; it is never written twice either way. Returns how long the
+    /// wait has left, `None` once the worker has drawn the text or the hang has passed.
+    fn text_undrawn(&mut self, seq: u64, written: Instant) -> Result<Option<Duration>, Fail> {
+        let Some(left) = text_hang_left(self.fx.mono(), written) else {
+            return Ok(None);
+        };
+        let r = self.call(&["status"])?;
+        if r.ok() {
+            self.launch_status = approval_loop::LaunchStatus::of(&r.stdout);
+        }
+        Ok(self.question_key_undrawn(seq).map(|_| left))
     }
 
     fn status_now(&mut self) -> Result<(Option<u64>, Option<String>), Fail> {
@@ -525,7 +588,17 @@ impl<C: Ctl> Session<'_, C> {
             }
             return Ok(Keyed::Not(p));
         }
-        Ok(self.written_or_not(&r, now.seq))
+        let keyed = self.written_or_not(&r, now.seq);
+        self.question_written(&keyed);
+        Ok(keyed)
+    }
+
+    /// A question key or text just written is input the worker has not read, at the seq the
+    /// server stamped on it ([`Session::question_key_undrawn`]).
+    fn question_written(&mut self, keyed: &Keyed) {
+        if let Keyed::Written(at) = keyed {
+            self.question.unread_at = Some((*at, self.fx.mono()));
+        }
     }
 
     fn question_text(
@@ -574,6 +647,7 @@ impl<C: Ctl> Session<'_, C> {
         if matches!(keyed, Keyed::Written(_)) {
             remember(self);
         }
+        self.question_written(&keyed);
         Ok(keyed)
     }
 

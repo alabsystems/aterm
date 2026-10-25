@@ -265,8 +265,12 @@ impl<S: Read + Write> RelayClient<S> {
     }
 
     fn read_line(&mut self) -> std::io::Result<String> {
+        let mut scanned = 0;
         loop {
-            let end = self.buf.iter().position(|&b| b == b'\n');
+            let end = self.buf[scanned..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|pos| scanned + pos);
             if end.unwrap_or(self.buf.len()) > MAX_LINE_BYTES {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -283,6 +287,9 @@ impl<S: Read + Write> RelayClient<S> {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "non-utf8 control line")
                 });
             }
+            // This prefix has no newline. Search only appended bytes after the read;
+            // a long, fragmented reply must not repeatedly scan its whole prefix.
+            scanned = self.buf.len();
             let mut tmp = [0u8; 8192];
             let n = self.io.read(&mut tmp)?;
             if n == 0 {
@@ -628,18 +635,27 @@ mod tests {
     struct RecordingTransport {
         sent: Vec<u8>,
         to_read: std::io::Cursor<Vec<u8>>,
+        max_read: usize,
+        error_at: Option<u64>,
     }
     impl RecordingTransport {
         fn new(canned: &[u8]) -> Self {
             Self {
                 sent: Vec::new(),
                 to_read: std::io::Cursor::new(canned.to_vec()),
+                max_read: usize::MAX,
+                error_at: None,
             }
         }
     }
     impl Read for RecordingTransport {
         fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-            self.to_read.read(out)
+            if self.error_at == Some(self.to_read.position()) {
+                self.error_at = None;
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let len = out.len().min(self.max_read);
+            self.to_read.read(&mut out[..len])
         }
     }
     impl Write for RecordingTransport {
@@ -681,6 +697,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn relay_client_keeps_fragmented_utf8_crlf_and_later_lines_separate() {
+        let expected = format!("prefix {} end", "α🦀z".repeat(4097));
+        let mut reply = expected.as_bytes().to_vec();
+        reply.extend_from_slice(b"\r\n\xff\nOK next\r\n");
+        for chunk in [1, 3, 8191, 8192] {
+            let mut transport = RecordingTransport::new(&reply);
+            transport.max_read = chunk;
+            let mut client = RelayClient::new(transport);
+            assert_eq!(client.next_pushed().unwrap(), expected, "chunk={chunk}");
+            assert_eq!(
+                client.next_pushed().unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData,
+                "invalid UTF-8 is confined to its own line, chunk={chunk}"
+            );
+            assert_eq!(client.next_pushed().unwrap(), "OK next", "chunk={chunk}");
+        }
+    }
+
+    #[test]
+    fn relay_client_resumes_a_fragmented_line_after_a_transport_error() {
+        let mut transport = RecordingTransport::new("prefix α🦀\r\nOK next\n".as_bytes());
+        transport.max_read = 3;
+        transport.error_at = Some(3);
+        let mut client = RelayClient::new(transport);
+        assert_eq!(
+            client.next_pushed().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(client.next_pushed().unwrap(), "prefix α🦀");
+        assert_eq!(client.next_pushed().unwrap(), "OK next");
     }
 
     #[test]

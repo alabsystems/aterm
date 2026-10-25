@@ -484,7 +484,7 @@ tests/xterm_differential_regressions.rs	scroll_region_set_in_alt_screen_persists
 
 ## 4. Measurements outside the ordinary test suite
 
-The 23 paint rows and 2 spin rows are explicit `harness = false` benchmarks in
+The 23 paint rows and 3 spin rows are explicit `harness = false` benchmarks in
 `benches/paint.rs` and `benches/spin.rs`. `verify measure --app <aterm.app>` runs both
 with the test profile against the handed release binary. Each matrix executes its
 canonical row table once, sequentially, and reports passed, failed and undecided

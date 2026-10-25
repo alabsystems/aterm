@@ -289,12 +289,12 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         spec(
             StageId::MeasurePrebuild,
-            "measuring rows' compile (paint and spin, --no-run)",
+            "measuring rows' compile (paint, spin and aos, --no-run)",
             Lane::MainTarget,
         ),
         exclusive(
             StageId::MeasuringTests,
-            "measuring tests (paint and spin over the handed bundle; run alone)",
+            "measuring tests (paint, spin and aos over the handed bundle; run alone)",
             Lane::MainTarget,
         ),
         exclusive(StageId::GuiSmoke, "gui typing-pacing smoke", Lane::Pure),

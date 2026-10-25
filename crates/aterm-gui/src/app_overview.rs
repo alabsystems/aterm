@@ -113,10 +113,14 @@ impl App {
             (None, None) if agent_word == "-" => "shell".to_string(),
             (None, None) => format!("{agent_word} {}", coarse_age(agent_age)),
         };
+        // A record that reads `done why=landed`: its task words say `landed`, so the driver's
+        // words do not say it again (§14.6).
+        let landed = task.as_ref().is_some_and(|t| {
+            t.state == crate::task_record::TaskState::Done
+                && t.why == Some(crate::task_record::WHY_LANDED)
+        });
         let task_words = task.as_ref().map(|t| {
             let age = coarse_age(t.since_ms());
-            let landed = t.state == crate::task_record::TaskState::Done
-                && t.why == Some(crate::task_record::WHY_LANDED);
             let mut words = if landed {
                 format!("task landed {age}")
             } else {
@@ -162,7 +166,10 @@ impl App {
                             None,
                         )
                     });
-                (crate::app_presence::driven_words(face, &glass, None), held)
+                (
+                    crate::app_presence::driven_words(face, &glass, None, landed),
+                    held,
+                )
             });
         let driven = driven.map(Driver::Aterm);
         let is_worker = worker_of.is_some();

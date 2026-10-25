@@ -3198,13 +3198,7 @@ pub(crate) fn footnote_of(key: &str) -> Option<&'static str> {
              turn it off."
         }
         EDIT_MOTION => motion_auto_footnote(std::env::consts::OS),
-        EDIT_WINDOW_THEME => {
-            if cfg!(target_os = "macos") {
-                "Auto matches the macOS appearance, light or dark."
-            } else {
-                "Auto matches the terminal theme, light or dark."
-            }
-        }
+        EDIT_WINDOW_THEME => window_theme_auto(std::env::consts::OS).note,
         EDIT_LOAD_ADAPTIVE_MOTION => {
             "Drops decorative effects while drawing falls behind. Scrolling stays smooth."
         }
@@ -3521,6 +3515,48 @@ pub(crate) fn motion_auto_copy(target_os: &str) -> (&'static str, &'static str) 
             "Automatic animates fully here: this system has no Reduce Motion setting to follow.",
             " · motion=auto cannot query OS Reduce Motion on this platform and does not reduce motion for an OS preference; choose reduced explicitly",
         ),
+    }
+}
+
+/// What Automatic window appearance (`window_theme = "auto"`) follows, in the words each place
+/// that says it uses ([`window_theme_auto`]).
+pub(crate) struct WindowThemeAuto {
+    /// What it takes its light or dark from.
+    pub(crate) follows: &'static str,
+    /// The choice's words in a picker.
+    pub(crate) choice: &'static str,
+    /// The note under the Window appearance segments, whose first is "Auto".
+    pub(crate) note: &'static str,
+    /// What follows the system instead, said after the side the window sample paints, or nothing.
+    pub(crate) system: &'static str,
+    /// Top Settings' sentence over its colors card.
+    pub(crate) card: &'static str,
+}
+
+/// WHAT AUTOMATIC WINDOW APPEARANCE FOLLOWS ON `target_os`, said in one place for every surface
+/// that says it (the picker's choice, the note under the segments, the window sample's spoken
+/// value, Top Settings' colors card). On every platform the window takes the terminal theme's
+/// side, the side the window sample paints (`settings_preview::window_sample_light`): macOS
+/// draws its transparent title bar over the theme-colored window with the toolbar pinned to the
+/// theme's side and leaves the window's own appearance unset, so only menus, sheets and alerts
+/// follow macOS; Windows resolves its caption, Linux its chrome, from the terminal theme. (The
+/// note said "Auto matches the macOS appearance" over a sample drawing Aterm Day's light title
+/// bar on a dark Mac.)
+pub(crate) fn window_theme_auto(target_os: &str) -> WindowThemeAuto {
+    let auto = WindowThemeAuto {
+        follows: "the terminal theme",
+        choice: "Match terminal",
+        note: "Auto matches the terminal theme, light or dark.",
+        system: "",
+        card: "Choose colors; the window can match the terminal, Light, or Dark.",
+    };
+    match target_os {
+        "macos" => WindowThemeAuto {
+            note: "Auto matches the terminal theme, light or dark; menus and sheets follow macOS.",
+            system: "; its menus and sheets follow macOS",
+            ..auto
+        },
+        _ => auto,
     }
 }
 
@@ -3867,7 +3903,14 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "picture",
             "photo",
         ],
-        EDIT_TEMPORAL_RECORDING => &["temporal", "recording", "replay", "history", "time"],
+        EDIT_TEMPORAL_RECORDING => &[
+            "rewind",
+            "temporal",
+            "recording",
+            "replay",
+            "history",
+            "time",
+        ],
         EDIT_DESKTOP_ALERTS => &[
             "notification",
             "notifications",
@@ -5332,7 +5375,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            label: "Record sessions for replay",
+            label: "Rewind (keep recent screen history)",
             key: EDIT_TEMPORAL_RECORDING,
             kind: EditKind::Bool,
             seed: Some(cfg.temporal_recording.unwrap_or(false).to_string()),

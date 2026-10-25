@@ -20,7 +20,17 @@
 //!   other session, as does one that never comes to a turn break within [`DELIVER_MS`] or may not
 //!   be asked ([`release`]); after [`MAX_ASKS`] lines or [`MAX_PICKS`] elections the episode is
 //!   out ([`Said::Out`]) and the owner's disk line says so;
-//! - the episode ends when the volume is back at or above its floor.
+//! - a pick whose host ended is adopted by the host that took over its session (a seamless
+//!   update's successor, a new [`HostId`]), and other hosts give it [`ADOPT_MS`] to do so, so an
+//!   update hands nothing off;
+//! - the episode ends only when a look reads the volume back past the floor it is held to by
+//!   [`END_MARGIN`] (and its free inodes past their line by [`END_FILES_MARGIN`]): the opening
+//!   host's floor, raised by any later look of a host whose floor is higher ([`Entry::floor`]),
+//!   so hosts whose floors differ, or free space hovering at one, never end and open it look
+//!   after look;
+//! - a settled or out episode gives way to a new one ([`COOLDOWN_MS`] after it parked and after
+//!   the volume's last line) at a look that reads the volume short, so a volume that stays near
+//!   its floor is still asked about, at most once a cooldown.
 
 use std::cmp::Ordering;
 use std::io;
@@ -62,15 +72,40 @@ pub const DELIVER_MS: i64 = 30 * 60_000;
 /// After its line, how long the asked session has to free [`FREED_MIN`].
 pub const ANSWER_MS: i64 = 20 * 60_000;
 
-/// No new episode opens on a volume within this of its last line.
+/// No new episode opens on a volume within this of its last line, and a settled or out
+/// episode gives way to a new one only this long after it parked.
 pub const COOLDOWN_MS: i64 = 6 * 3_600_000;
 
 /// A typing host's hold on its pick ([`claim`]): no host hands the ask off for this long after
 /// the claim, so a line being typed is never typed twice.
 pub const TYPE_GRACE_MS: i64 = 10 * 60_000;
 
+/// How long an owed pick whose host ended stays owed at the looks of hosts that do not
+/// supervise its session, from the first such look that read its host ended
+/// ([`Phase::Owed`]'s `orphan_ms`), before one of them hands it on as undelivered: a seamless
+/// update's successor, which supervises the session, looks first two minutes after it starts and
+/// then once a minute (the window's `DISK_FIRST_LOOK` and `DISK_TICK`, held to this there), so it
+/// adopts the pick before another host's look gives it away. A host that ended with no successor
+/// hands the ask on this much later.
+pub const ADOPT_MS: i64 = 3 * 60_000;
+
 /// A rise in free space of at least this, read since the line, is space the asked session freed.
 pub const FREED_MIN: u64 = 1 << 30;
+
+/// How far past the floor an episode is held to ([`Entry::floor`]) a look must read free space
+/// before the episode ends: the margin aterm's own pressure pass reclaims past the floor before
+/// it stops ([`super::PRESSURE_MARGIN_GIB`], `Thresholds::target`), so the ask's episode ends
+/// where the pass's pressure does. It is more than [`FREED_MIN`], so a session that freed a GiB
+/// settles the episode without ending it, and free space hovering a GiB either side of a floor
+/// stays one episode.
+pub const END_MARGIN: u64 = super::PRESSURE_MARGIN_GIB << 30;
+
+/// How far past the inode line ([`Look::files_floor`]) a look must read free inodes, where the
+/// volume says them, before an episode ends: as many again as the line itself
+/// ([`super::EMERGENCY_FILES_FREE`]), so a build that creates and removes thousands of small
+/// files between two looks, around the line, keeps one episode and does not end and open it
+/// look after look. The line is the same in every host, so no host's is recorded.
+pub const END_FILES_MARGIN: u64 = super::EMERGENCY_FILES_FREE;
 
 /// Lines an episode: the elected session's, then at most one other's.
 pub const MAX_ASKS: u32 = 2;
@@ -101,14 +136,63 @@ pub const LOCK_LADDER: [Duration; 6] = [
     Duration::from_millis(300),
 ];
 
-/// One host machine-wide: its process and that process's start
-/// ([`super::super::restart_stamp::kernel_start`]), so a pid the system hands out again is no
-/// one's host.
+/// One host machine-wide: its process and that process's start ([`start_of`]), so a pid the
+/// system hands out again is no one's host.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct HostId {
     pub pid: u32,
-    /// The start's spelling; empty where the system does not say it.
+    /// The start's spelling; empty where the system does not say it. On Linux it is the boot
+    /// clock's, in nanoseconds since boot ([`BOOT_START`]); elsewhere, and in a lease an older
+    /// build wrote, the kernel's start record ([`super::super::restart_stamp::kernel_start`]).
     pub start: String,
+}
+
+/// How [`HostId::start`] spells a start read off the boot clock (Linux's `/proc` start ticks,
+/// which [`aterm_uds::process::read_process_start`] gives as the nanoseconds since boot at which
+/// that tick began): `boot:<ns since boot>`, a spelling no step of the wall clock changes, read
+/// with no child process. Only equality is asked of it ([`alive_in`]).
+pub const BOOT_START: &str = "boot:";
+
+/// Process `pid`'s start as a host records it ([`HostId::start`]): on Linux off the boot clock
+/// ([`BOOT_START`]); elsewhere the kernel's start record, which the kernel keeps as the process
+/// began ([`super::super::restart_stamp::kernel_start`]).
+#[must_use]
+pub fn start_of(pid: u32) -> Option<String> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        boot_start(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        super::super::restart_stamp::kernel_start(pid)
+    }
+}
+
+/// Process `pid`'s start on the boot clock, spelled [`BOOT_START`]; `None` where it does not run
+/// or the system does not say.
+#[must_use]
+pub fn boot_start(pid: u32) -> Option<String> {
+    let start = aterm_uds::process::read_process_start(i32::try_from(pid).ok()?)?;
+    Some(format!("{BOOT_START}{}", start.boot.0))
+}
+
+/// Whether a host whose start reads `start` still runs, judged in that start's own spelling: a
+/// boot-clock one ([`BOOT_START`]) against `boot`, the process's boot-clock start read now; any
+/// other, as an older build's lease records it (`ps -o lstart=` on Linux), by `kernel`, so a host
+/// recorded before boot-clock starts is not read as ended for its spelling alone. An empty one
+/// the system did not say reads as running.
+fn alive_in(
+    start: &str,
+    boot: impl FnOnce() -> Option<String>,
+    kernel: impl FnOnce() -> bool,
+) -> bool {
+    if start.is_empty() {
+        true
+    } else if start.starts_with(BOOT_START) {
+        boot().as_deref() == Some(start)
+    } else {
+        kernel()
+    }
 }
 
 impl HostId {
@@ -120,19 +204,31 @@ impl HostId {
             let pid = std::process::id();
             HostId {
                 pid,
-                start: super::super::restart_stamp::kernel_start(pid).unwrap_or_default(),
+                start: start_of(pid).unwrap_or_default(),
             }
         })
         .clone()
     }
 
     /// Whether its process still runs: `false` only where the system says the pid ended or is
-    /// another process's. A start the system did not say reads as running, and the deadlines end
-    /// what such a host left.
+    /// another process's ([`alive_in`]). A start the system did not say reads as running, and the
+    /// deadlines end what such a host left.
     #[must_use]
     pub fn alive(&self) -> bool {
-        self.start.is_empty() || super::super::restart_stamp::alive_as(self.pid, &self.start)
+        alive_in(
+            &self.start,
+            || boot_start(self.pid),
+            || super::super::restart_stamp::alive_as(self.pid, &self.start),
+        )
     }
+}
+
+/// The floor an episode is held to ([`Entry::floor`]): the free bytes below which host `host`'s
+/// look read the volume short ([`Look::floor`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Floor {
+    pub host: HostId,
+    pub bytes: u64,
 }
 
 /// Why aterm's own freeing is done on a volume below its floor: what opens an episode.
@@ -179,13 +275,27 @@ pub struct Look<'a> {
     pub key: &'a str,
     pub level: Level,
     pub free: u64,
+    /// The free bytes below which this host's [`Self::level`] reads the volume short: its floor,
+    /// or with the floor at 0 what writes need ([`super::Thresholds::short_below`]).
+    pub floor: u64,
+    /// The volume's free inodes; `None` where it does not say them.
+    pub files_free: Option<u64>,
+    /// The free inodes below which [`Self::level`] reads an emergency
+    /// ([`super::Thresholds::files_emergency`]).
+    pub files_floor: u64,
     /// `None`: aterm's own passes may still free space here.
     pub done: Option<Done>,
     /// This host's sessions the ask could go to.
     pub seats: &'a [Seat],
     /// This host's supervised sessions, Autopilot not Off: an elected one that leaves them
-    /// before its line hands the ask on.
+    /// before its line, and is not [`Self::barred`], hands the ask on as undelivered.
     pub supervised: &'a [String],
+    /// Those of this host's live sessions the seat rule bars by a fact that lasts past this
+    /// look (their task is done or exited, their worker found them unfit at their last turn
+    /// break, their agent is no longer Claude Code, or their directory is on another volume):
+    /// an elected one among them is released ([`Miss::Released`]), so it costs no election,
+    /// whether or not it is still supervised.
+    pub barred: &'a [String],
     /// Every live session of this host: an asked one that leaves them hands the ask on.
     pub live: &'a [String],
     /// Whether another host's process still runs ([`HostId::alive`]).
@@ -214,11 +324,12 @@ pub struct Nominee {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Miss {
-    /// It came to no turn break within [`DELIVER_MS`], left its host's seats, or its host ended,
-    /// before its line.
+    /// It came to no turn break within [`DELIVER_MS`], left its host's supervision, or its host
+    /// ended and no host adopted it within [`ADOPT_MS`], before its line.
     Undelivered,
-    /// Its host found it may not be asked at its turn break (its task finished or landed, no
-    /// task yet), before its line.
+    /// Its host found it may not be asked ([`Look::barred`], or at its turn break its worker's
+    /// finding: its task finished, landed or exited, no task yet, its Autopilot Off), before its
+    /// line.
     Released,
     /// Its session ended after its line.
     Ended,
@@ -257,6 +368,11 @@ pub enum Phase {
         pick: Pick,
         elected_ms: i64,
         until_ms: i64,
+        /// When a look of a host that does not supervise the pick's session first read the
+        /// pick's host ended: such looks hand it on only [`ADOPT_MS`] later, so a successor
+        /// adopts it first. `None` while its host runs, and in a lease an older build wrote.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orphan_ms: Option<i64>,
     },
     /// Its line went at `typed_ms`; `free_at` the free figure then, `best_free` the most read since.
     Asked {
@@ -296,6 +412,14 @@ pub struct Entry {
     pub episode_ms: Option<i64>,
     /// Why it opened.
     pub done: Option<Done>,
+    /// The floor the episode is held to: the opening host's, replaced at every later look that
+    /// does not end the episode by that host's own floor, unless this one is another live
+    /// host's at least as high. A look ends the episode only once it reads free space at or
+    /// above this (while its host lives) and its own floor, plus [`END_MARGIN`]; after any look
+    /// that steps the episode it is what that look held it to. `None` between episodes, and in a
+    /// lease written before floors were recorded: a look then holds the episode to its own floor
+    /// and records it.
+    pub floor: Option<Floor>,
     pub phase: Phase,
     /// The sessions elected this episode, in order: none is elected twice.
     pub picks: Vec<Pick>,
@@ -437,7 +561,7 @@ pub enum Said {
     Settled,
     /// The episode is out.
     Spent,
-    /// Back at or above the floor: the episode ended.
+    /// Back past the floor the episode was held to by [`END_MARGIN`]: the episode ended.
     Ended {
         asks: u32,
     },
@@ -562,9 +686,10 @@ impl Said {
             ),
             Said::Settled => "an agent freed space this episode: nobody else is asked".to_owned(),
             Said::Spent => "this episode's asks are spent: no more agents are asked".to_owned(),
-            Said::Ended { asks } => {
-                format!("back at or above the floor: the episode ended after {asks} line(s)")
-            }
+            Said::Ended { asks } => format!(
+                "back {} past the floor it was held to: the episode ended after {asks} line(s)",
+                human_bytes(END_MARGIN)
+            ),
         }
     }
 }
@@ -582,8 +707,10 @@ pub fn rank(a: (u64, bool, &str), b: (u64, bool, &str)) -> Ordering {
 }
 
 /// Step volume `look.key`'s lease over what one host's look read: open, nominate, elect, hand
-/// off, settle, run out or end the episode. Only the elected session's host types anything
-/// ([`claim`]).
+/// off, settle, run out or end the episode, or give a parked one way to a new one. Only the
+/// elected session's host types anything ([`claim`]). A look that does not read the volume
+/// short steps an open episode too, unless it reads the volume clear of what the episode is
+/// held to ([`ends`]), which ends it.
 #[must_use]
 pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
     if look.level == Level::Unknown {
@@ -595,16 +722,23 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
     } else {
         match lease.entry_at(look.key) {
             Some(e) if e.episode_ms.is_some() => {
-                let asks = e.asks;
-                e.close();
-                return Said::Ended { asks };
+                if ends(e, look) {
+                    let asks = e.asks;
+                    e.close();
+                    return Said::Ended { asks };
+                }
+                e
             }
             _ => return Said::Quiet,
         }
     };
+    if entry.episode_ms.is_some() {
+        hold(entry, look);
+    }
     let now = look.now_ms;
     match entry.phase.clone() {
-        Phase::Idle => open(entry, look),
+        Phase::Idle if below => open(entry, look),
+        Phase::Idle => Said::Quiet,
         Phase::Nominating {
             until_ms, after, ..
         } => {
@@ -621,15 +755,44 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
             }
             elect(entry, look, after)
         }
-        Phase::Owed { pick, until_ms, .. } => {
-            let gone = if pick.host == *look.host {
+        Phase::Owed {
+            pick,
+            until_ms,
+            orphan_ms,
+            ..
+        } => {
+            let pick = adopt(entry, pick, look, look.supervised);
+            let here = pick.host == *look.host;
+            let barred = here && look.barred.contains(&pick.sid);
+            #[cfg(any(test, debug_assertions))]
+            let barred = barred && !fault::armed(fault::Fault::KeepBarred);
+            // A pick whose host ended, at the look of a host that does not supervise its session:
+            // owed on for [`ADOPT_MS`] from the first such look, so a successor adopts it first.
+            let orphan = (!here && !(look.alive)(&pick.host)).then(|| orphan_ms.unwrap_or(now));
+            let wait = ADOPT_MS;
+            #[cfg(any(test, debug_assertions))]
+            let wait = if fault::armed(fault::Fault::OrphanAtOnce) {
+                0
+            } else {
+                wait
+            };
+            let gone = if here {
                 !look.supervised.contains(&pick.sid)
             } else {
-                !(look.alive)(&pick.host)
+                orphan.is_some_and(|at| now.saturating_sub(at) >= wait)
             };
-            if gone || now >= until_ms {
+            #[cfg(any(test, debug_assertions))]
+            let barred = barred && !(gone && fault::armed(fault::Fault::GoneFirst));
+            // A pick its host bars is released whether or not it is still supervised: an agent
+            // that exited leaves the supervised roster, and its task record says why.
+            if barred {
+                hand_off(entry, now, pick, Miss::Released)
+            } else if gone || now >= until_ms {
                 hand_off(entry, now, pick, Miss::Undelivered)
             } else {
+                if let Phase::Owed { orphan_ms, .. } = &mut entry.phase {
+                    *orphan_ms = orphan;
+                }
                 Said::Owed { pick, until_ms }
             }
         }
@@ -640,6 +803,7 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
             free_at,
             best_free,
         } => {
+            let pick = adopt(entry, pick, look, look.live);
             let best = best_free.max(look.free);
             let rose = best.saturating_sub(free_at);
             if rose >= FREED_MIN {
@@ -672,9 +836,83 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
                 }
             }
         }
+        Phase::Settled { at_ms, .. } | Phase::Out { at_ms, .. }
+            if below && gives_way(entry, at_ms, look) =>
+        {
+            entry.close();
+            open(entry, look)
+        }
         Phase::Settled { .. } => Said::Settled,
         Phase::Out { .. } => Said::Spent,
     }
+}
+
+/// `pick`, moved to this look's host when its own host ended and this host has its session among
+/// `held` (its supervised sessions while the line is owed, its live ones once it went): a
+/// seamless update's successor adopts its sessions under the same sids as a new [`HostId`], so the
+/// pick moves to it, in the phase and in [`Entry::picks`], and its line is typed or its answer
+/// judged there, instead of the ask being handed on as though its session had gone and the
+/// session kept out of the episode.
+fn adopt(entry: &mut Entry, pick: Pick, look: &Look<'_>, held: &[String]) -> Pick {
+    if pick.host == *look.host || !held.contains(&pick.sid) || (look.alive)(&pick.host) {
+        return pick;
+    }
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::NoAdopt) {
+        return pick;
+    }
+    let moved = Pick {
+        host: look.host.clone(),
+        sid: pick.sid.clone(),
+    };
+    for p in &mut entry.picks {
+        if *p == pick {
+            p.clone_from(&moved);
+        }
+    }
+    if let Phase::Owed { pick: p, .. } | Phase::Asked { pick: p, .. } = &mut entry.phase {
+        p.clone_from(&moved);
+    }
+    moved
+}
+
+/// Whether `look` reads `entry`'s open episode clear of what it is held to: free space at or
+/// above [`held_to`] plus [`END_MARGIN`], and free inodes, where the volume says them, at or
+/// above their line plus [`END_FILES_MARGIN`].
+fn ends(entry: &Entry, look: &Look<'_>) -> bool {
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::EndAtOwnFloor) {
+        return true;
+    }
+    let (bytes, files) = (END_MARGIN, END_FILES_MARGIN);
+    #[cfg(any(test, debug_assertions))]
+    let (bytes, files) = if fault::armed(fault::Fault::EndAtHeldFloor) {
+        (0, 0)
+    } else {
+        (bytes, files)
+    };
+    look.free >= held_to(entry, look).saturating_add(bytes)
+        && look
+            .files_free
+            .is_none_or(|f| f >= look.files_floor.saturating_add(files))
+}
+
+/// Whether `entry`'s parked episode (settled or out since `at_ms`) gives way, at a look that
+/// reads the volume short, to a new one: [`COOLDOWN_MS`] has passed since it parked and the
+/// volume's last line is outside the cooldown, and aterm's own freeing is done, so the look
+/// opens the new one in the same step. A volume that stays short, or near its floor, after an
+/// episode ran out or a session freed a little is so asked about again, at most once a
+/// cooldown, instead of never.
+fn gives_way(entry: &Entry, at_ms: i64, look: &Look<'_>) -> bool {
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::ParkForever) {
+        return false;
+    }
+    look.done.is_some()
+        && look.now_ms.saturating_sub(at_ms) >= COOLDOWN_MS
+        && entry
+            .last_ask_ms
+            .is_none_or(|last| !(0..COOLDOWN_MS).contains(&look.now_ms.saturating_sub(last)))
 }
 
 fn open(entry: &mut Entry, look: &Look<'_>) -> Said {
@@ -688,6 +926,10 @@ fn open(entry: &mut Entry, look: &Look<'_>) -> Said {
     }
     entry.episode_ms = Some(look.now_ms);
     entry.done = Some(done);
+    entry.floor = Some(Floor {
+        host: look.host.clone(),
+        bytes: look.floor,
+    });
     entry.picks.clear();
     entry.released = 0;
     entry.asks = 0;
@@ -699,6 +941,35 @@ fn open(entry: &mut Entry, look: &Look<'_>) -> Said {
     };
     nominate(entry, look);
     Said::Opened { done }
+}
+
+/// The floor `entry`'s open episode is held to on `look`: the one recorded for it while its host
+/// lives, or this host's own where that is higher, where none is recorded, or where it is this
+/// host's.
+fn held_to(entry: &Entry, look: &Look<'_>) -> u64 {
+    entry
+        .floor
+        .as_ref()
+        .filter(|f| f.host != *look.host && (look.alive)(&f.host))
+        .map_or(0, |f| f.bytes)
+        .max(look.floor)
+}
+
+/// A look that steps `entry`'s open episode without ending it records what it holds it to
+/// ([`held_to`]): this host's floor, unless the floor recorded is another live host's at least
+/// as high. So the record, and the line, the owner's note and `harness disk why` that read it,
+/// say the floor the episode is held to, whether or not this look read the volume short.
+fn hold(entry: &mut Entry, look: &Look<'_>) {
+    let kept = entry
+        .floor
+        .as_ref()
+        .is_some_and(|f| f.host != *look.host && f.bytes >= look.floor && (look.alive)(&f.host));
+    if !kept {
+        entry.floor = Some(Floor {
+            host: look.host.clone(),
+            bytes: look.floor,
+        });
+    }
 }
 
 /// This host's best seat not yet picked this episode, in place of its last nominee.
@@ -758,6 +1029,7 @@ fn elect(entry: &mut Entry, look: &Look<'_>, after: Option<Miss>) -> Said {
         pick: pick.clone(),
         elected_ms: now,
         until_ms: now.saturating_add(DELIVER_MS),
+        orphan_ms: None,
     };
     Said::Elected { pick, held: n.held }
 }
@@ -810,6 +1082,7 @@ pub fn claim(lease: &mut Lease, key: &str, host: &HostId, sid: &str, now_ms: i64
             pick,
             elected_ms,
             until_ms,
+            ..
         } if pick.host == *host && pick.sid == sid && now_ms < *until_ms => {
             let cap = elected_ms
                 .saturating_add(DELIVER_MS)
@@ -824,8 +1097,10 @@ pub fn claim(lease: &mut Lease, key: &str, host: &HostId, sid: &str, now_ms: i64
 }
 
 /// Host `host` typed session `sid`'s line on volume `key` at `now_ms`, `free` bytes free then:
-/// the volume's cooldown starts, and the lease's pick (when it is this one) is asked. `false`:
-/// the lease had moved on, so the line is counted for the cooldown alone.
+/// the volume's cooldown starts, and the lease's pick (when it is this one) is asked. A line the
+/// lease moved on from owing, a pick of the open episode yet, is still counted as one of its
+/// lines ([`counted_late`]). `false`: it is no pick of the open episode, so the line is counted
+/// for the cooldown alone.
 pub fn typed(
     lease: &mut Lease,
     key: &str,
@@ -835,7 +1110,7 @@ pub fn typed(
     free: u64,
 ) -> bool {
     let entry = lease.entry_mut(key);
-    entry.last_ask_ms = Some(now_ms);
+    entry.last_ask_ms = Some(entry.last_ask_ms.map_or(now_ms, |last| last.max(now_ms)));
     match &entry.phase {
         Phase::Owed { pick, .. } if pick.host == *host && pick.sid == sid => {
             let pick = pick.clone();
@@ -850,13 +1125,82 @@ pub fn typed(
             };
             true
         }
-        _ => false,
+        _ => counted_late(entry, host, sid, now_ms, free),
     }
+}
+
+/// Whether `entry`'s open episode holds host `host`'s session `sid` as a pick that took no line,
+/// for a line typed at `at_ms`: one of the episode's own picks, elected before the line went.
+fn uncounted(entry: &Entry, host: &HostId, sid: &str, at_ms: i64) -> bool {
+    entry.episode_ms.is_some_and(|opened| at_ms >= opened)
+        && entry.picks.iter().any(|p| p.host == *host && p.sid == sid)
+        && !entry.asked.iter().any(|s| s == sid)
+}
+
+/// A line host `host` typed session `sid` at `at_ms` (`free` bytes free then) after the lease
+/// moved on from owing it: its record could not be written (a full disk), and another host
+/// handed its pick off before this host's next look recorded it ([`typed_unrecorded`]). A pick
+/// of the open episode that took no line is counted as asked, so [`MAX_ASKS`] bounds the lines
+/// that went, not the lines recorded in time. Where no pick elected after it took a line, the
+/// episode waits on its answer again ([`Phase::Asked`]) when it gathers nominees or ran out, or
+/// when it owes a later pick its line and this count reached [`MAX_ASKS`]: that later line would
+/// be one past the bound, so the later pick is withdrawn untyped. A release its own host made of
+/// it, the last pick, before recording is undone. `false`: it is no such pick, so the line
+/// counts for the cooldown alone.
+fn counted_late(entry: &mut Entry, host: &HostId, sid: &str, at_ms: i64, free: u64) -> bool {
+    if !uncounted(entry, host, sid, at_ms) {
+        return false;
+    }
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::CountOwedOnly) {
+        return false;
+    }
+    let at = entry
+        .picks
+        .iter()
+        .position(|p| p.host == *host && p.sid == sid);
+    let later_line = at.is_some_and(|i| {
+        entry.picks[i + 1..]
+            .iter()
+            .any(|p| entry.asked.contains(&p.sid))
+    });
+    entry.asks = entry.asks.saturating_add(1);
+    entry.asked.push(sid.to_owned());
+    let last = at.is_some_and(|i| i + 1 == entry.picks.len());
+    let spent = entry.asks >= MAX_ASKS;
+    #[cfg(any(test, debug_assertions))]
+    let spent = spent && !fault::armed(fault::Fault::OwedPastTwo);
+    let (back, missed) = match &entry.phase {
+        Phase::Nominating { after, .. } => (true, *after),
+        Phase::Out { last: why, .. } => (true, *why),
+        Phase::Owed { .. } => (spent, None),
+        _ => (false, None),
+    };
+    if later_line || !back {
+        return true;
+    }
+    if last && missed == Some(Miss::Released) {
+        entry.released = entry.released.saturating_sub(1);
+    }
+    entry.phase = Phase::Asked {
+        pick: Pick {
+            host: host.clone(),
+            sid: sid.to_owned(),
+        },
+        typed_ms: at_ms,
+        until_ms: at_ms.saturating_add(ANSWER_MS),
+        free_at: free,
+        best_free: free,
+    };
+    true
 }
 
 /// [`typed`], for the line host `host` last typed on volume `key` (session `sid`, at `at_ms`,
 /// `free` bytes free then), where the lease may lack its record because writing it failed (a
-/// full disk): recorded only when the volume's last line is older. `true`: it was.
+/// full disk): recorded when the volume's last line is older, or when the open episode still
+/// holds the session as a pick that took no line ([`counted_late`]), though a later line went. A
+/// line typed before the open episode opened is one of an earlier episode's, and starts the
+/// cooldown alone. `true`: it was recorded.
 pub fn typed_unrecorded(
     lease: &mut Lease,
     key: &str,
@@ -865,12 +1209,16 @@ pub fn typed_unrecorded(
     at_ms: i64,
     free: u64,
 ) -> bool {
-    if lease
-        .entry(key)
-        .and_then(|e| e.last_ask_ms)
-        .is_some_and(|last| last >= at_ms)
-    {
+    let Some(entry) = lease.entry_at(key) else {
+        typed(lease, key, host, sid, at_ms, free);
+        return true;
+    };
+    if entry.last_ask_ms.is_some_and(|last| last >= at_ms) && !uncounted(entry, host, sid, at_ms) {
         return false;
+    }
+    if entry.episode_ms.is_some_and(|opened| at_ms < opened) {
+        entry.last_ask_ms = Some(entry.last_ask_ms.map_or(at_ms, |last| last.max(at_ms)));
+        return true;
     }
     typed(lease, key, host, sid, at_ms, free);
     true
@@ -892,6 +1240,41 @@ pub fn release(
             Some(hand_off(entry, now_ms, pick, Miss::Released))
         }
         _ => None,
+    }
+}
+
+/// What a host's turn-break step found for its session's line ([`at_break`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Break {
+    /// It may not be asked: the lease handed the ask on ([`release`]).
+    Released(Said),
+    /// Type the line now ([`Claim::Yours`]).
+    Yours,
+    /// The lease names no line for it: type nothing.
+    Gone,
+}
+
+/// At session `sid`'s turn break on host `host`: when the seat rule bars it now (`barred`: its
+/// task is done or exited, or its worker finds it unfit), its line is released ([`release`]),
+/// so a session that may not be nominated is never typed one; otherwise it is claimed
+/// ([`claim`]).
+#[must_use]
+pub fn at_break(
+    lease: &mut Lease,
+    key: &str,
+    host: &HostId,
+    sid: &str,
+    now_ms: i64,
+    barred: bool,
+) -> Break {
+    #[cfg(any(test, debug_assertions))]
+    let barred = barred && !fault::armed(fault::Fault::TypeBarred);
+    if barred {
+        return release(lease, key, host, sid, now_ms).map_or(Break::Gone, Break::Released);
+    }
+    match claim(lease, key, host, sid, now_ms) {
+        Claim::Yours => Break::Yours,
+        Claim::Gone => Break::Gone,
     }
 }
 
@@ -1034,7 +1417,8 @@ pub struct Line<'a> {
     pub mount: &'a Path,
     pub total: u64,
     pub free: u64,
-    /// The line it is below: its floor, or with `emergency` what writes need.
+    /// The line it is held to: the episode's floor ([`Entry::floor`]), or with `emergency` what
+    /// writes need.
     pub floor: u64,
     pub emergency: bool,
     pub done: Done,
@@ -1061,11 +1445,12 @@ const CONFIRM: &str = "Check with `aterm ctl @self status` (disk=, disk_free_mb=
 /// The longest a holder's path is said, in characters.
 const HOLDER_PATH_CAP: usize = 56;
 
-/// The `disk-free@v1` line: the mark, the volume and how full it is, why aterm is done, the
-/// largest holders the pass left, what is safe to remove and how to confirm, then
-/// `(rule disk-free@v1)`, in at most [`LINE_CAP`] characters. A holder's path is said only in
-/// plain characters (letters, digits, `/._-~+@:,=` and spaces) and clipped; any other is said as
-/// "a build directory", so a folder's name carries nothing planted into an agent's prompt.
+/// The `disk-free@v1` line: the mark, the volume and how full it is (below its floor, or within
+/// [`END_MARGIN`] above it), why aterm is done, the largest holders the pass left, what is safe
+/// to remove and how to confirm, then `(rule disk-free@v1)`, in at most [`LINE_CAP`]
+/// characters. A holder's path is said only in plain characters (letters, digits, `/._-~+@:,=`
+/// and spaces) and clipped; any other is said as "a build directory", so a folder's name
+/// carries nothing planted into an agent's prompt.
 #[must_use]
 pub fn line(l: &Line<'_>) -> String {
     let used = l.total.saturating_sub(l.free);
@@ -1082,7 +1467,13 @@ pub fn line(l: &Line<'_>) -> String {
     let below = match (l.done, l.emergency) {
         (Done::Inodes, _) => "and out of inodes".to_owned(),
         (_, true) => format!("below the {} writes need", human_bytes(l.floor)),
-        (_, false) => format!("below its {} floor", human_bytes(l.floor)),
+        (_, false) if l.free < l.floor => format!("below its {} floor", human_bytes(l.floor)),
+        // The episode is held open until free space clears its floor by the margin.
+        (_, false) => format!(
+            "within {} of its {} floor",
+            human_bytes(END_MARGIN),
+            human_bytes(l.floor)
+        ),
     };
     let fact = format!(
         "the volume this tab works on ({}) is {pct}% full, {} free, {below}, and {why}.",
@@ -1245,9 +1636,9 @@ pub fn row_line(row: &str) -> Option<String> {
     })
 }
 
-/// What `aterm harness disk why` prints: one head line per volume the lease holds (its phase,
-/// what it waits on, its picks, lines and cooldown at `now_ms`), then `rows` (this rule's ledger
-/// rows, oldest first) as [`row_line`] says them.
+/// What `aterm harness disk why` prints: one head line per volume the lease holds (the floor
+/// its episode is held to, its phase, what it waits on, its picks, lines and cooldown at
+/// `now_ms`), then `rows` (this rule's ledger rows, oldest first) as [`row_line`] says them.
 #[must_use]
 pub fn why_lines(lease: &Lease, rows: &[String], now_ms: i64) -> Vec<String> {
     let at = |ms: i64| rfc3339_utc(ms / 1000);
@@ -1262,10 +1653,19 @@ pub fn why_lines(lease: &Lease, rows: &[String], now_ms: i64) -> Vec<String> {
             || "no episode".to_owned(),
             |ms| {
                 format!(
-                    "episode since {}{}",
+                    "episode since {}{}{}",
                     at(ms),
                     e.done
                         .map(|d| format!(" ({})", d.word()))
+                        .unwrap_or_default(),
+                    e.floor
+                        .as_ref()
+                        .map(|f| format!(
+                            ", held to {} (host pid {}) until free space is {} past it",
+                            human_bytes(f.bytes),
+                            f.host.pid,
+                            human_bytes(END_MARGIN)
+                        ))
                         .unwrap_or_default()
                 )
             },
@@ -1300,11 +1700,24 @@ pub fn why_lines(lease: &Lease, rows: &[String], now_ms: i64) -> Vec<String> {
                         .join(", ")
                 }
             ),
-            Phase::Owed { pick, until_ms, .. } => format!(
-                "owed @{} (host pid {}): its line goes at its next turn break, by {}",
+            Phase::Owed {
+                pick,
+                until_ms,
+                orphan_ms,
+                ..
+            } => format!(
+                "owed @{} (host pid {}): its line goes at its next turn break, by {}{}",
                 pick.sid,
                 pick.host.pid,
-                at(*until_ms)
+                at(*until_ms),
+                orphan_ms
+                    .map(|ms| format!(
+                        "; its host was read ended at {}: handed on from {} unless a host that \
+                         supervises it adopts it",
+                        at(ms),
+                        at(ms.saturating_add(ADOPT_MS))
+                    ))
+                    .unwrap_or_default()
             ),
             Phase::Asked {
                 pick,
@@ -1322,14 +1735,18 @@ pub fn why_lines(lease: &Lease, rows: &[String], now_ms: i64) -> Vec<String> {
                 at(*until_ms)
             ),
             Phase::Settled { at_ms, sid, freed } => format!(
-                "settled at {}: @{sid} freed {}",
+                "settled at {}: @{sid} freed {}; a look that reads the volume short from {} \
+                 opens a new episode",
                 at(*at_ms),
-                human_bytes(*freed)
+                human_bytes(*freed),
+                at(at_ms.saturating_add(COOLDOWN_MS))
             ),
             Phase::Out { at_ms, last } => format!(
-                "out at {} ({}): no more agents are asked this episode",
+                "out at {} ({}): no more agents are asked this episode; a look that reads the \
+                 volume short from {} opens a new one",
                 at(*at_ms),
-                last.map_or("no-agent", Miss::word)
+                last.map_or("no-agent", Miss::word),
+                at(at_ms.saturating_add(COOLDOWN_MS))
             ),
         };
         let cool = match e.last_ask_ms {
@@ -1374,7 +1791,7 @@ pub fn why_lines(lease: &Lease, rows: &[String], now_ms: i64) -> Vec<String> {
     out
 }
 
-/// A planted defect for the cross-host claim's negative control
+/// The planted defects of the conformance test's negative controls
 /// (`tests/conformance_disk_free_ask.rs`): proof and test builds only.
 #[cfg(any(test, debug_assertions))]
 pub mod fault {
@@ -1386,6 +1803,43 @@ pub mod fault {
         /// [`super::claim`] answers `Yours` whatever the lease says: a host types on what it
         /// believed when it was elected.
         ClaimBlind,
+        /// [`super::step`] ends an open episode at any look that does not read the volume short
+        /// by its own floor, as before floors were recorded: a host with a lower floor ends
+        /// another's episode, and free space at a floor ends and opens it look after look.
+        EndAtOwnFloor,
+        /// [`super::step`] ends an open episode at the floor it is held to, with no margin past
+        /// it: free space hovering at that floor ends and opens it look after look.
+        EndAtHeldFloor,
+        /// [`super::step`] keeps a settled or out episode parked however long ago it parked, as
+        /// before parked episodes gave way: a volume near its floor is never asked about again.
+        ParkForever,
+        /// [`super::step`] keeps an owed pick its host's seat rule bars owed, as the look did
+        /// when it only dropped the pick's line from its board.
+        KeepBarred,
+        /// [`super::step`] hands off an owed pick that left its host's supervision as
+        /// undelivered even when its host bars it, as the look did when it asked whether the pick
+        /// was gone first: an agent that exited cost an election.
+        GoneFirst,
+        /// [`super::at_break`] claims a line the seat rule bars, as the turn break did when it
+        /// read only the transcript.
+        TypeBarred,
+        /// [`super::step`] hands off a pick whose host ended though this look's host supervises
+        /// its session, as the look did before a successor adopted its picks: a seamless
+        /// update's successor lost its session's line and the session's place in the episode.
+        NoAdopt,
+        /// [`super::typed`] counts a line only while the lease still owes it, as before late
+        /// records were counted: a line whose record was lost and whose pick was handed off is
+        /// never one of the episode's lines, so two more sessions are asked after it.
+        CountOwedOnly,
+        /// [`super::step`] hands off an owed pick whose host ended at the first look of a host
+        /// that does not supervise its session, as before such picks waited [`super::ADOPT_MS`]:
+        /// any other host's look between a seamless update and its successor's first look gave
+        /// the successor's session away.
+        OrphanAtOnce,
+        /// [`super::typed`] counts a lost line late but leaves a pick elected after its hand-off
+        /// owed when that count reaches [`super::MAX_ASKS`], as before such picks were
+        /// withdrawn: the later pick takes a line past the bound.
+        OwedPastTwo,
     }
 
     thread_local! {

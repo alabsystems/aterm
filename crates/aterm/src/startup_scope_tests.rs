@@ -12,11 +12,18 @@ use super::{
 use aterm_cli::macos_doctor::{
     AutomaticSetupClaim, InitialSetupObservation, InitialSetupSnapshot, ProvisionalSetupWatchTest,
     claim_initial_setup_rerun_at, initial_setup_scope_ready_at, lasting_scope_refusal_at,
+    set_aside_unreadable_setup_at,
 };
 use aterm_gui::WorkstationSetupDecision;
-use aterm_types::macos_setup::Plan;
+use aterm_types::macos_setup::{Plan, Setting};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy)]
+enum AfterBind {
+    Corrupt,
+    TemporarilyUnreadable,
+}
 
 struct Startup {
     home: PathBuf,
@@ -28,6 +35,19 @@ struct Startup {
     failures: Vec<String>,
     /// The backoffs and binds before each bring-forward.
     brought: Vec<(usize, usize)>,
+    /// Bring-forwards still to meet the profile lock busy.
+    busy: usize,
+    /// The last bring-forward met it busy: the next backoff waits for it to let go.
+    lock_waits: bool,
+    /// The records aterm set aside, and the backoffs and binds before.
+    set_aside: Vec<(Vec<String>, usize, usize)>,
+    /// The records start afresh: no run to resume, so the startup offers its plan, which the
+    /// page admits as it stands.
+    fresh: bool,
+    /// The plans the startup offered.
+    offered: Vec<Plan>,
+    /// A real local read failure that starts after the startup captured readable state.
+    after_bind: Option<AfterBind>,
 }
 
 impl Startup {
@@ -52,14 +72,42 @@ impl SetupStartup for Startup {
         )
     }
 
-    fn bring_forward(&mut self) {
+    fn set_aside(&mut self) -> Result<(), String> {
+        if let Some(set) = set_aside_unreadable_setup_at(&self.root(), false)? {
+            self.set_aside.push((set.kept, self.backoffs, self.binds));
+        }
+        Ok(())
+    }
+
+    fn recover_after_read_error(&mut self) -> Result<bool, String> {
+        let before = self.set_aside.len();
+        self.set_aside()?;
+        Ok(self.set_aside.len() != before)
+    }
+
+    fn bring_forward(&mut self) -> bool {
         self.brought.push((self.backoffs, self.binds));
+        self.lock_waits = self.busy > 0;
+        if self.lock_waits {
+            self.busy -= 1;
+        }
+        !self.lock_waits
     }
 
     fn bind_authorization(&mut self) -> Result<u64, String> {
         self.binds += 1;
         assert_eq!(self.binds, 1, "capture the resolved home's records once");
-        Ok(self.snapshot()?.revision)
+        let revision = self.snapshot()?.revision;
+        let path = self.root().join("initial-setup.json");
+        match self.after_bind {
+            Some(AfterBind::Corrupt) => std::fs::write(path, b"{").unwrap(),
+            Some(AfterBind::TemporarilyUnreadable) => {
+                std::fs::rename(&path, self.root().join("progress-held")).unwrap();
+                std::fs::create_dir(path).unwrap();
+            }
+            None => {}
+        }
+        Ok(revision)
     }
 
     fn revision(&mut self) -> Result<u64, String> {
@@ -79,6 +127,9 @@ impl SetupStartup for Startup {
     }
 
     fn admission(&mut self) -> Result<Option<SetupAdmission>, String> {
+        if self.fresh {
+            return Ok(None);
+        }
         // The real startup admission reader, via the existing scratch fixture: the admitted
         // pending run is returned without any record write, as the before/after pins prove.
         let revision = ProvisionalSetupWatchTest::at(&self.root()).recover()?;
@@ -89,15 +140,25 @@ impl SetupStartup for Startup {
     }
 
     fn initial(&mut self) -> Result<Plan, String> {
-        panic!("an admitted pending run resumes without another offer")
+        assert!(
+            self.fresh,
+            "an admitted pending run resumes without another offer"
+        );
+        Ok(self.snapshot()?.plan)
     }
 
-    fn offer(&mut self, _: Plan) -> WorkstationSetupDecision {
-        panic!("scope recovery must not show another offer")
+    fn offer(&mut self, plan: Plan) -> WorkstationSetupDecision {
+        assert!(self.fresh, "scope recovery must not show another offer");
+        self.offered.push(plan.clone());
+        WorkstationSetupDecision::Begin(plan)
     }
 
     fn authorize(&mut self, _: &Plan) -> Result<Option<u64>, String> {
-        panic!("scope recovery must not reauthorize the saved run")
+        assert!(
+            self.fresh,
+            "scope recovery must not reauthorize the saved run"
+        );
+        Ok(Some(1))
     }
 
     fn authorization_pending(&self) -> bool {
@@ -110,10 +171,24 @@ impl SetupStartup for Startup {
 
     fn backoff(&mut self) {
         self.backoffs += 1;
+        if std::mem::take(&mut self.lock_waits) {
+            return;
+        }
+        if matches!(self.after_bind, Some(AfterBind::TemporarilyUnreadable)) {
+            let path = self.root().join("initial-setup.json");
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(self.root().join("progress-held"), path).unwrap();
+            self.after_bind = None;
+            return;
+        }
+        assert!(
+            !matches!(self.after_bind, Some(AfterBind::Corrupt)),
+            "newly corrupt records must retire this bound review so fresh recovery can run"
+        );
         let hidden = self
             .hidden
             .take()
-            .expect("only unresolved scope retries; record capture errors must end startup");
+            .expect("only unresolved scope retries: a corrupt record is set aside at once");
         std::fs::rename(hidden, &self.home).unwrap();
     }
 
@@ -143,6 +218,12 @@ fn startup(home: &Path) -> Startup {
         backoffs: 0,
         failures: Vec::new(),
         brought: Vec::new(),
+        busy: 0,
+        lock_waits: false,
+        set_aside: Vec::new(),
+        fresh: false,
+        offered: Vec::new(),
+        after_bind: None,
     }
 }
 
@@ -230,8 +311,13 @@ fn startup_scope_recovery_captures_the_revealed_pending_run_once() {
     assert_eq!(host.snapshot().unwrap().observation, before);
 }
 
+/// A progress record corrupt for good is set aside once the home resolves, never while it is
+/// hidden, and before the records bind (System State design §3.5): it is kept beside itself,
+/// the startup binds the fresh records once and goes on with no failure, offering the plan a
+/// fresh record gives, with the Mac preference groups left as is and aterm's own permissions
+/// set up.
 #[test]
-fn startup_scope_recovery_does_not_retry_a_failed_resolved_baseline() {
+fn startup_sets_a_corrupt_record_aside_once_the_home_resolves_and_goes_on() {
     for reveal in [false, true] {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let home = scratch.path().join("home");
@@ -239,16 +325,145 @@ fn startup_scope_recovery_does_not_retry_a_failed_resolved_baseline() {
         let record = home.join("doctor/initial-setup.json");
         std::fs::write(&record, b"{").unwrap();
         let mut host = startup(&home);
+        host.fresh = true;
         if reveal {
             let hidden = scratch.path().join("not-mounted");
             std::fs::rename(&home, &hidden).unwrap();
             host.hidden = Some(hidden);
         }
 
-        assert!(prepare_setup(&mut host).is_err());
+        let prepared = prepare_setup(&mut host).unwrap();
+        assert!(matches!(
+            prepared,
+            PreparedSetup::Authorized { revision: 1, .. }
+        ));
         assert_eq!(host.binds, 1);
-        assert_eq!(host.claims, 0, "a failed baseline takes no claim");
-        assert_eq!(host.backoffs, usize::from(reveal));
-        assert_eq!(std::fs::read(record).unwrap(), b"{");
+        let backoffs = usize::from(reveal);
+        assert_eq!(host.backoffs, backoffs);
+        assert_eq!(
+            host.set_aside,
+            [(
+                vec!["initial-setup.json.unreadable".to_owned()],
+                backoffs,
+                0
+            )]
+        );
+        assert_eq!(host.brought, [(backoffs, 0)]);
+        assert_eq!(host.failures.len(), backoffs, "only the hidden home waited");
+        assert_eq!(
+            std::fs::read(home.join("doctor/initial-setup.json.unreadable")).unwrap(),
+            b"{"
+        );
+        let recovered = host.snapshot().unwrap();
+        assert!(record.exists());
+        assert_ne!(recovered.revision, 0);
+        assert!(recovered.recovered);
+        assert!(!recovered.permissions_allowed);
+        let [offered] = host.offered.as_slice() else {
+            panic!("one offer: {:?}", host.offered);
+        };
+        assert!(offered.selection.contains(Setting::Permissions));
+        assert!(!offered.selection.contains(Setting::Dock));
+        assert!(!offered.selection.contains(Setting::Messages));
+        assert_eq!(&recovered.plan, offered);
     }
+}
+
+/// A bring-forward that meets the profile lock busy is asked again after a quiet wait, before
+/// the records bind and with no failure reported: a Restore's permissions get their run in this
+/// launch, never the next.
+#[test]
+fn a_busy_bring_forward_is_asked_again_before_the_records_bind() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let (revision, _) = pending(&home);
+    let mut host = startup(&home);
+    host.busy = 2;
+
+    let prepared = prepare_setup(&mut host).unwrap();
+    assert!(matches!(prepared, PreparedSetup::Authorized { revision: got, .. } if got == revision));
+    assert_eq!(host.brought, [(0, 0), (1, 0), (2, 0)]);
+    assert_eq!(host.binds, 1);
+    assert!(host.failures.is_empty(), "{:?}", host.failures);
+}
+
+#[test]
+fn startup_recovery_retires_a_bound_review_when_its_records_become_corrupt() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    pending(&home);
+    let mut old = startup(&home);
+    old.after_bind = Some(AfterBind::Corrupt);
+
+    assert!(matches!(
+        prepare_setup(&mut old),
+        Err(_) | Ok(PreparedSetup::Unavailable)
+    ));
+    assert_eq!(
+        old.binds, 1,
+        "the old review never adopts replacement records"
+    );
+    assert!(old.offered.is_empty());
+    assert_eq!(
+        old.set_aside.len(),
+        1,
+        "the old review repaired but never rebound"
+    );
+    assert!(old.snapshot().unwrap().recovered);
+
+    // As the next startup does, repair before capturing a fresh review. It offers
+    // Permissions with the Mac preference groups left alone, rather than replaying them.
+    let mut fresh = startup(&home);
+    fresh.fresh = true;
+    assert!(matches!(
+        prepare_setup(&mut fresh).unwrap(),
+        PreparedSetup::Authorized { revision: 1, .. }
+    ));
+    assert_eq!(fresh.binds, 1);
+    assert!(
+        fresh.set_aside.is_empty(),
+        "the old review already repaired the files"
+    );
+    assert_eq!(
+        std::fs::read(home.join("doctor/initial-setup.json.unreadable")).unwrap(),
+        b"{"
+    );
+    let [offered] = fresh.offered.as_slice() else {
+        panic!("one fresh recovery offer: {:?}", fresh.offered);
+    };
+    assert!(offered.selection.contains(Setting::Permissions));
+    for setting in Setting::ALL {
+        if !matches!(
+            setting,
+            Setting::Permissions | Setting::Secrets | Setting::Repositories
+        ) {
+            assert!(!offered.selection.contains(setting), "{setting:?}");
+        }
+    }
+}
+
+#[test]
+fn startup_recovery_keeps_its_bound_revision_through_a_transient_local_read_error() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let (revision, before) = pending(&home);
+    let mut host = startup(&home);
+    host.after_bind = Some(AfterBind::TemporarilyUnreadable);
+
+    assert!(matches!(
+        prepare_setup(&mut host).unwrap(),
+        PreparedSetup::Authorized { revision: got, .. } if got == revision
+    ));
+    assert_eq!(host.binds, 1);
+    assert_eq!(host.backoffs, 1);
+    assert_eq!(host.failures.len(), 1);
+    assert!(
+        host.offered.is_empty(),
+        "the admitted run resumes without another answer"
+    );
+    assert!(
+        host.set_aside.is_empty(),
+        "an I/O error is no corrupt record"
+    );
+    assert_eq!(host.snapshot().unwrap().observation, before);
 }

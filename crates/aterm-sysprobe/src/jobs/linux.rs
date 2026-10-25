@@ -204,9 +204,11 @@ pub fn parse_syscall(text: &str) -> Option<i32> {
 }
 
 /// `/proc/<pid>/wchan`: the kernel function, `None` for `0` or empty (on a core, or not waiting).
+/// A compiler's clone suffix goes (`poll_schedule_timeout.constprop.0` is `poll_schedule_timeout`).
 #[must_use]
 pub fn parse_wchan(text: &str) -> Option<String> {
     let w = text.trim();
+    let w = w.split_once('.').map_or(w, |(f, _)| f);
     (!w.is_empty() && w != "0").then(|| w.chars().take(64).collect())
 }
 
@@ -501,9 +503,10 @@ fn fds(dir: &Path, sleeping: Option<bool>) -> Option<(Vec<FdReading>, bool)> {
             });
             continue;
         }
-        let link = std::fs::read_link(dir.join("fd").join(fd.to_string()))
+        let target = std::fs::read_link(dir.join("fd").join(fd.to_string()))
             .ok()
-            .map_or(FdLink::Other, |t| parse_fd_link(&t.to_string_lossy()));
+            .map(|t| t.to_string_lossy().into_owned());
+        let link = target.as_deref().map_or(FdLink::Other, parse_fd_link);
         let info = || {
             read_text(&dir.join("fdinfo").join(fd.to_string()))
                 .map(|t| parse_fdinfo(&t))
@@ -552,10 +555,12 @@ fn fds(dir: &Path, sleeping: Option<bool>) -> Option<(Vec<FdReading>, bool)> {
             FdLink::Tty => FdKind::Device {
                 tty: true,
                 read: !info().write_only(),
+                ctty: target.as_deref() == Some("/dev/tty"),
             },
             FdLink::Device => FdKind::Device {
                 tty: false,
                 read: true,
+                ctty: false,
             },
             FdLink::Path(_) => {
                 let i = info();
@@ -594,6 +599,7 @@ pub fn read(root: &Path, pid: u32, want_fds: bool, hz: u64) -> Option<ProcFacts>
         uid,
         name: stat.name.clone(),
         state,
+        traced: stat.state == b't',
         tty,
         tpgid: tty.and(Some(stat.tpgid).filter(|g| *g != 0)),
         ..ProcFacts::default()

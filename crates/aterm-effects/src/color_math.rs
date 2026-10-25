@@ -526,7 +526,7 @@ pub const fn wear_pinned(pinned: u32, styled: u32, charge: f32, settled: f32) ->
 }
 
 #[inline]
-const fn cbrt_f32(x: f32) -> f32 {
+pub(crate) const fn cbrt_f32(x: f32) -> f32 {
     if x <= 0.0 {
         return 0.0;
     }

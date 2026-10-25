@@ -11,21 +11,10 @@ use aterm_time::Instant;
 
 use crate::{Policy, RateLimit};
 
-/// Abstraction over [`Instant::now`] so tests can step the clock without sleeping.
+/// The clock a debit reads, which the caller supplies: the crate offers no system clock, so a terminal engine debits at the instant its parse was given.
 pub trait TimeSource {
     /// Return the current instant.
     fn now(&self) -> Instant;
-}
-
-/// Production time source — delegates to [`Instant::now`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SystemClock;
-
-impl TimeSource for SystemClock {
-    #[inline]
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
 }
 
 /// Token-bucket state for one named [`RateLimit`] entry.

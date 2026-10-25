@@ -1259,8 +1259,9 @@ fn glass(app: &App) -> (usize, usize, usize, u64) {
 }
 
 /// The Claude accounts' lines (`HostNote::Accounts`) mark nothing on the glass: an account signed
-/// out is one `harness.accounts.signed-out` line whose key and action hold while its first label
-/// does, and none signed out ends it.
+/// out with no email is one `harness.accounts.signed-out` fact whose key holds while its first
+/// label does, its action the read of the roster and its labels line in Details, and none signed
+/// out ends it.
 #[test]
 fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     use crate::messages_host::wall_stamp_now;
@@ -1316,7 +1317,7 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
             .records()
             .filter(|r| r.later && r.is_live())
             .filter(|r| r.key.as_deref() == Some(mr::ACCOUNTS_SIGNED_OUT_KEY))
-            .map(|r| r.detail[1].clone())
+            .map(|r| r.detail[2].clone())
             .collect()
     };
     let line = |key: &str, then: &str| (key.to_string(), then.to_string());
@@ -1356,18 +1357,12 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     assert_eq!(posted.outcome, PostOutcome::Duplicate);
     assert_eq!(app.messages.digest_revision(), rev);
     assert_eq!(app.messages.digest().entries[0].id, id);
-    assert_eq!(
-        logged(&app),
-        [notice::ACCOUNT_SIGNED_OUT.fill(Some("work-2"), None).todo]
-    );
+    assert_eq!(logged(&app), ["Signed out: work-2"]);
 
     assert_eq!(step(&mut app, listed(&["pool-a"])), [login("pool-a")]);
     assert_ne!(app.messages.digest().entries[0].id, id, "raised anew");
     assert_eq!(shown(&app), (false, vec!["pool-a"]));
-    assert_eq!(
-        logged(&app),
-        [notice::ACCOUNT_SIGNED_OUT.fill(Some("pool-a"), None).todo]
-    );
+    assert_eq!(logged(&app), ["Signed out: pool-a"]);
     assert!(step(&mut app, listed(&[])).is_empty());
     assert!(logged(&app).is_empty());
 
@@ -1448,10 +1443,7 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
         "the adopted words gave way"
     );
     assert_eq!(app.messages.digest().len(), 1, "and the refused line ended");
-    assert_eq!(
-        logged(&app),
-        [notice::ACCOUNT_SIGNED_OUT.fill(Some("pool-a"), None).todo]
-    );
+    assert_eq!(logged(&app), ["Signed out: pool-a"]);
     assert_eq!(glass(&app), before);
     let mut app = adopting();
     app.note_harness_host(HostNote::Accounts(AccountsSaid::Nothing));
@@ -2663,7 +2655,7 @@ fn a_carried_notice_told_again_closes_fixed_when_the_login_is_back() {
 #[test]
 fn a_usage_limits_record_closes_as_a_switch_never_as_a_login_back() {
     for (text, words) in [
-        (&notice::LIMIT_RENEW, notice::SWITCHED),
+        (&notice::LIMIT_USE, notice::SWITCHED),
         (&notice::LIMIT_ROSTER, notice::SWITCHED),
         (&notice::LOGIN_SIGN_IN, notice::BACK),
     ] {

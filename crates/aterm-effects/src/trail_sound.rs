@@ -620,8 +620,9 @@ const fn bass_octave(anchor: f32) -> f32 {
 
 #[inline]
 const fn gesture_bend(f: f32, dir: i8) -> (f32, f32) {
+    const INV_GESTURE_BEND: f32 = 1.0 / GESTURE_BEND;
     if dir >= 0 {
-        (f / GESTURE_BEND, f)
+        (f * INV_GESTURE_BEND, f)
     } else {
         (f * GESTURE_BEND, f)
     }
@@ -1161,11 +1162,11 @@ impl Voice {
     };
 
     #[inline]
-    fn weight(&self) -> f32 {
+    const fn weight(&self) -> f32 {
         if !self.on {
             return -1.0;
         }
-        let env = (-self.t / self.decay.max(1e-3)).exp();
+        let env = crate::color_math::exp_f32(-self.t / self.decay.max(1e-3));
         (self.gl + self.gr) * env * (self.p[0].lvl + self.p[1].lvl + self.p[2].lvl + self.n_lvl)
     }
 }
@@ -1577,8 +1578,9 @@ impl TrailSynth {
             self.v2_key_pending = false;
         }
         let pause = self.since_event;
+        const INV_RATE_TAU: f32 = -1.0 / 0.6;
         self.rate = if self.rate > 0.0 && self.since_event > 0.0 {
-            self.rate * (-self.since_event / 0.6).exp() + 1.0
+            self.rate * (self.since_event * INV_RATE_TAU).exp() + 1.0
         } else {
             self.rate + 1.0
         };
@@ -2610,7 +2612,8 @@ impl TrailSynth {
         let phrase = &celebration_bar_degrees(sig, idx);
         let bass_bar = &CELEBRATION_BASS[idx];
         let shift = celebration_root(sig) + celebration_mode(sig);
-        let build = (f32::from(bar) / CELEBRATION_BUILD_BARS).min(1.0);
+        const INV_CELEBRATION_BUILD_BARS: f32 = 1.0 / CELEBRATION_BUILD_BARS;
+        let build = (f32::from(bar) * INV_CELEBRATION_BUILD_BARS).min(1.0);
         let lift = CELEBRATION_BAR_LIFT[idx];
         let clap = bar >= CELEBRATION_CLAP_BAR;
         let turnaround = idx == CELEBRATION_PHRASE_BARS - 1;
@@ -2733,7 +2736,8 @@ impl TrailSynth {
         self.since_space_step += dt_block;
         self.since_shift += dt_block;
         if self.rate > 0.0 {
-            self.rate *= (-dt_block / 0.6).exp();
+            const INV_RATE_TAU: f32 = -1.0 / 0.6;
+            self.rate *= (dt_block * INV_RATE_TAU).exp();
             if self.rate < 1e-7 {
                 self.rate = 0.0;
             }
@@ -2758,7 +2762,8 @@ impl TrailSynth {
 
         let dt = self.inv_sr;
         let duck_step = if self.duck > 0.0 {
-            (-dt / BONK_DUCK_TAU).exp()
+            const INV_BONK_DUCK_TAU: f32 = -1.0 / BONK_DUCK_TAU;
+            (dt * INV_BONK_DUCK_TAU).exp()
         } else {
             0.0
         };
@@ -2772,9 +2777,11 @@ impl TrailSynth {
         let sing_mul = 1.0 - SING_DUCK_DEPTH * self.sing;
         let lim_on = self.v2_latched;
         let (lim_att, lim_rel) = if lim_on {
+            const INV_LIMIT_ATTACK_S: f32 = -1.0 / LIMIT_ATTACK_S;
+            const INV_LIMIT_RELEASE_S: f32 = -1.0 / LIMIT_RELEASE_S;
             (
-                1.0 - (-dt / LIMIT_ATTACK_S).exp(),
-                (-dt / LIMIT_RELEASE_S).exp(),
+                1.0 - (dt * INV_LIMIT_ATTACK_S).exp(),
+                (dt * INV_LIMIT_RELEASE_S).exp(),
             )
         } else {
             (0.0, 0.0)
@@ -3001,7 +3008,8 @@ impl TrailSynth {
             if self.sing_hold > 0.0 {
                 self.sing_hold -= dt_block;
             } else {
-                self.sing *= (-dt_block / SING_DUCK_TAU).exp();
+                const INV_SING_DUCK_TAU: f32 = -1.0 / SING_DUCK_TAU;
+                self.sing *= (dt_block * INV_SING_DUCK_TAU).exp();
             }
             if self.sing < 1e-4 {
                 self.sing = 0.0;
@@ -3020,27 +3028,29 @@ impl TrailSynth {
     fn tick_bed(&mut self, dt: f32) {
         let b = &mut self.bed;
         if b.energy > 0.0 {
-            let tau_e = if b.energy < 0.02 { 0.2 } else { 0.7 };
-            b.energy *= (-dt / tau_e).exp();
+            let inv_tau_e = if b.energy < 0.02 { -5.0 } else { -1.0 / 0.7 };
+            b.energy *= (dt * inv_tau_e).exp();
         }
         let target = b.energy.min(1.0);
         if b.level != target {
-            let tau = if target > b.level {
-                0.25
+            let inv_tau = if target > b.level {
+                -4.0
             } else if b.level < 0.02 {
-                0.2
+                -5.0
             } else {
-                0.7
+                -1.0 / 0.7
             };
-            b.level += (target - b.level) * (1.0 - (-dt / tau).exp());
+            b.level += (target - b.level) * (1.0 - (dt * inv_tau).exp());
         }
         if b.energy < 3e-3 && b.level < 3e-3 {
             b.energy = 0.0;
             b.level = 0.0;
         }
-        let dying = (0.35 - b.level).max(0.0) / 0.35;
+        const INV_035: f32 = 1.0 / 0.35;
+        let dying = (0.35 - b.level).max(0.0) * INV_035;
         if b.droop != dying {
-            b.droop += (dying - b.droop) * (1.0 - (-dt / 0.4).exp());
+            const INV_DROOP_TAU: f32 = -1.0 / 0.4;
+            b.droop += (dying - b.droop) * (1.0 - (dt * INV_DROOP_TAU).exp());
             if b.level == 0.0 && (dying - b.droop).abs() < 1e-6 {
                 b.droop = dying;
             }
@@ -3104,7 +3114,7 @@ trait Palette {
 }
 
 #[inline]
-fn palette_for(voice: SoundVoice, style: GlowStyle) -> &'static dyn Palette {
+const fn palette_for(voice: SoundVoice, style: GlowStyle) -> &'static dyn Palette {
     match voice {
         SoundVoice::Mech => &MechPalette,
         SoundVoice::Typewriter => &TypewriterPalette,

@@ -350,7 +350,7 @@ impl Bridge {
         if let Some(m) = self.mirror.as_deref_mut() {
             m.unretained = true;
         }
-        eprintln!(
+        stderr_line!(
             "aterm-link: mirror: the broker retains none of this node's `ev` faces, and [fabric] \
              log is \"auto\": the session logs are not mirrored onto it (\"turns\" mirrors \
              them anyway, up to a total)"
@@ -382,7 +382,7 @@ impl Bridge {
         }
         m.acked = header.split_whitespace().any(|t| t == "log=turns");
         if !m.acked {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: [fabric] log = \"{}\", but this aterm did not acknowledge \
                  log=turns: it serves no session-log mirror, which stays off",
                 m.mode.word()
@@ -391,7 +391,7 @@ impl Bridge {
         }
         if wait {
             m.awaiting = true;
-            eprintln!(
+            stderr_line!(
                 "aterm-link: mirror: waits for the recovery an unclean stop owes, which \
                  reconciles its pin, before it judges the pin"
             );
@@ -465,7 +465,7 @@ impl Bridge {
                         m.pin.total = m.floor;
                         if absent && (key_copy.is_some() || floor.is_some()) {
                             if let Err(e) = self.state.set_logpin(&m.pin.render()) {
-                                eprintln!(
+                                stderr_line!(
                                     "aterm-link: mirror: no logpin, and one could not be \
                                      written from logkey and logfloor ({e}); the next take \
                                      writes it"
@@ -485,7 +485,7 @@ impl Bridge {
                         (copy, pinned) => {
                             let k = pin.slots.len();
                             if k > 0 {
-                                eprintln!(
+                                stderr_line!(
                                     "aterm-link: mirror: recovering a pinned batch of {k} slots"
                                 );
                             }
@@ -517,7 +517,7 @@ impl Bridge {
         }
         let report = match self.mirror.as_deref().and_then(|m| m.stopped.as_deref()) {
             Some(why) => {
-                eprintln!("aterm-link: mirror stopped: {why}");
+                stderr_line!("aterm-link: mirror stopped: {why}");
                 "link mirror stopped reason=pin"
             }
             None => "link mirror on",
@@ -684,7 +684,7 @@ impl Bridge {
             return;
         }
         m.stopped = Some(why.to_string());
-        eprintln!(
+        stderr_line!(
             "aterm-link: mirror stopped for this bridge's life: {why}; the pinned batch, if \
              any, is kept for the next"
         );
@@ -780,7 +780,7 @@ impl Bridge {
         let reply = match self.ctl_request(&format!("log-take n={n} tier={tier}{key}")) {
             Ok(reply) => reply,
             Err(e) => {
-                eprintln!("aterm-link: mirror: log-take failed: {e}");
+                stderr_line!("aterm-link: mirror: log-take failed: {e}");
                 self.mirror_retry_in(DEADLINE_RETRY);
                 return;
             }
@@ -828,7 +828,7 @@ impl Bridge {
                 }),
                 Err(e) => {
                     self.unsent = unsent;
-                    eprintln!("aterm-link: mirror: no sequence for a slot: {e}");
+                    stderr_line!("aterm-link: mirror: no sequence for a slot: {e}");
                     self.mirror_retry_in(DEADLINE_RETRY);
                     return;
                 }
@@ -858,7 +858,7 @@ impl Bridge {
         };
         m.bucket.spend(k as u64);
         if let Err(e) = self.state.set_logpin(&m.pin.render()) {
-            eprintln!("aterm-link: mirror: the pin could not be written ({e}); nothing sent");
+            stderr_line!("aterm-link: mirror: the pin could not be written ({e}); nothing sent");
             m.clear_batch();
             m.retry_at = Some(now + DEADLINE_RETRY);
         }
@@ -895,10 +895,12 @@ impl Bridge {
         }
         m.waiting = !open;
         let report = if open {
-            eprintln!("aterm-link: mirror: the broker's window has room again; the mirror goes on");
+            stderr_line!(
+                "aterm-link: mirror: the broker's window has room again; the mirror goes on"
+            );
             "link mirror on"
         } else {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: mirror: this node's {window} bytes in the broker's window (from \
                  @{}) reach its budget of {}; the mirror waits for the broker's retention to \
                  give the oldest of them up",
@@ -927,7 +929,7 @@ impl Bridge {
             return false;
         };
         if let Err(e) = self.state.ensure_logpin_durable(|| m.pin.render()) {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: mirror: the pin's version fence could not be made durable \
                  ({e}); nothing taken or sent, tried again"
             );
@@ -953,7 +955,7 @@ impl Bridge {
                 true
             }
             Err(e) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: mirror: the alias key could not be written to logkey ({e}); \
                      nothing taken or sent, tried again"
                 );
@@ -1003,7 +1005,7 @@ impl Bridge {
         match raised {
             Ok(floor) => {
                 if first {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: mirror: the floor of the node's total is on the media at \
                          {floor}, this open's first: 2 full flushes in {} us",
                         self.fx.now().saturating_duration_since(began).as_micros()
@@ -1016,7 +1018,7 @@ impl Bridge {
                 true
             }
             Err(e) => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: mirror: the floor of the node's total could not be raised \
                      ({e}); nothing sent, tried again"
                 );
@@ -1140,7 +1142,7 @@ impl Bridge {
                 Outcome::Owed
             }
             Err(e) if astream_broker::broker_refusal(&e).is_some() => {
-                eprintln!(
+                stderr_line!(
                     "aterm-link: mirror: the broker refused a slot for now ({e}); sent again"
                 );
                 self.mirror_retry_in(DEADLINE_RETRY);
@@ -1183,7 +1185,7 @@ impl Bridge {
                 Ok(seq) => fresh.push(seq),
                 Err(e) => {
                     self.unsent = unsent;
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: mirror: no sequence to re-pin at ({e}); the batch waits, \
                          nothing of it landed"
                     );
@@ -1204,7 +1206,7 @@ impl Bridge {
         }
         pin.inc = inc;
         if let Err(e) = self.state.set_logpin(&pin.render()) {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: mirror: the re-pin could not be written ({e}); nothing re-sent, the \
                  batch waits"
             );
@@ -1285,7 +1287,7 @@ impl Bridge {
                     return;
                 }
                 ReadBack::Unread => {
-                    eprintln!(
+                    stderr_line!(
                         "aterm-link: mirror: sequence {pseq} was deduped at @{off}, where {face} \
                          holds no record: sent again at its pinned sequence, not yet a collision"
                     );
@@ -1346,7 +1348,7 @@ impl Bridge {
                     m.retry_at = Some(now + REFUSED_WAIT);
                 }
                 if let Err(e) = self.state.set_logpin(&m.pin.render()) {
-                    eprintln!("aterm-link: mirror: the emptied pin could not be written ({e})");
+                    stderr_line!("aterm-link: mirror: the emptied pin could not be written ({e})");
                 }
             }
             return;
@@ -1355,7 +1357,7 @@ impl Bridge {
         let reply = match self.ctl_request(&mirror::landed_line(&pairs)) {
             Ok(reply) => reply.header().to_string(),
             Err(e) => {
-                eprintln!("aterm-link: mirror: log-landed failed: {e}");
+                stderr_line!("aterm-link: mirror: log-landed failed: {e}");
                 self.mirror_retry_in(DEADLINE_RETRY);
                 return;
             }
@@ -1384,10 +1386,11 @@ impl Bridge {
             return;
         };
         if m.recovered > 0 {
-            eprintln!(
+            stderr_line!(
                 "aterm-link: mirror: the recovered batch landed: {} slots republished, {} \
                  deduped at their pinned sequences",
-                m.recovered, m.recovered_deduped
+                m.recovered,
+                m.recovered_deduped
             );
         }
         let bytes: u64 = m
@@ -1417,7 +1420,7 @@ impl Bridge {
         m.recovered_deduped = 0;
         m.owed = true;
         if let Err(e) = self.state.set_logpin(&m.pin.render()) {
-            eprintln!("aterm-link: mirror: the emptied pin could not be written ({e})");
+            stderr_line!("aterm-link: mirror: the emptied pin could not be written ({e})");
         }
     }
 
@@ -1434,7 +1437,7 @@ impl Bridge {
         let started = fx.now();
         let answer = conn.retire_subject(producer, &face);
         if let Err(e) = self.observe(started, answer, None) {
-            eprintln!("aterm-link: mirror: retiring {face} failed: {e}");
+            stderr_line!("aterm-link: mirror: retiring {face} failed: {e}");
         } else {
             self.indexed_subjects.remove(&face);
         }
@@ -1454,7 +1457,7 @@ impl Bridge {
         m.repin = false;
         m.owed = true;
         if let Err(e) = self.state.set_logpin(&m.pin.render()) {
-            eprintln!("aterm-link: mirror: the dropped pin could not be written ({e})");
+            stderr_line!("aterm-link: mirror: the dropped pin could not be written ({e})");
         }
     }
 }

@@ -527,6 +527,11 @@ pub(crate) struct ButtonSpec {
     pub(crate) swatches: Vec<[u8; 3]>,
     pub(crate) chip: Option<[u8; 3]>,
     pub(crate) chevron_row: Option<u16>,
+    /// A navigation destination's pictogram gives way to its name in a row too narrow for
+    /// both: the row keeps its `visual_icon` (it is still a destination, selected as one) but
+    /// paints no pictogram, its label starting where a text row's does
+    /// ([`navigation_label_lead`]). Paint only.
+    pub(crate) icon_hidden: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -557,6 +562,8 @@ pub(crate) enum ButtonIcon {
     Sound,
     Themes,
     Spark,
+    /// Two tabs over a page: Tab Control's own pictogram, apart from Window's.
+    Tabs,
     Trash,
     Reset,
     Clear,
@@ -575,7 +582,14 @@ impl ButtonSpec {
             swatches: Vec::new(),
             chip: None,
             chevron_row: None,
+            icon_hidden: false,
         }
+    }
+
+    /// Paint no pictogram, the label in its room ([`Self::icon_hidden`]).
+    pub(crate) const fn icon_hidden(mut self, hidden: bool) -> Self {
+        self.icon_hidden = hidden;
+        self
     }
 
     /// Paint a colour strip.
@@ -1016,7 +1030,7 @@ pub(crate) struct TextFieldGeometry {
     pub(crate) ellipsis: TextFieldEllipsis,
 }
 
-/// Where a field not being edited marks the part of its value it cannot show.
+/// Where a field showing a stored value, not typed text, marks the part it cannot show.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum TextFieldEllipsis {
     #[default]
@@ -1167,6 +1181,11 @@ pub(crate) fn text_field_geometry(
     }
 
     let focused = control.state.focused && control.spec.input.is_some();
+    // A FIELD HOLDING WHAT A PERSON TYPES KEEPS ITS CARET'S END IN VIEW, the keyboard in it or
+    // not, as any text field scrolls its text: an ellipsis over typed words would hide the query
+    // a search's results answer. A stored value shown where nobody types marks what it cannot
+    // show.
+    let typed = control.spec.input.is_some();
     if !focused && text_field_value_on_lines(control) {
         return TextFieldGeometry {
             text_x,
@@ -1175,7 +1194,7 @@ pub(crate) fn text_field_geometry(
             ellipsis: TextFieldEllipsis::None,
         };
     }
-    if !focused && crate::tray_raster::ui_text_width(text, text_px) > available {
+    if !typed && crate::tray_raster::ui_text_width(text, text_px) > available {
         let mark = crate::tray_raster::ui_text_width(TEXT_FIELD_ELLIPSIS, text_px);
         let room = (available - mark).max(0.0);
         if reads_as_path(text) {
@@ -1237,15 +1256,11 @@ pub(crate) fn text_field_geometry(
             ellipsis: TextFieldEllipsis::Trail,
         };
     }
-    let anchor = if focused {
-        control
-            .spec
-            .input
-            .as_ref()
-            .map_or(0, |input| input.selection.head.min(text.len()))
-    } else {
-        0
-    };
+    let anchor = control
+        .spec
+        .input
+        .as_ref()
+        .map_or(0, |input| input.selection.head.min(text.len()));
     let anchor = grapheme_boundary_at_or_before(text, anchor);
     let scan_start =
         grapheme_boundary_at_or_before(text, anchor.saturating_sub(TEXT_FIELD_GEOMETRY_BYTES / 2));
@@ -1258,7 +1273,7 @@ pub(crate) fn text_field_geometry(
     .max(anchor);
 
     let mut start = anchor;
-    if focused {
+    if typed {
         let left_budget = available * 0.68;
         let boundaries = text[scan_start..anchor]
             .grapheme_indices()
@@ -1283,7 +1298,7 @@ pub(crate) fn text_field_geometry(
         }
         end = candidate;
     }
-    if focused && end == scan_end {
+    if typed && end == scan_end {
         let boundaries = text[scan_start..start]
             .grapheme_indices()
             .map(|(boundary, _)| boundary)
@@ -3950,6 +3965,12 @@ const fn centres_its_label(control: &Control<ButtonSpec>) -> bool {
         && control.spec.visual_label.is_some()
 }
 
+/// The width a centred label line may take in a text button `width` wide: the
+/// painter's end reserve kept clear on both sides.
+pub(crate) fn centred_label_room(spec: &ButtonSpec, width: f32) -> f32 {
+    (width - 2.0 * (text_button_trailing_reserve(spec) + button_end_reserve(spec))).max(0.0)
+}
+
 fn navigation_is_rail_destination(control: &Control<ButtonSpec>) -> bool {
     control.style == StyleRef::Navigation && control.spec.visual_icon.is_some()
 }
@@ -3985,6 +4006,47 @@ pub(crate) const NAVIGATION_LABEL_LEAD: f32 = 40.0;
 
 /// How far a navigation destination's label stops short of its row's end, ahead of its badge.
 pub(crate) const NAVIGATION_LABEL_END: f32 = 12.0;
+
+/// Where a navigation destination's label starts in its row: after its pictogram's slot
+/// ([`NAVIGATION_LABEL_LEAD`]), or 12pt in, as a text row's, where its pictogram gives way to it
+/// ([`ButtonSpec::icon_hidden`]).
+pub(crate) const fn navigation_label_lead(spec: &ButtonSpec) -> f32 {
+    if spec.icon_hidden {
+        12.0
+    } else {
+        NAVIGATION_LABEL_LEAD
+    }
+}
+
+/// The room a navigation destination's label has in a row `width` wide: after its lead, short
+/// of its end, its arrow and its badge. The painter, the fit audit and an author fitting a label
+/// to the row read this one formula, so none of them can disagree on the room.
+pub(crate) fn navigation_label_room(spec: &ButtonSpec, width: f32) -> f32 {
+    (width
+        - navigation_label_lead(spec)
+        - NAVIGATION_LABEL_END
+        - navigation_trailing_reserve(spec)
+        - badge_reserve(spec))
+    .max(0.0)
+}
+
+/// A navigation destination's label measured in the widest face its row paints it in, the
+/// semibold a selected row wears ([`navigation_label_type`]): a label fitted by it never wraps
+/// or elides differently when its row is selected.
+pub(crate) fn navigation_label_width(value: &str) -> f32 {
+    visual_text_width(
+        value,
+        native_type_px(TypeStep::Secondary).get(),
+        crate::widget::TextFace::UiBold,
+    )
+}
+
+/// The height a navigation destination needs for `lines` lines of its label
+/// ([`button_label_lines`]): its one line's `single` height, or the lines with 8pt over and
+/// under them, whichever is taller.
+pub(crate) fn navigation_row_height_for_lines(lines: usize, single: f32) -> f32 {
+    single.max(lines as f32 * native_button_line_height() + 16.0)
+}
 
 fn button_end_reserve(spec: &ButtonSpec) -> f32 {
     badge_reserve(spec)
@@ -4122,11 +4184,10 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                             .visual_label
                             .as_ref()
                             .unwrap_or(&control.spec.label),
-                        node.rect.x + NAVIGATION_LABEL_LEAD,
-                        node.rect.right()
-                            - NAVIGATION_LABEL_END
-                            - navigation_trailing_reserve(&control.spec)
-                            - badge_reserve(&control.spec),
+                        node.rect.x + navigation_label_lead(&control.spec),
+                        node.rect.x
+                            + navigation_label_lead(&control.spec)
+                            + navigation_label_room(&control.spec, node.rect.width),
                     )
                 } else {
                     return None;
@@ -4171,15 +4232,23 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                     (required + slack).max(0.0),
                 ));
             };
+            // A destination's label set on lines ([`button_label_lines`]) is audited line by
+            // line, each in the room its row gives every line.
             let authored_available = (text_right - text_x).max(0.0);
             let available = effective_horizontal_width(node, text_x, text_right);
-            let painted = elide_text_label(label, authored_available, size, face);
+            let painted = button_label_lines(label)
+                .map(|line| elide_text_label(line, authored_available, size, face))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let required = button_label_lines(label)
+                .map(|line| crate::tray_raster::ui_text_width_for(face, line, size))
+                .fold(0.0_f32, f32::max);
             Some(finish_text_fit(
                 node,
                 "button",
                 label,
                 painted,
-                crate::tray_raster::ui_text_width_for(face, label, size),
+                required,
                 authored_available,
                 available,
             ))
@@ -5097,8 +5166,10 @@ fn paint_compiled_node(
             };
             if let Some(icon) = control.spec.visual_icon {
                 if navigation && rect.width >= 96.0 {
-                    let icon_rect = LogicalRect::new(rect.x + 6.0, rect.y, 28.0, rect.height);
-                    paint_button_icon(prims, icon_rect, icon, color);
+                    if !control.spec.icon_hidden {
+                        let icon_rect = LogicalRect::new(rect.x + 6.0, rect.y, 28.0, rect.height);
+                        paint_button_icon(prims, icon_rect, icon, color);
+                    }
                     let size = native_type_px(TypeStep::Secondary);
                     let visual_label = control
                         .spec
@@ -5106,26 +5177,30 @@ fn paint_compiled_node(
                         .as_ref()
                         .unwrap_or(&control.spec.label);
                     let trailing_reserve = navigation_trailing_reserve(&control.spec);
-                    let label = elide_text_label(
-                        visual_label,
-                        (rect.width
-                            - NAVIGATION_LABEL_LEAD
-                            - NAVIGATION_LABEL_END
-                            - trailing_reserve
-                            - badge_reserve(&control.spec))
-                        .max(0.0),
-                        size.get(),
-                        nav_face,
-                    );
-                    prims.push(text_prim(
-                        rect.x + NAVIGATION_LABEL_LEAD,
-                        row_baseline(rect.y, rect.height, size.get()),
-                        label,
-                        size,
-                        nav_weight,
-                        nav_face,
-                        rgba(color, 255),
-                    ));
+                    let room = navigation_label_room(&control.spec, rect.width);
+                    // Its label's lines, one under another, centred in the row: an author that
+                    // fitted a long name to a narrow row set it on more than one.
+                    let lines = button_label_lines(visual_label)
+                        .map(|line| elide_text_label(line, room, size.get(), nav_face))
+                        .collect::<Vec<_>>();
+                    let line_height = if lines.len() > 1 {
+                        native_button_line_height()
+                    } else {
+                        rect.height
+                    };
+                    let top =
+                        rect.y + ((rect.height - line_height * lines.len() as f32) / 2.0).max(0.0);
+                    for (index, line) in lines.into_iter().enumerate() {
+                        prims.push(text_prim(
+                            rect.x + navigation_label_lead(&control.spec),
+                            row_baseline(top + index as f32 * line_height, line_height, size.get()),
+                            line,
+                            size,
+                            nav_weight,
+                            nav_face,
+                            rgba(color, 255),
+                        ));
+                    }
                     if control.spec.badge {
                         paint_badge(
                             prims,
@@ -6180,6 +6255,11 @@ fn paint_button_icon_prims(
                 r: 1.3,
                 color: rgba(color, 220),
             });
+        }
+        ButtonIcon::Tabs => {
+            prims.push(outline(cx - 8.0, cy - 3.0, 16.0, 10.0, 2.0));
+            prims.push(outline(cx - 8.0, cy - 7.0, 7.0, 5.0, 1.5));
+            prims.push(outline(cx + 1.0, cy - 7.0, 7.0, 5.0, 1.5));
         }
         ButtonIcon::Trash => {
             prims.push(line(cx - 6.0, cy - 5.0, 12.0, 1.0));
@@ -7979,6 +8059,10 @@ pub(crate) fn joined_as_named(visual: &str, name: &str) -> String {
             .is_some_and(|stem| name.contains(&format!("{stem}{first}")));
         if unhyphenated {
             out.pop();
+        } else if name.contains(&format!("{last}{FACT_SEPARATOR}{first}"))
+            && !name.contains(&format!("{last} {first}"))
+        {
+            out.push_str(FACT_SEPARATOR);
         } else if !name.contains(&format!("{last}{first}"))
             || name.contains(&format!("{last} {first}"))
         {
@@ -10537,6 +10621,8 @@ pub(crate) mod tests {
             ),
             ("Open\u{2026} site", "Open Project Site"),
             ("", "A card's surface"),
+            // A wrap's break that took the fact separator.
+            ("Problems\n5", "Problems \u{b7} 5"),
         ] {
             assert!(
                 visible_label_in_name(visual, name),
@@ -10550,6 +10636,7 @@ pub(crate) mod tests {
             ("Card\u{2026}dis", "Discard"),
             ("View", "Review in Modified: the unsaved Settings drafts"),
             ("Art", "Restart now"),
+            ("Problems\n6", "Problems \u{b7} 5"),
         ] {
             assert!(
                 !visible_label_in_name(visual, name),
@@ -11121,6 +11208,7 @@ pub(crate) mod tests {
             ButtonIcon::Sound,
             ButtonIcon::Themes,
             ButtonIcon::Spark,
+            ButtonIcon::Tabs,
             ButtonIcon::Trash,
             ButtonIcon::Reset,
             ButtonIcon::Clear,

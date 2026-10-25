@@ -568,7 +568,8 @@ impl CursorRainbow {
         }
         let (pop, shimmer) = match self.twinkle_at {
             Some(t0) => {
-                let u = now.saturating_duration_since(t0).as_secs_f32() / TWINKLE_DUR;
+                const INV_TWINKLE_DUR: f32 = 1.0 / TWINKLE_DUR;
+                let u = now.saturating_duration_since(t0).as_secs_f32() * INV_TWINKLE_DUR;
                 if u >= 1.0 {
                     self.twinkle_at = None;
                     (0.0, 0.0)
@@ -616,7 +617,8 @@ impl CursorRainbow {
             fill = mix_rgb(fill, glint, TWINKLE_MIX * pop * cfg.intensity);
         }
         let caret_floor = if dark_theme && paint > 0.0 {
-            RAINBOW_CARET_LIGHT_FLOOR * aterm_render::smoothstep01(paint / CARET_LIGHT_KNEE)
+            const INV_CARET_LIGHT_KNEE: f32 = 1.0 / CARET_LIGHT_KNEE;
+            RAINBOW_CARET_LIGHT_FLOOR * aterm_render::smoothstep01(paint * INV_CARET_LIGHT_KNEE)
         } else {
             0.0
         };
@@ -664,10 +666,11 @@ impl CursorRainbow {
             let cx = geom.origin_x as i32 + cc as i32 * cw;
             let cy = geom.origin_y as i32 + cr as i32 * ch;
             flare_pop = flare_age.map_or(1.0, |age| {
+                const INV_FLARE_RING_TAU_S: f32 = 1.0 / FLARE_RING_TAU_S;
                 if age >= 20.0 * FLARE_RING_TAU_S {
                     1.0
                 } else {
-                    1.0 + FLARE_RING_POP * (-age / FLARE_RING_TAU_S).exp()
+                    1.0 + FLARE_RING_POP * (-age * INV_FLARE_RING_TAU_S).exp()
                 }
             });
             let halo_r = lerp(HALO_RADIUS_IDLE, HALO_RADIUS_MAX, paint);
@@ -690,8 +693,9 @@ impl CursorRainbow {
                     m.key.rings,
                 )
             });
+            const INV_HALO_SPAN: f32 = 1.0 / (HALO_LAYERS - 1) as f32;
             for layer in 0..HALO_LAYERS {
-                let t = layer as f32 / (HALO_LAYERS - 1) as f32;
+                let t = layer as f32 * INV_HALO_SPAN;
                 let gx = (t * radius_x) as i32 + 1;
                 let gy = (t * radius_y) as i32 + 1;
                 let falloff = (1.0 - t) * (1.0 - t);
@@ -833,12 +837,13 @@ impl CursorRainbow {
             } else {
                 self.rim_light_peak(&out[emitted_from..], dark_theme)
             };
-            let floor_weight = (caret_floor / RAINBOW_CARET_LIGHT_FLOOR).clamp(0.0, 1.0);
-            let promised_margin =
+            const INV_RAINBOW_CARET_LIGHT_FLOOR: f32 = 1.0 / RAINBOW_CARET_LIGHT_FLOOR;
+            let floor_weight = (caret_floor * INV_RAINBOW_CARET_LIGHT_FLOOR).clamp(0.0, 1.0);
+            const PROMISED_MARGIN: f32 =
                 RAINBOW_CARET_LIGHT_FLOOR * (1.0 - RAINBOW_SPARKLE_LIGHT_SHARE) - 2.0;
             fill = lift_to_light_floor(
                 fill,
-                ((rim_peak + promised_margin) * floor_weight).max(caret_floor),
+                ((rim_peak + PROMISED_MARGIN) * floor_weight).max(caret_floor),
             );
         }
 
@@ -938,8 +943,7 @@ impl CursorRainbow {
         if w == 0 || h == 0 || w * h > Self::CARET_RASTER_MAX {
             return (None, None);
         }
-        let table = crate::color_math::relative_luminance_table();
-        let base = crate::color_math::relative_luminance_with(table, page);
+        let base = crate::color_math::relative_luminance(page);
         let mut scratch = std::mem::take(&mut self.rim_scratch);
         scratch.clear();
         scratch.resize(w * h, 0);
@@ -997,11 +1001,14 @@ impl CursorRainbow {
             if !buckets_complete {
                 return None;
             }
-            let level = RAINBOW_FIELD_LEVEL.round() as u32;
-            let field = (level << 16) | (level << 8) | level;
-            let mut peak = crate::color_math::relative_luminance_with(table, field) * 255.0;
+            const FIELD: u32 = {
+                let level = RAINBOW_FIELD_LEVEL.round() as u32;
+                (level << 16) | (level << 8) | level
+            };
+            const FIELD_PEAK: f32 = crate::color_math::relative_luminance(FIELD) * 255.0;
+            let mut peak = FIELD_PEAK;
             for &(mask, _) in &buckets[..n_buckets] {
-                let mut px = field;
+                let mut px = FIELD;
                 let mut m = mask;
                 for &c in &cols[..rings_len] {
                     if m == 0 {
@@ -1013,8 +1020,8 @@ impl CursorRainbow {
                         px = crate::spectrum::compose_on_glass(px, c, 0);
                     }
                 }
-                if px != field {
-                    peak = peak.max(crate::color_math::relative_luminance_with(table, px) * 255.0);
+                if px != FIELD {
+                    peak = peak.max(crate::color_math::relative_luminance(px) * 255.0);
                 }
             }
             Some(peak)
@@ -1022,8 +1029,7 @@ impl CursorRainbow {
         let pile_light = |cols: &[u32; HALO_LAYERS as usize]| -> f32 {
             let mut aurora = 0.0f32;
             for (i, &px_count) in ring_pixels[..rings_len].iter().enumerate() {
-                aurora +=
-                    px_count as f32 * crate::color_math::relative_luminance_with(table, cols[i]);
+                aurora += px_count as f32 * crate::color_math::relative_luminance(cols[i]);
             }
             let mut sum = 0.0f32;
             for &(mask, count) in &buckets[..n_buckets] {
@@ -1040,8 +1046,8 @@ impl CursorRainbow {
                     }
                 }
                 if px != page {
-                    sum += count as f32
-                        * (crate::color_math::relative_luminance_with(table, px) - base).max(0.0);
+                    sum +=
+                        count as f32 * (crate::color_math::relative_luminance(px) - base).max(0.0);
                 }
             }
             sum + aterm_render::hdr::HDR_GLOW_BOOST * aurora
@@ -1142,13 +1148,14 @@ impl CursorRainbow {
         if w == 0 || h == 0 || w * h > Self::CARET_RASTER_MAX {
             return 255.0;
         }
-        let table = crate::color_math::relative_luminance_table();
-        let level = RAINBOW_FIELD_LEVEL.round() as u32;
-        let field = (level << 16) | (level << 8) | level;
-        let field_peak = crate::color_math::relative_luminance_with(table, field) * 255.0;
+        const FIELD: u32 = {
+            let level = RAINBOW_FIELD_LEVEL.round() as u32;
+            (level << 16) | (level << 8) | level
+        };
+        const FIELD_PEAK: f32 = crate::color_math::relative_luminance(FIELD) * 255.0;
         let mut scratch = std::mem::take(&mut self.rim_scratch);
         scratch.clear();
-        scratch.resize(w * h, field);
+        scratch.resize(w * h, FIELD);
         for q in quads {
             let x_off = (u32::from(q.x) - x0) as usize;
             let qw = usize::from(q.w);
@@ -1160,13 +1167,13 @@ impl CursorRainbow {
                 row_start += w;
             }
         }
-        let mut last_px = field;
-        let peak = scratch.iter().copied().fold(field_peak, |peak, px| {
-            if px == field || px == last_px {
+        let mut last_px = FIELD;
+        let peak = scratch.iter().copied().fold(FIELD_PEAK, |peak, px| {
+            if px == FIELD || px == last_px {
                 peak
             } else {
                 last_px = px;
-                peak.max(crate::color_math::relative_luminance_with(table, px) * 255.0)
+                peak.max(crate::color_math::relative_luminance(px) * 255.0)
             }
         });
         self.rim_scratch = scratch;
@@ -1273,12 +1280,11 @@ pub(crate) const fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
     if floor <= 0.0 || (rgb & 0x00FF_FFFF) == 0x00FF_FFFF {
         return rgb;
     }
-    let table = crate::color_math::relative_luminance_table();
     #[inline]
-    const fn light(table: &crate::color_math::RelativeLuminanceTable, c: u32) -> f32 {
-        crate::color_math::relative_luminance_with(table, c) * 255.0
+    const fn light(c: u32) -> f32 {
+        crate::color_math::relative_luminance(c) * 255.0
     }
-    if light(table, rgb) >= floor {
+    if light(rgb) >= floor {
         return rgb;
     }
     if floor >= 255.0 {
@@ -1299,7 +1305,7 @@ pub(crate) const fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
             hi = mid;
             continue;
         }
-        if light(table, mid_rgb) < floor {
+        if light(mid_rgb) < floor {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {

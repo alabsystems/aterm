@@ -5464,22 +5464,41 @@ pub(super) fn session_files_in(claude_dir: &Path) -> Option<Vec<SessionFile>> {
                 claude_dir: Some(claude_dir.to_path_buf()),
                 ..file
             }),
-            Some(file) if !writer_may_live(file_pid) && !writer_may_live(file.pid) => {}
-            None if !writer_may_live(file_pid) => {}
+            Some(file)
+                if !may_have_written(file_pid, &path) && !may_have_written(file.pid, &path) => {}
+            None if !may_have_written(file_pid, &path) => {}
             _ => return None,
         }
     }
     Some(files)
 }
 
+/// Whether `pid` may be the live writer of the session file at `path` ([`session_files_in`]):
+/// [`writer_may_live`], and the process at `pid` started no later than the file was last
+/// written, in whole seconds (an unread start or write time may), since a process that took the
+/// number after that never wrote it. Claude Code's own sweep removes a stale file only on
+/// `ESRCH`, so a file a crash left half-written stays while any process holds its number.
+fn may_have_written(pid: u32, path: &Path) -> bool {
+    if !writer_may_live(pid) {
+        return false;
+    }
+    let written = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs());
+    match (started_s(pid), written) {
+        (Some(started), Some(written)) => started <= written,
+        _ => true,
+    }
+}
+
 /// Whether `pid` may be this user's live Claude Code, writing the session file it names
-/// ([`session_files_in`]): a signal reaches it, where [`alive`] also counts `EPERM`, another
-/// user's process (root's included) that took the number and keeps the file from being judged;
-/// and, on macOS, it runs as this effective user and is no zombie, which `kill` answers as
-/// alive and [`aterm_uds::process::read_short_info`] does not find. Claude Code's own sweep
-/// removes a stale file only on `ESRCH`, so a file a crash left half-written stays while such a
-/// process holds its number.
-fn writer_may_live(pid: u32) -> bool {
+/// ([`session_files_in`], [`may_have_written`]): a signal reaches it, where [`alive`] also
+/// counts `EPERM`, another user's process (root's included) that took the number and keeps the
+/// file from being judged; and, on macOS, it runs as this effective user and is no zombie,
+/// which `kill` answers as alive and [`aterm_uds::process::read_short_info`] does not find.
+pub(super) fn writer_may_live(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let Ok(p) = libc::pid_t::try_from(pid) else {

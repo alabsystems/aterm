@@ -538,6 +538,38 @@ fn has_ext(list: &str, ext: &str) -> bool {
     list.split_ascii_whitespace().any(|e| e == ext)
 }
 
+/// `found` in the order a headless device tries them: those `is_drm` names first, then the
+/// rest, each kind in enumeration order.
+#[cfg(not(target_arch = "wasm32"))]
+fn drm_first<T: Copy>(found: &[T], mut is_drm: impl FnMut(T) -> bool) -> Vec<T> {
+    let (mut drm, rest): (Vec<T>, Vec<T>) = found.iter().copied().partition(|&d| is_drm(d));
+    drm.extend(rest);
+    drm
+}
+
+/// The first device `open` makes of `candidates`, tried in order, else `fallback`'s; the error
+/// names every refusal. `open` answers `None` for a candidate with no display, which refuses
+/// nothing.
+#[cfg(not(target_arch = "wasm32"))]
+fn first_that_opens<D: Copy, T>(
+    candidates: &[D],
+    mut open: impl FnMut(D) -> Option<Result<T, String>>,
+    fallback: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut refused = Vec::new();
+    for &candidate in candidates {
+        match open(candidate) {
+            Some(Ok(dev)) => return Ok(dev),
+            Some(Err(e)) => refused.push(e),
+            None => {}
+        }
+    }
+    fallback().map_err(|e| {
+        refused.push(e);
+        refused.join("; ")
+    })
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl GlDevice {
     /// A headless device: no window system, rendering only into textures it reads back.
@@ -568,42 +600,54 @@ impl GlDevice {
         } else {
             &[ffi::EGL_NONE as ffi::EGLAttrib]
         };
-        let mut display = ffi::EGL_NO_DISPLAY;
-        if has_ext(&client_exts, "EGL_EXT_platform_device")
+        // Each enumerated device in turn, a DRM device first: one whose driver cannot initialize
+        // (zink over a Vulkan that exports no memory fd, as Venus in a krunkit guest) passes
+        // to the next, Mesa's software device, which zink then runs fd-less on the same GPU.
+        // Without reference tracking a refused device stays initialized, as a refusal left it
+        // before: terminating it could end another holder's display.
+        let devices = if has_ext(&client_exts, "EGL_EXT_platform_device")
             && has_ext(&client_exts, "EGL_EXT_device_enumeration")
-            && let Some(device) = Self::pick_device(egl, &client_exts)
         {
+            Self::devices_in_order(egl, &client_exts)
+        } else {
+            Vec::new()
+        };
+        let on_device = |device: ffi::EGLDeviceEXT| {
             // SAFETY: a device enumerated just now and a terminated list.
-            display = unsafe {
+            let display = unsafe {
                 (egl.fns.get_platform_display)(
                     ffi::EGL_PLATFORM_DEVICE_EXT,
                     device,
                     attribs.as_ptr(),
                 )
             };
-        }
-        if display == ffi::EGL_NO_DISPLAY && has_ext(&client_exts, "EGL_MESA_platform_surfaceless")
-        {
-            // SAFETY: a known platform enum, the default native display and an EGL_NONE-terminated
-            // attribute list.
-            display = unsafe {
-                (egl.fns.get_platform_display)(
-                    ffi::EGL_PLATFORM_SURFACELESS_MESA,
-                    ffi::EGL_DEFAULT_DISPLAY,
-                    attribs.as_ptr(),
-                )
-            };
-        }
-        let mut tracked = tracked && display != ffi::EGL_NO_DISPLAY;
-        if display == ffi::EGL_NO_DISPLAY {
-            // SAFETY: EGL_DEFAULT_DISPLAY is always a legal argument.
-            display = unsafe { (egl.fns.get_display)(ffi::EGL_DEFAULT_DISPLAY) };
-            tracked = false;
-        }
-        if display == ffi::EGL_NO_DISPLAY {
-            return Err(format!("gl: no EGL display ({})", egl.error_name()));
-        }
-        Self::on_display(egl, display, tracked, None)
+            (display != ffi::EGL_NO_DISPLAY).then(|| Self::on_display(egl, display, tracked, None))
+        };
+        let surfaceless = || {
+            let mut display = ffi::EGL_NO_DISPLAY;
+            if has_ext(&client_exts, "EGL_MESA_platform_surfaceless") {
+                // SAFETY: a known platform enum, the default native display and an
+                // EGL_NONE-terminated attribute list.
+                display = unsafe {
+                    (egl.fns.get_platform_display)(
+                        ffi::EGL_PLATFORM_SURFACELESS_MESA,
+                        ffi::EGL_DEFAULT_DISPLAY,
+                        attribs.as_ptr(),
+                    )
+                };
+            }
+            let mut tracked = tracked && display != ffi::EGL_NO_DISPLAY;
+            if display == ffi::EGL_NO_DISPLAY {
+                // SAFETY: EGL_DEFAULT_DISPLAY is always a legal argument.
+                display = unsafe { (egl.fns.get_display)(ffi::EGL_DEFAULT_DISPLAY) };
+                tracked = false;
+            }
+            if display == ffi::EGL_NO_DISPLAY {
+                return Err(format!("gl: no EGL display ({})", egl.error_name()));
+            }
+            Self::on_display(egl, display, tracked, None)
+        };
+        first_that_opens(&devices, on_device, surfaceless)
     }
 
     /// A device on a window system's display, the one its windows' surfaces are made on.
@@ -744,14 +788,15 @@ impl GlDevice {
         Ok(dev)
     }
 
-    fn pick_device(egl: &Egl, client_exts: &str) -> Option<ffi::EGLDeviceEXT> {
+    /// The enumerated devices, the DRM ones first, each kind in EGL's order.
+    fn devices_in_order(egl: &Egl, client_exts: &str) -> Vec<ffi::EGLDeviceEXT> {
         // SAFETY: eglGetProcAddress returns null or the named extension function, whose registry
         // signature the alias types declare.
         let (query_devices, query_string) = unsafe {
             let q = (egl.fns.get_proc_address)(c"eglQueryDevicesEXT".as_ptr());
             let s = (egl.fns.get_proc_address)(c"eglQueryDeviceStringEXT".as_ptr());
             if q.is_null() {
-                return None;
+                return Vec::new();
             }
             (
                 std::mem::transmute::<*const c_void, ffi::QueryDevicesFn>(q),
@@ -765,17 +810,16 @@ impl GlDevice {
         let ok =
             unsafe { query_devices(devices.len() as EGLint, devices.as_mut_ptr(), &raw mut n) };
         let found = &devices[..usize::try_from(n).unwrap_or(0).min(devices.len())];
-        if ok != ffi::EGL_TRUE || found.is_empty() {
-            return None;
+        if ok != ffi::EGL_TRUE {
+            return Vec::new();
         }
-        let hardware = query_string.and_then(|query| {
-            found.iter().copied().find(|&d| {
+        drm_first(found, |d| {
+            query_string.is_some_and(|query| {
                 // SAFETY: an enumerated device; the string is static.
                 let exts = unsafe { ffi::c_string(query(d, ffi::EGL_EXTENSIONS)) };
                 has_ext(&exts, "EGL_EXT_device_drm")
             })
-        });
-        Some(hardware.unwrap_or(found[0]))
+        })
     }
 
     fn on_display(
@@ -1124,6 +1168,61 @@ mod tests {
     use super::*;
 
     use super::super::test_device as device;
+
+    #[test]
+    fn a_headless_device_tries_every_drm_device_before_the_rest() {
+        // A krunkit guest's Mesa lists the virtio-gpu DRM device and the software device; zink
+        // cannot initialize the first, so the second must still be tried.
+        let found = ["software-a", "card0", "software-b", "card1"];
+        let order = drm_first(&found, |d| d.starts_with("card"));
+        assert_eq!(order, ["card0", "card1", "software-a", "software-b"]);
+        assert_eq!(
+            drm_first(&found, |_| false),
+            found,
+            "no DRM device: EGL's order"
+        );
+        assert!(drm_first::<&str>(&[], |_| true).is_empty());
+    }
+
+    #[test]
+    fn a_refused_device_passes_to_the_next_and_the_error_names_every_refusal() {
+        // Venus's DRM device refuses (EGL_NOT_INITIALIZED); the software device after it opens.
+        let order = ["card0", "card1", "software"];
+        let mut tried = Vec::new();
+        let opened = first_that_opens(
+            &order,
+            |d| {
+                tried.push(d);
+                Some(if d == "software" {
+                    Ok(d)
+                } else {
+                    Err(format!("{d}: eglInitialize: EGL_NOT_INITIALIZED"))
+                })
+            },
+            || panic!("the surfaceless display is tried only once every device refused"),
+        );
+        assert_eq!(opened, Ok("software"));
+        assert_eq!(
+            tried, order,
+            "each device in order, up to the one that opens"
+        );
+
+        // A device with no display refuses nothing; every refusal, the fallback's last, is named.
+        let refused = first_that_opens(
+            &order,
+            |d| (d != "card1").then(|| Err::<&str, _>(format!("{d} refused"))),
+            || Err("gl: no EGL display".to_owned()),
+        );
+        assert_eq!(
+            refused,
+            Err("card0 refused; software refused; gl: no EGL display".to_owned())
+        );
+        assert_eq!(
+            first_that_opens::<&str, _>(&[], |_| None, || Ok("surfaceless")),
+            Ok("surfaceless"),
+            "no device: the surfaceless display"
+        );
+    }
 
     #[test]
     fn the_context_is_current_only_inside_a_guard_and_moves_between_threads() {

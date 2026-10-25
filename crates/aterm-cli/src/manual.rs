@@ -99,13 +99,14 @@ fleet member, or one where the ALab vault answers). Elsewhere those groups start
 Leave as is, and their rows still show the value now and the value setup wants. Once
 aterm finds the ALab signal, in the same launch or a later one, it widens the plan it
 chose by itself and says so on the page, and a Stop while it widens puts that plan
-back; a plan you shaped, or a Restore left, is never changed, and pressing any group,
+back as yours, never widened again; a plan you shaped, or a Restore left, is never
+changed, and pressing any group,
 even to what it already is, makes the plan yours. Setup starts as soon as the tab is
 shown, with no countdown. A group's Set up / Leave as is takes effect at once, and
 Stop, beside the headline while a run is going, ends that run between steps. Closing
-the tab never cancels. System State remains available to rerun setup or restore
-preferences. Terminal and ssh sessions, -e commands, headless runs, private lab homes
-and utilities never start setup.
+the tab never cancels. System State remains available to rerun setup or to press
+Restore previous settings. Terminal and ssh sessions, -e commands, headless runs,
+private lab homes and utilities never start setup.
 
 Setup choices:
   Caps Lock as Control; natural scrolling off; trackpad momentum scrolling on
@@ -122,8 +123,12 @@ Setup choices:
 
 Approved setup resumes unfinished steps on later launches, silently, and so does a
 choice cut short by a quit or a crash, which still sets only what it changed. A choice
-made while another setup step holds the records waits up to ten seconds for it to
-finish. A row that waits for you is not retried until you act, press Check again, or
+made while another setup holds the records (another aterm, or aterm doctor in a
+terminal) waits for it and is applied when it finishes, as is a Restore; a later choice
+replaces it, and the page says it waits, with no failure. A saved setup record that
+cannot be parsed twice in a row is kept beside itself as <name>.unreadable, and setup
+goes on as from a fresh one: your Mac settings left as they are, aterm's permissions
+set up. A row that waits for you is not retried until you act, press Check again, or
 launch aterm again; a vault approval waits the same way, and the run goes on once an
 admin Mac approves. A join turns sync on; with sync turned off since, the join lands
 once you turn it on again (`aterm secrets agent on`), and the run does not wait for it.
@@ -134,7 +139,9 @@ anything when the tab is shown, after each step and on Check again; GitHub repos
 is read only while it is set up, or on Check again. macOS never tells an app whether it
 may use the local network: Local Network reads On once aterm reached the LAN, Off once
 macOS refused it (your answer, which aterm leaves), and otherwise shows — with a short
-note, so System State never waits on it. Completed setup preserves later local changes:
+note, so System State never waits on it. The newest answer wins: a later Local Network
+question aterm raised, or a later look, replaces an old refusal, and Check again looks
+again without ever asking. Completed setup preserves later local changes:
 a group turned to Set up later sets only its own preferences, and a Join or a group
 turned to Leave as is sets none. So it is after an older aterm's setup: its plan gains
 aterm's permissions, and a choice never resets its Dock or signs out again. Rust in
@@ -143,13 +150,15 @@ by itself (the toolchain it is using moves at its next update, which the row not
 your projects' build folders Spotlight indexes are yours, counted in the row's note and
 never moved.
 
-Only changed preference keys are backed up (no credentials). Restore preferences puts
-them back, stops automatic setup and turns Keyboard & Trackpad and Desktop & Dock to
-Leave as is, leaving cloned repos, credentials, sign-outs and aterm's permissions in
+Only changed preference keys are backed up (no credentials). Restore previous settings
+puts them back, stops automatic setup and turns Keyboard & Trackpad and Desktop & Dock
+to Leave as is, leaving cloned repos, credentials, sign-outs and aterm's permissions in
 place (its permission steps go on by themselves, also after a Restore or `doctor
 --apply` a quit or a crash cut short, which the next launch finishes; after a Restore
 that left no run to carry them, an older aterm's or one pressed before you answered the
-first offer, aterm sets them up with nothing else, at once or at the next launch);
+first offer, aterm sets them up with nothing else, at once or at the next launch, and
+restoring an older aterm's finished setup keeps them on; a choice you made after a
+Restore that a quit cut short is offered again at the next launch, never undone);
 turning one of those groups back to Set up sets only that group, and a Join or a group
 turned to Leave as is sets none. The Caps Lock key, a scroll direction the Mac had never set,
 Trackpad scrolling, and any setting whose app did not relaunch, come back at your next
@@ -164,7 +173,8 @@ any other setup step holding its records lets go), unless Desktop & Dock was tur
 to Set up since, or Set up now set it; no choice, Set up now or
 Join in between drops that put-back. `doctor --apply` applies the preference and
 account profile and adds aterm's permissions to the plan, unless setup was cancelled
-(a Restore withdraws none), and finishes a run a Restore ended; System State also
+(a Restore withdraws none), and finishes a run a Restore ended or one still waiting
+for setup's offer, so the next launch reruns nothing it did; System State also
 does Spotlight, the vault and repositories. The Messages and FaceTime sign-outs run
 last, only while System State is on screen, where Stop can end them.
 
@@ -215,6 +225,14 @@ KEY USAGE
   aterm --window             a GUI window: tabs, splits and the `❯` menu
                              (`aterm help needs`)
 
+REWIND
+  View > Rewind Pane (Cmd-Shift-R, or `aterm ctl rewind open`) freezes the focused pane
+  on a past screen its recorder kept. Left/Right step one recorded slice and Esc returns
+  to live; meanwhile keys and clicks reach no program, and its output keeps arriving
+  underneath. The band says whether a live witness checked that state (`faithful`,
+  `may differ from what was on screen`, or `unchecked`). It needs Settings > Terminal >
+  Rewind (`temporal_recording = true`) turned on before the tab opens.
+
 GOTCHAS
   * `aterm <tool>` for an uninstalled store tool exits 127 with `atpkg: <tool> is not
     installed (fix: aterm pkg install <tool>)`, or the recorded reason it is
@@ -254,16 +272,16 @@ GOTCHAS
     },
     Topic {
         name: "abrew",
-        tagline: "aterm's Homebrew: brew re-routed to abrew, real brew one flag away",
+        tagline: "native brew compatibility inside atpkg, with no Homebrew fallback",
         body: Some(
-            r#"abrew — aterm's Homebrew (`abrew`, `atpkg-abrew`, `aterm pkg abrew`).
+            r#"abrew — native brew compatibility inside atpkg (`abrew`, `atpkg-abrew`, `aterm pkg abrew`).
 
 WHAT IT IS
   `brew` reimplemented in Rust inside atpkg, over formulae.brew.sh and GHCR bottles,
   with its own prefix, cellar and receipts; it runs no Ruby. Inside an aterm session
-  `brew` reroutes to `abrew` with a one-line stderr notice. Real Homebrew is never
-  modified; `abrew bundle` lays a pinned Homebrew under the abrew prefix for the
-  operations abrew hands off.
+  `brew` reroutes to `abrew` with a one-line stderr notice. It never installs,
+  bundles or invokes real Homebrew. Unsupported operations report a native
+  capability gap; this is a restricted subset of brew compatibility.
 
 KEY USAGE (`abrew help <command>` has each one's flags)
   abrew install [--formula|--cask] <name>…     bottles and tar/zip/DMG/single-file casks
@@ -271,26 +289,31 @@ KEY USAGE (`abrew help <command>` has each one's flags)
   abrew update / upgrade / outdated / list / info / search / doctor
   abrew deps [--tree] / uses / leaves / missing / autoremove / cleanup
   abrew tap <user/repo>                        managed tap clones
-  abrew bundle [status|remove|dump|check|install]
+  abrew bundle [install|check|dump]             native Brewfile operations
+  abrew bundle status | remove                 inspect/remove an owned legacy bundle
   abrew shellenv [<shell>]                     ABREW_PREFIX, PATH, MANPATH, INFOPATH
   abrew on | off | status                      the brew reroute switch
 
   Source builds (`-s`/`--HEAD`), `user/repo/name` tap formulae, post-install
   recipes, services, `--zap`, pkg casks and bottles abrew cannot relocate (`:any`
-  needs macOS and the developer tools) run real Homebrew, before any change is
-  made; a need found only after abrew has changed the prefix fails instead.
+  needs macOS and the developer tools) fail with an unsupported-native error.
+  Install batches are planned before package changes; a later unsupported
+  member after native progress is reported as failed/skipped.
 
-ESCAPES — real Homebrew, unchanged
-  brew --real <cmd>…     one command, real brew (bundled first, then system)
-  ABREW_REAL=1           this shell runs real brew
-  abrew off              persistent, until `abrew on`
-  [abrew] enabled=false  in aterm.toml: no stub is laid
+BREWFILES AND DISABLING
+  Bare `abrew bundle` (also `bundle --file <path>`) installs a native Brewfile.
+  Simple quoted `tap`, `brew` and `cask` entries are supported; Ruby and unsupported
+  options fail before entry processing. Existing legacy Homebrew bundles remain
+  untouched unless explicitly removed with `bundle remove` after ownership checks.
+  `abrew off` or [abrew] enabled=false retains the managed brew stub and refuses
+  compatibility commands while disabled; `on` and `status` remain available.
+  `brew --real`, `brew --no-reroute` and ABREW_REAL refuse rather than select real Homebrew.
 
 GOTCHAS
   * `abrew linkage <formula>…` (macOS) reports build-prefix references and missing
     libraries in a keg's Mach-O files; `abrew doctor` reports prefix problems. Both
     exit 1 on any; `aterm pkg doctor` checks the `brew` stub.
-  * `abrew config` prints `ABREW_*` variables (`brew --real config` prints `HOMEBREW_*`)."#,
+  * `abrew config` prints `ABREW_*` variables for the native prefix."#,
         ),
     },
     Topic {
@@ -704,11 +727,14 @@ AUTOPILOT — how far the harness carries a session's work
     until=+2h`, or `[harness] land_at = "18:00"`; chip: `keeps going until then,
     finding more to do`) switches to `land` at `land_at=`.
   * land (`⤓ land`; chip: `wrapping up: landing everything on the remote main branch,
-    then stopping`) — continues every turn end until all of the work is on the remote
-    main branch (`git` confirms nothing uncommitted, unpushed, unmerged, parked on a
-    branch or left for later) and the reply defends that in a few lines starting
-    `Nothing left:`. That marks `task=landed` (`✓ landed`) and stops typing until
-    someone else's turn.
+    then stopping`) — continues every turn end until the reply defends in a few lines
+    starting `Nothing left:` that all of the work is on the remote main branch, leaving
+    nothing open or for later, and `git` in the session's repository finds nothing
+    uncommitted, untracked, stashed on its branch, unpushed or off the remote's main
+    branch. That check counts nothing unpushed where the repository has no remote, and
+    reads nothing in a folder that is not a repository, one macOS guards, a network or
+    automounted volume, or where no `git` runs; codex-alab lands by its own check. That
+    marks `task=landed` (`✓ landed`) and stops typing until someone else's turn.
   * off (`○ off`; chip: `hands off`) — nothing is pressed or typed.
 
   Task states (`status task=`): `open` (work goes on), `landed` (a clean `Nothing
@@ -821,7 +847,17 @@ THE FOOTER
   drawn (`face=`, `drawn=`, `spoken=`, `description=`; a debug build adds `title=`,
   the title its hover reads).
   Settings ▸ Harness shows the supervised sessions, what the harness decided for you,
-  a 7-day comparison of the Autopilot modes, and every `[harness]` key.
+  a 7-day comparison of the Autopilot modes, and every `[harness]` key. Its WHAT THE
+  HARNESS DID counts today and the last 7 days: `past “done”` (turns it kept going
+  past an agent's "done"), `Waited for you` (times it stopped and asked you, and how
+  long it waited), `Needs, carried on` (NEEDS YOU lines it put on screen while the work
+  went on), and one `None in 7 days` row naming every count the week has none of.
+  The menu bar's This Mac row counts a Land session that holds as `landing` (a need
+  or a wait it carries counts first, as `need you` or `waiting`; a Cruise session at
+  rest is `resting`), so its `landing` can be smaller than the page's Every session
+  row, which counts every open Land session. The Overview's row of a landed task says
+  `task landed` and `driven by aterm (land)`; the tab's hover says `driven by aterm
+  (land, landed)`.
 
   `aterm ctl @<sid> occupancy why` says why the occupancy door typed a line at a break,
   or why it did not; `occupancy check --replay 24h` replays a day of looks.
@@ -876,8 +912,11 @@ KEY USAGE (`aterm pkg --help` lists every verb, plumbing included)
                              nothing builds into, and pinned tools not run for a month
   aterm pkg lease <toolchain-dir> -- <command> [args…]
                              keep a toolchain build from cleanup and swap while it runs
+  aterm pkg capacity [--json] [<path>]
+                             the machine's free cores, memory, swap and disk above the floor,
+                             and the claims heavy and timing-sensitive work holds or waits for
   aterm pkg abrew <brew-command> [args…]
-                             aterm's Homebrew (`aterm help abrew`)
+                             native brew compatibility inside atpkg (`aterm help abrew`)
   aterm pkg self-uninstall [--dry-run]
                              remove what install.sh placed, each part only if aterm's
 
@@ -2273,8 +2312,9 @@ THE SURVEY & CHANNELS
 GOTCHAS
   * Hand over a task with `spawn agent=… -`, never by typing a `turn` into someone
     else's session.
-  * `done` means the harness saw a clean `Nothing left:` and `git` confirmed everything
-    is on the remote main branch. Check the tests, builds and diffs yourself.
+  * `done` means a clean `Nothing left:` and a `git` check that found nothing left to
+    land where it could read (codex-alab runs its own; `aterm help harness` names where
+    the check cannot read). Check the tests, builds and diffs yourself.
   * `ERR unsupervised: <switch>` names the setting that keeps the harness off that
     agent (`[harness] enabled`, `headless` or `autopilot`, or `[harness.<agent>]`)."#;
 
@@ -2487,7 +2527,8 @@ MEMBERSHIP
   join code to a 0600 file and prints that file's path (never the code), and sets
   `[fleet]` (port 7100). `aterm fleet join` on each other machine reads the code from
   stdin, `--code-file F` or a hidden prompt, never an argument. `init --rotate` mints
-  a new secret; `peers` checks every known peer (3 s) and `peers add|rm` edits the
+  a new secret, which every member joins again with and which keeps no drive grant on
+  either side; `peers` checks every known peer (3 s) and `peers add|rm` edits the
   book of peers (`add` refuses an address past the LAN, and this machine's own
   listener, writing nothing); `leave` removes the fleet secret, the join code, both
   books and `[fleet]`'s listen, allow and drive_from (the node id and node key stay).
@@ -2504,6 +2545,7 @@ READING & DRIVING ACROSS THE FLEET
     node key) may run `aterm ctl --host <h> spawn agent=<word>` here, with `await task`,
     `result`, `status`, `text`, `screen`, `turn`, `key`, `send`, `hold` and `close`
     (`aterm help workers`). A local Take Over always wins and lifts remote holds.
+    Every write that leaves the level below drive removes every grant and says so.
 
 FILES & CONFIG (`<state>` is `~/Library/Application Support/aterm` on macOS)
   `fleet.key`, `fleet-join-code`, `fleet-node`, `fleet-node-key`, `fleet-peers`,

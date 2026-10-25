@@ -30,8 +30,10 @@ pub const fn flight_ms(cells: f32) -> f32 {
 /// [`flight_ms`] as a [`Duration`], for minting the arrival edge.
 #[inline]
 #[must_use]
-pub fn flight(cells: f32) -> Duration {
-    Duration::from_secs_f32(flight_ms(cells) / 1000.0)
+pub const fn flight(cells: f32) -> Duration {
+    Duration::from_nanos(
+        ((flight_ms(cells) * (1.0 / 1000.0)) as f64 * 1_000_000_000.0).round() as u64,
+    )
 }
 
 /// Exponent of the landing's impact curve.
@@ -47,7 +49,7 @@ pub const fn impact(cells: f32) -> f32 {
     if !cells.is_finite() || cells <= 0.0 {
         return 1.0;
     }
-    crate::color_math::powf_pos_f32(cells / JUMP_MIN_CELLS as f32, IMPACT_EXP)
+    crate::color_math::powf_pos_f32(cells * (1.0 / JUMP_MIN_CELLS as f32), IMPACT_EXP)
         .clamp(1.0, IMPACT_MAX)
 }
 
@@ -175,7 +177,7 @@ pub const fn rain_spacing_ms(flight_ms: f32) -> f32 {
     if !flight_ms.is_finite() {
         return RAIN_SPACING_MIN_MS;
     }
-    (flight_ms / FAN_HERO_N as f32).clamp(RAIN_SPACING_MIN_MS, RAIN_SPACING_MAX_MS)
+    (flight_ms * (1.0 / FAN_HERO_N as f32)).clamp(RAIN_SPACING_MIN_MS, RAIN_SPACING_MAX_MS)
 }
 
 /// `12·n + 240` ms.
@@ -217,7 +219,7 @@ pub const EDGE_IN_S: f32 = 0.018;
 #[inline]
 #[must_use]
 pub const fn edge_in(age_s: f32) -> f32 {
-    smoothstep01(age_s / EDGE_IN_S)
+    smoothstep01(age_s * (1.0 / EDGE_IN_S))
 }
 
 /// `enter-at-speed`.

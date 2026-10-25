@@ -4738,9 +4738,9 @@ mod a11y_message_wiring_tests {
             "the folded row is off the glass"
         );
         assert_eq!(
-            app.message_band_rows, 2,
-            "the count holds through its quiet (D1's hysteresis shrinks late): an \
-             activate never re-grids the terminal under the reader"
+            app.message_band_rows, 1,
+            "Settings came to the front: the folded row's band row went with it, so \
+             Settings is laid out without it (no quiet is kept for a view that left)"
         );
         assert!(
             app.grid_a11y_messages(wid)

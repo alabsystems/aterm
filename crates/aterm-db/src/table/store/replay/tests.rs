@@ -442,7 +442,7 @@ fn quarantined_cutoff_frontiers_do_not_change_projection_between_replicas() {
 }
 
 #[test]
-fn filtering_quarantine_does_not_restore_a_known_equivocating_writer() {
+fn discarded_source_never_launders_a_selected_fork() {
     let f = Fixture::new(true, false, false);
     f.recover();
     let a = f.lab.bootstrap(0);

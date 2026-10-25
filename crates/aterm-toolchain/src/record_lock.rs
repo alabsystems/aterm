@@ -38,6 +38,30 @@ impl RecordLock {
         }
     }
 
+    /// Take `file`'s exclusive lock, blocking until the handle that holds it lets go (or its
+    /// process ends, which lets go of it whatever ended it).
+    ///
+    /// # Errors
+    /// The OS error.
+    pub fn lock(file: File, record: u64) -> std::io::Result<Self> {
+        let file: std::fs::File = file;
+        #[cfg(windows)]
+        {
+            record_range::lock(&file, record)?;
+            Ok(Self { file, record })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = record;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the record guard's own take: its Drop releases by LOCK_UN"
+            )]
+            file.lock()?;
+            Ok(Self { file })
+        }
+    }
+
     /// Let the lock go, keeping the file open.
     pub fn unlock(&self) {
         #[cfg(windows)]
@@ -144,6 +168,28 @@ mod record_range {
             Err(std::fs::TryLockError::WouldBlock)
         } else {
             Err(std::fs::TryLockError::Error(err))
+        }
+    }
+
+    /// [`try_lock`]'s range, waiting while another handle holds part of it.
+    pub(super) fn lock(file: &File, record: u64) -> std::io::Result<()> {
+        let (mut overlapped, low, high) = range(record);
+        // SAFETY: as in `try_lock`; without `LOCKFILE_FAIL_IMMEDIATELY` the call returns once
+        // the range is this handle's.
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                low,
+                high,
+                &mut overlapped,
+            )
+        };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
         }
     }
 

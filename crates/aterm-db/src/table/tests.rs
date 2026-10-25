@@ -16,6 +16,59 @@ use std::{path::PathBuf, time::Duration};
 
 const NETWORK: [u8; 16] = [9; 16];
 
+#[test]
+fn a_public_foundation_never_requests_a_historical_epoch_key() {
+    let lab = Lab::with_foundation(&[Role::Writer, Role::Writer]);
+    for _ in 0..2 {
+        for n in 0..2 {
+            let bootstrap = lab.bootstrap(n);
+            let session = Session::open(&bootstrap).unwrap();
+            let (needs, next) = session.history_needs(None, 16).unwrap();
+            assert!(needs.is_empty());
+            assert!(next.is_some());
+            assert_ne!(next, Some(bootstrap.trust().genesis));
+            assert!(session.history_needs(next, 16).unwrap().0.is_empty());
+        }
+        lab.rotate(&[Role::Writer, Role::Writer]);
+    }
+}
+
+#[test]
+fn negative_only_ciphertext_never_promotes_malformed_payloads() {
+    let lab = Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let scope = session.scope().unwrap();
+    let mut wire = session
+        .seal(
+            scope,
+            Causal {
+                sequence: 1,
+                previous: None,
+                parents: &[],
+            },
+            b"metadata",
+        )
+        .unwrap();
+    assert!(session.negative_record(scope, &wire).unwrap().is_some());
+    let last_payload = wire.len() - 65;
+    wire[last_payload] ^= 1;
+    resign(&bootstrap, &mut wire);
+    assert!(session.authenticate(scope, &wire).is_err());
+    assert!(session.negative_record(scope, &wire).unwrap().is_none());
+    let foreign = Scope::new(scope.trust(), *scope.table(), 2).unwrap();
+    assert!(session.negative_record(foreign, &wire).is_err());
+}
+
+pub(crate) fn seal(
+    session: &Session<'_>,
+    scope: Scope,
+    causal: Causal<'_>,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    session.seal(scope, causal, payload)
+}
+
 pub(crate) struct Lab {
     pub(crate) _home: aterm_tempfile::TempDir,
     pub(crate) paths: Vec<Paths>,
@@ -26,12 +79,18 @@ impl Lab {
         Self::with_enrolled(roles, roles.len())
     }
     pub(crate) fn with_enrolled(roles: &[Role], enrolled: usize) -> Self {
+        Self::build(roles, enrolled, false)
+    }
+    pub(crate) fn with_foundation(roles: &[Role]) -> Self {
+        Self::build(roles, roles.len(), true)
+    }
+    fn build(roles: &[Role], enrolled: usize, foundation: bool) -> Self {
         let home = aterm_tempfile::tempdir().unwrap();
         let source = home.path().join("test.vault");
         let paths: Vec<_> = (0..roles.len())
             .map(|n| Paths::for_home(&home.path().join(format!("m{}", n + 1))))
             .collect();
-        client::create(&paths[0], source.to_str().unwrap(), None, Some("m1")).unwrap();
+        client::test_create_unbound(&paths[0], source.to_str().unwrap(), None, Some("m1")).unwrap();
         let admin = client::admin_open(&paths[0]).unwrap();
         let mut document = admin.doc.clone();
         for (n, path) in paths.iter().enumerate().skip(1) {
@@ -41,12 +100,19 @@ impl Lab {
                 .unwrap();
         }
         let hosts = || (1..=roles.len()).map(|n| format!("m{n}")).collect();
+        let anchor = foundation
+            .then(|| commons::node::Node::foundation(admin.commons_authority().unwrap()).unwrap());
+        let network = anchor.as_ref().map_or(NETWORK, |node| node.network());
+        let initial = anchor.map_or_else(
+            || b"pending".to_vec(),
+            |node| Descriptor::from_genesis(node).unwrap().bytes(),
+        );
         document
-            .set_entry(&Audience::Hosts(hosts()), commons::ENTRY, b"pending")
+            .set_entry(&Audience::Hosts(hosts()), commons::ENTRY, &initial)
             .unwrap();
         client::admin_publish(&paths[0], &admin, &document).unwrap();
         let admin = client::admin_open(&paths[0]).unwrap();
-        let enrollments = paths
+        let proofs: Vec<_> = paths
             .iter()
             .zip(roles)
             .enumerate()
@@ -54,18 +120,40 @@ impl Lab {
             .map(|(n, (path, role))| {
                 let device = Device::open(path).unwrap().unwrap();
                 let request = device
-                    .request(NETWORK, admin.config.signer.unwrap())
+                    .request(network, admin.commons_authority().unwrap())
                     .unwrap();
                 let (mut pending, challenge) =
-                    Pending::issue(&request, NETWORK, *request.binding().authority()).unwrap();
+                    Pending::issue(&request, network, *request.binding().authority()).unwrap();
                 let proof = pending
                     .verify(&device.answer(&request, &challenge).unwrap())
                     .unwrap();
-                Enrollment::new(format!("m{}", n + 1), proof, *role)
+                (format!("m{}", n + 1), proof, *role)
             })
             .collect();
-        let genesis = admin.prepare_commons_genesis(NETWORK, enrollments).unwrap();
-        let descriptor = Descriptor::from_genesis(genesis).unwrap();
+        let descriptor = if foundation {
+            let bootstrap = Bootstrap::cached(&paths[0]).unwrap().unwrap();
+            let mut journal =
+                Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust()).unwrap();
+            let grants = proofs
+                .into_iter()
+                .map(|(host, proof, role)| {
+                    let certificate = admin
+                        .approve_commons_member(&journal, &host, proof)
+                        .unwrap();
+                    Grant::certified(host, certificate, role)
+                })
+                .collect();
+            let first = admin.prepare_commons_rotation(&journal, grants).unwrap();
+            journal.ingest(first.bytes()).unwrap();
+            Descriptor::from_journal(&journal).unwrap()
+        } else {
+            let enrollments = proofs
+                .into_iter()
+                .map(|(host, proof, role)| Enrollment::new(host, proof, role))
+                .collect();
+            Descriptor::from_genesis(admin.prepare_commons_genesis(network, enrollments).unwrap())
+                .unwrap()
+        };
         document
             .set_entry(
                 &Audience::Hosts(hosts()),
@@ -81,7 +169,7 @@ impl Lab {
                     source: format!(
                         "{}#{}",
                         source.display(),
-                        aterm_secrets::b64::encode_padded(&descriptor.trust().authority)
+                        aterm_secrets::b64::encode_padded(&admin.config.signer.unwrap())
                     ),
                     host: Some(format!("m{}", n + 1)),
                     interactive: false,
@@ -114,8 +202,12 @@ impl Lab {
             .map(|(n, role)| {
                 let device = Device::open(&self.paths[n]).unwrap().unwrap();
                 let request = bootstraps[n].request().unwrap();
-                let (mut pending, challenge) =
-                    Pending::issue(&request, NETWORK, *request.binding().authority()).unwrap();
+                let (mut pending, challenge) = Pending::issue(
+                    &request,
+                    *request.binding().network(),
+                    *request.binding().authority(),
+                )
+                .unwrap();
                 let possession = pending
                     .verify(&device.answer(&request, &challenge).unwrap())
                     .unwrap();

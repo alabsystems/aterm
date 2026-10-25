@@ -909,11 +909,20 @@ fn shipped_and_the_demo_code_are_the_only_bases() {
     assert_eq!(v1.bases(), &BASES_V1);
     assert_eq!(
         MomentumCode::ALL,
-        &[MomentumCode::Shipped, MomentumCode::DemoStrandedSettle]
+        &[
+            MomentumCode::Shipped,
+            MomentumCode::Safe,
+            MomentumCode::DemoStrandedSettle
+        ]
     );
     assert_eq!(
         v1.base(Sched::Prebuilt(MomentumCode::Shipped)),
         Some(Replace::Optimization)
+    );
+    assert_eq!(
+        v1.base(Sched::Prebuilt(MomentumCode::Safe)),
+        None,
+        "the safe code is no base"
     );
     assert_eq!(
         v1.base(Sched::Prebuilt(MomentumCode::DemoStrandedSettle)),

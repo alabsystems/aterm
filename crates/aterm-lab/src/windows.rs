@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use aterm_toolchain::named_lock::Wait;
 use aterm_uds::spawnfd::Stdio;
 
 use crate::linux::{LaneLock, Out};
@@ -60,7 +61,9 @@ const BOOT_KEYS_FOR: Duration = Duration::from_secs(12);
 
 /// The verbs, as `windows help` prints them.
 pub const USAGE: &str = "\
-targo --unverified lab windows <verb> — the Windows runtime lane: a QEMU VM (hvf, Windows 11 arm64, Prism for x86_64)
+targo --unverified lab windows [--no-wait] <verb> — the Windows runtime lane: a QEMU VM (hvf, Windows 11 arm64, Prism
+for x86_64). One run holds the VM at a time: a verb that finds it held waits for that run to end, naming it (pid, verb,
+checkout, since when) as the wait starts and once a minute; --no-wait answers NOT RUN at once instead, naming it
   up [--vnc]               make the VM on first use (fetch Windows 11's arm64 ISO from Microsoft and virtio-win,
                            install unattended, provision Git, Visual Studio Build Tools and Rust {rust}, snapshot),
                            boot the snapshot; leaves it running. --vnc: a VNC server on 127.0.0.1 (debugging only)
@@ -93,12 +96,28 @@ targo --unverified lab windows <verb> — the Windows runtime lane: a QEMU VM (h
   destroy                  stop the VM and delete it (disk, firmware variables, TPM, key); the images stay cached
 ";
 
+/// `args` past the lane's own `--no-wait` (before the verb; one after it is the verb's), and
+/// whether a held lane is waited for.
+fn lane_flags(args: &[String]) -> (&[String], Wait) {
+    let mut args = args;
+    let mut wait = Wait::Block;
+    while let [flag, rest @ ..] = args
+        && flag == "--no-wait"
+    {
+        wait = Wait::No;
+        args = rest;
+    }
+    (args, wait)
+}
+
 /// `windows <verb> …`.
 /// # Errors
 /// A usage error, or a step that failed.
 pub fn cmd_windows(args: &[String]) -> Res {
+    let (args, wait) = lane_flags(args);
     let verb = args.first().map_or("help", String::as_str);
     let rest = args.get(1..).unwrap_or_default();
+    crate::linux::name_run(format!("lab windows {verb}"), wait);
     match verb {
         "up" => cmd_up(rest),
         "down" => cmd_down(),
@@ -389,7 +408,11 @@ fn curl_text(url: &str, referer: Option<&str>) -> Result<String, String> {
     }
 }
 
-fn curl_file(url: &str, dest: &Path, browser: bool) -> Result<(), String> {
+/// Fetch `url` to `dest` (through `dest.part`, renamed when whole); `browser` sends a browser's
+/// user agent.
+/// # Errors
+/// The download failed, or the rename.
+pub(crate) fn curl_file(url: &str, dest: &Path, browser: bool) -> Result<(), String> {
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -1853,9 +1876,10 @@ pub fn bring_up(vnc: bool) -> Result<Up, Fail> {
     })
 }
 
-/// The one lane run of this Mac.
+/// The one lane run of this Mac, waiting for the run that holds it ([`LaneLock::at`]).
 /// # Errors
-/// Another run holds it (NOT RUN), or the lock file cannot be made.
+/// `--no-wait` and another run holds it (NOT RUN, naming it), an interrupt while waiting, or the
+/// lock file cannot be made.
 pub fn lane_lock(l: &Layout) -> Result<LaneLock, Fail> {
     std::fs::create_dir_all(&l.home)
         .map_err(|e| Fail::die(format!("{}: {e}", l.home.display())))?;
@@ -2408,6 +2432,23 @@ pub fn released(code: i32, cleanup: Result<(), String>) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lane_waits_unless_no_wait_comes_before_the_verb() {
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let asked = words(&["--no-wait", "exec", "--", "cargo", "test"]);
+        assert_eq!(
+            lane_flags(&asked),
+            (&asked[1..], Wait::No),
+            "--no-wait before the verb is the lane's"
+        );
+        let asked = words(&["exec", "--", "x", "--no-wait"]);
+        assert_eq!(
+            lane_flags(&asked),
+            (&asked[..], Wait::Block),
+            "after the verb it is the verb's own word"
+        );
+    }
 
     /// A missing QEMU or swtpm is named with where the lane looked, never with an install
     /// command: aterm provides neither (init design §6.1 row 26). The lookup's own NOT RUN

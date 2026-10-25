@@ -650,8 +650,13 @@ fn install(
     run: &dyn Run,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let me = aterm_toolchain::named_lock::Holder::me(
+        "ship dev-app",
+        &std::env::current_dir().unwrap_or_default(),
+    );
     let _installing = crate::trust_lane::RunLock::take(
         &dir.join(INSTALL_LOCK),
+        &me,
         "another ship dev-app is installing here; install again once it ends",
     )?;
     let installed = dir.join(DEV_APP_NAME);
@@ -1333,8 +1338,10 @@ mod tests {
             .insert(exe.clone(), "aterm 0.104.0 (dev)".into());
         install(&app, &dest, false, None, &fake).expect("install");
 
-        let other = crate::trust_lane::RunLock::take(&dest.join(INSTALL_LOCK), "a test holds it")
-            .expect("free once an install returned");
+        let me = aterm_toolchain::named_lock::Holder::me("a test", &root);
+        let other =
+            crate::trust_lane::RunLock::take(&dest.join(INSTALL_LOCK), &me, "a test holds it")
+                .expect("free once an install returned");
         std::fs::write(app.join("Contents/MacOS/aterm"), b"exe 2").unwrap();
         let refused = install(&app, &dest, false, None, &fake).unwrap_err();
         assert!(

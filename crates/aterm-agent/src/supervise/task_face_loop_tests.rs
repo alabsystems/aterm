@@ -61,16 +61,16 @@ impl IdleHost for Faces {
     fn finished(&self) -> Option<bool> {
         self.finished
     }
-    fn repo_work(&self) -> crate::harness::repo_work::RepoRead {
+    fn repo_work(&self) -> Option<crate::harness::repo_work::RepoRead> {
         self.probes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        crate::harness::repo_work::RepoRead::of_found(
+        Some(crate::harness::repo_work::RepoRead::of_found(
             self.repos
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .pop_front()
                 .unwrap_or_else(|| self.repo.clone()),
-        )
+        ))
     }
     fn task_face(&self, face: TaskFace) {
         self.told
@@ -2024,6 +2024,7 @@ fn a_relaunched_task_landed_under_land_is_told_so_and_typed_nothing() {
     };
     let done = IdlePoint {
         done_under_land: true,
+        ..IdlePoint::default()
     };
     let (points, faces, turns, notes, lines) = carried("carry-landed", LANDING_REPLY, "land", true);
     assert_eq!(points, [done], "{notes:#?}");
@@ -2055,6 +2056,99 @@ fn a_relaunched_task_landed_under_land_is_told_so_and_typed_nothing() {
             "{tag}: {notes:#?}"
         );
     }
+}
+
+/// The idle point a host is offered names what holds a fact it would type there of its own
+/// (`IdlePoint::held`), read by the occupancy door's own guards at that point: a person who typed
+/// within `human_grace_s`, a turn that was a person's own exchange, a manager waiting on the
+/// session (its task record says it works). The exchange and the manager's wait hold the session
+/// for as long as they keep it, so the point names them as theirs too (`IdlePoint::theirs`); a
+/// person's grace alone does not. With none of them it names nothing, so the host types its
+/// fact.
+#[test]
+fn an_idle_point_names_the_guard_that_holds_a_fact_the_host_would_type() {
+    type More<'a> = &'a dyn Fn(&mut Mock);
+    let held = |tag: &str, screens: Vec<Vec<String>>, grace: u32, managed: bool, more: More<'_>| {
+        let host = Arc::new(Carrier::default());
+        let (dir, ledger) = files(tag, &[], &[]);
+        let mut m = Mock::new(screens);
+        m.history_served();
+        m.autopilot = Some("land");
+        m.vanish_after = Some(30);
+        m.cursor_on_caret = true;
+        m.stall_sleep = Some(Duration::from_millis(20));
+        if managed {
+            m.task = Some((
+                1,
+                "state=working from=s-0a1b since_ms=0 result_bytes=0".to_string(),
+            ));
+        }
+        more(&mut m);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig {
+                human_grace_s: grace,
+                ..owners_policy()
+            },
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            tasks: managed.then(|| dir.join("tasks")),
+            ..auto(30)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_turn_end_timing(TurnEndTiming {
+                short_backoff: Duration::from_millis(30),
+                short_backoff_max: Duration::from_millis(60),
+                ..TurnEndTiming::default()
+            });
+            s.set_approval_ledger(Some(ledger.clone()));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let points = host.points();
+        (
+            points.first().map(|p| (p.held, p.theirs)),
+            format!("{points:?}\n{lines:#?}"),
+        )
+    };
+    let none = |_: &mut Mock| {};
+    let (word, log) = held("held-person", vec![ended(PROGRESS)], 60, false, &|m| {
+        m.human_ms = Some(500);
+    });
+    assert_eq!(
+        word,
+        Some((Some(Guard::Person), None)),
+        "a person typed half a second ago: {log}"
+    );
+    let screens = vec![busy_screen(), ended(PROGRESS)];
+    let (word, log) = held("held-exchange", screens, 0, false, &|m| {
+        m.human_on.insert(0, "0");
+        m.human_on.insert(1, "0");
+    });
+    assert_eq!(
+        word,
+        Some((Some(Guard::Exchange), Some(Guard::Exchange))),
+        "the turn was the person's own: {log}"
+    );
+    let (word, log) = held("held-managed", vec![ended(PROGRESS)], 0, true, &none);
+    assert_eq!(
+        word,
+        Some((Some(Guard::Managed), Some(Guard::Managed))),
+        "a manager waits on the session: {log}"
+    );
+    let (word, log) = held(
+        "held-managed-person",
+        vec![ended(PROGRESS)],
+        60,
+        true,
+        &|m| {
+            m.human_ms = Some(500);
+        },
+    );
+    assert_eq!(
+        word,
+        Some((Some(Guard::Person), Some(Guard::Managed))),
+        "a person at a managed worker: the person holds it now, the manager for good: {log}"
+    );
+    let (word, log) = held("held-none", vec![ended(PROGRESS)], 60, false, &none);
+    assert_eq!(word, Some((None, None)), "nothing holds it: {log}");
 }
 
 /// A host that restarts its agent for the memory banner (`IdleHost::restart`: `adopted`) and
@@ -2201,7 +2295,8 @@ fn a_landing_the_memory_banner_cut_is_carried_on_after_its_restart() {
     assert_eq!(
         points.first(),
         Some(&IdlePoint {
-            done_under_land: true
+            done_under_land: true,
+            ..IdlePoint::default()
         }),
         "{log}"
     );

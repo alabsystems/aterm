@@ -91,9 +91,18 @@ pub(super) fn vault_here() -> VaultHere {
 /// first request can raise macOS's Local Network alert, so the caller holds a
 /// [`MacosDialog`] ([`vault_here_now`] takes one).
 pub(super) fn probe_vault() -> VaultHere {
+    let here = probe_lan();
+    LAST_PROBE.store(here.code(), Ordering::Release);
+    here
+}
+
+/// [`probe_vault`]'s look, keeping only what it heard of the LAN: what the last probe of this
+/// process heard of the vault ([`vault_here`]) stays as it was. Check again's look
+/// ([`super::probe_local_network_again`]).
+pub(super) fn probe_lan() -> VaultHere {
     use access::LanAnswer;
     use aterm_secrets::client::ProbeOutcome;
-    let here = match aterm_secrets::client::probe_default(PROBE_WAIT) {
+    match aterm_secrets::client::probe_default(PROBE_WAIT) {
         Ok(ProbeOutcome::Found(_)) => {
             access::lan_answered(LanAnswer::Reached);
             VaultHere::Found
@@ -110,9 +119,7 @@ pub(super) fn probe_vault() -> VaultHere {
             }
             VaultHere::Unreached
         }
-    };
-    LAST_PROBE.store(here.code(), Ordering::Release);
-    here
+    }
 }
 
 /// [`probe_vault`] while no other macOS dialog this process started is up (§6:
@@ -216,7 +223,8 @@ impl InitialSetupAuthorization {
 
 /// The plan a provisional `saved` one widens to once this Mac shows the ALab
 /// signal, or `None` when it stays: a person-shaped, stopped, cancelled or
-/// restored plan, or one that is already the whole profile. A Restore's record
+/// restored plan (a widen a Stop put back is the person's, [`put_back_held_widen`]),
+/// or one that is already the whole profile. A Restore's record
 /// holds it for as long as it stands ([`Restored`]), whatever was admitted since:
 /// widening would set again the groups the Restore put back and sign Messages and
 /// FaceTime out, which nothing undoes.
@@ -439,10 +447,11 @@ impl UpgradeProgress {
             .as_object_mut()
             .unwrap()
             .insert("upgrade".into(), marker);
+        revision::reserve(root, self.pending.revision)?;
         write_json(&root.join("automatic-plan.json"), &record)
     }
 
-    fn read(value: &Value, plan: &Plan) -> Result<Self, String> {
+    fn read(root: &Path, value: &Value, plan: &Plan) -> Result<Self, String> {
         if value["version"].as_u64() != Some(1) {
             return Err("unrecognized automatic upgrade recovery".into());
         }
@@ -452,13 +461,20 @@ impl UpgradeProgress {
             None => return Err("missing automatic upgrade predecessor".into()),
         };
         let pending = parse_progress(&value["pending"])?;
+        let previous_revision = previous.unwrap_or_default().revision;
+        // Older markers allocated exactly after their predecessor. A modern
+        // allocation may have a gap after an interrupted reservation or a
+        // legacy recovery, proven by its separate durable floor.
+        let follows = pending.revision == next_revision(previous_revision)?
+            || (pending.revision > previous_revision
+                && revision::reserved(root, pending.revision)?);
         if plan.selection != Selection::all()
             || !pending.belongs_to(plan)
             || pending.admitted
             || pending.completed
             || pending.stopped
             || pending.running.is_some()
-            || pending.revision != next_revision(previous.unwrap_or_default().revision)?
+            || !follows
             || pending.done & !previous.unwrap_or_default().done != 0
         {
             return Err("invalid automatic upgrade recovery".into());
@@ -507,7 +523,7 @@ pub(super) fn keep_upgrade(root: &Path, plan: &Plan, record: &mut Value) -> Resu
     let Some(marker) = existing.get("upgrade") else {
         return Ok(());
     };
-    let Ok(recovery) = UpgradeProgress::read(marker, plan) else {
+    let Ok(recovery) = UpgradeProgress::read(root, marker, plan) else {
         return Ok(());
     };
     if progress_file(root)? == recovery.previous {
@@ -541,7 +557,7 @@ pub(super) fn upgrade_progress(
     };
     let (plan, modern) = parse_plan_record(&record)?;
     let for_plan = physical.filter(|progress| progress.belongs_to(&plan));
-    let recovery = match UpgradeProgress::read(marker, &plan) {
+    let recovery = match UpgradeProgress::read(root, marker, &plan) {
         Ok(recovery) => recovery,
         Err(_) if for_plan.is_some() => return Ok(physical),
         Err(why) => return Err(why),
@@ -586,7 +602,8 @@ const PUT_BACK: &str = "put_back";
 
 /// A widened run a Stop held, and the run of the plan it widened that takes its place.
 struct PutBack {
-    /// The plan the upgrade widened, which goes back in force as aterm's own.
+    /// The plan the upgrade widened, which goes back in force as the person's: their Stop
+    /// declined the widen, so no later look or launch widens it again ([`upgrade_of`]).
     plan: Plan,
     /// The held run as the put-back found it: its revision and the widened plan's digest
     /// say whether the progress record still holds it ([`Self::owed`]).
@@ -598,9 +615,9 @@ struct PutBack {
 }
 
 impl PutBack {
-    /// The plan's record, carrying the run it puts back.
+    /// The plan's record, a person's (never provisional), carrying the run it puts back.
     fn record(&self) -> Value {
-        let mut record = plan_record(&self.plan, true);
+        let mut record = plan_record(&self.plan, false);
         record.as_object_mut().unwrap().insert(
             PUT_BACK.into(),
             json!({
@@ -612,11 +629,11 @@ impl PutBack {
         record
     }
 
+    /// The put-back `marker` of the plan's `record`: a person's plan this build writes, or the
+    /// provisional one an earlier build wrote.
     fn read(record: &Value, marker: &Value) -> Result<Self, String> {
         let (plan, _) = parse_plan_record(record)?;
-        if marker["version"].as_u64() != Some(1)
-            || record.get("provisional") != Some(&Value::Bool(true))
-        {
+        if marker["version"].as_u64() != Some(1) {
             return Err("unrecognized System State put-back".into());
         }
         let held = parse_progress(&marker["held"])?;
@@ -679,8 +696,11 @@ enum PutBackWrite {
 /// A Stop held the widened run `revision` as it registered, before its worker took a step
 /// (System State's Stop pressed while a watch widened aterm's own plan): put back the plan the
 /// upgrade widened (System State design §3.5). The widening started nothing the person
-/// stopped, so the page shows what was in force before: that plan, still aterm's own, and its
-/// run as the widen found it, under the stopped revision. `false`, with nothing changed, when
+/// stopped, so the page shows what was in force before: that plan and its run as the widen
+/// found it, under the stopped revision. The Stop declined the widen, so the plan goes back as
+/// the person's: neither the next launch's upgrade nor a watch rearmed by Set up now widens it
+/// again, which would reset the Dock and sign out as the person stopped. `false`, with nothing
+/// changed, when
 /// there is nothing to put back: the run is not that widened run, it finished a step of its
 /// own, or a choice or a Restore came since. It takes profile.lock without waiting, so an error
 /// when another pass holds it; the caller asks again once that run's worker ends.
@@ -717,6 +737,7 @@ fn put_back_held_widen_with(
         return Ok(false);
     };
     before(PutBackWrite::Plan)?;
+    revision::reserve(root, back.held.revision.max(back.restored.revision))?;
     write_json(&root.join("automatic-plan.json"), &back.record())?;
     back.finish(root, &mut before)?;
     Ok(true)
@@ -748,7 +769,7 @@ fn held_widen(root: &Path, revision: u64) -> Result<Option<PutBack>, String> {
         previous: Some(previous),
         previous_plan: Some(plan),
         pending,
-    }) = UpgradeProgress::read(marker, &widened)
+    }) = UpgradeProgress::read(root, marker, &widened)
     else {
         return Ok(None);
     };
@@ -1086,8 +1107,8 @@ mod tests {
     }
 
     /// A Stop that holds the run a widen admitted, before it took a step, puts back the plan in
-    /// force before the widen: aterm's own, with its run as it was, so the page turns no more
-    /// groups to Set up (design §3.5).
+    /// force before the widen, with its run as it was, so the page turns no more groups to Set
+    /// up (design §3.5); the Stop declined the widen, so the plan is the person's from then on.
     #[test]
     fn a_stop_does_not_turn_more_groups_to_set_up() {
         for finished in [true, false] {
@@ -1103,8 +1124,8 @@ mod tests {
                 Some((narrow.clone(), true))
             );
             assert!(
-                saved_plan_provisional(root.path()).unwrap(),
-                "still aterm's own"
+                !saved_plan_provisional(root.path()).unwrap(),
+                "the person's: their Stop declined the widen"
             );
             let run = progress_file(root.path()).unwrap().unwrap();
             assert_eq!(progress(root.path()).unwrap(), Some(run));
@@ -1126,9 +1147,7 @@ mod tests {
                 "Permissions alone owes no Mac settings"
             );
             assert!(finished_at(root.path()).unwrap());
-            // As before the widen: a finished run's plan may widen at a later launch, and a
-            // stopped one's waits for a choice.
-            assert_eq!(widens_at(root.path()).unwrap(), finished);
+            assert!(!widens_at(root.path()).unwrap(), "nothing widens it again");
             fold_stop_request(root.path()).unwrap();
             assert_eq!(stop_request_at(root.path()), None, "the Stop is spent");
             assert_eq!(progress(root.path()).unwrap(), Some(run));
@@ -1137,6 +1156,55 @@ mod tests {
                 "nothing more to put back"
             );
         }
+    }
+
+    /// A Stop of the widened run declines the widen: once the plan is put back, the next
+    /// launch's upgrade finds nothing to widen, so the Dock reset and the sign-outs the person
+    /// stopped never run (design §3.5).
+    #[test]
+    fn a_stopped_widen_is_never_widened_again_by_a_later_launch() {
+        for finished in [true, false] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let (narrow, _, widened) = widened_and_stopped(root.path(), finished);
+            assert!(put_back_held_widen(root.path(), widened).unwrap());
+            // Relaunch: the Stop is spent on the run it held, and the launch looks again.
+            fold_stop_request(root.path()).unwrap();
+            assert!(
+                prepare_upgrade(root.path(), || true, || Ok(None))
+                    .unwrap()
+                    .is_none(),
+                "finished: {finished}"
+            );
+            assert_eq!(saved_plan(root.path()).unwrap(), Some(narrow));
+        }
+    }
+
+    /// Set up now on the plan a Stop put back runs it as it stands, and the plan stays the
+    /// person's: the watch Set up now rearms finds nothing to widen.
+    #[test]
+    fn set_up_now_after_a_stopped_widen_leaves_nothing_to_widen() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (narrow, _, widened) = widened_and_stopped(root.path(), false);
+        assert!(put_back_held_widen(root.path(), widened).unwrap());
+        let shown = snapshot_at(root.path(), narrow.clone()).unwrap();
+        assert_eq!(shown.plan, narrow, "the page shows the plan put back");
+        assert!(!shown.provisional, "as the person's");
+        observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+            InitialSetupRestart::default()
+                .changing(Some(Selection::none()))
+                .persist_with(
+                    root,
+                    &shown.plan,
+                    false,
+                    || Ok(None),
+                    save_progress,
+                    |root| observation_at(root).map_err(|error| error.to_string()),
+                )
+        })
+        .result
+        .unwrap()
+        .expect("Set up now admitted");
+        assert!(!widens_at(root.path()).unwrap());
     }
 
     /// A widened run that finished a step of its own, or that a choice replaced, keeps what

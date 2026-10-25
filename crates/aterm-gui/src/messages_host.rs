@@ -543,9 +543,14 @@ impl App {
             .extend(shown.iter().map(|key| (*key).to_string()));
     }
 
-    /// Downgrades live config warning rows to records when Settings opens and shows them inline.
-    pub(crate) fn record_config_rows_settings_shows(&mut self) {
-        if self.keep_config_rows_settings_shows_as_records() > 0 {
+    /// The front window or its tab may have changed (`changed` when it did):
+    /// config rows Settings now shows on its own rows become records, and a band
+    /// row the new view does not want leaves before its first frame
+    /// ([`aterm_messages::MessageCenter::view_changed`]).
+    pub(crate) fn band_meets_the_front(&mut self, changed: bool) {
+        let kept = self.keep_config_rows_settings_shows_as_records();
+        let fall = (changed || kept > 0) && self.messages.view_changed();
+        if kept > 0 || fall {
             self.sync_messages();
         }
     }

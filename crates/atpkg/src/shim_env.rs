@@ -290,6 +290,46 @@ pub(crate) fn read_sidecar(build_dir: &Path) -> ShimEnv {
     }
 }
 
+/// The environment the shims of the store build holding `exe` export, from that build's sidecar
+/// ([`read_sidecar`]): what a launcher that types `exe` by its own path must give it for it to run
+/// as it does under its managed name.
+///
+/// `exe` is an absolute path inside `<prefix>/store/<program>/<build>/`, or inside that build's
+/// laid-aside tree `<build>.noindex` (the path a process image reads as). Any other path (a
+/// relative one, or one with a `..` step, among them), or a build with no valid sidecar, is
+/// [`ShimEnv::NONE`]. The path is read by its shape alone, never resolved, so the sidecar read is
+/// the one beside the build the path names. Its build directory is read as
+/// [`crate::ops::store_build_of`] reads one ([`crate::ops::build_dir_name`]), but with no prefix
+/// (a launcher holds only the path) and only by a name atpkg writes
+/// ([`crate::store::parse_build_name`]), since that name picks the file read.
+#[must_use]
+pub fn of_store_binary(exe: &Path) -> ShimEnv {
+    store_build_of(exe).map_or(ShimEnv::NONE, |build_dir| read_sidecar(&build_dir))
+}
+
+/// The `store/<program>/<build>` directory nearest above `exe` ([`of_store_binary`]).
+fn store_build_of(exe: &Path) -> Option<PathBuf> {
+    let plain = exe.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::Normal(_)
+        )
+    });
+    if !exe.is_absolute() || !plain {
+        return None;
+    }
+    exe.ancestors().skip(1).find_map(|dir| {
+        let build = crate::ops::build_dir_name(dir.file_name()?)?;
+        crate::store::parse_build_name(build)?;
+        let program = dir.parent()?;
+        let store = program.parent()?;
+        (store.file_name() == Some(std::ffi::OsStr::new(aterm_toolchain::layout::STORE_DIR)))
+            .then(|| program.join(build))
+    })
+}
+
 /// Remove `build_dir`'s sidecar, if any ([`crate::store::discard_build`]'s half).
 pub(crate) fn remove_sidecar(build_dir: &Path) {
     if let Some(path) = sidecar_path(build_dir) {
@@ -397,6 +437,60 @@ mod tests {
         write_sidecar(&build_dir, &env).unwrap();
         remove_sidecar(&build_dir);
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A binary inside a store build, or inside its laid-aside `.noindex` tree, reads that build's
+    /// sidecar; a build with none reads nothing, and so do a path outside any store, one with no
+    /// program level, one whose build name is not one atpkg writes and one whose `..` steps leave
+    /// the build, each beside a record of its own a looser reading would take, and a relative path.
+    #[test]
+    fn a_store_binary_reads_its_builds_sidecar_and_nothing_else_does() {
+        let root = crate::testdir::dir("atpkg-shim-env-of-");
+        let store = root.join("pkg").join("store").join("claude");
+        let build_dir = store.join("1000002000001000310");
+        std::fs::create_dir_all(build_dir.join("bin")).unwrap();
+        let exe = build_dir.join("bin").join("claude");
+        std::fs::write(&exe, "").unwrap();
+        let env = ShimEnv::admit(&raw(&["DISABLE_AUTOUPDATER=1", "CLAUDE_CODE_X=1"])).unwrap();
+        write_sidecar(&build_dir, &env).unwrap();
+        assert_eq!(of_store_binary(&exe), env);
+        assert_eq!(
+            of_store_binary(&store.join("1000002000001000310.noindex/bin/claude")),
+            env,
+            "a laid-aside tree's image path reads the build's own sidecar"
+        );
+        assert_eq!(of_store_binary(&build_dir.join("lib/deep/node")), env);
+
+        let bare = store.join("1000002000001000311");
+        std::fs::create_dir_all(bare.join("bin")).unwrap();
+        assert_eq!(of_store_binary(&bare.join("bin/claude")), ShimEnv::NONE);
+        for decoy in [
+            root.join("pkg/other/claude/1000002000001000310"),
+            root.join("pkg/store/1000002000001000310"),
+            store.join("01000002000001000310"),
+        ] {
+            write_sidecar(&decoy, &env).unwrap();
+            let other = decoy.join("bin/claude");
+            assert_eq!(
+                of_store_binary(&other),
+                ShimEnv::NONE,
+                "{}",
+                other.display()
+            );
+        }
+        for other in [
+            root.join("pkg/agents/claude"),
+            build_dir.join("../../../elsewhere/bin/claude"),
+            PathBuf::from("pkg/store/claude/1000002000001000310/bin/claude"),
+        ] {
+            assert_eq!(
+                of_store_binary(&other),
+                ShimEnv::NONE,
+                "{}",
+                other.display()
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

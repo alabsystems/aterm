@@ -10,11 +10,13 @@ use aterm_aos::publish::Head;
 use aterm_effects::aos_momentum::bundle::CandidateBundle;
 #[cfg(debug_assertions)]
 use aterm_effects::aos_momentum::m4::Admitted;
-use aterm_effects::aos_momentum::{DEMO_CODE_NAME, MomentumAosStatus, MomentumCode};
+use aterm_effects::aos_momentum::{
+    DEMO_CODE_NAME, MomentumAosStatus, MomentumCode, MomentumTrace, TraceCheck, TraceFault,
+};
 
 #[cfg(debug_assertions)]
 use crate::aos_host::PlanPublished;
-use crate::aos_host::{Repaired, Resumed, TraceSummary};
+use crate::aos_host::{Exported, Repaired, Resumed, TraceSummary};
 
 /// Whether this build answers the debug-only forms ([`cmd`]): `publish`, `bundle` and the demonstration code.
 const DEBUG_FORMS: bool = cfg!(debug_assertions);
@@ -23,8 +25,15 @@ const DEBUG_FORMS: bool = cfg!(debug_assertions);
 const DEMO_NAMES: [&str; 2] = ["demo-stranded-settle", DEMO_CODE_NAME];
 
 /// The usage line every junk form answers with.
-const USAGE: &str = "usage: aos [status|attach [code=<name>]|pause|repair [code=<name>]|\
-                     publish plan=<24 hex>|bundle|resume|detach|trace [hex]]";
+const USAGE: &str = "usage: aos [status|ls|attach [code=<name>]|pause|repair [code=<name>]|\
+                     publish plan=<24 hex>|bundle|resume|detach|trace [hex]|export [kept=<n>]|\
+                     check <file>]";
+
+/// The largest trace file `aos check` reads.
+const CHECK_MAX_BYTES: usize = 32 << 20;
+
+/// The directory under the state dir that `aos export` writes and a bare `aos check` name reads.
+const EXPORT_DIR: &str = "aos";
 
 /// The bytes of a schedule plan, as `publish plan=` spells them in hex.
 const PLAN_BYTES: usize = 12;
@@ -45,6 +54,8 @@ pub(crate) fn needs_debug(form: &str) -> String {
 pub(crate) enum Asked {
     /// Read it (`status`, or bare).
     Status,
+    /// List every window's hosted task and its timeline.
+    Ls,
     /// Start hosting it under this code.
     Attach(MomentumCode),
     /// Pause it at this step boundary.
@@ -70,6 +81,7 @@ pub(crate) fn parse(rest: &str, debug_forms: bool) -> Result<Asked, String> {
     let words: Vec<&str> = rest.split_whitespace().collect();
     Ok(match words.as_slice() {
         [] | ["status"] => Asked::Status,
+        ["ls"] => Asked::Ls,
         ["attach"] => Asked::Attach(MomentumCode::Shipped),
         ["attach", code] => Asked::Attach(code_of(code, debug_forms)?),
         ["pause"] => Asked::Pause,
@@ -84,6 +96,41 @@ pub(crate) fn parse(rest: &str, debug_forms: bool) -> Result<Asked, String> {
         ["trace", "hex"] => Asked::TraceHex,
         _ => return Err(USAGE.to_string()),
     })
+}
+
+/// One form of the verb by where it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Form {
+    /// An ask the main thread answers (`Wake::Aos`).
+    Main(Asked),
+    /// Write the front window's live trace, or its kept fault `n`, to a private file (`Wake::AosExport`, then this thread).
+    Export(Option<u64>),
+    /// Replay this trace file under this build, on this thread.
+    Check(String),
+}
+
+/// [`parse`], with `export [kept=<n>]` and `check <file>`, whose file is the rest of the line.
+pub(crate) fn parse_form(rest: &str, debug_forms: bool) -> Result<Form, String> {
+    let trimmed = rest.trim();
+    if let Some(file) = trimmed.strip_prefix("check")
+        && (file.is_empty() || file.starts_with(char::is_whitespace))
+    {
+        let file = file.trim();
+        if file.is_empty() {
+            return Err(USAGE.to_string());
+        }
+        return Ok(Form::Check(file.to_owned()));
+    }
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    match words.as_slice() {
+        ["export"] => Ok(Form::Export(None)),
+        ["export", kept] => kept
+            .strip_prefix("kept=")
+            .and_then(|n| n.parse::<u64>().ok())
+            .map(|n| Form::Export(Some(n)))
+            .ok_or_else(|| USAGE.to_string()),
+        _ => parse(rest, debug_forms).map(Form::Main),
+    }
 }
 
 fn code_of(word: &str, debug_forms: bool) -> Result<MomentumCode, String> {
@@ -277,7 +324,7 @@ pub(crate) fn repair_line(r: &Repaired) -> String {
     format!(
         "window={} repaired paused_first={} rev={} code={} live={} live_verdict={} \
          candidate_verdict={} same_code_reproduced={} grade={} trace={} ancestor={} \
-         range={from}..{to} log_epoch={} delivered={}",
+         range={from}..{to} log_epoch={} delivered={} main_us={} off_main={}",
         r.window.0,
         r.paused_first,
         r.commit.revision.0,
@@ -290,7 +337,9 @@ pub(crate) fn repair_line(r: &Repaired) -> String {
         w.trace_digest().short(),
         w.ancestor().short(),
         w.log_epoch(),
-        r.commit.delivered.len()
+        r.commit.delivered.len(),
+        r.main.as_micros(),
+        r.off_main
     )
 }
 
@@ -407,13 +456,128 @@ pub(crate) fn trace_file_line(t: &TraceSummary, file: &[u8]) -> String {
     line
 }
 
-/// The verb's control-thread half: the ask on the main thread (`Wake::Aos`).
+/// The `export` answer's words before the file's path, which ends the line since the state dir may hold a space.
+pub(crate) fn export_line(e: &Exported, file: &str) -> String {
+    format!(
+        "window={} exported kept={} log_epoch={} identity={} bytes={} mode=0600 file={file}",
+        e.window.0,
+        e.kept.map_or_else(|| "live".to_string(), |k| k.to_string()),
+        e.log_epoch,
+        e.identity.short(),
+        e.bytes.len()
+    )
+}
+
+/// Writes `bytes` as a new private (0600) file `name` in `root`'s export directory and returns its path.
+/// # Errors
+/// The directory is not private and ours, or the file exists or did not write.
+pub(crate) fn write_export(
+    root: &std::path::Path,
+    name: &str,
+    bytes: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = root.join(EXPORT_DIR);
+    aterm_types::fs_restricted::ensure_private_dir(&dir)?;
+    let pinned = crate::pinned_dir::PinnedDir::open_resolved(&dir)?;
+    pinned.write_new_private(std::ffi::OsStr::new(name), bytes)?;
+    Ok(pinned.path().join(name))
+}
+
+/// A fresh export file name: the window, the log epoch, the wall clock and a per-process count.
+fn export_name(e: &Exported) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let what = e
+        .kept
+        .map_or_else(|| "live".to_string(), |k| format!("kept{k}"));
+    format!(
+        "momentum-w{}-{what}-e{}-{ms}-{}-{n}.trace",
+        e.window.0,
+        e.log_epoch,
+        std::process::id()
+    )
+}
+
+/// The path `aos check` reads: a bare name in `root`'s export directory, or an absolute path.
+/// # Errors
+/// A relative path with a separator, or a bare name with no state dir.
+pub(crate) fn check_path(
+    root: Option<&std::path::Path>,
+    file: &str,
+) -> Result<std::path::PathBuf, String> {
+    let path = std::path::Path::new(file);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    if path.components().count() != 1 || file.contains(std::path::MAIN_SEPARATOR) {
+        return Err(format!(
+            "aos check: `{file}` is neither a bare export name nor an absolute path"
+        ));
+    }
+    root.map(|r| r.join(EXPORT_DIR).join(file))
+        .ok_or_else(|| "aos check: no state directory for a bare export name".to_string())
+}
+
+/// `aos check <file>`: reads the trace file at most [`CHECK_MAX_BYTES`], refuses it unless this build runs its identity, and replays it with no live effect.
+/// # Errors
+/// The read's failure, or the trace's refusal as `refused=<word>: <why>`.
+pub(crate) fn check_file(path: &std::path::Path, build: &str) -> Result<String, String> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(format!("aos check: `{}` names no file", path.display()));
+    };
+    let dir = crate::pinned_dir::PinnedDir::open_resolved(parent)
+        .map_err(|e| format!("aos check: {}: {e}", parent.display()))?;
+    let (bytes, _) = dir
+        .read_private_at_retained(name, CHECK_MAX_BYTES)
+        .map_err(|e| format!("aos check: {}: {e}", path.display()))?;
+    let refused = |f: TraceFault| format!("aos check refused={}: {f}", f.word());
+    let trace = MomentumTrace::decode(&bytes).map_err(refused)?;
+    let c = trace
+        .check(std::time::Instant::now(), build)
+        .map_err(refused)?;
+    Ok(check_line(&name.to_string_lossy(), bytes.len(), &c))
+}
+
+/// Formats the `check` answer from the replay and the contract's verdict on it.
+pub(crate) fn check_line(file: &str, bytes: usize, c: &TraceCheck) -> String {
+    let r = &c.replay;
+    let n = &r.counts;
+    format!(
+        "checked code={} log_epoch={} first={} keys={} resets={} ticks={} queries={} \
+         checkpoint={} state={} chain={} verdict={} bytes={bytes} file={file}",
+        r.code.name(),
+        r.log_epoch,
+        r.first_cursor,
+        n.keys,
+        n.resets,
+        n.ticks,
+        n.queries,
+        r.checkpoint.short(),
+        r.state_digest.short(),
+        r.observation_chain.short(),
+        verdict_word(&c.verdict)
+    )
+}
+
+/// The verb's control-thread half: the ask on the main thread (`Wake::Aos`), an export's bytes from it (`Wake::AosExport`) written here, or a check run here.
 pub(crate) fn cmd(
     proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
     rest: &str,
 ) -> String {
-    let asked = match parse(rest, DEBUG_FORMS) {
-        Ok(asked) => asked,
+    let asked = match parse_form(rest, DEBUG_FORMS) {
+        Ok(Form::Main(asked)) => asked,
+        Ok(Form::Export(kept)) => return export(proxy, kept),
+        Ok(Form::Check(file)) => {
+            let answer = check_path(aterm_types::dirs::state_dir().as_deref(), &file)
+                .and_then(|path| check_file(&path, &aterm_types::version::build_id()));
+            return match answer {
+                Ok(line) => format!("OK {line}\n"),
+                Err(e) => format!("ERR {e}\n"),
+            };
+        }
         Err(refusal) => return format!("ERR {refusal}\n"),
     };
     #[cfg(debug_assertions)]
@@ -430,6 +594,32 @@ pub(crate) fn cmd(
         Ok(Ok(line)) => format!("OK {line}\n"),
         Ok(Err(e)) => format!("ERR {e}\n"),
         Err(e) => format!("ERR {e}\n"),
+    }
+}
+
+/// `aos export [kept=<n>]`: the trace from the main thread, written here under the state dir.
+fn export(
+    proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
+    kept: Option<u64>,
+) -> String {
+    let exported = match crate::control::control_media::call_main(proxy, |reply| {
+        crate::Wake::AosExport { kept, reply }
+    }) {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => return format!("ERR {e}\n"),
+        Err(e) => return format!("ERR {e}\n"),
+    };
+    let Some(root) = aterm_types::dirs::state_dir() else {
+        return "ERR aos export: no state directory\n".to_string();
+    };
+    let name = export_name(&exported);
+    match write_export(&root, &name, &exported.bytes) {
+        Ok(path) => format!(
+            "OK {} path={}\n",
+            export_line(&exported, &name),
+            path.display()
+        ),
+        Err(e) => format!("ERR aos export: {e}\n"),
     }
 }
 
@@ -517,9 +707,90 @@ mod tests {
         assert_eq!(
             parse("repair code=nope", true),
             Err(format!(
-                "{USAGE} (no code `nope`; this build carries shipped, demo-stranded-settle)"
+                "{USAGE} (no code `nope`; this build carries shipped, safe, demo-stranded-settle)"
             ))
         );
+    }
+
+    #[test]
+    fn r2s_forms_parse_in_every_build_and_check_takes_the_rest_of_the_line() {
+        for debug in [true, false] {
+            for (rest, want) in [
+                ("ls", Form::Main(Asked::Ls)),
+                (" ls ", Form::Main(Asked::Ls)),
+                (
+                    "attach code=safe",
+                    Form::Main(Asked::Attach(MomentumCode::Safe)),
+                ),
+                (
+                    "repair code=momentum-glow.safe",
+                    Form::Main(Asked::Repair(MomentumCode::Safe)),
+                ),
+                ("export", Form::Export(None)),
+                ("export kept=3", Form::Export(Some(3))),
+                ("check x.trace", Form::Check("x.trace".into())),
+                (
+                    "  check /a dir/with space.trace  ",
+                    Form::Check("/a dir/with space.trace".into()),
+                ),
+                ("status", Form::Main(Asked::Status)),
+            ] {
+                assert_eq!(parse_form(rest, debug), Ok(want), "debug={debug} {rest:?}");
+            }
+            for junk in [
+                "ls now",
+                "export kept=",
+                "export kept=-1",
+                "export 3",
+                "export kept=1 extra",
+                "check",
+                "check   ",
+                "checkx",
+                "lsx",
+            ] {
+                let refusal = parse_form(junk, debug).expect_err(junk);
+                assert!(
+                    refusal.starts_with(USAGE),
+                    "debug={debug} {junk:?}: {refusal}"
+                );
+            }
+        }
+        assert_eq!(
+            parse_form("attach code=demo-stranded-settle", false),
+            Err("aos code=demo-stranded-settle needs a debug build".to_string())
+        );
+    }
+
+    #[test]
+    fn the_export_and_check_lines_name_what_they_wrote_and_replayed() {
+        let e = Exported {
+            window: crate::WindowId(4),
+            kept: None,
+            log_epoch: 2,
+            identity: aterm_aos::Digest([0xcd; 32]),
+            bytes: vec![0; 10],
+        };
+        assert_eq!(
+            export_line(&e, "f.trace"),
+            format!(
+                "window=4 exported kept=live log_epoch=2 identity={} bytes=10 mode=0600 file=f.trace",
+                aterm_aos::Digest([0xcd; 32]).short()
+            )
+        );
+        let kept = Exported {
+            kept: Some(1),
+            ..e.clone()
+        };
+        assert!(export_line(&kept, "g").contains(" kept=1 "));
+        let name = export_name(&e);
+        assert!(
+            name.starts_with("momentum-w4-live-e2-") && name.ends_with(".trace"),
+            "{name}"
+        );
+        assert_ne!(export_name(&e), name, "each name is fresh");
+        assert!(crate::pinned_dir::is_one_component(std::ffi::OsStr::new(
+            &name
+        )));
     }
 
     const WINNER_HEX: &str = "010100000000000000000000";

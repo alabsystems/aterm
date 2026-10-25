@@ -163,6 +163,21 @@ pub(super) struct NameFloor {
     pub(super) floor: f32,
 }
 
+/// A measured [`ShowcaseState::strip_names`] entry: for which rows (`cards`,
+/// by address), at which text scale, and in which title rooms (beside a
+/// trial's buttons without Keep ▾ and with it, their bits, and whether the
+/// theme a trial replaces sets type, so every trial shows Keep ▾).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct StripNames {
+    pub(super) cards: usize,
+    pub(super) scale: u32,
+    pub(super) rooms: (u32, u32, bool),
+    /// The most lines a name takes in its room.
+    pub(super) lines: usize,
+    /// Whether a word of a name is wider than its room.
+    pub(super) broken: bool,
+}
+
 /// Settings ▸ Themes' view state.
 #[derive(Debug)]
 pub(crate) struct ShowcaseState {
@@ -197,6 +212,9 @@ pub(crate) struct ShowcaseState {
     page_rows: Cell<usize>,
     /// Cached minimum width measurements for theme names ([`view::name_floor`]).
     pub(super) name_floors: RefCell<Vec<NameFloor>>,
+    /// The strip's names, as last measured ([`view::strip_names`]): a frame
+    /// measures every name once, not once a layout.
+    pub(super) strip_names: RefCell<Vec<StripNames>>,
     /// Animation clock epoch when the page opened.
     pub(crate) demo_epoch_ms: Cell<Option<u64>>,
     /// Animation phase at the last user input on the page.
@@ -230,6 +248,7 @@ impl ShowcaseState {
             order: RefCell::new(Vec::new()),
             page_rows: Cell::new(8),
             name_floors: RefCell::new(Vec::new()),
+            strip_names: RefCell::new(Vec::new()),
             demo_epoch_ms: Cell::new(None),
             last_input_phase_ms: Cell::new(0),
             input_pending: Cell::new(true),
@@ -401,6 +420,7 @@ impl SettingsViewState {
             crate::settings_preview::theme_card::attention_rows(&self.assets.themes, &cards).into();
         self.showcase.cards = cards;
         self.showcase.name_floors.borrow_mut().clear();
+        self.showcase.strip_names.borrow_mut().clear();
         self.showcase.trash_armed = None;
         self.reseat_focus_off_a_gone_row();
         if let Some(id) = self.showcase.trial_id().map(str::to_string)

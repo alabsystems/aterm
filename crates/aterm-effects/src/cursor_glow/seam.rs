@@ -1238,11 +1238,25 @@ impl CursorGlow {
         self.recent_typed_run = Some(self.typed_run_from_probe(row, col0, col1, now));
     }
 
-    fn typed_run_from_probe(&self, row: u16, col0: u16, col1: u16, now: Instant) -> RecentTypedRun {
+    const fn typed_run_from_probe(
+        &self,
+        row: u16,
+        col0: u16,
+        col1: u16,
+        now: Instant,
+    ) -> RecentTypedRun {
         let mut glyphs = [' '; RECENT_TYPED_RUN_CAP];
-        if let Some(src) = self.row_cur.get(usize::from(col0)..) {
-            let copy_len = src.len().min(usize::from(col1 - col0));
-            glyphs[..copy_len].copy_from_slice(&src[..copy_len]);
+        let src = self.row_cur.as_slice();
+        let start = col0 as usize;
+        if start < src.len() {
+            let rem = src.len() - start;
+            let req = (col1 - col0) as usize;
+            let copy_len = if rem < req { rem } else { req };
+            let mut i = 0;
+            while i < copy_len {
+                glyphs[i] = src[start + i];
+                i += 1;
+            }
         }
         RecentTypedRun {
             row,
@@ -1630,10 +1644,10 @@ impl CursorGlow {
     /// The clock a swept cell is born at.
     #[inline]
     pub(super) fn sweep_born(key_at: Instant, now: Instant) -> Instant {
-        key_at.max(
-            now.checked_sub(Duration::from_secs_f32(Self::TYPE_HINT_FRESH))
-                .unwrap_or(now),
-        )
+        const TYPE_HINT_FRESH_DUR: Duration = Duration::from_nanos(
+            (CursorGlow::TYPE_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64,
+        );
+        key_at.max(now.checked_sub(TYPE_HINT_FRESH_DUR).unwrap_or(now))
     }
 
     /// Whether a glyph sits left of `col` on `row` in this frame's row probe ([`HeldPark::landing_glyph`]).
@@ -1728,27 +1742,36 @@ impl CursorGlow {
     }
 
     /// A cross-row park needs content evidence.
-    pub(super) fn park_source_unchanged(&self, row: u16, col: u16) -> bool {
-        if col == 0
-            || !self
-                .row_prev_meta
-                .is_some_and(|p| p.row == row && p.caret == col)
-        {
+    pub(super) const fn park_source_unchanged(&self, row: u16, col: u16) -> bool {
+        if col == 0 {
             return false;
         }
-        let Some(sample) = self.witness_rows[..self.witness_rows_n]
-            .iter()
-            .find(|s| s.row == row)
-        else {
+        match self.row_prev_meta {
+            Some(p) if p.row == row && p.caret == col => {}
+            _ => return false,
+        }
+        let witness = self.witness_rows.as_slice();
+        let mut wi = 0;
+        let mut sample = None;
+        while wi < self.witness_rows_n {
+            if witness[wi].row == row {
+                sample = Some(&witness[wi]);
+                break;
+            }
+            wi += 1;
+        }
+        let Some(sample) = sample else {
             return false;
         };
         let mut ink = false;
-        for c in 0..col {
-            let previous = rk::witness::unit_at(&self.row_prev, c);
-            if previous != rk::witness::unit_at(&sample.cols, c) {
+        let mut c = 0;
+        while c < col {
+            let previous = rk::witness::unit_at(self.row_prev.as_slice(), c);
+            if !previous.eq(rk::witness::unit_at(sample.cols.as_slice(), c)) {
                 return false;
             }
             ink |= !previous.is_blank();
+            c += 1;
         }
         ink
     }
@@ -1907,7 +1930,17 @@ impl CursorGlow {
         if joined && let Some(run) = old {
             let (standing, first) = self.typed_run_standing(row, run.col0, col0, now);
             origin = first.map(|(_, o)| o).or(run.origin);
-            let missing = standing[..usize::from(run.len)].contains(&false);
+            let standing = &standing[..usize::from(run.len)];
+            let missing = standing.contains(&false)
+                && standing.iter().enumerate().any(|(index, &stands)| {
+                    !stands
+                        && !self.v2.returning_partial_cell(
+                            row,
+                            run.col0.saturating_add(index as u16),
+                            &self.row_cur,
+                            now,
+                        )
+                });
             if missing {
                 self.v2.on_event(
                     rk::Event::Sweep {

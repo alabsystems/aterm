@@ -407,24 +407,29 @@ impl CursorComet {
             }
         }
 
+        const GLINT_TW_PHASES: [f32; GLINTS as usize] = [0.0, 2.4, 4.8, 7.2];
+        const INV_GLINT_TW_SPAN: f32 = 1.0 / 0.45;
         let glint_r = radius * 0.72;
         let arm = ((ch * 0.11) as i32).max(1);
         let two_arm_plus_1 = 2 * arm + 1;
         let cov_base = cov_core * (0.35 + 0.65 * e);
         let phase2 = phase * 2.0;
-        let phase_ang = phase * 0.55;
-        for i in 0..GLINTS {
-            let fi = i as f32;
-            let tw = 0.5 + 0.5 * (phase2 + fi * 2.4).sin();
+        let (sin_p, cos_p) = (phase * 0.55).sin_cos();
+        let glint_dirs: [(f32, f32); GLINTS as usize] = [
+            (sin_p, cos_p),
+            (cos_p, -sin_p),
+            (-sin_p, -cos_p),
+            (-cos_p, sin_p),
+        ];
+        for (tw_off, (sin_a, cos_a)) in GLINT_TW_PHASES.into_iter().zip(glint_dirs) {
+            let tw = 0.5 + 0.5 * (phase2 + tw_off).sin();
             if tw < 0.55 {
                 continue;
             }
-            let cov = (cov_base * (tw - 0.55) / 0.45).min(GLINT_BUDGET) as u8;
+            let cov = (cov_base * (tw - 0.55) * INV_GLINT_TW_SPAN).min(GLINT_BUDGET) as u8;
             if cov == 0 {
                 continue;
             }
-            let ang = fi / GLINTS as f32 * std::f32::consts::TAU + phase_ang;
-            let (sin_a, cos_a) = ang.sin_cos();
             let gx = (cx + cos_a * glint_r) as i32;
             let gy = (cy + sin_a * glint_r * 0.9) as i32;
             let spark = premul_rgb(ICE_WHITE, cov);
@@ -527,13 +532,16 @@ const fn ice_ramp(color: u32, t: f32) -> u32 {
 
 #[inline]
 const fn ice_ramp_with(color: u32, dimmed: u32, whitened: u32, t: f32) -> u32 {
+    const INV_045: f32 = 1.0 / 0.45;
+    const INV_033: f32 = 1.0 / 0.33;
+    const INV_022: f32 = 1.0 / 0.22;
     let t = t.clamp(0.0, 1.0);
     if t < 0.45 {
-        lerp_rgb(dimmed, color, t / 0.45)
+        lerp_rgb(dimmed, color, t * INV_045)
     } else if t < 0.78 {
-        lerp_rgb(color, whitened, (t - 0.45) / 0.33)
+        lerp_rgb(color, whitened, (t - 0.45) * INV_033)
     } else {
-        lerp_rgb(whitened, ICE_WHITE, (t - 0.78) / 0.22)
+        lerp_rgb(whitened, ICE_WHITE, (t - 0.78) * INV_022)
     }
 }
 

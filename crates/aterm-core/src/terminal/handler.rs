@@ -518,7 +518,7 @@ fn shell_event_row(payload: &str, code: u32) -> Option<(char, u64, u16)> {
     Some((command, row.parse().ok()?, col.parse().ok()?))
 }
 
-/// The gates every program-originated reply passes, debiting the rate limit when both open.
+/// The gates every program-originated reply passes, debiting the rate limit at the batch's clock when both open.
 pub(super) fn program_response_admitted(
     policy: &mut super::policy_gates::PolicyState,
     transient: &mut TransientState,
@@ -527,15 +527,11 @@ pub(super) fn program_response_admitted(
     if !policy.gates().response_sink().resolve(true) {
         return false;
     }
-    let bytes = len as u64;
-    let clock = aterm_policy::limits::SystemClock;
-    if let Some(permitted) = policy.response_rate_limit_try_consume(bytes, &clock) {
+    let clock = super::response_rate_limiter::BatchClock(transient.process_now);
+    if let Some(permitted) = policy.response_rate_limit_try_consume(len as u64, &clock) {
         permitted
     } else {
-        let legacy_clock = super::response_rate_limiter::SystemTime;
-        transient
-            .response_rate_limiter
-            .try_consume(len, &legacy_clock)
+        transient.response_rate_limiter.try_consume(len, &clock)
     }
 }
 

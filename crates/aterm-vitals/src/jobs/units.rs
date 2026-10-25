@@ -484,7 +484,8 @@ fn reads_tty(d: &super::Fd) -> bool {
         d.kind,
         super::FdKind::Device {
             tty: true,
-            read: true
+            read: true,
+            ..
         }
     )
 }
@@ -498,27 +499,25 @@ fn may_read_tty(f: Option<&JobProc>) -> bool {
         .is_none_or(|fds| fds.iter().any(|d| (d.fd == 0 || d.fd > 2) && reads_tty(d)))
 }
 
-/// Whether a process sleeps on its terminal, or opened it for reading past its standard
-/// descriptors with no sleeping event queue that lists no read of it, or (on Linux, at a `raw`
-/// read) pages as util-linux `more` since 2.35 does: its input a pipe at fd 0, the terminal at
-/// fd 1 and its keys' at fd 2 (read in `read` before 2.35 and after a `poll` since), asleep in a
-/// `poll` or a `select`, holding no socket; `more` keeps the terminal raw, so a filter that polls
-/// its input beside a password prompt does not page. A pager over its piped input (`less`, `fzf`, `ssh` asking for a
-/// password over the input it forwards), never a worker that inherited the terminal at fd 0 and
-/// reads its parent's pipe past it (multiprocessing's resource tracker, an idle `Pool`, a queue's
-/// consumer in its `poll`), nor a `tee /dev/tty`, nor a filter that only writes it (asleep reading
-/// its pipe, or a `node` whose libuv reopened its output past fd 2, its loop on its input), nor one
-/// that writes a pipe, a file or a socket (`| pv |`, `| ssh logs 'cat >> sync.log'`, `| nc`), nor
-/// a server in its loop. A fork of the tab's shell (bash's `| while read` stage, zsh's function
-/// stage, a shell nested in it) holds the terminal its line editor reads past its standard
-/// descriptors (bash's at 255, zsh's at 10): only a sleep on it counts.
-fn pages(
-    scene: &wait::Scene<'_>,
-    sweep: &HashMap<u32, &SweepProc>,
-    pid: u32,
-    shell: (u32, &str),
-    raw: bool,
-) -> bool {
+/// Whether a process sleeps on its terminal, or opened it as `/dev/tty` for reading (also at a
+/// standard descriptor: a git hook's `exec < /dev/tty`), or (on Linux, at a `raw` read) pages as
+/// util-linux `more` since 2.35 does: its input at fd 0 a pipe another process writes from its
+/// standard output (`| more`, not one a REPL opened past its own to feed a child that polls it),
+/// the terminal at fd 1 and its keys' at fd 2 (read in `read` before 2.35 and after a `poll`
+/// since), asleep in a `poll` or a `select`, holding no socket; `more` keeps the terminal raw, so
+/// a filter that polls its input beside a password prompt does not page. A pager over its piped
+/// input (`less`, `fzf`, `ssh` asking for a password over the input it forwards: each opens
+/// `/dev/tty` for its keys), never a worker that inherited the
+/// terminal at fd 0 and reads its parent's pipe past it (multiprocessing's resource tracker, an
+/// idle `Pool`, a queue's consumer in its `poll`), nor a `tee /dev/tty`, nor a filter that only
+/// writes it (asleep reading its pipe), nor one that writes a pipe, a file or a socket (`| pv |`,
+/// `| ssh logs 'cat >> sync.log'`, `| nc`), nor a server in its loop, nor one that holds past its
+/// standard descriptors a terminal it inherited or duplicated, not opened as `/dev/tty`: a shell's
+/// line editor's (bash's at 255, zsh's at 10, in a `| while read` stage, a function's stage, a
+/// script or a shell nested in the tab's), a `node` whose libuv reopened its output by the
+/// terminal's own name, an `ssh` past its login (its standard descriptors duplicated at 4, 5 and
+/// 6); only a sleep on one of those counts.
+fn pages(scene: &wait::Scene<'_>, pid: u32, raw: bool) -> bool {
     let Some(f) = scene.procs.get(&pid) else {
         return false;
     };
@@ -526,43 +525,32 @@ fn pages(
         return false;
     };
     let at = |n: i32| fds.iter().find(|d| d.fd == n);
-    let past = !shell_fork(sweep, pid, shell) && wait::reads_terminal(scene, pid);
-    fds.iter()
-        .any(|d| reads_tty(d) && (Some(d.fd) == f.blocked_fd || (d.fd > 2 && past)))
-        || (raw
-            && f.wchan.as_deref().is_some_and(wait::is_poll_wchan)
-            && at(0).is_some_and(|d| {
-                matches!(d.kind, super::FdKind::Pipe { write_end, .. } if write_end != Some(true))
-            })
-            && at(1).is_some_and(|d| matches!(d.kind, super::FdKind::Device { tty: true, .. }))
-            && at(2).is_some_and(reads_tty)
-            && !fds.iter().any(|d| {
-                matches!(
-                    d.kind,
-                    super::FdKind::Tcp { .. } | super::FdKind::Socket
-                )
-            }))
-}
-
-/// Whether `p` is the tab's shell `(pid, name)` or a fork of it: it and every process between
-/// them is named as the shell is.
-fn shell_fork(sweep: &HashMap<u32, &SweepProc>, p: u32, (shell, name): (u32, &str)) -> bool {
-    let mut cur = p;
-    for _ in 0..TREE_CAP {
-        match sweep.get(&cur) {
-            Some(s) if s.name == name => {
-                if cur == shell {
-                    return true;
-                }
-                if s.ppid == cur {
-                    return false;
-                }
-                cur = s.ppid;
-            }
-            _ => return false,
-        }
-    }
-    false
+    fds.iter().any(|d| {
+        reads_tty(d)
+            && (Some(d.fd) == f.blocked_fd
+                || matches!(d.kind, super::FdKind::Device { ctty: true, .. }))
+    }) || (raw
+        && f.wchan.as_deref().is_some_and(wait::is_poll_wchan)
+        && at(0).is_some_and(|d| match d.kind {
+            super::FdKind::Pipe {
+                handle,
+                peer,
+                write_end,
+                ..
+            } if write_end != Some(true) => scene.procs.values().any(|p| {
+                p.fds
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|w| w.fd == 1 && write_end_of(&w.kind, handle, peer))
+            }),
+            _ => false,
+        })
+        && at(1).is_some_and(|d| matches!(d.kind, super::FdKind::Device { tty: true, .. }))
+        && at(2).is_some_and(reads_tty)
+        && !fds
+            .iter()
+            .any(|d| matches!(d.kind, super::FdKind::Tcp { .. } | super::FdKind::Socket)))
 }
 
 /// Whether `p` is `a` or below it by parent.
@@ -594,11 +582,16 @@ fn feeds(facts: &HashMap<u32, &JobProc>, writer: u32, reader: u32) -> bool {
         else {
             return false;
         };
-        fds(writer).iter().any(|w| {
-            matches!(w.kind, super::FdKind::Pipe { handle: h, write_end, .. }
-                if h == peer && write_end != Some(false) && (peer != handle || write_end == Some(true)))
-        })
+        fds(writer)
+            .iter()
+            .any(|w| write_end_of(&w.kind, handle, peer))
     })
+}
+
+/// Whether `w` is the write end of the pipe whose read end is `handle`, the other end `peer`.
+fn write_end_of(w: &super::FdKind, handle: u64, peer: u64) -> bool {
+    matches!(*w, super::FdKind::Pipe { handle: h, write_end, .. }
+        if h == peer && write_end != Some(false) && (peer != handle || write_end == Some(true)))
 }
 
 /// `n` over `dt_ms`, a minute.
@@ -623,10 +616,14 @@ struct Unit {
     command: String,
     block: Option<u64>,
     shell: Option<u32>,
+    /// The process that made this group, out of front (a command a shell nested in the tab's
+    /// stopped, or sent on with `bg`; the groups other programs make fold into their own): the job
+    /// that holds that process hands the group over.
+    nested_by: Option<u32>,
 }
 
 /// What a tab's pass knows beyond its units.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct TabFacts {
     shell_pgid: u32,
     tpgid: Option<u32>,
@@ -642,6 +639,10 @@ struct TabFacts {
     front_idle: bool,
     /// Background groups with a process that is neither stopped nor a zombie (one that can print).
     bg_units: usize,
+    /// The processes that made the group in front, or the next group up the walk of the groups
+    /// it runs under ([`discover`]'s `under`): each waits on the command in front (a nested
+    /// shell, vim under its `:sh`).
+    makers: Vec<u32>,
 }
 
 /// Per-instance stuck-process evaluation engine.
@@ -678,6 +679,8 @@ pub struct Jobs {
 struct Born {
     /// The clock of the pass reading them.
     at: u64,
+    /// That pass's clock as its probe began reading them ([`JobTick::probe_ms`]).
+    probe: u64,
     /// The clock of the pass before.
     since: u64,
     seen: HashMap<u32, MakerSeen>,
@@ -828,17 +831,45 @@ struct MakerSeen {
     start: Option<u64>,
     block: Option<u64>,
     at: u64,
-    /// When it was born, on the pass's clock: the pass that first saw it less its age then (that
-    /// pass where its age went unread).
-    born: u64,
-    /// The block that ran the prompt's program by name it is the fork of (the person typed
-    /// `pwsh`, also with `dotnet build` typed ahead): of the block open at a pass that saw it, the
+    /// When it was born, on the pass's clock, as the span it lies in: the probe's reading that
+    /// first saw it less its age then; else, where that age went unread or puts it before the pass
+    /// before, which did not see it (a wall-clock age counts a sleep of the machine, or a step of
+    /// its clock, that the pass's clock does not), between that pass and the reading.
+    born: (u64, u64),
+    /// The clock of the pass that first saw it.
+    first: u64,
+    /// The block it is the fork of, whatever it ran: of the block open at a pass that saw it, the
     /// tab's last one and the one that replaced, opened since about the pass before (the `pwsh`'s
-    /// own prompt closed it), the one opened nearest its birth, by a moment after it (its `C` read
-    /// late): not a quick `pwsh -c` run before it, nor the `pwsh` it took typed ahead, nor one the
-    /// person ran after a `Start-Process -NoNewWindow pwsh` started it. A pwsh a second shell runs
-    /// takes only a block newer than that shell's own: not one the second shell's profile started.
-    typed: Option<u64>,
+    /// own prompt closed it), the last one opened by its birth, where that one opened a moment
+    /// before it (a `C` comes before its fork: the next line pasted behind a `Start-Process`
+    /// opens just after the watcher's fork), else the first opened a moment after it (its `C`
+    /// read late, also by a later pass), else the last one before. A fork of a process the tab's
+    /// shell did not run takes only a block newer than that process's own (not one a second
+    /// shell's profile started).
+    near: Option<Near>,
+}
+
+/// A block a process is the fork of ([`MakerSeen::near`]).
+#[derive(Clone, Debug)]
+struct Near {
+    id: u64,
+    started_ms: u64,
+    /// The program its command ran by name: its first word's last path part.
+    word: String,
+}
+
+impl MakerSeen {
+    /// The block that ran the prompt's program `prompt` by name it is the fork of (the person
+    /// typed `pwsh`, also with `dotnet build` typed ahead, or before a pass knew the prompt's
+    /// program): not a quick `pwsh -c` run before it, nor the `pwsh` typed after it, nor one the
+    /// person ran after a `Start-Process -NoNewWindow pwsh` started it (the `Start-Process` block
+    /// is nearer its birth).
+    fn typed(&self, prompt: Option<&str>) -> Option<u64> {
+        self.near
+            .as_ref()
+            .filter(|n| prompt.is_some_and(|p| n.word == p))
+            .map(|n| n.id)
+    }
 }
 
 /// An open backed-up episode as the engine keeps it ([`HeldEpisode`] is what a view says).
@@ -1144,12 +1175,13 @@ impl Jobs {
                 {
                     let b = self.born.entry(tab.key).or_default();
                     b.since = std::mem::replace(&mut b.at, at);
+                    b.probe = tick.probe_ms;
                     b.left.clear();
                     b
                 },
                 self.roots.get(&tab.key),
             );
-            tab_facts.insert(tab.key, tf);
+            tab_facts.insert(tab.key, tf.clone());
             // A command the shell started that job control stopped (a debugger's traced child has
             // the debugger for its parent).
             let shell_stopped = |p: &u32| {
@@ -1177,11 +1209,14 @@ impl Jobs {
                     });
                 // A job whose block a newer one replaced hands this block what it holds of it
                 // (the shell, and a group in front it took before `D` was fed): its command is
-                // over. So does one of no block (a shell nested in the tab's that the block's
-                // group in front runs under, a `zsh` whose own marks closed the block that ran it,
-                // a row of its own at its prompt; a job the block resumes is the one it gives way
-                // to below).
-                let handed = |c: usize| u.block.is_some() && self.jobs[c].block != u.block;
+                // over. A job that holds the nested shell that made a group out of front hands
+                // that group to its own unit: the shell's job control is the person's (a
+                // nested `bash`'s Ctrl-Z and `bg`, which writes no marks).
+                let handed = |c: usize| {
+                    let j = &self.jobs[c];
+                    (u.block.is_some() && j.block.is_some() && j.block != u.block)
+                        || u.nested_by.is_some_and(|m| j.members.contains_key(&m))
+                };
                 let mut free: Vec<u32> = u
                     .members
                     .iter()
@@ -1506,7 +1541,7 @@ impl Jobs {
             let tab = tabs.get(&self.jobs[i].key.tab).copied();
             let tf = tab_facts
                 .get(&self.jobs[i].key.tab)
-                .copied()
+                .cloned()
                 .unwrap_or_default();
             // A job whose command is unknown has no class: it reads its own μ or the prior.
             let class_mu = (!self.jobs[i].command.is_empty())
@@ -2143,6 +2178,7 @@ impl Jobs {
                     matches!(gate.word, GateWord::Clear | GateWord::Unmeasured)
                 },
                 consumer: job.consumer_pid,
+                behind: leaves.iter().all(|(p, _)| tf.makers.contains(p)),
             };
             let lanes = tick.lanes;
             let scene = Scene {
@@ -2178,13 +2214,14 @@ impl Jobs {
             // Every process at the far end of a pipe the parent or one below it sleeps on is one it
             // feeds or one that feeds it (the writers of one it reads: a `dump.sh` and the `ssh` it
             // runs, the `ssh` whose pipe a `zstd -dc` the parent started reads on the stdin it
-            // inherited; the readers of one it fills), and so is what feeds one of them in turn,
-            // but through one below the parent (a worker's stdin, inherited from the `fzf` that
-            // feeds the parent's own, while the worker sleeps on no pipe); every reader of a full
-            // pipe is followed (a zsh function's subshell and its `less`). The tab's shell and its
-            // forks are no pager by the terminal their line editor holds past their standard
-            // descriptors (zsh's at fd 10, bash's at 255) while the shell reads a `$(…)` or a fork
-            // runs a `| while read` loop or a function's stage.
+            // inherited, the `ssh` whose pipe an asyncio loop reads; the readers of one it fills),
+            // and so is what feeds one of them in turn, but through one below the parent (a
+            // worker's stdin, inherited from the `fzf` that feeds the parent's own, while the
+            // worker sleeps on no pipe); every reader of a full pipe is followed (a zsh function's
+            // subshell and its `less`). A shell is no pager by the terminal its line editor holds
+            // past its standard descriptors (zsh's at fd 10, bash's at 255, a dup of the tab's,
+            // never opened as `/dev/tty`) while it reads a `$(…)` or a fork of it runs a
+            // `| while read` loop or a function's stage.
             let zombie_parent_waits = zombies.as_ref().is_some_and(|z| {
                 let name = |p: u32| sweep.get(&p).map_or("", |s| s.name.as_str());
                 let mut fed: BTreeSet<u32> = BTreeSet::new();
@@ -2198,7 +2235,7 @@ impl Jobs {
                     }
                 }
                 let raw = wait.name == WaitName::TtyRaw;
-                let pager_at = |p: u32| pages(&scene, &sweep, p, (shell_pid, shell_name), raw);
+                let pager_at = |p: u32| pages(&scene, p, raw);
                 let pager = fed.iter().any(|p| pager_at(*p));
                 let leader_line = nested_holds
                     && first.is_some_and(|f| f.canonical && !f.echo)
@@ -2215,7 +2252,11 @@ impl Jobs {
                     .iter()
                     .filter(|p| below(&sweep, **p, z.parent))
                     .filter_map(|p| wait::wait_of(&scene, jf.consumer, *p, name(*p)))
-                    .flat_map(|w| wait::peers(&scene, &w))
+                    .flat_map(|w| {
+                        let mut far = wait::peers(&scene, &w);
+                        far.extend(wait::loop_feeders(&scene, &w));
+                        far
+                    })
                     .collect();
                 to.retain(|q| *q != z.parent);
                 while let Some(r) = to.pop() {
@@ -2239,23 +2280,49 @@ impl Jobs {
                 } else {
                     wait.leaf == z.parent
                 };
+                // `w` writes a pipe `r` reads, full where its fill is read (macOS), or where none is
+                // (Linux) while `w` `polls`, asleep in an event wait: a writer that names no wait
+                // there (a deadlocked script's futex) fills nothing.
+                let fills = |w: u32, r: u32, polls: bool| {
+                    let fds = |p: u32| facts.get(&p).and_then(|f| f.fds.as_deref()).unwrap_or(&[]);
+                    fds(r).iter().any(|d| match d.kind {
+                        super::FdKind::Pipe {
+                            handle,
+                            peer,
+                            queued,
+                            ..
+                        } if queued.map_or(polls, |n| n >= wait::PIPE_FULL_BYTES) => {
+                            fds(w).iter().any(|x| write_end_of(&x.kind, handle, peer))
+                        }
+                        _ => false,
+                    })
+                };
                 // A full write whose pipes, one stage blocked on the next, end at the pager (or at
-                // a reader aterm may not read).
+                // a reader aterm may not read); the last may write from a poll loop
+                // (`communicate`, asyncio's drain), which names no blocked write.
                 let to_pager = |from: u32| {
                     let (mut next, mut seen) = (vec![from], BTreeSet::new());
                     while let Some(cur) = next.pop() {
                         if !seen.insert(cur) || seen.len() > TREE_CAP {
                             continue;
                         }
-                        let Some(w) = wait::wait_of(&scene, jf.consumer, cur, name(cur))
-                            .filter(|w| w.name == WaitName::PipeFull)
-                        else {
-                            continue;
+                        let readers = match wait::wait_of(&scene, jf.consumer, cur, name(cur)) {
+                            Some(w) if w.name == WaitName::PipeFull => {
+                                let readers = wait::peers(&scene, &w);
+                                if readers.is_empty() {
+                                    return true;
+                                }
+                                readers
+                            }
+                            Some(w) if w.name != WaitName::EventLoop => continue,
+                            w => {
+                                let polls = w.is_some();
+                                fed.iter()
+                                    .copied()
+                                    .filter(|q| fills(cur, *q, polls))
+                                    .collect()
+                            }
                         };
-                        let readers = wait::peers(&scene, &w);
-                        if readers.is_empty() {
-                            return true;
-                        }
                         for q in readers.into_iter().filter(|q| fed.contains(q)) {
                             if pager_at(q) {
                                 return true;
@@ -3070,45 +3137,54 @@ fn discover(
     // watcher's loop, also one a second shell's profile started under that shell's own block),
     // or one a left program runs (the watcher's `pwsh -File build.ps1`), is a left program.
     let in_own: BTreeSet<u32> = own.iter().copied().collect();
-    let runs_prompt = |b: &Block| {
-        prompt_name.is_some_and(|n| {
-            b.command
-                .split_whitespace()
-                .next()
-                .is_some_and(|w| w.rsplit('/').next() == Some(n))
-        })
-    };
-    // The blocks that ran the prompt's program by name a process may be the fork of: the open
-    // one, and the tab's last one and the one that replaced, opened since about the pass before.
+    // The blocks a process may be the fork of: the open one, and the tab's last one and the one
+    // that replaced, opened since about the pass before.
     let fresh = |b: &Block| b.started_ms.saturating_add(C_LAG_MS) > born.since;
-    let typing: Vec<&Block> = tab
+    let near: Vec<&Block> = tab
         .ended
         .iter()
         .filter(|e| fresh(e))
         .chain(tab.block.iter().filter(|b| b.open || fresh(b)))
-        .filter(|b| runs_prompt(b))
         .collect();
-    // The one of them `p`, born at `birth`, is the fork of: of those opened by a moment after its
-    // birth and newer than its parent's when that is a second shell, the one opened nearest it.
-    let pick = |seen: &HashMap<u32, MakerSeen>, p: u32, birth: u64| {
+    // How near a block opened at `started` is to a birth between `lo` and `hi`
+    // ([`MakerSeen::near`]), the nearest the least; `None` for one opened past a moment after.
+    let rank = |(lo, hi): (u64, u64), started: u64| {
+        if started <= hi {
+            let early = started.saturating_add(BIRTH_LAG_MS) < lo;
+            Some((if early { 2 } else { 0 }, u64::MAX - started))
+        } else {
+            (started <= hi.saturating_add(BIRTH_LAG_MS)).then_some((1, started))
+        }
+    };
+    // The one of them `p`, born in `span`, is the fork of, of those newer than the one its
+    // parent took (the tab's shell, in no group here, takes none).
+    let pick = |seen: &HashMap<u32, MakerSeen>, p: u32, span: (u64, u64)| {
         let floor = sweep
             .get(&p)
             .map(|s| s.ppid)
-            .filter(|q| *q != shell)
             .and_then(|q| seen.get(&q))
-            .and_then(|s| s.typed);
-        typing
-            .iter()
-            .filter(|b| {
-                b.started_ms <= birth.saturating_add(BIRTH_LAG_MS) && floor.is_none_or(|f| f < b.id)
+            .and_then(|s| s.near.as_ref())
+            .map(|n| n.id);
+        near.iter()
+            .filter(|b| floor.is_none_or(|f| f < b.id))
+            .filter_map(|b| rank(span, b.started_ms).map(|r| (r, b)))
+            .min_by_key(|(r, _)| *r)
+            .map(|(_, b)| Near {
+                id: b.id,
+                started_ms: b.started_ms,
+                word: b
+                    .command
+                    .split_whitespace()
+                    .next()
+                    .and_then(|w| w.rsplit('/').next())
+                    .unwrap_or_default()
+                    .to_owned(),
             })
-            .min_by_key(|b| b.started_ms.abs_diff(birth))
-            .map(|b| b.id)
     };
     let prompts = |seen: &HashMap<u32, MakerSeen>, m: u32| {
         let one = |p: u32| {
             prompt_name.is_some_and(|n| sweep.get(&p).is_some_and(|s| s.name == n))
-                && seen.get(&p).is_some_and(|s| s.typed.is_some())
+                && seen.get(&p).is_some_and(|s| s.typed(prompt_name).is_some())
                 && facts
                     .get(&p)
                     .and_then(|f| f.fds.as_deref())
@@ -3152,13 +3228,19 @@ fn discover(
             .filter(|m| !prompts(&born.seen, *m))
             .and_then(|m| born.seen.get(&m))
             .map(|m| (m.block, m.at));
-        let birth = at.saturating_sub(facts.get(p).and_then(|f| f.age_ms).unwrap_or(0));
+        let birth = facts
+            .get(p)
+            .and_then(|f| f.age_ms)
+            .map(|a| born.probe.saturating_sub(a))
+            .filter(|b| *b >= born.since)
+            .map_or((born.since, born.probe), |b| (b, b));
         let first = MakerSeen {
             start,
             block: made.map_or(open, |(b, _)| b),
             at: made.map_or(at, |(_, a)| a),
             born: birth,
-            typed: pick(&born.seen, *p, birth),
+            first: at,
+            near: pick(&born.seen, *p, birth),
         };
         let seen = born.seen.entry(*p).or_insert_with(|| first.clone());
         match (seen.start, start) {
@@ -3166,22 +3248,30 @@ fn discover(
             (None, Some(_)) => seen.start = start,
             _ => {}
         }
-        // A pass that read the tab before the `C` of the `pwsh` it swept the fork of.
-        let (typed, birth) = (seen.typed, seen.born);
-        if typed.is_none()
-            && let Some(b) = pick(&born.seen, *p, birth)
+        // A pass that read the tab before the `C` of the command it swept the fork of: a nearer
+        // block that opened past the first pass's clock replaces the one taken.
+        let (birth, first) = (seen.born, seen.first);
+        let was = seen.near.as_ref().map(|n| rank(birth, n.started_ms));
+        if let Some(b) = pick(&born.seen, *p, birth)
+            .filter(|b| was.is_none_or(|w| b.started_ms > first && rank(birth, b.started_ms) < w))
             && let Some(s) = born.seen.get_mut(p)
         {
-            s.typed = Some(b);
+            s.near = Some(b);
         }
         let Some(seen) = born.seen.get_mut(p) else {
             continue;
         };
         // A pass that read the tab before a command's `C` and swept its fork after saw it under
-        // no block, or the one before: the block that opened a moment after that pass is its.
+        // no block, or the one before: the block that opened a moment after that pass is its, but
+        // for a process the block it was seen under is the fork of (a `Start-Process` watcher, the
+        // next command opened a moment after); a process another made follows its maker.
         if let Some(b) = block_open
             && seen.block != open
             && b.started_ms <= seen.at.saturating_add(C_LAG_MS)
+            && made.map_or_else(
+                || seen.near.as_ref().is_none_or(|n| Some(n.id) != seen.block),
+                |(m, _)| m == open,
+            )
         {
             seen.block = open;
         }
@@ -3253,6 +3343,7 @@ fn discover(
             command: hint.and_then(|h| h.command.clone()).unwrap_or_default(),
             block: None,
             shell: None,
+            nested_by: None,
         });
     }
     // A terminal session nested in the tab's is a call of the program that opened it, judged by
@@ -3287,6 +3378,7 @@ fn discover(
             command: String::new(),
             block: None,
             shell: None,
+            nested_by: None,
         });
     }
     let front = tf.tpgid.filter(|g| *g != tf.shell_pgid && *g != 0);
@@ -3305,8 +3397,9 @@ fn discover(
     // The groups the group in front runs under, up to the shell's: those of the shells nested in
     // the tab's, each in a group of its own (a `zsh` run there, its own marks having closed the
     // block that ran it, or vim's `:sh`), and of the programs that ran them (vim, also when no
-    // pass saw its `:sh` at a prompt, the shell's group folded into vim's): the open block's
-    // command is theirs, and in a tab without marks the command in front, not a job beside it.
+    // pass saw its `:sh` at a prompt, the shell's group folded into vim's). Each is a job of its
+    // own, waiting on the command in front (`JobFacts::behind`), and none a background job that
+    // may print.
     let holder = |p: u32| {
         groups
             .iter()
@@ -3315,21 +3408,16 @@ fn discover(
     };
     let mut under: Vec<u32> = Vec::new();
     let mut at_g = front;
-    while let Some(h) = at_g
+    while let Some((m, h)) = at_g
         .and_then(|g| groups.get(&g).and_then(|ms| made_by(g, ms)))
-        .and_then(holder)
-        .filter(|h| *h != tf.shell_pgid && Some(*h) != front && !under.contains(h))
+        .and_then(|m| holder(m).map(|h| (m, h)))
+        .filter(|(_, h)| *h != tf.shell_pgid && Some(*h) != front && !under.contains(h))
         .filter(|_| under.len() < TREE_CAP)
     {
         under.push(h);
+        tf.makers.push(m);
         at_g = Some(h);
     }
-    let under_members: Vec<u32> = under
-        .iter()
-        .filter_map(|h| groups.get(h))
-        .flatten()
-        .copied()
-        .collect();
     if let Some(b) = block_open {
         // The shell's own group is the block's for what the block started in it: a program a
         // pwsh `Start-Job` left running there is no later command's.
@@ -3347,7 +3435,6 @@ fn discover(
             .cloned()
             .unwrap_or_default();
         members.extend(&in_front);
-        members.extend(&under_members);
         tf.has_fg = true;
         units.push(Unit {
             key: Key {
@@ -3368,19 +3455,17 @@ fn discover(
             command: b.command.clone(),
             block: Some(b.id),
             shell: Some(shell),
+            nested_by: None,
         });
     }
-    for (g, mut members) in groups {
+    for (g, members) in groups {
         if g == tf.shell_pgid || g == 0 {
             continue;
         }
         let fg = front == Some(g);
-        if (fg && block_open.is_some()) || under.contains(&g) {
-            // Folded into the block's job above, or into the job in front.
+        if fg && block_open.is_some() {
+            // Folded into the block's job above.
             continue;
-        }
-        if fg {
-            members.extend(&under_members);
         }
         let leader_name = sweep
             .get(&g)
@@ -3389,13 +3474,23 @@ fn discover(
             .unwrap_or_default();
         if fg {
             tf.has_fg = true;
-        } else if members.iter().any(|p| {
-            sweep
-                .get(p)
-                .is_some_and(|s| !matches!(s.state, ProcState::Stopped | ProcState::Zombie))
-        }) {
+        } else if !under.contains(&g)
+            && members.iter().any(|p| {
+                sweep
+                    .get(p)
+                    .is_some_and(|s| !matches!(s.state, ProcState::Stopped | ProcState::Zombie))
+            })
+        {
             tf.bg_units += 1;
         }
+        // A debugger's inferior stopped at a breakpoint is the debugger's command.
+        let nested_by = made_by(g, &members)
+            .filter(|m| !under.contains(&g) && *m != shell)
+            .filter(|_| {
+                !members
+                    .iter()
+                    .any(|p| facts.get(p).is_some_and(|f| f.traced))
+            });
         units.push(Unit {
             key: Key {
                 tab: tab.key,
@@ -3419,6 +3514,7 @@ fn discover(
             command: leader_name,
             block: None,
             shell: None,
+            nested_by,
         });
     }
     (units, tf)

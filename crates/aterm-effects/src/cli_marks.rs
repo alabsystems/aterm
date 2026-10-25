@@ -66,23 +66,16 @@ impl CliMark {
     /// Look up the mark for a canonical lowercase CLI app id.
     #[must_use]
     pub const fn for_app(app_id: &str) -> Option<Self> {
-        let target = app_id.as_bytes();
-        let mut i = 0;
-        while i < Self::ALL.len() {
-            let m = Self::ALL[i];
-            let word = m.word().as_bytes();
-            if word.len() == target.len() {
-                let mut j = 0;
-                while j < word.len() && word[j] == target[j] {
-                    j += 1;
-                }
-                if j == word.len() {
-                    return Some(m);
-                }
-            }
-            i += 1;
+        match app_id.as_bytes() {
+            b"claude" => Some(Self::Claude),
+            b"codex" => Some(Self::Codex),
+            b"agy" => Some(Self::Agy),
+            b"muse" => Some(Self::Muse),
+            b"gemini" => Some(Self::Gemini),
+            b"grok" => Some(Self::Grok),
+            b"kimi" => Some(Self::Kimi),
+            _ => None,
         }
-        None
     }
 
     /// Canonical lowercase word for this CLI.

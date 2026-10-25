@@ -136,6 +136,42 @@ fn an_open_capture_never_waits_for_its_own_frame_to_close() {
 }
 
 #[test]
+fn a_requested_rainbow_return_losing_eligibility_is_inconclusive() {
+    let live = "trail resolved=rainbow-kitty config_enabled=true effective=true intensity=1.00 ribbon_segments=12 ribbon_drawn=30";
+    let expected = expects_rainbow(&config_lines("rainbow kitty pet", Theme::Dark, &[])).unwrap();
+    assert!(expected);
+    let mut wrongly_measured = Vec::new();
+    for (loss, line) in [
+        (
+            "disabled",
+            live.replace("config_enabled=true", "config_enabled=false"),
+        ),
+        (
+            "ineffective",
+            live.replace("effective=true", "effective=false"),
+        ),
+        ("unlit", live.replace("intensity=1.00", "intensity=0.00")),
+        ("changed style", live.replace("rainbow-kitty", "comet")),
+    ] {
+        let measured = return_measurement(
+            expected,
+            &Reply {
+                stdout: line,
+                ..Reply::default()
+            },
+        )
+        .unwrap();
+        if measured != ReturnMeasurement::Inconclusive {
+            wrongly_measured.push((loss, measured));
+        }
+    }
+    assert!(
+        wrongly_measured.is_empty(),
+        "a requested rainbow was not measured: {wrongly_measured:?}"
+    );
+}
+
+#[test]
 fn a_return_without_a_live_rainbow_is_inconclusive_but_other_styles_are_not() {
     let live = "trail resolved=rainbow-kitty config_enabled=true effective=true intensity=1.00 ribbon_segments=12 ribbon_drawn=30";
     let status = |line: String| Reply {
@@ -143,7 +179,7 @@ fn a_return_without_a_live_rainbow_is_inconclusive_but_other_styles_are_not() {
         ..Reply::default()
     };
     assert_eq!(
-        return_measurement(&status(live.into())).unwrap(),
+        return_measurement(true, &status(live.into())).unwrap(),
         ReturnMeasurement::LiveRibbon
     );
     for dead in [
@@ -151,35 +187,124 @@ fn a_return_without_a_live_rainbow_is_inconclusive_but_other_styles_are_not() {
         live.replace("drawn=30", "drawn=0"),
     ] {
         assert_eq!(
-            return_measurement(&status(dead)).unwrap(),
+            return_measurement(true, &status(dead)).unwrap(),
             ReturnMeasurement::Inconclusive
         );
     }
-    for other in [
-        live.replace("rainbow-kitty", "comet"),
-        live.replace("rainbow-kitty", "off"),
-        live.replace("config_enabled=true", "config_enabled=false"),
-        live.replace("effective=true", "effective=false"),
-        live.replace("intensity=1.00", "intensity=0.00"),
-    ] {
+    for style in ["comet", "off"] {
+        let expected = expects_rainbow(&config_lines(style, Theme::Dark, &[])).unwrap();
+        assert!(!expected);
         assert_eq!(
-            return_measurement(&status(other)).unwrap(),
+            return_measurement(expected, &status(live.replace("rainbow-kitty", style))).unwrap(),
             ReturnMeasurement::NotApplicable
         );
     }
     for missing in [
         live.replace("ribbon_drawn=30", ""),
         live.replace("intensity=1.00", "intensity=NaN"),
+        live.replace("intensity=1.00", "intensity=-1.00"),
+        live.replace("rainbow-kitty", "unknown"),
+        live.replace("config_enabled=true", "config_enabled=maybe"),
+        live.replace("effective=true", "effective=maybe"),
+        live.replace("ribbon_segments=12", "ribbon_segments=NaN"),
     ] {
-        assert!(return_measurement(&status(missing)).is_err());
+        for expected in [false, true] {
+            assert!(return_measurement(expected, &status(missing.clone())).is_err());
+        }
     }
-    assert!(
-        return_measurement(&Reply {
-            code: 1,
-            ..Reply::default()
-        })
-        .is_err()
-    );
+    for expected in [false, true] {
+        assert!(
+            return_measurement(
+                expected,
+                &Reply {
+                    code: 1,
+                    ..Reply::default()
+                }
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn rainbow_measurement_intent_uses_the_final_config_and_shared_style_and_motion_parsers() {
+    for (style, extra, expected) in [
+        ("rainbow kitty pet", None, true),
+        ("nyan", None, true),
+        ("off", None, false),
+        ("comet", None, false),
+        (
+            "rainbow kitty pet",
+            Some("cursor_trail_style = 'comet'"),
+            false,
+        ),
+        (
+            "comet",
+            Some("cursor_trail_style = 'rainbow kitty pet'"),
+            true,
+        ),
+        (
+            "rainbow kitty pet",
+            Some("cursor_trail_style = 'off'"),
+            false,
+        ),
+        ("rainbow kitty pet", Some("cursor_trail = false"), false),
+        ("rainbow kitty pet", Some("motion = ' REDUCE '"), false),
+        ("rainbow kitty pet", Some("motion = 'off'"), true),
+        ("rainbow kitty pet", Some("motion = 'unknown'"), true),
+        ("rainbow kitty pet", Some("serious_mode = true"), false),
+        (
+            "rainbow kitty pet",
+            Some("cursor_trail_intensity = 0"),
+            false,
+        ),
+        (
+            "rainbow kitty pet",
+            Some("cursor_trail_intensity = 0.0"),
+            false,
+        ),
+        (
+            "rainbow kitty pet",
+            Some("cursor_trail_intensity = -1.0"),
+            false,
+        ),
+        (
+            "rainbow kitty pet",
+            Some("cursor_trail_intensity = nan"),
+            false,
+        ),
+        (
+            "rainbow kitty pet",
+            Some("cursor_trail_intensity = inf"),
+            false,
+        ),
+        (
+            "rainbow kitty pet",
+            Some("cursor_trail_intensity = 0.1"),
+            true,
+        ),
+        (
+            "rainbow kitty pet",
+            Some("cursor_trail_intensity = 2"),
+            true,
+        ),
+    ] {
+        let extra: Vec<String> = extra.into_iter().map(str::to_owned).collect();
+        let config = config_lines(style, Theme::Dark, &extra);
+        assert_eq!(expects_rainbow(&config).unwrap(), expected, "{config:?}");
+    }
+    for extra in [
+        "cursor_trail_style = 'unknown'",
+        "cursor_trail_style = 7",
+        "cursor_trail = 'false'",
+        "motion = false",
+        "serious_mode = 'true'",
+        "cursor_trail_intensity = '0'",
+        "cursor_trail_intensity = [",
+    ] {
+        let config = config_lines("rainbow kitty pet", Theme::Dark, &[extra.into()]);
+        assert!(expects_rainbow(&config).is_err(), "{config:?}");
+    }
 }
 
 fn args(words: &[&str]) -> Vec<String> {

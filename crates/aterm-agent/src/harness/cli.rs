@@ -29,8 +29,8 @@ use crate::supervise::run::{Ctl, Session};
 use crate::supervise::transport::{Endpoint, RelayCtl};
 use crate::supervise::{SupervisorConfig, approvals, limit};
 
-/// The harness name, which is also the state directory's name (design §1.3).
-pub const HARNESS: &str = "claude-harness";
+/// The harness name, which is also the state directory's name (design §1.3): one definition with the folder the tools that admit a disk need read the disk watch's rooms from (`aterm_capacity::room::state_dir`).
+pub const HARNESS: &str = aterm_capacity::room::HARNESS;
 
 /// How many rows `ledger` prints when the caller names no count.
 pub const LEDGER_DEFAULT_ROWS: usize = 20;
@@ -3007,7 +3007,7 @@ fn disk_read(text: &str, faults: &mut Vec<DiskFault>) -> DiskReading {
         }
     };
     let mut cfg = d;
-    let mut written = disk::Written::default();
+    let mut knobs = aterm_capacity::floor::Knobs::default();
     let mut notes = Vec::new();
     let mut off = false;
     let mut floor_read = true;
@@ -3030,7 +3030,7 @@ fn disk_read(text: &str, faults: &mut Vec<DiskFault>) -> DiskReading {
                         cfg.idle_build_days = *n;
                     }
                     ("room_gib", T::Integer(n)) if *n >= 0 => {
-                        cfg.room_gib = u64::try_from(*n).ok();
+                        knobs.read(key, *n);
                     }
                     ("room_gib", value) => {
                         let kind = value.type_str();
@@ -3059,15 +3059,10 @@ fn disk_read(text: &str, faults: &mut Vec<DiskFault>) -> DiskReading {
                             notes.push(format!("disk.{key} is negative; it is read as {reading}"));
                         }
                         match key {
-                            "warn_free_gib" => {
-                                cfg.warn_free_gib = u64::try_from(*n).unwrap_or(d.warn_free_gib);
-                                written.warn_free_gib = *n >= 0;
-                            }
                             "target_stale_days" if *n >= 0 => cfg.target_stale_days = *n,
                             "target_stale_days" => {}
                             _ => {
-                                cfg.auto_free_gib = u64::try_from(*n).unwrap_or(0);
-                                written.auto_free_gib = true;
+                                knobs.read(key, *n);
                             }
                         }
                     }
@@ -3146,12 +3141,15 @@ fn disk_read(text: &str, faults: &mut Vec<DiskFault>) -> DiskReading {
             notes.push(note);
         }
     }
+    cfg.warn_free_gib = knobs.warn_free_gib;
+    cfg.auto_free_gib = knobs.auto_free_gib;
+    cfg.room_gib = knobs.room_gib;
     DiskReading {
         config: if off { removal_off(cfg) } else { cfg },
         floor_gib: floor_read.then_some(cfg.auto_free_gib),
         notes,
         off_by_fault: off,
-        written,
+        written: knobs.written,
     }
 }
 
@@ -6007,9 +6005,10 @@ fn login_words(
     words
 }
 
-/// The row's last automatic sign-in, where it says something now: a failure while the row is
-/// still without a login it can be run on (`sign-in: error no-route since <t>: tried profile(none)
-/// mailbox(none configured) …`), or the route of the one that signed it in.
+/// The row's last automatic sign-in, where it says something now: a failure while the row still
+/// needs a sign-in ([`accounts::needs_sign_in`]: no login it can be run on, or one due for
+/// renewal; `sign-in: error no-route since <t>: tried profile(none) mailbox(none configured) …`),
+/// or the route of the one that signed it in.
 fn sign_in_attempt_words(
     row: &accounts::Row,
     state: &accounts::State,
@@ -6020,11 +6019,7 @@ fn sign_in_attempt_words(
     let attempt = logins.get(&row.label)?.sign_in_attempt.as_ref()?;
     let since = rfc3339_utc(attempt.since);
     if attempt.outcome.failing() {
-        matches!(
-            accounts::condition(row, state, here, now),
-            accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
-        )
-        .then(|| {
+        accounts::needs_sign_in(row, state, logins, here, now).then(|| {
             format!(
                 "sign-in: error {} since {since}: tried {}",
                 attempt.outcome.as_str(),

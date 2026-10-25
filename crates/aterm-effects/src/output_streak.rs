@@ -661,9 +661,22 @@ impl OutputStreak {
 
     /// The first free comet slot under the host's resident cap.
     #[inline]
-    fn free_slot(&self, cfg: &StreakConfig) -> Option<usize> {
-        let cap = (cfg.max_streaks as usize).clamp(1, MAX_COMETS);
-        self.comets.iter().take(cap).position(Option::is_none)
+    const fn free_slot(&self, cfg: &StreakConfig) -> Option<usize> {
+        let cap = if (cfg.max_streaks as usize) < 1 {
+            1
+        } else if (cfg.max_streaks as usize) > MAX_COMETS {
+            MAX_COMETS
+        } else {
+            cfg.max_streaks as usize
+        };
+        let mut i = 0;
+        while i < cap {
+            if self.comets[i].is_none() {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
     }
 
     /// Governor 6, opening half: one pip on the quiet→active crossing, then mute.
@@ -799,11 +812,11 @@ impl OutputStreak {
             let life = 1.0 - c.progress;
             let head = c.from_col as f32 + (c.to_col - c.from_col) as f32 * c.progress;
             let tail_f = f32::from(c.tail);
-            let tail_denom = tail_f.max(1.0);
+            let inv_tail_denom = 1.0 / tail_f.max(1.0);
             let tail_start = (head - tail_f).max(c.from_col as f32);
             let y = i32::from(c.row) * ch_i;
             for col in tail_start.floor() as i32..=head.round() as i32 {
-                let u = ((head - col as f32) / tail_denom).clamp(0.0, 1.0);
+                let u = ((head - col as f32) * inv_tail_denom).clamp(0.0, 1.0);
                 let shape = (1.0 - u) * (1.0 - u);
                 self.push_cell(
                     out,
@@ -824,13 +837,13 @@ impl OutputStreak {
         }
 
         if let Some(r) = self.ribbon {
-            let fade =
-                1.0 - (r.since_output_s / (RIBBON_LINGER_MS as f32 / 1000.0)).clamp(0.0, 1.0) * 0.5;
-            let cols_f = geom.cols.max(1) as f32;
+            const INV_RIBBON_LINGER_S: f32 = 1000.0 / (RIBBON_LINGER_MS as f32);
+            let fade = 1.0 - (r.since_output_s * INV_RIBBON_LINGER_S).clamp(0.0, 1.0) * 0.5;
+            let hue_step = HUE_SPAN / geom.cols.max(1) as f32;
             let y = i32::from(r.row) * ch_i;
             let shape = 0.55 * fade;
             for col in r.from_col..=r.to_col {
-                let t = r.hue + (col as f32 / cols_f) * HUE_SPAN;
+                let t = r.hue + col as f32 * hue_step;
                 self.push_cell(out, geom, cfg, amp, (cw_i, ch_i), y, col, t, shape);
             }
             fp = fp

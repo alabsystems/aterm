@@ -614,6 +614,8 @@ fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
             press,
         )
     };
+    // A Wide 1074x348 window's heading sits 12pt down on every page, its list 178pt tall
+    // under the subtitle and 214pt without it.
     let wide_short = (1_074.0, 348.0);
     let (anchor, (need, room), (heading, subtitle), press) =
         chrome(SettingsRoute::Security, Some(&anchored), wide_short, None);
@@ -621,12 +623,12 @@ fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
         anchor,
         PageChrome {
             no_subtitle: true,
-            inset: Some(12.0),
+            inset: None,
             bar_room_given: false,
             preview_listed: false,
         }
     );
-    assert_eq!((need, room), (212.0, 234.0));
+    assert_eq!((need, room), (212.0, 214.0));
     assert!(heading && !subtitle, "the heading stays, the subtitle goes");
     assert_eq!(press, Some(44.0), "Open Privacy & Security… whole and live");
     let (step, (need, room), _, press) =
@@ -640,14 +642,15 @@ fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
             preview_listed: false,
         }
     );
-    assert_eq!((need, room), (188.0, 194.0));
+    // Its card keeps its words beside its buttons where the list holds them together.
+    assert_eq!((need, room), (212.0, 214.0));
     assert_eq!(press, Some(44.0));
     for window in [(584.0, 292.0), (444.0, 292.0)] {
         let (step, (need, room), _, press) =
             chrome(SettingsRoute::Security, Some(&anchored), window, None);
         assert_eq!(
             (step.inset, need, room),
-            (Some(4.0), 229.0, 232.0),
+            (Some(4.0), 228.0, 232.0),
             "{window:?}"
         );
         assert_eq!(press, Some(44.0), "{window:?}");

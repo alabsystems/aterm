@@ -5356,14 +5356,14 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
     };
     let rest = |here: &str, landed: usize, today: &str, every: &str| {
         format!(
-            "here=\"{here}\" landed_tabs={landed} landing_tabs=6 landings=3 today=\"{today}\" every=\"{every}\" did=\"Landed: 3 today \u{b7} 3 in 7 days\""
+            "here=\"{here}\" landed_tabs={landed} landing_tabs=6 held_landing=6 held_needs=0 held_unread=0 landings=3 today=\"{today}\" every=\"{every}\" did=\"Landed: 3 today \u{b7} 3 in 7 days\""
         )
     };
     const TODAY: &str = "3 landed today · 2 kept going · 7 land prompts";
     const EVERY: &str = "Every session, 12 sessions: 2 cruising, 6 landing, 3 landed, 1 off";
     let l7 = |s: &Seen| one(Chain::LandE, s, "gemini", Scenario::L7);
     let good = seen(Some(&rest(
-        "This Mac — 3 landed · 2 shells",
+        "This Mac — 6 landing · 3 landed · 2 shells",
         3,
         TODAY,
         EVERY,
@@ -5411,7 +5411,7 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
         ),
     ] {
         let (w, why) = l7(&seen(Some(&rest(
-            "This Mac — 3 landed · 2 shells",
+            "This Mac — 6 landing · 3 landed · 2 shells",
             3,
             today,
             every,
@@ -5421,15 +5421,20 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
     }
     for (today, every) in [("-", EVERY), (TODAY, "-")] {
         let (w, why) = l7(&seen(Some(&rest(
-            "This Mac — 3 landed · 2 shells",
+            "This Mac — 6 landing · 3 landed · 2 shells",
             3,
             today,
             every,
         ))));
         assert_eq!(w, "UNOBSERVED", "{today} / {every}: {why}");
     }
-    let none =
-        rest("This Mac — 3 landed · 2 shells", 3, TODAY, EVERY).replace("landings=3", "landings=0");
+    let none = rest(
+        "This Mac — 6 landing · 3 landed · 2 shells",
+        3,
+        TODAY,
+        EVERY,
+    )
+    .replace("landings=3", "landings=0");
     assert_eq!(l7(&seen(Some(&none))).0, "FAIL");
 }
 

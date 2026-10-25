@@ -592,6 +592,7 @@ impl EffectsPipeline {
         self.cursor.glow.swap_charred(&mut input.char_fg);
         self.cursor.glow.swap_halo_cells(&mut input.fire_halo);
         input.cursor_trail.clone_from(&self.cursor.trail_scratch);
+        input.bloom_gate = aterm_core::render::BloomGate::of(self.cursor.bloom_held);
     }
 
     /// Open a frame's word channels.
@@ -605,7 +606,7 @@ impl EffectsPipeline {
     /// The word pass's icons from `from` on in the window's sprites, to the
     /// next frame's sky and ribbon ([`crate::cursor_glow::CursorGlow::note_word_icons`]).
     #[inline]
-    fn note_word_icons(&mut self, from: usize) {
+    pub(super) fn note_word_icons(&mut self, from: usize) {
         let icons = self
             .free_scratch
             .get(from..)
@@ -629,6 +630,7 @@ impl EffectsPipeline {
             &mut input.cursor_glow_add,
             &mut input.glow_under,
             &mut input.glow_halo,
+            &mut input.fire_patch,
         ));
     }
 
@@ -1019,6 +1021,23 @@ impl EffectsPipeline {
             .publish(&self.free_scratch, &mut input.fx_layers);
         input.nova_add.clone_from(&self.nova_scratch);
         self.shade_word_icons(input);
+        self.veil_pet_letters(input);
+    }
+
+    /// The page veil under the letters the pet lies beneath, by the body its
+    /// tick drew this frame, into the published under stream
+    /// ([`crate::cursor_glow::CursorGlow::veil_pet_letters`]): every host
+    /// calls it after its pet's tick and the trail's publish.
+    #[inline]
+    pub fn veil_pet_letters(&mut self, input: &mut RenderInput) {
+        #[cfg(test)]
+        if self.pet_veil_stale {
+            return;
+        }
+        let _ = self
+            .cursor
+            .glow
+            .veil_pet_letters(&mut input.glow_under, &self.free_scratch);
     }
 
     /// The pet's level rules and senses before its tick ([`CompanionOwner::prepare`]), reading the
@@ -1359,8 +1378,11 @@ pub(super) fn step_cursor_family(
         }
     }
     let rainbow = matches!(step.glow.style, crate::cursor_glow::GlowStyle::RainbowKitty);
+    const INSERT_HINT_FRESH_DUR: std::time::Duration = std::time::Duration::from_nanos(
+        (CursorGlow::INSERT_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64,
+    );
     for d in deliveries {
-        if now.saturating_duration_since(d.at).as_secs_f32() > CursorGlow::INSERT_HINT_FRESH {
+        if now.saturating_duration_since(d.at) > INSERT_HINT_FRESH_DUR {
             continue;
         }
         apply_delivery(cursor, rainbow, d);

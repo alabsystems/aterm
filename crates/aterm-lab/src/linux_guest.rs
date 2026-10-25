@@ -298,9 +298,9 @@ pub const BROWSER_ARM64: &[&str] = &[
     "libxrender1",
 ];
 
-/// Every package the guest installs, `:amd64` names last.
+/// Every package the guest installs, `:amd64` names last, and those only when `x86_64`.
 #[must_use]
-pub fn packages() -> Vec<String> {
+pub fn packages_for(x86_64: bool) -> Vec<String> {
     let native = TOOLS
         .iter()
         .chain(DEV_LIBRARIES)
@@ -313,7 +313,7 @@ pub fn packages() -> Vec<String> {
         .chain(BROWSER_AMD64);
     native
         .map(|p| (*p).to_string())
-        .chain(foreign.map(|p| format!("{p}:amd64")))
+        .chain(foreign.filter(|_| x86_64).map(|p| format!("{p}:amd64")))
         .collect()
 }
 
@@ -395,9 +395,22 @@ pub fn provision_steps() -> Vec<Step> {
     provision_plan(std::fs::read_to_string(WEB2).ok())
 }
 
+/// [`provision_steps`], with the x86_64 half (the amd64 sources, architecture and libraries, and
+/// the x86_64 std) only when `x86_64`: a guest with no Rosetta (the GPU instance's) runs none.
+#[must_use]
+pub fn provision_steps_for(x86_64: bool) -> Vec<Step> {
+    provision_plan_for(std::fs::read_to_string(WEB2).ok(), x86_64)
+}
+
 /// The provisioning plan, in order, laying `web2` at [`WEB2`] when it is given.
 #[must_use]
 pub fn provision_plan(web2: Option<String>) -> Vec<Step> {
+    provision_plan_for(web2, true)
+}
+
+/// [`provision_plan`], with its x86_64 half only when `x86_64`.
+#[must_use]
+pub fn provision_plan_for(web2: Option<String>, x86_64: bool) -> Vec<Step> {
     let mut install = vec![
         "sudo",
         "env",
@@ -411,27 +424,41 @@ pub fn provision_plan(web2: Option<String>) -> Vec<Step> {
     .into_iter()
     .map(str::to_string)
     .collect::<Vec<_>>();
-    install.extend(packages());
-    let mut steps = vec![
-        step(
-            "arm64 sources",
-            &["sudo", "tee", "/etc/apt/sources.list.d/ubuntu.sources"],
-            Some(SOURCES_ARM64),
-        ),
-        step(
-            "amd64 sources",
-            &[
-                "sudo",
-                "tee",
-                "/etc/apt/sources.list.d/ubuntu-amd64.sources",
-            ],
-            Some(SOURCES_AMD64),
-        ),
-        step(
-            "amd64 architecture",
-            &["sudo", "dpkg", "--add-architecture", "amd64"],
-            None,
-        ),
+    install.extend(packages_for(x86_64));
+    let rust = [
+        "rustup",
+        "toolchain",
+        "install",
+        RUST,
+        "--profile",
+        "minimal",
+        "--target",
+        Arch::X86_64.triple(),
+    ];
+    let mut steps = vec![step(
+        "arm64 sources",
+        &["sudo", "tee", "/etc/apt/sources.list.d/ubuntu.sources"],
+        Some(SOURCES_ARM64),
+    )];
+    if x86_64 {
+        steps.extend([
+            step(
+                "amd64 sources",
+                &[
+                    "sudo",
+                    "tee",
+                    "/etc/apt/sources.list.d/ubuntu-amd64.sources",
+                ],
+                Some(SOURCES_AMD64),
+            ),
+            step(
+                "amd64 architecture",
+                &["sudo", "dpkg", "--add-architecture", "amd64"],
+                None,
+            ),
+        ]);
+    }
+    steps.extend([
         // A VM stopped mid-install (the Mac restarted under it) leaves dpkg interrupted, and
         // apt refuses every install until its unpacked packages are configured; with nothing
         // pending this does nothing.
@@ -455,16 +482,7 @@ pub fn provision_plan(web2: Option<String>) -> Vec<Step> {
         },
         step(
             "rust toolchain",
-            &[
-                "rustup",
-                "toolchain",
-                "install",
-                RUST,
-                "--profile",
-                "minimal",
-                "--target",
-                Arch::X86_64.triple(),
-            ],
+            if x86_64 { &rust } else { &rust[..6] },
             None,
         ),
         step(
@@ -477,7 +495,7 @@ pub fn provision_plan(web2: Option<String>) -> Vec<Step> {
             &["sh", "-s", "--", BASH_3_2.0, BASH_3_2.1],
             Some(BASH_3_2_INSTALL),
         ),
-    ];
+    ]);
     if let Some(words) = web2 {
         steps.push(step(
             "web2",
@@ -537,6 +555,7 @@ pub fn cargo_env(arch: Arch, target_dir: &str, default_target: bool) -> Vec<(Str
             env.push(("CARGO_BUILD_TARGET".into(), arch.triple().into()));
         }
     }
+    env.extend(crate::linux_gpu::client_env());
     env
 }
 
@@ -1389,7 +1408,7 @@ mod tests {
 
     #[test]
     fn every_library_is_installed_for_both_architectures() {
-        let all = packages();
+        let all = packages_for(true);
         for lib in DEV_LIBRARIES.iter().chain(MESA) {
             assert!(all.iter().any(|p| p == lib), "{lib}");
             assert!(
@@ -1448,6 +1467,30 @@ mod tests {
             fingerprint(&words),
             fingerprint(&provision_plan(Some("a\nc\n".into())))
         );
+    }
+
+    #[test]
+    fn a_guest_without_rosetta_is_provisioned_for_aarch64_alone() {
+        let native = provision_plan_for(None, false);
+        assert!(native.iter().all(|s| !s.label.starts_with("amd64")));
+        let install = native.iter().find(|s| s.label == "apt-get install");
+        assert!(
+            install
+                .expect("an install step")
+                .argv
+                .iter()
+                .all(|a| !a.ends_with(":amd64"))
+        );
+        let rust = native.iter().find(|s| s.label == "rust toolchain");
+        assert!(
+            !rust
+                .expect("a toolchain step")
+                .argv
+                .iter()
+                .any(|a| a == Arch::X86_64.triple())
+        );
+        assert_eq!(provision_plan(None).len(), native.len() + 2);
+        assert_eq!(provision_plan(None), provision_plan_for(None, true));
     }
 
     /// The host's web2 goes to the guest at its own path, its words as the step's

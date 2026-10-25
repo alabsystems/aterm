@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm db`: explicit private databases, peer enrollment, reads, edits and LAN repair.
+//! `aterm db`: private and Commons databases, reads, edits and LAN repair.
 
 use crate::{
     Error, Result, crypto,
@@ -16,7 +16,24 @@ use std::{
 
 /// Command help. Mutation request IDs are caller-held, so lost replies are safely retried.
 pub const USAGE: &str = "aterm db — encrypted embedded application databases (Unix)\n\
-  Every command takes --dir <dedicated-private-directory>, except nonce and inspect-csv.\n\
+  Commons tables use enrolled secrets and default LAN repair (no --dir):\n\
+  commons-status                       local membership, control history and sharing setting\n\
+  commons-tables                       list declarations, provenance and subscriptions\n\
+  commons-open --application <id> --role <id> [--version <n>]\n\
+                                       open a deterministic offline application table\n\
+  commons-create --application <id> --role <id> [--version <n>] [--name <name>]\n\
+                                       create and publish an independent table\n\
+  accounts-init                       open the shared account/contact proposals table\n\
+  accounts-get --collection <name> --key <id>\n\
+  accounts-scan --collection <name>    values and explicit concurrent candidates\n\
+  accounts-write --changes <json-array> --request <hex>\n\
+                                       atomic proposals; null is reversible deletion\n\
+  accounts-revert --operation <digest> --request <hex>\n\
+  accounts-history                    signed provenance and local receipts\n\
+  accounts-import-csv --file <path> --request <hex>\n\
+                                       one atomic, inert CSV candidate document\n\
+  accounts-imports                    shared candidates and signed provenance\n\
+  The private database commands below take --dir, except nonce and inspect-csv.\n\
   init [--namespace accounts]           create a complete single-machine database\n\
   request                              create/print this installation's public actor\n\
   invite --actor <actor-hex>            write join.invite privately in this database\n\
@@ -103,6 +120,26 @@ pub fn run(words: &[String]) -> Result<Value> {
             return Err(Error::new("nonce takes no options"));
         }
         return Ok(json!({"request":hex::encode_lower(&crypto::random::<16>()?)}));
+    }
+    if matches!(
+        command,
+        "commons-status" | "commons-tables" | "commons-open" | "commons-create"
+    ) {
+        return crate::catalog::command::run(command, options);
+    }
+    if matches!(command, "accounts-import-csv" | "accounts-imports") {
+        return crate::import::commons::run(command, options);
+    }
+    if matches!(
+        command,
+        "accounts-init"
+            | "accounts-get"
+            | "accounts-scan"
+            | "accounts-write"
+            | "accounts-revert"
+            | "accounts-history"
+    ) {
+        return crate::accounts::proposals::command::run(command, options);
     }
     let dir_word = take(&mut options, "--dir")?;
     let dir = Path::new(dir_word);

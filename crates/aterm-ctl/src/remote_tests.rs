@@ -196,7 +196,7 @@ fn what_never_crosses_the_fleet_is_refused_here() {
 fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
     fn left(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
         Err(DriveRefused {
-            left: Some("496e9154e57ae1d4bb20b01cf5d624cf".to_owned()),
+            left: Some(Left::Fleet("496e9154e57ae1d4bb20b01cf5d624cf".to_owned())),
             ..DriveRefused::once("this machine is in no fleet".to_owned())
         })
     }
@@ -221,6 +221,31 @@ fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
             .to_string();
         assert_eq!(said, "this machine is in no fleet", "{other}");
     }
+    fn unbooked(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        Err(DriveRefused {
+            left: Some(Left::Book("496e9154e57ae1d4bb20b01cf5d624cf".to_owned())),
+            ..DriveRefused::once("`lab-mnii` is no Mac this machine's book records".to_owned())
+        })
+    }
+    let local = LocalVerbs {
+        fleet_drive: Some(unbooked),
+        ..LocalVerbs::NONE
+    };
+    let off = run("lab-mnii", &words("hold s-a1 off"), None, &local)
+        .expect_err("no such Mac in the book")
+        .to_string();
+    assert_eq!(
+        off,
+        "`lab-mnii` is no Mac this machine's book records; if this machine took s-a1 on a Mac \
+         its book records no more (it joined another fleet since, or a `peers rm` took that Mac \
+         out), that Mac's person lifts the hold (Take Over, or `aterm fleet peers rm 496e9154` \
+         there), and so does `aterm ctl --host lab-mnii hold s-a1 off` once this machine's book \
+         records that Mac again"
+    );
+    let on = run("lab-mnii", &words("hold s-a1 on"), None, &local)
+        .expect_err("no such Mac in the book")
+        .to_string();
+    assert_eq!(on, "`lab-mnii` is no Mac this machine's book records");
 }
 
 #[test]
@@ -380,4 +405,82 @@ fn a_drive_cut_before_its_answer_says_what_cuts_one_and_what_may_have_landed() {
         .expect_err("cut")
         .to_string();
     assert!(spawned.contains("the worker may have started"), "{spawned}");
+}
+
+struct Frozen;
+
+impl Read for Frozen {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::from(io::ErrorKind::WouldBlock))
+    }
+}
+
+impl Write for Frozen {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_drive_whose_answer_never_comes_says_which_peer_and_what_may_have_landed() {
+    let frozen = || DriveLink {
+        stream: Box::new(Frozen),
+        label: "lab-mini".to_owned(),
+    };
+    let turned =
+        exchange(frozen(), "@s-a1 turn timeout=20000 go\n", "turn").expect_err("unanswered");
+    assert_eq!(turned.kind(), io::ErrorKind::WouldBlock, "exit 124 stays");
+    let turned = turned.to_string();
+    assert!(
+        turned.starts_with("lab-mini did not answer within 28 s (its aterm is stopped, frozen")
+            && turned.contains(
+                "what this `turn` sent may have landed: `aterm ctl --host lab-mini @s-a1 status`"
+            )
+            && !turned.contains("os error"),
+        "{turned}"
+    );
+    let read = exchange(frozen(), "@s-a1 text\n", "text")
+        .expect_err("unanswered")
+        .to_string();
+    assert!(
+        read.contains("`aterm ctl --host lab-mini @s-a1 text …` again is safe")
+            && !read.contains("landed"),
+        "{read}"
+    );
+    let spawned = spawn_exchange(frozen(), "spawn agent=claude len=2", b"go")
+        .expect_err("unanswered")
+        .to_string();
+    assert!(
+        spawned.starts_with("lab-mini did not answer") && spawned.contains("may have started"),
+        "{spawned}"
+    );
+    let reader_gone = io::Error::new(io::ErrorKind::BrokenPipe, crate::StdoutClosed);
+    assert!(
+        crate::is_stdout_closed(&closed(
+            "lab-mini",
+            "@s-a1 text\n",
+            DRIVE_WITHIN,
+            reader_gone
+        )),
+        "a closed stdout is no cut of the drive"
+    );
+    fn drive(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        Ok(DriveLink {
+            stream: Box::new(Frozen),
+            label: "lab-mini".to_owned(),
+        })
+    }
+    let awaited = await_task::run_driven(&words("await task @s-a1"), None, "lab-mini", drive)
+        .expect_err("unanswered");
+    assert_eq!(awaited.kind(), io::ErrorKind::WouldBlock, "exit 124 stays");
+    let awaited = awaited.to_string();
+    assert!(
+        awaited.starts_with("lab-mini did not answer within 8 s")
+            && awaited.contains("`aterm ctl --host lab-mini await …` again is safe"),
+        "{awaited}"
+    );
 }

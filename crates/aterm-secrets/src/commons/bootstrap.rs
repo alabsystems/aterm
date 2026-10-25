@@ -18,6 +18,7 @@ use crate::{
     client::{self, Paths},
     fsx,
 };
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const DESCRIPTOR_HEADER: usize = 4 + 16 + 32 + 1;
@@ -27,9 +28,73 @@ const CLAIM_LEN: usize = 4 + 32 + 16 + 16 + 32;
 const PIN_LEN: usize = 4 + 16 + 32 + 32;
 const MAX_DEVICE: usize = 4096;
 
-/// A signed genesis packaged for the reserved, encrypted Commons vault entry.
-/// Its self-signature is integrity, not admission: only an authenticated vault
-/// observation or an independently pinned journal establishes its authority.
+/// Serializes custody observations independently of the removable control log.
+/// The lock is never replaced, and never held during network I/O.
+struct CustodyLock(std::fs::File);
+
+impl CustodyLock {
+    fn acquire_commons_custody(paths: &Paths, name: &str, wait: bool) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        fsx::ensure_private_dir(&paths.dir)?;
+        let path = paths.dir.join(name);
+        // This empty inode is the lock, not a replaceable data record. A
+        // hard-link publication briefly has two names and is correctly refused
+        // by concurrent private-file readers. Publish it with one name from
+        // the first instant; never truncate or replace an existing lock.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(file) => {
+                aterm_durable::durable(&file)?;
+                aterm_durable::durable_dir(&paths.dir)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        let (file, metadata) = aterm_uds::private_file::open_private(&paths.dir, name)
+            .map_err(|error| Error::new(format!("Commons custody lock is not private: {error}")))?;
+        let custody_file: std::fs::File = file;
+        aterm_uds::keep_out_of_children(&custody_file)?;
+        if wait {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "CustodyLock is CLOEXEC/CLOFORK and unlocks before close; device creation has no network IO"
+            )]
+            custody_file
+                .lock()
+                .map_err(|_| Error::new("cannot lock Commons device custody"))?;
+        } else {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "CustodyLock is CLOEXEC/CLOFORK and explicitly unlocks before close"
+            )]
+            custody_file
+                .try_lock()
+                .map_err(|_| Error::new("another local Commons bootstrap is active"))?;
+        }
+        let lock = Self(custody_file);
+        if fsx::file_id(&path) != Some((metadata.dev(), metadata.ino())) {
+            return Err(Error::new(
+                "Commons custody lock changed while acquiring it",
+            ));
+        }
+        Ok(lock)
+    }
+}
+
+impl Drop for CustodyLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// A genesis packaged for the reserved, encrypted Commons vault entry. Only an
+/// authenticated vault observation or independently pinned journal establishes
+/// its authority; a public foundation or self-signature grants no admission.
 #[derive(Clone, Debug)]
 pub struct Descriptor {
     genesis: Node,
@@ -37,7 +102,7 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
-    /// Package an ACN3 genesis. The publisher retains the exact node before
+    /// Package an ACN3 genesis or canonical ACF1 foundation. Retain the node before
     /// placing these bytes in the reserved explicit-member vault entry.
     pub fn from_genesis(genesis: Node) -> Result<Self> {
         if genesis.kind() != Kind::Genesis
@@ -45,7 +110,9 @@ impl Descriptor {
             || genesis.network() == [0; 16]
             || genesis.authority() == [0; 32]
         {
-            return Err(Error::new("Commons descriptor requires an ACN3 genesis"));
+            return Err(Error::new(
+                "Commons descriptor requires an ACN3 or ACF1 genesis",
+            ));
         }
         Ok(Self {
             genesis,
@@ -106,7 +173,7 @@ impl Descriptor {
         }
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < DESCRIPTOR_HEADER || bytes.len() > MAX_DESCRIPTOR || &bytes[..4] != b"ACD1"
         {
             return Err(Error::new("invalid Commons bootstrap descriptor"));
@@ -234,15 +301,40 @@ impl Device {
         let Some(identity) = client::read_identity(paths)? else {
             return Ok(None);
         };
+        Self::open_identity(paths, identity, false).map(Some)
+    }
+
+    pub(crate) fn open_existing(paths: &Paths) -> Result<Self> {
+        let identity = client::read_identity(paths)?
+            .ok_or_else(|| Error::new("Commons secrets identity is missing"))?;
+        Self::open_identity(paths, identity, true)
+    }
+
+    fn open_identity(paths: &Paths, identity: Identity, require_existing: bool) -> Result<Self> {
+        // Device creation and loss checks share one lock even when invoked
+        // without a network bootstrap. No caller holding this lock takes the
+        // bootstrap lock, so bootstrap -> device is the sole lock order.
+        let _lock = CustodyLock::acquire_commons_custody(paths, "commons-device.lock", true)?;
         // The secrets installer flushes identity contents before publishing its
         // name. Order that name before any ciphertext depending on this key.
         aterm_durable::durable_dir(&paths.dir)?;
         let dir = paths.dir.join("commons");
+        let established = require_existing
+            || client::creation_requires_device(paths)?
+            || fsx::kind(&paths.dir.join("commons.claim"))? != fsx::Kind::Missing;
+        if established && fsx::kind(&dir)? == fsx::Kind::Missing {
+            return Err(Error::new(
+                "established Commons device directory is missing; recovery is required",
+            ));
+        }
         fsx::ensure_private_dir(&dir)?;
-        let claim = fsx::read_private(&dir.join("device.claim"), CLAIM_LEN)?;
         let mut encrypted = fsx::read_private(&dir.join("device.age"), MAX_DEVICE)?;
+        let claim = fsx::read_private(&dir.join("device.claim"), CLAIM_LEN)?;
         if encrypted.is_none()
-            && (claim.is_some() || fsx::kind(&dir.join("control"))? != fsx::Kind::Missing)
+            && (established
+                || claim.is_some()
+                || has_history(paths)?
+                || fsx::kind(&dir.join("default.pin"))? != fsx::Kind::Missing)
         {
             // A creator may have published its key, claim and journal since
             // our first reads. The journal appears after the key, so re-read
@@ -281,7 +373,9 @@ impl Device {
         // Flush the key name before publishing its claim. write_new flushes the
         // file; this explicit directory flush propagates errors to the caller.
         aterm_durable::durable_dir(&dir)?;
-        fsx::write_new(&dir.join("device.claim"), &expected, 0o600)?;
+        if claim.is_none() {
+            fsx::write_new(&dir.join("device.claim"), &expected, 0o600)?;
+        }
         let kept = fsx::read_private(&dir.join("device.claim"), CLAIM_LEN)?
             .ok_or_else(|| Error::new("Commons device claim was not retained"))?;
         if kept.as_slice() != expected {
@@ -289,7 +383,7 @@ impl Device {
         }
         aterm_durable::durable_dir(&dir)?;
         aterm_durable::durable_dir(&paths.dir)?;
-        Ok(Some(device))
+        Ok(device)
     }
 
     fn generate(identity: Identity) -> Result<Self> {
@@ -398,14 +492,45 @@ pub struct Bootstrap {
     journal_dir: PathBuf,
 }
 
+/// One authenticated vault observation followed by Commons custody validation.
+/// Neither an unavailable result nor an error grants initialization authority.
+pub enum Availability {
+    Unavailable(super::Unavailable),
+    Available(Box<Bootstrap>),
+}
+
 impl Bootstrap {
-    /// Observe the existing authenticated vault cache offline. Missing enrollment,
-    /// a busy cache or absent control entry returns None without creating state.
+    /// Observe the authenticated vault cache offline. An unavailable vault or
+    /// invisible control entry returns None without creating custody. A visible
+    /// descriptor may establish local custody; it does not grant membership.
     pub fn cached(paths: &Paths) -> Result<Option<Self>> {
-        let Some(snapshot) = super::cached(paths)? else {
-            return Ok(None);
-        };
-        Self::from_snapshot(paths, &snapshot).map(Some)
+        match Self::observe(paths)? {
+            Availability::Unavailable(_) => Ok(None),
+            Availability::Available(bootstrap) => Ok(Some(*bootstrap)),
+        }
+    }
+
+    /// Explain an unavailable vault without a second observation. An available
+    /// descriptor opens the existing custody or creates its first local pin;
+    /// it never substitutes a new network for missing established history.
+    pub fn observe(paths: &Paths) -> Result<Availability> {
+        match super::observe(paths)? {
+            super::Observation::Unavailable(reason) => Ok(Availability::Unavailable(reason)),
+            super::Observation::Visible(snapshot) => Self::from_snapshot(paths, &snapshot)
+                .map(|bootstrap| Availability::Available(Box::new(bootstrap))),
+        }
+    }
+
+    /// Open Commons or report the specific unavailable vault boundary.
+    pub fn required(paths: &Paths) -> Result<Self> {
+        match Self::observe(paths)? {
+            Availability::Available(bootstrap) => Ok(*bootstrap),
+            Availability::Unavailable(reason) => Err(Error::new(format!(
+                "Commons unavailable ({}): {}",
+                reason.code(),
+                reason.explanation()
+            ))),
+        }
     }
 
     #[cfg_attr(
@@ -448,11 +573,174 @@ impl Bootstrap {
             project = "aterm_secrets::commons::bootstrap::tests::history_transition"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "MissingOuterPin",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "MissingPinAndHistory",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "MissingCommonsDirectory",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "ChangedTrustMissingPin",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "CorruptHistoryClaim",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "LegacyBackfill",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "MissingOuterClaims",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "BusyBootstrap",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "PreparingResume",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "ForeignPreparing",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "LegacyDamagedAnchor",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "OrphanTables",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "WrongIdentity",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "UnclaimedPartial",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "PreparingPinLostLog",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbBootstrapHistory",
+            action = "OrphanHistory",
+            project = "aterm_secrets::commons::bootstrap::tests::history_transition"
+        )
+    )]
     fn from_snapshot(paths: &Paths, snapshot: &Snapshot) -> Result<Self> {
+        Self::open_snapshot(paths, snapshot, false)
+    }
+
+    pub(crate) fn from_creation_snapshot(paths: &Paths, snapshot: &Snapshot) -> Result<Self> {
+        Self::open_snapshot(paths, snapshot, true)
+    }
+
+    fn open_snapshot(paths: &Paths, snapshot: &Snapshot, require_device: bool) -> Result<Self> {
         let descriptor = Descriptor::decode(snapshot.control())?;
+        let _lock = CustodyLock::acquire_commons_custody(paths, "commons.lock", false)?;
+        let identity = client::read_identity(paths)?
+            .ok_or_else(|| Error::new("Commons secrets identity is missing"))?;
+        if identity.recipient() != snapshot.recipient() {
+            return Err(Error::new(
+                "Commons secrets identity changed since the vault observation",
+            ));
+        }
         let dir = paths.dir.join("commons");
-        fsx::ensure_private_dir(&dir)?;
         let pin = pin_bytes(descriptor.trust());
+        let claim = claim_bytes(descriptor.trust());
+        let retained = fsx::read_private(&paths.dir.join("commons.claim"), PIN_LEN)?;
+        let preparing = retained
+            .as_ref()
+            .is_some_and(|kept| kept.as_slice() == preparing_bytes(descriptor.trust()));
+        if retained
+            .as_ref()
+            .is_some_and(|kept| kept.as_slice() != claim)
+            && !preparing
+        {
+            return Err(Error::new(
+                "Commons default network differs from its retained history claim",
+            ));
+        }
+        if retained.is_some() && fsx::kind(&dir)? == fsx::Kind::Missing {
+            return Err(Error::new(
+                "established Commons directory is missing; recovery is required",
+            ));
+        }
+        fsx::ensure_private_dir(&dir)?;
         let established = fsx::read_private(&dir.join("default.pin"), PIN_LEN)?;
         if established
             .as_ref()
@@ -462,33 +750,66 @@ impl Bootstrap {
                 "Commons default network differs from its immutable pin",
             ));
         }
-        let device = Device::open(paths)?
-            .ok_or_else(|| Error::new("Commons secrets identity is missing"))?;
-        if device.identity.recipient() != snapshot.recipient() {
-            return Err(Error::new(
-                "Commons secrets identity changed since the vault observation",
-            ));
-        }
         // Validate the journal's independent immutable pin before writing ours.
         // If our pin was lost, a replacement descriptor must not poison it before
         // the older journal has had the opportunity to refuse reanchoring.
         let journal_dir = dir.join("control");
-        let mut journal = if established.is_some() {
+        let history = has_history(paths)?;
+        let must_exist = established.is_some()
+            || (retained.is_some() && !preparing)
+            || (history && !preparing)
+            || has_application_history(paths)?;
+        if must_exist && fsx::kind(&journal_dir)? != fsx::Kind::Dir {
+            return Err(Error::new(
+                "established Commons control directory is missing; recovery is required",
+            ));
+        }
+        let device = Device::open_identity(paths, identity, require_device)?;
+        if !must_exist && !preparing {
+            // A crash during the first journal open can resume only with this
+            // durable same-trust intent. No bootstrap accessor escapes until
+            // the marker has advanced to the established phase below.
+            let pending = preparing_bytes(descriptor.trust());
+            fsx::write_new(&paths.dir.join("commons.claim"), &pending, 0o600)?;
+            let kept = fsx::read_private(&paths.dir.join("commons.claim"), PIN_LEN)?
+                .ok_or_else(|| Error::new("Commons initialization claim was not retained"))?;
+            if kept.as_slice() != pending {
+                return Err(Error::new("Commons initialization claim changed"));
+            }
+            aterm_durable::durable_dir(&paths.dir)?;
+        }
+        let mut journal = if must_exist {
             Journal::open_existing(&journal_dir, descriptor.trust())?
         } else {
             Journal::open(&journal_dir, descriptor.trust())?
         };
-        fsx::write_new(&dir.join("default.pin"), &pin, 0o600)?;
+        // End the empty-journal initialization window before the first record
+        // is ingested. Once any restriction can be acknowledged, both the log
+        // and its anchor must survive even if no accessor has returned yet.
+        if preparing || (!must_exist && retained.is_none()) {
+            fsx::write_atomic(&paths.dir.join("commons.claim"), &claim, 0o600)?;
+        } else if retained.is_none() {
+            fsx::write_new(&paths.dir.join("commons.claim"), &claim, 0o600)?;
+        }
+        let kept = fsx::read_private(&paths.dir.join("commons.claim"), PIN_LEN)?
+            .ok_or_else(|| Error::new("Commons history claim was not retained"))?;
+        if kept.as_slice() != claim {
+            return Err(Error::new("Commons history claim changed during creation"));
+        }
+        aterm_durable::durable_dir(&paths.dir)?;
+        journal.ingest(descriptor.genesis.bytes())?;
+        for node in &descriptor.repair {
+            journal.ingest(node.bytes())?;
+        }
+        if established.is_none() {
+            fsx::write_new(&dir.join("default.pin"), &pin, 0o600)?;
+        }
         let kept = fsx::read_private(&dir.join("default.pin"), PIN_LEN)?
             .ok_or_else(|| Error::new("Commons network pin was not retained"))?;
         if kept.as_slice() != pin {
             return Err(Error::new("Commons network pin changed during creation"));
         }
         aterm_durable::durable_dir(&dir)?;
-        journal.ingest(descriptor.genesis.bytes())?;
-        for node in &descriptor.repair {
-            journal.ingest(node.bytes())?;
-        }
         Ok(Self {
             descriptor,
             device,
@@ -732,6 +1053,31 @@ fn pin_bytes(trust: Trust) -> Vec<u8> {
     bytes.extend_from_slice(&trust.authority);
     bytes.extend_from_slice(&trust.genesis);
     bytes
+}
+
+fn claim_bytes(trust: Trust) -> Vec<u8> {
+    let mut bytes = pin_bytes(trust);
+    bytes[..4].copy_from_slice(b"ACH1");
+    bytes
+}
+
+fn preparing_bytes(trust: Trust) -> Vec<u8> {
+    let mut bytes = pin_bytes(trust);
+    bytes[..4].copy_from_slice(b"ACI1");
+    bytes
+}
+
+fn has_application_history(paths: &Paths) -> Result<bool> {
+    let dir = paths.dir.join("commons");
+    Ok(fsx::kind(&dir.join("history"))? != fsx::Kind::Missing
+        || fsx::kind(&dir.join("tables"))? != fsx::Kind::Missing)
+}
+
+fn has_history(paths: &Paths) -> Result<bool> {
+    Ok(
+        fsx::kind(&paths.dir.join("commons/control"))? != fsx::Kind::Missing
+            || has_application_history(paths)?,
+    )
 }
 
 #[cfg(test)]

@@ -190,6 +190,9 @@ pub const SING_REPEAT_GAP: Duration = Duration::from_millis(250);
 /// Wind-down crossfade length.
 pub const SING_WIND_DOWN: f32 = 1.0;
 
+const SING_WIND_DOWN_DUR: Duration =
+    Duration::from_nanos((SING_WIND_DOWN as f64 * 1_000_000_000.0).round() as u64);
+
 /// Per-window sing-along detector.
 pub struct KittySing {
     /// The character of the current same-key run.
@@ -268,14 +271,7 @@ impl KittySing {
         // A fired celebration has no key under it: typing over it clears the
         // run bookkeeping and leaves the bars playing to their line. Only
         // `settle` (drive 0) or a session switch ends it early.
-        if self.external.is_some() && self.wind_from.is_none() {
-            self.run = None;
-            self.count = 0;
-            self.last = None;
-            self.handover_from = None;
-            return;
-        }
-        if self.armed_at.is_some() && self.wind_from.is_none() {
+        if self.external.is_none() && self.armed_at.is_some() && self.wind_from.is_none() {
             self.wind_from = Some(self.lazy_release().map_or(at, |lazy| lazy.min(at)));
         }
         self.run = None;
@@ -322,8 +318,9 @@ impl KittySing {
     /// since the arm anchor.
     #[inline]
     fn raw_bar(&self, now: Instant) -> Option<u64> {
+        const INV_SING_BAR_SECONDS: f32 = 1.0 / SING_BAR_SECONDS;
         let t0 = self.armed_at?;
-        Some((now.saturating_duration_since(t0).as_secs_f32() / SING_BAR_SECONDS) as u64)
+        Some((now.saturating_duration_since(t0).as_secs_f32() * INV_SING_BAR_SECONDS) as u64)
     }
 
     /// Feed one committed printed keystroke.
@@ -396,22 +393,23 @@ impl KittySing {
     #[inline]
     fn has_drive(&self, now: Instant) -> bool {
         self.armed_at.is_some()
-            && self.wind_start(now).is_none_or(|start| {
-                now.saturating_duration_since(start).as_secs_f32() < SING_WIND_DOWN
-            })
+            && self
+                .wind_start(now)
+                .is_none_or(|start| now.saturating_duration_since(start) < SING_WIND_DOWN_DUR)
     }
 
     /// The celebration drive `0..=1` at `now`.
     #[inline]
     #[must_use]
     pub fn drive(&self, now: Instant) -> f32 {
+        const INV_SING_WIND_DOWN: f32 = 1.0 / SING_WIND_DOWN;
         if self.armed_at.is_none() {
             return 0.0;
         }
         let Some(start) = self.wind_start(now) else {
             return 1.0;
         };
-        let t = now.saturating_duration_since(start).as_secs_f32() / SING_WIND_DOWN;
+        let t = now.saturating_duration_since(start).as_secs_f32() * INV_SING_WIND_DOWN;
         if t >= 1.0 {
             return 0.0;
         }
@@ -430,11 +428,12 @@ impl KittySing {
     #[inline]
     #[must_use]
     pub fn beat(&self, now: Instant) -> Option<f32> {
+        const INV_SING_BEAT_SECONDS: f32 = 1.0 / SING_BEAT_SECONDS;
         let t0 = self.armed_at?;
         if !self.has_drive(now) {
             return None;
         }
-        Some(now.saturating_duration_since(t0).as_secs_f32() / SING_BEAT_SECONDS)
+        Some(now.saturating_duration_since(t0).as_secs_f32() * INV_SING_BEAT_SECONDS)
     }
 
     /// The riff bar index at `now` while armed.
@@ -536,7 +535,7 @@ impl KittySing {
         if !ext.outro_taken {
             return Some(release.max(now));
         }
-        Some((release + Duration::from_secs_f32(SING_WIND_DOWN)).max(now))
+        Some((release + SING_WIND_DOWN_DUR).max(now))
     }
 
     /// Report `session`'s exit-0 block.
@@ -752,7 +751,7 @@ impl MusicNotes {
         }
         self.spawned_half_beat = Some(half_beat);
         let seed = self.rnd();
-        let kind = if half_beat % 2 == 0 {
+        let kind = if half_beat & 1 == 0 {
             NoteKind::Eighth
         } else {
             NoteKind::Beamed
@@ -765,7 +764,10 @@ impl MusicNotes {
             kind,
             seed,
         });
-        self.head = (self.head + 1) % MAX_NOTES;
+        const {
+            assert!(MAX_NOTES.is_power_of_two());
+        }
+        self.head = (self.head + 1) & (MAX_NOTES - 1);
     }
 
     /// True while any note is alive.
@@ -790,30 +792,39 @@ impl MusicNotes {
     #[inline]
     fn resolve(note: &Note, now: Instant, reduced_motion: bool) -> Option<NoteSprite> {
         let age = now.saturating_duration_since(note.born).as_secs_f32();
+        Self::resolve_age(note.kind, note.seed, age, reduced_motion)
+    }
+
+    #[inline]
+    const fn resolve_age(
+        kind: NoteKind,
+        seed: u32,
+        age: f32,
+        reduced_motion: bool,
+    ) -> Option<NoteSprite> {
         let u = age * (1.0 / NOTE_LIFE);
-        if !(0.0..1.0).contains(&u) {
+        if !(u >= 0.0 && u < 1.0) {
             return None;
         }
         let fade_in = (u * (1.0 / 0.15)).min(1.0);
         let fade_out = ((1.0 - u) * (1.0 / 0.4)).min(1.0);
         let alpha = (fade_in * fade_out * 255.0) as u8;
-        let s = note.seed;
+        let s = seed;
         let tint = NOTE_TINTS[(s % NOTE_TINTS.len() as u32) as usize];
         let x0 = 0.1 + (0.8 / 255.0) * ((s >> 8) & 0xff) as f32;
         let phase = ((s >> 16) & 0xff) as f32 * (1.0 / 255.0);
         let (dx, dy) = if reduced_motion {
             (x0, -0.3 - 0.8 * phase)
         } else {
-            (
-                x0 + 0.18 * (std::f32::consts::TAU * (u * 1.5 + phase)).sin(),
-                -NOTE_RISE_CELLS * u,
-            )
+            let (sin_w, _) =
+                crate::supernova::sin_cos_f32(std::f32::consts::TAU * (u * 1.5 + phase));
+            (x0 + 0.18 * sin_w, -NOTE_RISE_CELLS * u)
         };
         Some(NoteSprite {
             dx,
             dy,
             alpha,
-            kind: note.kind,
+            kind,
             tint,
         })
     }

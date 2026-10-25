@@ -134,7 +134,7 @@ pub const fn r_max_for(cell_h: i32, grid_h: i32) -> f32 {
     let ch = if cell_h < 1 { 1 } else { cell_h };
     let gh = if grid_h < cell_h { cell_h } else { grid_h };
     (SUPER_RADIUS_ROWS * ch as f32)
-        .min((gh as f32) / 2.0)
+        .min((gh as f32) * 0.5)
         .max(1.0)
 }
 
@@ -280,8 +280,8 @@ const fn premul(color: u32, cov: f32) -> u32 {
 
 /// `sin(π·e)` — one rise-and-fall, never periodic (flash-safety shape).
 #[inline]
-fn rise_fall(e: f32) -> f32 {
-    (core::f32::consts::PI * e.clamp(0.0, 1.0)).sin()
+const fn rise_fall(e: f32) -> f32 {
+    sin_cos_f32(core::f32::consts::PI * e.clamp(0.0, 1.0)).0
 }
 
 /// `1 − (1 − q)²` ease-out (the nova shockwave curve).
@@ -358,11 +358,14 @@ pub fn emit_super(
         cell_h: env.cell_h,
         budget: budget.min(MAX_SUPER_QUADS_PER),
     };
+    const INV_CHARGE_END_MS: f32 = 1.0 / CHARGE_END_MS as f32;
+    const INV_DETONATION_SPAN_MS: f32 = 1.0 / (DETONATION_END_MS - CHARGE_END_MS) as f32;
+    const INV_SHOCK_SPAN_MS: f32 = 1.0 / (SHOCK_END_MS - DETONATION_END_MS) as f32;
     if t_ms < CHARGE_END_MS {
         // Charge: 12 motes spiral toward the word centre. Dark themes only;
         // light themes draw them on the Over deco stream (`emit_super_decos`).
         if !env.light {
-            let p = t_ms as f32 / CHARGE_END_MS as f32;
+            let p = t_ms as f32 * INV_CHARGE_END_MS;
             let n0 = sink.out.len();
             let sz = (env.cell_h / 5).max(2);
             let half_sz = sz / 2;
@@ -376,7 +379,7 @@ pub fn emit_super(
             counts.charge = sink.out.len() - n0;
         }
     } else if t_ms < DETONATION_END_MS {
-        let e = (t_ms - CHARGE_END_MS) as f32 / (DETONATION_END_MS - CHARGE_END_MS) as f32;
+        let e = (t_ms - CHARGE_END_MS) as f32 * INV_DETONATION_SPAN_MS;
         let env_a = rise_fall(e) * env.intensity;
         if !env.light {
             let vrows = env.grid_h / env.cell_h.max(1);
@@ -405,7 +408,7 @@ pub fn emit_super(
             counts.crown = sink.out.len() - n0;
         }
     } else if t_ms < SHOCK_END_MS {
-        let q = (t_ms - DETONATION_END_MS) as f32 / (SHOCK_END_MS - DETONATION_END_MS) as f32;
+        let q = (t_ms - DETONATION_END_MS) as f32 * INV_SHOCK_SPAN_MS;
         let fade = 1.0 - q;
         let n0 = sink.out.len();
         for (ring, rscale) in [(0usize, 1.0f32), (1, 0.72)] {
@@ -556,12 +559,13 @@ const fn scale_rgb_floor(rgb: u32, numerator: u32, denominator: u32) -> u32 {
 /// Charge mote `k`'s px position at progress `p` (0..1): a spiral converging on
 /// the word centre, shared by the dark and light paths.
 #[inline]
-fn charge_mote_pos(env: &SuperEnv, k: usize, p: f32) -> (i32, i32) {
+const fn charge_mote_pos(env: &SuperEnv, k: usize, p: f32) -> (i32, i32) {
+    const ANG_SCALE: f32 = core::f32::consts::TAU / 4096.0;
     let s = crate::genome::mix(env.seed ^ (k as u64).wrapping_mul(0xA24B_AED4_963E_E407));
-    let ang = (s % 4096) as f32 / 4096.0 * core::f32::consts::TAU + p * 1.8;
+    let ang = (s % 4096) as f32 * ANG_SCALE + p * 1.8;
     let r0 = env.r_max * (1.1 + (s >> 13 & 0x3) as f32 * 0.15);
     let r = r0 * (1.0 - p * p);
-    let (sin_a, cos_a) = ang.sin_cos();
+    let (sin_a, cos_a) = sin_cos_f32(ang);
     (
         env.cx + (cos_a * r) as i32,
         env.cy + (sin_a * r * 0.6) as i32,
@@ -681,18 +685,19 @@ fn emit_ring_chords(sink: &mut QuadSink<'_>, env: &SuperEnv, r: f32, thick: f32,
     let bands = if extent >= 2.0 * SUPER_RING_BANDS as f32 {
         SUPER_RING_BANDS
     } else {
-        ((extent / 2.0).floor() as usize).clamp(1, SUPER_RING_BANDS)
+        ((extent * 0.5).floor() as usize).clamp(1, SUPER_RING_BANDS)
     };
-    let bands_f = bands as f32;
+    const INV_075: f32 = 1.0 / 0.75;
+    let inv_bands = 1.0 / bands as f32;
     let cyf = env.cy as f32;
     let top = cyf - ro;
     let mut prev_y1 = top;
     for b in 0..bands {
         let y0 = prev_y1;
-        let y1 = top + extent * (b + 1) as f32 / bands_f;
+        let y1 = top + extent * (b + 1) as f32 * inv_bands;
         prev_y1 = y1;
         let ym = 0.5 * (y0 + y1) - cyf;
-        let dy = ym / 0.75;
+        let dy = ym * INV_075;
         if dy.abs() >= ro {
             continue;
         }
@@ -725,10 +730,14 @@ fn emit_ring_chords(sink: &mut QuadSink<'_>, env: &SuperEnv, r: f32, thick: f32,
 
 /// Emit one supernova frame's `WordDecoration` stream within `cap`.
 pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>, cap: usize) {
+    const INV_CHARGE_END_MS: f32 = 1.0 / CHARGE_END_MS as f32;
+    const INV_DETONATION_SPAN_MS: f32 = 1.0 / (DETONATION_END_MS - CHARGE_END_MS) as f32;
+    const INV_SHOCK_SPAN_MS: f32 = 1.0 / (SHOCK_END_MS - DETONATION_END_MS) as f32;
+    const INV_DEBRIS_SPAN_MS: f32 = 1.0 / (SUPER_TOTAL_MS - DEBRIS_START_MS) as f32;
     let out_start = out.len();
     let (cw, ch) = (env.cell_w.max(1), env.cell_h.max(1));
     if env.light && t_ms < CHARGE_END_MS {
-        let p = t_ms as f32 / CHARGE_END_MS as f32;
+        let p = t_ms as f32 * INV_CHARGE_END_MS;
         let cov = env.intensity * (0.25 + 0.75 * p);
         let alpha = (255.0 * cov.min(1.0)) as u8;
         let half_cw = env.cell_w / 2;
@@ -756,7 +765,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         }
     }
     if env.light && (CHARGE_END_MS..DETONATION_END_MS).contains(&t_ms) {
-        let e = (t_ms - CHARGE_END_MS) as f32 / (DETONATION_END_MS - CHARGE_END_MS) as f32;
+        let e = (t_ms - CHARGE_END_MS) as f32 * INV_DETONATION_SPAN_MS;
         let env_a = rise_fall(e) * env.intensity;
         let rows_span = 7i32;
         let r0 = i32::from(env.row) - rows_span / 2;
@@ -765,8 +774,8 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
             i32::from(env.start_col) + (i32::from(env.end_col) - i32::from(env.start_col)) / 2;
         let c0 = (word_mid - width as i32 / 2)
             .clamp(0, i32::from(env.cols).saturating_sub(width as i32).max(0));
-        let half_rows = rows_span as f32 / 2.0;
-        let half_w = width as f32 / 2.0;
+        const INV_HALF_ROWS: f32 = 2.0 / 7.0;
+        let inv_half_w = 2.0 / width as f32;
         let base_a = 235.0 * env_a;
         let mut stamped = 0usize;
         if base_a >= 14.0 {
@@ -781,7 +790,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 }
                 let row_u = r as u16;
                 let dy_abs = (dr - rows_span / 2).unsigned_abs() as usize;
-                let ny = (dr - rows_span / 2) as f32 / half_rows;
+                let ny = (dr - rows_span / 2) as f32 * INV_HALF_ROWS;
                 let ny2 = ny * ny;
                 for dc in 0..width as i32 {
                     if out.len() >= cap || stamped >= MAX_VEIL_CELLS {
@@ -798,7 +807,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                         }
                         f
                     } else {
-                        let nx = (c0 + dc - word_mid) as f32 / half_w;
+                        let nx = (c0 + dc - word_mid) as f32 * inv_half_w;
                         let d2 = nx * nx + ny2;
                         if d2 >= 1.0 {
                             continue;
@@ -858,7 +867,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         }
     }
     if env.light && (DETONATION_END_MS..SHOCK_END_MS).contains(&t_ms) {
-        let q = (t_ms - DETONATION_END_MS) as f32 / (SHOCK_END_MS - DETONATION_END_MS) as f32;
+        let q = (t_ms - DETONATION_END_MS) as f32 * INV_SHOCK_SPAN_MS;
         let r = env.r_max * ease_out(q);
         let fade = 1.0 - q;
         let alpha = (170.0 * fade * env.intensity) as u8;
@@ -885,8 +894,10 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         }
     }
     if (DEBRIS_START_MS..SUPER_TOTAL_MS).contains(&t_ms) {
+        const ANG_SCALE: f32 = core::f32::consts::TAU / 4096.0;
+        const INV_255: f32 = 1.0 / 255.0;
         let n = 24 + (env.seed % 17) as usize;
-        let p = (t_ms - DEBRIS_START_MS) as f32 / (SUPER_TOTAL_MS - DEBRIS_START_MS) as f32;
+        let p = (t_ms - DEBRIS_START_MS) as f32 * INV_DEBRIS_SPAN_MS;
         let base_r = env.r_max * (0.3 + 1.1 * p);
         let grav_y = (p * p * env.cell_h as f32) as i32;
         let grid_tick = t_ms / crate::nova::TWINKLE_GRID_MS;
@@ -907,8 +918,8 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 break;
             }
             let s = crate::genome::mix(env.seed ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let ang = (s % 4096) as f32 / 4096.0 * core::f32::consts::TAU;
-            let speed = 0.5 + (s >> 13 & 0xff) as f32 / 255.0;
+            let ang = (s % 4096) as f32 * ANG_SCALE;
+            let speed = 0.5 + (s >> 13 & 0xff) as f32 * INV_255;
             let r = base_r * speed;
             let (sin_a, cos_a) = ang.sin_cos();
             let x = env.cx + (cos_a * r) as i32;

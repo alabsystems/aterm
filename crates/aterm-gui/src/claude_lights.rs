@@ -319,7 +319,8 @@ pub(crate) enum ChipFace {
     CruiseUntil,
     /// `⤓ land`: Land, its task open or unknown.
     Land,
-    /// `✓ landed`: all of the work is on the remote main branch.
+    /// `✓ landed`: under Land, a clean `Nothing left:` defense, and no repository check found work
+    /// left to land ([`aterm_agent::supervise::mode_words::LANDED_WORDS`]).
     Landed,
     /// `⤓ quiet`: a person's own exchange.
     Theirs,
@@ -2459,10 +2460,7 @@ impl ChipFace {
                     None => sentence.into(),
                 });
             }
-            ChipFace::Landed => {
-                "all of the work is on the remote main branch; the harness types nothing more \
-                 until someone else's turn"
-            }
+            ChipFace::Landed => aterm_agent::supervise::mode_words::LANDED_WORDS,
             ChipFace::Theirs => {
                 "a person's own exchange; the harness types nothing until someone else's turn ends"
             }

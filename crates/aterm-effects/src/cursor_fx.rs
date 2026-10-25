@@ -69,6 +69,10 @@ pub struct CursorFx {
     /// The comet cells this tick produced, projected through load shedding, brightness, and
     /// legibility.
     pub trail_scratch: Vec<TrailCell>,
+    /// Whether the page's text holds the GPU's bloom off this tick's frame
+    /// ([`aterm_core::render::RenderInput::bloom_gate`], from the glow
+    /// config's theme ink and ground).
+    pub bloom_held: bool,
     /// Memoised [`bed_legible_share`] for the last `(color, ground, ink)` triple.
     pub(crate) legible_memo: Option<((u32, u32, u32), f32)>,
     /// Memoised [`floor_block_fill`] for the last
@@ -365,31 +369,21 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
     let color = color & 0x00FF_FFFF;
     let ground = ground & 0x00FF_FFFF;
     let ink = ink & 0x00FF_FFFF;
-    let table = crate::color_math::relative_luminance_table();
-    let lum_ink = crate::color_math::relative_luminance_with(table, ink);
+    let lum_ink = crate::color_math::relative_luminance(ink);
     #[inline]
-    const fn contrast_ink(
-        table: &crate::color_math::RelativeLuminanceTable,
-        lum_ink: f32,
-        bg: u32,
-    ) -> f32 {
-        let lb = crate::color_math::relative_luminance_with(table, bg);
+    const fn contrast_ink(lum_ink: f32, bg: u32) -> f32 {
+        let lb = crate::color_math::relative_luminance(bg);
         (lum_ink.max(lb) + 0.05) / (lum_ink.min(lb) + 0.05)
     }
-    let target = BED_INK_FLOOR.min(contrast_ink(table, lum_ink, ground));
+    let target = BED_INK_FLOOR.min(contrast_ink(lum_ink, ground));
     #[inline]
-    const fn holds_bg(
-        table: &crate::color_math::RelativeLuminanceTable,
-        lum_ink: f32,
-        target: f32,
-        bg: u32,
-    ) -> bool {
-        let lb = crate::color_math::relative_luminance_with(table, bg);
+    const fn holds_bg(lum_ink: f32, target: f32, bg: u32) -> bool {
+        let lb = crate::color_math::relative_luminance(bg);
         lum_ink.max(lb) + 0.05 >= target * (lum_ink.min(lb) + 0.05)
     }
     let peak = crate::cursor_trail::BED_PEAK_ALPHA;
     let peak_bg = aterm_render::blend_rgb(ground, color, peak);
-    if holds_bg(table, lum_ink, target, peak_bg) {
+    if holds_bg(lum_ink, target, peak_bg) {
         return 1.0;
     }
     let (mut lo, mut hi) = (0u8, peak);
@@ -402,7 +396,7 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
         } else if lo > 0 && mid_bg == lo_bg {
             true
         } else {
-            holds_bg(table, lum_ink, target, mid_bg)
+            holds_bg(lum_ink, target, mid_bg)
         };
         if ok {
             lo = mid;
@@ -412,7 +406,8 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
             hi_bg = mid_bg;
         }
     }
-    ((lo as f32 - 0.5).max(0.0) / peak as f32).clamp(0.0, 1.0)
+    const INV_PEAK: f32 = 1.0 / crate::cursor_trail::BED_PEAK_ALPHA as f32;
+    ((lo as f32 - 0.5).max(0.0) * INV_PEAK).clamp(0.0, 1.0)
 }
 
 /// Floor an effect-owned caret fill against the page `ground` ([`caret_page_floor`]), by lightness
@@ -458,16 +453,11 @@ pub const fn caret_page_floor(owner: BlockFillOwner) -> f32 {
 #[inline]
 #[must_use]
 const fn bolt_body(color: u32, blaze: f32, dark: bool) -> u32 {
-    const fn mix(color: u32, sh: u32, k: f32) -> u32 {
-        let c = ((color >> sh) & 0xff) as f32;
-        (c + (255.0 - c) * k).min(255.0) as u32
-    }
     let blaze = blaze.clamp(0.0, 1.0);
     if !dark {
         return crate::color_math::light_body_fill(color, blaze);
     }
-    let k = 0.55 * blaze;
-    (mix(color, 16, k) << 16) | (mix(color, 8, k) << 8) | mix(color, 0, k)
+    crate::effect_util::lerp_rgb(color, 0x00FF_FFFF, 0.55 * blaze)
 }
 
 /// Project the resolved effect-owned cursor body through adaptive shedding.
@@ -1058,6 +1048,7 @@ impl CursorFx {
         let bed_brightness = finite_clamp_or_off(f.trail_brightness, 0.0, 1.0);
         trail_cfg.enabled &= bed_brightness > 0.0;
         let dark = aterm_render::theme_is_dark(f.default_bg);
+        self.bloom_held = self.glow.holds_bloom(glow_cfg.theme_fg, glow_cfg.theme_bg);
         self.glow.set_colour_pins(crate::cursor_glow::ColourPins {
             trail: f.user_tinted,
             accent: f.accent_pinned,
@@ -1378,8 +1369,9 @@ impl CursorFx {
             .glow
             .guard_letters(&mut self.glow_scratch, cur, geom, glow_cfg.style);
         let glow_fp = glow_fp ^ guarded.rotate_left(37);
-        let veiled = self.glow.veil_letters_on_pet(cur, geom);
-        let glow_fp = glow_fp ^ veiled.rotate_left(43);
+        // The pet's veil is drawn after the pet's tick, by the body it drew
+        // this frame (`EffectsPipeline::veil_pet_letters`).
+        self.glow.note_veil_frame(cur, geom);
         let bolt_cursor = rainbow_block
             && glow_cfg.enabled
             && glow_cfg.intensity > 0.0

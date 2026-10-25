@@ -793,8 +793,8 @@ struct Deck<'a> {
     hits_rows: Vec<Hit>,
     hits_last: Vec<Hit>,
     boxes: Boxes,
-    /// The header line as planned (T-G14).
-    #[cfg(test)]
+    /// The header line: handed in already planned ([`DeckStill`]) or planned by [`Self::paint`],
+    /// and as planned after it (T-G14).
     head: Option<HeaderPlan>,
 }
 
@@ -827,7 +827,6 @@ impl<'a> Deck<'a> {
             hits_rows: Vec::new(),
             hits_last: Vec::new(),
             boxes: Boxes::default(),
-            #[cfg(test)]
             head: None,
         }
     }
@@ -1671,10 +1670,6 @@ impl<'a> Deck<'a> {
     }
 
     fn header(&mut self, head: &HeaderPlan, base: f64, small: bool, states: &[HeadState<'_>]) {
-        #[cfg(test)]
-        {
-            self.head = Some(head.clone());
-        }
         let words2 = self.inks.words2;
         let sep = " \u{b7} ";
         for label in &head.labels {
@@ -1906,9 +1901,13 @@ impl<'a> Deck<'a> {
             tab: self.tab,
             machine: self.machine,
         };
-        let head = plan::header_full(&plan, text, self.m);
+        let head = self
+            .head
+            .take()
+            .unwrap_or_else(|| planned_header(|| plan::header_full(&plan, text, self.m)));
         let small = self.small_cells(&plan.strip, rows.cell);
         self.header(&head, HEADER_BASE_FULL, small, &[]);
+        self.head = Some(head);
         if !words.reading {
             let rect = self.px_rect(0.0, 0.0, self.w_pt, HEADER_HIT_FULL);
             self.hits_last.push(Hit::header(rect));
@@ -1986,13 +1985,17 @@ impl<'a> Deck<'a> {
                     bare: &st.st.label,
                 })
         });
-        let head = plan::header_folded(&plan, text, labels, self.m);
+        let head = self
+            .head
+            .take()
+            .unwrap_or_else(|| planned_header(|| plan::header_folded(&plan, text, labels, self.m)));
         let small = plan
             .blocks
             .first()
             .is_some_and(|b| self.small_cells(&b.strip, b.rows.cell));
         let states = if words.reading { Vec::new() } else { states };
         self.header(&head, HEADER_BASE_FOLDED, small, &states);
+        self.head = Some(head);
         if !words.reading {
             let rect = self.px_rect(0.0, 0.0, self.w_pt, HEADER_HIT_FOLDED);
             self.hits_last.push(Hit::header(rect));
@@ -2000,9 +2003,17 @@ impl<'a> Deck<'a> {
     }
 
     fn paint(&mut self, words: &DeckWords, form: DeckForm) {
+        // The Deck places its own pixels: its strips glide by fractions of one, which the
+        // raster's device grid would turn into steps.
+        if self.draw {
+            self.p.prims.push(DrawPrim::SubpixelPush);
+        }
         match form {
             DeckForm::Full => self.full(words),
             DeckForm::Folded => self.folded(words),
+        }
+        if self.draw {
+            self.p.prims.push(DrawPrim::SubpixelPop);
         }
     }
 
@@ -2049,6 +2060,61 @@ pub(crate) struct LiveOut {
     pub(crate) glide_px_per_s: f64,
 }
 
+/// What the Deck's layout reads that its live edge never moves: the snapshot's words and the
+/// header line as planned. A frame that moves only the live edge ([`crate::stats_live`]) lays
+/// the deck out again over these, so it measures no words and plans no header line; a change
+/// to anything else the layout reads changes their key and reads them again.
+#[derive(Debug, Default)]
+pub(crate) struct DeckStill {
+    key: u64,
+    words: Option<DeckWords>,
+    head: Option<HeaderPlan>,
+}
+
+impl DeckStill {
+    /// These for a layout whose inputs, but for the live edge, hash to `key`: kept when they
+    /// were read for `key`, else dropped to be read again.
+    pub(crate) fn at(&mut self, key: u64) -> &mut Self {
+        if self.key != key {
+            *self = Self {
+                key,
+                ..Self::default()
+            };
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's deck layouts, the words they read and the header lines they planned
+    /// (test-only).
+    static LAYOUT_WORK: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+/// This thread's deck layouts ([`deck_paint_kept`]) so far, the snapshot words they read and the
+/// header lines they planned (test-only): a frame's layout work is the difference across it.
+/// Unix only, like the App-level live-deck tests in `stats_live_tests.rs` that read it.
+#[cfg(all(test, unix))]
+pub(crate) fn layout_work() -> [u64; 3] {
+    LAYOUT_WORK.with(std::cell::Cell::get)
+}
+
+fn note_layout_work(_part: usize) {
+    #[cfg(test)]
+    LAYOUT_WORK.with(|work| {
+        let mut w = work.get();
+        w[_part] += 1;
+        work.set(w);
+    });
+}
+
+/// `plan()`, the header line planned (counted for [`layout_work`]).
+fn planned_header(plan: impl FnOnce() -> HeaderPlan) -> HeaderPlan {
+    note_layout_work(2);
+    plan()
+}
+
 /// Lay the Deck out and paint it (the tests' form of [`deck_paint_live`]).
 #[cfg(test)]
 pub(crate) fn deck_paint(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<Hit>) {
@@ -2057,14 +2123,31 @@ pub(crate) fn deck_paint(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>,
 }
 
 /// Lay the Deck out and paint it, with what the layout says of its live edge.
+#[cfg(test)]
 pub(crate) fn deck_paint_live(
     g: &DeckGeom,
     input: &DeckInput<'_>,
 ) -> (Vec<DrawPrim>, Vec<Hit>, LiveOut) {
+    deck_paint_kept(g, input, &mut DeckStill::default())
+}
+
+/// Lay the Deck out and paint it, with what the layout says of its live edge, over the words
+/// and header line `still` keeps (read into it when it has none).
+pub(crate) fn deck_paint_kept(
+    g: &DeckGeom,
+    input: &DeckInput<'_>,
+    still: &mut DeckStill,
+) -> (Vec<DrawPrim>, Vec<Hit>, LiveOut) {
+    note_layout_work(0);
     let m = deck_metrics();
-    let words = DeckWords::new(input, &m);
+    let words = still.words.get_or_insert_with(|| {
+        note_layout_work(1);
+        DeckWords::new(input, &m)
+    });
     let mut deck = Deck::new(g, input, &m, true);
-    deck.paint(&words, input.form);
+    deck.head = still.head.take();
+    deck.paint(words, input.form);
+    still.head = deck.head.take();
     let hits = deck.hits();
     let out = LiveOut {
         rects: std::mem::take(&mut deck.live_rects),
@@ -2322,8 +2405,9 @@ impl crate::App {
         h.finish() | 1
     }
 
-    fn deck_layout(&self, wid: crate::WindowId, f: &DeckFrame, key: u64) -> Vec<DrawPrim> {
-        let input = DeckInput {
+    /// What frame `f`'s card shows: its inputs and the App's reading.
+    pub(crate) fn deck_input(&self, f: &DeckFrame) -> DeckInput<'_> {
+        DeckInput {
             snap: self.vitals.snapshot.as_deref(),
             tab_panes: f.tab_panes.clone(),
             tab_label: f.tab_label.clone(),
@@ -2339,13 +2423,35 @@ impl crate::App {
                 utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
             },
             live: f.live,
-        };
+        }
+    }
+
+    /// Lay out frame `f`'s card, whose key is `key` (`base` without the live edge), and keep
+    /// what the layout says of it: its fingerprint, hits and live edge.
+    fn deck_layout(
+        &self,
+        wid: crate::WindowId,
+        f: &DeckFrame,
+        (base, key): (u64, u64),
+    ) -> Vec<DrawPrim> {
+        let input = self.deck_input(f);
         let (prims, hits, out) = match f.form {
             StatsBars::Sill => {
                 let (prims, hits) = crate::stats_sill::sill_paint(&f.geom, &input);
                 (prims, hits, LiveOut::default())
             }
-            _ => deck_paint_live(&f.geom, &input),
+            _ => match self.windows.get(&wid) {
+                Some(ws) => {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    base.hash(&mut h);
+                    input.locale.utc_offset_s.hash(&mut h);
+                    input.locale.platform.hash(&mut h);
+                    let mut still = ws.deck_still.borrow_mut();
+                    deck_paint_kept(&f.geom, &input, still.at(h.finish() | 1))
+                }
+                None => deck_paint_kept(&f.geom, &input, &mut DeckStill::default()),
+            },
         };
         if let Some(ws) = self.windows.get(&wid) {
             ws.deck_memo
@@ -2372,19 +2478,32 @@ impl crate::App {
         let Some(f) = self.deck_frame(wid) else {
             return lens;
         };
-        let (_, key) = self.deck_key(&f);
+        let keys = self.deck_key(&f);
         if let Some((k, fp)) = self.windows.get(&wid).map(|ws| ws.deck_memo.get())
-            && k == key
+            && k == keys.1
         {
             return fp ^ lens;
         }
-        let _ = self.deck_layout(wid, &f, key);
-        self.windows.get(&wid).map_or(0, |ws| ws.deck_memo.get().1) ^ lens
+        let prims = self.deck_layout(wid, &f, keys);
+        let Some(ws) = self.windows.get(&wid) else {
+            return lens;
+        };
+        // The frame that asked for the fingerprint rasters this layout next.
+        *ws.deck_laid.borrow_mut() = Some(DeckLaid {
+            base: keys.0,
+            key: keys.1,
+            live: f.live,
+            prims,
+        });
+        ws.deck_memo.get().1 ^ lens
     }
 
     /// Rasterize the stats card into `wid`'s paint-only `deck_card`, again only when its prims
-    /// or placement moved, and the lens into its own card. A frame that moved only the live
-    /// edge re-rasters only the card's rects it moved ([`patch_live`]).
+    /// or placement moved, and the lens into its own card. The layout the frame's fingerprint
+    /// made ([`Self::stats_deck_fp`]) is the one rastered, its live edge with it (a beat that
+    /// ticked over since is the next frame's, as `service_stats_live` asks), so the deck is laid
+    /// out once a frame. A frame that moved only the live edge re-rasters only the card's rects
+    /// it moved ([`patch_live`]).
     pub(crate) fn splice_stats_deck(&mut self, wid: crate::WindowId) {
         self.splice_stats_lens(wid);
         let Some(f) = self.deck_frame(wid) else {
@@ -2393,10 +2512,18 @@ impl crate::App {
                 ws.deck_fold = None;
                 ws.stats_hits.borrow_mut().clear();
                 ws.deck_live_drawn.set(None);
+                // A card built again is laid out again, so its hits and live edge come back.
+                *ws.deck_laid.borrow_mut() = None;
             }
             return;
         };
         let (base, key) = self.deck_key(&f);
+        let laid = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.deck_laid.borrow_mut().take())
+            .filter(|laid| laid.base == base);
+        let (key, live) = laid.as_ref().map_or((key, f.live), |l| (l.key, l.live));
         if self
             .windows
             .get(&wid)
@@ -2405,7 +2532,10 @@ impl crate::App {
         {
             return;
         }
-        let prims = self.deck_layout(wid, &f, key);
+        let prims = match laid {
+            Some(laid) => laid.prims,
+            None => self.deck_layout(wid, &f, (base, key)),
+        };
         let fp = self.windows.get(&wid).map_or(0, |ws| ws.deck_memo.get().1);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
@@ -2415,7 +2545,7 @@ impl crate::App {
             && card.fp == fp
         {
             card.geom = key;
-            ws.deck_live_card.set((base, f.live));
+            ws.deck_live_card.set((base, live));
             return;
         }
         if let Some(card) = ws.deck_card.as_mut()
@@ -2426,16 +2556,16 @@ impl crate::App {
                 &prims,
                 &ws.deck_live_rects.borrow(),
                 &card_live,
-                &f.live,
+                &live,
             )
         {
             card.fp = fp;
             card.geom = key;
             card.raster_fingerprint_once = std::sync::OnceLock::new();
-            ws.deck_live_card.set((base, f.live));
+            ws.deck_live_card.set((base, live));
             return;
         }
-        ws.deck_live_card.set((base, f.live));
+        ws.deck_live_card.set((base, live));
         let (rgba, pw, ph) = crate::tray_raster::rasterize_tray(
             &prims,
             f.geom.w as u32,
@@ -2495,6 +2625,16 @@ impl crate::App {
         }
         ws.deck_fold = fold_cards(&cards, fp);
     }
+}
+
+/// A deck card's layout, kept from the frame's fingerprint for the splice that rasters it
+/// ([`crate::App::splice_stats_deck`]): the layout's key, `base` without its live edge, the live
+/// edge it drew, and its prims.
+pub(crate) struct DeckLaid {
+    base: u64,
+    key: u64,
+    live: DeckLive,
+    prims: Vec<DrawPrim>,
 }
 
 /// Re-raster into `card` only the rects of `rects` whose layer moved from `was` to `now`

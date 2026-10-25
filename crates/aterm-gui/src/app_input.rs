@@ -4303,6 +4303,9 @@ impl App {
                 ) {
                     return InputOutcome::Ok;
                 }
+                if matches!(src, Source::Human) && self.pool.is_rewound(target) {
+                    return InputOutcome::Ok;
+                }
                 self.note_person_input(target, &ev, src);
                 return self.input_to_hidden_session(target, ev, phase, completion);
             };
@@ -4354,6 +4357,15 @@ impl App {
                 .get(session)
                 .is_some_and(|s| c.matches(session, &s.ctx))
         });
+        if matches!(src, Source::Human)
+            && self.pool.is_rewound(session)
+            && crate::rewind::withheld(&ev)
+        {
+            if crate::rewind::noticed(&ev) {
+                self.note_rewind_withheld(session);
+            }
+            return InputOutcome::Ok;
+        }
         self.note_person_input(session, &ev, src);
         let input_now = match &ev {
             InputEvent::Key {
@@ -4633,6 +4645,11 @@ impl App {
                                 })
                                 .unwrap_or(1)
                                 .max(1);
+                            if tty_swallows {
+                                crate::aos_host::privacy_detach(ws, crate::aos_host::NO_ECHO_KEY);
+                            } else if self.config.secure_keyboard_entry_or_default() {
+                                crate::aos_host::privacy_detach(ws, crate::aos_host::SECURE_ENTRY);
+                            }
                             ws.fx.cursor_mut().momentum.on_key(
                                 input_now,
                                 aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S,
@@ -6896,8 +6913,8 @@ impl App {
         }
 
         if HARDCODED_SUPER_CHORDS
-            && (self.on_key_super_shift_chord(mods, ev)
-                || self.on_key_super_chord(mods, ev)
+            && (self.on_key_super_shift_chord(wid, mods, ev)
+                || self.on_key_super_chord(wid, mods, ev)
                 || self.on_key_pane_focus(mods, ev))
         {
             self.note_consumed_press(wid, ev);
@@ -7180,6 +7197,10 @@ impl App {
             self.note_press_disposition(wid, &ev, None);
             return;
         }
+        if self.rewind_key(wid, mods, &ev.logical_key, inert) {
+            self.note_press_disposition(wid, &ev, None);
+            return;
+        }
         #[cfg(any(windows, target_os = "linux"))]
         if let Some(ekey) = aterm_winit_keymap::map_logical_key(&ev.logical_key)
             && tab_menu_chord(
@@ -7306,11 +7327,11 @@ impl App {
             self.terminal_emacs_search_pressed(wid, ev.physical_key, forward);
             return;
         }
-        if HARDCODED_SUPER_CHORDS && self.on_key_super_shift_chord(mods, &ev) {
+        if HARDCODED_SUPER_CHORDS && self.on_key_super_shift_chord(wid, mods, &ev) {
             self.note_consumed_press(wid, &ev);
             return;
         }
-        if HARDCODED_SUPER_CHORDS && self.on_key_super_chord(mods, &ev) {
+        if HARDCODED_SUPER_CHORDS && self.on_key_super_chord(wid, mods, &ev) {
             self.note_consumed_press(wid, &ev);
             return;
         }
@@ -7505,18 +7526,23 @@ impl App {
     }
 
     /// Hardcoded Cmd-Shift chords of [`Self::on_key`].
-    fn on_key_super_shift_chord(&mut self, mods: ModifiersState, ev: &KeyEvent) -> bool {
+    fn on_key_super_shift_chord(
+        &mut self,
+        wid: WindowId,
+        mods: ModifiersState,
+        ev: &KeyEvent,
+    ) -> bool {
         if mods.super_key()
             && mods.shift_key()
             && let Key::Character(s) = &ev.logical_key
         {
             match s.as_str() {
                 "]" | "}" => {
-                    self.cycle_tab(true);
+                    self.cycle_tab_in(wid, true);
                     return true;
                 }
                 "[" | "{" => {
-                    self.cycle_tab(false);
+                    self.cycle_tab_in(wid, false);
                     return true;
                 }
                 "t" | "T" => {
@@ -7544,8 +7570,7 @@ impl App {
                     return true;
                 }
                 "l" | "L" => {
-                    // The chord has no `wid`: it acts on the front window, as
-                    // every chord here does.
+                    // Ledger follows the front window.
                     if let Some(wid) = self.frontmost_window {
                         self.open_session_ledger(wid);
                     }
@@ -7558,7 +7583,7 @@ impl App {
     }
 
     /// Hardcoded Cmd (no Shift) chords of [`Self::on_key`].
-    fn on_key_super_chord(&mut self, mods: ModifiersState, ev: &KeyEvent) -> bool {
+    fn on_key_super_chord(&mut self, wid: WindowId, mods: ModifiersState, ev: &KeyEvent) -> bool {
         if mods.super_key()
             && !mods.shift_key()
             && let Key::Character(s) = &ev.logical_key
@@ -7570,7 +7595,7 @@ impl App {
                     return true;
                 }
                 "t" => {
-                    self.open_tab();
+                    self.open_tab_in(wid);
                     return true;
                 }
                 "d" => {
@@ -7582,11 +7607,9 @@ impl App {
                     return true;
                 }
                 "w" => {
-                    // The last pane of the last tab sets `pending_close` on the window
-                    // `close_active_tab` closed (the frontmost, not the event's `wid`,
-                    // which can differ); `window_event`, which has the
-                    // `ActiveEventLoop`, closes it after `on_key` returns.
-                    if let Some(closed) = self.close_active_tab()
+                    // The last pane marks its originating window for closure;
+                    // `window_event` closes it after `on_key` returns.
+                    if let Some(closed) = self.close_active_tab_in(wid)
                         && let Some(ws) = self.windows.get_mut(&closed)
                     {
                         ws.pending_close = true;
@@ -7595,7 +7618,7 @@ impl App {
                 }
                 "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
                     if let Some(d) = lc.chars().next().and_then(|c| c.to_digit(10)) {
-                        self.switch_tab(d as usize - 1);
+                        self.switch_tab_in(wid, d as usize - 1);
                     }
                     return true;
                 }
@@ -8154,22 +8177,21 @@ impl App {
         use keybinding::Action;
         self.note_update_handoff_activity();
         match action {
-            Action::NewTab => self.open_tab(),
+            Action::NewTab => self.open_tab_in(wid),
             Action::ReopenClosedTab => {
                 let _ = self.reopen_last_closed_tab();
             }
             Action::CloseTab => {
-                let _ = wid;
-                if let Some(closed) = self.close_active_tab()
+                if let Some(closed) = self.close_active_tab_in(wid)
                     && let Some(ws) = self.windows.get_mut(&closed)
                 {
                     ws.pending_close = true;
                 }
             }
             Action::NewWindow => self.open_new_window(),
-            Action::NextTab => self.cycle_tab(true),
-            Action::PrevTab => self.cycle_tab(false),
-            Action::SwitchTab(n) => self.switch_tab(usize::from(n).saturating_sub(1)),
+            Action::NextTab => self.cycle_tab_in(wid, true),
+            Action::PrevTab => self.cycle_tab_in(wid, false),
+            Action::SwitchTab(n) => self.switch_tab_in(wid, usize::from(n).saturating_sub(1)),
             Action::SplitVertical => self.split_focused_pane(pane::SplitDir::Vertical),
             Action::SplitHorizontal => self.split_focused_pane(pane::SplitDir::Horizontal),
             Action::FocusPaneLeft => self.focus_pane(pane::FocusDir::Left),
@@ -9163,6 +9185,11 @@ impl App {
             MenuAction::ToggleStatsLens => {
                 let _ = self.toggle_stats_lens();
             }
+            MenuAction::RewindPane => {
+                if let Some(wid) = self.frontmost_window {
+                    self.toggle_rewind(wid);
+                }
+            }
             MenuAction::CloseTab => {
                 // As Cmd-W; the window closes when its last tab did.
                 if let Some(closed) = self.close_active_tab() {
@@ -9941,8 +9968,11 @@ mod ledger_key_tests {
             .to_string();
         assert!(app.last_ledger_plan.is_none());
 
-        let fired =
-            app.on_key_super_shift_chord(ModifiersState::SUPER | ModifiersState::SHIFT, &shift_l());
+        let fired = app.on_key_super_shift_chord(
+            wid,
+            ModifiersState::SUPER | ModifiersState::SHIFT,
+            &shift_l(),
+        );
         assert!(fired, "⇧⌘L is consumed, never typed into the PTY");
         let plan = app.last_ledger_plan.clone().expect("a plan was composed");
         assert_eq!(plan.sid, stable);
@@ -9952,7 +9982,7 @@ mod ledger_key_tests {
         assert_eq!(plan.argv[6], plan.out.to_string_lossy());
 
         app.last_ledger_plan = None;
-        assert!(!app.on_key_super_shift_chord(ModifiersState::SUPER, &shift_l()));
+        assert!(!app.on_key_super_shift_chord(wid, ModifiersState::SUPER, &shift_l()));
         assert!(app.last_ledger_plan.is_none());
 
         app.dispatch_action(wid, Action::OpenLedger);

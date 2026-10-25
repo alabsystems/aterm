@@ -440,6 +440,108 @@ fn a_changed_row_offers_reset_on_its_own_page() {
     }
 }
 
+/// A CONTROL A PAGE DRAWS ITSELF SAYS ITS STATE AS EVERY ROW DOES: a written wallpaper's image
+/// row on Wallpaper says Changed, as Dim and Text tint under it do, its line keeping the word's
+/// room either way so nothing moves when it comes; a written display face's row on Text & Fonts
+/// says Changed and offers Reset, which unsets the key. (The image line said only the file, and
+/// the faces card only its switches, while Modified listed both keys as changed.) Negative
+/// control: neither says Changed with its key unwritten, and the faces keep Reset's place.
+#[test]
+fn a_page_drawn_control_says_changed_as_every_row_does() {
+    let image = |source: &str| {
+        let mut lab = Lab::new(source);
+        lab.state_mut().navigate(SettingsRoute::Wallpaper);
+        let compiled = lab.compile(1_074.0, 820.0);
+        let current = compiled
+            .semantic(&UiKey::new("settings/wallpaper/current"))
+            .expect("the image row")
+            .clone();
+        let painted: Vec<String> = compiled
+            .paint
+            .iter()
+            .filter(|node| {
+                node.key
+                    .as_str()
+                    .starts_with("settings/wallpaper/current/name")
+            })
+            .filter_map(|node| match &node.content {
+                UiContent::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect();
+        let dim = compiled
+            .semantic(&UiKey::new(format!(
+                "settings/label/{}",
+                prefs::EDIT_WALLPAPER_DIM
+            )))
+            .map(|node| node.label.clone())
+            .unwrap_or_default();
+        (current, painted.join(" "), dim)
+    };
+    let (set, set_painted, dim) = image("wallpaper = \"/tmp/none.png\"\nwallpaper_dim = 0.5\n");
+    assert!(dim.contains("Changed"), "premise: Dim says Changed: {dim}");
+    assert!(
+        set.label.starts_with("Wallpaper image \u{b7} Changed: "),
+        "{}",
+        set.label
+    );
+    assert!(set_painted.contains("Changed"), "{set_painted}");
+    let (unset, unset_painted, _) = image("");
+    assert!(!unset.label.contains("Changed"), "{}", unset.label);
+    assert!(!unset_painted.contains("Changed"), "{unset_painted}");
+    assert_eq!(
+        set.rect.height, unset.rect.height,
+        "the word's room is kept either way"
+    );
+
+    let faces = |source: &str| {
+        let mut lab = Lab::new(source);
+        lab.state_mut().navigate(SettingsRoute::TextFonts);
+        let caption = "settings/group-heading/display-faces/display-faces";
+        let reset = format!("settings/reset/{}", prefs::EDIT_DISPLAY_FONT);
+        let slot = format!("settings/reset-slot/{}", prefs::EDIT_DISPLAY_FONT);
+        let mut seen = None;
+        for _ in 0..12 {
+            let compiled = lab.compile(1_074.0, 820.0);
+            if let Some(heading) = compiled
+                .semantic(&UiKey::new(caption))
+                .filter(|node| !node.offscreen)
+            {
+                let painted =
+                    |key: &str| compiled.paint.iter().find(|node| node.key.as_str() == key);
+                let line = painted(caption).map(|node| node.rect);
+                let reset_rect = painted(&reset)
+                    .or_else(|| painted(&slot))
+                    .map(|node| node.rect);
+                seen = Some((
+                    heading.label.clone(),
+                    compiled.semantic(&UiKey::new(reset.clone())).is_some(),
+                    line.zip(reset_rect),
+                ));
+                break;
+            }
+            lab.dispatch(AppEvent::ScrollLines(3));
+        }
+        let (label, reset, rects) = seen.expect("the faces card on Text & Fonts");
+        (label, reset, rects, lab)
+    };
+    let (label, reset, rects, mut lab) = faces("display_font = \"pixel\"\n");
+    assert!(label.ends_with("\u{b7} CHANGED"), "{label}");
+    assert!(reset, "a written display face offers Reset");
+    let (line, at) = rects.expect("the caption and its Reset are painted");
+    assert!(at.x >= line.right(), "Reset ends the caption's line");
+    lab.commit(
+        &format!("settings/reset/{}", prefs::EDIT_DISPLAY_FONT),
+        None,
+    );
+    assert_eq!(lab.text(), "");
+    let (label, reset, rects, _) = faces("");
+    assert_eq!(label, "DISPLAY FACES");
+    assert!(!reset, "an unwritten one offers no Reset");
+    let (_, kept) = rects.expect("an unwritten one keeps Reset's place");
+    assert!((kept.x - at.x).abs() < 0.5, "in the same place");
+}
+
 #[test]
 fn compact_reset_follows_the_switch() {
     let mut lab = Lab::new("cursor_blink = false\n");

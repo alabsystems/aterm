@@ -95,8 +95,8 @@ fn derive_identity(block: &OutputBlock) -> Option<AppIdentity> {
             if id == SHELL_APP_ID {
                 return None;
             }
+            let look = KittyLook::for_app(id);
             let id = id.to_owned();
-            let look = KittyLook::for_app(&id);
             Some(AppIdentity { id, basename, look })
         }
         _ => None,

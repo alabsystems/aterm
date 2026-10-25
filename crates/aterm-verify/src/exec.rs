@@ -184,11 +184,23 @@ impl Run {
         if let Some(e) = &self.spawn_error {
             return Some(e.clone());
         }
-        if self.output.contains(ENOSPC_SENTENCE) {
+        if out_of_disk(&self.output) {
             return Some(format!("the child ran out of disk ({ENOSPC_SENTENCE})"));
         }
         crate::libtest::environment_refusals(&self.output)
             .map(|names| crate::libtest::refusal_reason("every failing test", &names, &self.output))
+    }
+}
+
+/// Whether a failed child's log says the disk ran out: when it accounts for its failures as failed
+/// tests, only if each one's own block names [`ENOSPC_SENTENCE`] (a test that passes may print a full
+/// disk it simulated); otherwise anywhere, as a build or a tool that died says it.
+fn out_of_disk(output: &str) -> bool {
+    match crate::libtest::failed_tests(output) {
+        Some(failed) if !failed.is_empty() => failed
+            .iter()
+            .all(|test| test.block.contains(ENOSPC_SENTENCE)),
+        _ => output.contains(ENOSPC_SENTENCE),
     }
 }
 

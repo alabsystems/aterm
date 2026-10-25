@@ -494,7 +494,7 @@ fn chips_per_row(column_width: f32) -> usize {
     }
 }
 
-/// The palette: sixteen chips (normal over bright, eight to a row, or four where eight would stand closer than [`CHIP_PITCH_LEAST`]), the open slot's editor, and Reset palette.
+/// The palette: sixteen chips (normal over bright, eight to a row, or four where eight would stand closer than [`CHIP_PITCH_LEAST`]), the open slot's editor (its chips' row, its field, its tools and its picker) in its row's place, and Reset palette.
 pub(super) fn palette_blocks(
     state: &SettingsViewState,
     column_width: f32,
@@ -690,6 +690,17 @@ pub(super) fn palette_blocks(
     }
     let (tools, tools_height) =
         control_row("settings/showcase/palette-tools", "Palette color", controls);
+    let caption = caption_height() + 4.0;
+    // THE OPEN SLOT'S PICKER IS PART OF ITS EDITOR wherever the two share a screen under the
+    // section's caption: right under its chips' row, field and tools, one stop with them, so
+    // opening a slot (which reveals its field) shows the wheel it sets too, as a colour row's
+    // picker comes under its row. Where they cannot share, the picker is the section's next stop.
+    // (It was a stop of its own under the palette-wide Reset palette, and opening a slot showed
+    // no wheel at 150x48.)
+    let picker_in = |room: f32| {
+        palette_slot_picker(state, column_width, room).filter(|(_, height)| *height <= room + 0.5)
+    };
+    let mut alone = None;
     let mut blocks = Vec::new();
     match field {
         None => blocks.push(with_heading_rows(
@@ -701,7 +712,7 @@ pub(super) fn palette_blocks(
                 .collect(),
             column_width,
         )),
-        Some(field) if rows > 2 => {
+        Some(field) => {
             let open = state
                 .showcase
                 .slot
@@ -712,11 +723,44 @@ pub(super) fn palette_blocks(
                 "Palette color",
                 vec![field],
             );
-            let mut parts = vec![chip_row(open), slot_row, tools];
-            let mut editor_height = chip_height + 6.0 + slot_height + 6.0 + tools_height;
-            if let Some((row, height)) = reset_row {
-                parts.push(row);
-                editor_height += height + 6.0;
+            // The editor holds the open slot's chips' row where the picker still shares the
+            // screen with it, else starts at the field, the chips' row a row of its own over it.
+            let tools_part = slot_height + 6.0 + tools_height;
+            let with_chips = chip_height + 6.0 + tools_part;
+            let shared = |editor: f32| (room - caption - editor - 6.0).min(colour_picker_room());
+            let (chips_inside, picker) = match picker_in(shared(with_chips)) {
+                Some(picker) => (true, Some(picker)),
+                None => match picker_in(shared(tools_part)) {
+                    Some(picker) => (false, Some(picker)),
+                    None => (true, None),
+                },
+            };
+            let mut lead = None;
+            let mut parts = Vec::new();
+            let mut editor_height = tools_part;
+            if chips_inside {
+                parts.push(chip_row(open));
+                editor_height = with_chips;
+            } else {
+                lead = Some((chip_row(open), chip_height));
+            }
+            parts.extend([slot_row, tools]);
+            let mut next = None;
+            match picker {
+                Some((picker, height)) => {
+                    parts.push(picker);
+                    editor_height += height + 6.0;
+                }
+                None => match picker_in((room - caption).min(colour_picker_room())) {
+                    Some(picker) => next = Some(picker),
+                    None => {
+                        alone = palette_slot_picker(
+                            state,
+                            column_width,
+                            colour_picker_room().min(room),
+                        );
+                    }
+                },
             }
             let editor = UiNode::new(
                 "settings/showcase/palette-and-tools",
@@ -733,59 +777,27 @@ pub(super) fn palette_blocks(
                 "settings/showcase/palette-section",
                 "PALETTE",
                 (0..rows)
-                    .map(|row| {
+                    .flat_map(|row| {
                         if row == open {
-                            editor.take().expect("one open row")
+                            vec![
+                                lead.take(),
+                                Some(editor.take().expect("one open row")),
+                                next.take(),
+                            ]
                         } else {
-                            (chip_row(row), chip_height)
+                            vec![Some((chip_row(row), chip_height))]
                         }
                     })
+                    .flatten()
+                    // Reset palette is the whole palette's, so it ends the section, as it does
+                    // with no slot open.
+                    .chain(reset_row)
                     .collect(),
                 column_width,
             ));
         }
-        Some(field) => {
-            let grid_height = 2.0 * chip_height + 4.0;
-            let grid = UiNode::new(
-                "settings/showcase/palette",
-                UiContent::Group(GroupSpec::new("Palette")),
-            )
-            .layout(Layout::column().height(Length::Fixed(grid_height)).gap(4.0))
-            .children(vec![chip_row(0), chip_row(1)]);
-            let (slot_row, slot_height) = control_row(
-                "settings/showcase/palette-slot-row",
-                "Palette color",
-                vec![field],
-            );
-            let mut parts = vec![grid, slot_row, tools];
-            let mut section_height = grid_height + 6.0 + slot_height + 6.0 + tools_height;
-            if let Some((row, height)) = reset_row {
-                parts.push(row);
-                section_height += height + 6.0;
-            }
-            let section = UiNode::new(
-                "settings/showcase/palette-and-tools",
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(
-                Layout::column()
-                    .height(Length::Fixed(section_height))
-                    .gap(6.0),
-            )
-            .children(parts);
-            blocks.push(with_heading(
-                "settings/showcase/palette-section",
-                "PALETTE",
-                (section, section_height),
-                column_width,
-            ));
-        }
     }
-    blocks.extend(palette_slot_picker(
-        state,
-        column_width,
-        colour_picker_room().min(room),
-    ));
+    blocks.extend(alone);
     blocks
 }
 

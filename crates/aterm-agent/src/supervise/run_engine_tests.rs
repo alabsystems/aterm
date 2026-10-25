@@ -3656,6 +3656,7 @@ struct TestHost {
     marks: AtomicBool,
     turns_ran: std::sync::atomic::AtomicUsize,
     taps: std::sync::atomic::AtomicUsize,
+    busy_taps: std::sync::atomic::AtomicUsize,
     types: AtomicBool,
     ends: AtomicBool,
     again: std::sync::atomic::AtomicUsize,
@@ -3820,6 +3821,9 @@ impl IdleHost for TestHost {
     }
     fn usage_tap(&self) {
         self.taps.fetch_add(1, Ordering::SeqCst);
+    }
+    fn busy_tap(&self) {
+        self.busy_taps.fetch_add(1, Ordering::SeqCst);
     }
     fn limited(&self, open: bool) {
         self.limits.lock().unwrap().push(open);
@@ -7096,6 +7100,35 @@ fn the_host_reads_its_usage_tap_at_each_decided_idle_turn_end() {
 }
 
 #[test]
+fn the_host_reads_its_usage_tap_at_busy_reads_and_never_at_an_idle_one() {
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let run = |screens: Vec<Vec<String>>| {
+        let host = Arc::new(TestHost::default());
+        host.owns.store(true, Ordering::SeqCst);
+        let mut m = Mock::new(screens);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        m.vanish_after = Some(0);
+        let stop = Stop::reached(
+            |h| h.taps.load(Ordering::SeqCst) >= 2,
+            Duration::from_millis(300),
+        );
+        let _ = hosted_with_host(&mut m, &full, &host, stop, None);
+        host.busy_taps.load(Ordering::SeqCst)
+    };
+    let busy = run(vec![
+        idle_screen(),
+        busy_screen(),
+        busy_screen(),
+        idle_screen(),
+    ]);
+    assert!(busy >= 1, "a turn running: {busy}");
+    assert_eq!(run(vec![idle_screen()]), 0, "idle reads only");
+}
+
+#[test]
 fn a_turn_the_host_typed_is_no_short_turn_of_the_workers() {
     let full = SuperviseOpts {
         max: Duration::from_secs(30),
@@ -8325,6 +8358,64 @@ fn a_question_key_refused_busy_input_unread_is_backed_off_then_answered() {
             .any(|r| r.starts_with("meta set attention")),
         "{:?}",
         m.requests
+    );
+}
+
+/// A question key the worker has not drawn is not sent again while the screen stands where it
+/// was written ([`Session::question_key_undrawn`]). A starved worker that reads its Enter 5 s after
+/// it was written and draws it 15 s after gets one Enter, and so does one that reads it at once
+/// and draws it 15 s after: the write itself is input not yet drawn. A screen that never moves
+/// ends the hold `UNDRAWN_INPUT_HANG` after the write, a hang detector, and the key is sent again.
+/// Negative control: a screen that moves past the write while the dialog stays as it was keyed
+/// (a dialog that dropped the key) gets the dialog's re-send at once.
+#[test]
+fn a_question_key_the_worker_has_not_drawn_is_not_sent_again() {
+    use aterm_phase::prompt::fixtures as f;
+    let keyed_at = |unread: Option<Duration>, unmoved: Option<Duration>| {
+        let mut m = match unmoved {
+            Some(_) => questioned(vec![q(f::QUESTION_ONE), idle_screen()]),
+            None => questioned(vec![q(f::QUESTION_ONE)]),
+        };
+        m.key_releases = unmoved.map(|_| 0);
+        m.unmoved_after_key = unmoved;
+        m.unread_after_write = unread;
+        let mut s = virtual_session(&mut m, None);
+        s.set_approval_env(owner_env());
+        let _ = s.supervise(&answering(150));
+        assert!(
+            m.presses().iter().all(|p| p.ends_with(" enter")),
+            "{:?}",
+            m.requests
+        );
+        let first = m.key_times.first().map(|(_, at)| *at);
+        let after: Vec<Duration> = m
+            .key_times
+            .iter()
+            .filter_map(|(_, at)| first.map(|f| at.saturating_duration_since(f)))
+            .collect();
+        (after, m.requests.clone())
+    };
+    let drawn = Some(Duration::from_secs(15));
+    let hang = super::super::turn_end_loop::UNDRAWN_INPUT_HANG;
+
+    let (keys, requests) = keyed_at(Some(Duration::from_secs(5)), drawn);
+    assert_eq!(keys.len(), 1, "a worker that reads late: {requests:?}");
+
+    let (keys, requests) = keyed_at(None, drawn);
+    assert_eq!(keys.len(), 1, "a worker that draws late: {requests:?}");
+
+    let (keys, requests) = keyed_at(None, Some(Duration::from_secs(120)));
+    assert!(
+        keys.len() >= 2 && keys[1] >= hang && keys[1] < hang + Duration::from_secs(30),
+        "a screen that never moves is sent the key again once the hold's hang ends ({keys:?}): \
+         {requests:?}"
+    );
+
+    let (keys, requests) = keyed_at(None, None);
+    assert!(
+        keys.len() >= 2 && keys[1] < Duration::from_secs(15),
+        "the control: a screen that moved past the write is sent the key again ({keys:?}): \
+         {requests:?}"
     );
 }
 
@@ -12456,6 +12547,17 @@ fn the_auto_mode_setup_offer_is_put_off_at_every_level_and_the_turn_continued() 
         (f::AUTO_MODE_SETUP, "safe", true),
         (f::AUTO_MODE_SETUP_FULLSCREEN_60COL, "none", true),
         (f::AUTO_MODE_SETUP_FULLSCREEN_40COL, "safe", true),
+        (f::AUTO_MODE_SETUP_34COL, "none", true),
+        (f::AUTO_MODE_SETUP_FULLSCREEN_34COL, "safe", true),
+        (f::AUTO_MODE_SETUP_26COL, "all", true),
+        (f::AUTO_MODE_SETUP_FULLSCREEN_26COL, "none", true),
+        (f::AUTO_MODE_SETUP_22COL, "safe", true),
+        (f::AUTO_MODE_SETUP_FULLSCREEN_20COL, "all", true),
+        (f::AUTO_MODE_SETUP_19COL, "none", true),
+        (f::AUTO_MODE_SETUP_FULLSCREEN_19COL, "safe", true),
+        (f::AUTO_MODE_SETUP_FULLSCREEN_17COL, "all", true),
+        (f::AUTO_MODE_SETUP_16COL, "safe", true),
+        (f::AUTO_MODE_SETUP_FULLSCREEN_16COL, "none", true),
         (f::AUTO_MODE_SETUP_FULLSCREEN_SHELL, "none", false),
         (f::AUTO_MODE_SETUP_FULLSCREEN_SHELL_MODE, "all", false),
     ] {

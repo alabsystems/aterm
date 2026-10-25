@@ -16511,20 +16511,22 @@ fn the_wait_log_keeps_each_change_of_wait_with_the_facts_that_decided_it() {
 }
 
 /// A version probe's deadline (300 ms here) bounds a child that keeps running and one that exits
-/// while its own child still holds stdout.
+/// while its own child still holds stdout. Each script has run once before its probe
+/// ([`crate::harness::stand_in::proven`]), so the deadline meets the script, not macOS's
+/// assessment of a new file.
 #[cfg(unix)]
 #[test]
 fn a_version_probe_is_bounded_whole() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = aterm_tempfile::Builder::new()
-        .prefix("aterm-version-probe-")
-        .tempdir()
-        .expect("exclusive probe directory");
+    let mut dir = aterm_uds::deadline::KeptUntilRan::new(
+        aterm_tempfile::Builder::new()
+            .prefix("aterm-version-probe-")
+            .tempdir()
+            .expect("exclusive probe directory")
+            .keep(),
+    );
     let script = |name: &str, body: &str| {
         let path = dir.path().join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("script");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .expect("private executable");
+        crate::harness::stand_in::proven(&path, body);
         path
     };
     let parked = aterm_spec::wait::PARKED_SECS;
@@ -16540,6 +16542,9 @@ fn a_version_probe_is_bounded_whole() {
             "printf '%s\n' \"$$\" > \"$0.pid\"\n/bin/sleep {parked} &\nprintf '%s\n' \"$!\" > \"$0.child\"\nprintf '%s\n' '2.1.282 (Claude Code)'\nexit 0"
         ),
     );
+    let answer = script("answer", "printf '%s\n' '2.1.282 (Claude Code)'");
+    let silent = script("silent", "exit 3");
+    dir.ran();
     let results = [&hang, &lingers].map(|exe| version_within(exe, Duration::from_millis(300)));
     let mut observed = Vec::new();
     for exe in [&hang, &lingers] {
@@ -16571,8 +16576,6 @@ fn a_version_probe_is_bounded_whole() {
     for (name, result) in ["hang", "lingers"].into_iter().zip(results) {
         assert_eq!(result, Probed::TimedOut, "{name}");
     }
-    let answer = script("answer", "printf '%s\n' '2.1.282 (Claude Code)'");
-    let silent = script("silent", "exit 3");
     assert_eq!(
         version_within(&answer, Duration::from_secs(60)),
         Probed::Version(Version::parse("2.1.282").expect("v"))
@@ -27185,10 +27188,12 @@ fn the_harness_token_is_never_in_the_options_debug() {
 }
 
 /// A session file that cannot be parsed fails the roster only while its writer may live: a
-/// process of this user's at its number. Root's process at that number (`kill` answers `EPERM`,
-/// which [`alive`] counts as alive) or an unreaped zombie (`kill` answers 0) cannot be this
-/// user's Claude Code writing it, and Claude Code's own sweep leaves such a file in place.
-/// Negative control: judged by [`alive`], each of those fails the roster.
+/// process of this user's at its number that started by the file's last write. Root's process
+/// at that number (`kill` answers `EPERM`, which [`alive`] counts as alive), an unreaped zombie
+/// (`kill` answers 0), or a process that started after the file was last written cannot be
+/// this user's Claude Code writing it, and Claude Code's own sweep leaves such a file in place.
+/// Negative control: judged by [`alive`], each of those fails the roster; this process at the
+/// number, with the file written after it started, fails it.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn an_unparsable_session_file_fails_the_roster_only_while_this_users_process_may_write_it() {
@@ -27223,9 +27228,19 @@ fn an_unparsable_session_file_fails_the_roster_only_while_this_users_process_may
     drop(zombie);
     assert_eq!(with_zombie, Some(0), "an unreaped zombie writes nothing");
     std::fs::remove_file(sessions.join(format!("{pid}.json"))).expect("the zombie's record");
-    half(std::process::id());
+    let me = std::process::id();
+    half(me);
     assert!(
         session_files_in(&claude_dir).is_none(),
         "this user's live process may be writing its record"
+    );
+    let born = started_s(me).expect("this process's start");
+    std::fs::File::open(sessions.join(format!("{me}.json")))
+        .and_then(|f| f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(born - 10)))
+        .expect("a write before this process started");
+    assert_eq!(
+        session_files_in(&claude_dir).map(|f| f.len()),
+        Some(0),
+        "last written before this process started: a process that took the number since"
     );
 }

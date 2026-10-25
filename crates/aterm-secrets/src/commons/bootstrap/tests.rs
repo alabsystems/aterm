@@ -168,8 +168,12 @@ fn history_transition(
     let identity = client::read_identity(&paths).unwrap().unwrap();
     let initial = descriptor(&identity, NETWORK, &ROOT, 1);
     let mut observation = snapshot(&identity, &initial);
-    let prior =
-        (action != "FirstBoot").then(|| Bootstrap::from_snapshot(&paths, &observation).unwrap());
+    let prior = (!matches!(
+        action,
+        "FirstBoot" | "PreparingResume" | "ForeignPreparing" | "WrongIdentity" | "UnclaimedPartial"
+    ))
+    .then(|| Bootstrap::from_snapshot(&paths, &observation).unwrap());
+    let mut held = None;
     let scenario = match action {
         "FirstBoot" => 1,
         "Reopen" => 2,
@@ -190,9 +194,167 @@ fn history_transition(
             observation = snapshot(&identity, &descriptor(&identity, [8; 16], &ROOT, 1));
             5
         }
+        "MissingOuterPin" => {
+            std::fs::remove_file(paths.dir.join("commons/default.pin")).unwrap();
+            6
+        }
+        "MissingPinAndHistory" => {
+            std::fs::remove_file(paths.dir.join("commons/default.pin")).unwrap();
+            std::fs::rename(
+                prior.as_ref().unwrap().journal_dir(),
+                home.path().join("preserved-history"),
+            )
+            .unwrap();
+            7
+        }
+        "MissingCommonsDirectory" => {
+            std::fs::rename(
+                paths.dir.join("commons"),
+                home.path().join("preserved-commons"),
+            )
+            .unwrap();
+            8
+        }
+        "ChangedTrustMissingPin" => {
+            std::fs::remove_file(paths.dir.join("commons/default.pin")).unwrap();
+            observation = snapshot(&identity, &descriptor(&identity, [8; 16], &ROOT, 1));
+            9
+        }
+        "CorruptHistoryClaim" => {
+            fsx::write_atomic(&paths.dir.join("commons.claim"), b"damaged", 0o600).unwrap();
+            10
+        }
+        "LegacyBackfill" => {
+            std::fs::remove_file(paths.dir.join("commons.claim")).unwrap();
+            11
+        }
+        "MissingOuterClaims" => {
+            std::fs::remove_file(paths.dir.join("commons.claim")).unwrap();
+            std::fs::remove_file(paths.dir.join("commons/default.pin")).unwrap();
+            12
+        }
+        "BusyBootstrap" => {
+            held =
+                Some(CustodyLock::acquire_commons_custody(&paths, "commons.lock", false).unwrap());
+            13
+        }
+        "PreparingResume" => {
+            Device::open(&paths).unwrap().unwrap();
+            fsx::write_atomic(
+                &paths.dir.join("commons.claim"),
+                &preparing_bytes(initial.trust()),
+                0o600,
+            )
+            .unwrap();
+            fsx::ensure_private_dir(&paths.dir.join("commons/control")).unwrap();
+            14
+        }
+        "ForeignPreparing" => {
+            Device::open(&paths).unwrap().unwrap();
+            let foreign = descriptor(&identity, [8; 16], &ROOT, 1);
+            fsx::write_atomic(
+                &paths.dir.join("commons.claim"),
+                &preparing_bytes(foreign.trust()),
+                0o600,
+            )
+            .unwrap();
+            15
+        }
+        "LegacyDamagedAnchor" => {
+            std::fs::remove_file(paths.dir.join("commons.claim")).unwrap();
+            std::fs::remove_file(paths.dir.join("commons/default.pin")).unwrap();
+            std::fs::rename(
+                paths.dir.join("commons/control/control.anchor"),
+                home.path().join("saved-anchor"),
+            )
+            .unwrap();
+            16
+        }
+        "OrphanTables" | "OrphanHistory" => {
+            std::fs::remove_file(paths.dir.join("commons.claim")).unwrap();
+            std::fs::remove_file(paths.dir.join("commons/default.pin")).unwrap();
+            std::fs::rename(
+                paths.dir.join("commons/control"),
+                home.path().join("saved-control"),
+            )
+            .unwrap();
+            let name = if action == "OrphanTables" {
+                "tables"
+            } else {
+                "history"
+            };
+            fsx::ensure_private_dir(&paths.dir.join("commons").join(name)).unwrap();
+            if action == "OrphanTables" { 17 } else { 21 }
+        }
+        "WrongIdentity" => {
+            observation.recipient = Identity::from_secret_bytes([37; 32]).recipient();
+            18
+        }
+        "UnclaimedPartial" => {
+            Device::open(&paths).unwrap().unwrap();
+            fsx::ensure_private_dir(&paths.dir.join("commons/control")).unwrap();
+            19
+        }
+        "PreparingPinLostLog" => {
+            fsx::write_atomic(
+                &paths.dir.join("commons.claim"),
+                &preparing_bytes(initial.trust()),
+                0o600,
+            )
+            .unwrap();
+            std::fs::rename(
+                paths.dir.join("commons/control"),
+                home.path().join("saved-control"),
+            )
+            .unwrap();
+            20
+        }
         _ => panic!("unknown bootstrap action"),
     };
-    let opened = Bootstrap::from_snapshot(&paths, &observation).is_ok();
+    let opened = match Bootstrap::from_snapshot(&paths, &observation) {
+        Ok(opened) => {
+            assert_eq!(opened.trust(), initial.trust());
+            assert_eq!(
+                fsx::read_private(&paths.dir.join("commons.claim"), PIN_LEN)
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                claim_bytes(initial.trust()),
+            );
+            assert_eq!(
+                fsx::read_private(&paths.dir.join("commons/default.pin"), PIN_LEN)
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                pin_bytes(initial.trust())
+            );
+            true
+        }
+        Err(_) => false,
+    };
+    drop(held);
+    if matches!(
+        action,
+        "LostHistory"
+            | "MissingPinAndHistory"
+            | "OrphanTables"
+            | "OrphanHistory"
+            | "PreparingPinLostLog"
+    ) {
+        assert!(!paths.dir.join("commons/control").exists());
+    }
+    if matches!(action, "MissingCommonsDirectory" | "WrongIdentity") {
+        assert!(!paths.dir.join("commons").exists());
+    }
+    if matches!(
+        action,
+        "MissingPinAndHistory" | "ChangedTrustMissingPin" | "OrphanTables" | "OrphanHistory"
+    ) {
+        assert!(!paths.dir.join("commons/default.pin").exists());
+    }
+    if matches!(action, "LegacyDamagedAnchor" | "UnclaimedPartial") {
+        assert!(!paths.dir.join("commons/control/control.anchor").exists());
+    }
     let mut next = state.clone();
     next.insert("scenario", scenario);
     next.insert("opened", i64::from(opened));
@@ -223,6 +385,14 @@ fn actual_bootstrap_conforms_and_silent_history_reset_is_detected() {
     let mut reset = history_transition(&initial, "LostHistory");
     reset.insert("opened", 1);
     assert!(!model.successors("LostHistory", &initial).contains(&reset));
+    assert!(!model.check_invariant("EstablishedHistoryNeverResets", &reset));
+    let mut reset = history_transition(&initial, "MissingPinAndHistory");
+    reset.insert("opened", 1);
+    assert!(
+        !model
+            .successors("MissingPinAndHistory", &initial)
+            .contains(&reset)
+    );
     assert!(!model.check_invariant("EstablishedHistoryNeverResets", &reset));
 }
 
@@ -354,6 +524,130 @@ fn loss_of_established_journal_state_cannot_restart_from_genesis() {
         );
         assert!(opened.witness().is_err(), "{missing}");
         assert!(opened.access().is_err(), "{missing}");
+    }
+}
+
+#[test]
+fn bootstrap_lock_outlives_control_loss_and_rechecks_retained_history() {
+    let (home, paths) = fixture();
+    let identity = client::read_identity(&paths).unwrap().unwrap();
+    let observation = snapshot(&identity, &descriptor(&identity, NETWORK, &ROOT, 1));
+    let opened = Bootstrap::from_snapshot(&paths, &observation).unwrap();
+    let lock = CustodyLock::acquire_commons_custody(&paths, "commons.lock", false).unwrap();
+    let saved = home.path().join("preserved-control");
+    std::fs::rename(opened.journal_dir(), &saved).unwrap();
+    std::fs::remove_file(paths.dir.join("commons/default.pin")).unwrap();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let error = Bootstrap::from_snapshot(&paths, &observation)
+                    .err()
+                    .unwrap();
+                assert!(error.to_string().contains("bootstrap is active"), "{error}");
+            })
+            .join()
+            .unwrap();
+    });
+    assert!(!opened.journal_dir().exists());
+    drop(lock);
+    assert!(Bootstrap::from_snapshot(&paths, &observation).is_err());
+    assert!(!opened.journal_dir().exists());
+    std::fs::rename(saved, opened.journal_dir()).unwrap();
+    assert_eq!(
+        Bootstrap::from_snapshot(&paths, &observation)
+            .unwrap()
+            .trust(),
+        opened.trust()
+    );
+}
+
+#[test]
+fn retained_history_prevents_replacement_device_after_local_directory_loss() {
+    for whole_directory in [false, true] {
+        let (home, paths) = fixture();
+        let identity = client::read_identity(&paths).unwrap().unwrap();
+        let observation = snapshot(&identity, &descriptor(&identity, NETWORK, &ROOT, 1));
+        Bootstrap::from_snapshot(&paths, &observation).unwrap();
+        let dir = paths.dir.join("commons");
+        if whole_directory {
+            std::fs::rename(&dir, home.path().join("preserved-commons")).unwrap();
+        } else {
+            for file in ["device.age", "device.claim", "control"] {
+                std::fs::rename(dir.join(file), home.path().join(file)).unwrap();
+            }
+        }
+        assert!(Device::open(&paths).is_err());
+        assert!(!dir.join("device.age").exists());
+        assert!(!dir.join("device.claim").exists());
+        assert!(!dir.join("control").exists());
+        if whole_directory {
+            assert!(!dir.exists());
+        }
+    }
+}
+
+#[test]
+fn legacy_pin_or_application_history_prevents_replacement_device() {
+    for name in ["default.pin", "history", "tables"] {
+        let (home, paths) = fixture();
+        let device = Device::open(&paths).unwrap().unwrap();
+        let dir = paths.dir.join("commons");
+        std::fs::rename(dir.join("device.age"), home.path().join("saved-device.age")).unwrap();
+        std::fs::rename(
+            dir.join("device.claim"),
+            home.path().join("saved-device.claim"),
+        )
+        .unwrap();
+        if name == "default.pin" {
+            let initial = descriptor(&device.identity, NETWORK, &ROOT, 1);
+            fsx::write_new(&dir.join(name), &pin_bytes(initial.trust()), 0o600).unwrap();
+        } else {
+            fsx::ensure_private_dir(&dir.join(name)).unwrap();
+        }
+        assert!(Device::open(&paths).is_err(), "{name}");
+        assert!(!dir.join("device.age").exists());
+        assert!(!dir.join("device.claim").exists());
+    }
+}
+
+#[test]
+fn legacy_migration_requires_intact_history_before_retaining_a_claim() {
+    let (home, paths) = fixture();
+    let identity = client::read_identity(&paths).unwrap().unwrap();
+    let observation = snapshot(&identity, &descriptor(&identity, NETWORK, &ROOT, 1));
+    let opened = Bootstrap::from_snapshot(&paths, &observation).unwrap();
+    std::fs::remove_file(paths.dir.join("commons.claim")).unwrap();
+    std::fs::rename(opened.journal_dir(), home.path().join("preserved-control")).unwrap();
+    assert!(Bootstrap::from_snapshot(&paths, &observation).is_err());
+    assert!(!paths.dir.join("commons.claim").exists());
+    assert!(!opened.journal_dir().exists());
+}
+
+#[test]
+fn bootstrap_refuses_unsafe_outer_lock_and_history_claim() {
+    for (file, symlinked) in [
+        ("commons.lock", false),
+        ("commons.lock", true),
+        ("commons.claim", false),
+        ("commons.claim", true),
+        ("commons-device.lock", false),
+        ("commons-device.lock", true),
+    ] {
+        let (_home, paths) = fixture();
+        let identity = client::read_identity(&paths).unwrap().unwrap();
+        let observation = snapshot(&identity, &descriptor(&identity, NETWORK, &ROOT, 1));
+        Bootstrap::from_snapshot(&paths, &observation).unwrap();
+        let path = paths.dir.join(file);
+        if symlinked {
+            std::fs::rename(&path, paths.dir.join("saved-file")).unwrap();
+            symlink("saved-file", &path).unwrap();
+        } else {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert!(
+            Bootstrap::from_snapshot(&paths, &observation).is_err(),
+            "{file}"
+        );
     }
 }
 

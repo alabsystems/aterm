@@ -328,6 +328,7 @@ fn vnode_kind(pid: c_int, fd: i32, start_us: Option<u64>) -> FdKind {
         Some(v) if v.char_device() => FdKind::Device {
             tty: v.terminal(),
             read: v.readable(),
+            ctty: v.controlling(),
         },
         Some(v) => FdKind::File {
             regular: v.regular(),
@@ -627,6 +628,7 @@ pub(super) fn read(
     };
     facts.sid = getsid(p).or(facts.sid);
     let flags = bsd.as_ref().map(|b| b.pbi_flags);
+    facts.traced = flags.is_some_and(|f| f & darwin::PROC_FLAG_TRACED != 0);
     let runs_its_exec = flags.is_some_and(|f| f & darwin::PROC_FLAG_EXEC != 0);
     if facts.state == RunState::Zombie {
         return Some((facts, None, false));

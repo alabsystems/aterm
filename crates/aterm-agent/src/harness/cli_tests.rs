@@ -1458,9 +1458,13 @@ fn disk_why_explains_the_ask_from_its_lease_and_its_ledger_rows() {
         key: "dev:1",
         level: disk::Level::Short,
         free: 9 << 30,
+        floor: 10 << 30,
+        files_free: None,
+        files_floor: disk::EMERGENCY_FILES_FREE,
         done: Some(ask::Done::Spent),
         seats: &seats,
         supervised: &live,
+        barred: &[],
         live: &live,
         alive: &alive,
     };
@@ -1483,6 +1487,7 @@ fn disk_why_explains_the_ask_from_its_lease_and_its_ledger_rows() {
     let (ok, out, err) = go(&Cmd::DiskWhy { json: false }, &env);
     assert!(ok, "{err}");
     assert!(out.contains("volume=dev:1 episode since"), "{out}");
+    assert!(out.contains("held to 10"), "{out}");
     assert!(out.contains("owed @s-a (host pid 7)"), "{out}");
     assert!(out.contains(" opened dev:1 — "), "{out}");
     assert!(out.contains(" elected @s-a dev:1 — "), "{out}");

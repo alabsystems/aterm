@@ -18,12 +18,11 @@ pub const EXCERPT_WIDE_CHARS: usize = 4 * EXCERPT_CHARS;
 /// Maximum characters in an unanswered-instance line.
 pub(crate) const UNANSWERED_CHARS: usize = 160;
 const LABEL_KEPT: usize = 24;
+/// Characters an unanswered line keeps for its label and its reason together.
+pub const UNANSWERED_ROOM: usize =
+    UNANSWERED_CHARS - UNANSWERED_FRAME.len() - UNANSWERED_JOIN.len() - TRUST_LABEL.len();
 /// Minimum reason characters preserved in an unanswered line.
-pub const UNANSWERED_REASON_CHARS: usize = UNANSWERED_CHARS
-    - UNANSWERED_FRAME.len()
-    - UNANSWERED_JOIN.len()
-    - TRUST_LABEL.len()
-    - LABEL_KEPT;
+pub const UNANSWERED_REASON_CHARS: usize = UNANSWERED_ROOM - LABEL_KEPT;
 const UNANSWERED_FRAME: &str = "== ";
 const UNANSWERED_JOIN: &str = " did not answer: ";
 const TRUST_LABEL: &str = " trust=screen";
@@ -83,6 +82,8 @@ pub struct PeerSurvey {
     pub fault: PeerFault,
     /// True when the peer answered without proving a bound node key.
     pub unproven: bool,
+    /// The node the read asked for, when the book names one.
+    pub node: Option<String>,
 }
 
 /// Failure category for a fleet peer query ([`fleet_note`]).
@@ -198,6 +199,8 @@ pub(crate) struct HostReply {
     pub(crate) remote: bool,
     /// True when a remote peer did not prove a bound node key.
     pub(crate) unproven: bool,
+    /// The node a fleet read asked for, when its book names one.
+    pub(crate) node: Option<String>,
     /// The survey, or why there is none.
     pub(crate) answer: Result<Survey, String>,
 }
@@ -545,8 +548,7 @@ fn sent_at_facts(survey: &Survey, s: &Fields) -> bool {
 fn unanswered_line(label: &str, why: &str) -> String {
     let (label, why) = (fit_place(label, 60), shown(why, 200));
     let n = |s: &str| s.chars().count();
-    let room =
-        UNANSWERED_CHARS - UNANSWERED_FRAME.len() - UNANSWERED_JOIN.len() - TRUST_LABEL.len();
+    let room = UNANSWERED_ROOM;
     let (label, why) = if n(&label) + n(&why) <= room {
         (label, why)
     } else {
@@ -1344,7 +1346,14 @@ pub(crate) fn render_json(replies: &[HostReply]) -> String {
                         .join(",")
                 ),
                 Err(why) => format!(
-                    "{{{head},\"error\":\"{}\"}}",
+                    "{{{head}{},\"error\":\"{}\"}}",
+                    reply
+                        .node
+                        .as_deref()
+                        .map_or_else(String::new, |node| format!(
+                            ",\"node\":\"{}\"",
+                            aterm_codec::json::escape(node)
+                        )),
                     aterm_codec::json::escape(why)
                 ),
             }
@@ -1461,6 +1470,7 @@ pub(crate) fn read_survey(
             label: "this machine".to_string(),
             remote: false,
             unproven: false,
+            node: None,
             answer: Err(report.lines().next().unwrap_or_default().to_string()),
         }],
     };
@@ -1479,6 +1489,7 @@ pub(crate) fn read_survey(
                 answer: Err(why),
                 fault: PeerFault::NotDialled,
                 unproven: false,
+                node: None,
             }],
         };
         notes.extend(fleet_note(&peers).map(str::to_owned));
@@ -1486,6 +1497,7 @@ pub(crate) fn read_survey(
             label: peer.label,
             remote: true,
             unproven: peer.unproven,
+            node: peer.node,
             answer: peer.answer.and_then(|lines| parse_reply(&lines)),
         }));
     }
@@ -1615,6 +1627,7 @@ fn local_replies(sock: Option<&str>, pid: Option<u32>) -> Result<Vec<HostReply>,
                     label,
                     remote: false,
                     unproven: false,
+                    node: None,
                     answer: parse_reply(lines),
                 }),
                 crate::Probe::Refused {
@@ -1624,6 +1637,7 @@ fn local_replies(sock: Option<&str>, pid: Option<u32>) -> Result<Vec<HostReply>,
                     label,
                     remote: false,
                     unproven: false,
+                    node: None,
                     answer: Err(crate::probe_cause(*pid, other)),
                 }),
             }

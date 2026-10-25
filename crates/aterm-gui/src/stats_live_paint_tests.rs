@@ -451,6 +451,68 @@ fn a_live_frame_patches_only_what_moved_to_the_whole_rasters_bytes() {
     }
 }
 
+/// A beat's patch costs its narrow rects, not the card: of the text the whole raster blends, it
+/// blends only the glyphs over its rects (`Canvas::texels_meet_canvas`), so a beat frame touches
+/// under 5% of the card's glyphs as it does of its pixels.
+#[test]
+fn a_beat_patch_blends_only_the_glyphs_over_its_rects() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut snap = scene(Scene::Calm);
+    snap.at_unix_ms = OPEN;
+    let was = DeckLive {
+        glide_ms: Some(OPEN + 2_000),
+        beat: Some(0.0),
+        fresh: true,
+    };
+    let now = DeckLive {
+        beat: Some(0.5),
+        ..was
+    };
+    // The Folded deck at 1524 pt 2x is the window the cost was measured in.
+    for (form, w, s) in [
+        (DeckForm::Full, 1524.0, 2.0),
+        (DeckForm::Folded, 1524.0, 2.0),
+        (DeckForm::Folded, 1119.0, 1.0),
+    ] {
+        let at = format!("{form:?} {w} pt {s}x");
+        let g = geom_at(w, s, form);
+        let mut input = scene_input(&snap, form);
+        input.live = was;
+        let (before, _, _) = deck_paint_live(&g, &input);
+        input.live = now;
+        let (after, _, out) = deck_paint_live(&g, &input);
+        let blits = crate::tray_raster::glyph_blits();
+        let (rgba, pw, ph) =
+            crate::tray_raster::rasterize_tray(&before, g.w as u32, g.h as u32, 1.0, [0, 0, 0, 0]);
+        let whole = crate::tray_raster::glyph_blits() - blits;
+        assert!(
+            whole > 100,
+            "CONTROL {at}: the card's text blends {whole} glyphs"
+        );
+        let mut card = crate::SettingsCard {
+            rgba,
+            pw,
+            ph,
+            dx: 0,
+            dy: 0,
+            fp: 1,
+            geom: 1,
+            raster_fingerprint_once: std::sync::OnceLock::new(),
+            scrim: None,
+        };
+        let blits = crate::tray_raster::glyph_blits();
+        assert!(
+            patch_live(&mut card, &after, &out.rects, &was, &now),
+            "{at}"
+        );
+        let patched = crate::tray_raster::glyph_blits() - blits;
+        assert!(
+            patched * 20 < whole,
+            "{at}: the beat's patch blends {patched} of the card's {whole} glyphs"
+        );
+    }
+}
+
 /// The scale's words and tick marks are drawn where the header plan puts them, and the marker's
 /// dot is a box the overlap sweep (T-G4) reads.
 #[test]

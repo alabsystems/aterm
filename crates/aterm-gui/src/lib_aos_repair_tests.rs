@@ -31,7 +31,11 @@ const HORIZON: Duration = Duration::from_secs(60);
 
 /// Scripted fixture with only the momentum glow enabled on a focused 120 Hz window.
 pub(super) fn momentum_app(light: bool) -> App {
-    let mut app = scripted_app();
+    momentum_app_on(scripted_app(), light)
+}
+
+/// [`momentum_app`] over `app`, a scripted app whose sink a test may hold.
+pub(super) fn momentum_app_on(mut app: App, light: bool) -> App {
     app.config.serious_mode = Some(false);
     app.config.cursor_trail = Some(true);
     app.config.cursor_trail_style = Some("off".into());
@@ -166,7 +170,7 @@ pub(super) fn exported_log(app: &App, epoch: Instant) -> Vec<MomentumEvent> {
 }
 
 /// Attaches `DemoStrandedSettle`, types keys, and runs the lane until the glow is stranded.
-fn stranded(light: bool, t0: Instant) -> (App, Parked) {
+pub(super) fn stranded(light: bool, t0: Instant) -> (App, Parked) {
     let mut app = momentum_app(light);
     app.redraw_window_at(WID, t0);
     let (id, attached) = app

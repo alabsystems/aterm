@@ -373,3 +373,116 @@ fn a_held_arrow_installs_once_per_frame() {
         Some(landing_id.as_str())
     );
 }
+
+/// The Themes page as shown, `view` the Settings view: its frame built and presented, so the
+/// pointer hits what it draws.
+fn present_themes(app: &mut App) -> crate::tab_model::ViewId {
+    let wid = WindowId(0);
+    let (_, view) = app.active_native_view(wid).expect("Settings in front");
+    assert!(app.prepare_native_input_scratch(wid));
+    app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .leaf_render_cache
+        .get_mut(&view)
+        .expect("drawn")
+        .native
+        .as_mut()
+        .expect("a native frame")
+        .presented = true;
+    view
+}
+
+fn pointer_at(app: &App, view: crate::tab_model::ViewId, key: &str) -> (f64, f64) {
+    let artifact = app
+        .retained_native_leaf_artifact(WindowId(0), view, true)
+        .expect("a shown frame");
+    let hit = artifact
+        .compiled
+        .hits
+        .iter()
+        .find(|hit| hit.key.as_str() == key)
+        .unwrap_or_else(|| panic!("{key} is drawn"));
+    let scale = artifact.scale;
+    (
+        artifact.device_x as f64 + f64::from(hit.rect.x + hit.rect.width * 0.5) * scale,
+        artifact.device_y as f64 + f64::from(hit.rect.y + hit.rect.height * 0.5) * scale,
+    )
+}
+
+fn hit_under(app: &App, (x, y): (f64, f64)) -> Option<String> {
+    let (artifact, x, y) = app.retained_native_leaf_at_pointer(WindowId(0), x, y)?;
+    artifact
+        .compiled
+        .hit_test(x, y)
+        .map(|hit| hit.key.as_str().to_string())
+}
+
+fn click_still(app: &mut App, (x, y): (f64, f64)) {
+    use aterm_window::event::{ElementState, MouseButton};
+    for state in [ElementState::Pressed, ElementState::Released] {
+        app.on_cursor_moved(WindowId(0), x, y);
+        app.on_mouse_input(WindowId(0), state, MouseButton::Left);
+    }
+}
+
+/// A DOUBLE-CLICK IS ONE CLICK'S WORTH ON WHAT IT PRESSED: the second press of a double-click on
+/// Keep, which lands once Keep's save has put Customize under the still pointer, opens nothing
+/// and only lights Customize, as a triple-click's third does; a press after a double click's
+/// interval opens it. (The second press opened the Customize sheet.)
+#[test]
+fn a_double_click_on_keep_never_opens_what_takes_its_place() {
+    let mut app = app();
+    {
+        let ws = app.windows.get_mut(&WindowId(0)).expect("window");
+        ws.cols = 102;
+        ws.rows = 29;
+    }
+    settings_trial(&mut app, "Nord");
+    let view = present_themes(&mut app);
+    let at = pointer_at(&app, view, "settings/showcase/keep");
+    app.native_config_inflight = true;
+    click_still(&mut app, at);
+    complete_settings_save(&mut app, false);
+    app.sync_settings_theme_trial(std::time::Instant::now());
+    assert_eq!(
+        app.config.theme.as_deref(),
+        Some("Nord"),
+        "the first press kept"
+    );
+    present_themes(&mut app);
+    assert_eq!(
+        hit_under(&app, at).as_deref(),
+        Some("settings/showcase/customize"),
+        "premise: Customize came up under the still pointer"
+    );
+    let sheet_open = |app: &App| {
+        let (_, _, _, state) = app.native_settings_view_target().unwrap();
+        state.showcase.sheet_open
+    };
+    click_still(&mut app, at);
+    assert!(
+        !sheet_open(&app),
+        "the double-click's second press opened nothing"
+    );
+    let lit = app
+        .native_runtime
+        .view_state(view)
+        .and_then(|state| state.common().hovered.as_ref())
+        .map(|key| key.as_str().to_string());
+    assert_eq!(lit.as_deref(), Some("settings/showcase/customize"));
+    present_themes(&mut app);
+    click_still(&mut app, at);
+    assert!(!sheet_open(&app), "nor did a triple-click's third");
+    present_themes(&mut app);
+    app.windows
+        .get_mut(&WindowId(0))
+        .and_then(|ws| ws.native_rest.as_mut())
+        .expect("the pointer rests")
+        .age_press();
+    click_still(&mut app, at);
+    assert!(
+        sheet_open(&app),
+        "a press after the interval opens Customize"
+    );
+}

@@ -1492,18 +1492,16 @@ impl SettingsPreviewSpec {
                 let window = match spec.appearance.window_theme.as_str() {
                     "light" => "Light window appearance".to_string(),
                     "dark" => "Dark window appearance".to_string(),
-                    _ if cfg!(target_os = "macos") => match auto_side {
-                        Some(side) => format!(
-                            "window appearance that follows macOS, its title bar in the terminal theme's colors, currently {side}"
-                        ),
-                        None => "window appearance that follows macOS, its title bar in the terminal theme's colors".to_string(),
-                    },
-                    _ => match auto_side {
-                        Some(side) => format!(
-                            "window appearance that matches the terminal theme, currently {side}"
-                        ),
-                        None => "window appearance that matches the terminal theme".to_string(),
-                    },
+                    _ => {
+                        let auto = crate::prefs::window_theme_auto(std::env::consts::OS);
+                        let side = auto_side
+                            .map(|side| format!(", currently {side}"))
+                            .unwrap_or_default();
+                        format!(
+                            "window appearance that matches {}{side}{}",
+                            auto.follows, auto.system
+                        )
+                    }
                 };
                 let subject = if spec.theme_sample {
                     "Color theme sample"
@@ -4001,6 +3999,8 @@ struct SceneStep {
     trail: Vec<aterm_core::render::TrailCell>,
     frame: Option<aterm_effects::cursor_fx::CursorFxFrame>,
     cat: Option<aterm_effects::kitty_cursor::CatFrame>,
+    /// The theme's text holds the bloom, as the live terminal's does.
+    bloom_held: bool,
 }
 
 struct ScenePlayer {
@@ -4231,6 +4231,7 @@ impl CursorScene {
         input.char_fg = step.char_fg;
         input.fire_halo = step.fire_halo;
         input.cursor_trail = step.trail;
+        input.bloom_gate = aterm_core::render::BloomGate::of(step.bloom_held);
         if let Some(frame) = step.frame {
             input.cursor_trail_color = frame.trail_color;
             input.cursor_fill_override = frame.block_fill.map(|owned| owned.fill);
@@ -4400,6 +4401,7 @@ impl CursorScene {
                 trail: fx.trail_scratch.clone(),
                 frame: Some(frame),
                 cat,
+                bloom_held: fx.bloom_held,
             };
         }
     }
@@ -4413,7 +4415,7 @@ impl CursorScene {
         if !self.typing {
             return Ok(());
         }
-        if self.post_fx.bloom {
+        if self.post_fx.bloom && !input.bloom_gate.held() {
             aterm_render::bloom::apply(
                 frame,
                 &input.cursor_glow_add,
@@ -6417,11 +6419,7 @@ mod tests {
         let light_palette = dark_palette.clone().with_terminal_theme(paper);
         assert!(!dark_palette.window_sample_is_light(host));
         assert!(light_palette.window_sample_is_light(host));
-        let side_words = if cfg!(target_os = "macos") {
-            "its title bar in the terminal theme's colors, currently Light"
-        } else {
-            "matches the terminal theme, currently Light"
-        };
+        let side_words = "matches the terminal theme, currently Light";
         assert!(
             light_palette.semantic_value().contains(side_words),
             "{}",

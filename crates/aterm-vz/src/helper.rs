@@ -1398,6 +1398,11 @@ pub fn take(paths: &Paths, ident: &Ident, pids: &dyn Pids) -> Result<Held, Strin
                     "helper {} (unique id {}, started {})",
                     r.pid, r.uniq, r.started
                 ),
+                Holder::Unproven(r) => format!(
+                    "helper {} (unique id {}, started {}), which an earlier build started (its \
+                     record names no start time; `down` asks it to stop)",
+                    r.pid, r.uniq, r.started
+                ),
                 Holder::Dead(r) => format!(
                     "a process whose record names helper {}, which is gone",
                     r.pid

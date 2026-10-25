@@ -12,5 +12,6 @@ mod ident_digest;
 mod log_codec;
 mod publish_boundary;
 mod publish_faults;
+mod publish_retired;
 mod replay_fold;
 mod wire_codec;

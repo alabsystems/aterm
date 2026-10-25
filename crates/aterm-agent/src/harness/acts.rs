@@ -388,7 +388,7 @@ pub enum HoldLeg {
     Needs,
     /// The session's repository holds work no remote main has.
     Repo,
-    /// The repository probe did not finish: what the repository holds is unknown.
+    /// The repository probe could not read the repository: what it holds is unknown.
     Unread,
     /// Land's strict reading found open work in the reply.
     Open,

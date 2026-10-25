@@ -2334,12 +2334,7 @@ fn why_now_section(c: Ctx<'_>) -> Option<Section<'_>> {
         format!("{you}, {trend}."),
         format!("{step}; {how}{signed}."),
     ];
-    let secs = f.window_ns as f64 / 1e9;
-    let window = if secs >= 1.0 {
-        format!("{secs:.0} s window")
-    } else {
-        format!("{secs:.1} s window")
-    };
+    let window = window_words(f.window_ns);
     let exact = if f.split.exact { "exact, " } else { "" };
     let subs = vec![
         format!("{window} \u{b7} {exact}{} coalitions", f.split.listed),
@@ -2420,6 +2415,23 @@ fn hundredths<const N: usize>(mcs: [i64; N], total_mc: i64) -> [i64; N] {
         out[i] += 1;
     }
     out
+}
+
+/// Why now's window, `window_ns` long, as `1 s window` (`0.9 s window`):
+/// rounded to a tenth of a second first, then in whole seconds where that
+/// reads 1.0 s or more and with its one decimal under it, so a window that
+/// wobbles about a second (995 to 1,004 ms from one split tick to the next)
+/// keeps its words.
+fn window_words(window_ns: u64) -> String {
+    const SECOND_NS: u64 = 1_000_000_000;
+    const TENTH_NS: u64 = SECOND_NS / 10;
+    let tenths = window_ns.saturating_add(TENTH_NS / 2) / TENTH_NS;
+    if tenths >= 10 {
+        let secs = window_ns.saturating_add(SECOND_NS / 2) / SECOND_NS;
+        format!("{secs} s window")
+    } else {
+        format!("0.{tenths} s window")
+    }
 }
 
 /// Hundredths of a core `h` as `2.17` (`-0.05`).

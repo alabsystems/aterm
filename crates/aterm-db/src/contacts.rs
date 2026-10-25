@@ -6,6 +6,25 @@
 use crate::{Error, Result, crypto::name};
 use aterm_json::Value;
 
+pub(crate) fn validate_secret_ref(value: &Value) -> Result<()> {
+    let reference = value
+        .as_object()
+        .ok_or_else(|| Error::new("secret reference must name a vault and entry"))?;
+    if reference.len() != 2
+        || !["vault", "entry"].iter().all(|key| {
+            reference
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(name)
+        })
+    {
+        return Err(Error::new(
+            "secret reference must contain only vault and entry names",
+        ));
+    }
+    Ok(())
+}
+
 /// Known route types. Providers choose among these using typed adapter workflows.
 pub fn method(value: &str) -> bool {
     matches!(
@@ -222,6 +241,9 @@ pub fn validate(collection: &str, value: &Value) -> Result<()> {
         }
         if let Some(auth) = o.get("auth") {
             validate_auth(auth)?;
+        }
+        if let Some(reference) = o.get("secret_ref").filter(|value| !value.is_null()) {
+            validate_secret_ref(reference)?;
         }
     }
     if collection == "phones"

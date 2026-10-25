@@ -323,6 +323,8 @@ pub enum FdKind {
         tty: bool,
         /// Opened for reading (`O_RDONLY`, `O_RDWR`); `true` where unread (a Linux device that is no terminal), `false` for one only written (`tee /dev/tty`).
         read: bool,
+        /// Opened as `/dev/tty`, the controlling terminal (`less`, `fzf` and ssh's password prompt read their keys there), not a terminal inherited or duplicated from one (zsh's fd 10, bash's 255).
+        ctty: bool,
     },
     /// One end of a pipe.
     Pipe {
@@ -484,6 +486,9 @@ pub struct ProcFacts {
     pub exe: Option<String>,
     /// Its state (on macOS refined from its threads).
     pub state: RunState,
+    /// A debugger traces it (macOS's `PROC_FLAG_TRACED`), or holds it in a tracing stop (Linux's
+    /// state `t`).
+    pub traced: bool,
     /// Its controlling terminal's device; `None` when it has none.
     pub tty: Option<u32>,
     /// That terminal's foreground process group; `None` without a terminal.

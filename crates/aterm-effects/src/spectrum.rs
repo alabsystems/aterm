@@ -366,7 +366,7 @@ pub(crate) const fn spectrum_crossing_position() -> f32 {
         }
         i += 1;
     }
-    best as f32 / (SPECTRUM_LUT_LEN - 1) as f32
+    best as f32 * (1.0 / (SPECTRUM_LUT_LEN - 1) as f32)
 }
 
 /// Width of the green→blue leg in `t`.
@@ -375,7 +375,7 @@ pub(crate) const fn spectrum_crossing_position() -> f32 {
 pub(crate) const fn spectrum_crossing_span() -> f32 {
     (SPECTRUM_ANCHOR_AT[SPECTRUM_CROSSING_SEG + 1] - SPECTRUM_ANCHOR_AT[SPECTRUM_CROSSING_SEG])
         as f32
-        / (SPECTRUM_LUT_LEN - 1) as f32
+        * (1.0 / (SPECTRUM_LUT_LEN - 1) as f32)
 }
 
 /// Where along a leg the pace has spent `want`: the inverse of the cumulative
@@ -477,7 +477,7 @@ pub(crate) const fn spectrum_stop_position(i: usize) -> f32 {
     } else {
         SPECTRUM_STOPS - 1
     };
-    SPECTRUM_ANCHOR_AT[idx] as f32 / (SPECTRUM_LUT_LEN - 1) as f32
+    SPECTRUM_ANCHOR_AT[idx] as f32 * (1.0 / (SPECTRUM_LUT_LEN - 1) as f32)
 }
 
 /// The colour of named stop `i` (red, orange, yellow, green, blue, indigo, violet).

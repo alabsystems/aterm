@@ -262,24 +262,36 @@ pub struct Ctx<'a> {
     pub flow: Flow,
 }
 
+/// How many px clear of the caret's block a dark star keeps
+/// ([`Ctx::near_paper_caret`]): an arm ending at the block's edge reads as
+/// part of it.
+pub const DARK_CARET_GAP_PX: i32 = 3;
+
 impl Ctx<'_> {
-    /// Whether a light at `(x, y)` reaching `reach` px stands within a cell of the caret's block on
-    /// paper, where stars keep a cell clear of the block on every side; on a dark page the caret's
-    /// own light keeps them off, and this is false.
+    /// Whether a light at `(x, y)` reaching `reach` px stands on the caret:
+    /// on paper within a cell of its block, every side; on a dark page on
+    /// the block's own cell or within [`DARK_CARET_GAP_PX`] of it (after the
+    /// gallery's dark Return a fan star's crosshair stood at the new caret's
+    /// corner, looks7 M3).
     #[inline]
     #[must_use]
     pub const fn near_paper_caret(&self, (x, y): (i32, i32), reach: i32) -> bool {
         let (row, col) = self.caret;
-        if self.cfg.dark_theme || row as usize >= self.geom.rows || col as usize >= self.geom.cols {
+        if row as usize >= self.geom.rows || col as usize >= self.geom.cols {
             return false;
         }
         let (cw, ch) = (self.geom.cw as i32, self.geom.ch as i32);
         let x0 = self.geom.origin_x as i32 + col as i32 * cw;
         let y0 = self.geom.origin_y as i32 + row as i32 * ch;
-        x + reach >= x0 - cw
-            && x - reach < x0 + 2 * cw
-            && y + reach >= y0 - ch
-            && y - reach < y0 + 2 * ch
+        let (mx, my) = if self.cfg.dark_theme {
+            (DARK_CARET_GAP_PX, DARK_CARET_GAP_PX)
+        } else {
+            (cw, ch)
+        };
+        x + reach >= x0 - mx
+            && x - reach < x0 + cw + mx
+            && y + reach >= y0 - my
+            && y - reach < y0 + ch + my
     }
 }
 
@@ -374,7 +386,8 @@ impl Cadence {
     /// A fade whose next visible step is `step_s` away.
     #[inline]
     pub(crate) fn tail(&mut self, step_s: f32) {
-        let at = if step_s.is_finite() && step_s > TAIL_FLOOR.as_secs_f32() {
+        const TAIL_FLOOR_S: f32 = TAIL_FLOOR.as_secs_f32();
+        let at = if step_s.is_finite() && step_s > TAIL_FLOOR_S {
             self.now + Duration::from_secs_f32(step_s)
         } else {
             self.now + TAIL_FLOOR
@@ -432,6 +445,8 @@ pub const ECHO_LEDGER_DEPTH: usize = crate::cursor_glow::TYPED_STAMP_DEPTH;
 
 /// The ribbon's birth floor, seconds.
 pub const SWEEP_BIRTH_FLOOR_S: f32 = crate::cursor_glow::CursorGlow::TYPE_HINT_FRESH;
+const SWEEP_BIRTH_FLOOR_DUR: Duration =
+    Duration::from_nanos((SWEEP_BIRTH_FLOOR_S as f64 * 1_000_000_000.0).round() as u64);
 
 /// The echo ledger.
 #[derive(Clone, Copy, Debug)]
@@ -543,16 +558,6 @@ impl EchoLedger {
     }
 
     #[inline]
-    fn cells_where(&self, keep: impl Fn(Instant) -> bool) -> usize {
-        self.slots
-            .iter()
-            .map_while(Option::as_ref)
-            .filter(|&&(at, _)| keep(at))
-            .map(|&(_, cells)| usize::from(cells))
-            .sum()
-    }
-
-    #[inline]
     const fn total(&self) -> usize {
         let mut sum = 0;
         let mut i = 0;
@@ -568,7 +573,7 @@ impl EchoLedger {
 
     #[inline]
     fn older_than(&self, key: Instant) -> usize {
-        self.cells_where(|at| at < key)
+        self.older_and_total(key).0
     }
 
     #[inline]
@@ -898,9 +903,7 @@ impl Engine {
             self.last_host_sweep_at = host_sweep;
         }
         let bridge = self.echo_bridge(from, to, licence, host_sweep, now);
-        let floor = now
-            .checked_sub(Duration::from_secs_f32(SWEEP_BIRTH_FLOOR_S))
-            .unwrap_or(now);
+        let floor = now.checked_sub(SWEEP_BIRTH_FLOOR_DUR).unwrap_or(now);
         let birth = host_sweep.map(|at| at.max(floor));
         if let (Some(birth), Some((Event::Sweep { .. }, at))) = (birth, self.events.last_mut()) {
             *at = birth;
@@ -1244,6 +1247,24 @@ impl Engine {
                     .restored(&self.restored_scratch, self.ribbon.cells());
             }
         }
+    }
+
+    /// An exact returning typed cell still occupies its column while its partial release waits
+    /// for the frame's queued edits to finish. This query lifts no stamp and renews no clock.
+    pub(crate) fn returning_partial_cell(
+        &self,
+        row: u16,
+        col: u16,
+        cols: &[char],
+        now: Instant,
+    ) -> bool {
+        self.ribbon.cells().iter().any(|cell| {
+            cell.row == row
+                && cell.col == col
+                && cell.typing
+                && self.witness.released_cell_matches(cell, cols)
+                && self.ribbon.partial_custody_valid(cell, now)
+        })
     }
 
     /// The laid ribbon, read-only.
@@ -1787,6 +1808,7 @@ impl Engine {
         out: &mut Frame<'_>,
         rows: &[RowSample<'_>],
     ) {
+        self.ribbon.forget_rails();
         out.caret = self.caret_seam;
         out.companion = self.companion;
         out.fp = 0;
@@ -1944,6 +1966,7 @@ impl Engine {
             out.out.truncate(o0);
             out.halos.truncate(h0);
             self.stardust.clear_marks();
+            self.ribbon.forget_rails();
         }
         self.caret_seam.field_t = ctx.caret_t;
         self.caret_seam.paint = self.caret_paint(now);
@@ -2290,10 +2313,10 @@ impl Engine {
             impl IntoIterator<Item = (i32, i32, i32, i32)>,
             impl IntoIterator<Item = (i32, i32, i32, i32)>,
         ),
-        rows: impl IntoIterator<Item = (i32, i32, i32, i32)>,
+        (rows, past): (impl IntoIterator<Item = (i32, i32, i32, i32)>, i32),
     ) {
         self.stardust.keep_out.set_split(icons, cells);
-        self.stardust.keep_out.set_rows(rows);
+        self.stardust.keep_out.set_rows_past(rows, past);
         self.ribbon.keep_out.clone_from(&self.stardust.keep_out);
         self.meteor.keep_out.clone_from(&self.stardust.keep_out);
     }

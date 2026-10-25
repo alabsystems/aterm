@@ -1297,6 +1297,7 @@ impl Witness {
         {
             self.deferred_runs.insert(k, run);
         }
+        let mut deferred_run: Option<((u16, u32), bool)> = None;
         for cell in cells {
             let row_sample = match sample_row {
                 Some((r, s)) if r == cell.row => s,
@@ -1306,12 +1307,20 @@ impl Witness {
                     s
                 }
             };
-            if !self.deferred_runs.is_empty()
-                && self
-                    .deferred_runs
-                    .binary_search(&(cell.row, cell.cohort))
-                    .is_ok()
-            {
+            let is_deferred = if self.deferred_runs.is_empty() {
+                false
+            } else {
+                let run = (cell.row, cell.cohort);
+                match deferred_run {
+                    Some((r, ok)) if r == run => ok,
+                    _ => {
+                        let ok = self.deferred_runs.binary_search(&run).is_ok();
+                        deferred_run = Some((run, ok));
+                        ok
+                    }
+                }
+            };
+            if is_deferred {
                 if let Some(i) = self.find(cell.row, cell.col, cell.born) {
                     self.seen[i].live = true;
                     if !self.seen[i].released
@@ -1468,13 +1477,21 @@ impl Witness {
         self.released_runs.sort_unstable();
         if !self.retired_runs.is_empty() || !self.released_runs.is_empty() {
             let mut sample_row: Option<(u16, Option<RowSample<'_>>)> = None;
+            let mut run_verdict: Option<((u16, u32), bool, bool)> = None;
             for cell in cells {
                 if cell.leaving() {
                     continue;
                 }
                 let run = (cell.row, cell.cohort);
-                let retired = self.retired_runs.binary_search(&run).is_ok();
-                let released = !retired && self.released_runs.binary_search(&run).is_ok();
+                let (retired, released) = match run_verdict {
+                    Some((r, ret, rel)) if r == run => (ret, rel),
+                    _ => {
+                        let ret = self.retired_runs.binary_search(&run).is_ok();
+                        let rel = !ret && self.released_runs.binary_search(&run).is_ok();
+                        run_verdict = Some((run, ret, rel));
+                        (ret, rel)
+                    }
+                };
                 if (!retired && !released) || self.find(cell.row, cell.col, cell.born).is_some() {
                     continue;
                 }
@@ -1542,13 +1559,18 @@ impl Witness {
             }
         }
         if !self.released_runs.is_empty() {
+            let mut released_run: Option<((u16, u32), bool)> = None;
             for cell in cells {
-                if self
-                    .released_runs
-                    .binary_search(&(cell.row, cell.cohort))
-                    .is_ok()
-                    && let Some(i) = self.find(cell.row, cell.col, cell.born)
-                {
+                let run = (cell.row, cell.cohort);
+                let is_rel = match released_run {
+                    Some((r, ok)) if r == run => ok,
+                    _ => {
+                        let ok = self.released_runs.binary_search(&run).is_ok();
+                        released_run = Some((run, ok));
+                        ok
+                    }
+                };
+                if is_rel && let Some(i) = self.find(cell.row, cell.col, cell.born) {
                     self.seen[i].restorable = true;
                 }
             }
@@ -1860,10 +1882,21 @@ impl Witness {
         self.retired_runs.sort_unstable();
         self.retired_cells.extend_from_slice(retire);
         self.retired_cells.sort_unstable();
+        let mut retired_run: Option<((u16, u32), bool)> = None;
         for cell in cells {
+            if cell.leaving() {
+                continue;
+            }
             let run = (cell.row, cell.cohort);
-            if !cell.leaving()
-                && self.retired_runs.binary_search(&run).is_ok()
+            let is_retired = match retired_run {
+                Some((r, ok)) if r == run => ok,
+                _ => {
+                    let ok = self.retired_runs.binary_search(&run).is_ok();
+                    retired_run = Some((run, ok));
+                    ok
+                }
+            };
+            if is_retired
                 && self.find(cell.row, cell.col, cell.born).is_some()
                 && self
                     .retired_cells
@@ -1875,6 +1908,15 @@ impl Witness {
         }
         self.standing_runs.sort_unstable();
         self.standing_runs.dedup();
+    }
+
+    /// The sampled glyph is the exact identity held by a released cell.
+    pub(super) fn released_cell_matches(&self, cell: &Cell, cols: &[char]) -> bool {
+        self.find(cell.row, cell.col, cell.born)
+            .is_some_and(|index| {
+                let seen = self.seen[index];
+                seen.released && seen.restorable && seen.unit == unit_at(cols, cell.col)
+            })
     }
 
     /// Releases whose original cells and glyphs are back, as sorted `(cohort, stamp)`.
@@ -1973,10 +2015,22 @@ impl Witness {
         if cohorts.is_empty() {
             return;
         }
-        for cell in cells
-            .iter()
-            .filter(|c| !c.leaving() && cohorts.binary_search(&c.cohort).is_ok())
-        {
+        let mut cohort_hit: Option<(u32, bool)> = None;
+        for cell in cells {
+            if cell.leaving() {
+                continue;
+            }
+            let in_cohorts = match cohort_hit {
+                Some((c, ok)) if c == cell.cohort => ok,
+                _ => {
+                    let ok = cohorts.binary_search(&cell.cohort).is_ok();
+                    cohort_hit = Some((cell.cohort, ok));
+                    ok
+                }
+            };
+            if !in_cohorts {
+                continue;
+            }
             if let Some(i) = self.find(cell.row, cell.col, cell.born) {
                 // A held blank goes back to never-armed: un-released, it would
                 // be a blank record no walk can name (blank over blank is a
@@ -3102,6 +3156,41 @@ mod tests {
             &mut rel,
         );
         (pos(&out), pos(&rel))
+    }
+
+    #[test]
+    fn returning_partial_ink_requires_the_released_identity_and_exact_unit() {
+        for text in ["abcdef", "ab你\0ef"] {
+            let (mut w, cells) = armed_line(text);
+            let held = cells[2];
+            let original = row(text);
+            assert!(!w.released_cell_matches(&held, &original));
+            let (retired, mut released) = walk_row(&mut w, &cells, 5, "ab    ");
+            released.sort_unstable();
+            released.dedup();
+            assert!(retired.is_empty());
+            assert_eq!(released, vec![(5, 2), (5, 3), (5, 4), (5, 5)]);
+            assert!(w.released_cell_matches(&held, &original));
+            assert!(!w.released_cell_matches(&cells[0], &original));
+            assert!(!w.released_cell_matches(&held, &row("abxdef")));
+            assert!(!w.released_cell_matches(&held, &row("ab    ")));
+            let mut changed = held;
+            changed.born += std::time::Duration::from_millis(1);
+            assert!(!w.released_cell_matches(&changed, &original));
+            changed = held;
+            changed.row += 1;
+            assert!(!w.released_cell_matches(&changed, &original));
+            if text.contains('\0') {
+                assert!(w.released_cell_matches(&cells[3], &original));
+                assert!(!w.released_cell_matches(&held, &row("ab你def")));
+                assert!(!w.released_cell_matches(&cells[3], &row("abc\0ef")));
+            }
+            let mut restored = w.clone();
+            restored.restored(&[7], &cells);
+            assert!(!restored.released_cell_matches(&held, &original));
+            walk_row(&mut w, &cells, 5, "abxxxx");
+            assert!(!w.released_cell_matches(&held, &original));
+        }
     }
 
     #[test]

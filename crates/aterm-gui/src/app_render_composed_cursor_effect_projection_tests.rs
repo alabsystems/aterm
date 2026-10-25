@@ -121,6 +121,8 @@ fn every_composed_cursor_channel_is_hard_clipped_and_clean_is_a_real_negative_co
             trail_color: 0x00DE_ADBE,
             active_cursor_fill: Some(0x0050_FA7B),
             fx_layers: &[],
+            bloom_held: false,
+            pet_veil: &flat,
         },
         Some(ComposedCursorEffectClip {
             row0: 2,
@@ -145,7 +147,11 @@ fn every_composed_cursor_channel_is_hard_clipped_and_clean_is_a_real_negative_co
         assert_eq!((quad.x, quad.y, quad.w, quad.h), (10, 30, 5, 5));
     }
     assert_eq!(input.cursor_glow_add.len(), 1);
-    assert_eq!(input.glow_under.len(), 1);
+    assert_eq!(
+        input.glow_under.len(),
+        2,
+        "the under stream and the pet's veil are projected, each clipped"
+    );
     assert_eq!(input.glow_halo.len(), 1);
     assert_eq!(
         (
@@ -251,6 +257,8 @@ fn composed_status_owner_follows_the_fill_that_survives_host_projection() {
                 trail_color: 0,
                 active_cursor_fill: Some(owned.fill),
                 fx_layers: &[],
+                bloom_held: false,
+                pet_veil: &[],
             },
             clip,
             cursor_override,

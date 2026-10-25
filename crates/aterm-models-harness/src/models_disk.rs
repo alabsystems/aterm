@@ -223,22 +223,51 @@ pub fn disk_await_liveness() -> aterm_spec::derive::Liveness {
 }
 
 /// THE ASK (`disk-free@v1`, `docs/DESIGN-disk-free-ask-2026-10-24.md`): one machine-wide lease
-/// over three sessions A, B and C, whichever hosts they run on. `below`: the volume is below its
-/// floor; `done`: aterm's own freeing is done there; `phase`: no episode (0), nominating (1),
-/// owed to `owner` (2), asked (3), settled (4), out (5); `pX`: X was elected this episode;
-/// `lX`: the lines X took this episode; `asks`: the lines the lease counted; `cool`: a line went
-/// within the cooldown; `rose`: free space rose a GiB since a line; `raised`: the owner's disk
-/// line says the asks ran out. `sowed`, `scool`, `sdone` and `slate` are what the last line, or
-/// the last opening, saw.
+/// over three sessions A, B and C, whichever hosts they run on, read by two hosts whose floors on
+/// the volume differ: H's lies past L's by more than the margin an episode ends past. Neither
+/// host ends, so the floor an episode is held to is only ever raised.
+/// - `free`: below both floors (0), within the margin above L's (1), past that and below H's (2),
+///   within the margin above H's (3), past it (4);
+/// - `bar`: the floor the lease holds the episode to, L's (1) or H's (2): the opener's, raised
+///   by any later look of H's that does not end it;
+/// - `done`: aterm's own freeing is done there; `dA`: A's task is done or exited, so the seat
+///   rule bars it;
+/// - `phase`: no episode (0), nominating (1), owed to `owner` (2), asked (3), settled (4),
+///   out (5); `aged`: a settled or out episode parked a cooldown ago, so a look that reads the
+///   volume short opens a new one in its place (`Expire`, then the opening);
+/// - `pX`: X was elected this episode; `lX`: the lines X took this episode; `asks`: the lines
+///   the lease counted; `cool`: a line went within the cooldown; `rose`: free space rose a GiB
+///   since a line; `raised`: the owner's disk line says the asks ran out;
+/// - `uA`: A's line went but its host could not write its record (a full disk), so the lease
+///   still owes it, or has handed it off, run out, or elected another, until that host's next
+///   look records it: the record counts it as one of the episode's lines, and the episode waits
+///   on A's answer again (`RecordA`, `RecordBackA`) unless another session elected since may
+///   still take the episode's second line (`RecordOverA`); one elected since whose line would be
+///   past the two is withdrawn untyped (`RecordWithdrawA`). The record lands before another
+///   session's line goes (`TypeB` and `TypeC` wait on it): a host looks a minute apart
+///   (`LOOK_EVERY_MS`), and design §7 names a record lost for longer.
+///
+/// The rest record what a step saw, for the laws to judge: `sowed`, what the last line was
+/// typed on; `scool` and `sdone`, what the last opening saw; `slate`, whether the last line went
+/// after space was freed; `past`, whether the last episode closed past the margin of the floor
+/// it was held to, or gave way a cooldown after it parked; `sflap`, whether an episode opened
+/// after one that closed short of that; `skept`, whether A's host kept A owed with its task
+/// done; `sfit`, whether the last line to A went while the seat rule admitted it. `End`,
+/// `Expire`, `KeepA` and `TypeA` record from their own state what their guards are meant to
+/// hold, and each of their mutants is the same step under a weaker guard, so a guard weakened
+/// in the step itself breaks the law too.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn disk_free_ask_model() -> Model {
     aterm_spec::ty_model! {
         DiskFreeAsk {
             const Buggy = 0;
-            var below = 0;
+            var free = 4;
+            var bar = 0;
             var done = 0;
+            var dA = 0;
             var phase = 0;
+            var aged = 0;
             var owner = 0;
             var pA = 0;
             var pB = 0;
@@ -250,34 +279,100 @@ pub fn disk_free_ask_model() -> Model {
             var cool = 0;
             var rose = 0;
             var raised = 0;
+            var past = 1;
             var sowed = 1;
             var scool = 0;
             var sdone = 1;
             var slate = 0;
+            var sflap = 0;
+            var sfit = 1;
+            var skept = 0;
+            var uA = 0;
 
-            action Fall when (below == 0) { below = 1; }
-            action Rise when (below == 1) { below = 0; }
+            action Drop when (free > 0) { free = free - 1; }
+            action Climb when (4 > free) { free = free + 1; }
             action Spend when (done == 0) { done = 1; }
             action Unspend when (done == 1) { done = 0; }
+            action Finish when (dA == 0) { dA = 1; }
+            action Unfinish when (dA == 1) { dA = 0; }
             action Cools when (cool == 1) { cool = 0; }
-            action Open when (below == 1 && phase == 0 && done == 1 && cool == 0) {
+            action Ages when (phase > 3 && aged == 0) { aged = 1; }
+            action OpenH when (free <= 2 && phase == 0 && done == 1 && cool == 0) {
                 phase = 1;
+                bar = 2;
                 scool = cool;
                 sdone = done;
+                sflap = if (past == 0) { 1 } else { sflap };
             }
-            action ElectA when (below == 1 && phase == 1 && pA == 0) { phase = 2; owner = 1; pA = 1; }
-            action ElectB when (below == 1 && phase == 1 && pB == 0) { phase = 2; owner = 2; pB = 1; }
-            action ElectC when (below == 1 && phase == 1 && pC == 0) { phase = 2; owner = 3; pC = 1; }
-            action ElectNone when (below == 1 && phase == 1) { phase = 5; raised = 1; }
-            action TypeA when (phase == 2 && owner == 1) {
+            action OpenL when (free == 0 && phase == 0 && done == 1 && cool == 0) {
+                phase = 1;
+                bar = 1;
+                scool = cool;
+                sdone = done;
+                sflap = if (past == 0) { 1 } else { sflap };
+            }
+            action RaiseH when (free <= 3 && phase > 0 && bar == 1) { bar = 2; }
+            action ElectA when (free <= 3 && phase == 1 && pA == 0) {
+                phase = 2;
+                owner = 1;
+                pA = 1;
+            }
+            action ElectB when (free <= 3 && phase == 1 && pB == 0) {
+                phase = 2;
+                owner = 2;
+                pB = 1;
+            }
+            action ElectC when (free <= 3 && phase == 1 && pC == 0) {
+                phase = 2;
+                owner = 3;
+                pC = 1;
+            }
+            action ElectNone when (free <= 3 && phase == 1) { phase = 5; raised = 1; }
+            action KeepA when (phase == 2 && owner == 1 && dA == 0) {
+                owner = 1;
+                skept = dA;
+            }
+            action ReleaseA when (phase == 2 && owner == 1 && dA == 1) { phase = 1; owner = 0; }
+            action TypeA when (phase == 2 && owner == 1 && dA == 0 && uA == 0) {
                 lA = lA + 1;
                 asks = asks + 1;
                 phase = 3;
                 cool = 1;
                 sowed = 1;
                 slate = rose;
+                sfit = if (dA == 0) { 1 } else { 0 };
             }
-            action TypeB when (phase == 2 && owner == 2) {
+            action TypeALost when (phase == 2 && owner == 1 && dA == 0 && uA == 0) {
+                lA = lA + 1;
+                cool = 1;
+                uA = 1;
+                sowed = 1;
+                slate = rose;
+                sfit = if (dA == 0) { 1 } else { 0 };
+            }
+            action RecordA when (uA == 1 && phase == 2 && owner == 1) {
+                asks = asks + 1;
+                phase = 3;
+                uA = 0;
+            }
+            action RecordBackA when (uA == 1 && (phase == 1 || phase == 5)) {
+                asks = asks + 1;
+                phase = 3;
+                owner = 1;
+                aged = 0;
+                uA = 0;
+            }
+            action RecordOverA when (uA == 1 && phase == 2 && owner > 1 && asks == 0) {
+                asks = asks + 1;
+                uA = 0;
+            }
+            action RecordWithdrawA when (uA == 1 && phase == 2 && owner > 1 && asks > 0) {
+                asks = asks + 1;
+                phase = 3;
+                owner = 1;
+                uA = 0;
+            }
+            action TypeB when (phase == 2 && owner == 2 && uA == 0) {
                 lB = lB + 1;
                 asks = asks + 1;
                 phase = 3;
@@ -285,7 +380,7 @@ pub fn disk_free_ask_model() -> Model {
                 sowed = 1;
                 slate = rose;
             }
-            action TypeC when (phase == 2 && owner == 3) {
+            action TypeC when (phase == 2 && owner == 3 && uA == 0) {
                 lC = lC + 1;
                 asks = asks + 1;
                 phase = 3;
@@ -294,19 +389,21 @@ pub fn disk_free_ask_model() -> Model {
                 slate = rose;
             }
             action Frees when (phase == 3 && rose == 0) { rose = 1; }
-            action Freed when (below == 1 && phase == 3 && rose == 1) { phase = 4; owner = 0; }
+            action Freed when (free <= 3 && phase == 3 && rose == 1) { phase = 4; owner = 0; }
             action HandOffOwed when (phase == 2) { phase = 1; owner = 0; }
-            action HandOffAsked when (below == 1 && phase == 3 && rose == 0 && 2 > asks) {
+            action HandOffAsked when (free <= 3 && phase == 3 && rose == 0 && 2 > asks) {
                 phase = 1;
                 owner = 0;
             }
-            action OutAsked when (below == 1 && phase == 3 && rose == 0 && asks > 1) {
+            action OutAsked when (free <= 3 && phase == 3 && rose == 0 && asks > 1) {
                 phase = 5;
                 owner = 0;
                 raised = 1;
             }
-            action End when (below == 0 && phase > 0) {
+            action End when (phase > 0 && (free == 4 || (bar == 1 && free > 1))) {
                 phase = 0;
+                aged = 0;
+                bar = 0;
                 owner = 0;
                 pA = 0;
                 pB = 0;
@@ -317,6 +414,25 @@ pub fn disk_free_ask_model() -> Model {
                 asks = 0;
                 rose = 0;
                 raised = 0;
+                uA = 0;
+                past = if (free == 4 || (bar == 1 && free > 1)) { 1 } else { 0 };
+            }
+            action Expire when (phase > 3 && aged == 1 && cool == 0 && done == 1 && free <= 2) {
+                phase = 0;
+                aged = 0;
+                bar = 0;
+                owner = 0;
+                pA = 0;
+                pB = 0;
+                pC = 0;
+                lA = 0;
+                lB = 0;
+                lC = 0;
+                asks = 0;
+                rose = 0;
+                raised = 0;
+                uA = 0;
+                past = if (aged == 1 && cool == 0) { 1 } else { 0 };
             }
 
             action BlindTypeA when (
@@ -329,40 +445,121 @@ pub fn disk_free_ask_model() -> Model {
                 slate = rose;
             }
             action OpenInCooldown when (
-                Buggy == 2 && below == 1 && phase == 0 && done == 1 && cool == 1
+                Buggy == 2 && free <= 2 && phase == 0 && done == 1 && cool == 1
             ) {
                 phase = 1;
+                bar = 2;
                 scool = cool;
                 sdone = done;
             }
             action OpenBeforeDone when (
-                Buggy == 3 && below == 1 && phase == 0 && done == 0 && cool == 0
+                Buggy == 3 && free <= 2 && phase == 0 && done == 0 && cool == 0
             ) {
                 phase = 1;
+                bar = 2;
                 scool = cool;
                 sdone = done;
             }
             action HandOffPastTwo when (
-                Buggy == 4 && below == 1 && phase == 3 && rose == 0 && asks > 1
+                Buggy == 4 && free <= 3 && phase == 3 && rose == 0 && asks > 1
             ) {
                 phase = 1;
                 owner = 0;
             }
-            action ElectPickedA when (Buggy == 5 && below == 1 && phase == 1 && pA == 1) {
+            action ElectPickedA when (Buggy == 5 && free <= 3 && phase == 1 && pA == 1) {
                 phase = 2;
                 owner = 1;
             }
             action HandOffAfterFreed when (
-                Buggy == 6 && below == 1 && phase == 3 && rose == 1 && 2 > asks
+                Buggy == 6 && free <= 3 && phase == 3 && rose == 1 && 2 > asks
             ) {
                 phase = 1;
                 owner = 0;
             }
             action OutSilent when (
-                Buggy == 7 && below == 1 && phase == 3 && rose == 0 && asks > 1
+                Buggy == 7 && free <= 3 && phase == 3 && rose == 0 && asks > 1
             ) {
                 phase = 5;
                 owner = 0;
+            }
+            action EndAtOwnFloor when (Buggy == 8 && phase > 0 && free > 0) {
+                phase = 0;
+                aged = 0;
+                bar = 0;
+                owner = 0;
+                pA = 0;
+                pB = 0;
+                pC = 0;
+                lA = 0;
+                lB = 0;
+                lC = 0;
+                asks = 0;
+                rose = 0;
+                raised = 0;
+                uA = 0;
+                past = if (free == 4 || (bar == 1 && free > 1)) { 1 } else { 0 };
+            }
+            action EndAtHeldFloor when (
+                Buggy == 9 && phase > 0 && (free > 2 || (bar == 1 && free > 0))
+            ) {
+                phase = 0;
+                aged = 0;
+                bar = 0;
+                owner = 0;
+                pA = 0;
+                pB = 0;
+                pC = 0;
+                lA = 0;
+                lB = 0;
+                lC = 0;
+                asks = 0;
+                rose = 0;
+                raised = 0;
+                uA = 0;
+                past = if (free == 4 || (bar == 1 && free > 1)) { 1 } else { 0 };
+            }
+            action KeepDoneA when (Buggy == 10 && phase == 2 && owner == 1) {
+                owner = 1;
+                skept = dA;
+            }
+            action TypeDoneA when (Buggy == 11 && phase == 2 && owner == 1) {
+                lA = lA + 1;
+                asks = asks + 1;
+                phase = 3;
+                cool = 1;
+                sowed = 1;
+                slate = rose;
+                sfit = if (dA == 0) { 1 } else { 0 };
+            }
+            action RecordLostA when (
+                Buggy == 13 && uA > 0 && (phase <= 1 || phase > 2 || owner <= 0 || owner > 1)
+            ) {
+                uA = 0;
+            }
+            action RecordKeepPastTwoA when (
+                Buggy == 14 && uA == 1 && phase == 2 && owner > 1 && asks > 0
+            ) {
+                asks = asks + 1;
+                uA = 0;
+            }
+            action ExpireEarly when (
+                Buggy == 12 && phase > 3 && cool == 0 && done == 1 && free <= 2
+            ) {
+                phase = 0;
+                aged = 0;
+                bar = 0;
+                owner = 0;
+                pA = 0;
+                pB = 0;
+                pC = 0;
+                lA = 0;
+                lB = 0;
+                lC = 0;
+                asks = 0;
+                rose = 0;
+                raised = 0;
+                uA = 0;
+                past = if (aged == 1 && cool == 0) { 1 } else { 0 };
             }
 
             invariant TypedOnlyWhileOwed: sowed == 1;
@@ -372,8 +569,15 @@ pub fn disk_free_ask_model() -> Model {
             invariant OneLinePerSession: lA <= 1 && lB <= 1 && lC <= 1;
             invariant NoAskAfterFreed: slate == 0;
             invariant OutIsRaised: phase <= 4 || raised == 1;
+            invariant NoFlap: sflap == 0;
+            invariant DoneIsReleased: skept == 0;
+            invariant TypedOnlyFit: sfit == 1;
+            invariant LinesCounted: uA > 0 || asks == lA + lB + lC;
             bound PhaseBox: phase <= 5;
             bound AsksBox: asks <= 3;
+            bound FreeBox: free <= 4;
+            bound BarBox: bar <= 2;
+            bound LostBox: uA <= 1;
         }
     }
 }

@@ -7287,6 +7287,9 @@ impl App {
         }
         let secure_input_refusal =
             crate::secure_input::set_desired(self.config.secure_keyboard_entry_or_default()).err();
+        if self.config.secure_keyboard_entry_or_default() {
+            self.aos_privacy_detach_all(crate::aos_host::SECURE_ENTRY);
+        }
         if let Some(voice) = audition_voice {
             self.audition_typing_sound(voice);
         }

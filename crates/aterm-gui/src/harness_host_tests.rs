@@ -22,6 +22,9 @@ mod hold_store_tests;
 #[path = "harness_needs_whole_tests.rs"]
 mod needs_whole_tests;
 
+#[path = "harness_host_commit_stop_tests.rs"]
+mod commit_stop_tests;
+
 #[test]
 fn phase_follow_reads_only_the_changed_workers_record() {
     let world = Arc::new(World::default());
@@ -497,6 +500,7 @@ fn idle_host(sid: &str, agent: Program, switches: Arc<Switches>, hooks: Hooks) -
         points: Arc::default(),
         settle_later: AtomicBool::default(),
         told: AtomicU8::new(0),
+        repo_probe: Default::default(),
     }
 }
 
@@ -7227,6 +7231,65 @@ fn a_told_watch_that_found_the_lock_busy_is_told_again() {
     host.shutdown_and_join();
 }
 
+/// A WORKER'S REPOSITORY PROBE READS BESIDE ITS LOOP ([`IdleHost::repo_work`]): with the
+/// session's probe held, the worker's ask answers `None` once its
+/// [`aterm_agent::harness::repo_work::PROBE_ASK`] is spent, the loop left free to renew its claim
+/// and see its stop; once the probe's reads go on, asking again answers what they found, and the
+/// probe read the session's kept snapshot, once. NEGATIVE CONTROL: the probe let go, the next
+/// asks begin and answer a new probe.
+#[test]
+fn a_workers_repository_probe_reads_beside_its_loop() {
+    use aterm_agent::harness::repo_work::{RepoRead, RepoWork};
+    use aterm_agent::supervise::IdleHost;
+    let world = Arc::new(World::default());
+    let mut hooks = hooks(&world, parking_body(&world));
+    let (go, held) = std::sync::mpsc::channel::<()>();
+    let held = Mutex::new(held);
+    let read: Arc<Mutex<Vec<String>>> = Arc::default();
+    let found = RepoRead::Found(RepoWork {
+        repo: "/r".to_string(),
+        changed: 1,
+        ..RepoWork::default()
+    });
+    hooks.acts = Acts {
+        repo_work: {
+            let (read, found) = (Arc::clone(&read), found.clone());
+            Arc::new(move |snap| {
+                read.lock().unwrap().push(snap.tab.clone());
+                let _ = held
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+                found.clone()
+            })
+        },
+        ..Acts::inert()
+    };
+    let idle = idle_host("s-repo-beside", Program::Claude, switched(&on()), hooks);
+    with_kept_of(&idle.kept, |k| k.snapshot = Some(snap("s-repo-beside")));
+    // As the loop asks: again until the probe answers, within the hang detector.
+    let answered = || {
+        let by = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        loop {
+            if let Some(read) = idle.repo_work() {
+                return read;
+            }
+            assert!(Instant::now() < by, "the probe answered within a minute");
+        }
+    };
+    assert_eq!(idle.repo_work(), None, "the probe's reads are held");
+    go.send(()).expect("the probe waits on its reads");
+    assert_eq!(answered(), found, "the held probe's finding");
+    assert_eq!(
+        *read.lock().unwrap(),
+        ["s-repo-beside"],
+        "one probe, of the kept snapshot"
+    );
+    go.send(()).expect("the next probe's reads go on");
+    assert_eq!(answered(), found, "a new probe's finding");
+    assert_eq!(read.lock().unwrap().len(), 2, "a new probe begun");
+}
+
 #[test]
 fn a_due_look_wants_a_point_and_the_point_spends_it() {
     let world = Arc::new(World::default());
@@ -7307,10 +7370,12 @@ fn a_task_done_under_land_is_carried_on_with_nothing_typed() {
         settle_later: AtomicBool::default(),
         activations: Arc::default(),
         told: AtomicU8::new(0),
+        repo_probe: Default::default(),
     };
     let done = idle
         .at_idle_on(IdlePoint {
             done_under_land: true,
+            ..IdlePoint::default()
         })
         .expect("the carry-on's step");
     assert_eq!(done.line, "carry-on step=done:said-done");
@@ -7376,6 +7441,7 @@ fn a_relaunchs_owed_carry_on_is_settled_where_its_loop_takes_a_point() {
         points: Arc::default(),
         settle_later: AtomicBool::default(),
         told: AtomicU8::new(0),
+        repo_probe: Default::default(),
         activations: Arc::default(),
     };
     let told = || {
@@ -7659,6 +7725,7 @@ fn the_workers_own_readers_follow_the_agents_record_first() {
             login_latches: Arc::default(),
             lifted_off: false,
             told: AtomicU8::new(0),
+            repo_probe: Default::default(),
             beside: Arc::default(),
             sid: sid.to_string(),
             agent: Program::Claude,
@@ -27900,7 +27967,7 @@ fn a_tapped_sessions_fresh_reading_is_recorded_for_the_machines_own_login() {
     w.later(10);
     w.tap(20, 42, None);
     assert_eq!(
-        idle.tap_step(),
+        idle.tap_step(TapAt::Point),
         None,
         "the same windows: not taken to the store"
     );
@@ -28114,6 +28181,41 @@ fn a_silent_tap_is_said_once_and_its_end_with_it() {
     assert!(w.notes().is_empty(), "{:?}", w.notes());
 }
 
+/// A turn that runs for hours keeps the accounts store current: a busy read takes the tap's
+/// newest reading, once a minute at most, and never judges the tap silent.
+#[cfg(unix)]
+#[test]
+fn a_busy_read_records_the_tap_s_reading_once_a_minute_and_never_judges_it_silent() {
+    let w = TapWorld::new();
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    w.tap(10, 42, None);
+    idle.busy_tap();
+    let session = |w: &TapWorld| w.sample().and_then(|s| s.session_pct);
+    assert_eq!(session(&w), Some(42), "taken mid-turn");
+    w.later(BUSY_TAP_S / 2);
+    w.tap(20, 47, None);
+    idle.busy_tap();
+    assert_eq!(session(&w), Some(42), "within the minute");
+    w.later(BUSY_TAP_S / 2);
+    idle.busy_tap();
+    assert_eq!(session(&w), Some(47), "a minute on");
+    // The negative control: the same unheard tap at two decided points is judged silent.
+    idle.turn_ran();
+    for _ in 0..2 {
+        w.later(BUSY_TAP_S);
+        idle.busy_tap();
+    }
+    assert_eq!(
+        w.rows(accounts::Kind::NoTap),
+        0,
+        "busy reads judge no silence"
+    );
+    idle.usage_tap();
+    w.later(31);
+    idle.usage_tap();
+    assert_eq!(w.rows(accounts::Kind::NoTap), 1, "decided points do");
+}
+
 /// A silent tap's line ends with its process: the mark said for a process the same worker then
 /// relaunches in place.
 #[cfg(unix)]
@@ -28177,7 +28279,10 @@ fn a_fresh_reading_not_taken_is_tried_again() {
     w.later(10);
     w.tap(20, 47, None);
     let held = w.hold_lock();
-    assert_eq!(idle.tap_step(), Some("reading dropped: lock-held"));
+    assert_eq!(
+        idle.tap_step(TapAt::Point),
+        Some("reading dropped: lock-held")
+    );
     drop(held);
     w.later(10);
     w.tap(20, 47, None);
@@ -28186,7 +28291,11 @@ fn a_fresh_reading_not_taken_is_tried_again() {
     assert_eq!(w.rows(accounts::Kind::Sample), 2);
     w.later(10);
     w.tap(20, 47, None);
-    assert_eq!(idle.tap_step(), None, "an idle repeat of one taken");
+    assert_eq!(
+        idle.tap_step(TapAt::Point),
+        None,
+        "an idle repeat of one taken"
+    );
     assert_eq!(w.rows(accounts::Kind::Sample), 2);
 }
 
@@ -28289,16 +28398,28 @@ fn a_reading_held_back_for_a_new_login_is_taken_when_served_after_it() {
     assert_eq!(key(), profile::AccountKey::claude(a));
     w.later(10);
     w.tap(20, 42, None);
-    assert_eq!(idle.tap_step(), None, "a repeat of figures taken");
+    assert_eq!(
+        idle.tap_step(TapAt::Point),
+        None,
+        "a repeat of figures taken"
+    );
     sign_in(b);
     w.later(10);
     w.tap(30, 50, None);
-    assert_eq!(idle.tap_step(), Some("reading recorded"), "the epoch");
+    assert_eq!(
+        idle.tap_step(TapAt::Point),
+        Some("reading recorded"),
+        "the epoch"
+    );
     assert_eq!(key(), profile::AccountKey::claude(b));
     assert_eq!(w.sample(), None, "held back");
     w.later(accounts::KEY_ADOPT_S);
     w.tap(40, 50, None);
-    assert_eq!(idle.tap_step(), Some("reading recorded"), "served again");
+    assert_eq!(
+        idle.tap_step(TapAt::Point),
+        Some("reading recorded"),
+        "served again"
+    );
     assert_eq!(w.sample().and_then(|s| s.session_pct), Some(50));
     assert_eq!(key(), profile::AccountKey::claude(b));
 }
@@ -28387,11 +28508,19 @@ fn a_first_reading_under_an_epoch_is_tried_again_when_served_again() {
     );
     w.later(10);
     w.tap(40, 7, None);
-    assert_eq!(after.tap_step(), Some("reading recorded"), "served again");
+    assert_eq!(
+        after.tap_step(TapAt::Point),
+        Some("reading recorded"),
+        "served again"
+    );
     assert_eq!(w.sample().and_then(|s| s.session_pct), Some(7));
     w.later(10);
     w.tap(50, 7, None);
-    assert_eq!(after.tap_step(), None, "a repeat of figures taken");
+    assert_eq!(
+        after.tap_step(TapAt::Point),
+        None,
+        "a repeat of figures taken"
+    );
 }
 
 /// One [`Acts::startup_mark`] as the deadlines' fakes keep it.
@@ -30890,6 +31019,7 @@ fn an_unnamed_conversation_is_read_again_at_a_look_not_at_once() {
             points: Arc::default(),
             settle_later: AtomicBool::default(),
             told: AtomicU8::new(0),
+            repo_probe: Default::default(),
             activations: Arc::default(),
         };
         idle.kept.lock().unwrap().snapshot = Some(Snapshot {
@@ -31105,6 +31235,7 @@ fn idle_of(hooks: Hooks, agent: Program, session: Option<String>) -> WorkerIdle 
         points: Arc::default(),
         settle_later: AtomicBool::default(),
         told: AtomicU8::new(0),
+        repo_probe: Default::default(),
         activations: Arc::default(),
     };
     idle.kept.lock().unwrap().snapshot = Some(Snapshot {
@@ -32460,6 +32591,7 @@ fn a_full_disk_withholds_continuations_and_space_back_types_the_resume_once() {
         points: Arc::default(),
         settle_later: AtomicBool::default(),
         told: AtomicU8::new(0),
+        repo_probe: Default::default(),
         activations: Arc::default(),
     };
     let full = idle("s-disk-full");
@@ -32686,8 +32818,9 @@ fn the_disk_free_line_goes_only_to_the_tab_it_is_owed_at_its_turn_break_and_keep
     let mut hooks = hooks(&world, parking_body(&world));
     hooks.acts = Acts {
         due: Arc::new(|_| Due::No),
-        disk_free: Arc::new(move |sid, owed, unfit| {
+        disk_free: Arc::new(move |sid, owed, unfit, held| {
             assert!(owed.text.ends_with("(rule disk-free@v1)"), "{}", owed.text);
+            assert_eq!(held, None, "nothing holds these turn breaks");
             c.lock().unwrap().push((sid.to_string(), unfit));
             unfit.map_or_else(
                 || a.lock().unwrap().clone(),
@@ -32788,6 +32921,199 @@ fn the_disk_free_line_goes_only_to_the_tab_it_is_owed_at_its_turn_break_and_keep
         ]),
         "every turn break tells the look's seats which tabs may not be asked, owed or not"
     );
+}
+
+/// A turn break the loop's guards hold for a host's own fact types no disk-free line. A person's
+/// grace alone (`IdlePoint::held`) is a wait: the act is told, answers `wait:person`, and the line
+/// stays owed for the next turn break, which types it. A session that is the person's own
+/// exchange or a manager's worker (`IdlePoint::theirs`, whatever else holds it) is theirs for as
+/// long as they keep it: it is unfit, so the act releases its line at no election's cost and the
+/// board tells the look not to nominate it again, instead of the line waiting out its delivery
+/// window and spending an election.
+#[test]
+fn the_disk_free_line_waits_out_a_persons_grace_and_is_released_from_a_session_that_is_theirs() {
+    static BOARD: Shelf = Shelf::new();
+    let world = Arc::new(World::default());
+    /// Each act's `(unfit, held)`.
+    type Calls = Vec<(Option<&'static str>, Option<&'static str>)>;
+    let calls: Arc<Mutex<Calls>> = Arc::default();
+    let c = Arc::clone(&calls);
+    let mut hooks = hooks(&world, parking_body(&world));
+    hooks.acts = Acts {
+        due: Arc::new(|_| Due::No),
+        disk_free: Arc::new(move |_, _, unfit, held| {
+            c.lock().unwrap().push((unfit, held));
+            match (unfit, held) {
+                (Some(why), _) => format!("released:{why}"),
+                (None, Some(why)) => format!("wait:{why}"),
+                (None, None) => "typed".to_string(),
+            }
+        }),
+        finished: Arc::new(|_, _, _| Some(false)),
+        tasked: Arc::new(|_, _, _| Some(true)),
+        disk_board: &BOARD,
+        ..Acts::inert()
+    };
+    let mut idle = idle_of(
+        hooks,
+        Program::Claude,
+        Some("0badf00d-1111-2222-3333-444455556666".to_string()),
+    );
+    idle.sid = "s-df-held".to_string();
+    let owe = || {
+        BOARD.publish(|b| {
+            b.asks.insert(
+                "s-df-held".to_string(),
+                crate::disk_board::AskOwed {
+                    key: "dev:1".to_string(),
+                    text: "[aterm harness] aterm: the volume is full. (rule disk-free@v1)"
+                        .to_string(),
+                },
+            );
+        });
+    };
+    let unfit = || BOARD.board_lock().unfit.get("s-df-held").copied();
+    let point = |held: Option<Guard>, theirs: Option<Guard>| IdlePoint {
+        held,
+        theirs,
+        ..IdlePoint::default()
+    };
+    owe();
+    assert_eq!(
+        idle.at_idle_on(point(Some(Guard::Person), None))
+            .map(|s| s.line),
+        None,
+        "a person's grace: nothing typed"
+    );
+    assert!(
+        disk_ask_owed(&BOARD, "s-df-held").is_some(),
+        "a person's grace keeps the line owed"
+    );
+    assert_eq!(unfit(), None, "and the session seated");
+    for (held, theirs, why) in [
+        (Guard::Exchange, Guard::Exchange, "exchange"),
+        (Guard::Managed, Guard::Managed, "managed"),
+        (Guard::Person, Guard::Managed, "managed"),
+    ] {
+        owe();
+        assert_eq!(
+            idle.at_idle_on(point(Some(held), Some(theirs)))
+                .map(|s| s.line),
+            None,
+            "{held:?} over {theirs:?}: nothing typed"
+        );
+        assert!(
+            disk_ask_owed(&BOARD, "s-df-held").is_none(),
+            "{held:?} over {theirs:?}: released, not kept owed through its delivery window"
+        );
+        assert_eq!(
+            unfit(),
+            Some(why),
+            "{held:?} over {theirs:?}: the look nominates it no more"
+        );
+    }
+    owe();
+    let step = idle
+        .at_idle_on(IdlePoint::default())
+        .expect("a turn break nothing holds types it");
+    assert_eq!(step.line, "disk-free@v1 step=typed");
+    assert_eq!(unfit(), None, "seated again once nothing holds it");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            (None, Some("person")),
+            (Some("exchange"), Some("exchange")),
+            (Some("managed"), Some("managed")),
+            (Some("managed"), Some("person")),
+            (None, None),
+        ],
+        "the act is told what holds each turn break"
+    );
+    assert!(disk_ask_owed(&BOARD, "s-df-held").is_none());
+}
+
+/// The disk resume is a carry-on, so it is typed into no turn break the loop holds for a person:
+/// a person's grace keeps it owed, spending none of its tries, and the next turn break types it;
+/// the person's own exchange gives it up, as the conversation is theirs until they hand it back.
+#[test]
+fn the_disk_resume_waits_out_a_persons_grace_and_is_given_up_in_their_own_exchange() {
+    use aterm_agent::harness::disk::Level;
+    use aterm_phase::disk_full::{Code, DiskFull, Source};
+    static BOARD: Shelf = Shelf::new();
+    let state = aterm_tempfile::TempDir::new().expect("owned disk journal");
+    let world = Arc::new(World::default());
+    let typed: Arc<Mutex<Vec<String>>> = Arc::default();
+    let t = Arc::clone(&typed);
+    let mut hooks = hooks(&world, parking_body(&world));
+    hooks.acts = Acts {
+        due: Arc::new(|_| Due::No),
+        disk_resume: Arc::new(move |sid, _| {
+            t.lock().unwrap().push(sid.to_string());
+            "typed".to_string()
+        }),
+        finished: Arc::new(|_, _, _| Some(false)),
+        tasked: Arc::new(|_, _, _| Some(true)),
+        disk_board: &BOARD,
+        ..Acts::inert()
+    };
+    let idle = |sid: &str| {
+        let mut idle = idle_of(
+            hooks.clone(),
+            Program::Claude,
+            Some("0badf00d-1111-2222-3333-444455556666".to_string()),
+        );
+        idle.sid = sid.to_string();
+        idle
+    };
+    let (grace, exchange) = (idle("s-dr-grace"), idle("s-dr-exchange"));
+    let seen: Vec<(String, DiskFull)> = ["s-dr-grace", "s-dr-exchange"]
+        .iter()
+        .map(|sid| {
+            (
+                (*sid).to_string(),
+                DiskFull {
+                    code: Code::Enospc,
+                    source: Source::Notification,
+                    row: 3,
+                    message: "the notice".to_string(),
+                },
+            )
+        })
+        .collect();
+    disk_sightings(&BOARD, &seen, Level::Emergency, Some(0), state.path(), 1);
+    disk_episode_after(&BOARD, Level::Emergency, 0, &[]);
+    disk_episode_after(&BOARD, Level::Short, 30 << 30, &[]);
+    let person = IdlePoint {
+        held: Some(Guard::Person),
+        ..IdlePoint::default()
+    };
+    for _ in 0..=DISK_RESUME_TRIES {
+        assert_eq!(
+            grace.at_idle_on(person).map(|s| s.line),
+            None,
+            "nothing typed within a person's grace"
+        );
+    }
+    assert!(
+        disk_owed(&BOARD, "s-dr-grace").is_some(),
+        "a person's grace spends none of its tries"
+    );
+    let theirs = IdlePoint {
+        held: Some(Guard::Exchange),
+        theirs: Some(Guard::Exchange),
+        ..IdlePoint::default()
+    };
+    assert_eq!(exchange.at_idle_on(theirs).map(|s| s.line), None);
+    assert!(
+        disk_owed(&BOARD, "s-dr-exchange").is_none(),
+        "given up in the person's own exchange"
+    );
+    assert!(typed.lock().unwrap().is_empty(), "{:?}", typed.lock());
+    let step = grace
+        .at_idle_on(IdlePoint::default())
+        .expect("the resume's step once the grace is over");
+    assert_eq!(step.line, "disk-resume@v1 step=typed");
+    assert_eq!(*typed.lock().unwrap(), ["s-dr-grace"]);
 }
 
 #[test]
@@ -34756,6 +35082,7 @@ fn a_codex_is_told_no_resume_line_and_claude_codes_is_unchanged() {
             points: Arc::default(),
             settle_later: AtomicBool::new(false),
             told: AtomicU8::new(0),
+            repo_probe: Default::default(),
         };
         idle.kept.lock().unwrap().snapshot = kept;
         idle.resume_command()
