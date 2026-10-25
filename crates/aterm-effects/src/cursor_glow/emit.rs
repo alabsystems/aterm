@@ -3854,7 +3854,8 @@ impl CursorGlow {
     /// trail colour stays grey). A colour the user chose ([`ColourPins`]) is
     /// the veil's as it is, held legible by [`Self::dark_veil_cap`]'s coverage
     /// alone, since re-hued and brightened it would land another colour.
-    pub(super) fn dark_veil_ink(cfg: &GlowConfig, rgb: u32, pins: ColourPins) -> u32 {
+    #[must_use]
+    pub(super) const fn dark_veil_ink(cfg: &GlowConfig, rgb: u32, pins: ColourPins) -> u32 {
         let chosen = match cfg.style {
             GlowStyle::Laser => pins.trail,
             _ => pins.accent || (pins.trail && cfg.style.draws_trail_color()),
@@ -4029,11 +4030,15 @@ impl CursorGlow {
     }
 
     /// A light landing veil's ink for `rgb`.
-    pub(super) fn light_veil_ink(rgb: u32) -> u32 {
+    #[must_use]
+    pub(super) const fn light_veil_ink(rgb: u32) -> u32 {
+        const fn ch(full: u32, k: f32, sh: u32) -> u32 {
+            ((((full >> sh) & 0xff) as f32 * k) + 0.5) as u32
+        }
         let (h, s, _) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
-        let h = if (30.0..80.0).contains(&h) {
+        let h = if h >= 30.0 && h < 80.0 {
             30.0 + (h - 30.0) * 0.2
-        } else if (80.0..95.0).contains(&h) {
+        } else if h >= 80.0 && h < 95.0 {
             40.0 + (h - 80.0) * (55.0 / 15.0)
         } else {
             h
@@ -4044,8 +4049,7 @@ impl CursorGlow {
             return full;
         }
         let k = LIGHT_INK_BOLD_MAX_LUMA / y;
-        let ch = |sh: u32| ((((full >> sh) & 0xff) as f32 * k) + 0.5) as u32;
-        (ch(16) << 16) | (ch(8) << 8) | ch(0)
+        (ch(full, k, 16) << 16) | (ch(full, k, 8) << 8) | ch(full, k, 0)
     }
 
     /// Emit the flying particles, style by style.
@@ -4727,7 +4731,8 @@ impl CursorGlow {
     }
 
     /// The comet colour at path position `pos` (0 tail .. 1 head) for the style.
-    pub(super) fn comet_color(&self, cfg: &GlowConfig, pos: f32) -> u32 {
+    #[must_use]
+    pub(super) const fn comet_color(&self, cfg: &GlowConfig, pos: f32) -> u32 {
         if matches!(cfg.style, GlowStyle::Sparkle) {
             return Self::sparkle_gold_at(cfg, pos);
         }
@@ -4750,18 +4755,20 @@ impl CursorGlow {
 
     /// Sparkle's gold on a dark ground at warm gold chroma.
     #[inline]
+    #[must_use]
     pub(super) const fn sparkle_gold(cfg: &GlowConfig) -> u32 {
         crate::spectrum::spectrum_with_min_saturation(cfg.color & 0x00FF_FFFF, 0.72)
     }
 
     /// Sparkle's gold along its tail, `pos` 0 (tail) to 1 (head).
     #[inline]
-    pub(super) fn sparkle_gold_at(cfg: &GlowConfig, pos: f32) -> u32 {
+    #[must_use]
+    pub(super) const fn sparkle_gold_at(cfg: &GlowConfig, pos: f32) -> u32 {
         Self::shade_gold_to_tail(Self::sparkle_gold(cfg), pos)
     }
 
     #[inline]
-    fn shade_gold_to_tail(gold: u32, pos: f32) -> u32 {
+    const fn shade_gold_to_tail(gold: u32, pos: f32) -> u32 {
         let (h, s, v) = crate::color_math::rgb2hsv(gold);
         let k = 1.0 - pos.clamp(0.0, 1.0);
         let k = k * k * (3.0 - 2.0 * k);
@@ -4770,7 +4777,8 @@ impl CursorGlow {
 
     /// Sparkle's body gold on paper at `pos`, shaded toward the tail.
     #[inline]
-    pub(crate) fn sparkle_paper_gold_at(cfg: &GlowConfig, pos: f32) -> u32 {
+    #[must_use]
+    pub(crate) const fn sparkle_paper_gold_at(cfg: &GlowConfig, pos: f32) -> u32 {
         let gold = if cfg.color & 0x00FF_FFFF == SPARKLE_DEFAULT_COLOR {
             Self::SPARKLE_PAPER_CORE
         } else {

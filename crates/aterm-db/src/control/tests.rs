@@ -2,11 +2,91 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use aterm_net::lan::{Connection, Scope};
 use aterm_secrets::{age::Identity, commons::node::Edit};
 use std::{io::Cursor, net::TcpListener, thread};
 
 const ROOT: [u8; 32] = [17; 32];
 const NETWORK: [u8; 16] = [9; 16];
+
+#[test]
+fn established_repair_storage_cannot_reinitialize_after_directory_loss() {
+    let lab = Lab::new();
+    lab.journal(0).ingest(lab.genesis.bytes()).unwrap();
+    let path = lab.path(0);
+    std::fs::rename(&path, lab.root.path().join("preserved-control")).unwrap();
+    let disk = Disk {
+        dir: &path,
+        trust: lab.trust,
+    };
+    assert!(disk.inventory().is_err());
+    assert!(disk.batch(&[lab.genesis.id()]).is_err());
+    assert!(disk.retain(&[lab.genesis.bytes().to_vec()]).is_err());
+    assert!(!path.join("control.astream").exists());
+}
+
+#[test]
+fn control_endpoint_uses_the_secrets_backed_bootstrap_identity() {
+    use aterm_secrets::{
+        client::{self, Paths},
+        commons::{
+            self,
+            binding::Pending,
+            bootstrap::{Bootstrap, Descriptor, Device},
+            roster::{Enrollment, Role},
+        },
+        text::Audience,
+    };
+    let home = aterm_tempfile::tempdir().unwrap();
+    let source = home.path().join("test.vault");
+    let paths = Paths::for_home(&home.path().join("m1"));
+    client::create(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+    let admin = client::admin_open(&paths).unwrap();
+    let mut document = admin.doc.clone();
+    document
+        .set_entry(
+            &Audience::Hosts(vec!["m1".into()]),
+            commons::ENTRY,
+            b"pending",
+        )
+        .unwrap();
+    client::admin_publish(&paths, &admin, &document).unwrap();
+    let admin = client::admin_open(&paths).unwrap();
+    let device = Device::open(&paths).unwrap().unwrap();
+    let request = device
+        .request(NETWORK, admin.config.signer.unwrap())
+        .unwrap();
+    let (mut pending, challenge) =
+        Pending::issue(&request, NETWORK, *request.binding().authority()).unwrap();
+    let possession = pending
+        .verify(&device.answer(&request, &challenge).unwrap())
+        .unwrap();
+    let genesis = admin
+        .prepare_commons_genesis(
+            NETWORK,
+            vec![Enrollment::new("m1", possession, Role::Writer)],
+        )
+        .unwrap();
+    let descriptor = Descriptor::from_genesis(genesis).unwrap();
+    document
+        .set_entry(
+            &Audience::Hosts(vec!["m1".into()]),
+            commons::ENTRY,
+            &descriptor.bytes(),
+        )
+        .unwrap();
+    client::admin_publish(&paths, &admin, &document).unwrap();
+    let bootstrap = Bootstrap::cached(&paths).unwrap().unwrap();
+    let endpoint = Endpoint::from_bootstrap(&bootstrap).unwrap().unwrap();
+    assert_eq!(endpoint.actor, request.binding().actor());
+    assert_eq!(endpoint.trust, descriptor.trust());
+    std::fs::rename(
+        bootstrap.journal_dir(),
+        home.path().join("preserved-control"),
+    )
+    .unwrap();
+    assert!(Endpoint::from_bootstrap(&bootstrap).is_err());
+}
 
 struct Lab {
     root: aterm_tempfile::TempDir,
@@ -101,11 +181,19 @@ impl Lab {
         let addr = listener.local_addr().unwrap();
         thread::scope(|scope| {
             let server = scope.spawn(move || {
-                eb.exchange(listener.accept().unwrap().0, Side::Responder, b)
-                    .unwrap()
+                eb.exchange(
+                    Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                    Side::Responder,
+                    b,
+                )
+                .unwrap()
             });
             let report = ea
-                .exchange(TcpStream::connect(addr).unwrap(), Side::Initiator, a)
+                .exchange(
+                    Connection::connect(addr, Scope::Loopback, Duration::from_secs(2)).unwrap(),
+                    Side::Initiator,
+                    a,
+                )
                 .unwrap();
             (report, server.join().unwrap())
         })
@@ -278,7 +366,7 @@ fn real_tls_rejects_a_copied_witness_without_its_writer_key() {
     thread::scope(|scope| {
         let served = scope.spawn(|| {
             server.exchange(
-                listener.accept().unwrap().0,
+                Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
                 Side::Responder,
                 &mut Repair::default(),
             )
@@ -286,7 +374,7 @@ fn real_tls_rejects_a_copied_witness_without_its_writer_key() {
         assert!(
             impostor
                 .exchange(
-                    TcpStream::connect(addr).unwrap(),
+                    Connection::connect(addr, Scope::Loopback, Duration::from_secs(2)).unwrap(),
                     Side::Initiator,
                     &mut Repair::default()
                 )
@@ -550,6 +638,7 @@ fn control_admission_model_conforms_and_rejects_copied_witness_bypass() {
 #[test]
 fn one_bad_record_does_not_block_other_signed_records_in_the_batch() {
     let lab = Lab::new();
+    drop(lab.journal(0));
     let store = Disk {
         dir: &lab.path(0),
         trust: lab.trust,

@@ -5,8 +5,8 @@
 //! Historical authority evidence grants only sealed control-history exchange;
 //! it grants no current roster, table, vault, administrator or terminal access.
 //! No network epoch key is needed, so a retired/offline device can learn newer
-//! restrictions. This module neither dials nor listens: the runtime must approve
-//! the actual connected route under its LAN policy before passing a socket here.
+//! restrictions. This module neither dials nor listens: it accepts connections
+//! admitted by the native LAN policy and rechecks their bound route observations.
 
 use crate::{Error, Result};
 use astream_wire::sync::{Actor, Digest};
@@ -21,7 +21,6 @@ use aterm_secrets::commons::{
 use std::{
     collections::BTreeSet,
     io::{Read, Write},
-    net::TcpStream,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -62,6 +61,10 @@ pub struct Repair {
     cursor: Option<Digest>,
 }
 impl Repair {
+    /// The channel-authenticated peer after a completed hello exchange.
+    pub fn actor(&self) -> Option<Actor> {
+        self.peer.map(|(_, actor)| actor)
+    }
     fn prepare(&mut self, trust: Trust, actor: Actor) {
         if self.peer != Some((trust, actor)) {
             self.cursor = None;
@@ -113,11 +116,51 @@ pub struct Endpoint {
     hello: Vec<u8>,
 }
 impl Endpoint {
+    /// Build the control-only endpoint from encrypted secrets custody. Pending
+    /// enrollment has no historical witness and cannot open an endpoint.
+    pub fn from_bootstrap(
+        bootstrap: &aterm_secrets::commons::bootstrap::Bootstrap,
+    ) -> Result<Option<Self>> {
+        let Some(witness) = bootstrap.witness().map_err(failure)? else {
+            return Ok(None);
+        };
+        let request = bootstrap.request().map_err(failure)?;
+        bootstrap
+            .device()
+            .with_seed(|seed| {
+                let endpoint = Self::configured(
+                    bootstrap.journal_dir(),
+                    bootstrap.trust(),
+                    &request,
+                    witness.bytes(),
+                    seed,
+                )?;
+                drop(
+                    Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust())
+                        .map_err(failure)?,
+                );
+                Ok(endpoint)
+            })
+            .map(Some)
+    }
+
     /// `witness` is a signed ACN3 node containing this request's exact Bind fact.
     /// A genesis witness must equal the independent pin. Other signed witnesses
     /// establish historical approval only, even before their ancestry arrives.
     /// No journal lock is retained by this handle.
     pub fn new(
+        dir: &Path,
+        trust: Trust,
+        request: &Request,
+        witness: &[u8],
+        seed: &[u8; 32],
+    ) -> Result<Self> {
+        let endpoint = Self::configured(dir, trust, request, witness, seed)?;
+        drop(Journal::open(dir, trust).map_err(failure)?);
+        Ok(endpoint)
+    }
+
+    fn configured(
         dir: &Path,
         trust: Trust,
         request: &Request,
@@ -135,7 +178,6 @@ impl Endpoint {
                 "Commons writer differs from its persistent identity",
             ));
         }
-        drop(Journal::open(dir, trust).map_err(failure)?);
         let mut hello = b"ACX1".to_vec();
         hello.extend_from_slice(&trust.network);
         hello.extend_from_slice(&trust.authority);
@@ -151,10 +193,18 @@ impl Endpoint {
         })
     }
 
-    /// Exchange over an already connected, locally policy-approved socket.
+    /// Exchange over a connection admitted by the native LAN/loopback policy.
     /// One absolute 30-second deadline covers TLS, authentication and repair.
-    /// This does not enforce LAN routes or start any automatic network service.
-    pub fn exchange(&self, tcp: TcpStream, side: Side, repair: &mut Repair) -> Result<Report> {
+    /// Route evidence is rechecked after TLS and after the bounded exchange.
+    /// This does not start any automatic network service.
+    pub fn exchange(
+        &self,
+        connection: aterm_net::lan::Connection,
+        side: Side,
+        repair: &mut Repair,
+    ) -> Result<Report> {
+        let (tcp, locality) = connection.into_parts();
+        locality.recheck()?;
         let _deadline = crate::network::Deadline::arm(&tcp)?;
         // This PUBLIC discriminator separates networks/protocols. It is not an
         // admission secret. Authority witness + exporter-bound identity below
@@ -175,12 +225,15 @@ impl Endpoint {
                     Duration::from_secs(30),
                 )
                 .map_err(|_| Error::new("Commons control TLS handshake failed"))?;
-                self.connected(
+                locality.recheck()?;
+                let result = self.connected(
                     channel.transport.stream(),
                     channel.peer.as_ref(),
                     side,
                     repair,
-                )
+                );
+                locality.recheck()?;
+                result
             }
             Side::Responder => {
                 let mut channel = fleet::server_handshake_as(
@@ -192,12 +245,15 @@ impl Endpoint {
                     Duration::from_secs(30),
                 )
                 .map_err(|_| Error::new("Commons control TLS handshake failed"))?;
-                self.connected(
+                locality.recheck()?;
+                let result = self.connected(
                     channel.transport.stream(),
                     channel.peer.as_ref(),
                     side,
                     repair,
-                )
+                );
+                locality.recheck()?;
+                result
             }
         }
     }
@@ -354,11 +410,11 @@ struct Disk<'a> {
 }
 impl Store for Disk<'_> {
     fn inventory(&self) -> Result<BTreeSet<Digest>> {
-        let journal = Journal::open(self.dir, self.trust).map_err(failure)?;
+        let journal = Journal::open_existing(self.dir, self.trust).map_err(failure)?;
         Ok(journal.inventory().copied().collect())
     }
     fn batch(&self, ids: &[Digest]) -> Result<Vec<Vec<u8>>> {
-        let journal = Journal::open(self.dir, self.trust).map_err(failure)?;
+        let journal = Journal::open_existing(self.dir, self.trust).map_err(failure)?;
         ids.iter()
             .map(|id| {
                 journal
@@ -383,7 +439,7 @@ impl Store for Disk<'_> {
         if !valid.iter().any(|valid| *valid) {
             return Ok(valid);
         }
-        let mut journal = Journal::open(self.dir, self.trust).map_err(failure)?;
+        let mut journal = Journal::open_existing(self.dir, self.trust).map_err(failure)?;
         Ok(wires
             .iter()
             .zip(valid)

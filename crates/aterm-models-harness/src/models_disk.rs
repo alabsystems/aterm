@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The disk watch's pass.
+//! The disk watch's pass, its waits, and its ask to free space.
 
 use aterm_spec::derive::Model;
 
@@ -219,5 +219,161 @@ pub fn disk_await_liveness() -> aterm_spec::derive::Liveness {
         weak: vec!["Timeout"],
         strong: vec![],
         mutants: vec!["LoseTimer"],
+    }
+}
+
+/// THE ASK (`disk-free@v1`, `docs/DESIGN-disk-free-ask-2026-10-24.md`): one machine-wide lease
+/// over three sessions A, B and C, whichever hosts they run on. `below`: the volume is below its
+/// floor; `done`: aterm's own freeing is done there; `phase`: no episode (0), nominating (1),
+/// owed to `owner` (2), asked (3), settled (4), out (5); `pX`: X was elected this episode;
+/// `lX`: the lines X took this episode; `asks`: the lines the lease counted; `cool`: a line went
+/// within the cooldown; `rose`: free space rose a GiB since a line; `raised`: the owner's disk
+/// line says the asks ran out. `sowed`, `scool`, `sdone` and `slate` are what the last line, or
+/// the last opening, saw.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn disk_free_ask_model() -> Model {
+    aterm_spec::ty_model! {
+        DiskFreeAsk {
+            const Buggy = 0;
+            var below = 0;
+            var done = 0;
+            var phase = 0;
+            var owner = 0;
+            var pA = 0;
+            var pB = 0;
+            var pC = 0;
+            var lA = 0;
+            var lB = 0;
+            var lC = 0;
+            var asks = 0;
+            var cool = 0;
+            var rose = 0;
+            var raised = 0;
+            var sowed = 1;
+            var scool = 0;
+            var sdone = 1;
+            var slate = 0;
+
+            action Fall when (below == 0) { below = 1; }
+            action Rise when (below == 1) { below = 0; }
+            action Spend when (done == 0) { done = 1; }
+            action Unspend when (done == 1) { done = 0; }
+            action Cools when (cool == 1) { cool = 0; }
+            action Open when (below == 1 && phase == 0 && done == 1 && cool == 0) {
+                phase = 1;
+                scool = cool;
+                sdone = done;
+            }
+            action ElectA when (below == 1 && phase == 1 && pA == 0) { phase = 2; owner = 1; pA = 1; }
+            action ElectB when (below == 1 && phase == 1 && pB == 0) { phase = 2; owner = 2; pB = 1; }
+            action ElectC when (below == 1 && phase == 1 && pC == 0) { phase = 2; owner = 3; pC = 1; }
+            action ElectNone when (below == 1 && phase == 1) { phase = 5; raised = 1; }
+            action TypeA when (phase == 2 && owner == 1) {
+                lA = lA + 1;
+                asks = asks + 1;
+                phase = 3;
+                cool = 1;
+                sowed = 1;
+                slate = rose;
+            }
+            action TypeB when (phase == 2 && owner == 2) {
+                lB = lB + 1;
+                asks = asks + 1;
+                phase = 3;
+                cool = 1;
+                sowed = 1;
+                slate = rose;
+            }
+            action TypeC when (phase == 2 && owner == 3) {
+                lC = lC + 1;
+                asks = asks + 1;
+                phase = 3;
+                cool = 1;
+                sowed = 1;
+                slate = rose;
+            }
+            action Frees when (phase == 3 && rose == 0) { rose = 1; }
+            action Freed when (below == 1 && phase == 3 && rose == 1) { phase = 4; owner = 0; }
+            action HandOffOwed when (phase == 2) { phase = 1; owner = 0; }
+            action HandOffAsked when (below == 1 && phase == 3 && rose == 0 && 2 > asks) {
+                phase = 1;
+                owner = 0;
+            }
+            action OutAsked when (below == 1 && phase == 3 && rose == 0 && asks > 1) {
+                phase = 5;
+                owner = 0;
+                raised = 1;
+            }
+            action End when (below == 0 && phase > 0) {
+                phase = 0;
+                owner = 0;
+                pA = 0;
+                pB = 0;
+                pC = 0;
+                lA = 0;
+                lB = 0;
+                lC = 0;
+                asks = 0;
+                rose = 0;
+                raised = 0;
+            }
+
+            action BlindTypeA when (
+                Buggy == 1 && pA == 1 && lA == 0
+                    && (phase <= 1 || phase > 2 || owner <= 0 || owner > 1)
+            ) {
+                lA = 1;
+                cool = 1;
+                sowed = 0;
+                slate = rose;
+            }
+            action OpenInCooldown when (
+                Buggy == 2 && below == 1 && phase == 0 && done == 1 && cool == 1
+            ) {
+                phase = 1;
+                scool = cool;
+                sdone = done;
+            }
+            action OpenBeforeDone when (
+                Buggy == 3 && below == 1 && phase == 0 && done == 0 && cool == 0
+            ) {
+                phase = 1;
+                scool = cool;
+                sdone = done;
+            }
+            action HandOffPastTwo when (
+                Buggy == 4 && below == 1 && phase == 3 && rose == 0 && asks > 1
+            ) {
+                phase = 1;
+                owner = 0;
+            }
+            action ElectPickedA when (Buggy == 5 && below == 1 && phase == 1 && pA == 1) {
+                phase = 2;
+                owner = 1;
+            }
+            action HandOffAfterFreed when (
+                Buggy == 6 && below == 1 && phase == 3 && rose == 1 && 2 > asks
+            ) {
+                phase = 1;
+                owner = 0;
+            }
+            action OutSilent when (
+                Buggy == 7 && below == 1 && phase == 3 && rose == 0 && asks > 1
+            ) {
+                phase = 5;
+                owner = 0;
+            }
+
+            invariant TypedOnlyWhileOwed: sowed == 1;
+            invariant NoOpenInCooldown: phase == 0 || scool == 0;
+            invariant OpenedOnlyDone: phase == 0 || sdone == 1;
+            invariant AtMostTwoLines: lA + lB + lC <= 2;
+            invariant OneLinePerSession: lA <= 1 && lB <= 1 && lC <= 1;
+            invariant NoAskAfterFreed: slate == 0;
+            invariant OutIsRaised: phase <= 4 || raised == 1;
+            bound PhaseBox: phase <= 5;
+            bound AsksBox: asks <= 3;
+        }
     }
 }

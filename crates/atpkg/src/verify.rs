@@ -18,18 +18,27 @@ pub enum StagedFrom {
         /// The staged binary's sha256 (lowercase hex).
         sha256: String,
     },
+    /// The payload digest the vendor's own documents named, its tree copied from another
+    /// row's complete build of those same bytes instead of downloaded again.
+    Sibling {
+        /// The row whose build the tree was copied from.
+        program: String,
+    },
 }
 
 impl StagedFrom {
     /// What `record` says its tree was staged from.
     #[must_use]
     pub(crate) fn of(record: &crate::vendor_direct::VendorRecord) -> Self {
-        match (&record.anchor, &record.measured_sha256) {
-            (crate::vendor_direct::Anchor::XaiDeveloperId, _) => Self::DeveloperIdMeasured,
-            (_, Some(sha256)) => Self::RegistryAgreed {
+        match (&record.anchor, &record.measured_sha256, &record.tree_from) {
+            (crate::vendor_direct::Anchor::XaiDeveloperId, _, _) => Self::DeveloperIdMeasured,
+            (_, Some(sha256), _) => Self::RegistryAgreed {
                 sha256: sha256.clone(),
             },
-            (_, None) => Self::Documents,
+            (_, None, Some(program)) => Self::Sibling {
+                program: program.clone(),
+            },
+            (_, None, None) => Self::Documents,
         }
     }
 }
@@ -377,6 +386,7 @@ mod tests {
             verified_at: 1_790_526_112,
             measured_sha256: None,
             agreed_with: None,
+            tree_from: None,
         };
         crate::vendor_direct::durable::write_durable(
             &crate::vendor_direct::record_path(&dir).unwrap(),

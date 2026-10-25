@@ -274,7 +274,11 @@ fn gone_to(verb: &str) -> Option<&'static str> {
         "read" => "`aterm ctl @<sid> text`",
         "shot" => "`aterm ctl @<sid> image <name.png>`",
         "await" => "`aterm ctl @<sid> await <cond>`",
-        "await-turn" => "`aterm ctl @<sid> await agent idle,prompt,question,wall`",
+        "await-turn" => {
+            "`aterm ctl @<sid> await agent idle,prompt,question,wall` (Claude Code, agy, Muse \
+             Code, Gemini CLI); for a codex, `aterm ctl @<sid> await log kind=program \
+             since=<log_seq> ep=<log_ep>` (both from `status`, read before typing)"
+        }
         "supervise" | "watch" => "the window's host (`aterm help harness`)",
         "task" => {
             "`aterm ctl @self spawn agent=claude -` then `aterm ctl await task @<sid> since=0`"

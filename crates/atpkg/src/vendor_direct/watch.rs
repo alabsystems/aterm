@@ -1276,6 +1276,7 @@ mod tests {
             verified_at: 1_790_000_000,
             measured_sha256: None,
             agreed_with: None,
+            tree_from: None,
         };
         let bytes = record.record_bytes().unwrap();
         super::super::durable::write_durable(&record_path(&dir).unwrap(), &bytes).unwrap();

@@ -203,13 +203,25 @@ impl App {
 
     /// Synchronize live theme previews with any open palette's highlighted theme row.
     pub(crate) fn sync_palette_theme_preview(&mut self) {
+        let closed_owner = self.theme_preview.as_ref().and_then(|preview| {
+            let PreviewHold::Palette { window } = preview.hold else {
+                return None;
+            };
+            self.windows
+                .get(&window)
+                .is_none_or(|ws| ws.palette().is_none())
+                .then_some(window)
+        });
+        if let Some(window) = closed_owner {
+            self.end_theme_preview_if(|preview| preview.hold == PreviewHold::Palette { window });
+        }
         let front = self.frontmost_window;
         let trial_window = self.palette_tab_theme.as_ref().map(|trial| trial.window);
         let mut trial_open = false;
         let mut trial_ask: Option<Option<String>> = None;
         let mut any_open = false;
-        let mut ask: Option<Option<String>> = None;
-        let mut front_ask: Option<Option<String>> = None;
+        let mut ask: Option<(crate::WindowId, Option<String>)> = None;
+        let mut front_ask: Option<(crate::WindowId, Option<String>)> = None;
         for (&wid, ws) in &mut self.windows {
             let Some(palette) = ws.palette_mut() else {
                 continue;
@@ -223,29 +235,32 @@ impl App {
             any_open = true;
             if let Some(change) = change {
                 if Some(wid) == front {
-                    front_ask = Some(change);
+                    front_ask = Some((wid, change));
                 } else {
-                    ask = Some(change);
+                    ask = Some((wid, change));
                 }
             }
         }
         self.sync_tab_theme_trial(trial_open, trial_ask);
-        let palette_held =
-            |preview: &crate::control_theme::ThemePreview| preview.hold == PreviewHold::Palette;
+        let palette_held = |preview: &crate::control_theme::ThemePreview| {
+            matches!(preview.hold, PreviewHold::Palette { .. })
+        };
         if !any_open {
             self.end_theme_preview_if(palette_held);
             return;
         }
         match front_ask.or(ask) {
             None => {}
-            Some(Some(id)) if !id.eq_ignore_ascii_case(self.configured_theme_id()) => {
-                if let Err(why) = self.begin_theme_preview(&id, PreviewHold::Palette) {
+            Some((window, Some(id))) if !id.eq_ignore_ascii_case(self.configured_theme_id()) => {
+                if let Err(why) = self.begin_theme_preview(&id, PreviewHold::Palette { window }) {
                     aterm_log::debug!("palette theme preview {id:?}: {why}");
                     self.end_theme_preview_if(palette_held);
                 }
             }
-            Some(_) => {
-                self.end_theme_preview_if(palette_held);
+            Some((window, _)) => {
+                self.end_theme_preview_if(|preview| {
+                    preview.hold == PreviewHold::Palette { window }
+                });
             }
         }
     }
@@ -259,11 +274,15 @@ impl App {
     }
 
     /// Commit theme `id` from the palette while holding [`PreviewHold::Committing`].
+    #[cfg(test)]
     pub(crate) fn palette_choose_theme(&mut self, id: &str) {
-        if let Some(trial) = self
-            .palette_tab_theme
-            .take_if(|trial| Some(trial.window) == self.frontmost_window)
-        {
+        if let Some(wid) = self.frontmost_window {
+            self.palette_choose_theme_in(wid, id);
+        }
+    }
+
+    fn palette_choose_theme_in(&mut self, wid: crate::WindowId, id: &str) {
+        if let Some(trial) = self.palette_tab_theme.take_if(|trial| trial.window == wid) {
             if self.pool.get(trial.session).is_none() {
                 return;
             }
@@ -278,7 +297,9 @@ impl App {
             return;
         }
         if id.eq_ignore_ascii_case(&self.configured_side_name()) {
-            self.end_theme_preview_if(|preview| preview.hold == PreviewHold::Palette);
+            self.end_theme_preview_if(|preview| {
+                preview.hold == PreviewHold::Palette { window: wid }
+            });
             return;
         }
         let already = self
@@ -607,7 +628,9 @@ impl App {
         #[cfg(a11y_tree)]
         self.push_a11y_tree(wid);
         if closed {
-            self.end_theme_preview_if(|preview| preview.hold == PreviewHold::Palette);
+            self.end_theme_preview_if(|preview| {
+                preview.hold == PreviewHold::Palette { window: wid }
+            });
         }
         if closed {
             self.replay_held_pointer(wid);
@@ -624,11 +647,18 @@ impl App {
     }
 
     /// Move the palette selection cursor by `delta` over the filtered rows.
+    #[cfg(test)]
     pub(crate) fn palette_move(&mut self, delta: isize) {
-        if let Some(p) = self.front_mut().and_then(|ws| ws.palette_mut()) {
+        if let Some(wid) = self.frontmost_window {
+            self.palette_move_in(wid, delta);
+        }
+    }
+
+    fn palette_move_in(&mut self, wid: crate::WindowId, delta: isize) {
+        if let Some(p) = self.windows.get_mut(&wid).and_then(|ws| ws.palette_mut()) {
             p.move_selection(delta);
         }
-        self.palette_repaint_front();
+        self.palette_repaint_in(wid);
     }
 
     /// Append filter character `c` and re-filter the open palette.
@@ -637,37 +667,69 @@ impl App {
         if let Some(p) = self.front_mut().and_then(|ws| ws.palette_mut()) {
             p.push_char(c);
         }
-        self.palette_repaint_front();
+        if let Some(wid) = self.frontmost_window {
+            self.palette_repaint_in(wid);
+        }
     }
 
     /// Activate the currently selected palette target.
+    #[cfg(test)]
     pub(crate) fn palette_activate(&mut self) {
+        if let Some(wid) = self.frontmost_window {
+            self.palette_activate_in(wid);
+        }
+    }
+
+    pub(crate) fn palette_activate_in(&mut self, wid: crate::WindowId) {
         let Some(target) = self
-            .front()
+            .windows
+            .get(&wid)
             .and_then(|ws| ws.palette())
             .and_then(PaletteState::selected_target)
         else {
             return;
         };
+        let content = self
+            .windows
+            .get(&wid)
+            .and_then(|window| window.front_content);
         if let PaletteTarget::Theme(id) = target {
-            self.palette_choose_theme(&id);
-            self.palette_exit();
+            self.palette_choose_theme_in(wid, &id);
+            self.palette_exit_in(wid);
             return;
         }
-        self.palette_exit();
+        self.palette_exit_in(wid);
+        if self
+            .windows
+            .get(&wid)
+            .is_none_or(|window| window.front_content != content)
+        {
+            self.pending_action_refusal = Some("The palette's active content changed".to_string());
+            return;
+        }
         match target {
             PaletteTarget::Menu(crate::menu::MenuAction::TakeOver) => {
-                if let Some(wid) = self.frontmost_window {
-                    self.take_over(wid);
-                }
+                self.take_over(wid);
             }
             PaletteTarget::Menu(crate::menu::MenuAction::HandBack) => {
-                if let Some(wid) = self.frontmost_window {
-                    self.hand_back(wid);
+                self.hand_back(wid);
+            }
+            PaletteTarget::Menu(crate::menu::MenuAction::Find) => {
+                self.clear_move_license(wid);
+                self.find_requested_in(wid);
+            }
+            PaletteTarget::Menu(
+                action @ (crate::menu::MenuAction::FindNext | crate::menu::MenuAction::FindPrev),
+            ) => {
+                self.clear_move_license(wid);
+                if let Err(why) =
+                    self.search_find_again_in(wid, action == crate::menu::MenuAction::FindNext)
+                {
+                    self.pending_action_refusal = Some(why.to_string());
                 }
             }
             PaletteTarget::Menu(action) => {
-                self.post_menu_action(action);
+                self.post_palette_menu_action(wid, action);
             }
             PaletteTarget::Native(target) => {
                 let _ = self.activate_native_palette_target(&target);
@@ -709,33 +771,39 @@ impl App {
         Ok(())
     }
 
-    fn palette_repaint_front(&mut self) {
-        if let Some(wid) = self.frontmost_window {
-            self.sync_palette_pointer_cursor(wid);
-        }
-        if let Some(ws) = self.front_mut()
+    fn palette_repaint_in(&mut self, wid: crate::WindowId) {
+        self.sync_palette_pointer_cursor(wid);
+        if let Some(ws) = self.windows.get_mut(&wid)
             && let Some(w) = &ws.os_window
         {
             w.request_redraw();
         }
-        self.overlay_a11y_update();
+        #[cfg(a11y_tree)]
+        self.push_a11y_tree(wid);
     }
 
     /// Apply a [`SearchEdit`](crate::app_search::SearchEdit) to the open palette filter.
+    #[cfg(test)]
     pub(crate) fn palette_edit(&mut self, edit: crate::app_search::SearchEdit) {
-        if let Some(p) = self.front_mut().and_then(|ws| ws.palette_mut()) {
+        if let Some(wid) = self.frontmost_window {
+            self.palette_edit_in(wid, edit);
+        }
+    }
+
+    fn palette_edit_in(&mut self, wid: crate::WindowId, edit: crate::app_search::SearchEdit) {
+        if let Some(p) = self.windows.get_mut(&wid).and_then(|ws| ws.palette_mut()) {
             p.edit(edit);
         }
-        self.palette_repaint_front();
+        self.palette_repaint_in(wid);
     }
 
     /// Execute a classified [`PaletteKey`] on the open palette.
-    pub(crate) fn apply_palette_key(&mut self, key: PaletteKey) {
+    pub(crate) fn apply_palette_key_in(&mut self, wid: crate::WindowId, key: PaletteKey) {
         match key {
-            PaletteKey::Close => self.palette_exit(),
-            PaletteKey::Move(delta) => self.palette_move(delta),
-            PaletteKey::Activate => self.palette_activate(),
-            PaletteKey::Edit(edit) => self.palette_edit(edit),
+            PaletteKey::Close => self.palette_exit_in(wid),
+            PaletteKey::Move(delta) => self.palette_move_in(wid, delta),
+            PaletteKey::Activate => self.palette_activate_in(wid),
+            PaletteKey::Edit(edit) => self.palette_edit_in(wid, edit),
             PaletteKey::Inert => {}
         }
     }
@@ -750,7 +818,7 @@ impl App {
         if self.windows.get(&wid).and_then(|ws| ws.palette()).is_none() {
             return false;
         }
-        self.apply_palette_key(palette_key(mods, ev));
+        self.apply_palette_key_in(wid, palette_key(mods, ev));
         true
     }
 
@@ -767,7 +835,7 @@ impl App {
         let folded = ev.keypad_folded();
         let ev = folded.as_ref().unwrap_or(ev);
         if let Some(key) = palette_input_key(ev) {
-            self.apply_palette_key(key);
+            self.apply_palette_key_in(wid, key);
         }
     }
 }
@@ -878,6 +946,314 @@ mod tests {
         }
     }
 
+    fn two_editor_windows() -> (
+        aterm_tempfile::TempDir,
+        App,
+        [WindowId; 2],
+        [std::path::PathBuf; 2],
+    ) {
+        use crate::native_app::AppKind;
+
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let paths = [scratch.path().join("a.txt"), scratch.path().join("b.txt")];
+        for path in &paths {
+            std::fs::write(path, "one needle two needle").unwrap();
+        }
+        let mut app = App::headless_for_test();
+        let a = WindowId(0);
+        app.open_document_tab(
+            AppKind::Editor,
+            &crate::native_document_host::path_to_file_uri(&paths[0]).unwrap(),
+        )
+        .unwrap();
+        let sink = app.pool.get(0).unwrap().ctx.sink.clone();
+        let sid = app.next_session_id;
+        let b = app.insert_logical_window(crate::stub_session_with_sink(sid, sink), 24, 80);
+        app.open_document_tab(
+            AppKind::Editor,
+            &crate::native_document_host::path_to_file_uri(&paths[1]).unwrap(),
+        )
+        .unwrap();
+        (scratch, app, [a, b], paths)
+    }
+
+    fn open_palette_in(app: &mut App, wid: WindowId, query: &str) {
+        app.palette_open_state(wid, app.palette_snapshot(wid));
+        app.palette_edit_in(
+            wid,
+            crate::app_search::SearchEdit::Insert(query.to_string()),
+        );
+    }
+
+    fn physical_palette_event(
+        app: &mut App,
+        wid: WindowId,
+        code: aterm_window::keyboard::KeyCode,
+        key: aterm_window::keyboard::Key,
+        state: aterm_window::event::ElementState,
+        repeat: bool,
+    ) {
+        app.on_key(
+            wid,
+            aterm_window::event::KeyEvent::synthetic_for_test(
+                aterm_window::keyboard::PhysicalKey::Code(code),
+                key,
+                None,
+                aterm_window::keyboard::KeyLocation::Standard,
+                state,
+                repeat,
+            ),
+        );
+    }
+
+    #[test]
+    fn palette_keys_repeats_and_engine_input_keep_their_originating_window() {
+        use crate::native_app::{AppEvent, TextInputEvent};
+        use aterm_window::event::ElementState::{Pressed, Released};
+        use aterm_window::keyboard::{Key, KeyCode, NamedKey, SmolStr};
+
+        let (_scratch, mut app, [a, b], _) = two_editor_windows();
+        app.find_requested_in(a);
+        app.dispatch_native_event(
+            a,
+            AppEvent::TextInput(TextInputEvent::Commit("needle".into())),
+        )
+        .unwrap();
+        app.dispatch_native_event(
+            a,
+            AppEvent::EditorInput(amacs::input::EditorInput::Key {
+                key: aterm_types::keyboard::Key::Named(aterm_types::keyboard::NamedKey::Enter),
+                mods: aterm_types::keyboard::Modifiers::empty(),
+                text: None,
+            }),
+        )
+        .unwrap();
+        open_palette_in(&mut app, a, "");
+        open_palette_in(&mut app, b, "find");
+        let b_before = app.windows[&b].palette().unwrap().controls_lines();
+        let character = Key::Character(SmolStr::new("s"));
+        physical_palette_event(
+            &mut app,
+            a,
+            KeyCode::KeyS,
+            character.clone(),
+            Pressed,
+            false,
+        );
+        physical_palette_event(&mut app, b, KeyCode::KeyS, character.clone(), Pressed, true);
+        physical_palette_event(&mut app, b, KeyCode::KeyS, character, Released, false);
+        assert_eq!(app.windows[&a].palette().unwrap().query(), "ss");
+        app.palette_input_event(a, &crate::input::InputEvent::Text("ave".to_string()));
+        assert_eq!(app.windows[&a].palette().unwrap().query(), "ssave");
+        app.palette_edit_in(a, crate::app_search::SearchEdit::KillToStart);
+        app.palette_input_event(a, &crate::input::InputEvent::Text("find".to_string()));
+        physical_palette_event(
+            &mut app,
+            a,
+            KeyCode::ArrowDown,
+            Key::Named(NamedKey::ArrowDown),
+            Pressed,
+            false,
+        );
+        physical_palette_event(
+            &mut app,
+            a,
+            KeyCode::ArrowDown,
+            Key::Named(NamedKey::ArrowDown),
+            Released,
+            false,
+        );
+        assert_eq!(
+            app.windows[&a].palette().unwrap().selected_action(),
+            Some(crate::menu::MenuAction::FindNext)
+        );
+        assert_eq!(
+            app.windows[&b].palette().unwrap().controls_lines(),
+            b_before
+        );
+        physical_palette_event(
+            &mut app,
+            a,
+            KeyCode::Escape,
+            Key::Named(NamedKey::Escape),
+            Pressed,
+            false,
+        );
+        physical_palette_event(
+            &mut app,
+            a,
+            KeyCode::Escape,
+            Key::Named(NamedKey::Escape),
+            Released,
+            false,
+        );
+        assert!(app.windows[&a].palette().is_none());
+        assert_eq!(
+            app.windows[&b].palette().unwrap().controls_lines(),
+            b_before
+        );
+        assert_eq!(app.frontmost_window, Some(b));
+    }
+
+    #[test]
+    fn palette_save_and_find_activate_the_owning_editor_without_changing_focus() {
+        use crate::native_app::{AppEvent, AppViewState, TextInputEvent};
+        use crate::native_editor::Minibuffer;
+        use aterm_window::event::ElementState::{Pressed, Released};
+        use aterm_window::keyboard::{Key, KeyCode, NamedKey};
+
+        fn selection(app: &App, wid: WindowId) -> std::ops::Range<usize> {
+            let (_, view) = app.active_native_view(wid).unwrap();
+            match app.native_runtime.view_state(view).unwrap() {
+                AppViewState::Editor(state) => {
+                    state.buffer.as_ref().unwrap().primary_selection().range()
+                }
+                _ => panic!("editor view"),
+            }
+        }
+
+        let (_scratch, mut app, [a, b], paths) = two_editor_windows();
+        for wid in [a, b] {
+            app.dispatch_native_event(
+                wid,
+                AppEvent::TextInput(TextInputEvent::Commit("draft ".into())),
+            )
+            .unwrap();
+            open_palette_in(&mut app, wid, "save");
+        }
+        let (a_instance, a_view) = app.active_native_view(a).unwrap();
+        let (b_instance, b_view) = app.active_native_view(b).unwrap();
+        let a_document = app.native_runtime.document_id(a_instance).unwrap();
+        let b_document = app.native_runtime.document_id(b_instance).unwrap();
+        let draft = app.document_store.snapshot(a_document).unwrap();
+        let b_before = app.windows[&b].palette().unwrap().controls_lines();
+        physical_palette_event(
+            &mut app,
+            a,
+            KeyCode::Enter,
+            Key::Named(NamedKey::Enter),
+            Pressed,
+            false,
+        );
+        physical_palette_event(
+            &mut app,
+            a,
+            KeyCode::Enter,
+            Key::Named(NamedKey::Enter),
+            Released,
+            false,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&paths[0]).unwrap(),
+            draft.text.as_ref()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&paths[1]).unwrap(),
+            "one needle two needle"
+        );
+        assert_eq!(app.document_store.dirty(a_document), Some(false));
+        assert_eq!(app.document_store.dirty(b_document), Some(true));
+        assert_eq!(
+            app.windows[&b].palette().unwrap().controls_lines(),
+            b_before
+        );
+
+        open_palette_in(&mut app, a, "find");
+        app.palette_input_event(
+            a,
+            &crate::input::InputEvent::Key {
+                key: aterm_types::keyboard::Key::Named(aterm_types::keyboard::NamedKey::Enter),
+                mods: aterm_types::keyboard::Modifiers::empty(),
+                base_layout: None,
+                layout_text: None,
+                event_type: aterm_types::keyboard::KeyEventType::Press,
+            },
+        );
+        assert!(matches!(
+            app.native_runtime.view_state(a_view).unwrap(),
+            AppViewState::Editor(state) if matches!(state.buffer.as_ref().unwrap().minibuffer, Minibuffer::Search { .. })
+        ));
+        assert!(matches!(
+            app.native_runtime.view_state(b_view).unwrap(),
+            AppViewState::Editor(state) if matches!(state.buffer.as_ref().unwrap().minibuffer, Minibuffer::Inactive)
+        ));
+        app.dispatch_native_event(
+            a,
+            AppEvent::TextInput(TextInputEvent::Commit("needle".into())),
+        )
+        .unwrap();
+        let first = selection(&app, a);
+        let b_selection = selection(&app, b);
+        for (query, expected) in [("find next", false), ("find previous", true)] {
+            open_palette_in(&mut app, a, query);
+            physical_palette_event(
+                &mut app,
+                a,
+                KeyCode::Enter,
+                Key::Named(NamedKey::Enter),
+                Pressed,
+                false,
+            );
+            physical_palette_event(
+                &mut app,
+                a,
+                KeyCode::Enter,
+                Key::Named(NamedKey::Enter),
+                Released,
+                false,
+            );
+            assert_eq!(selection(&app, a) == first, expected);
+            assert_eq!(selection(&app, b), b_selection);
+            assert_eq!(
+                app.windows[&b].palette().unwrap().controls_lines(),
+                b_before
+            );
+        }
+        assert_eq!(app.frontmost_window, Some(b));
+        let after = app.document_store.snapshot(a_document).unwrap();
+        assert_eq!(after.seq, draft.seq);
+        assert_eq!(after.text, draft.text);
+    }
+
+    #[test]
+    fn queued_palette_menu_actions_refuse_replaced_tabs_panes_and_windows() {
+        for replacement in ["tab", "pane", "window"] {
+            let mut app = App::headless_for_test();
+            let a = WindowId(0);
+            let origin = app.palette_menu_origin(a).unwrap();
+            let action = crate::menu::MenuAction::NextTab;
+            assert_eq!(
+                app.menu_action_for_origin(action, Some(origin)),
+                Some(action)
+            );
+            let sink = app.pool.get(0).unwrap().ctx.sink.clone();
+            let sid = app.next_session_id;
+            match replacement {
+                "tab" => {
+                    app.next_session_id += 1;
+                    app.install_tab_session(a, crate::stub_session_with_sink(sid, sink), None);
+                }
+                "pane" => {
+                    app.install_split_pane(
+                        a,
+                        crate::pane::SplitDir::Vertical,
+                        crate::stub_session_with_sink(sid, sink),
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    app.close_window_logical(a);
+                    app.insert_logical_window(crate::stub_session_with_sink(sid, sink), 24, 80);
+                }
+            }
+            assert_eq!(
+                app.menu_action_for_origin(action, Some(origin)),
+                None,
+                "{replacement}"
+            );
+        }
+    }
+
     #[test]
     fn one_shared_find_row_opens_the_active_native_search() {
         use crate::menu::MenuAction;
@@ -911,7 +1287,6 @@ mod tests {
             assert_eq!(chosen, MenuAction::Find);
             app.palette_activate();
             assert!(app.windows[&wid].palette().is_none());
-            app.dispatch_action(wid, crate::keybinding::Action::Find);
         }
 
         let mut app = App::headless_for_test();
@@ -2005,6 +2380,60 @@ mod tests {
     }
 
     #[test]
+    fn a_palette_close_ends_only_its_own_theme_preview() {
+        let mut app = themed_app("theme = \"Dracula\"\n");
+        let before = app.theme;
+        let a = WindowId(0);
+        app.palette_enter();
+        let sink = app.pool.get(0).unwrap().ctx.sink.clone();
+        let sid = app.next_session_id;
+        let b = app.insert_logical_window(crate::stub_session_with_sink(sid, sink), 24, 80);
+        app.open_theme_palette();
+        highlight_in(&mut app, b, "Gruvbox Light");
+        app.sync_palette_theme_preview();
+        let preview = app.theme_preview.clone().unwrap();
+        assert_eq!(preview.hold, PreviewHold::Palette { window: b });
+        app.palette_exit_in(a);
+        assert_eq!(app.theme_preview.as_ref(), Some(&preview));
+        open_palette_in(&mut app, a, "");
+        app.close_window_logical(b);
+        app.sync_palette_theme_preview();
+        assert!(app.windows[&a].palette().is_some());
+        assert!(app.theme_preview.is_none());
+        assert_eq!(app.theme, before);
+    }
+
+    #[test]
+    fn a_background_tab_theme_palette_commits_only_its_own_session() {
+        let mut app = themed_app("theme = \"Dracula\"\n");
+        let before = durable(&app);
+        let a = WindowId(0);
+        app.open_tab_theme_palette();
+        highlight_in(&mut app, a, "Gruvbox Light");
+        app.sync_palette_theme_preview();
+        let sink = app.pool.get(0).unwrap().ctx.sink.clone();
+        let sid = app.next_session_id;
+        let b = app.insert_logical_window(crate::stub_session_with_sink(sid, sink), 24, 80);
+        app.palette_enter();
+        let b_before = app.windows[&b].palette().unwrap().controls_lines();
+        app.palette_activate_in(a);
+        app.sync_palette_theme_preview();
+        assert!(app.windows[&a].palette().is_none());
+        assert_eq!(
+            app.windows[&b].palette().unwrap().controls_lines(),
+            b_before
+        );
+        assert_eq!(app.frontmost_window, Some(b));
+        assert_eq!(
+            app.pool.theme(0).map(|theme| theme.selector.as_str()),
+            Some("Gruvbox Light")
+        );
+        assert!(app.pool.theme(sid).is_none());
+        assert!(app.palette_tab_theme.is_none());
+        assert_eq!(durable(&app), before);
+    }
+
+    #[test]
     fn palette_theme_highlight_previews_and_esc_reverts() {
         let mut app = themed_app("theme = \"Dracula\"\n");
         let before = app.theme;
@@ -2020,7 +2449,12 @@ mod tests {
         assert_eq!(app.engine_color_fanouts, fanouts + 1, "one install");
         assert_eq!(
             app.theme_preview.as_ref().map(|p| (p.id.as_str(), p.hold)),
-            Some(("Gruvbox Light", PreviewHold::Palette))
+            Some((
+                "Gruvbox Light",
+                PreviewHold::Palette {
+                    window: WindowId(0)
+                }
+            ))
         );
         assert_eq!(
             app.next_theme_preview_wake(),
@@ -2185,7 +2619,6 @@ mod tests {
 
         app.palette_enter();
         assert!(app.windows[&b].palette().is_some());
-        app.frontmost_window = Some(a);
         let esc = crate::input::InputEvent::Key {
             key: aterm_types::keyboard::Key::Named(aterm_types::keyboard::NamedKey::Escape),
             mods: aterm_types::keyboard::Modifiers::empty(),

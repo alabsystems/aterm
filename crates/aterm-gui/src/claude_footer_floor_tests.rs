@@ -75,13 +75,14 @@ fn tabs(sides: &[Side]) -> Vec<(&'static str, RenderCell)> {
     tabs
 }
 
+/// The marks [`every_fact`] draws: the join twice, before the plan and before the week.
 const MARKS: [char; 10] = [
     footer::MODEL_MARK,
     footer::PATH_MARK,
     footer::BRANCH_MARK,
     footer::ACCOUNT_MARK,
-    footer::PLAN_MARK,
-    footer::WEEKLY_MARK,
+    footer::JOIN_MARK,
+    footer::JOIN_MARK,
     footer::WALL_MARK,
     footer::CONTEXT_MARK,
     footer::USAGE_MARK,
@@ -93,8 +94,8 @@ fn every_fact() -> footer::RuleFit {
     footer::RuleFit {
         segments: vec![
             Segment::plain(footer::ACCOUNT_MARK, "me@example.test"),
-            Segment::plain(footer::PLAN_MARK, "max"),
-            Segment::plain(footer::WEEKLY_MARK, "40%"),
+            Segment::joined(footer::PLAN_MARK, "max"),
+            Segment::joined(footer::WEEKLY_MARK, "40%"),
             Segment::plain(footer::WALL_MARK, format!("5h {} 3pm", footer::RESET_MARK)),
             Segment {
                 split: Some("Opus 5.5 ".len()),
@@ -128,6 +129,7 @@ fn every_fact_mark_reads_on_every_ground() {
         FactKind::Branch => Some(footer::BRANCH_MARK),
         FactKind::Context => Some(footer::CONTEXT_MARK),
         FactKind::Usage => Some(footer::USAGE_MARK),
+        FactKind::Account => Some(footer::ACCOUNT_MARK),
         FactKind::Effort => None,
     };
     for instance in &sides {
@@ -143,6 +145,7 @@ fn every_fact_mark_reads_on_every_ground() {
                         FactKind::Branch,
                         FactKind::Context,
                         FactKind::Usage,
+                        FactKind::Account,
                     ]
                     .map(Some),
                 ) {
@@ -201,7 +204,7 @@ fn every_fact_mark_reads_on_every_ground() {
     assert!(kept > 0, "some theme's own mix reads and is kept");
     assert_eq!(
         lit_marks,
-        sides.len() * sides.len() * 3 * 5,
+        sides.len() * sides.len() * 3 * 6,
         "every lit fact's mark"
     );
     assert!(lit_kept > 0, "some accent reads and is kept lit");
@@ -240,6 +243,7 @@ fn every_fact_word_reads_on_every_ground() {
                         FactKind::Branch,
                         FactKind::Context,
                         FactKind::Usage,
+                        FactKind::Account,
                     ]
                     .map(Some),
                 ) {

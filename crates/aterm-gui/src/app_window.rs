@@ -145,6 +145,68 @@ impl CarriedFrame {
             inner_px: PhysicalSize::new(width, height),
         })
     }
+
+    /// The grid and frame a cold restore creates its first window at from that window's
+    /// `layout`, where the command line's `--lines` and `--columns` (`lines`, `columns`) name the
+    /// grid over the layout's: the frame is `layout`'s, as the windows after it carry theirs
+    /// ([`Self::of`]), unless the command line named the lines or columns, which size it
+    /// instead. `None` for a maximized window, which the OS sizes.
+    #[must_use]
+    pub(crate) fn cold_first_seed(
+        layout: &crate::restore::WindowLayout,
+        lines: Option<u16>,
+        columns: Option<u16>,
+    ) -> Option<ColdFirstSeed> {
+        if layout.maximized == Some(true) {
+            return None;
+        }
+        let grid = (
+            lines.unwrap_or(layout.rows).clamp(5, 300),
+            columns.unwrap_or(layout.cols).clamp(20, 500),
+        );
+        let frame = (lines.is_none() && columns.is_none())
+            .then(|| Self::of(layout))
+            .flatten()
+            .map(|frame| frame.inner_px);
+        Some(ColdFirstSeed { grid, frame })
+    }
+}
+
+/// What a cold restore creates its first window at ([`CarriedFrame::cold_first_seed`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ColdFirstSeed {
+    /// Rows and columns.
+    pub(crate) grid: (u16, u16),
+    /// The frame it carries, or `None` to size it to `grid`.
+    pub(crate) frame: Option<PhysicalSize<u32>>,
+}
+
+/// The frame a window attaches at when it carries `carried` and its grid's own frame is
+/// `exact`: `carried` where it holds the `grid` (rows, cols) with less than a cell to spare each
+/// way, or, where the deck moved under it for something other than its rows (`moved`,
+/// `CarriedDeck::keeps_frame`), where it holds the grid's columns with less than a cell to
+/// spare, and the grid re-grids to it once (`attach_os_window`); else `None`, and the window
+/// takes `exact`. `grid_of` is the grid a frame holds. [`App::attach_frame_px`] and the Windows
+/// early reveal both size by it, so the window shown early is the window attached.
+#[must_use]
+pub(crate) fn kept_carried_frame(
+    exact: PhysicalSize<u32>,
+    carried: PhysicalSize<u32>,
+    (cell_w, cell_h): (usize, usize),
+    grid: (u16, u16),
+    moved: bool,
+    grid_of: impl Fn(PhysicalSize<u32>) -> (u16, u16),
+) -> Option<PhysicalSize<u32>> {
+    let under_a_cell = |got: u32, frame: u32, cell: usize| {
+        got.checked_sub(frame)
+            .is_some_and(|extra| (extra as usize) < cell)
+    };
+    if !under_a_cell(carried.width, exact.width, cell_w) {
+        return None;
+    }
+    let held = grid_of(carried);
+    let holds = under_a_cell(carried.height, exact.height, cell_h) && held == grid;
+    (holds || moved && held.1 == grid.1).then_some(carried)
 }
 
 /// Where a restored window goes before it is first shown (Windows, and X11's position).
@@ -768,28 +830,15 @@ impl App {
         let Some(carried) = carried else {
             return exact;
         };
-        let (cell_w, cell_h) = self.win_cell_size(wid);
-        let remainder = |got: u32, frame: u32, cell: usize| {
-            got.checked_sub(frame)
-                .is_some_and(|extra| (extra as usize) < cell)
-        };
-        if remainder(carried.width, exact.width, cell_w)
-            && remainder(carried.height, exact.height, cell_h)
-            && self.grid_dims_for(wid, carried) == (rows, cols)
-        {
-            return carried;
-        }
-        // A frame whose deck moved under it for something other than its rows keeps its size;
-        // the grid re-grids to it once (`attach_os_window`, `CarriedDeck::keeps_frame`).
         let moved = self.windows.get(&wid).is_some_and(|ws| {
             self.carried_deck_of(wid, ws.head_pts, ws.scale, (rows, cols), carried.height)
                 .is_some_and(|was| was.keeps_frame(self.deck_style(), ws.deck_form))
         });
-        if moved
-            && remainder(carried.width, exact.width, cell_w)
-            && self.grid_dims_for(wid, carried).1 == cols
-        {
-            return carried;
+        let cells = self.win_cell_size(wid);
+        if let Some(kept) = kept_carried_frame(exact, carried, cells, (rows, cols), moved, |px| {
+            self.grid_dims_for(wid, px)
+        }) {
+            return kept;
         }
         aterm_log::info!(
             "restore: window {}'s carried size {}x{} does not hold the carried \
@@ -1035,11 +1084,8 @@ impl App {
                 let head_in = |style, form| {
                     band + crate::stats_deck::deck_px(bars, style, form, scale, cell_h)
                 };
-                let carried_h = self
-                    .windows
-                    .get(&wid)
-                    .and_then(|ws| ws.carried_inner_px)
-                    .map(|c| c.height);
+                let carried = self.windows.get(&wid).and_then(|ws| ws.carried_inner_px);
+                let carried_h = carried.map(|c| c.height);
                 let was = carried_h.and_then(|h| {
                     crate::stats_deck::carried_deck(h, cell_h, style, head_in, |head| {
                         frame(head).height
@@ -1065,11 +1111,37 @@ impl App {
                 let room =
                     crate::stats_deck::deck_room(style, bars, band, scale, cell_h, rows_under);
                 let deck = crate::stats_plan::deck_form_for(room, prev, self.deck_size_pref());
-                // A frame whose deck moved under it keeps its size (`attach_frame_px`).
-                let exact = match was {
-                    Some(was) if was.keeps_frame(style, deck) => frame(was.head),
-                    _ => frame(head_in(style, deck)),
+                // Sized as `attach_frame_px` sizes it, so the window shown is the one attached.
+                let head = head_in(style, deck);
+                let moved = was.is_some_and(|was| was.keeps_frame(style, deck));
+                let grid_of = |px: PhysicalSize<u32>| {
+                    let cols = aterm_render::pad_split(px.width as usize, pad, cell_w).cells;
+                    let rows = crate::asymmetric_pad_cells(
+                        (px.height as usize).saturating_sub(head),
+                        pad_top,
+                        pad,
+                        cell_h,
+                    );
+                    (
+                        u16::try_from(rows)
+                            .unwrap_or(u16::MAX)
+                            .saturating_sub(chrome)
+                            .max(1),
+                        u16::try_from(cols).unwrap_or(u16::MAX),
+                    )
                 };
+                let exact = carried
+                    .and_then(|carried| {
+                        kept_carried_frame(
+                            frame(head),
+                            carried,
+                            (cell_w, cell_h),
+                            (rows, cols),
+                            moved,
+                            grid_of,
+                        )
+                    })
+                    .unwrap_or_else(|| frame(head));
                 let _ = window.request_inner_size(exact);
                 if let Some((x, y)) =
                     bootstrap_restore.and_then(|wl| Some((wl.outer_x?, wl.outer_y?)))
@@ -3010,6 +3082,82 @@ mod tests {
     use super::*;
 
     use crate::feed_session_for_test as feed;
+
+    #[test]
+    fn a_cold_restores_first_window_carries_its_frame_unless_sized_otherwise() {
+        let layout = |maximized, inner_px| crate::restore::WindowLayout {
+            rows: 66,
+            cols: 146,
+            active_tab: 0,
+            outer_x: None,
+            outer_y: None,
+            maximized,
+            inner_px,
+            presence_row: false,
+            show: crate::restore::WindowShow::UNKNOWN,
+            tabs: Vec::new(),
+            native_tabs: Vec::new(),
+            tab_order: Vec::new(),
+            active_item: None,
+            restored_tabs: Vec::new(),
+        };
+        let quit = PhysicalSize::new(2238, 2168);
+        let framed = layout(None, Some([2238, 2168]));
+        let seed = |layout, lines, columns| {
+            CarriedFrame::cold_first_seed(layout, lines, columns)
+                .map(|seed| (seed.grid, seed.frame))
+        };
+        assert_eq!(seed(&framed, None, None), Some(((66, 146), Some(quit))));
+        assert_eq!(
+            seed(&framed, None, None).and_then(|(_, frame)| frame),
+            CarriedFrame::of(&framed).map(|frame| frame.inner_px),
+            "as the windows after it carry theirs"
+        );
+        assert_eq!(seed(&framed, Some(40), None), Some(((40, 146), None)));
+        assert_eq!(seed(&framed, None, Some(9)), Some(((66, 20), None)));
+        let maximized = layout(Some(true), Some([2238, 2168]));
+        assert_eq!(seed(&maximized, None, None), None);
+        assert_eq!(seed(&maximized, Some(40), Some(100)), None);
+        let unframed = layout(Some(false), None);
+        assert_eq!(seed(&unframed, None, None), Some(((66, 146), None)));
+    }
+
+    #[test]
+    fn a_carried_frame_is_kept_where_it_holds_the_grid_or_the_deck_moved_under_it() {
+        let cell = (14_usize, 28_usize);
+        let grid = (66_u16, 146_u16);
+        let grid_of = |px: PhysicalSize<u32>| {
+            (
+                (px.height as usize / cell.1) as u16,
+                (px.width as usize / cell.0) as u16,
+            )
+        };
+        let exact = PhysicalSize::new(146 * 14, 66 * 28);
+        let by = |w: u32, h: u32| PhysicalSize::new(exact.width + w, exact.height + h);
+        let kept = |carried, moved| kept_carried_frame(exact, carried, cell, grid, moved, grid_of);
+        assert_eq!(kept(exact, false), Some(exact));
+        assert_eq!(
+            kept(by(13, 27), false),
+            Some(by(13, 27)),
+            "under a cell to spare"
+        );
+        assert_eq!(kept(by(14, 0), false), None, "a column to spare");
+        assert_eq!(kept(by(0, 28), false), None, "a row to spare");
+        let short = PhysicalSize::new(exact.width, exact.height - 1);
+        assert_eq!(kept(short, false), None, "short of the grid");
+        let restyled = by(5, 3 * 28);
+        assert_eq!(kept(restyled, false), None);
+        assert_eq!(
+            kept(restyled, true),
+            Some(restyled),
+            "the deck moved under it"
+        );
+        assert_eq!(
+            kept(by(14, 3 * 28), true),
+            None,
+            "its columns are not the grid's"
+        );
+    }
 
     #[test]
     fn the_os_caption_drops_a_leading_spinner_frame() {

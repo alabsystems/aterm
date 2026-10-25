@@ -595,6 +595,8 @@ impl std::error::Error for FleetError {
 /// or early data.
 #[must_use]
 pub fn server_config() -> Arc<ServerConfig> {
+    #[cfg(all(test, unix))]
+    test_socket_headroom();
     static CONFIG: OnceLock<Arc<ServerConfig>> = OnceLock::new();
     Arc::clone(CONFIG.get_or_init(|| {
         tls::init_crypto();
@@ -611,10 +613,45 @@ pub fn server_config() -> Arc<ServerConfig> {
     }))
 }
 
+/// Parallel loopback fixtures deliberately hold hundreds of cloned sockets.
+/// macOS shells commonly inherit a 256-descriptor soft limit; that is a fixture
+/// resource shortage, not a reason for unrelated peers to fail authentication.
+#[cfg(all(test, unix))]
+fn test_socket_headroom() {
+    static READY: std::sync::Once = std::sync::Once::new();
+    READY.call_once(|| {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: limit is a live writable rlimit for this complete call.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) },
+            0
+        );
+        let wanted = limit.rlim_max.min(4096);
+        if limit.rlim_cur < wanted {
+            limit.rlim_cur = wanted;
+            // SAFETY: initialized resource limit, bounded by the existing hard
+            // limit. Only the test process's soft descriptor limit is raised.
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) },
+                0
+            );
+        }
+        assert!(
+            limit.rlim_cur >= 1024,
+            "parallel network fixtures need at least 1024 descriptors"
+        );
+    });
+}
+
 /// Dialer TLS 1.3 [`ClientConfig`] pinning [`CERT_DER`] and offering [`ALPN_NODES`] before
 /// [`ALPN`].
 #[must_use]
 pub fn client_config() -> Arc<ClientConfig> {
+    #[cfg(all(test, unix))]
+    test_socket_headroom();
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     Arc::clone(CONFIG.get_or_init(|| {
         tls::init_crypto();
@@ -959,6 +996,7 @@ pub struct Served {
     release: Release,
     transport: TlsTransport<ServerConnection>,
     peer: Option<NodeProof>,
+    admission: Admission,
 }
 
 impl Served {
@@ -977,20 +1015,97 @@ impl Served {
     /// Relay the connection to `local` via [`tls::relay_answers`], releasing the listener hold
     /// before EOF.
     /// # Errors
-    /// As [`tls::relay_answers`].
+    /// As [`tls::relay_answers`], or if native locality evidence changed.
     pub fn relay_answers(self, local: aterm_uds::CtlStream) -> io::Result<()> {
-        tls::relay_answers(self.transport, local, self.release)
+        self.admission.recheck()?;
+        let result = tls::relay_answers(self.transport, local, self.release);
+        self.admission.recheck()?;
+        result
     }
 
     /// Serve a direct response via `write` ([`tls::answer`]), flushing and releasing the listener
     /// hold before EOF.
     /// # Errors
-    /// `write`'s own, or the flush's.
+    /// `write`'s own, the flush's, or changed native locality evidence.
     pub fn answer<T>(
         self,
         write: impl FnOnce(&mut tls::Answering<'_, ServerConnection>) -> io::Result<T>,
     ) -> io::Result<T> {
-        tls::answer(self.transport, self.release, write)
+        self.admission.recheck()?;
+        tls::answer(self.transport, self.release, |stream| {
+            let result = write(stream);
+            self.admission.recheck()?;
+            result
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Locality {
+    Fleet,
+    #[cfg(unix)]
+    Link(crate::lan::Scope),
+}
+
+#[derive(Default)]
+struct Admission {
+    #[cfg(unix)]
+    proof: Option<crate::lan::Proof>,
+}
+impl Admission {
+    fn inspect(
+        tcp: TcpStream,
+        locality: Locality,
+        #[cfg(unix)] witness: Option<crate::lan::ListenerWitness>,
+    ) -> io::Result<(TcpStream, Self)> {
+        match locality {
+            Locality::Fleet => Ok((tcp, Self::default())),
+            #[cfg(unix)]
+            Locality::Link(scope) => {
+                let connection = match witness {
+                    Some(witness) => crate::lan::Connection::admitted_by(tcp, scope, witness)?,
+                    None => crate::lan::Connection::admit(tcp, scope)?,
+                };
+                let (tcp, proof) = connection.into_parts();
+                Ok((tcp, Self { proof: Some(proof) }))
+            }
+        }
+    }
+    fn recheck(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        if let Some(proof) = &self.proof {
+            proof.recheck()?;
+        }
+        Ok(())
+    }
+}
+
+enum ListenerSocket<'a> {
+    Fleet(&'a TcpListener),
+    #[cfg(unix)]
+    Link(crate::lan::Listener),
+}
+impl ListenerSocket<'_> {
+    fn tcp(&self) -> &TcpListener {
+        match self {
+            Self::Fleet(tcp) => tcp,
+            #[cfg(unix)]
+            Self::Link(listener) => &listener.tcp,
+        }
+    }
+    fn recheck(&self) -> io::Result<()> {
+        match self {
+            Self::Fleet(_) => Ok(()),
+            #[cfg(unix)]
+            Self::Link(listener) => listener.recheck(),
+        }
+    }
+    #[cfg(unix)]
+    fn witness(&self) -> Option<crate::lan::ListenerWitness> {
+        match self {
+            Self::Fleet(_) => None,
+            Self::Link(listener) => Some(listener.witness()),
+        }
     }
 }
 
@@ -1006,7 +1121,80 @@ pub fn serve<H, E>(
     H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
     E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
 {
-    if let Err(error) = listener.set_nonblocking(true) {
+    serve_with_handshake(
+        listener,
+        listening,
+        running,
+        HANDSHAKE_WITHIN,
+        hand_over,
+        on_event,
+    );
+}
+
+/// Supply the handshake policy explicitly; test peers use their hang detector.
+pub(crate) fn serve_with_handshake<H, E>(
+    listener: &TcpListener,
+    listening: &Listening,
+    running: &AtomicBool,
+    handshake_within: Duration,
+    hand_over: H,
+    on_event: E,
+) where
+    H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
+    E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
+{
+    serve_inner(
+        ListenerSocket::Fleet(listener),
+        listening,
+        running,
+        Locality::Fleet,
+        handshake_within,
+        hand_over,
+        on_event,
+    );
+}
+
+/// Own and serve a prepared listener with native admission before TLS, after
+/// authentication, and around each response. A changed attachment stops service,
+/// closes all live connections, and drops the listening socket before returning.
+/// This retains the fleet listener's bounded slots and lifetimes.
+#[cfg(unix)]
+pub fn serve_lan<H, E>(
+    listener: crate::lan::Listener,
+    listening: &Listening,
+    running: &AtomicBool,
+    hand_over: H,
+    on_event: E,
+) where
+    H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
+    E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
+{
+    let locality = Locality::Link(listener.scope);
+    serve_inner(
+        ListenerSocket::Link(listener),
+        listening,
+        running,
+        locality,
+        HANDSHAKE_WITHIN,
+        hand_over,
+        on_event,
+    );
+}
+
+fn serve_inner<H, E>(
+    listener: ListenerSocket<'_>,
+    listening: &Listening,
+    running: &AtomicBool,
+    locality: Locality,
+    handshake_within: Duration,
+    hand_over: H,
+    on_event: E,
+) where
+    H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
+    E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
+{
+    if let Err(error) = listener.tcp().set_nonblocking(true) {
+        drop(listener);
         on_event(FleetEvent::Stopped(format!(
             "could not make the fleet listener non-blocking: {error}"
         )));
@@ -1015,16 +1203,21 @@ pub fn serve<H, E>(
     let slots = Arc::new(Slots::new(listening.slots, PREAUTH_GRACE));
     let live = Arc::new(LiveConnections::default());
     let mut next_id: u64 = 0;
+    let mut stopped = None;
     while running.load(Ordering::Acquire) {
+        if let Err(error) = listener.recheck() {
+            stopped = Some(format!("listener withdrawn: {error}"));
+            break;
+        }
         live.cut_overdue(listening.lifetime);
-        let (tcp, peer) = match listener.accept() {
+        let (tcp, peer) = match listener.tcp().accept() {
             Ok(accepted) => {
                 let _ = aterm_uds::keep_out_of_children(&accepted.0);
                 accepted
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // A readiness error backs off like an accept error below, so neither busy-loops.
-                if wait_listener_readable(listener, ACCEPT_POLL).is_err()
+                if wait_listener_readable(listener.tcp(), ACCEPT_POLL).is_err()
                     && running.load(Ordering::Acquire)
                 {
                     std::thread::sleep(ACCEPT_POLL);
@@ -1036,7 +1229,11 @@ pub fn serve<H, E>(
                 continue;
             }
         };
-        if !is_fleet_source(peer.ip()) {
+        if let Err(error) = listener.recheck() {
+            stopped = Some(format!("listener withdrawn: {error}"));
+            break;
+        }
+        if matches!(locality, Locality::Fleet) && !is_fleet_source(peer.ip()) {
             on_event(FleetEvent::Refused {
                 peer,
                 reason: NOT_A_FLEET_SOURCE.to_owned(),
@@ -1054,7 +1251,7 @@ pub fn serve<H, E>(
         let armed = tcp
             .try_clone()
             .map_err(FleetError::Io)
-            .and_then(|line| Ok((line, arm(&tcp, HANDSHAKE_WITHIN)?)));
+            .and_then(|line| Ok((line, arm(&tcp, handshake_within)?)));
         let (line, watchdog) = match armed {
             Ok(armed) => armed,
             Err(e) => {
@@ -1081,37 +1278,62 @@ pub fn serve<H, E>(
         } = listening.clone();
         let hand_over = hand_over.clone();
         let tell = on_event.clone();
+        #[cfg(unix)]
+        let witness = listener.witness();
         let spawned = std::thread::Builder::new()
             .name("aterm-fleet-conn".to_owned())
             .spawn(move || {
                 let release = release;
-                let event = match server_handshake_armed(
-                    tcp,
-                    watchdog,
-                    HANDSHAKE_WITHIN,
-                    (&secret, node.as_ref()),
-                    scope,
-                    serves,
-                    |op| {
-                        let drive = op == FleetOp::Drive;
-                        let share = if drive {
-                            drive_per_source(most)
-                        } else {
-                            per_source
-                        };
-                        release.tenure.proved(drive, share)
-                    },
-                ) {
-                    Ok(Accepted {
-                        transport,
-                        op,
-                        peer: proof,
-                    }) => {
+                let handshake: Result<_, FleetError> = (|| {
+                    let (tcp, admission) = match Admission::inspect(
+                        tcp,
+                        locality,
+                        #[cfg(unix)]
+                        witness,
+                    ) {
+                        Ok(admitted) => admitted,
+                        Err(error) => {
+                            // The native refusal still owns the armed phase.
+                            // Retire its thread/socket before freeing the slot.
+                            let _ = watchdog.finish();
+                            return Err(FleetError::Io(error));
+                        }
+                    };
+                    let accepted = server_handshake_armed(
+                        tcp,
+                        watchdog,
+                        handshake_within,
+                        (&secret, node.as_ref()),
+                        scope,
+                        serves,
+                        |op| {
+                            let drive = op == FleetOp::Drive;
+                            let share = if drive {
+                                drive_per_source(most)
+                            } else {
+                                per_source
+                            };
+                            release.tenure.proved(drive, share)
+                        },
+                    )?;
+                    admission.recheck().map_err(FleetError::Io)?;
+                    Ok((accepted, admission))
+                })();
+                let event = match handshake {
+                    Ok((
+                        Accepted {
+                            transport,
+                            op,
+                            peer: proof,
+                        },
+                        admission,
+                    )) => {
                         tell(FleetEvent::Admitted { peer, op });
                         let served = Served {
                             transport,
                             release,
                             peer: proof,
+                            admission,
                         };
                         FleetEvent::Closed {
                             peer,
@@ -1135,7 +1357,11 @@ pub fn serve<H, E>(
             });
         }
     }
+    drop(listener);
     live.cut_all();
+    if let Some(reason) = stopped {
+        on_event(FleetEvent::Stopped(reason));
+    }
 }
 
 #[derive(Default)]
@@ -2688,6 +2914,7 @@ mod tests {
 
     #[derive(Default)]
     struct Heard {
+        refused: Mutex<Vec<String>>,
         at_capacity: std::sync::atomic::AtomicUsize,
         displaced: std::sync::atomic::AtomicUsize,
         refused_v6: Mutex<Vec<String>>,
@@ -2706,19 +2933,27 @@ mod tests {
             let thread = std::thread::spawn({
                 let (heard, running) = (Arc::clone(&heard), Arc::clone(&running));
                 move || {
-                    serve(&listener, &listening, &running, echo, move |event| {
-                        if let FleetEvent::Refused { peer, reason } = event {
-                            if reason == AT_CAPACITY {
-                                heard.at_capacity.fetch_add(1, Ordering::SeqCst);
+                    serve_with_handshake(
+                        &listener,
+                        &listening,
+                        &running,
+                        HANG,
+                        echo,
+                        move |event| {
+                            if let FleetEvent::Refused { peer, reason } = event {
+                                heard.refused.lock().unwrap().push(reason.clone());
+                                if reason == AT_CAPACITY {
+                                    heard.at_capacity.fetch_add(1, Ordering::SeqCst);
+                                }
+                                if reason == DISPLACED {
+                                    heard.displaced.fetch_add(1, Ordering::SeqCst);
+                                }
+                                if peer.ip().to_canonical().is_ipv6() {
+                                    heard.refused_v6.lock().unwrap().push(reason);
+                                }
                             }
-                            if reason == DISPLACED {
-                                heard.displaced.fetch_add(1, Ordering::SeqCst);
-                            }
-                            if peer.ip().to_canonical().is_ipv6() {
-                                heard.refused_v6.lock().unwrap().push(reason);
-                            }
-                        }
-                    });
+                        },
+                    );
                 }
             });
             Self {
@@ -2892,7 +3127,16 @@ mod tests {
         };
 
         let mut members: Vec<_> = (0..MAX_SLOTS)
-            .map(|i| dial().unwrap_or_else(|e| panic!("member {i}: {e}")).0)
+            .map(|i| {
+                dial()
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "member {i}: {e}; listener refused: {:?}",
+                            served.heard.refused.lock().unwrap()
+                        )
+                    })
+                    .0
+            })
             .collect();
         std::thread::sleep(PREAUTH_GRACE + Duration::from_millis(500));
 

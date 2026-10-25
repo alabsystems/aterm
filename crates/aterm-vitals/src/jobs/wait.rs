@@ -244,7 +244,9 @@ fn reads_terminal(scene: &Scene<'_>, pid: u32) -> bool {
             knotes.as_ref().is_none_or(|k| {
                 k.iter().any(|k| {
                     k.filter == KnoteFilter::Read
-                        && fd_is(fds, k.ident, |f| matches!(f, FdKind::Device { tty: true }))
+                        && fd_is(fds, k.ident, |f| {
+                            matches!(f, FdKind::Device { tty: true, .. })
+                        })
                 })
             })
         })
@@ -265,6 +267,9 @@ fn leaf_wait(
         return Some(mk(WaitName::ProgramCheck));
     }
 
+    // Linux names no pipe's waiter: the wait channel says the process sleeps on a pipe, and the
+    // descriptor its read or write names, where read, which one.
+    let named = |f: &Fd| p.blocked_fd.is_none_or(|b| b == f.fd);
     let linux_reading =
         wchan.starts_with("pipe_read") || wchan == "pipe_wait" || wchan == "wait_for_partner";
     for f in fds {
@@ -282,7 +287,7 @@ fn leaf_wait(
             continue;
         }
         let flagged = scene.lanes.pipe_flags && status.is_some_and(|s| s & PIPE_WANTR != 0);
-        if !(flagged || linux_reading) {
+        if !(flagged || (linux_reading && named(f))) {
             continue;
         }
         let writer = holder(scene, *peer, *handle, true, pid);
@@ -316,7 +321,7 @@ fn leaf_wait(
         }
         let reader = holder(scene, *peer, *handle, false, pid);
         let full = scene.lanes.pipe_flags && reader_end_full(scene, *peer, *handle, pid);
-        if !(full || (linux_writing && *write_end == Some(true))) {
+        if !(full || (linux_writing && *write_end == Some(true) && named(f))) {
             continue;
         }
         let mut w = mk(WaitName::PipeFull);

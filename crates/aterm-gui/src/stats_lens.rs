@@ -72,6 +72,29 @@ pub(crate) struct LensSlot {
     pub(crate) rect: Option<(u32, u32, u32, u32)>,
     /// The instrument and scope the last lens showed.
     pub(crate) last: Option<(Instrument, Bar)>,
+    /// The open lens's shell raster, kept while its prims stay the same.
+    pub(crate) shell: Option<ShellRaster>,
+}
+
+/// The lens shell's raster: its shadow rings, ground and rim, which a new reading leaves as they
+/// were, so the card's body is drawn over a copy of it.
+#[derive(Clone)]
+pub(crate) struct ShellRaster {
+    /// The shell's prims and size it was rasterized from.
+    fp: u64,
+    rgba: std::sync::Arc<[u8]>,
+    pw: u32,
+    ph: u32,
+}
+
+impl std::fmt::Debug for ShellRaster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShellRaster")
+            .field("fp", &self.fp)
+            .field("pw", &self.pw)
+            .field("ph", &self.ph)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The lens card's geometry.
@@ -3618,6 +3641,8 @@ fn draw_lines(
 /// A laid lens: its prims, what a reader hears, and how its body went.
 pub(crate) struct LensLaid {
     pub(crate) prims: Vec<DrawPrim>,
+    /// How many of `prims`, from the first, draw the shell (none when not drawn).
+    pub(crate) shell: usize,
     /// "`<Name>` close-up".
     pub(crate) title: String,
     /// The explainer.
@@ -3663,10 +3688,12 @@ pub(crate) fn lay_lens(
     if draw {
         pen.shell(lg);
     }
+    let shell = pen.p.prims.len();
     let (lw, lh) = lg.shell_pt();
     let (two, cw) = columns(lw);
     let mut laid = LensLaid {
         prims: Vec::new(),
+        shell,
         title: format!("{} close-up", lens.focus.word()),
         explainer: String::new(),
         wells: Vec::new(),
@@ -3773,6 +3800,7 @@ pub(crate) fn lay_lens(
 }
 
 /// Paint the lens: its prims (card pixels).
+#[cfg(test)]
 pub(crate) fn lens_paint(lg: &LensGeom, input: &DeckInput<'_>, lens: &Lens) -> Vec<DrawPrim> {
     lay_lens(lg, input, lens, &deck_metrics(), true).prims
 }
@@ -3837,6 +3865,7 @@ impl crate::App {
                 platform: Platform::host(),
                 utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
             },
+            live: crate::stats_live::DeckLive::STILL,
             needs: Vec::new(),
         }
     }
@@ -3859,7 +3888,8 @@ impl crate::App {
         h.finish().rotate_left(17) | 1
     }
 
-    /// Rasterize the open lens into `wid`'s `lens_card`, only when its fingerprint moved.
+    /// Rasterize the open lens into `wid`'s `lens_card`, only when its fingerprint moved: its body
+    /// over the shell's raster, which is rasterized again only when the shell's prims move.
     pub(crate) fn splice_stats_lens(&mut self, wid: crate::WindowId) {
         let Some((lg, lens, f)) = self.lens_frame(wid) else {
             if let Some(ws) = self.windows.get_mut(&wid) {
@@ -3867,6 +3897,7 @@ impl crate::App {
                 ws.stats_lens.rect = None;
                 ws.stats_lens.open = None;
                 ws.stats_lens.leave_due = None;
+                ws.stats_lens.shell = None;
             }
             return;
         };
@@ -3880,12 +3911,39 @@ impl crate::App {
             return;
         }
         let input = self.lens_input(&f);
-        let prims = lens_paint(&lg, &input, &lens);
-        let (rgba, pw, ph) =
-            crate::tray_raster::rasterize_tray(&prims, lg.w as u32, lg.h as u32, 1.0, [0, 0, 0, 0]);
+        let laid = lay_lens(&lg, &input, &lens, &deck_metrics(), true);
+        let (shell, body) = laid.prims.split_at(laid.shell);
+        let (w, h) = (lg.w as u32, lg.h as u32);
+        let shell_fp = crate::stats_deck::prims_fp(shell) ^ (u64::from(w) << 32 | u64::from(h));
+        let ground = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.stats_lens.shell.clone())
+            .filter(|kept| kept.fp == shell_fp)
+            .unwrap_or_else(|| {
+                let (rgba, pw, ph) =
+                    crate::tray_raster::rasterize_tray(shell, w, h, 1.0, [0, 0, 0, 0]);
+                ShellRaster {
+                    fp: shell_fp,
+                    rgba: rgba.into(),
+                    pw,
+                    ph,
+                }
+            });
+        let (pw, ph) = (ground.pw, ground.ph);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        // The outgoing card's buffer takes the shell's copy, so a reading allocates no new card.
+        let mut px = ws
+            .lens_card
+            .take()
+            .map(|card| card.rgba)
+            .unwrap_or_default();
+        px.clear();
+        px.extend_from_slice(&ground.rgba);
+        let rgba = crate::tray_raster::rasterize_tray_over(body, 1.0, px, pw, ph);
+        ws.stats_lens.shell = Some(ground);
         ws.stats_lens.rect = Some((lg.dx, lg.dy, pw, ph));
         ws.lens_card = Some(crate::SettingsCard {
             scrim: None,

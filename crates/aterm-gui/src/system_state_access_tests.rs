@@ -4169,3 +4169,57 @@ fn a_switch_toggled_twice_brings_the_page_once() {
         assert!(!app.consent_card_host.launch_held, "{off}: nothing held");
     }
 }
+
+/// Through the real tick, while System State offers the Debugger row's `Turn On…` the window takes
+/// its own reading of debugger access, so the person's first press finds this aterm's hardening
+/// read rather than starting nothing; with nothing offered it takes none, and one reading in hand
+/// is not taken again.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_offered_debugger_turn_on_has_the_windows_reading_in_hand() {
+    use crate::devtools_helper::test_arms;
+    use crate::native_app::NativeApp;
+    let debugger = Subject::Access(Access::Debugger);
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    app.access_steps.set_reach(stepping());
+    set_front(true);
+    assert!(app.open_system_state_tab());
+    let wid = app.frontmost_window.unwrap();
+    let (instance, _) = app.active_native_view(wid).unwrap();
+    let offered = |app: &App| {
+        matches!(app.native_runtime.app(instance),
+            Some(NativeApp::SystemState(page)) if page.can_open_access(Access::Debugger))
+    };
+
+    app.publish_system_state(status(
+        Selection::all(),
+        vec![observed(debugger, Standing::InPlace, None)],
+    ));
+    assert!(
+        !offered(&app),
+        "PRECONDITION: on already, so nothing offered"
+    );
+    app.tick_consent_lanes(Instant::now());
+    assert!(
+        app.consent.debugger_slot_idle_for_test(),
+        "nothing offered, nothing read"
+    );
+
+    app.publish_system_state(status(
+        Selection::all(),
+        vec![observed(debugger, Standing::NeedsYou, None)],
+    ));
+    assert!(offered(&app), "PRECONDITION: Turn On… offered");
+    app.tick_consent_lanes(Instant::now());
+    let gate = app.config.privacy_probe_gate();
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the window's own reading of debugger access",
+        || app.consent.debugger_cached(gate).map(|_| ()),
+    );
+    app.tick_consent_lanes(Instant::now());
+    assert!(
+        !app.consent.debugger_in_flight_for_test(),
+        "a reading in hand is not taken again"
+    );
+}

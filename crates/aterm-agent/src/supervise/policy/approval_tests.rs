@@ -5637,6 +5637,111 @@ fn an_unproven_rm_breaker_under_safe_is_approved_with_a_warning() {
     assert!(reason(&on_screen(&touch, &warn)).starts_with("not read-only"));
 }
 
+/// The owner's screenshot of 2026-10-25: a general-purpose subagent's `bash -c` script whose rm
+/// Claude Code could not check (`This shell -c script runs rm and could not be checked`) is the
+/// vendor's rm circuit breaker. Every level that answers the `$VAR` rm box answers it Yes the same
+/// way: full power (`approve = "all"`, the default) presses Yes naming the breaker, and `"safe"`
+/// approves it with its warning unless `rm_breaker_ask` hands it to a person. A deny rule of the
+/// owner's inside the script is never overridden by a Yes.
+#[test]
+fn a_subagents_shell_c_rm_box_is_answered_yes_like_the_variable_rm_box() {
+    let unchecked = "This shell -c script runs rm and could not be checked";
+    let valued = "Dangerous rm operation in a shell -c script, on a target built from a value \
+                  known only when it runs";
+    let warned_bypass = ApprovalCtx {
+        bypass_mode: true,
+        ..safe_warn()
+    };
+    let full_bypass = ApprovalCtx {
+        bypass_mode: true,
+        ..full()
+    };
+    for (row, label) in [
+        (
+            format!(" {unchecked}"),
+            format!("the rm circuit breaker ({unchecked})"),
+        ),
+        (
+            format!(" │ {unchecked}"),
+            format!("the rm circuit breaker ({unchecked})"),
+        ),
+        (
+            format!(" │ {valued}"),
+            "the rm circuit breaker (in a shell -c script, on a target built from a value known \
+             only when it runs)"
+                .to_string(),
+        ),
+    ] {
+        let rows = phase_fixtures::shell_c_rm_box(&row);
+        for (level, c) in [("all", full()), ("all, bypass", full_bypass.clone())] {
+            let d = on_screen(&rows, &c);
+            let (rule, choice, guard, _, unproven) = approval(&d);
+            assert_eq!(
+                (rule, choice),
+                (RULE_ALLOW_ONCE, &Choice::Digit(1)),
+                "{level} {row}"
+            );
+            let unproven = unproven.expect("full power names what it did not prove");
+            assert!(unproven.starts_with(&label), "{level} {row}: {unproven}");
+            assert!(
+                !unproven.contains("vendor note"),
+                "{level} {row}: {unproven}"
+            );
+            assert_eq!(
+                guarded(guard, &rows).len(),
+                1,
+                "{level} {row}: one judged row"
+            );
+        }
+        for (level, c) in [
+            ("safe", safe_warn()),
+            ("safe, bypass", warned_bypass.clone()),
+        ] {
+            let d = on_screen(&rows, &c);
+            let (rule, choice, _, _, unproven) = approval(&d);
+            assert_eq!(
+                (rule, choice),
+                (RULE_RM_BREAKER_WARN, &Choice::Digit(1)),
+                "{level} {row}"
+            );
+            let unproven = unproven.expect("a warning");
+            assert!(
+                unproven.starts_with(&label) && unproven.contains(WARNED_UNDER_SAFE),
+                "{level} {row}: {unproven}"
+            );
+        }
+        for (level, c) in [
+            ("rm_breaker_ask", ctx()),
+            ("rm_breaker_ask, bypass", bypass()),
+        ] {
+            let r = reason(&on_screen(&rows, &c)).to_string();
+            assert!(r.starts_with(&label), "{level} {row}: {r}");
+        }
+        assert!(
+            reason(&on_screen(&rows, &none(full()))).contains("approve = \"none\""),
+            "{row}"
+        );
+    }
+    let deny = "A permission rule denies a command in this shell -c script";
+    let rows = phase_fixtures::shell_c_rm_box(&format!(" │ {deny}"));
+    for (level, c) in [
+        ("all", full()),
+        ("all, bypass", full_bypass),
+        ("safe", safe_warn()),
+        ("safe, bypass", warned_bypass),
+    ] {
+        let r = reason(&on_screen(&rows, &c)).to_string();
+        assert_eq!(
+            r,
+            format!(
+                "the owner's Claude Code settings send this box to a person (a deny rule, which \
+                 a Yes would override): {deny}"
+            ),
+            "{level}"
+        );
+    }
+}
+
 #[test]
 fn full_power_presses_bash_under_every_header_form() {
     let read = bash_box(&["git status --short"], None);
@@ -7447,6 +7552,25 @@ fn a_tall_box_under_a_not_ruled_out_breaker_is_declined_with_a_split() {
         text.contains("Run the removal on its own") && !text.contains("Split it"),
         "{text}"
     );
+    for row in [
+        " │ This shell -c script runs rm and could not be checked",
+        " │ Dangerous rm operation in a shell -c script, on a target built from a value known \
+         only when it runs",
+    ] {
+        let rows = with_row(&screen, note, row);
+        for level in [Approve::All, Approve::Safe] {
+            let d = on_screen(&rows, &owner_ctx(level));
+            let (rule, text) = declined(&d);
+            assert_eq!(rule, RULE_TALL_BOX, "{row}, {level:?}");
+            assert!(
+                text.contains(
+                    "Run the removal on its own as a short command, outside any shell \
+                               -c script"
+                ) && text.contains("literal absolute paths"),
+                "{row}, {level:?}: {text}"
+            );
+        }
+    }
 }
 
 #[test]

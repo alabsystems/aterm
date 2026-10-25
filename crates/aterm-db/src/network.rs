@@ -14,10 +14,11 @@ use crate::{
 };
 use astream_wire::sync::{Actor, Digest};
 use aterm_net::fleet::{self, FleetOp, FleetScope, FleetSecret, NodeIdentity, NodeProof};
+use aterm_net::lan::{Connection, Listener, Scope};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Read, Write},
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{Shutdown, SocketAddr, TcpStream},
     path::Path,
     sync::{
         Arc, Mutex,
@@ -32,7 +33,8 @@ use std::{
 pub const RECORDS_PER_ROUND: usize = 256;
 const WITHIN: Duration = Duration::from_secs(30);
 
-/// Durably exchanged operation counts. A repeated round with both zero is caught up.
+/// Durably exchanged operation counts for this peer and round. Zero counts do
+/// not prove global convergence or the absence of another peer's unseen history.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Report {
     /// Records this side sent and the peer durably acknowledged.
@@ -80,6 +82,7 @@ pub(crate) struct Deadline {
 impl Deadline {
     pub(crate) fn arm(tcp: &TcpStream) -> Result<Self> {
         let socket = tcp.try_clone()?;
+        aterm_uds::keep_out_of_children(&socket)?;
         let (done, wait) = mpsc::channel();
         let join = thread::Builder::new()
             .name("db-exchange-deadline".into())
@@ -278,11 +281,11 @@ fn receive_operations(stream: &mut (impl Read + Write), dir: &Path) -> Result<(u
     Ok((received, deferred))
 }
 
-/// Receive one admitted connection. No journal lock is held before peer authentication.
-pub fn serve_connection(dir: &Path, tcp: TcpStream) -> Result<Report> {
-    if !fleet::is_fleet_source(tcp.peer_addr()?.ip()) {
-        return Err(Error::new("database currently accepts LAN peers only"));
-    }
+/// Receive one connection with native link evidence. No journal lock is held
+/// before peer authentication, and locality is checked around the exchange.
+pub fn serve_connection(dir: &Path, connection: Connection) -> Result<Report> {
+    let (tcp, locality) = connection.into_parts();
+    locality.recheck()?;
     let _deadline = Deadline::arm(&tcp)?;
     let credentials = Credentials::load(dir)?;
     let (secret, identity) = transport(&credentials)?;
@@ -295,14 +298,17 @@ pub fn serve_connection(dir: &Path, tcp: TcpStream) -> Result<Report> {
         WITHIN,
     )
     .map_err(|_| Error::new("database TLS peer authentication failed"))?;
+    locality.recheck()?;
     let stream = accepted.transport.stream();
-    server_exchange(
+    let result = server_exchange(
         dir,
         &credentials,
         accepted.peer.as_ref(),
         stream,
         &Mutex::new(BTreeMap::new()),
-    )
+    );
+    locality.recheck()?;
+    result
 }
 fn server_exchange(
     dir: &Path,
@@ -347,16 +353,16 @@ pub fn sync_round(dir: &Path, peer: SocketAddr) -> Result<Report> {
 }
 /// Continue repair past a peer's temporary deferrals without claiming they synced.
 pub fn sync_round_with(dir: &Path, peer: SocketAddr, repair: &mut Repair) -> Result<Report> {
-    if !fleet::is_fleet_source(peer.ip()) {
-        return Err(Error::new("database currently dials LAN peers only"));
-    }
     let credentials = Credentials::load(dir)?;
     let (secret, identity) = transport(&credentials)?;
-    let tcp = TcpStream::connect_timeout(&peer, Duration::from_secs(3))?;
+    let (tcp, locality) =
+        Connection::connect(peer, scope(peer), Duration::from_secs(3))?.into_parts();
+    locality.recheck()?;
     let _deadline = Deadline::arm(&tcp)?;
     let mut dialed =
         fleet::client_handshake_as(tcp, &secret, Some(&identity), FleetOp::Database, WITHIN)
             .map_err(|_| Error::new("database TLS peer authentication failed"))?;
+    locality.recheck()?;
     let stream = dialed.transport.stream();
     send_frame(stream, credentials.capability.bytes())?;
     let capability = receive_frame(stream, 256)?;
@@ -372,15 +378,23 @@ pub fn sync_round_with(dir: &Path, peer: SocketAddr, repair: &mut Repair) -> Res
     let remote = receive_inventory(stream)?;
     let (sent, outgoing_deferred) = send_operations(stream, dir, &remote, repair)?;
     let (received, incoming_deferred) = receive_operations(stream, dir)?;
+    locality.recheck()?;
     Ok(Report {
         sent,
         received,
         deferred: incoming_deferred + outgoing_deferred,
     })
 }
+fn scope(address: SocketAddr) -> Scope {
+    if address.ip().is_loopback() {
+        Scope::Loopback
+    } else {
+        Scope::Lan
+    }
+}
 /// Serve on an explicitly selected LAN address. Optional peers are retried in a
 /// separate thread with random jitter, so partitions do not stop local editing.
-pub fn serve(dir: &Path, listener: TcpListener, peers: Vec<SocketAddr>) -> Result<()> {
+pub fn serve(dir: &Path, listener: Listener, peers: Vec<SocketAddr>) -> Result<()> {
     serve_until(
         dir,
         listener,
@@ -392,7 +406,7 @@ pub fn serve(dir: &Path, listener: TcpListener, peers: Vec<SocketAddr>) -> Resul
 /// may update dial hints; every candidate still proves its certified TLS identity.
 pub fn serve_until(
     dir: &Path,
-    listener: TcpListener,
+    listener: Listener,
     running: Arc<AtomicBool>,
     peers: Arc<Mutex<Vec<SocketAddr>>>,
 ) -> Result<()> {
@@ -434,8 +448,8 @@ pub fn serve_until(
     let error = stopped.clone();
     let dir = dir.to_path_buf();
     let repairs = Arc::new(Mutex::new(BTreeMap::new()));
-    fleet::serve(
-        &listener,
+    fleet::serve_lan(
+        listener,
         &fleet::Listening {
             secret,
             scope: FleetScope::Facts,
@@ -473,6 +487,7 @@ mod tests {
     use super::*;
     use crate::database::{Change, Command};
     use aterm_json::json;
+    use std::net::TcpListener;
 
     struct DeferredPeer {
         answers: std::io::Cursor<Vec<u8>>,
@@ -548,13 +563,61 @@ mod tests {
     }
 
     #[test]
+    fn bounded_listener_repairs_both_replicas_and_stops_without_a_peer() {
+        let (_root, a, b) = crate::tests::pair();
+        for (dir, request, key) in [(&a, 1, "a"), (&b, 2, "b")] {
+            Database::open(dir)
+                .unwrap()
+                .commit(Command::Write {
+                    request: [request; 16],
+                    changes: vec![Change {
+                        collection: "example".into(),
+                        key: key.into(),
+                        value: Some(json!(request)),
+                    }],
+                })
+                .unwrap();
+        }
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+        let address = listener.local_addr().unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let server = {
+            let a = a.clone();
+            let running = running.clone();
+            thread::spawn(move || {
+                serve_until(&a, listener, running, Arc::new(Mutex::new(Vec::new())))
+            })
+        };
+        let first = sync_round(&b, address);
+        let second = first.as_ref().ok().map(|_| sync_round(&b, address));
+        running.store(false, Ordering::Release);
+        server.join().unwrap().unwrap();
+        let first = first.unwrap();
+        assert_eq!((first.sent, first.received, first.deferred), (1, 1, 0));
+        assert_eq!(second.unwrap().unwrap(), Report::default());
+        let inventory = |dir: &Path| {
+            Database::open(dir)
+                .unwrap()
+                .history
+                .index
+                .inventory()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(inventory(&a), inventory(&b));
+    }
+
+    #[test]
     fn an_authenticated_peer_waiting_for_its_next_frame_does_not_hold_the_writer_lock() {
         let (_root, a, b) = crate::tests::pair();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let served = a.clone();
-        let server =
-            thread::spawn(move || serve_connection(&served, listener.accept().unwrap().0).unwrap());
+        let server = thread::spawn(move || {
+            let connection =
+                Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap();
+            serve_connection(&served, connection).unwrap()
+        });
         let credentials = Credentials::load(&b).unwrap();
         let (secret, identity) = transport(&credentials).unwrap();
         let tcp = TcpStream::connect(address).unwrap();
@@ -603,8 +666,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let served = a.clone();
-        let server =
-            thread::spawn(move || serve_connection(&served, listener.accept().unwrap().0).unwrap());
+        let server = thread::spawn(move || {
+            let connection =
+                Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap();
+            serve_connection(&served, connection).unwrap()
+        });
         let credentials = Credentials::load(&b).unwrap();
         let (secret, identity) = transport(&credentials).unwrap();
         let tcp = TcpStream::connect(address).unwrap();

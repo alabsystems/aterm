@@ -950,7 +950,10 @@ fn fd(f: &probe::FdReading) -> Fd {
             lf_tail: *lf_tail,
             fresh_dylib: *fresh_dylib,
         },
-        probe::FdKind::Device { tty } => FdKind::Device { tty: *tty },
+        probe::FdKind::Device { tty, read } => FdKind::Device {
+            tty: *tty,
+            read: *read,
+        },
         probe::FdKind::Pipe {
             handle,
             peer,
@@ -1035,6 +1038,7 @@ fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
         }),
         wchan: p.wchan.clone(),
         fds: p.fds.as_ref().map(|fs| fs.iter().map(fd).collect()),
+        blocked_fd: p.blocked_fd,
         program_check: member_start(p, stand_in) == Some(AtStart::Held),
         version: None,
     }

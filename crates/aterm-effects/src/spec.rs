@@ -561,8 +561,8 @@ impl CompiledToyPack {
     #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn lexicon_toml(&self) -> &str {
-        &self.lexicon_toml
+    pub const fn lexicon_toml(&self) -> &str {
+        self.lexicon_toml.as_str()
     }
 
     #[inline]
@@ -600,8 +600,8 @@ impl ToyPackError {
 
     #[must_use]
     #[cfg(test)]
-    pub fn diagnostics(&self) -> &[String] {
-        &self.diagnostics
+    pub const fn diagnostics(&self) -> &[String] {
+        self.diagnostics.as_slice()
     }
 }
 

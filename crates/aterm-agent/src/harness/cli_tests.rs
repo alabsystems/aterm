@@ -119,6 +119,8 @@ fn the_grammar_parses_what_the_help_text_advertises() {
                 json: true,
             },
         ),
+        ("disk why", Cmd::DiskWhy { json: false }),
+        ("disk why --json", Cmd::DiskWhy { json: true }),
         (
             "ledger",
             Cmd::Ledger {
@@ -1428,6 +1430,72 @@ fn the_disk_report_names_nothing_removable_by_default_and_is_journalled() {
         &env,
     );
     assert_eq!(rows.lines().count(), 2, "{rows}");
+}
+
+#[test]
+fn disk_why_explains_the_ask_from_its_lease_and_its_ledger_rows() {
+    use disk::ask;
+    let tmp = tmp_dir("disk-why");
+    let env = env_at(&tmp);
+    let (ok, out, err) = go(&Cmd::DiskWhy { json: false }, &env);
+    assert!(ok, "{err}");
+    assert!(out.contains("the lease is empty"), "{out}");
+    assert!(out.contains("no free-ask rows"), "{out}");
+    let host = ask::HostId {
+        pid: 7,
+        start: "x".to_owned(),
+    };
+    let seats = [ask::Seat {
+        sid: "s-a".to_owned(),
+        held: 40 << 30,
+        at_break: true,
+    }];
+    let live = ["s-a".to_owned()];
+    let alive = |_: &ask::HostId| true;
+    let look = |now_ms| ask::Look {
+        now_ms,
+        host: &host,
+        key: "dev:1",
+        level: disk::Level::Short,
+        free: 9 << 30,
+        done: Some(ask::Done::Spent),
+        seats: &seats,
+        supervised: &live,
+        live: &live,
+        alive: &alive,
+    };
+    let t = env.now * 1000;
+    let mut rows = Vec::new();
+    for at in [t - ask::NOMINATE_MS, t] {
+        let said = ask::transact(&env.state, &ask::LOCK_LADDER, |l| ask::step(l, &look(at)))
+            .expect("lease")
+            .expect("free lock");
+        rows.push(ask::row(
+            at / 1000,
+            "dev:1",
+            &said,
+            disk::Level::Short,
+            9 << 30,
+            &host,
+        ));
+    }
+    disk_ask_journal(&env.state, &rows);
+    let (ok, out, err) = go(&Cmd::DiskWhy { json: false }, &env);
+    assert!(ok, "{err}");
+    assert!(out.contains("volume=dev:1 episode since"), "{out}");
+    assert!(out.contains("owed @s-a (host pid 7)"), "{out}");
+    assert!(out.contains(" opened dev:1 — "), "{out}");
+    assert!(out.contains(" elected @s-a dev:1 — "), "{out}");
+    let (ok, out, _) = go(&Cmd::DiskWhy { json: true }, &env);
+    assert!(ok);
+    let mut lines = out.lines();
+    assert!(
+        lines
+            .next()
+            .is_some_and(|l| l.contains("\"state\":\"owed\"")),
+        "{out}"
+    );
+    assert_eq!(lines.count(), 2, "{out}");
 }
 
 #[test]

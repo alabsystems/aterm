@@ -1445,7 +1445,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
 
-    fn geom() -> Geom {
+    const fn geom() -> Geom {
         Geom {
             cw: 8,
             ch: 16,
@@ -1458,7 +1458,7 @@ mod tests {
             head: 0,
         }
     }
-    fn cfg() -> RainbowConfig {
+    const fn cfg() -> RainbowConfig {
         RainbowConfig {
             enabled: true,
             intensity: 1.0,
@@ -1739,7 +1739,7 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn blink_cfg() -> RainbowConfig {
+    const fn blink_cfg() -> RainbowConfig {
         RainbowConfig {
             blinking: true,
             ..cfg()

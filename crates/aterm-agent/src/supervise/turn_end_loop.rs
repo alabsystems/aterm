@@ -18,6 +18,7 @@ use super::super::tap_clock::{TapClock, TapSays, Timed, UsageWindow, timed};
 use super::wall_confirm::{Check, LeftRead};
 use super::*;
 use crate::harness::accounts::Sample;
+use crate::harness::profile::AccountKey;
 use crate::harness::upgrade_drive::HAND_RENEW;
 use crate::harness::usage::{
     PanelRead, PanelWindow, USAGE_COMMAND, panel_sample, usage_panel_read,
@@ -38,6 +39,36 @@ pub(super) struct WallTap {
     by_tap: bool,
     /// Reset unix timestamp carried from a prior loop's tap (`tap_unix=`, [`Session::seed_tap`]).
     carried: Option<i64>,
+}
+
+/// THE ACCOUNT A STANDING LIMIT WAS READ UNDER ([`Session::login_moved_at`]):
+/// kept from the first decision at the limit (or a prior loop's `login=`)
+/// until its track ends, as the usage tap's clock is ([`WallTap`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WallLogin {
+    /// The account the session's profile named then.
+    pub(super) account: AccountKey,
+    /// Another account the profile names since, held until the policy takes
+    /// the move up ([`Session::login_taken`]).
+    pub(super) moved_to: Option<AccountKey>,
+    /// The account the limit was read under before the move the policy
+    /// took, while the resume that move owes is untyped: what the limit's
+    /// ledger row names, so a successor loop owes the resume too.
+    pub(super) owed_from: Option<AccountKey>,
+}
+
+/// How often the profile is read for a moved login while a wait stands ([`Session::login_edge`]).
+pub(super) const LOGIN_LOOK_EVERY: Duration = Duration::from_secs(5);
+
+/// Whether a wall of `kind` is the account's own, lifted by a login on
+/// another account: a usage limit or a model bucket ([`TurnEndReading::login_moved`]).
+const fn moves_with_login(kind: aterm_phase::WallKind) -> bool {
+    matches!(
+        kind,
+        aterm_phase::WallKind::UsageSession
+            | aterm_phase::WallKind::UsageWeekly
+            | aterm_phase::WallKind::ModelBucket { .. }
+    )
 }
 
 /// Whether `composer` holds the point `action` was decided at with nothing due
@@ -688,6 +719,133 @@ impl<C: Ctl> Session<'_, C> {
         });
     }
 
+    /// Whether the session's login moved off the account its standing limit
+    /// was read under ([`TurnEndReading::login_moved`]): at a decision at a
+    /// Claude Code usage limit or model bucket (`wall`, the one the reading
+    /// shows or the one the policy still waits on with its notice gone), the
+    /// account the host reads off the session's profile
+    /// ([`IdleHost::login_account`]), the first kept as the limit's
+    /// ([`WallLogin`]) and another held as moved until the policy takes it up
+    /// ([`Self::login_taken`]). No host, no account read, another program or
+    /// a replay that lacks the door is no move.
+    pub(super) fn login_moved_at(
+        &mut self,
+        host: Option<&Arc<dyn IdleHost>>,
+        wall: Option<aterm_phase::WallKind>,
+        program: Program,
+        check: Check,
+    ) -> bool {
+        let signs_in = match program {
+            Program::Claude => true,
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Gemini
+            | Program::Generic => false,
+        };
+        if !signs_in || !wall.is_some_and(moves_with_login) {
+            return false;
+        }
+        if !self.turn_end.login_resume_owed()
+            && let Some(kept) = self.wall_login.as_mut()
+        {
+            kept.owed_from = None;
+        }
+        if check == Check::Decide
+            && !self.fx.replay_lacks_host_door("host.login_account")
+            && let Some(now) = host.and_then(|h| h.login_account())
+        {
+            match self.wall_login.as_mut() {
+                Some(kept) => kept.moved_to = (now != kept.account).then_some(now),
+                None => {
+                    self.wall_login = Some(WallLogin {
+                        account: now,
+                        moved_to: None,
+                        owed_from: None,
+                    });
+                }
+            }
+        }
+        self.wall_login
+            .as_ref()
+            .is_some_and(|kept| kept.moved_to.is_some())
+    }
+
+    /// The policy took the moved login up ([`TurnEndState::login_resume_owed`]):
+    /// the moved-to account is the limit's from now on, and the ledger says so.
+    pub(super) fn login_taken(&mut self, seq: u64) {
+        let Some(kept) = self.wall_login.as_mut() else {
+            return;
+        };
+        let Some(to) = kept.moved_to.take() else {
+            return;
+        };
+        let reason = approvals::login_moved_reason(kept.account, to);
+        kept.owed_from.get_or_insert(kept.account);
+        kept.account = to;
+        self.ledger_row(
+            approvals::RULE_LOGIN_MOVED,
+            approvals::Outcome::Waiting,
+            "",
+            &reason,
+            seq,
+        );
+    }
+
+    /// Read the session's profile for a moved login while a limit stands,
+    /// waited on or held with nothing decided, every [`LOGIN_LOOK_EVERY`]:
+    /// `true` where it names an account other than the limit's and other
+    /// than one already held as moved, so the point is decided again at once
+    /// and once for each account it names.
+    pub(super) fn login_edge(&mut self, opts: &SuperviseOpts) -> bool {
+        let stands =
+            self.turn_end_due.is_some() || (self.nothing_decided && self.wall_login.is_some());
+        if !stands
+            || self.fx.replay_lacks_host_door("host.login_account")
+            || self
+                .login_looked_at
+                .is_some_and(|at| self.fx.since(at) < LOGIN_LOOK_EVERY)
+        {
+            return false;
+        }
+        let (Some(kept), Some(host)) = (self.wall_login.as_ref(), opts.idle_host.as_ref()) else {
+            return false;
+        };
+        let (account, moved_to) = (kept.account, kept.moved_to);
+        self.login_looked_at = Some(self.fx.mono());
+        let Some(now) = host.login_account().filter(|now| *now != account) else {
+            return false;
+        };
+        if moved_to == Some(now) {
+            return false;
+        }
+        if let Some(kept) = self.wall_login.as_mut() {
+            kept.moved_to = Some(now);
+        }
+        true
+    }
+
+    /// The account the standing limit was read under, for its ledger row
+    /// ([`approvals::wall_wait_reason_of`]): the one before a move whose
+    /// resume is still owed ([`WallLogin::owed_from`]).
+    pub(super) fn wall_login_account(&self) -> Option<AccountKey> {
+        self.wall_login.as_ref().map(|kept| match kept.owed_from {
+            Some(from) if self.turn_end.login_resume_owed() => from,
+            _ => kept.account,
+        })
+    }
+
+    /// Seed the limit's account from a prior loop's `login=` ([`Self::seed_wall_memory`]).
+    pub(super) fn seed_login(&mut self, account: Option<AccountKey>) {
+        self.wall_login = account.map(|account| WallLogin {
+            account,
+            moved_to: None,
+            owed_from: None,
+        });
+    }
+
     /// `at`, the placement of the reset `text` names, as an undated one is kept
     /// ([`Self::wall_reset_at`], [`limit::SESSION_AHEAD_MAX`]).
     fn within_a_session_window(&self, text: Option<&str>, at: i64) -> i64 {
@@ -870,6 +1028,7 @@ impl<C: Ctl> Session<'_, C> {
                 };
                 if worked.is_some() || answered {
                     self.wall_tap = None;
+                    self.wall_login = None;
                 }
                 let host = opts.idle_host.as_ref();
                 let program = reading.program;
@@ -891,12 +1050,25 @@ impl<C: Ctl> Session<'_, C> {
                     self.wall_reset = None;
                     self.reprint_jumps = 0;
                 }
-                if worked.is_some() || !self.turn_end.waits_on_named_reset() {
+                if worked.is_some()
+                    || !(self.turn_end.waits_on_named_reset() || self.turn_end.login_resume_owed())
+                {
                     self.wall_tap = None;
+                    self.wall_login = None;
                 }
                 None
             }
         };
+        let login_moved = self.login_moved_at(
+            opts.idle_host.as_ref(),
+            reading
+                .wall
+                .as_ref()
+                .map(|w| w.kind)
+                .or_else(|| self.turn_end.waited_limit().map(|w| w.kind())),
+            reading.program,
+            check,
+        );
         self.date_unread_try(&reading, &screen.rows, screen.seq);
         if reading.wall.is_some() {
             self.persist_wall(screen.seq);
@@ -1014,6 +1186,7 @@ impl<C: Ctl> Session<'_, C> {
             login_superseded,
             login_method,
             login_shared,
+            login_moved,
             taskless: (r.taskless
                 && !self
                     .turn_end
@@ -2654,6 +2827,7 @@ impl<C: Ctl> Session<'_, C> {
                     self.forget_wall(seq);
                     self.wall_reset = None;
                     self.wall_tap = None;
+                    self.wall_login = None;
                     self.reprint_jumps = 0;
                     self.account_seen = None;
                     self.roster_seen = None;

@@ -34,7 +34,9 @@ mod models_supervise_tape;
 mod models_wakes;
 
 pub use models_agent_verdict::claude_idle_at_composer_model;
-pub use models_disk::{disk_await_liveness, disk_await_model, disk_reclaim_pass_model};
+pub use models_disk::{
+    disk_await_liveness, disk_await_model, disk_free_ask_model, disk_reclaim_pass_model,
+};
 pub use models_harness::*;
 pub use models_harness_account_key::harness_account_key_model;
 pub use models_harness_host::{

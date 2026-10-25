@@ -162,7 +162,7 @@ impl AnimalBaker {
 mod tests {
     use super::*;
 
-    fn any_species() -> AnimalGlyphId {
+    const fn any_species() -> AnimalGlyphId {
         crate::animal_glyphs_gen::ANIMAL_GLYPH_IDS[0]
     }
 

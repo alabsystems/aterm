@@ -131,6 +131,7 @@ impl GlowStyle {
 
     /// Parse a config string (trimmed, case-insensitive) through [`spellings::canonical`].
     #[inline]
+    #[must_use]
     pub const fn parse(s: &str) -> Self {
         match spellings::row(s) {
             Some(spellings::TrailStyleRow {

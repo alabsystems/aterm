@@ -1410,14 +1410,18 @@ mod tests {
 
     #[test]
     fn song_signature_mixer_is_bijective_over_all_chars() {
-        fn minv(m: u32) -> u32 {
+        const fn minv(m: u32) -> u32 {
             let mut x = m;
-            for _ in 0..5 {
+            let mut i = 0;
+            while i < 5 {
                 x = x.wrapping_mul(2u32.wrapping_sub(m.wrapping_mul(x)));
+                i += 1;
             }
             x
         }
-        let (inv_a, inv_b) = (minv(0x7feb_352d), minv(0x846c_a68b));
+        const INV_A: u32 = minv(0x7feb_352d);
+        const INV_B: u32 = minv(0x846c_a68b);
+        let (inv_a, inv_b) = (INV_A, INV_B);
         assert_eq!(inv_a.wrapping_mul(0x7feb_352d), 1);
         assert_eq!(inv_b.wrapping_mul(0x846c_a68b), 1);
         let unmix = |y: u32| -> u32 {
@@ -1447,9 +1451,9 @@ mod tests {
     }
 
     impl HostSim {
-        fn new(t0: Instant) -> Self {
+        const fn new(t0: Instant) -> Self {
             Self {
-                d: KittySing::default(),
+                d: KittySing::new(),
                 clock: t0,
                 latch: None,
                 pushed: Vec::new(),

@@ -5261,12 +5261,13 @@ fn removed_programs(layout: &crate::store::Layout) -> std::collections::BTreeSet
     layout.removed_programs()
 }
 
-/// The programs this machine keeps complete.
+/// The programs this machine keeps complete: the index's default set
+/// ([`crate::manifest::Index::default_set`]), so a harness lands only when a person names it.
 pub(crate) fn wanted_programs(
     index: &crate::manifest::Index,
     cfg: &crate::config::PackagesConfig,
 ) -> std::collections::BTreeSet<String> {
-    index.installable(cfg.exclude())
+    index.default_set(cfg.exclude())
 }
 
 fn reconcile_system_satisfied_with(
@@ -10528,7 +10529,7 @@ fn index_serves(
     if !seed_serviceable(layout, fetcher, index, cfg).is_empty() {
         return IndexServes::Yes;
     }
-    let unnarrowed = index.installable(&[]);
+    let unnarrowed = index.default_set(&[]);
     let everything = serviceable_among(
         layout,
         fetcher,
@@ -12590,13 +12591,17 @@ fn pkg_post_verify_refusal(verified: &crate::VerifiedBytes) -> Option<String> {
 }
 
 /// What `pkg verify` says `program`'s vendor-direct tree was staged from: the vendor's
-/// authenticated digest; npm's registry-signed tarball, its binary matched by the vendor's own
-/// copy; or, for a build staged before that, the bytes its Developer ID signature vouched for,
-/// whose digest the lane measured.
+/// authenticated digest, downloaded or copied from another row's verified build of the same
+/// bytes; npm's registry-signed tarball, its binary matched by the vendor's own copy; or, for a
+/// build staged before that, the bytes its Developer ID signature vouched for, whose digest the
+/// lane measured.
 fn staged_from(program: &str, vendor: &str, from: &crate::verify::StagedFrom) -> String {
     use crate::verify::StagedFrom;
     match from {
         StagedFrom::Documents => format!("{vendor}'s authenticated digest"),
+        StagedFrom::Sibling { program: lender } => format!(
+            "{vendor}'s authenticated digest, through {lender}'s verified build of the same bytes"
+        ),
         StagedFrom::DeveloperIdMeasured => format!(
             "bytes signed with {vendor}'s Developer ID, whose digest no {vendor} document names"
         ),

@@ -478,6 +478,7 @@ pub(crate) fn main() -> ExitCode {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if session_lane_is_interactive() {
+        spawn_commons_runtime();
         let build = aterm_gui::running_build_number();
         #[cfg(target_os = "linux")]
         start_linux_session_trial(build);
@@ -804,6 +805,15 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     }
     #[cfg(not(windows))]
     let _ = (host, handoff);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if !args.iter().any(|a| {
+        matches!(
+            a.to_string_lossy().as_ref(),
+            "--headless" | "--diagnose" | "--control-sock"
+        )
+    }) {
+        spawn_commons_runtime();
+    }
     let first_run = wire_window(&args);
     #[expect(
         clippy::disallowed_methods,
@@ -811,6 +821,39 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     )]
     aterm_gui::main_entry_with_first_run(args, first_run);
     ExitCode::SUCCESS
+}
+
+/// Only long-lived ordinary hosts contend for Commons transport ownership.
+/// One-shot verbs return before these call sites; private labs are inert.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn spawn_commons_runtime() {
+    static RUNTIME: std::sync::OnceLock<aterm_db::runtime::Runtime> = std::sync::OnceLock::new();
+    if std::env::var_os("ATERM_STATE_HOME").is_some()
+        || std::env::var_os("CI").is_some()
+        || RUNTIME.get().is_some()
+    {
+        return;
+    }
+    let Ok(paths) = aterm_secrets::client::Paths::live() else {
+        return;
+    };
+    let Some(config) = aterm_types::dirs::aterm_config_path() else {
+        return;
+    };
+    match aterm_db::runtime::Runtime::start(paths, config, |status| {
+        if status == aterm_db::runtime::Status::Refused {
+            aterm_log::warn!(
+                "Commons automatic control repair refused local configuration or trust state"
+            );
+        } else {
+            aterm_log::debug!("Commons control repair: {status:?}");
+        }
+    }) {
+        Ok(runtime) => {
+            let _ = RUNTIME.set(runtime);
+        }
+        Err(error) => aterm_log::warn!("Commons runtime could not start: {error}"),
+    }
 }
 
 /// What the window's process wires before the GUI starts: on macOS the LAN agent's retirement
@@ -930,13 +973,17 @@ fn apply_first_run_doctor() -> bool {
 /// A plan a watch widened ([`widen_on_alab_signal`]), as the run it admitted registers
 /// ([`register_admitted_run`]).
 #[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 struct Widened {
     /// The admission number ([`SETUP_SENT`]) the look took before it read the Stop hold: a Stop
     /// pressed since covers the widened run.
     sent: u64,
     /// The revision it widened: a Stop asked for it holds the widened run too.
     from: u64,
+    /// The exact revision this look admitted.
+    to: u64,
+    /// The look's shutdown ownership, retained until its exact run registers or is retired.
+    under_way: Option<UnderWay>,
 }
 
 /// Offer or resume setup as a launch does, then run it. A plan aterm chose by itself before it
@@ -960,8 +1007,7 @@ fn run_startup_setup(widened: Option<Widened>) {
         answer
     });
     if let Some(widened) = widened {
-        sent.sent = sent.sent.min(widened.sent);
-        sent.widened_from = Some(widened.from);
+        sent.inherit_widened(&prepared, widened);
     }
     with_setup_watch(
         false,
@@ -1099,42 +1145,103 @@ impl AlabWatch for LiveAlabWatch {
     }
 
     fn look(&mut self) -> Result<Option<u64>, String> {
-        // The look notes the plan it widens and numbers its admission before it reads the
-        // Stop hold: a Stop pressed before is seen here, and one pressed after stops the widened
-        // run as it registers. An upgrade this watch holds widens the plan it began from, under
-        // the number the look that began it took: only this watch's looks begin one it holds,
-        // each after taking its number.
-        self.widened = match self.upgrade.widens_from() {
-            Some(from) => Widened {
-                from,
-                sent: self.widened.sent,
-            },
-            None => Widened {
-                from: aterm_cli::macos_doctor::initial_setup_revision()?,
-                sent: send_admission(),
-            },
-        };
-        // A Stop asked in this launch holds the plan in force, even one too late for its run,
-        // until a choice, Set up now or a relaunch (System State design §3.5). An upgrade this
-        // watch holds finishes its failed save instead, which giving it up would strand, and the
-        // Stop holds the widened run as it registers.
-        if !self.upgrade.pending() && setup_stop_requested(self.widened.from) {
-            return Ok(None);
-        }
-        let upgraded = self.upgrade.persist()?;
-        Ok(upgraded.map(|upgrade| {
-            // The revision the upgrade itself widened, which a Set up now since the read above
-            // may have replaced: a Stop asked for it holds the widened run as it registers.
-            self.widened.from = upgrade.from;
-            upgrade.to
-        }))
+        look_setup_upgrade_with(&mut self.widened, &mut self.upgrade)
     }
 
     fn run(&mut self) {
         // A worker parked on the narrower revision wakes, finds it gone, and ends.
         wake_setup();
-        run_startup_setup(Some(self.widened));
+        run_startup_setup(Some(std::mem::take(&mut self.widened)));
     }
+}
+
+/// The actual admission port of one look; the test arm uses the same scratch record writers.
+#[cfg(target_os = "macos")]
+trait WatchUpgrade {
+    fn pending(&self) -> bool;
+    fn widens_from(&self) -> Option<u64>;
+    fn revision(&self) -> Result<u64, String>;
+    fn persist(&mut self) -> Result<Option<aterm_cli::macos_doctor::SetupUpgrade>, String>;
+    fn published(&self) -> Result<Option<aterm_cli::macos_doctor::SetupUpgrade>, String>;
+    fn forget(&mut self);
+}
+
+#[cfg(target_os = "macos")]
+impl WatchUpgrade for aterm_cli::macos_doctor::InitialSetupUpgrade {
+    fn pending(&self) -> bool {
+        Self::pending(self)
+    }
+    fn widens_from(&self) -> Option<u64> {
+        Self::widens_from(self)
+    }
+    fn revision(&self) -> Result<u64, String> {
+        aterm_cli::macos_doctor::initial_setup_revision()
+    }
+    fn persist(&mut self) -> Result<Option<aterm_cli::macos_doctor::SetupUpgrade>, String> {
+        Self::persist(self)
+    }
+    fn published(&self) -> Result<Option<aterm_cli::macos_doctor::SetupUpgrade>, String> {
+        Self::published(self)
+    }
+    fn forget(&mut self) {
+        Self::forget(self);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn look_setup_upgrade_with(
+    widened: &mut Widened,
+    upgrade: &mut impl WatchUpgrade,
+) -> Result<Option<u64>, String> {
+    let pending = upgrade.pending();
+    if let Some(from) = upgrade.widens_from() {
+        widened.from = from;
+    } else {
+        widened.from = upgrade.revision()?;
+        widened.sent = send_admission();
+        widened.to = 0;
+        widened.under_way = None;
+    }
+    let unpublished = !pending || widened.under_way.is_none();
+    widened
+        .under_way
+        .get_or_insert_with(|| UnderWay::new(widened.sent));
+    // No writes have been published when an idle, unpublished attempt had no guard.
+    // A covered Stop can retire it, without naming a speculative next revision.
+    if unpublished && (setup_stop_requested(widened.from) || stop_covers(widened.sent)) {
+        upgrade.forget();
+        widened.under_way = None;
+        return Ok(None);
+    }
+    let result = upgrade.persist();
+    let published = match &result {
+        Ok(Some(target)) => Ok(Some(*target)),
+        Ok(None) => Ok(None),
+        Err(_) => upgrade.published(),
+    };
+    match published {
+        Ok(Some(target)) => {
+            widened.from = target.from;
+            widened.to = target.to;
+            widened
+                .under_way
+                .as_ref()
+                .unwrap()
+                .published(target.from, target.to);
+        }
+        Ok(None) => {
+            let covered = stop_covers(widened.sent) || setup_stop_requested(widened.from);
+            widened.under_way = None;
+            if covered || !upgrade.pending() {
+                upgrade.forget();
+            }
+        }
+        Err(why) => {
+            // A failed read cannot certify that the attempt published nothing.
+            return Err(why);
+        }
+    }
+    result.map(|target| target.map(|target| target.to))
 }
 
 /// Keep one watch of aterm's own provisional plan. Active runs try a worker; a finished
@@ -1317,6 +1424,7 @@ fn prepare_first_run_doctor(
         chosen: false,
         vault_typed: false,
         sent: StartupSent::default(),
+        retry_seen: SETUP_WAKES.count(),
     };
     let prepared = match prepare_setup(&mut host) {
         Ok(prepared) => prepared,
@@ -1340,6 +1448,7 @@ struct StartupSent {
     under_way: std::sync::Arc<std::sync::Mutex<Option<UnderWay>>>,
     /// The revision a watch widened into the plan this startup resumes ([`Widened`]).
     widened_from: Option<u64>,
+    upgrade: Option<UnderWay>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1347,6 +1456,30 @@ type StartupHandoff = Box<dyn FnOnce() + Send>;
 
 #[cfg(target_os = "macos")]
 impl StartupSent {
+    /// Stop evidence is independent of whether this review may still admit its plan.
+    fn record_publication(&self, publication: Result<Option<u64>, String>) {
+        let under_way = self
+            .under_way
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(under_way) = under_way.as_ref() {
+            under_way.record_publication(publication);
+        }
+    }
+
+    /// A new durable answer supersedes older abandoned publications, including when empty.
+    fn admitted(&self) {
+        retire_unconfirmed_admissions(self.sent);
+    }
+
+    fn inherit_widened<C>(&mut self, prepared: &PreparedSetup<C>, mut widened: Widened) {
+        if matches!(prepared, PreparedSetup::Authorized { revision, .. } if *revision == widened.to)
+        {
+            self.sent = self.sent.min(widened.sent);
+            self.widened_from = Some(widened.from);
+            self.upgrade = widened.under_way.take();
+        }
+    }
     /// Number the admission the startup sends now: a resume, or an offer.
     fn send(&mut self) {
         self.under_way = Default::default();
@@ -1388,6 +1521,12 @@ struct SetupAdmission {
 trait SetupStartup {
     type Claim;
 
+    /// Whether this launch's person is resolved: a passing failure waits before any records
+    /// bind the review; a lasting refusal has no startup work.
+    fn scope_ready(&mut self) -> Result<bool, String> {
+        Ok(true)
+    }
+
     /// Number the admission the startup sends now (`SETUP_SENT`), so a Stop pressed after it
     /// covers the run it admits (`StartupSent`).
     fn send(&mut self) {}
@@ -1414,6 +1553,9 @@ trait SetupStartup {
     }
     fn authorize(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<Option<u64>, String>;
     fn authorization_pending(&self) -> bool;
+    fn stopped(&self) -> bool {
+        false
+    }
     /// Wait before writing the page's answer again, holding the claim. The
     /// wait ends the moment a person's choice made in this process waits for
     /// that claim (`run_setup_restart`), or already does: `true` then, and the
@@ -1444,6 +1586,8 @@ struct LiveSetupStartup<F> {
     vault_typed: bool,
     /// This launch's admission as Stop and a quit know it.
     sent: StartupSent,
+    /// Setup changes heard before the operation whose failure may need a retry.
+    retry_seen: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -1456,6 +1600,24 @@ enum StartupAnswerKind {
 
 #[cfg(target_os = "macos")]
 impl<F> LiveSetupStartup<F> {
+    fn backoff_for(&mut self, limit: std::time::Duration) -> bool {
+        SETUP_WAKES.back_off(&mut self.retry_seen, limit)
+    }
+
+    fn wait_holding_claim_for(&mut self, limit: std::time::Duration) -> bool {
+        wait_before_admission_retry(
+            self.sent.sent,
+            &mut self.retry_seen,
+            limit,
+            |seen, limit| {
+                if !choice_awaits_claim() {
+                    SETUP_WAKES.back_off(seen, limit);
+                }
+            },
+        );
+        choice_awaits_claim()
+    }
+
     fn answer_kind(&self, plan: &aterm_types::macos_setup::Plan) -> StartupAnswerKind {
         if self.vault_typed {
             StartupAnswerKind::Join
@@ -1477,6 +1639,10 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
     SetupStartup for LiveSetupStartup<F>
 {
     type Claim = StartupClaim;
+
+    fn scope_ready(&mut self) -> Result<bool, String> {
+        aterm_cli::macos_doctor::initial_setup_scope_ready()
+    }
 
     fn send(&mut self) {
         self.sent.send();
@@ -1538,6 +1704,7 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
         &mut self,
         initial: aterm_types::macos_setup::Plan,
     ) -> aterm_gui::WorkstationSetupDecision {
+        self.retry_seen = SETUP_WAKES.count();
         let mut answer = (self.offer)(initial, self.sent.handoff());
         self.receipt = answer.receipt.take();
         self.chosen = answer.chosen;
@@ -1551,6 +1718,7 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
     }
 
     fn authorize(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<Option<u64>, String> {
+        self.retry_seen = SETUP_WAKES.count();
         let kind = self.answer_kind(plan);
         let authorization = self
             .authorization
@@ -1562,8 +1730,10 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
             StartupAnswerKind::Join => authorization.persist_join_observed(plan),
         };
         self.observation = observed.observation;
+        self.sent.record_publication(authorization.stop_target());
         let revision = observed.result?;
         if revision.is_some() {
+            self.sent.admitted();
             clear_initial_setup_rows();
             if let Some(receipt) = self.receipt.take() {
                 receipt.accept();
@@ -1579,12 +1749,18 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
             .is_some_and(aterm_cli::macos_doctor::InitialSetupAuthorization::pending)
     }
 
+    fn stopped(&self) -> bool {
+        stop_covers(self.sent.sent)
+    }
+
     fn wait_holding_claim(&mut self) -> bool {
-        await_waiting_choice(SETUP_RETRY_WAIT)
+        self.wait_holding_claim_for(SETUP_RETRY_WAIT)
     }
 
     fn backoff(&mut self) {
-        std::thread::sleep(SETUP_RETRY_WAIT);
+        // Focus returning, Check again and other setup recovery signals all resume
+        // the same bound review. An unchanged failure still waits for its timer.
+        self.backoff_for(SETUP_RETRY_WAIT);
     }
 
     fn report_failure(&mut self, why: &str) {
@@ -1622,6 +1798,7 @@ mod startup_answer_tests {
             chosen: false,
             vault_typed: false,
             sent: StartupSent::default(),
+            retry_seen: SETUP_WAKES.count(),
         };
         assert_eq!(
             host.offer(plan.clone()),
@@ -1683,6 +1860,11 @@ fn retry_setup_step<H: SetupStartup, T>(
 fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim>, String> {
     use aterm_gui::WorkstationSetupDecision;
     host.send();
+    // An unavailable home can look like empty setup records. Wait for the account to resolve
+    // before binding its one review; a failed record capture after that still ends this attempt.
+    if !retry_setup_step(host, H::scope_ready) {
+        return Ok(PreparedSetup::Unavailable);
+    }
     let revision = host
         .bind_authorization()
         .inspect_err(|why| host.report_failure(why))?;
@@ -1772,7 +1954,11 @@ fn finish_setup_choice<H: SetupStartup>(
         return PreparedSetup::Unavailable;
     }
     let mut claim = Some(claim);
+    let mut attempted = false;
     loop {
+        if attempted && host.stopped() {
+            return PreparedSetup::Unavailable;
+        }
         let Some(held) = claim.take() else {
             match host.claim() {
                 Ok(Some(held)) => claim = Some(held),
@@ -1787,6 +1973,7 @@ fn finish_setup_choice<H: SetupStartup>(
             }
             continue;
         };
+        attempted = true;
         match host.authorize(&plan) {
             Ok(None) => return PreparedSetup::Unavailable,
             // Empty authorization already durably commits completion.
@@ -1802,6 +1989,10 @@ fn finish_setup_choice<H: SetupStartup>(
                 return PreparedSetup::Unavailable;
             }
             Err(why) => {
+                if host.stopped() {
+                    host.report_rejection(&why);
+                    return PreparedSetup::Unavailable;
+                }
                 host.report_failure(&why);
                 if host.wait_holding_claim() {
                     drop(held);
@@ -3396,11 +3587,6 @@ static STARTUP_CLAIM_ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 #[cfg(target_os = "macos")]
 static CHOICES_AWAITING_CLAIM: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 
-/// Raised when a person's choice comes to wait for the claim: it ends the
-/// startup's wait before it writes its answer again ([`await_waiting_choice`]).
-#[cfg(target_os = "macos")]
-static CHOICE_AWAITS_CLAIM: std::sync::Condvar = std::sync::Condvar::new();
-
 #[cfg(target_os = "macos")]
 fn choices_awaiting_claim() -> std::sync::MutexGuard<'static, usize> {
     CHOICES_AWAITING_CLAIM
@@ -3450,7 +3636,7 @@ struct AwaitingClaim;
 impl AwaitingClaim {
     fn new() -> Self {
         *choices_awaiting_claim() += 1;
-        CHOICE_AWAITS_CLAIM.notify_all();
+        wake_setup();
         Self
     }
 }
@@ -3468,16 +3654,17 @@ fn choice_awaits_claim() -> bool {
     *choices_awaiting_claim() > 0
 }
 
-/// Wait, at most `limit`, until a person's choice waits for the claim the
-/// startup holds. Whether one does: at once when one already did.
+/// The admission's retry wait, separate from the operation that failed.
 #[cfg(target_os = "macos")]
-fn await_waiting_choice(limit: std::time::Duration) -> bool {
-    CHOICE_AWAITS_CLAIM
-        .wait_timeout_while(choices_awaiting_claim(), limit, |waiting| *waiting == 0)
-        .map_or_else(
-            |poison| *poison.into_inner().0 > 0,
-            |(waiting, _)| *waiting > 0,
-        )
+fn wait_before_admission_retry(
+    sent: u64,
+    seen: &mut u64,
+    limit: std::time::Duration,
+    wait: impl FnOnce(&mut u64, std::time::Duration),
+) {
+    if !stop_covers(sent) {
+        wait(seen, limit);
+    }
 }
 
 /// Whether this process's startup coordinator holds the automatic claim, or
@@ -3582,6 +3769,8 @@ fn stop_covers(sent: u64) -> bool {
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 struct StopSaves {
+    /// The newest exact Stop handed here, retained across failed saves and owner retirement.
+    requested: Option<u64>,
     /// The run whose Stop waits for the worker.
     wanted: Option<u64>,
     /// The run whose Stop the worker is saving now.
@@ -3592,7 +3781,19 @@ struct StopSaves {
     /// `wanted`.
     worker: bool,
     /// The admissions under way ([`UnderWay`]), by number ([`SETUP_SENT`]).
-    under_way: Vec<u64>,
+    under_way: Vec<AdmissionDebt>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct AdmissionDebt {
+    sent: u64,
+    /// Only a target whose actual publication the owning ticket confirmed.
+    target: Option<u64>,
+    /// An unidentified mutation cannot be called unpublished when its worker retires.
+    unconfirmed: bool,
+    /// A live guard still owns the admission, even if a newer choice superseded its writes.
+    owned: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -3602,13 +3803,30 @@ impl StopSaves {
     /// admission the Stop covers that has not registered its run yet.
     fn owed(&self, covers: u64) -> bool {
         self.saving.is_some()
-            || (self.wanted.is_some() && self.worker)
-            || self.under_way.iter().any(|sent| *sent <= covers)
+            || self.wanted.is_some()
+            || self
+                .requested
+                .is_some_and(|requested| self.saved.is_none_or(|saved| saved < requested))
+            || self.under_way.iter().any(|debt| {
+                debt.sent <= covers
+                    && debt
+                        .target
+                        .is_none_or(|target| self.saved.is_none_or(|saved| saved < target))
+            })
+    }
+
+    fn covered_target(&self, covers: u64) -> Option<u64> {
+        self.under_way
+            .iter()
+            .filter(|debt| debt.sent <= covers)
+            .filter_map(|debt| debt.target)
+            .max()
     }
 }
 
 #[cfg(target_os = "macos")]
 static STOP_SAVES: std::sync::Mutex<StopSaves> = std::sync::Mutex::new(StopSaves {
+    requested: None,
     wanted: None,
     saving: None,
     saved: None,
@@ -3626,15 +3844,72 @@ struct UnderWay(u64);
 #[cfg(target_os = "macos")]
 impl UnderWay {
     fn new(sent: u64) -> Self {
-        stop_saves().under_way.push(sent);
+        stop_saves().under_way.push(AdmissionDebt {
+            sent,
+            target: None,
+            unconfirmed: false,
+            owned: true,
+        });
         Self(sent)
+    }
+
+    /// A write attempt's evidence for Stop, never permission to execute or write again.
+    fn record_publication(&self, publication: Result<Option<u64>, String>) {
+        match publication {
+            Ok(Some(target)) => self.confirm_target(target, None),
+            result => {
+                if let Some(debt) = stop_saves()
+                    .under_way
+                    .iter_mut()
+                    .find(|debt| debt.sent == self.0)
+                {
+                    debt.unconfirmed = result.is_err();
+                }
+                STOP_SAVES_MOVED.notify_all();
+            }
+        }
+    }
+
+    fn published(&self, from: u64, target: u64) {
+        self.confirm_target(target, Some(from));
+    }
+
+    fn confirm_target(&self, target: u64, widened_from: Option<u64>) {
+        // Prepare the background saver before publishing a target the UI can stop.
+        start_stop_worker();
+        // The same lock order as a Stop: registration, in-memory Stop, then debt.
+        let _run = SETUP_RUN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stopped = widened_from.is_some_and(setup_stop_requested);
+        let covered = {
+            let mut saves = stop_saves();
+            let covered = stop_covers(self.0)
+                || (widened_from.is_some()
+                    && (stopped || saves.under_way.iter().any(|debt| stop_covers(debt.sent))));
+            if let Some(debt) = saves.under_way.iter_mut().find(|debt| debt.sent == self.0) {
+                debt.target = Some(target);
+                debt.unconfirmed = false;
+            }
+            covered
+        };
+        if covered {
+            save_setup_stop(target);
+        }
+        STOP_SAVES_MOVED.notify_all();
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Drop for UnderWay {
     fn drop(&mut self) {
-        stop_saves().under_way.retain(|sent| *sent != self.0);
+        stop_saves().under_way.retain_mut(|debt| {
+            if debt.sent != self.0 {
+                return true;
+            }
+            debt.owned = false;
+            debt.unconfirmed
+        });
         STOP_SAVES_MOVED.notify_all();
     }
 }
@@ -3820,6 +4095,7 @@ fn wake_setup() {
 /// behind another dialog also retries once its last guard ends.
 #[cfg(target_os = "macos")]
 fn watch_setup_signals() {
+    aterm_gui::on_window_focus_gained(wake_setup);
     aterm_types::macos_setup::on_system_state_front(wake_setup);
     aterm_types::macos_setup::access_record::on_append(access_step_recorded);
     aterm_types::macos_setup::on_macos_dialog_waiter_ready(wake_setup);
@@ -3854,6 +4130,7 @@ fn access_step_recorded(
 #[cfg(target_os = "macos")]
 fn setup_stop_requested(revision: u64) -> bool {
     SETUP_STOP.lock().is_ok_and(|stop| *stop == Some(revision))
+        || stop_saves().requested == Some(revision)
 }
 
 /// A stage of the running pass started or ended: its rows paint busy while it
@@ -4221,13 +4498,32 @@ fn stop_runs_sent_through(through: u64) -> bool {
         return false;
     };
     STOP_COVERS.fetch_max(through, std::sync::atomic::Ordering::AcqRel);
-    let Some(revision) = *run else {
-        return false;
-    };
-    stop_setup_run(revision);
+    let revision = *run;
+    if let Some(revision) = revision {
+        stop_setup_run(revision);
+    }
+    let target = stop_saves().covered_target(through);
+    if let Some(target) = target {
+        save_setup_stop(target);
+    }
     drop(run);
     wake_setup();
-    true
+    revision.is_some() || target.is_some()
+}
+
+/// A newly saved choice supersedes earlier unidentified publications. Live guards still
+/// count until their workers retire; abandoned ones no longer owe an unidentifiable Stop.
+/// Call only for a new successful admission, never a resume of a readable run.
+#[cfg(target_os = "macos")]
+fn retire_unconfirmed_admissions(sent: u64) {
+    stop_saves().under_way.retain_mut(|debt| {
+        if debt.sent >= sent || !debt.unconfirmed {
+            return true;
+        }
+        debt.unconfirmed = false;
+        debt.owned
+    });
+    STOP_SAVES_MOVED.notify_all();
 }
 
 /// Register admitted run `revision` as the one a Stop stops ([`SETUP_RUN`]),
@@ -4249,7 +4545,7 @@ fn register_admitted_run(revision: u64, sent: u64, overtaken: bool, widened_from
                 || stop_saves()
                     .under_way
                     .iter()
-                    .any(|under_way| stop_covers(*under_way))
+                    .any(|debt| stop_covers(debt.sent))
         });
         if overtaken || stop_covers(sent) || held {
             stop_setup_run(revision);
@@ -4280,10 +4576,17 @@ fn stop_setup_run(revision: u64) {
 fn save_setup_stop(revision: u64) {
     {
         let mut saves = stop_saves();
-        if saves.saved == Some(revision) || saves.saving == Some(revision) {
+        saves.requested = Some(
+            saves
+                .requested
+                .map_or(revision, |requested| requested.max(revision)),
+        );
+        if saves.saved.is_some_and(|saved| saved >= revision)
+            || saves.saving.is_some_and(|saving| saving >= revision)
+        {
             return;
         }
-        saves.wanted = Some(revision);
+        saves.wanted = Some(saves.wanted.map_or(revision, |wanted| wanted.max(revision)));
     }
     STOP_SAVES_MOVED.notify_all();
     start_stop_worker();
@@ -4331,7 +4634,7 @@ fn save_wanted_stops() {
             let mut saves = stop_saves();
             saves.saving = None;
             if saved {
-                saves.saved = Some(revision);
+                saves.saved = Some(saves.saved.map_or(revision, |saved| saved.max(revision)));
             }
         }
         STOP_SAVES_MOVED.notify_all();
@@ -4345,10 +4648,19 @@ fn save_wanted_stops() {
 /// Whether everything a Stop asked for is saved.
 #[cfg(target_os = "macos")]
 fn settle_setup_stop(limit: std::time::Duration) -> bool {
-    if let Some(revision) = SETUP_STOP.lock().ok().and_then(|stop| *stop) {
-        save_setup_stop(revision);
-    }
+    let stopped = SETUP_STOP.lock().ok().and_then(|stop| *stop);
     let covers = STOP_COVERS.load(std::sync::atomic::Ordering::Acquire);
+    let target = {
+        let saves = stop_saves();
+        [stopped, saves.requested].into_iter().flatten().max()
+    };
+    if let Some(target) = target {
+        save_setup_stop(target);
+    }
+    let queued = stop_saves().wanted.is_some();
+    if queued {
+        start_stop_worker();
+    }
     let waited = STOP_SAVES_MOVED
         .wait_timeout_while(stop_saves(), limit, |saves| saves.owed(covers))
         .is_ok_and(|(saves, _)| !saves.owed(covers));
@@ -4356,7 +4668,7 @@ fn settle_setup_stop(limit: std::time::Duration) -> bool {
     // one asked for last, read without holding the worker's lock (the order
     // is [`SETUP_STOP`], then [`STOP_SAVES`]).
     let stopped = SETUP_STOP.lock().ok().and_then(|stop| *stop);
-    waited && stopped.is_none_or(|stopped| stop_saves().saved == Some(stopped))
+    waited && stopped.is_none_or(|stopped| stop_saves().saved.is_some_and(|saved| saved >= stopped))
 }
 
 /// [`aterm_gui::InitialSetupHandlers::settle`]: the app is quitting.
@@ -4423,7 +4735,6 @@ fn begin_setup_choice(
 /// that run takes no step first.
 #[cfg(target_os = "macos")]
 fn forget_setup_choice(choice: &SetupChoice) {
-    let mut stopped = false;
     if let Some(run) = choice.replaced
         && let Ok(mut registered) = SETUP_RUN.lock()
     {
@@ -4434,11 +4745,7 @@ fn forget_setup_choice(choice: &SetupChoice) {
             && (setup_choice_overtaken(choice.generation) || stop_covers(choice.sent))
         {
             stop_setup_run(run);
-            stopped = true;
         }
-    }
-    if stopped {
-        wake_setup();
     }
     if let Ok(mut rows) = OBSERVED_ROWS.lock()
         && rows.choices == choice.choices
@@ -4446,6 +4753,9 @@ fn forget_setup_choice(choice: &SetupChoice) {
         rows.choices += 1;
         rows.plan = None;
     }
+    // Startup may already have answered the choice's earlier claim-wait wake.
+    // A terminal refusal releases it only after both rollback locks are gone.
+    wake_setup();
 }
 
 /// The plan a reading is taken for, and [`ObservedRows::choices`] then: the
@@ -4839,6 +5149,7 @@ fn admit_setup_change(
         awaiting,
         under_way: Some(under_way),
         startup_held: false,
+        retry_seen: SETUP_WAKES.count(),
     };
     if let Some(busy) = run_setup_restart(&mut host, &choice.plan, password, receipt, busy) {
         forget_setup_choice(choice);
@@ -4864,6 +5175,9 @@ trait SetupRestartHost {
     fn await_claim(&mut self);
     fn persist(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<Option<u64>, String>;
     fn pending(&self) -> bool;
+    fn stopped(&self) -> bool {
+        false
+    }
     fn backoff(&mut self);
     fn admitted(
         &mut self,
@@ -4906,7 +5220,12 @@ fn run_setup_restart<H: SetupRestartHost>(
             }
         }
     };
+    let mut attempted = false;
     loop {
+        if attempted && host.stopped() {
+            return Some(busy);
+        }
+        attempted = true;
         match host.persist(plan) {
             Ok(Some(revision)) => {
                 host.admitted(revision, claim, busy, password, receipt);
@@ -4915,7 +5234,7 @@ fn run_setup_restart<H: SetupRestartHost>(
             Ok(None) => return Some(busy),
             Err(why) => {
                 host.failure(&why);
-                if !host.pending() {
+                if host.stopped() || !host.pending() {
                     return Some(busy);
                 }
                 host.backoff();
@@ -4941,6 +5260,17 @@ struct LiveSetupRestart {
     /// The startup coordinator held the claim, or asked for it, around the
     /// last ask that found it taken.
     startup_held: bool,
+    /// Setup changes heard before this attempt began its write.
+    retry_seen: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl LiveSetupRestart {
+    fn backoff_for(&mut self, limit: std::time::Duration) {
+        wait_before_admission_retry(self.sent, &mut self.retry_seen, limit, |seen, limit| {
+            SETUP_WAKES.back_off(seen, limit);
+        });
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4975,8 +5305,12 @@ impl SetupRestartHost for LiveSetupRestart {
     }
 
     fn persist(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<Option<u64>, String> {
+        self.retry_seen = SETUP_WAKES.count();
         let observed = (setup_io().persist)(&mut self.restart, plan, self.vault_typed);
         self.observation = observed.observation;
+        if let Some(under_way) = &self.under_way {
+            under_way.record_publication(self.restart.stop_target());
+        }
         observed.result
     }
 
@@ -4984,8 +5318,12 @@ impl SetupRestartHost for LiveSetupRestart {
         self.restart.pending()
     }
 
+    fn stopped(&self) -> bool {
+        stop_covers(self.sent)
+    }
+
     fn backoff(&mut self) {
-        std::thread::sleep(std::time::Duration::from_secs(60));
+        self.backoff_for(SETUP_RETRY_WAIT);
     }
 
     fn admitted(
@@ -4999,6 +5337,7 @@ impl SetupRestartHost for LiveSetupRestart {
         // Registered at once, holding the slot and the claim: a Stop from now stops this run,
         // saved by the worker started here. A choice or a Stop made while this plan was being
         // admitted stops it before its first stage.
+        retire_unconfirmed_admissions(self.sent);
         register_admitted_run(
             revision,
             self.sent,
@@ -5464,6 +5803,15 @@ fn restore_initial_setup() -> bool {
 
 #[cfg(all(test, target_os = "macos"))]
 mod initial_setup_result_tests {
+    #[path = "startup_retry_wake_tests.rs"]
+    mod startup_retry_wake_tests;
+
+    #[path = "admission_stop_handoff_tests.rs"]
+    mod admission_stop_handoff_tests;
+
+    #[path = "watch_stop_handoff_tests.rs"]
+    mod watch_stop_handoff_tests;
+
     use super::*;
     use aterm_cli::macos_doctor::{
         InitialSetupObservation, InitialSetupSnapshot, InitialSetupSnapshotError,
@@ -5840,6 +6188,8 @@ mod initial_setup_result_tests {
         stop_hold: bool,
         /// Stop saves that fail before one lands.
         stop_failures: usize,
+        /// An optional actual scratch Stop writer for admission handoff tests.
+        stop_root: Option<std::path::PathBuf>,
         /// A person's choice asks for the claim only once this is clear.
         claim_hold: bool,
         /// Admissions of a person's choice begun.
@@ -5893,6 +6243,7 @@ mod initial_setup_result_tests {
             stops: Vec::new(),
             stop_hold: false,
             stop_failures: 0,
+            stop_root: None,
             claim_hold: false,
             persists: 0,
             persist_hold: false,
@@ -6032,6 +6383,13 @@ mod initial_setup_result_tests {
                 script.stop_failures -= 1;
                 return Err("the disk is full".into());
             }
+            let root = script.stop_root.clone();
+            drop(script);
+            if let Some(root) = root {
+                aterm_cli::macos_doctor::ProvisionalSetupWatchTest::at(&root)
+                    .stop_revision(revision)?;
+            }
+            let mut script = self::script();
             script.stops.push(revision);
             SCRIPT_MOVED.notify_all();
             Ok(())
@@ -6323,7 +6681,13 @@ mod initial_setup_result_tests {
             change(|script| script.retry_waits += 1);
             // Twice the hang detector: a choice that had to wait it out
             // fails the test before the wait ends.
-            await_waiting_choice(HANG * 2)
+            let mut seen = SETUP_WAKES.count();
+            wait_before_admission_retry(self.sent.sent, &mut seen, HANG * 2, |seen, limit| {
+                if !choice_awaits_claim() {
+                    SETUP_WAKES.back_off(seen, limit);
+                }
+            });
+            choice_awaits_claim()
         }
         fn backoff(&mut self) {
             drop(wait_while(script(), |script| script.startup_backoff_hold));
@@ -8907,6 +9271,9 @@ mod doctor;
 /// test-only mount runs the same code against real `-vV` fixtures.
 #[cfg(test)]
 mod compiler_probe;
+
+#[cfg(all(test, target_os = "macos"))]
+mod startup_scope_tests;
 
 #[cfg(test)]
 mod tests {

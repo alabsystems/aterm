@@ -2994,7 +2994,7 @@ impl TrailSynth {
 
     /// Feed the bed for one admitted trail gesture: [`bed_kick`]'s energy for the kind and the smoothed gain for the user volume.
     #[inline]
-    pub(super) fn kick_bed(&mut self, kind: SoundKind, gain: f32) {
+    pub(super) const fn kick_bed(&mut self, kind: SoundKind, gain: f32) {
         self.bed.energy = (self.bed.energy + bed_kick(kind)).min(1.0);
         self.bed.gain += (gain - self.bed.gain) * 0.3;
     }
@@ -4868,7 +4868,7 @@ const fn tri(ph: f32) -> f32 {
 }
 
 #[inline]
-fn limit(y: f32, env: &mut f32, g: &mut f32, k_att: f32, k_rel: f32) -> f32 {
+const fn limit(y: f32, env: &mut f32, g: &mut f32, k_att: f32, k_rel: f32) -> f32 {
     *env = y.abs().max(*env * k_rel);
     let target = if *env > LIMIT_THRESHOLD {
         LIMIT_THRESHOLD / *env
@@ -4884,7 +4884,7 @@ fn limit(y: f32, env: &mut f32, g: &mut f32, k_att: f32, k_rel: f32) -> f32 {
 }
 
 #[inline]
-fn soft_clip(x: f32) -> f32 {
+const fn soft_clip(x: f32) -> f32 {
     let y = x * (27.0 + x * x) / (27.0 + 9.0 * x * x);
     y.clamp(-0.98, 0.98)
 }
@@ -5057,7 +5057,7 @@ mod tests {
         );
     }
 
-    fn ev(style: GlowStyle, kind: SoundKind) -> SoundEvent {
+    const fn ev(style: GlowStyle, kind: SoundKind) -> SoundEvent {
         SoundEvent {
             style,
             voice: SoundVoice::Style,
@@ -5072,7 +5072,7 @@ mod tests {
         }
     }
 
-    fn bonk(style: GlowStyle) -> SoundEvent {
+    const fn bonk(style: GlowStyle) -> SoundEvent {
         SoundEvent {
             style,
             voice: SoundVoice::Style,
@@ -5087,7 +5087,7 @@ mod tests {
         }
     }
 
-    fn output(style: GlowStyle, gesture: OutputGesture) -> SoundEvent {
+    const fn output(style: GlowStyle, gesture: OutputGesture) -> SoundEvent {
         SoundEvent {
             style,
             voice: SoundVoice::Style,
@@ -5102,14 +5102,14 @@ mod tests {
         }
     }
 
-    fn toned(style: GlowStyle, kind: SoundKind, tone: Tone) -> SoundEvent {
+    const fn toned(style: GlowStyle, kind: SoundKind, tone: Tone) -> SoundEvent {
         SoundEvent {
             tone,
             ..ev(style, kind)
         }
     }
 
-    fn reduce(mut r: f32) -> f32 {
+    const fn reduce(mut r: f32) -> f32 {
         while r < 1.0 {
             r *= 2.0;
         }
@@ -5154,11 +5154,11 @@ mod tests {
 
     const VOICES: &[SoundVoice] = SoundVoice::ALL;
 
-    fn is_music_box(voice: SoundVoice, style: GlowStyle) -> bool {
+    const fn is_music_box(voice: SoundVoice, style: GlowStyle) -> bool {
         matches!(
             voice,
             SoundVoice::RainbowKittyV2 | SoundVoice::Of(GlowStyle::RainbowKitty)
-        ) || (voice == SoundVoice::Style && style == GlowStyle::RainbowKitty)
+        ) || (matches!(voice, SoundVoice::Style) && matches!(style, GlowStyle::RainbowKitty))
     }
 
     const KINDS: [SoundKind; 8] = [
@@ -5267,7 +5267,7 @@ mod tests {
         }
     }
 
-    fn voiced(voice: SoundVoice, style: GlowStyle, kind: SoundKind) -> SoundEvent {
+    const fn voiced(voice: SoundVoice, style: GlowStyle, kind: SoundKind) -> SoundEvent {
         SoundEvent {
             voice,
             ..ev(style, kind)
@@ -5853,7 +5853,7 @@ mod tests {
         assert_eq!(bonked.duck, 0.0, "the duck must snap back to exact rest");
     }
 
-    fn riff_sig(style: GlowStyle, bar: u16, sig: u32) -> SoundEvent {
+    const fn riff_sig(style: GlowStyle, bar: u16, sig: u32) -> SoundEvent {
         SoundEvent {
             style,
             voice: SoundVoice::Style,
@@ -5868,7 +5868,7 @@ mod tests {
         }
     }
 
-    fn riff(style: GlowStyle, bar: u16) -> SoundEvent {
+    const fn riff(style: GlowStyle, bar: u16) -> SoundEvent {
         riff_sig(style, bar, crate::kitty_sing::NEUTRAL_SIGNATURE)
     }
 
@@ -5941,7 +5941,7 @@ mod tests {
         assert_eq!(s.sing, 0.0, "the sing duck must hand back to exact rest");
     }
 
-    fn outro_sig(sig: u32) -> SoundEvent {
+    const fn outro_sig(sig: u32) -> SoundEvent {
         SoundEvent {
             kind: SoundGesture::Celebration(CelebrationGesture::outro(sig)),
             ..riff_sig(GlowStyle::RainbowKitty, 0, sig)

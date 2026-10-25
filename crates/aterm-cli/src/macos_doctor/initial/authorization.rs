@@ -5,16 +5,33 @@
 
 use super::*;
 
+#[cfg(any(test, debug_assertions))]
+#[path = "admission_stop_test.rs"]
+mod admission_stop_test;
+#[cfg(any(test, debug_assertions))]
+pub use admission_stop_test::{InitialSetupAdmissionFault, InitialSetupAdmissionStopTest};
+
+#[cfg(any(test, debug_assertions))]
+#[derive(Clone, Copy)]
+enum WatchFault {
+    Write(usize, bool),
+    PublicationRead(usize, bool),
+}
+
 /// Authorization bound to the records observed before a startup offer.
 pub struct InitialSetupAuthorization {
     revision: u64,
     vault: AdmittedVault,
     state: AuthorizationState,
+    stop: StopReservation,
 }
 
 enum AuthorizationState {
     Bound(InitialSetupObservation),
     Writing(AuthorizationCommit),
+    /// A write failed and its publication identity could not be captured. This
+    /// owns no further writes, but cannot certify that it published nothing.
+    Unconfirmed,
     Ended,
 }
 
@@ -53,6 +70,14 @@ enum AuthorizationWrite {
 }
 
 impl AuthorizationWrite {
+    fn stop_target(&self) -> Option<u64> {
+        match self {
+            Self::Progress(progress) => Some(progress.revision),
+            Self::UpgradePlan(_, recovery) => Some(recovery.pending.revision),
+            Self::Plan(..) | Self::Workstation(..) => None,
+        }
+    }
+
     fn persist(&self, root: &Path) -> Result<(), String> {
         match self {
             Self::Plan(plan, provisional) => save_plan_as(root, plan, *provisional),
@@ -89,6 +114,25 @@ impl AuthorizationWrite {
 }
 
 impl AuthorizationCommit {
+    fn published_target(&self, root: &Path) -> Result<Option<u64>, String> {
+        if observation::publications(root)? != self.publications {
+            return Ok(None);
+        }
+        let current = observation_at(root).map_err(|error| error.to_string())?;
+        if current.publications() != self.publications
+            || !self
+                .prefixes
+                .iter()
+                .any(|expected| self.same_records(&current.records, expected))
+            || !current.records.progress.is_some_and(|progress| {
+                progress.revision == self.revision && progress.belongs_to(&self.plan)
+            })
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.revision))
+    }
+
     fn same_records(&self, current: &Records, expected: &Records) -> bool {
         if !matches!(
             self.writes.first(),
@@ -204,6 +248,47 @@ impl AuthorizationCommit {
 }
 
 impl InitialSetupAuthorization {
+    /// The exact revision this attempt reserved, for Stop only, never admission or replay.
+    pub fn stop_target(&self) -> Result<Option<u64>, String> {
+        self.stop.target()
+    }
+
+    /// An upgrade target this attempt actually published, never its unwritten next revision.
+    pub(super) fn published_upgrade_at(
+        &self,
+        root: &Path,
+    ) -> Result<Option<scope::SetupUpgrade>, String> {
+        if self.publication_unknown() {
+            // Scope owns this upgrade ticket. A successful earlier checkpoint
+            // reserved its exact revision even though write ownership was lost.
+            return self.stop_target().map(|target| {
+                target.map(|to| scope::SetupUpgrade {
+                    from: self.revision,
+                    to,
+                })
+            });
+        }
+        let AuthorizationState::Writing(commit) = &self.state else {
+            return Ok(None);
+        };
+        if !matches!(
+            commit.writes.first(),
+            Some(AuthorizationWrite::UpgradePlan(..))
+        ) {
+            return Ok(None);
+        }
+        Ok(commit
+            .published_target(root)?
+            .map(|to| scope::SetupUpgrade {
+                from: self.revision,
+                to,
+            }))
+    }
+
+    pub(super) const fn publication_unknown(&self) -> bool {
+        matches!(self.state, AuthorizationState::Unconfirmed)
+    }
+
     /// Observe existing setup records before loading or displaying an offer ([`Self::offer`]).
     pub fn capture() -> Result<Self, String> {
         Self::capture_at(&state_root()?)
@@ -217,6 +302,7 @@ impl InitialSetupAuthorization {
             revision,
             vault: AdmittedVault::Unknown,
             state: AuthorizationState::Bound(baseline),
+            stop: StopReservation::default(),
         })
     }
 
@@ -250,7 +336,10 @@ impl InitialSetupAuthorization {
 
     /// Whether this bound choice can still be persisted or confirmed.
     pub const fn pending(&self) -> bool {
-        !matches!(self.state, AuthorizationState::Ended)
+        matches!(
+            self.state,
+            AuthorizationState::Bound(_) | AuthorizationState::Writing(_)
+        )
     }
 
     /// Some confirms this ticket's exact admitted revision, including an empty plan.
@@ -412,6 +501,45 @@ impl InitialSetupAuthorization {
         upgrade: bool,
         fault: Option<(usize, bool)>,
     ) -> Result<Option<u64>, String> {
+        self.persist_watch_fault(
+            root,
+            plan,
+            upgrade,
+            fault.map(|(at, after)| WatchFault::Write(at, after)),
+        )
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(super) fn lose_publication_for_watch_test(
+        &mut self,
+        root: &Path,
+        plan: &Plan,
+        at: usize,
+        published: bool,
+    ) -> Result<Option<u64>, String> {
+        let result = self.persist_watch_fault(
+            root,
+            plan,
+            true,
+            Some(WatchFault::PublicationRead(at, published)),
+        );
+        std::fs::remove_dir(root.join("automatic-plan.json")).map_err(|error| error.to_string())?;
+        std::fs::rename(
+            root.join("held-upgrade-plan.json"),
+            root.join("automatic-plan.json"),
+        )
+        .map_err(|error| error.to_string())?;
+        result
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn persist_watch_fault(
+        &mut self,
+        root: &Path,
+        plan: &Plan,
+        upgrade: bool,
+        fault: Option<WatchFault>,
+    ) -> Result<Option<u64>, String> {
         let mut index = 0;
         observe_mutation_at(root, None, Err("busy".into()), |root| {
             self.persist_with(
@@ -425,7 +553,22 @@ impl InitialSetupAuthorization {
                 |step, root| {
                     let current = index;
                     index += 1;
-                    if let Some((at, published)) = fault
+                    if let Some(WatchFault::PublicationRead(at, published)) = fault
+                        && current == at
+                    {
+                        if published {
+                            step.persist(root)?;
+                        }
+                        std::fs::rename(
+                            root.join("automatic-plan.json"),
+                            root.join("held-upgrade-plan.json"),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        std::fs::create_dir(root.join("automatic-plan.json"))
+                            .map_err(|error| error.to_string())?;
+                        return Err("injected post-publication identity failure".into());
+                    }
+                    if let Some(WatchFault::Write(at, published)) = fault
                         && current == at
                     {
                         if published {
@@ -453,7 +596,7 @@ impl InitialSetupAuthorization {
         let publications = match &self.state {
             AuthorizationState::Bound(baseline) => baseline.publications(),
             AuthorizationState::Writing(commit) => commit.publications.clone(),
-            AuthorizationState::Ended => return Ok(None),
+            AuthorizationState::Unconfirmed | AuthorizationState::Ended => return Ok(None),
         };
         if !owns_publications(root, &publications)? {
             self.state = AuthorizationState::Ended;
@@ -494,26 +637,44 @@ impl InitialSetupAuthorization {
                     .is_some_and(|expected| commit.same_records(&current.records, expected))
                 {
                     let revision = commit.revision;
+                    self.stop = StopReservation::Known(revision);
                     self.state = AuthorizationState::Ended;
                     return Ok(Some(revision));
                 }
             }
-            AuthorizationState::Ended => return Ok(None),
+            AuthorizationState::Unconfirmed | AuthorizationState::Ended => return Ok(None),
         }
         let AuthorizationState::Writing(commit) = &self.state else {
             unreachable!()
         };
         let revision = commit.revision;
-        let result = commit.writes.iter().try_for_each(|step| write(step, root));
+        let before = commit.publications.clone();
+        let previous_stop = self.stop;
+        self.stop.writing();
+        let result = commit.writes.iter().try_for_each(|step| {
+            write(step, root)?;
+            if let Some(revision) = step.stop_target() {
+                self.stop = StopReservation::Known(revision);
+            }
+            Ok::<_, String>(())
+        });
         if let Err(why) = result {
             match observation::publications(root) {
                 Ok(publications) => {
+                    let unchanged = publications == before;
                     let AuthorizationState::Writing(commit) = &mut self.state else {
                         unreachable!()
                     };
                     commit.publications = publications;
+                    if !matches!(self.stop, StopReservation::Known(_)) {
+                        if unchanged {
+                            self.stop = previous_stop;
+                        } else if let Ok(Some(revision)) = commit.published_target(root) {
+                            self.stop = StopReservation::Known(revision);
+                        }
+                    }
                 }
-                Err(_) => self.state = AuthorizationState::Ended,
+                Err(_) => self.state = AuthorizationState::Unconfirmed,
             }
             return Err(why);
         }
@@ -526,9 +687,7 @@ fn records_finished(records: &Records) -> bool {
     match records.progress {
         None => records.decision == Decision::Applied(true),
         Some(progress) => {
-            (progress.stopped
-                || (progress.admitted
-                    && (progress.completed || progress.stopped_by(records.stop_request))))
+            (progress.stopped_by(records.stop_request) || (progress.admitted && progress.completed))
                 && records
                     .plan
                     .as_ref()

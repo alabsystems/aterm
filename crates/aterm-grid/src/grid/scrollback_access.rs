@@ -12,6 +12,41 @@ use aterm_scrollback::{Line, ScrollbackStorage};
 use super::{Grid, scroll_convert, scroll_materialize};
 
 impl Grid {
+    /// Whether any retained history image is accepted by `selected`.
+    #[must_use]
+    pub fn history_any_image(
+        &self,
+        selected: &dyn Fn(&aterm_scrollback::ImageSpan) -> bool,
+    ) -> bool {
+        self.storage.ring_extras.any_image(selected)
+            || self.storage.lazy_buffer.any_image(selected)
+            || self
+                .storage
+                .scrollback
+                .as_ref()
+                .is_some_and(|store| store.any_image(selected))
+    }
+
+    /// Retains accepted image spans in ring, staged and hot history, preserving text and row order.
+    /// Returns whether any image span was removed and invalidates history render caches on change.
+    pub fn retain_history_images(
+        &mut self,
+        keep: &mut dyn FnMut(&aterm_scrollback::ImageSpan) -> bool,
+    ) -> bool {
+        let ring = self.storage.ring_extras.retain_images(keep);
+        let staged = self.storage.lazy_buffer.retain_images(keep);
+        let stored = self
+            .storage
+            .scrollback
+            .as_mut()
+            .is_some_and(|store| store.retain_images(keep));
+        let changed = ring || staged || stored;
+        if changed {
+            self.storage.mark_content_full();
+        }
+        changed
+    }
+
     /// Drains the lazy buffer and returns a mutable reference to the scrollback storage.
     #[inline]
     pub fn scrollback_mut(&mut self) -> Option<&mut ScrollbackStorage> {

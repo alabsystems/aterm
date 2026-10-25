@@ -887,8 +887,9 @@ pub(crate) fn probe(
     sink: &SinkWriter,
     published: bool,
     last_output: Option<Instant>,
+    now: Instant,
 ) -> (Option<InputBacklog>, bool, Activity) {
-    let backlog = sink.input_backlog();
+    let backlog = sink.input_backlog_at(now);
     let master = sink.master();
     let unread = backlog.is_some_and(|b| b.unread() > 0);
     let stopped = unread && fg_stopped(master);
@@ -1199,6 +1200,7 @@ impl crate::App {
                 &ctx.sink,
                 self.session_status.inputs.published(id).is_some(),
                 (output_ns != 0).then(|| self.lat_epoch + Duration::from_nanos(output_ns)),
+                now,
             );
             let master = ctx.sink.master();
             let (transition, _) = self.session_status.inputs.step(
@@ -2424,7 +2426,7 @@ pub(crate) mod tests {
         let sink = SinkWriter::new(master);
         sink.note_master_nonblocking(true);
         sink.write_frame_nonparking(b"\r").expect("the Enter");
-        let (backlog, stopped, activity) = probe(&sink, false, None);
+        let (backlog, stopped, activity) = probe(&sink, false, None, Instant::now());
         assert!(
             backlog.is_some_and(|b| b.unread() == 1 && !b.canonical),
             "{backlog:?}"
@@ -2438,7 +2440,7 @@ pub(crate) mod tests {
         {
             let _held =
                 crate::program_check_watch::HeldStandIn::of(u32::try_from(leader).expect("pid"));
-            let (_, _, activity) = probe(&sink, false, None);
+            let (_, _, activity) = probe(&sink, false, None, Instant::now());
             assert!(activity.program_check, "the leader stood in as held");
         }
         drop(job);

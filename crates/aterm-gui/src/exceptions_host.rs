@@ -513,6 +513,7 @@ impl App {
                 free_gib,
                 floor_gib,
                 hogs,
+                asked,
             } => {
                 if self.host_noted.insert(DISK_NOTED.to_string()) {
                     self.record_message(message_reporters::disk_low_record(
@@ -521,12 +522,16 @@ impl App {
                 }
                 self.except_clear(message_reporters::DISK_LOW_CLEANUP_OFF_KEY);
                 self.except(&message_reporters::disk_low_entry(
-                    free_gib, floor_gib, &hogs,
+                    free_gib,
+                    floor_gib,
+                    &hogs,
+                    asked.as_deref(),
                 ));
             }
             HostNote::DiskLowCleanupOff {
                 free_gib,
                 floor_gib,
+                asked,
             } => {
                 if self.host_noted.insert(DISK_CLEANUP_OFF_NOTED.to_string()) {
                     self.record_message(message_reporters::disk_low_cleanup_off_record(
@@ -534,9 +539,11 @@ impl App {
                     ));
                 }
                 self.except_end(message_reporters::DISK_LOW_KEY);
-                self.except(&message_reporters::disk_low_cleanup_off_entry(
-                    free_gib, floor_gib,
-                ));
+                let entry = message_reporters::disk_low_cleanup_off_entry(free_gib, floor_gib);
+                self.except(&match asked {
+                    Some(asked) => entry.more(asked),
+                    None => entry,
+                });
             }
             HostNote::DiskPlenty => {
                 // Both, whichever this process held: `|` is not `||`.
@@ -560,14 +567,13 @@ impl App {
                 hogs,
                 cause,
                 thresholds,
+                asked,
             } => {
-                self.post_message(message_reporters::disk_full(
-                    free,
-                    freed,
-                    &hogs,
-                    cause,
-                    &thresholds,
-                ));
+                let full = message_reporters::disk_full(free, freed, &hogs, cause, &thresholds);
+                self.post_message(match asked {
+                    Some(asked) => full.line(asked),
+                    None => full,
+                });
             }
             HostNote::DiskFullOver => {
                 self.messages.resolve_key_prefix(

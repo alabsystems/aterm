@@ -2,7 +2,7 @@
 name: supervise-agent
 description: Run other Claude Code, codex-alab, Gemini CLI, agy or Muse Code sessions in aterm tabs as workers — start each on a task, wait for them in the background, read each one's result and check it against ground truth (tests, diff, exit codes) — or oversee another program (a codex-alab, a REPL, a long build) in an aterm session. Use when asked to hand work to other sessions or windows, run work in parallel in aterm, say what every aterm session or machine is doing, manage or babysit another agent, or act as a lead over workers.
 ---
-<!-- aterm skill v12 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v13 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Workers: other aterm sessions doing the work
 
@@ -48,10 +48,11 @@ Start every worker first, then wait for them together.
 aterm ctl await task @s-a,@s-b,@s-c since=0
 ```
 
-Its exit wakes you and prints `@<sid> rev=<n> state=<s> agent=<word> attention=<pct|->
-result_bytes=<n>` per worker as soon as one is `done`, `exited`, `stalled` or needs
-attention (`all` waits for all of them; `state=closed` if its tab closed; exit 124 with
-`OK timeout` on stderr after 60 min or `timeout=<ms>`).
+Its exit wakes you and prints `@<sid> rev=<n> state=<s> agent=<word> program_state=<w|->
+attention=<pct|-> result_bytes=<n>` per worker as soon as one is `done`, `exited`, `stalled`
+or needs attention (`all` waits for all of them; `state=closed` if its tab closed; exit 124
+with `OK timeout` on stderr after 60 min or `timeout=<ms>`). `program_state=` is a codex's
+own report (a claim, `-` for every other agent); it never wakes the wait.
 
 `await task` answers only on news after its starting rev (defaulting to each worker's
 current rev, where an already-`done` worker is not news). Always pass `since=0` on the
@@ -150,9 +151,19 @@ reads its output. For a hand-driven agent:
   `aterm ctl @s-x await log need since=<log_seq> ep=<log_ep> timeout=600000`, or for both
   with `await log need,close=turn since=<log_seq> ep=<log_ep>`. Always pass `since=` and
   re-arm from the reply's `seq=`/`ep=` (or `resync_to=` on `OK gap`).
-- aterm does not parse Codex screens (`aterm drive phase` always reads `idle` there): judge
-  `codex-alab` by `supervisor=`/`program_state=` and vendor `codex` by `program_state=` and
-  ground truth; read `text` before typing and never `await agent` on `agent=unknown|-`.
+- aterm does not parse Codex screens (`aterm drive phase` always reads `idle` there, and
+  `agent=` stays `unknown`): judge `codex-alab` by `supervisor=`/`supervisor_proven=`/
+  `program_state=` and vendor `codex` by `program_state=` and ground truth; read `text`
+  before typing. Never `await agent` on `agent=unknown|-`: wait on the program's own report.
+  Read `log_seq=` and `log_ep=` from `aterm ctl @s-x status` BEFORE you type to it, then
+  type, then wait with `aterm ctl @s-x await log kind=program since=<log_seq> ep=<log_ep>
+  timeout=600000`, which answers at the first move past `since=`, even one made before the
+  wait began (`… program state=<idle|working|blocked|done|error|none>
+  [ask=<permission|question|auth>] [coalesced=<n>] src=engine conf=claim`); a `since=` read
+  after typing misses a quick turn's moves and waits for the next. Re-arm from the reply's
+  `seq=`/`ep=` until `state=` is one you act on. It is the program's claim, not aterm's
+  reading: check ground truth before acting. `await log close=turn` closes a codex turn
+  only on a codex-alab build aterm measured.
 - `kind question` in `aterm drive phase @s-x` is a question dialog (even if titled `Do you
   want to proceed?`): answer via `aterm ctl @s-x meta set questions ask` + `aterm drive
   answer @s-x <choice>`, or escalate.

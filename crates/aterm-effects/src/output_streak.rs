@@ -1005,7 +1005,7 @@ const fn hue_position_of(rgb: u32) -> f32 {
 mod tests {
     use super::*;
 
-    fn geom() -> Geom {
+    const fn geom() -> Geom {
         Geom {
             cw: 8,
             ch: 16,
@@ -1019,15 +1019,15 @@ mod tests {
         }
     }
 
-    fn cfg_on() -> StreakConfig {
+    const fn cfg_on() -> StreakConfig {
         StreakConfig {
             enabled: true,
             sound: true,
-            ..StreakConfig::default()
+            ..StreakConfig::DEFAULT
         }
     }
 
-    fn span(row: u16) -> [(u16, u16, u16); 1] {
+    const fn span(row: u16) -> [(u16, u16, u16); 1] {
         [(row, 0, 40)]
     }
 

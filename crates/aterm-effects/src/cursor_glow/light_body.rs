@@ -49,29 +49,31 @@ const fn over_at(bg: u32, ink: u32, a: u8) -> u32 {
 /// The opacity `0..=255` at which source-over `ink` on `theme_bg` leaves `theme_fg` `keep` of its contrast on the bare paper, composited as the renderer composites a quad.
 #[must_use]
 pub(crate) fn light_alpha_keeping(ink: u32, theme_fg: u32, theme_bg: u32, keep: f32) -> f32 {
-    use crate::color_math::{relative_luminance_table, relative_luminance_with};
+    use crate::color_math::{
+        RelativeLuminanceTable, relative_luminance_table, relative_luminance_with,
+    };
     let table = relative_luminance_table();
     let (fg, bg) = (theme_fg & 0x00FF_FFFF, theme_bg & 0x00FF_FFFF);
     let lum_fg = relative_luminance_with(table, fg);
-    let ratio = |c: u32| {
+    #[inline]
+    const fn ratio(table: &RelativeLuminanceTable, lum_fg: f32, c: u32) -> f32 {
         let l = relative_luminance_with(table, c);
         (lum_fg.max(l) + 0.05) / (lum_fg.min(l) + 0.05)
-    };
-    let want = ratio(bg) * keep;
-    let holds = |a: u8| ratio(over_at(bg, ink, a)) >= want;
-    if holds(u8::MAX) {
-        return f32::from(u8::MAX);
+    }
+    let want = ratio(table, lum_fg, bg) * keep;
+    if ratio(table, lum_fg, over_at(bg, ink, u8::MAX)) >= want {
+        return u8::MAX as f32;
     }
     let (mut lo, mut hi) = (0u8, u8::MAX);
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
-        if holds(mid) {
+        if ratio(table, lum_fg, over_at(bg, ink, mid)) >= want {
             lo = mid;
         } else {
             hi = mid;
         }
     }
-    f32::from(lo)
+    lo as f32
 }
 
 /// THE LIGHT BODY'S INK: `rgb`'s vivid ink ([`light_ink_bold`], the most chroma one ink weight allows), walked toward white only as far as the body's composite at its strongest opacity `a_max` over `theme_bg` must be lifted for `theme_fg` to keep [`BODY_CONTRAST_BAR`] over it ([`light_body_floor`]).

@@ -179,24 +179,36 @@ impl TypedStamps {
     }
 
     /// Put back what [`Self::split_off_after`] took, behind the remaining earlier stamps.
-    pub(crate) fn merge(&mut self, later: Self) {
-        let n_later = later
-            .slots
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or(TYPED_STAMP_DEPTH);
+    pub(crate) const fn merge(&mut self, later: Self) {
+        let mut n_later = 0;
+        while n_later < TYPED_STAMP_DEPTH && later.slots[n_later].is_some() {
+            n_later += 1;
+        }
         if n_later == 0 {
             return;
         }
-        let n_kept = self
-            .slots
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or(TYPED_STAMP_DEPTH);
-        let keep = n_kept.min(TYPED_STAMP_DEPTH - n_later);
-        self.slots.copy_within(n_kept - keep..n_kept, 0);
-        self.slots[keep..keep + n_later].copy_from_slice(&later.slots[..n_later]);
-        self.slots[keep + n_later..].fill(None);
+        let mut n_kept = 0;
+        while n_kept < TYPED_STAMP_DEPTH && self.slots[n_kept].is_some() {
+            n_kept += 1;
+        }
+        let max_keep = TYPED_STAMP_DEPTH - n_later;
+        let keep = if n_kept < max_keep { n_kept } else { max_keep };
+        let shift = n_kept - keep;
+        let mut i = 0;
+        while i < keep {
+            self.slots[i] = self.slots[shift + i];
+            i += 1;
+        }
+        let mut j = 0;
+        while j < n_later {
+            self.slots[keep + j] = later.slots[j];
+            j += 1;
+        }
+        let mut k = keep + n_later;
+        while k < TYPED_STAMP_DEPTH {
+            self.slots[k] = None;
+            k += 1;
+        }
     }
 
     /// Keep only the stamps `keep` admits, packed oldest-first in their banked order.
@@ -1439,7 +1451,8 @@ impl CursorGlow {
     }
 
     /// Host delivery edge for the key classes.
-    pub fn note_delivered(&mut self, at: Instant, class: DeliveredClass) {
+    #[inline]
+    pub const fn note_delivered(&mut self, at: Instant, class: DeliveredClass) {
         self.unsettle();
         match class {
             DeliveredClass::Typed => self.type_hint.stamp(at),

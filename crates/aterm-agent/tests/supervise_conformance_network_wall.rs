@@ -123,6 +123,7 @@ fn reading(st: &State, worked: Option<Duration>, measured: Instant) -> TurnEndRe
         login_at_wall: None,
         login_method: None,
         login_shared: None,
+        login_moved: false,
         roster: None,
         wall_remembered: false,
         answered: None,

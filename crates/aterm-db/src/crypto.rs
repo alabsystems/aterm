@@ -41,7 +41,7 @@ pub fn public(seed: &[u8; 32]) -> Result<[u8; 32]> {
         .try_into()
         .map_err(|_| Error::new("invalid public key size"))
 }
-fn signed(seed: &[u8; 32], domain: &[u8], body: &[u8]) -> Result<[u8; 64]> {
+pub(crate) fn signed(seed: &[u8; 32], domain: &[u8], body: &[u8]) -> Result<[u8; 64]> {
     let mut message = domain.to_vec();
     message.extend_from_slice(body);
     pair(seed)?
@@ -50,7 +50,7 @@ fn signed(seed: &[u8; 32], domain: &[u8], body: &[u8]) -> Result<[u8; 64]> {
         .try_into()
         .map_err(|_| Error::new("invalid signature size"))
 }
-fn verify(key: &[u8; 32], domain: &[u8], body: &[u8], signature: &[u8]) -> Result<()> {
+pub(crate) fn verify(key: &[u8; 32], domain: &[u8], body: &[u8], signature: &[u8]) -> Result<()> {
     let mut message = domain.to_vec();
     message.extend_from_slice(body);
     UnparsedPublicKey::new(&ED25519, key)
@@ -348,13 +348,13 @@ pub fn open(manifest: &Manifest, key: &[u8; 32], wire: &[u8]) -> Result<Opened> 
         wire: wire.to_vec(),
     })
 }
-fn cipher(key: &[u8; 32], salt: &[u8; 32], header: &[u8]) -> Result<aead::LessSafeKey> {
-    let prk = aterm_digest::hkdf_extract(salt, key);
+pub(crate) fn cipher(key: &[u8; 32], salt: &[u8; 32], header: &[u8]) -> Result<aead::LessSafeKey> {
+    let prk = zeroize::Zeroizing::new(aterm_digest::hkdf_extract(salt, key));
     let mut info = b"aterm-db/payload/1".to_vec();
     info.extend_from_slice(header);
-    let subkey = aterm_digest::hkdf_expand_32(&prk, &info);
+    let subkey = zeroize::Zeroizing::new(aterm_digest::hkdf_expand_32(&prk, &info));
     Ok(aead::LessSafeKey::new(
-        aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &subkey)
+        aead::UnboundKey::new(&aead::CHACHA20_POLY1305, subkey.as_ref())
             .map_err(|_| Error::new("invalid encryption key"))?,
     ))
 }
@@ -392,6 +392,9 @@ impl<'a> Reader<'a> {
     }
     pub(crate) fn byte(&mut self) -> Result<u8> {
         Ok(self.array::<1>()?[0])
+    }
+    pub(crate) fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
     }
     pub(crate) fn end(&self) -> Result<()> {
         if self.pos == self.bytes.len() {

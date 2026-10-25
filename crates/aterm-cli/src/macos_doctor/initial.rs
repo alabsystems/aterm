@@ -14,6 +14,8 @@ mod observation;
 pub use observation::{InitialSetupObservation, InitialSetupObserved};
 mod authorization;
 pub use authorization::InitialSetupAuthorization;
+#[cfg(any(test, debug_assertions))]
+pub use authorization::{InitialSetupAdmissionFault, InitialSetupAdmissionStopTest};
 mod access;
 mod observe;
 pub use observe::observe_initial_setup;
@@ -200,6 +202,32 @@ enum AdmittedVault {
     Configured([u8; 32]),
 }
 
+/// What this attempt can hand Stop after its write authority ends. A confirmed
+/// progress publication reserves its revision; an uncertain write reserves no number.
+#[derive(Clone, Copy, Default)]
+enum StopReservation {
+    #[default]
+    None,
+    Unknown,
+    Known(u64),
+}
+
+impl StopReservation {
+    fn target(self) -> Result<Option<u64>, String> {
+        match self {
+            Self::None => Ok(None),
+            Self::Unknown => Err("the failed setup publication could not be identified".into()),
+            Self::Known(revision) => Ok(Some(revision)),
+        }
+    }
+
+    fn writing(&mut self) {
+        if !matches!(self, Self::Known(_)) {
+            *self = Self::Unknown;
+        }
+    }
+}
+
 impl AdmittedVault {
     fn of(configured: Result<Option<ConfiguredVault>, String>) -> Self {
         match configured {
@@ -301,11 +329,12 @@ impl Progress {
 
     /// Whether a person stopped this revision: saved in the record, or asked for
     /// in a `request` no pass has folded in yet ([`request_stop_at`]). A run
-    /// whose every stage finished is completed, not stopped: a Stop asked for
+    /// whose admission and every stage finished is completed, not stopped: a Stop asked for
     /// during its last stage, or after it, came too late to stop anything.
     fn stopped_by(self, request: Option<StopRequest>) -> bool {
         self.stopped
-            || (!self.completed && request.is_some_and(|request| request.names(self.revision)))
+            || (!(self.admitted && self.completed)
+                && request.is_some_and(|request| request.names(self.revision)))
     }
 }
 
@@ -943,6 +972,7 @@ pub struct InitialSetupRestart {
     /// ([`Self::changing`]); `None`: the plan as sent.
     changed: Option<Selection>,
     final_commit: Option<RestartCommit>,
+    stop: StopReservation,
 }
 
 struct RestartCommit {
@@ -972,6 +1002,11 @@ impl RestartCommit {
 }
 
 impl InitialSetupRestart {
+    /// The exact revision this attempt reserved, for Stop only, never admission or replay.
+    pub fn stop_target(&self) -> Result<Option<u64>, String> {
+        self.stop.target()
+    }
+
     /// A restart of a plan a person (or a control client) shaped on System
     /// State, by a group choice or a Join: the plan is theirs from now on, even
     /// where it equals the provisional plan aterm chose by itself, so no later
@@ -1085,8 +1120,12 @@ impl InitialSetupRestart {
                 ),
                 _ => chosen,
             };
+            let before = observation::publications(root)?;
             self.started = true;
-            let mut next = stage_restart(
+            let previous_stop = self.stop;
+            self.stop.writing();
+            let mut proposed = None;
+            let staged = stage_restart_with(
                 root,
                 &admitted_plan,
                 Restart {
@@ -1094,7 +1133,37 @@ impl InitialSetupRestart {
                     joins: self.chosen && vault_typed,
                 },
                 AdmittedVault::of(configured),
-            )?;
+                |root, progress| {
+                    proposed = Some(progress);
+                    save_progress(root, progress)?;
+                    self.stop = StopReservation::Known(progress.revision);
+                    Ok(())
+                },
+            );
+            let mut next = match staged {
+                Ok(next) => next,
+                Err(why) => {
+                    if !matches!(self.stop, StopReservation::Known(_)) {
+                        match observation::publications(root) {
+                            Ok(after) if after == before => self.stop = previous_stop,
+                            Ok(after) => {
+                                if let Some(proposed) = proposed
+                                    && let Ok(current) = observation_at(root)
+                                    && current.publications() == after
+                                    && current.records.plan.as_ref().is_some_and(
+                                        |(plan, modern)| *modern && *plan == admitted_plan,
+                                    )
+                                    && current.records.progress == Some(proposed)
+                                {
+                                    self.stop = StopReservation::Known(proposed.revision);
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    return Err(why);
+                }
+            };
             let staged = observe(root)?;
             if !staged
                 .records
@@ -1228,6 +1297,16 @@ fn stage_restart(
     restart: Restart,
     vault: AdmittedVault,
 ) -> Result<Progress, String> {
+    stage_restart_with(root, plan, restart, vault, save_progress)
+}
+
+fn stage_restart_with(
+    root: &Path,
+    plan: &Plan,
+    restart: Restart,
+    vault: AdmittedVault,
+    publish_progress: impl FnOnce(&Path, Progress) -> Result<(), String>,
+) -> Result<Progress, String> {
     let Restart { chosen, .. } = restart;
     validate_plan(plan)?;
     // A Stop asked for the run this replaces ends it on record first: should
@@ -1250,7 +1329,7 @@ fn stage_restart(
             .is_some_and(|(saved, modern)| *modern && saved == plan)
         && saved_plan_provisional(root)?;
     save_plan_as(root, plan, provisional)?;
-    save_progress(root, next)?;
+    publish_progress(root, next)?;
     for (record, what) in [
         ("automatic-attempt.json", "the automatic retry cooldown"),
         (HELD_RECORD, "the held automatic setup items"),
@@ -1741,9 +1820,8 @@ fn completed_at(root: &Path) -> Result<bool, String> {
     match progress(root)? {
         Some(progress) => Ok(saved_plan(root)?.is_some_and(|plan| {
             progress.belongs_to(&plan)
-                && (progress.stopped
-                    || (progress.admitted
-                        && (progress.completed || progress.stopped_by(stop_request_at(root)))))
+                && (progress.stopped_by(stop_request_at(root))
+                    || (progress.admitted && progress.completed))
         })),
         None => first_run_complete(root),
     }
@@ -2173,7 +2251,7 @@ impl Records {
         plan
     }
 
-    /// Whether a person stopped the admitted run of these records, on record
+    /// Whether a person stopped the staged or admitted run of these records, on record
     /// or by a request no pass has folded in yet.
     fn stopped_run(&self) -> bool {
         self.progress.is_some_and(|progress| {
@@ -2307,9 +2385,7 @@ fn snapshot_from_observation(
     };
     // A person's Stop ends this revision's work, its access steps included,
     // from the moment it is asked for.
-    let run_stopped = progress.is_some_and(|progress| {
-        progress.stopped || (progress.admitted && progress.stopped_by(records.stop_request))
-    });
+    let run_stopped = progress.is_some_and(|progress| progress.stopped_by(records.stop_request));
     let finished = stopped.is_some() || completed || run_stopped;
     // A Restore puts back Mac preferences and never withdraws aterm's own permissions: the
     // run it ends stays admitted ([`leave_restored_as_is`]), so the access steps go on by

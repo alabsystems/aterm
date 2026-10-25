@@ -385,3 +385,30 @@ fn codex_old_is_the_vendors_bytes_where_codex_is_alab() {
     let kept = install_one(&alab_lane(&l, &f, &policy, &trust, true), codex(), false);
     assert!(matches!(kept.verdict, Verdict::AlabKept { .. }), "{kept:?}");
 }
+
+/// An active ALab codex lends codex-old nothing: its build is no vendor build of the release
+/// codex-old lands and carries no record of OpenAI's bytes, so codex-old downloads them.
+#[test]
+fn an_alab_codex_lends_codex_old_nothing() {
+    let l = world::layout("alab-lends-nothing");
+    alab_codex(&l, B, true);
+    let f = Fake::default();
+    f.publish_codex_default("0.163.0");
+    let (policy, trust) = (Policy::default(), world::trust());
+    let old = super::super::spec("codex-old").unwrap();
+    let o = install_one(&lane(&l, &f, &policy, &trust, false), old, false);
+    assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+    assert_eq!(
+        f.downloads.borrow().as_slice(),
+        [Fake::codex_payload_url("0.163.0")]
+    );
+    let dir = l.build_dir(
+        "codex-old",
+        super::super::Version::parse("0.163.0").unwrap().build_id(),
+    );
+    assert_eq!(complete_record(&dir).unwrap().tree_from, None);
+    let alias = dir.join(world::bin("codex-old"));
+    assert_eq!(std::fs::read(&alias).unwrap(), native_exe("codex 0.163.0"));
+    assert!(!crate::alab::exe_is_alab(&alias));
+    assert_eq!(active(&l), Some(B), "codex stays on its ALab build");
+}

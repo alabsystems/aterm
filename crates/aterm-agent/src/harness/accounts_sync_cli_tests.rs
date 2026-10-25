@@ -993,3 +993,315 @@ region = \"global\"
         "PERSON_BACKOFF elapsed on wall clock must admit retry after sleep"
     );
 }
+
+#[test]
+fn walled_or_low_vendor_pool_enrolls_unenrolled_successor_ahead_of_due_rows() {
+    let bed = Bed::new("vendor-wall-recovery");
+    fake_headless_browser(&bed.home);
+    bed.keep_roster(Cli::Kimi);
+    let kimi_fleet_toml = "\
+[[account]]
+label = \"kimi-1\"
+email = \"kimi-one@example.com\"
+machines = [\"m16\"]
+region = \"global\"
+
+[[account]]
+label = \"kimi-2\"
+email = \"kimi-two@example.com\"
+machines = [\"m16\"]
+region = \"global\"
+";
+    bed.secret(&cli_fleet_file(Cli::Kimi), kimi_fleet_toml);
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+        + 2_000;
+    assert!(matches!(bed.sync(Cli::Kimi, None), Ok(CliSync::Synced(_))));
+    let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
+    let spawned: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let count = Arc::clone(&spawned);
+    let spawn = move |_work: Box<dyn FnOnce() + Send>| {
+        *count.lock().unwrap() += 1;
+        Ok(())
+    };
+    let cooldown = Mutex::new(None);
+    let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
+
+    // CONTROL 1: while `main` is healthy (`Unseen`), unenrolled `kimi-1` and `kimi-2` stay idle
+    // and `accounts renew --cli kimi --due` reports nothing due.
+    let idle_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let idle_fx = UpkeepEffects {
+        fetch: &fetch,
+        spawn_renewal: &spawn,
+        sync_cooldown: &cooldown,
+        renew_guard: &idle_guard,
+    };
+    assert!(
+        !renew_pool_due(
+            Cli::Kimi,
+            &bed.home,
+            &bed.state,
+            &bed.roster(Cli::Kimi),
+            now,
+            &idle_fx
+        ),
+        "CONTROL: healthy unwalled pool must not auto-enroll secondary rows"
+    );
+    let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), now);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = super::super::cli::run_accounts_of(
+        &super::super::cli::AccountsOf {
+            cli: Cli::Kimi,
+            form: super::super::cli::AccountsCmd::Renew {
+                labels: Vec::new(),
+                due: true,
+                on: None,
+            },
+            vendor: accounts::Vendor::default(),
+        },
+        &env,
+        &super::super::cli::LiveAccounts,
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "nothing is due on this machine\n",
+        "CONTROL: unwalled `renew --cli kimi --due` finds nothing due"
+    );
+
+    // Enroll `kimi-1` and mark it rate-limited + signed-out (`renew_due`, limited), while `kimi-2`
+    // remains `NotEnrolled` with an older historical `wrong_at`. When `main` hits a weekly wall,
+    // `renew_pool_due` must enroll `kimi-2` (tier 0) rather than stalling on limited `kimi-1`.
+    signed_out_kimi_login(&bed, "kimi-1");
+    let mut note = None;
+    store
+        .transact_logins(now, &mut note, |state, logins| {
+            let _ = accounts::note_wall(
+                state,
+                ACCOUNTS_OWN_LABEL,
+                "weekly",
+                Some(now + 86_400),
+                now,
+                now,
+            );
+            let _ = accounts::note_wall(state, "kimi-1", "weekly", Some(now + 86_400), now, now);
+            accounts::note_wrong_account(logins, "kimi-2", now - 3_600);
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let wall_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let wall_fx = UpkeepEffects {
+        fetch: &fetch,
+        spawn_renewal: &spawn,
+        sync_cooldown: &cooldown,
+        renew_guard: &wall_guard,
+    };
+    assert!(renew_pool_due(
+        Cli::Kimi,
+        &bed.home,
+        &bed.state,
+        &bed.roster(Cli::Kimi),
+        now,
+        &wall_fx,
+    ));
+    let keys: Vec<String> = wall_guard
+        .lock()
+        .unwrap()
+        .last_attempt
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        keys,
+        ["kimi:kimi-2"],
+        "walled vendor pool must enroll unenrolled kimi-2 ahead of limited due rows"
+    );
+
+    // CONTROL 2: once an enrolled ready successor exists (`kimi-1` signed in and unwalled),
+    // `auto_renew_candidates_for` stops emitting tier-0 `NotEnrolled` rows.
+    let mut ready_note = None;
+    store
+        .transact_logins(now + 10, &mut ready_note, |state, _logins| {
+            state.accounts.remove("kimi-1");
+            let _ = accounts::note_auth(state, "kimi-1", accounts::Auth::Ok, now + 10);
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let roster = Roster::load_for(Cli::Kimi, &bed.roster(Cli::Kimi)).unwrap();
+    let (ready_state, _) = store.load(now + 10).unwrap();
+    let (ready_logins, _) = store.load_logins(now + 10).unwrap();
+    assert!(
+        auto_renew_candidates_for(
+            Cli::Kimi,
+            Some(&store),
+            &roster,
+            &ready_state,
+            &ready_logins,
+            now + 10,
+        )
+        .is_empty(),
+        "CONTROL: ready enrolled kimi-1 satisfies wall recovery without enrolling kimi-2"
+    );
+}
+
+#[test]
+fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
+    let bed = Bed::new("vendor-pending-pin");
+    fake_headless_browser(&bed.home);
+    bed.keep_roster(Cli::Codex);
+    let login_1 = bed.home.join(".aterm/logins/codex/codex-1");
+    let login_2 = bed.home.join(".aterm/logins/codex/codex-2");
+    let login_3 = bed.home.join(".aterm/logins/codex/codex-3");
+    for d in [&login_1, &login_2, &login_3] {
+        fs::create_dir_all(d).unwrap();
+    }
+    fs::write(login_1.join("auth.json"), "{}").unwrap();
+    fs::write(
+        bed.roster(Cli::Codex),
+        format!(
+            "[[account]]\nlabel = \"codex-1\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             email = \"codex-one@example.com\"\n\n\
+             [[account]]\nlabel = \"codex-2\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             email = \"codex-two@example.com\"\n\n\
+             [[account]]\nlabel = \"codex-3\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+            login_1.display(),
+            login_2.display(),
+            login_3.display(),
+        ),
+    )
+    .unwrap();
+    // Even with `[harness] logins = "off"`, an explicit saved choice must resume.
+    fs::write(
+        bed.aterm_toml(),
+        "[fleet]\nmachine = \"m16\"\n[harness]\nlogins = \"off\"\n",
+    )
+    .unwrap();
+    let now = crate::supervise::limit::unix_now().max(NOW);
+    let roster = Roster::load_for(Cli::Codex, &bed.roster(Cli::Codex)).unwrap();
+    let codex_store = accounts::Store::at_for(&bed.state, Cli::Codex, &bed.home);
+    let claude_store = accounts::Store::at(&bed.state);
+
+    // CONTROL 1: unenrolled row without email refuses without saving `pending_pin`.
+    assert!(
+        codex_store
+            .select_account_for(Cli::Codex, &roster, "codex-3", now)
+            .is_err()
+    );
+    assert!(codex_store.load(now).unwrap().0.pending_pin.is_none());
+
+    // Enrolled row pins immediately in Codex's store alone.
+    assert_eq!(
+        codex_store
+            .select_account_for(Cli::Codex, &roster, "codex-1", now)
+            .unwrap(),
+        accounts::PinSelection::Pinned
+    );
+    let (pinned_one, _) = codex_store.load(now).unwrap();
+    assert_eq!(pinned_one.active.as_deref(), Some("codex-1"));
+    assert!(pinned_one.pinned);
+    assert!(claude_store.load(now).unwrap().0.active.is_none());
+
+    // Unenrolled row with email saves `PinSelection::Renew(request)`; a second selection
+    // supersedes the earlier nonce.
+    let stale = codex_store.request_pin("codex-2", now).unwrap();
+    let accounts::PinSelection::Renew(request) = codex_store
+        .select_account_for(Cli::Codex, &roster, "codex-2", now)
+        .unwrap()
+    else {
+        panic!("unenrolled codex-2 with email must save a renew request");
+    };
+    assert_ne!(stale, request);
+    assert!(any_pending_pin(&bed.state, now));
+
+    // Hold global admission via an in-flight Claude permit (`wake_pending = Some(bed.state)`).
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let mut claude_permit = AutoRenewPermit::claim(&guard, "m16", Instant::now(), false).unwrap();
+    claude_permit.wake_pending = Some(bed.state.clone());
+    let _ = fs::remove_file(codex_store.wake_path());
+    let _ = fs::remove_file(claude_store.wake_path());
+
+    let noop_spawn = |_: Box<dyn FnOnce() + Send>| Ok(());
+    assert_eq!(
+        renew_requested_pin_for(
+            Cli::Codex,
+            &bed.home,
+            &bed.state,
+            &bed.roster(Cli::Codex),
+            request.clone(),
+            now,
+            &guard,
+            &noop_spawn,
+        ),
+        RenewalDispatch::Held,
+        "in-flight Claude renewal must hold Codex's request without cancelling it"
+    );
+    assert_eq!(
+        codex_store.load(now).unwrap().0.pending_pin.as_ref(),
+        Some(&request)
+    );
+
+    // Dropping the Claude permit wakes BOTH Codex's store wake and the root store wake.
+    drop(claude_permit);
+    assert!(codex_store.wake_path().is_file());
+    assert!(claude_store.wake_path().is_file());
+
+    // CONTROL 2: a stale nonce is reported `Superseded` without disturbing `request`.
+    assert_eq!(
+        renew_requested_pin_for(
+            Cli::Codex,
+            &bed.home,
+            &bed.state,
+            &bed.roster(Cli::Codex),
+            stale,
+            now,
+            &guard,
+            &noop_spawn,
+        ),
+        RenewalDispatch::Superseded
+    );
+
+    // Stage a completed Codex checkpoint for `codex-2`; `upkeep` resumes `pending_pin`, recovers
+    // the login, pins `codex-2`, and clears `pending_pin` even with `[harness] logins = "off"`.
+    let completed = codex_store.claim_staging_dir("codex-2").unwrap();
+    fs::write(completed.join("auth.json"), "{}").unwrap();
+    accounts::write_renewal_checkpoint_for(
+        Cli::Codex,
+        "codex-2",
+        "codex-two@example.com",
+        completed.to_str().unwrap(),
+        None,
+        Some(accounts::Proof::Status),
+        now + 1,
+    )
+    .unwrap();
+    let cooldown = Mutex::new(None);
+    let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
+    let fx = UpkeepEffects {
+        fetch: &fetch,
+        spawn_renewal: &noop_spawn,
+        sync_cooldown: &cooldown,
+        renew_guard: &guard,
+    };
+    let _ = upkeep(
+        &bed.home,
+        &bed.state,
+        (
+            &bed.config.join(accounts::ACCOUNTS_FILE),
+            now + 2,
+            UpkeepStep::Renew,
+        ),
+        &fx,
+    );
+    let (after, _) = codex_store.load(now + 2).unwrap();
+    assert_eq!(after.active.as_deref(), Some("codex-2"));
+    assert!(after.pinned);
+    assert!(after.pending_pin.is_none());
+    assert!(!any_pending_pin(&bed.state, now + 2));
+}

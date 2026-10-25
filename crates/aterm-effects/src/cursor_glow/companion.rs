@@ -119,7 +119,7 @@ impl CursorGlow {
     /// ([`Self::keep_out_boxes`]).
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn keep_out(&self) -> &[(i32, i32, i32, i32)] {
+    pub const fn keep_out(&self) -> &[(i32, i32, i32, i32)] {
         self.v2.keep_out()
     }
 

@@ -14,11 +14,11 @@ struct GlowFrame<'a> {
 }
 
 impl<'a> GlowFrame<'a> {
-    fn read(input: &'a RenderInput) -> Self {
+    const fn read(input: &'a RenderInput) -> Self {
         Self {
-            under: &input.glow_under,
-            over: &input.cursor_glow_add,
-            halos: &input.glow_halo,
+            under: input.glow_under.as_slice(),
+            over: input.cursor_glow_add.as_slice(),
+            halos: input.glow_halo.as_slice(),
         }
     }
 }
@@ -90,7 +90,7 @@ impl Host {
         self.pipeline.cursor.glow.in_flight_tally().credits
     }
 
-    fn glow_frame(&self) -> GlowFrame<'_> {
+    const fn glow_frame(&self) -> GlowFrame<'_> {
         GlowFrame::read(&self.input)
     }
 }

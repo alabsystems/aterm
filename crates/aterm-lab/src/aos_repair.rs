@@ -16,8 +16,8 @@ use aterm_effects::aos_momentum::plan::{PLAN_LEN, PLAN_NAME, SchedulePlan};
 use aterm_uds::CtlStream;
 
 use crate::aos_phase::{self, ms};
-use crate::aos_search::LAB_BUILD;
 use crate::instance::{self, Instance, Launch, World, take_flag, take_value};
+use crate::lab_build::LAB_BUILD;
 use crate::paths::{from_caller, paths};
 use crate::pyjson::J;
 use crate::stop::{self, Stopped};

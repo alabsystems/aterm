@@ -194,10 +194,10 @@ mod tests {
     use crate::kitty_sing::CelebrateOn;
     use crate::kitty_summon::DOG_SUMMON_KEYS;
 
-    fn glyph(c: char) -> TypedPress<'static> {
+    const fn glyph(c: char) -> TypedPress<'static> {
         TypedPress {
             typed: Some(c),
-            ..TypedPress::default()
+            ..TypedPress::NONE
         }
     }
 

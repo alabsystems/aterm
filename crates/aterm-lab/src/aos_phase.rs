@@ -857,7 +857,7 @@ mod tests {
     use aterm_effects::aos_momentum::{MOMENTUM_HOST_MAX_EVENTS, MomentumHost};
 
     use super::*;
-    use crate::aos_search::LAB_BUILD;
+    use crate::lab_build::LAB_BUILD;
 
     /// A key at `at_ms` ms, as an attached host records it.
     fn key(cursor: u64, at_ms: i128) -> Step {

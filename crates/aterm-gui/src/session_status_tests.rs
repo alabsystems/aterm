@@ -1642,8 +1642,8 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              detail confidence reasons attribution fs_consent conflict revision enabled hold \
              hold_advisory fabric fabric_rtt_ms fabric_link_age_ms fleet hand hand_pid level story why \
              needs needs_n needs_told hold_by typed_by typed_ms path program agent agent_detail agent_rev \
-             agent_since_ms agent_gen agent_fp \
-             program_state last_act os_appearance theme_side reported_scheme scheme_from bg_dark \
+             agent_since_ms agent_gen agent_fp program_state program_state_ms \
+             last_act os_appearance theme_side reported_scheme scheme_from bg_dark \
              session_theme theme_origin{conpty} integration input input_bytes input_wait_ms fg_rss_mb \
              disk disk_free_mb disk_room_mb disk_age_ms job job_quiet_ms program_check syspolicyd \
              syspolicyd_workers syspolicyd_full_ms occupancy occupancy_hold ready slots \
@@ -2427,5 +2427,110 @@ fn status_counts_a_harness_needs() {
         (crate::needs::Verdict::default(), "- needs_n=-"),
     ] {
         assert_eq!(super::needs_fields(&verdict), want);
+    }
+}
+
+/// A REPORT NEVER SHOWS UNDER THE PROGRAM THAT REPLACED ITS WRITER: the real sweep
+/// (`App::observe_session_statuses`) judges the claim by the program in front once it has
+/// noted the foreground move, not by the name it read before. A codex in front shows its
+/// `working`; it reports `blocked:permission` and a claude takes the front before the next
+/// sweep: that sweep's `status` and `ls` show `program_state=-`, as does the one after the
+/// resolver names claude. A codex that takes the front the same way has that report, which
+/// no sweep saw before the move (its writer is not attributable), shown once it is named.
+#[test]
+fn a_report_that_rode_a_foreground_move_never_shows_under_the_program_now_in_front() {
+    use super::program::{LeaderFacts, ProgramResolver};
+    const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
+    const BLOCKED_PERMISSION: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\";
+    const CODEX: i32 = i32::MAX - 11;
+    const CLAUDE: i32 = i32::MAX - 12;
+    const NEXT_CODEX: i32 = i32::MAX - 13;
+    let field = |row: &str, key: &str| {
+        row.split(' ')
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+            .map(str::to_string)
+    };
+    for (successor, successor_name, want) in [
+        (CLAUDE, "claude", "-"),
+        (NEXT_CODEX, "codex", "blocked:permission"),
+    ] {
+        let mut app = crate::App::headless_for_test();
+        app.session_factory.fg_probe = |master| master;
+        app.session_status.programs = ProgramResolver::with_lookup(|pgid, _shell| LeaderFacts {
+            program: match pgid {
+                CODEX | NEXT_CODEX => Some("codex".into()),
+                CLAUDE => Some("claude".into()),
+                _ => None,
+            },
+            ..LeaderFacts::default()
+        });
+        let sid = app.next_session_id;
+        app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
+        let front = |app: &mut crate::App, group: i32| {
+            app.pool
+                .sessions
+                .get_mut(&sid)
+                .expect("pooled")
+                .session
+                .master = group;
+        };
+        let (term, timeline) = {
+            let pooled = app.pool.get(sid).expect("pooled");
+            (
+                std::sync::Arc::clone(&pooled.term),
+                std::sync::Arc::clone(&pooled.ctx.timeline),
+            )
+        };
+        let named = |want: &str| {
+            let program = || timeline.lock().unwrap().agent().program.clone();
+            let named = aterm_spec::wait::within(
+                aterm_spec::wait::MUST_HAPPEN,
+                std::time::Duration::from_millis(1),
+                || (program().as_deref() == Some(want)).then_some(()),
+            );
+            assert!(named.is_some(), "never named {want}: {:?}", program());
+        };
+        let shown = |app: &crate::App| {
+            let status = app.session_status_record(sid).expect("a record");
+            let row = crate::control::cmd_sessions_store(&app.store, None)
+                .lines()
+                .find(|line| line.split(' ').next() == Some(sid.to_string().as_str()))
+                .expect("the session's row")
+                .to_string();
+            (
+                field(&status, "program_state").unwrap_or_default(),
+                field(&row, "program_state").unwrap_or_default(),
+            )
+        };
+        let step = std::time::Duration::from_secs(1);
+        let mut t = std::time::Instant::now();
+        front(&mut app, CODEX);
+        let _ = app.observe_session_statuses(t);
+        named("codex");
+        crate::term_lock(&term).process(WORKING);
+        t += step;
+        let _ = app.observe_session_statuses(t);
+        assert_eq!(
+            shown(&app),
+            ("working".to_string(), "working".to_string()),
+            "PRECONDITION: the codex in front shows its report"
+        );
+        crate::term_lock(&term).process(BLOCKED_PERMISSION);
+        front(&mut app, successor);
+        t += step;
+        let _ = app.observe_session_statuses(t);
+        assert_eq!(
+            shown(&app),
+            ("-".to_string(), "-".to_string()),
+            "the sweep that notes the move judges the report by the unnamed program in front"
+        );
+        named(successor_name);
+        t += step;
+        let _ = app.observe_session_statuses(t);
+        assert_eq!(
+            shown(&app),
+            (want.to_string(), want.to_string()),
+            "once {successor_name} is named in front"
+        );
     }
 }

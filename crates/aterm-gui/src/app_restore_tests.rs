@@ -243,9 +243,14 @@ fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
     };
     let relaunch = |layout: &restore::RestoreManifest| {
         let mut next = App::headless_for_test();
-        let row0 = &layout.windows[0];
-        let size = next.window_frame_px_for(w0, row0.rows, row0.cols);
-        size_to(&mut next, w0, size);
+        let seed = CarriedFrame::cold_first_seed(&layout.windows[0], None, None)
+            .expect("window 0 was not maximized");
+        let (rows, cols) = seed.grid;
+        let ws = next.windows.get_mut(&w0).expect("window 0");
+        ws.take_carried_frame(seed.frame);
+        let carried = ws.carried_inner_px.take();
+        let first = next.attach_frame_px(w0, rows, cols, carried);
+        size_to(&mut next, w0, first);
         let row = CarriedFrame::of(&layout.windows[1]);
         let ((rows, cols), inner) = next.new_window_frame(row);
         assert_eq!(
@@ -257,7 +262,7 @@ fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
         let carried = ws.carried_inner_px.take();
         let frame = next.attach_frame_px(w1, rows, cols, carried);
         size_to(&mut next, w1, frame);
-        (next, frame)
+        (next, first, frame)
     };
 
     let mut desk = App::headless_for_test();
@@ -266,7 +271,8 @@ fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
         desk.insert_logical_window(crate::stub_session(1), 40, 120),
         w1
     );
-    let first = desk.window_frame_px_for(w0, 29, 100);
+    let front = desk.window_frame_px_for(w0, 29, 100);
+    let first = PhysicalSize::new(front.width + 5, front.height + 1);
     let exact = desk.window_frame_px_for(w1, 40, 120);
     let dragged = PhysicalSize::new(exact.width + 3, exact.height + 2);
     size_to(&mut desk, w0, first);
@@ -278,10 +284,11 @@ fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
     );
 
     let layout = quit(&desk);
-    let (next, frame) = relaunch(&layout);
+    let (next, front_frame, frame) = relaunch(&layout);
     assert_eq!(grid(&next, w1), (40, 120), "window 1 keeps its own grid");
     assert_eq!(frame, dragged, "and the size it had");
     assert_eq!(grid(&next, w0), (29, 100));
+    assert_eq!(front_frame, first, "the first window keeps its size too");
 
     desk.set_font_size(base + crate::FONT_ZOOM_STEP);
     size_to(&mut desk, w0, first);
@@ -292,14 +299,22 @@ fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
         (40, 120),
         "PRECONDITION: the zoom re-gridded window 1"
     );
-    let (next, frame) = relaunch(&quit(&desk));
+    let front_zoomed = grid(&desk, w0);
+    let (next, front_frame, frame) = relaunch(&quit(&desk));
     assert_eq!(grid(&next, w1), zoomed, "window 1 keeps its grid");
     assert_eq!(frame, next.window_frame_px_for(w1, zoomed.0, zoomed.1));
+    assert_eq!(grid(&next, w0), front_zoomed, "so does the first");
+    assert_eq!(
+        front_frame,
+        next.window_frame_px_for(w0, front_zoomed.0, front_zoomed.1)
+    );
 
     let mut older = layout;
     older.windows[1].inner_px = None;
-    let (next, _) = relaunch(&older);
+    older.windows[0].inner_px = None;
+    let (next, front_frame, _) = relaunch(&older);
     assert_eq!(grid(&next, w1), (29, 100), "the front window's grid");
+    assert_eq!(front_frame, next.window_frame_px_for(w0, 29, 100));
 }
 
 fn feed_session0(app: &App, bytes: &[u8]) {

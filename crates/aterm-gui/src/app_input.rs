@@ -6443,7 +6443,7 @@ impl App {
                 }
                 self.note_update_handoff_activity();
                 self.reset_blink(wid);
-                self.apply_palette_key(key);
+                self.apply_palette_key_in(wid, key);
                 true
             }
         }
@@ -8636,6 +8636,32 @@ impl App {
                 native.generation,
                 native.field.as_ref(),
             );
+        }
+    }
+
+    /// Retire a closing view's actual composition before its generation goes
+    /// away. A shared model may survive in another view; its marked state must
+    /// end with its owner, while a passive sibling closes without changing it.
+    pub(crate) fn retire_native_ime_view(&mut self, view: crate::tab_model::ViewId) {
+        let retired: Vec<_> = self
+            .windows
+            .values_mut()
+            .filter_map(|window| window.ime_recipient.as_mut())
+            .filter(|composition| {
+                !composition.cancelled
+                    && composition
+                        .recipient
+                        .native
+                        .as_ref()
+                        .is_some_and(|native| native.view == view)
+            })
+            .map(|composition| {
+                composition.cancelled = true;
+                composition.recipient.clone()
+            })
+            .collect();
+        for recipient in retired {
+            self.cancel_ime_projection(&recipient);
         }
     }
 

@@ -1335,13 +1335,13 @@ pub fn context_left(rows: &[String]) -> Option<u8> {
 /// of the footer (the rows down to a blank) against the rule's right edge. It is the mode row's
 /// last run, after many spaces where the row has room and after one where it has little, and on a
 /// row of its own under the mode row where the pane is too narrow for both (measured on 2.1.310
-/// at 120, 60 and 44 columns, `context_fixtures`). A recognized footer row establishes the
-/// reading's start, after a custom status line if present: completion-menu descriptions and
-/// custom status lines occupy the same space and can end in those words too.
+/// at 120, 60 and 44 columns, `context_fixtures`). The last recognized footer row establishes
+/// the reading's start, after a custom status line if present: completion-menu descriptions and
+/// custom status lines occupy the same space and can imitate the footer's words too.
 fn context_under(rows: &[String], frame: Frame, width: usize) -> Option<u8> {
     let from = frame.bottom + 1;
     let footer = &rows[from..footer_end(rows, from)];
-    let first = footer.iter().position(|row| {
+    let first = footer.iter().rposition(|row| {
         let text = crate::text::trim_start(row);
         let mode = text
             .strip_prefix(crate::anchor!("vim.insert"))
@@ -5181,10 +5181,30 @@ mod tests {
             let pad = width - row.chars().count() - indicator.chars().count();
             format!("{row}{}{indicator}", " ".repeat(pad))
         };
-        statusline[mode] = at_edge(&statusline[mode], 7);
+        let actual_mode = statusline[mode].clone();
+        statusline[mode] = at_edge(&actual_mode, 7);
         assert_eq!(context_left(&statusline), Some(7));
         statusline[frame.bottom + 1] = at_edge(&statusline[frame.bottom + 1], 50);
         assert_eq!(context_left(&statusline), Some(7));
+        for imitation in [
+            "  ? for shortcuts",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+            "  ⏸ manual mode on · ? for shortcuts",
+            "  -- INSERT -- ⏸ manual mode on",
+            "  esc to clear",
+            "  esc to interrupt",
+        ] {
+            for false_left in [0, 50] {
+                statusline[frame.bottom + 1] = at_edge(imitation, false_left);
+                statusline[mode] = at_edge(&actual_mode, 7);
+                assert_eq!(context_left(&statusline), Some(7), "{imitation}");
+                statusline[mode] = actual_mode.clone();
+                assert_eq!(context_left(&statusline), None, "{imitation}");
+                let mut wrapped = statusline.clone();
+                wrapped.insert(mode + 1, parked(width, "7% until auto-compact"));
+                assert_eq!(context_left(&wrapped), Some(7), "{imitation}");
+            }
+        }
     }
 
     /// The one reading on recorded screens of each build: at the mode row's end at any width and

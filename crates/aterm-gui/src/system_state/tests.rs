@@ -948,6 +948,113 @@ fn accessibility_is_managed_only_while_a_sign_out_is() {
 }
 
 #[test]
+fn accounts_accessibility_remains_actionable_with_permissions_left_as_is() {
+    let accessibility = Subject::Access(Access::Accessibility);
+    let mut selection = Selection::none();
+    selection.set(Setting::Messages, true);
+    let mut grant = reading(accessibility, Standing::NeedsYou, Some("Off"));
+    grant.detail = Some("The Messages and FaceTime sign-outs need it to press Sign Out.".into());
+    let status = with_readings(
+        selection,
+        vec![
+            grant,
+            reading(
+                Subject::Setting(Setting::Messages),
+                Standing::Waiting,
+                Some("Signed in"),
+            ),
+        ],
+    );
+    let key = "system-state/row/accessibility/open";
+    // The ordinary Permissions-on form proves the published action exists
+    // for this actual producer-shaped reading before testing the exception.
+    let mut all_permissions = status.clone();
+    all_permissions
+        .plan
+        .as_mut()
+        .unwrap()
+        .selection
+        .set(Setting::Permissions, true);
+    let mut baseline = SystemStateApp::new(all_permissions.plan.clone().unwrap());
+    baseline.publish(all_permissions.clone());
+    assert!(
+        compile(&baseline, &SystemStateViewState::default(), 999.0, 900.0)
+            .semantic(&UiKey::new(key))
+            .unwrap()
+            .state
+            .unwrap()
+            .enabled
+    );
+    let baseline_menu = crate::system_state_access::menu_line(&all_permissions, false)
+        .unwrap()
+        .label;
+
+    let mut app = SystemStateApp::new(status.plan.clone().unwrap());
+    app.publish(status.clone());
+    let ui = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
+    assert!(
+        ui.semantic(&UiKey::new(key))
+            .is_some_and(|node| node.state.is_some_and(|state| state.enabled)),
+        "the selected sign-out's required grant must keep its remedy"
+    );
+    assert!(app.can_open_access(Access::Accessibility));
+    assert!(app.needs_attention());
+    assert_eq!(
+        headline(&status, &app.reviewed_rows(), Some(&app.reviewed_plan())).open,
+        Some(Access::Accessibility)
+    );
+    assert_eq!(
+        crate::system_state_access::menu_line(&status, false)
+            .unwrap()
+            .label,
+        baseline_menu
+    );
+    app.gesture(true);
+    act(&mut app, key);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::OpenAccess {
+            access: Access::Accessibility,
+            by_person: true
+        })
+    ));
+    assert!(app.take_action().is_none());
+}
+
+#[test]
+fn accounts_accessibility_does_not_reopen_an_unneeded_or_settled_grant() {
+    for (permissions, accounts, standing, opted_out) in [
+        (false, false, Standing::NeedsYou, false),
+        (true, false, Standing::NeedsYou, false),
+        (false, true, Standing::InPlace, false),
+        (false, true, Standing::InPlace, true),
+    ] {
+        let mut selection = Selection::none();
+        selection.set(Setting::Permissions, permissions);
+        selection.set(Setting::Messages, accounts);
+        let mut grant = reading(
+            Subject::Access(Access::Accessibility),
+            standing,
+            Some(if opted_out { "Off" } else { "On" }),
+        );
+        if opted_out {
+            grant.wanted = "Off".into();
+            grant.note = Some("You chose Not now.".into());
+        }
+        let status = with_readings(selection, vec![grant]);
+        let mut app = SystemStateApp::new(status.plan.clone().unwrap());
+        app.publish(status);
+        let ui = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
+        let key = "system-state/row/accessibility/open";
+        assert!(ui.semantic(&UiKey::new(key)).is_none());
+        assert!(!app.can_open_access(Access::Accessibility));
+        assert!(!app.needs_attention());
+        act(&mut app, key);
+        assert!(app.take_action().is_none());
+    }
+}
+
+#[test]
 fn group_headers_count_only_what_is_not_in_place() {
     let status = with_readings(
         Selection::all(),

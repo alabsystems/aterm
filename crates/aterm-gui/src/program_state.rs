@@ -17,6 +17,10 @@ pub(crate) struct ProgramStateGate {
     floor_seq: u64,
     /// The report shown, and since when.
     shown: Option<(ProgramState, Instant)>,
+    /// When the report shown began on the clock that counts sleep
+    /// (`aterm_uds::process::continuous_ms`), which the survey's `agent_ms=`
+    /// runs on too: `program_state_ms=` ([`Self::shown_age_ms`]).
+    shown_continuous_ms: Option<u64>,
     /// How many shown `working` reports were followed by a shown `done` or
     /// `idle`: the program's own turn ends, which presence tells as a story
     /// point and, where nobody watched, as the tab's `•`
@@ -68,7 +72,26 @@ impl ProgramStateGate {
             self.turn_started = Some(now);
         }
         self.shown = next.map(|state| (state, now));
+        self.shown_continuous_ms = next.and_then(|_| aterm_uds::process::continuous_ms());
         true
+    }
+
+    /// How long the report shown has stood (`status program_state_ms=`), counted through sleep
+    /// as the survey's `agent_ms=` is; the sweep's clock where this host has no such clock.
+    /// `status`'s own `agent_since_ms=` and `human_ms=` stop while the Mac sleeps, so across a
+    /// sleep this age is not comparable with them. `None` while none is shown.
+    pub(crate) fn shown_age_ms(&self) -> Option<u64> {
+        let (_, since) = self.shown?;
+        Some(
+            match (
+                self.shown_continuous_ms,
+                aterm_uds::process::continuous_ms(),
+            ) {
+                (Some(at), Some(now)) => now.saturating_sub(at),
+                _ => u64::try_from(Instant::now().saturating_duration_since(since).as_millis())
+                    .unwrap_or(u64::MAX),
+            },
+        )
     }
 
     /// When the latest turn the gate counted began ([`Self::turn_starts`]), on the sweep's clock.
@@ -142,6 +165,24 @@ pub(crate) fn honoured_for(program: Option<&str>) -> bool {
 /// `status program_state=<state>[:<kind>]`, `-` while none is shown.
 pub(crate) fn wire(shown: Option<(ProgramState, Instant)>) -> String {
     shown.map_or_else(|| "-".to_string(), |(state, _)| state.wire())
+}
+
+/// `status program_state=<state>[:<kind>] program_state_ms=<ms>`, both `-` while none is
+/// shown: the gate's report and its age, read from the one gate so they agree.
+pub(crate) fn status_fields(gate: Option<&ProgramStateGate>) -> String {
+    let shown = gate.and_then(ProgramStateGate::shown);
+    let age = gate
+        .and_then(ProgramStateGate::shown_age_ms)
+        .map_or_else(|| "-".to_string(), |ms| ms.to_string());
+    format!("program_state={} program_state_ms={age}", wire(shown))
+}
+
+/// The `program_state=` column of `sessions`, `task` and `await task`: the report the
+/// timeline holds as shown ([`crate::session_timeline::SessionTimeline::program_shown`], which
+/// every gate move sets in the same sweep), `-` while none is. A claim in its own column:
+/// nothing that decides reads it, and it never moves `agent=`.
+pub(crate) fn column(shown: Option<crate::session_timeline::ShownProgram>) -> String {
+    shown.map_or_else(|| "-".to_string(), |shown| shown.state.wire())
 }
 
 /// The hover's word for a shown report (`presence::state_line`), when the screen's reader names no phase.
@@ -500,6 +541,17 @@ mod tests {
                 Some(want),
                 "{record}"
             );
+            let age = field(&record, "program_state_ms");
+            if codex {
+                assert!(
+                    age.as_deref()
+                        .and_then(|ms| ms.parse::<u64>().ok())
+                        .is_some(),
+                    "the shown report's age: {record}"
+                );
+            } else {
+                assert_eq!(age.as_deref(), Some("-"), "none shown, no age: {record}");
+            }
             for key in [
                 "agent",
                 "agent_detail",
@@ -536,6 +588,160 @@ mod tests {
                 field(&record, "program_state").as_deref(),
                 Some("-"),
                 "{record}"
+            );
+            assert_eq!(
+                field(&record, "program_state_ms").as_deref(),
+                Some("-"),
+                "{record}"
+            );
+        }
+    }
+
+    /// `program_state_ms=` counts through sleep, as the survey's `agent_ms=` does: the gate stamps
+    /// a shown report on the continuous clock (`aterm_uds::process::continuous_ms`) and ages it
+    /// there, never by the sweep's `Instant` nor by the process's `Instant` epoch
+    /// (`aterm_gui_timing::now_ms`, the clock of `status agent_since_ms=`), which both stop while
+    /// the Mac sleeps. The stamp lies between continuous readings taken around the sweep, far
+    /// above the process epoch's count; a stamp a minute back that no `Instant` here saw pass
+    /// reads a minute; a repeat of the shown report keeps its age and a move restarts it.
+    #[test]
+    fn the_shown_reports_age_counts_on_the_clock_that_counts_sleep() {
+        const MINUTE: u64 = 60_000;
+        let mut term = Terminal::new(24, 80);
+        let mut gate = ProgramStateGate::default();
+        assert_eq!(gate.shown_age_ms(), None);
+        assert_eq!(
+            status_fields(Some(&gate)),
+            "program_state=- program_state_ms=-"
+        );
+        assert_eq!(status_fields(None), "program_state=- program_state_ms=-");
+        let swept = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(10))
+            .expect("an instant ten seconds back");
+        term.process(WORKING);
+        let before = aterm_uds::process::continuous_ms();
+        assert!(gate.observe(term.program_state(), true, false, swept));
+        let after = aterm_uds::process::continuous_ms();
+        let Some((before, after)) = before.zip(after) else {
+            let age = gate.shown_age_ms().expect("a shown report has an age");
+            assert!(
+                age >= 10_000,
+                "no continuous clock here: the sweep's Instant: {age}"
+            );
+            return;
+        };
+        let stamp = gate.shown_continuous_ms.expect("a shown report is stamped");
+        assert!(
+            (before..=after).contains(&stamp),
+            "stamped on the continuous clock: {before} <= {stamp} <= {after} (the process \
+             epoch reads {})",
+            aterm_gui_timing::now_ms()
+        );
+        let age = gate.shown_age_ms().expect("a shown report has an age");
+        assert!(
+            age < 10_000,
+            "aged from the continuous stamp, not the sweep's Instant: {age}"
+        );
+        let fields = status_fields(Some(&gate));
+        assert!(
+            fields.starts_with("program_state=working program_state_ms="),
+            "{fields}"
+        );
+        gate.shown_continuous_ms = Some(stamp.checked_sub(MINUTE).expect("a machine up a minute"));
+        let slept = gate.shown_age_ms().expect("a shown report has an age");
+        assert!(
+            (MINUTE..MINUTE + 10_000).contains(&slept),
+            "a minute only the continuous clock saw reads a minute: {slept}"
+        );
+        assert!(
+            !gate.observe(term.program_state(), true, false, Instant::now()),
+            "PRECONDITION: a repeat is no move"
+        );
+        let kept = gate.shown_age_ms().expect("a shown report has an age");
+        assert!(kept >= MINUTE, "a repeat keeps the age: {kept}");
+        term.process(BLOCKED_PERMISSION);
+        assert!(gate.observe(term.program_state(), true, false, Instant::now()));
+        let moved = gate.shown_age_ms().expect("a shown report has an age");
+        assert!(moved < 10_000, "a move restarts the age: {moved}");
+        term.process(CLEAR);
+        assert!(gate.observe(term.program_state(), true, false, Instant::now()));
+        assert_eq!(gate.shown_age_ms(), None, "a clear takes the age with it");
+    }
+
+    /// THE CLAIM'S OWN COLUMN ON `ls`, through the real sweep (`App::observe_session_statuses`)
+    /// and the real `sessions` reply: a codex's shown report is its row's `program_state=`, beside
+    /// `agent=` and its siblings, which it never moves; under claude the same bytes show `-`.
+    #[test]
+    fn a_shown_report_is_the_ls_rows_program_state_and_never_agent() {
+        let field = |row: &str, key: &str| {
+            row.split(' ')
+                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+                .map(str::to_string)
+        };
+        for codex in [true, false] {
+            let mut app = crate::App::headless_for_test();
+            let sid = app.next_session_id;
+            app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
+            let (term, timeline) = {
+                let pooled = app.pool.get(sid).expect("pooled");
+                (
+                    std::sync::Arc::clone(&pooled.term),
+                    std::sync::Arc::clone(&pooled.ctx.timeline),
+                )
+            };
+            {
+                let mut tl = timeline.lock().unwrap();
+                tl.note_foreground_group(4242);
+                tl.set_program(4242, Some(if codex { "codex" } else { "claude" }.into()));
+            }
+            let row = |app: &crate::App| {
+                crate::control::cmd_sessions_store(&app.store, None)
+                    .lines()
+                    .find(|line| line.split(' ').next() == Some(sid.to_string().as_str()))
+                    .expect("the session's row")
+                    .to_string()
+            };
+            let mut t = Instant::now();
+            let _ = app.observe_session_statuses(t);
+            let before = row(&app);
+            assert_eq!(
+                field(&before, "program_state").as_deref(),
+                Some("-"),
+                "{before}"
+            );
+            for bytes in [WORKING, BLOCKED_PERMISSION] {
+                t += std::time::Duration::from_secs(1);
+                crate::term_lock(&term).process(bytes);
+                let _ = app.observe_session_statuses(t);
+            }
+            let after = row(&app);
+            let want = if codex { "blocked:permission" } else { "-" };
+            assert_eq!(
+                field(&after, "program_state").as_deref(),
+                Some(want),
+                "{after}"
+            );
+            for key in [
+                "agent",
+                "agent_detail",
+                "agent_rev",
+                "agent_gen",
+                "agent_fp",
+            ] {
+                assert_eq!(
+                    field(&after, key),
+                    field(&before, key),
+                    "{key} moved: {after}"
+                );
+            }
+            assert!(
+                after.contains(" program_state=") && after.contains(" human_ms="),
+                "{after}"
+            );
+            let (agent_cols, rest) = after.split_once(" program_state=").expect("the column");
+            assert!(
+                agent_cols.contains(" agent_fp=") && rest.contains(" human_ms="),
+                "after the agent fields, before human_ms=: {after}"
             );
         }
     }

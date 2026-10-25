@@ -2080,11 +2080,18 @@ impl Engine {
     /// `trail status`'s `ribbon_hue_bands=` while v2 owns the frame.
     #[inline]
     #[must_use]
-    pub fn ribbon_hue_bands(&self) -> usize {
+    pub const fn ribbon_hue_bands(&self) -> usize {
+        let plan = self.ribbon.plan_segments();
         let mut seen = 0u32;
-        for seg in self.ribbon.lit_segments() {
-            let band = ((meteor::tri(seg.t) * 20.0) as usize).min(19);
-            seen |= 1u32 << band;
+        let mut i = 0;
+        while i < plan.len() {
+            let seg = &plan[i];
+            if seg.cov >= ribbon::STATUS_LIT_COV {
+                let b = (meteor::tri(seg.t) * 20.0) as usize;
+                let band = if b < 19 { b } else { 19 };
+                seen |= 1u32 << band;
+            }
+            i += 1;
         }
         seen.count_ones() as usize
     }
@@ -2576,7 +2583,7 @@ const fn swept_space_cell(events: &[(Event, Instant)], index: usize) -> Option<(
 mod swept_space_tests {
     use super::*;
 
-    fn key(cells: u16, class: TypedClass) -> Event {
+    const fn key(cells: u16, class: TypedClass) -> Event {
         Event::Typed {
             cells,
             shifted: false,
@@ -2679,7 +2686,7 @@ const fn liveness(under: &[GlowQuad], out: &[GlowQuad], halos: &[RainHalo]) -> u
 mod tests {
     use super::*;
 
-    fn geom() -> Geom {
+    const fn geom() -> Geom {
         Geom {
             cw: 9,
             ch: 18,
@@ -2693,7 +2700,7 @@ mod tests {
         }
     }
 
-    fn config() -> Config {
+    const fn config() -> Config {
         Config {
             dark_theme: true,
             intensity: 1.0,
@@ -2716,14 +2723,14 @@ mod tests {
     }
 
     impl Scratch {
-        fn frame(&mut self) -> Frame<'_> {
+        const fn frame(&mut self) -> Frame<'_> {
             Frame {
                 under: &mut self.under,
                 out: &mut self.out,
                 halos: &mut self.halos,
                 beams: &mut self.beams,
                 cues: &mut self.cues,
-                caret: CaretSeam::default(),
+                caret: CaretSeam::EMPTY,
                 companion: None,
                 fp: 0,
             }
@@ -2785,7 +2792,7 @@ mod tests {
         eng.probe_mut().probe_row(i32::from(row), &[false; 120]);
     }
 
-    fn typed(n: u16) -> Event {
+    const fn typed(n: u16) -> Event {
         Event::Typed {
             cells: n,
             shifted: false,
@@ -2793,15 +2800,12 @@ mod tests {
         }
     }
 
-    fn mv(from: (u16, u16), to: (u16, u16), licence: Licence) -> Event {
+    const fn mv(from: (u16, u16), to: (u16, u16), licence: Licence) -> Event {
         Event::Move {
             from,
             to,
             licence,
-            dir: Dir::of(
-                i32::from(to.1) - i32::from(from.1),
-                i32::from(to.0) - i32::from(from.0),
-            ),
+            dir: Dir::of(to.1 as i32 - from.1 as i32, to.0 as i32 - from.0 as i32),
         }
     }
 
@@ -4539,7 +4543,7 @@ mod tests {
         lower[2] = 'c';
         lower[3] = 'd';
         let blank = [' '; 36];
-        fn at(row: u16, cols: &[char]) -> RowSample<'_> {
+        const fn at(row: u16, cols: &[char]) -> RowSample<'_> {
             RowSample { row, cols }
         }
         eng.witness_rows(
@@ -4576,7 +4580,7 @@ mod tests {
         hand[2] = 'a';
         hand[3] = 'b';
         let blank = [' '; 36];
-        fn at(row: u16, cols: &[char]) -> RowSample<'_> {
+        const fn at(row: u16, cols: &[char]) -> RowSample<'_> {
             RowSample { row, cols }
         }
         eng.witness_rows(&[at(2, &blank), at(3, &hand), at(4, &blank)], t);
@@ -4608,7 +4612,7 @@ mod tests {
         hand[2] = 'a';
         hand[3] = 'b';
         let blank = [' '; 36];
-        fn at(row: u16, cols: &[char]) -> RowSample<'_> {
+        const fn at(row: u16, cols: &[char]) -> RowSample<'_> {
             RowSample { row, cols }
         }
         eng.witness_rows(&[at(2, &blank), at(3, &hand), at(4, &blank)], t);
@@ -6153,7 +6157,7 @@ mod tests {
         assert!(eng.drain_sound_cues().next().is_none());
     }
 
-    fn cat(row: u16, col: f32, settled: bool, purr: f32) -> companion::PetOnGlass {
+    const fn cat(row: u16, col: f32, settled: bool, purr: f32) -> companion::PetOnGlass {
         companion::PetOnGlass {
             col,
             width: 6.0,

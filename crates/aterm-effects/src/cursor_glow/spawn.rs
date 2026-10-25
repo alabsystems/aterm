@@ -118,7 +118,8 @@ impl CursorGlow {
     }
 
     /// Per-style spark lifetime for this move.
-    pub(super) fn move_spark_life(&self, mv: &MoveCtx, gap: f32) -> f32 {
+    #[inline]
+    pub(super) const fn move_spark_life(&self, mv: &MoveCtx, gap: f32) -> f32 {
         let &MoveCtx { cfg, typing, .. } = mv;
         let full_life = cfg.duration.as_secs_f32().max(0.001);
         if typing {
@@ -1123,7 +1124,7 @@ impl CursorGlow {
 
     /// Make this frame's row probe the one the emitters read ([`Self::probed_text_spans`]).
     #[inline]
-    pub(super) fn rotate_row_probe(&mut self) {
+    pub(super) const fn rotate_row_probe(&mut self) {
         if self.row_cur_meta.is_some() {
             std::mem::swap(&mut self.row_prev, &mut self.row_cur);
             std::mem::swap(&mut self.row_above_prev, &mut self.row_above_cur);

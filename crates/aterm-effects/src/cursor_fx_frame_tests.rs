@@ -12,7 +12,7 @@ const DARK: (u32, u32) = (0x00C8_D3F5, 0x001A_1B26);
 const LIGHT: (u32, u32) = (0x001F_2328, 0x00FF_FFFF);
 const THEME_CURSOR: u32 = 0x0009_69DA;
 
-fn geom() -> Geom {
+const fn geom() -> Geom {
     Geom {
         cw: 10,
         ch: 20,
@@ -26,7 +26,7 @@ fn geom() -> Geom {
     }
 }
 
-fn knobs() -> GlowKnobs {
+const fn knobs() -> GlowKnobs {
     GlowKnobs {
         enabled: true,
         color: None,

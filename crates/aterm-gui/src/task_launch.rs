@@ -867,11 +867,13 @@ fn worker_starter_of(
 
 /// `starter` under the login its CLI's pool picks for a launch
 /// ([`aterm_agent::harness::accounts_pool::launch_env`], once each row's usage was read in its
-/// own home on this launcher thread), where the starter sets none of the pool's seam variable
-/// (one that does runs on a home of its own, which the pool leaves alone): every pick removes
-/// [`pool_onto`]'s variables, and a row of its own directory also exports its seam variable. The
-/// machine's default row leaves the starter's seam as it is. Claude Code's workers keep the
-/// starter's login, which the host's own flow moves.
+/// own home on this launcher thread), unless the starter runs on a non-default home, a credential
+/// override, or sets the pool's seam variable to a login outside the bound roster (one that does
+/// runs on a home or credential of its own, which the pool leaves alone; a starter already on a
+/// bound pool row still rotates): every pick removes [`pool_onto`]'s variables, replaces any
+/// carried seam variable for a row of its own directory, and drops a carried pool seam variable
+/// when moving back to the machine's default row. Claude Code's workers keep the starter's login,
+/// which the host's own flow moves.
 fn pooled_starter(
     starter: aterm_agent::harness::worker::Starter,
     cli: &aterm_agent::harness::worker::WorkerCli,
@@ -881,10 +883,6 @@ fn pooled_starter(
     let Some(pool) = accounts::Cli::of(cli.agent).filter(|c| *c != accounts::Cli::Claude) else {
         return starter;
     };
-    let var = pool.accounts().seam.var();
-    if starter.env.iter().any(|(name, _)| name == var) {
-        return starter;
-    }
     let (Some(config), Some(state), Some(home), Some(now)) = (
         aterm_types::dirs::aterm_config_path(),
         crate::harness_host::harness_state(),
@@ -902,8 +900,37 @@ fn pooled_starter(
         home: &home,
         now,
     };
-    if let Some(pick) = accounts_pool::launch_env(&seat, pool, &accounts_pool::live_usage) {
-        match pool_onto(starter.clone(), pool, &pick, &home) {
+    pooled_starter_in(starter, pool, &seat, &accounts_pool::live_usage, local)
+}
+
+pub(crate) fn pooled_starter_in(
+    starter: aterm_agent::harness::worker::Starter,
+    pool: aterm_agent::harness::accounts::Cli,
+    seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+    read: aterm_agent::harness::accounts_pool::ReadUsage<'_>,
+    local: u64,
+) -> aterm_agent::harness::worker::Starter {
+    use aterm_agent::harness::{accounts, accounts_pool};
+    let pairs: Vec<(&str, &str)> = starter
+        .env
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    let who = accounts::ProcessLogin::of_env_for(pool, pairs.iter().copied());
+    if !who.default_home || !who.stored_login {
+        return starter;
+    }
+    let var = pool.accounts().seam.var();
+    if starter.env.iter().any(|(name, _)| name == var) {
+        let Ok(roster) = seat.bound_roster(pool) else {
+            return starter;
+        };
+        if accounts::judged_label(&roster, &who).is_none() {
+            return starter;
+        }
+    }
+    if let Some(pick) = accounts_pool::launch_env(seat, pool, read) {
+        match pool_onto(starter.clone(), pool, &pick, seat.home) {
             Ok(onto) => {
                 aterm_log::info!(
                     "worker session {local}: starts under {} account {}",
@@ -926,7 +953,7 @@ fn pooled_starter(
 /// `starter` onto `pool`'s login `pick` ([`pooled_starter`]): the variables
 /// [`aterm_agent::harness::relaunch::pool_args`] removes and its flags (Grok Build's own leader
 /// socket for a row of its own, in the home the starter carries, else `~/.grok` under the user's
-/// `home`), and a row of its own's seam variable exported.
+/// `home`), any prior seam variable replaced, and a row of its own's seam variable exported.
 ///
 /// # Errors
 ///
@@ -941,7 +968,7 @@ pub(crate) fn pool_onto(
         starter
             .env
             .iter()
-            .find(|(n, _)| n == name)
+            .find(|(n, _)| n == name && n != pick.var)
             .map(|(_, value)| value.clone())
     };
     let cli_home = aterm_agent::ai::facts::home_of(pool.connector(), &carried, Some(home)).ok();
@@ -951,6 +978,7 @@ pub(crate) fn pool_onto(
         *flags = args.flags;
     }
     starter.unset = args.unset;
+    starter.env.retain(|(n, _)| n != pick.var);
     if let Some(value) = pick.value.clone() {
         starter.env.push((pick.var.to_string(), value));
     }

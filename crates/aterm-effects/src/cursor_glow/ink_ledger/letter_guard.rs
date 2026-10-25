@@ -751,28 +751,40 @@ const fn lifted(c: u32, lift: [u32; 3]) -> u32 {
 
 /// The solid ink of a letter drawn in `ink` on `ground`: the colour on the
 /// way from `ink` to `ground` that reads [`SOLID_SHARE`] of the clean ratio.
-fn solid_ink(ink: u32, ground: u32, table: &crate::color_math::RelativeLuminanceTable) -> u32 {
-    let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
-    let lg = lum(ground);
-    let ratio = |a: u32| {
-        let la = lum(a);
+const fn solid_ink(
+    ink: u32,
+    ground: u32,
+    table: &crate::color_math::RelativeLuminanceTable,
+) -> u32 {
+    let lg = crate::color_math::relative_luminance_with(table, ground);
+    #[inline]
+    const fn ratio(table: &crate::color_math::RelativeLuminanceTable, lg: f32, a: u32) -> f32 {
+        let la = crate::color_math::relative_luminance_with(table, a);
         (la.max(lg) + 0.05) / (la.min(lg) + 0.05)
-    };
-    let want = SOLID_SHARE * ratio(ink);
-    let mix = |t: f32| {
-        let ch = |sh: u32| {
-            let (a, b) = (((ink >> sh) & 0xff) as f32, ((ground >> sh) & 0xff) as f32);
-            ((a + (b - a) * t).round() as u32).min(255)
-        };
-        (ch(16) << 16) | (ch(8) << 8) | ch(0)
-    };
+    }
+    #[inline]
+    const fn mix_ch(ink: u32, ground: u32, sh: u32, t: f32) -> u32 {
+        let (a, b) = (((ink >> sh) & 0xff) as f32, ((ground >> sh) & 0xff) as f32);
+        let u = (a + (b - a) * t).round() as u32;
+        if u < 255 { u } else { 255 }
+    }
+    #[inline]
+    const fn mix(ink: u32, ground: u32, t: f32) -> u32 {
+        (mix_ch(ink, ground, 16, t) << 16)
+            | (mix_ch(ink, ground, 8, t) << 8)
+            | mix_ch(ink, ground, 0, t)
+    }
+    let want = SOLID_SHARE * ratio(table, lg, ink);
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (ink & 0x00FF_FFFF, ground & 0x00FF_FFFF);
     let mut hi_checked = false;
-    for _ in 0..10 {
+    let mut step = 0;
+    while step < 10 {
         let mid = 0.5 * (lo + hi);
-        let mid_rgb = mix(mid);
-        if mid_rgb == lo_rgb || ((!hi_checked || mid_rgb != hi_rgb) && ratio(mid_rgb) >= want) {
+        let mid_rgb = mix(ink, ground, mid);
+        if mid_rgb == lo_rgb
+            || ((!hi_checked || mid_rgb != hi_rgb) && ratio(table, lg, mid_rgb) >= want)
+        {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -783,6 +795,7 @@ fn solid_ink(ink: u32, ground: u32, table: &crate::color_math::RelativeLuminance
         if lo_rgb == hi_rgb {
             break;
         }
+        step += 1;
     }
     lo_rgb
 }

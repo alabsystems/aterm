@@ -466,8 +466,9 @@ struct SessionLights {
     autopilot: Option<AutopilotView>,
     /// An Autopilot click in flight.
     autopilot_pending: Option<(Autopilot, Instant)>,
-    /// A press of the harness switch's `on` that wrote a switch of aterm.toml.
-    switch_turning: Option<Instant>,
+    /// A press of the harness switch that wrote a switch of aterm.toml: the side it turns to
+    /// (`true` on, `false` off), and when `◐` stops waiting for the policy to read it back.
+    switch_turning: Option<(bool, Instant)>,
     /// When a press last flipped the harness switch (either way).
     switch_pressed: Option<Instant>,
     /// What the Team chip says, as the last frame that drew the footer read it.
@@ -549,7 +550,7 @@ pub(crate) enum Fact {
     Context,
     /// `Σ 6m33s ↑20M ↓82k`.
     Usage,
-    /// `⎆ sol-m27@example.test   ◇ max 20x   ◷ weekly 0% left`.
+    /// `⎆ sol-m27@example.test · max 20x · weekly 0% left`, one unit.
     Account,
 }
 
@@ -613,6 +614,7 @@ impl Fact {
             FactKind::Branch => Fact::Branch,
             FactKind::Context => Fact::Context,
             FactKind::Usage => Fact::Usage,
+            FactKind::Account => Fact::Account,
         }
     }
 
@@ -626,7 +628,8 @@ impl Fact {
             Fact::Branch => FactKind::Branch,
             Fact::Context => FactKind::Context,
             Fact::Usage => FactKind::Usage,
-            Fact::TopEffort | Fact::Account => return None,
+            Fact::Account => FactKind::Account,
+            Fact::TopEffort => return None,
         })
     }
 
@@ -1293,10 +1296,11 @@ impl WindowLights {
         let s = self.sessions.entry(session).or_default();
         s.autopilot = Some(view);
         s.glass = glass;
-        if s.switch_turning.is_some()
+        if let Some((on, _)) = s.switch_turning
             && !matches!(
-                crate::autopilot::HarnessSwitch::of(view),
-                Some(crate::autopilot::HarnessSwitch::Off(_))
+                (on, crate::autopilot::HarnessSwitch::of(view)),
+                (true, Some(crate::autopilot::HarnessSwitch::Off(_)))
+                    | (false, Some(crate::autopilot::HarnessSwitch::On))
             )
         {
             s.switch_turning = None;
@@ -1350,15 +1354,16 @@ impl WindowLights {
         session: u64,
         face: crate::autopilot::HarnessSwitch,
     ) -> (crate::autopilot::HarnessSwitch, bool) {
-        let turning = !face.is_on()
-            && self
-                .sessions
-                .get(&session)
-                .is_some_and(|s| s.switch_turning.is_some());
-        let face = if turning {
-            crate::autopilot::HarnessSwitch::Turning
-        } else {
-            face
+        use crate::autopilot::HarnessSwitch;
+        let turning = self
+            .sessions
+            .get(&session)
+            .and_then(|s| s.switch_turning)
+            .map(|(on, _)| on);
+        let face = match (turning, face) {
+            (Some(true), HarnessSwitch::Off(_)) => HarnessSwitch::Turning,
+            (Some(false), HarnessSwitch::On) => HarnessSwitch::TurningOff,
+            _ => face,
         };
         (face, self.switch_lit(session))
     }
@@ -1378,11 +1383,13 @@ impl WindowLights {
         let turning = self
             .sessions
             .get(&session)
-            .is_some_and(|s| s.switch_turning.is_some());
+            .and_then(|s| s.switch_turning)
+            .map(|(on, _)| on);
         u64::from(supervised)
-            | u64::from(turning) << 1
+            | u64::from(turning.is_some()) << 1
             | u64::from(self.switch_lit(session)) << 2
             | u64::from(self.mark_hovered(session)) << 3
+            | u64::from(turning == Some(false)) << 4
     }
 
     /// The grid the lists were laid on, for a test to read or to forge.
@@ -1396,7 +1403,7 @@ impl WindowLights {
         self.mark_hover == Some(session)
     }
 
-    /// Let every switch turning on go.
+    /// Let every switch turning on or off go.
     pub(crate) fn let_switches_go(&mut self) -> bool {
         let mut any = false;
         for s in self.sessions.values_mut() {
@@ -1537,7 +1544,7 @@ impl WindowLights {
                 s.autopilot_pending = None;
                 any = true;
             }
-            if s.switch_turning.is_some_and(|until| until <= now) {
+            if s.switch_turning.is_some_and(|(_, until)| until <= now) {
                 s.switch_turning = None;
                 any = true;
             }
@@ -2783,7 +2790,7 @@ thread_local! {
     /// The windows [`App::redraw_autopilot_title_readers`] asked for a frame on this thread.
     pub(crate) static TITLE_READERS_ASKED: std::cell::Cell<u32> =
         const { std::cell::Cell::new(0) };
-    /// The harness switches a refused write let go of `◐ turning on` on this thread.
+    /// The harness switches a refused write let go of `◐ turning on` or `off` on this thread.
     pub(crate) static SWITCHES_LET_GO: std::cell::Cell<u32> =
         const { std::cell::Cell::new(0) };
 }
@@ -3522,9 +3529,20 @@ impl App {
         {
             return;
         }
-        let (word, view, _) = self.session_autopilot(session);
+        let (_, view, _) = self.session_autopilot(session);
+        let turning = |app: &mut Self, on: bool| {
+            if let Some(ws) = app.windows.get_mut(&wid) {
+                ws.claude_lights
+                    .sessions
+                    .entry(session)
+                    .or_default()
+                    .switch_turning = Some((on, now + crate::autopilot::SWITCH_SETTLE));
+                wake_after(session, crate::autopilot::SWITCH_SETTLE);
+            }
+        };
         let flipped = match (shown, HarnessSwitch::of(view)) {
             (HarnessSwitch::On, Some(HarnessSwitch::On)) => {
+                turning(self, false);
                 self.toggle_session_harness(session);
                 true
             }
@@ -3533,17 +3551,11 @@ impl App {
                     &self.harness_policy.get().policy,
                     self.headless,
                     self.session_agent(session),
-                    word,
                 )
                 .keys
                 .is_empty();
-                if writes && let Some(ws) = self.windows.get_mut(&wid) {
-                    ws.claude_lights
-                        .sessions
-                        .entry(session)
-                        .or_default()
-                        .switch_turning = Some(now + crate::autopilot::SWITCH_SETTLE);
-                    wake_after(session, crate::autopilot::SWITCH_SETTLE);
+                if writes {
+                    turning(self, true);
                 }
                 self.switch_harness_on(session);
                 true
@@ -3645,6 +3657,12 @@ impl App {
     }
 
     /// A left press on the harness banner over Claude Code's update notice of `session`.
+    ///
+    /// On the link a plain press (no modifier held) in the focused pane opens it, as a
+    /// link-modifier press does in any pane, once per double click; in an unfocused pane a plain
+    /// press is that pane's focus click and opens nothing, and a press with another modifier
+    /// (Shift extending a selection, Option taking one from a tracking app) is the notice rows'
+    /// own. A press the banner takes settles a tab name being edited first.
     fn press_claude_notice(
         &mut self,
         wid: WindowId,
@@ -3654,22 +3672,39 @@ impl App {
         let Some(mods) = self.windows.get(&wid).map(|ws| ws.mods) else {
             return false;
         };
-        if crate::app_mouse::link_modifier_held(mods) {
-            if let Some(url) = url.filter(|url| crate::is_safe_url(url)) {
-                crate::app_mouse::open_url_external(url);
-            }
-            return true;
-        }
-        let tracking = self.session_is_front(wid, session)
+        let modifier = crate::app_mouse::link_modifier_held(mods);
+        let front = self.session_is_front(wid, session);
+        let opens = url
+            .filter(|url| crate::is_safe_url(url))
+            .filter(|_| modifier || (front && mods.is_empty()));
+        let tracking = front
             && self
                 .pool
                 .get(session)
                 .is_some_and(|owner| owner.ctx.modes.mouse_tracking_enabled());
-        tracking
-            && !crate::app_mouse::press_starts_selection(
-                tracking,
-                crate::app_mouse::tracking_bypass_held(mods),
-            )
+        let takes = modifier
+            || opens.is_some()
+            || (tracking
+                && !crate::app_mouse::press_starts_selection(
+                    tracking,
+                    crate::app_mouse::tracking_bypass_held(mods),
+                ));
+        if !takes {
+            return false;
+        }
+        if self.inline_rename_edit(wid).is_some() {
+            self.clear_strip_press(wid);
+            self.settle_rename_edit(wid);
+        }
+        if let Some(url) = opens
+            && self
+                .windows
+                .get_mut(&wid)
+                .is_some_and(|ws| !ws.claude_card.link_press_repeats(session, Instant::now()))
+        {
+            crate::app_mouse::open_url_external(url);
+        }
+        true
     }
 
     /// Pointer and reader clicks share the current row's custody and settle an open rename.
@@ -4338,7 +4373,8 @@ impl App {
                 | HarnessChip::Context
                 | HarnessChip::Usage
                 | HarnessChip::Account
-                | HarnessChip::Title => {}
+                | HarnessChip::Title
+                | HarnessChip::Link => {}
                 HarnessChip::Mode => {
                     if let Some(s) = ws.claude_lights.sessions.get(&node.session) {
                         (node.label, node.description) = light_spoken(s, Light::Mode, lights_now());
@@ -4430,6 +4466,7 @@ impl App {
         }
         chips.retain(|node| !node.label.is_empty());
         chips.extend(switches);
+        chips.extend(self.claude_notice_links_a11y(wid, strip));
         chips
     }
 
@@ -4465,6 +4502,10 @@ impl App {
                 return;
             }
             HarnessChip::Title => return,
+            HarnessChip::Link => {
+                self.open_claude_notice_for_reader(wid, session);
+                return;
+            }
             fact => {
                 let Some(fact) = fact.fact() else {
                     return;
@@ -4524,13 +4565,40 @@ fn light_spoken(s: &SessionLights, light: Light, now: Instant) -> (String, Optio
     (format!("{}: {word}.", light.title()), description)
 }
 
-/// The harness switch's accessible name.
+/// The harness switch's accessible name: the words it paints and, under the agent's own switch
+/// off, whose harness that is (`product`'s). Lit, or under the master switch off, the switch is
+/// the whole harness, every agent's, so no product is named, nor while it turns.
 #[cfg(a11y_tree)]
-pub(crate) fn switch_label(words: &str, product: &str) -> String {
-    if words.split(' ').any(|w| w == "harness") {
-        format!("{words}: {product}")
-    } else {
-        format!("{words}: {product} harness")
+pub(crate) fn switch_label(
+    words: &str,
+    face: crate::autopilot::HarnessSwitch,
+    product: &str,
+) -> String {
+    use crate::autopilot::{HarnessSwitch, SwitchOff};
+    let named = words.split(' ').any(|w| w == "harness");
+    match (face, named) {
+        (HarnessSwitch::Off(SwitchOff::Agent(_)), true) => format!("{words}: {product}"),
+        (HarnessSwitch::Off(SwitchOff::Agent(_)), false) => format!("{words}: {product} harness"),
+        (_, true) => words.to_owned(),
+        (_, false) => format!("{words}: harness"),
+    }
+}
+
+/// The off face's `on` button's accessible name: what a press turns on, the agent's harness
+/// under its own switch off, the whole harness (Settings ▸ Harness's `Supervise coding agents`)
+/// under the master switch off.
+#[cfg(a11y_tree)]
+pub(crate) fn switch_on_label(
+    words: &str,
+    face: crate::autopilot::HarnessSwitch,
+    product: &str,
+) -> String {
+    use crate::autopilot::{HarnessSwitch, SwitchOff};
+    match face {
+        HarnessSwitch::Off(SwitchOff::Agent(_)) => {
+            format!("{words}: turn the {product} harness {words}")
+        }
+        _ => format!("{words}: turn the harness {words} (Supervise coding agents)"),
     }
 }
 
@@ -4545,7 +4613,7 @@ pub(crate) fn harness_switch_nodes(
     let (switch_words, button_words) = crate::claude_footer::switch_words(b);
     let mut nodes = Vec::with_capacity(2);
     if !b.switch.is_empty() {
-        let label = switch_label(&switch_words, product);
+        let label = switch_label(&switch_words, b.face, product);
         nodes.push(GridChip {
             session: b.session,
             chip: HarnessChip::Switch,
@@ -4564,7 +4632,7 @@ pub(crate) fn harness_switch_nodes(
         nodes.push(GridChip {
             session: b.session,
             chip: HarnessChip::SwitchOn,
-            label: format!("{words}: turn the {product} harness {words}"),
+            label: switch_on_label(&words, b.face, product),
             description: Some(b.face.described(product)),
             toggled: None,
             row,

@@ -6402,14 +6402,31 @@ impl Store {
         label: &str,
         now: i64,
     ) -> Result<PinSelection, String> {
+        self.select_account_for(Cli::Claude, file_roster, label, now)
+    }
+
+    /// [`Self::select_account`] for `cli`'s pool ([`enrolled_for`]).
+    /// # Errors
+    /// As [`Self::select_account`], or when `cli` has no sign-in flow for an unenrolled or
+    /// signed-out row.
+    pub fn select_account_for(
+        &self,
+        cli: Cli,
+        file_roster: &Roster,
+        label: &str,
+        now: i64,
+    ) -> Result<PinSelection, String> {
         let mut selected = PinSelection::Pinned;
         self.transact_logins_within(&LOCK_LADDER, now, &mut None, |state, logins| {
             let roster = bound(file_roster, logins);
-            let enrolled = enrolled(&roster);
+            let enrolled = enrolled_for(cli, &roster);
             match pin_refusal(state, &roster, &enrolled, label) {
                 None => pin(state, &roster, &enrolled, label, now).map(|event| vec![event]),
                 Some(why @ PinRefusal::NotListed) => Err(why.message(label)),
-                Some(PinRefusal::NotEnrolled | PinRefusal::SignedOut) => {
+                Some(why @ (PinRefusal::NotEnrolled | PinRefusal::SignedOut)) => {
+                    if cli != Cli::Claude && cli.accounts().signin.is_none() {
+                        return Err(why.message(label));
+                    }
                     if roster
                         .row(label)
                         .and_then(|row| row.email.as_ref())

@@ -162,26 +162,32 @@ impl InkRole {
     }
 }
 
+#[inline]
+const fn rem_euclid_pos(x: f32, rhs: f32) -> f32 {
+    let r = x % rhs;
+    if r < 0.0 { r + rhs } else { r }
+}
+
 /// The one sweep: where a cell sits on the spectrum given its column and the ribbon's phase clock.
 #[inline]
-pub(crate) fn rainbow_sweep_at(col: u16, phase: f32) -> f32 {
+pub(crate) const fn rainbow_sweep_at(col: u16, phase: f32) -> f32 {
     rainbow_sweep_reflect(col as f32 * RAINBOW_LIGHT_RAIL_SPREAD + rainbow_sweep_phase(phase))
 }
 
 /// Fold an unbounded spectrum position onto the sweep's ping-pong `0..1`, for callers that offset a resolved position (the caret's halo rings step outward along the wheel).
 #[inline]
-pub(crate) fn rainbow_sweep_reflect(x: f32) -> f32 {
-    let raw = if (0.0..2.0).contains(&x) {
+pub(crate) const fn rainbow_sweep_reflect(x: f32) -> f32 {
+    let raw = if x >= 0.0 && x < 2.0 {
         x
     } else {
-        x.rem_euclid(2.0)
+        rem_euclid_pos(x, 2.0)
     };
     if raw <= 1.0 { raw } else { 2.0 - raw }
 }
 
 /// Resolve a reflected spectrum position for a persistent mark — the caret's read of the same field the ribbon paints, past the cycle's turnaround.
 #[inline]
-pub(crate) fn rainbow_thing_of(sweep: f32) -> u32 {
+pub(crate) const fn rainbow_thing_of(sweep: f32) -> u32 {
     let phase = rainbow_cycle_phase(sweep);
     if phase > 1.0 {
         return rainbow_cycle_ink(phase);
@@ -202,7 +208,7 @@ pub(crate) const fn rainbow_band_of(sweep: f32) -> u32 {
 /// [`rainbow_band_of`] at a column and phase (test-only: live kitty marks read the cached classic field).
 #[cfg(test)]
 #[inline]
-pub(crate) fn rainbow_band_at(col: u16, phase: f32) -> u32 {
+pub(crate) const fn rainbow_band_at(col: u16, phase: f32) -> u32 {
     rainbow_band_of(rainbow_sweep_at(col, phase))
 }
 
@@ -218,14 +224,20 @@ pub(super) const RAINBOW_LIGHT_RAIL_FLOW: f32 = 179.0 / 512.0;
 
 /// Spectrum-clock position on the reflected sweep's period-two domain.
 #[inline]
-pub(super) fn rainbow_sweep_phase(phase: f32) -> f32 {
-    (phase.rem_euclid(RAINBOW_PHASE_RING) * RAINBOW_LIGHT_RAIL_FLOW).rem_euclid(2.0)
+pub(super) const fn rainbow_sweep_phase(phase: f32) -> f32 {
+    rem_euclid_pos(
+        rem_euclid_pos(phase, RAINBOW_PHASE_RING) * RAINBOW_LIGHT_RAIL_FLOW,
+        2.0,
+    )
 }
 
 /// Lift a standalone unit-turn animation clock onto the rainbow phase ring so one `0..1` turn traverses one whole reflected spectrum cycle, turns 0 and 1 both at sweep position zero.
 #[inline]
-pub(crate) fn rainbow_phase_from_unit_turn(turn: f32) -> f32 {
-    ((turn.rem_euclid(1.0) * 2.0) / RAINBOW_LIGHT_RAIL_FLOW).rem_euclid(RAINBOW_PHASE_RING)
+pub(crate) const fn rainbow_phase_from_unit_turn(turn: f32) -> f32 {
+    rem_euclid_pos(
+        (rem_euclid_pos(turn, 1.0) * 2.0) / RAINBOW_LIGHT_RAIL_FLOW,
+        RAINBOW_PHASE_RING,
+    )
 }
 
 /// Adjacency bound for the ancillary laid-hue lattice, kept for its compile-time checks below; the live kitty field is bounded by the classic geometry.
@@ -269,18 +281,18 @@ const _: () = assert!(
 
 /// The walk folded into one turn of the spectrum: `[0, 1]` is the red→violet arc, `(1, `[`RAINBOW_CYCLE`]`)` is the wrap that closes it.
 #[inline]
-pub(super) fn rainbow_cycle_phase(p: f32) -> f32 {
+pub(super) const fn rainbow_cycle_phase(p: f32) -> f32 {
     // Fast path: most callers pass a value already inside one turn, and the
     // hot ribbon calls this per slab per vertex, so avoid `rem_euclid` (a
     // library `fmod`) there.
-    if (0.0..RAINBOW_CYCLE).contains(&p) {
+    if p >= 0.0 && p < RAINBOW_CYCLE {
         return p;
     }
     if !p.is_finite() {
         return 0.0;
     }
     let folded = p - RAINBOW_CYCLE * (p * RAINBOW_CYCLE_INV).floor();
-    if !(0.0..RAINBOW_CYCLE).contains(&folded) {
+    if !(folded >= 0.0 && folded < RAINBOW_CYCLE) {
         return 0.0;
     }
     folded
@@ -291,7 +303,7 @@ pub(super) const RAINBOW_CYCLE_INV: f32 = 1.0 / RAINBOW_CYCLE;
 
 /// The cycle's colour: `spectrum` on the arc, and past it the wrap leg, violet to red the short way through magenta.
 #[inline]
-pub(super) fn rainbow_cycle_ink(p: f32) -> u32 {
+pub(super) const fn rainbow_cycle_ink(p: f32) -> u32 {
     let phase = rainbow_cycle_phase(p);
     if phase <= 1.0 {
         spectrum(phase)
@@ -486,31 +498,84 @@ pub(super) fn fresh_ink_glyph_ink(band: u32, fg: u32, side: GlyphInkSide, cap: f
         return None;
     }
     let span = (hi - lo).max(1e-3);
-    let sat = |c: f32| ((c - lo) / span * hi).clamp(0.0, 255.0);
-    let s = [sat(r), sat(g), sat(b)];
+    #[inline]
+    const fn sat(c: f32, lo: f32, span: f32, hi: f32) -> f32 {
+        ((c - lo) / span * hi).clamp(0.0, 255.0)
+    }
+    let s = [
+        sat(r, lo, span, hi),
+        sat(g, lo, span, hi),
+        sat(b, lo, span, hi),
+    ];
     let table = crate::color_math::relative_luminance_table();
-    let fg_rgb = [16u32, 8, 0].map(|sh| ((fg >> sh) & 0xff) as usize);
-    let cand_rgb = |k: f32| -> [usize; 3] {
-        s.map(|c| {
-            let v = match side {
-                GlyphInkSide::Dark => c * k,
-                GlyphInkSide::Light => c + (255.0 - c) * (1.0 - k),
-            };
-            ((v + 0.5) as usize).min(255)
-        })
-    };
-    let pack = |[r, g, b]: [usize; 3]| ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
-    let ok = |ink: [usize; 3]| -> bool {
+    let fg_rgb = [
+        ((fg >> 16) & 0xff) as usize,
+        ((fg >> 8) & 0xff) as usize,
+        (fg & 0xff) as usize,
+    ];
+    #[inline]
+    const fn cand_ch(c: f32, k: f32, side: GlyphInkSide) -> usize {
+        let v = match side {
+            GlyphInkSide::Dark => c * k,
+            GlyphInkSide::Light => c + (255.0 - c) * (1.0 - k),
+        };
+        let u = (v + 0.5) as usize;
+        if u < 255 { u } else { 255 }
+    }
+    #[inline]
+    const fn cand_rgb(s: [f32; 3], k: f32, side: GlyphInkSide) -> [usize; 3] {
+        [
+            cand_ch(s[0], k, side),
+            cand_ch(s[1], k, side),
+            cand_ch(s[2], k, side),
+        ]
+    }
+    #[inline]
+    const fn pack([r, g, b]: [usize; 3]) -> u32 {
+        ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+    }
+    #[inline]
+    const fn ok(
+        table: &crate::color_math::RelativeLuminanceTable,
+        fg_rgb: [usize; 3],
+        side: GlyphInkSide,
+        cap: f32,
+        ink: [usize; 3],
+    ) -> bool {
         let corner = match side {
             GlyphInkSide::Dark => [
-                ink[0].max(fg_rgb[0]),
-                ink[1].max(fg_rgb[1]),
-                ink[2].max(fg_rgb[2]),
+                if ink[0] > fg_rgb[0] {
+                    ink[0]
+                } else {
+                    fg_rgb[0]
+                },
+                if ink[1] > fg_rgb[1] {
+                    ink[1]
+                } else {
+                    fg_rgb[1]
+                },
+                if ink[2] > fg_rgb[2] {
+                    ink[2]
+                } else {
+                    fg_rgb[2]
+                },
             ],
             GlyphInkSide::Light => [
-                ink[0].min(fg_rgb[0]),
-                ink[1].min(fg_rgb[1]),
-                ink[2].min(fg_rgb[2]),
+                if ink[0] < fg_rgb[0] {
+                    ink[0]
+                } else {
+                    fg_rgb[0]
+                },
+                if ink[1] < fg_rgb[1] {
+                    ink[1]
+                } else {
+                    fg_rgb[1]
+                },
+                if ink[2] < fg_rgb[2] {
+                    ink[2]
+                } else {
+                    fg_rgb[2]
+                },
             ],
         };
         let l = crate::color_math::relative_luminance_rgb(table, corner[0], corner[1], corner[2]);
@@ -518,34 +583,36 @@ pub(super) fn fresh_ink_glyph_ink(band: u32, fg: u32, side: GlyphInkSide, cap: f
             GlyphInkSide::Dark => l <= cap,
             GlyphInkSide::Light => l >= cap,
         }
-    };
-    let c1 = cand_rgb(1.0);
-    if ok(c1) {
+    }
+    let c1 = cand_rgb(s, 1.0, side);
+    if ok(table, fg_rgb, side, cap, c1) {
         return Some(pack(c1));
     }
-    let c0 = cand_rgb(0.0);
-    if !ok(c0) {
+    let c0 = cand_rgb(s, 0.0, side);
+    if !ok(table, fg_rgb, side, cap, c0) {
         return None;
     }
     let (mut lo_k, mut hi_k) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (c0, c1);
-    for _ in 0..FRESH_INK_GLYPH_BISECT {
+    let mut step = 0;
+    while step < FRESH_INK_GLYPH_BISECT {
         let mid = 0.5 * (lo_k + hi_k);
-        let mid_rgb = cand_rgb(mid);
-        if mid_rgb == lo_rgb {
+        let mid_rgb = cand_rgb(s, mid, side);
+        if mid_rgb[0] == lo_rgb[0] && mid_rgb[1] == lo_rgb[1] && mid_rgb[2] == lo_rgb[2] {
             lo_k = mid;
-        } else if mid_rgb == hi_rgb {
+        } else if mid_rgb[0] == hi_rgb[0] && mid_rgb[1] == hi_rgb[1] && mid_rgb[2] == hi_rgb[2] {
             hi_k = mid;
-        } else if ok(mid_rgb) {
+        } else if ok(table, fg_rgb, side, cap, mid_rgb) {
             lo_k = mid;
             lo_rgb = mid_rgb;
         } else {
             hi_k = mid;
             hi_rgb = mid_rgb;
         }
-        if lo_rgb == hi_rgb {
+        if lo_rgb[0] == hi_rgb[0] && lo_rgb[1] == hi_rgb[1] && lo_rgb[2] == hi_rgb[2] {
             break;
         }
+        step += 1;
     }
     Some(pack(lo_rgb))
 }
@@ -557,14 +624,14 @@ pub(super) type GlyphPaletteMemo = ((u32, u32), Option<[u32; RAINBOW_BANDS.len()
 pub(super) fn fresh_ink_glyph_palette(fg: u32, bg: u32) -> Option<[u32; RAINBOW_BANDS.len()]> {
     let (side, cap) = glyph_ink_bound(fg, bg)?;
     let mut out = [0u32; RAINBOW_BANDS.len()];
-    for (slot, &band) in out.iter_mut().zip(RAINBOW_BANDS.iter()) {
+    for (dst, &band) in out.iter_mut().zip(&RAINBOW_BANDS) {
         let ink = fresh_ink_glyph_ink(band, fg, side, cap)?;
         if chan_spread(ink) < FRESH_INK_GLYPH_MIN_SPREAD
             || chan_dist(ink, fg) < FRESH_INK_GLYPH_MIN_DELTA
         {
             return None;
         }
-        *slot = ink;
+        *dst = ink;
     }
     Some(out)
 }
@@ -596,7 +663,14 @@ pub(super) const fn classic_ring_life(base: f32, scale: f32) -> f32 {
 
 /// The comet colour for `style` at path position `pos` (0 tail .. 1 head): the single ramp shared by the live animator ([`CursorGlow::comet_color`]) and the settings-card demo.
 #[inline]
-pub fn style_comet_color(style: GlowStyle, color: u32, accent: u32, hue: f32, pos: f32) -> u32 {
+#[must_use]
+pub const fn style_comet_color(
+    style: GlowStyle,
+    color: u32,
+    accent: u32,
+    hue: f32,
+    pos: f32,
+) -> u32 {
     match style {
         GlowStyle::Lumen => lerp_rgb(accent, color, pos),
         GlowStyle::Comet => {
@@ -621,16 +695,19 @@ pub fn style_comet_color(style: GlowStyle, color: u32, accent: u32, hue: f32, po
 
 /// The particle colour for `style` at remaining life `fade` (1 fresh → 0 dead) with per-particle seed `hue` — shared by the live ember/droplet/spark emitters and the settings-card effect demo.
 #[inline]
-pub fn style_particle_color(style: GlowStyle, color: u32, hue: f32, fade: f32) -> u32 {
+#[must_use]
+pub const fn style_particle_color(style: GlowStyle, color: u32, hue: f32, fade: f32) -> u32 {
     match style {
         GlowStyle::Fire => fire_ramp(fade.min(0.83)),
         GlowStyle::Water => water_ramp(0.35 + 0.55 * fade + 0.1 * hue),
         GlowStyle::Laser => lerp_rgb(color, 0x00FF_FFFF, 0.55 * fade),
         GlowStyle::Beam => lerp_rgb(color, 0x00FF_FFFF, 0.35 + 0.45 * fade),
         GlowStyle::Comet => lerp_rgb(color, 0x00FF_FFFF, 0.65 * fade),
-        GlowStyle::RainbowKitty => {
-            lerp_rgb(spectrum_snap(hue.rem_euclid(1.0)), 0x00FF_FFFF, 0.35 * fade)
-        }
+        GlowStyle::RainbowKitty => lerp_rgb(
+            spectrum_snap(rem_euclid_pos(hue, 1.0)),
+            0x00FF_FFFF,
+            0.35 * fade,
+        ),
         _ => lerp_rgb(hsv2rgb(hue, 0.85, 1.0), 0x00FF_FFFF, 0.35 * fade),
     }
 }
@@ -1133,7 +1210,7 @@ pub(crate) fn push_ripple_ring(
 
 /// Fractional part `x − ⌊x⌋`: unlike `f32::fract`, never negative.
 #[inline]
-pub(super) fn fract(x: f32) -> f32 {
+pub(super) const fn fract(x: f32) -> f32 {
     x - x.floor()
 }
 
@@ -1166,7 +1243,7 @@ pub(super) fn beam_power(frac: f32) -> f32 {
 
 /// HSV (all `0..1`; `h` in turns, any real, wrapped) → `0x00RRGGBB`: the colour wheel the classic wake and the phaser turn.
 #[inline]
-pub(crate) fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
+pub(crate) const fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
     let h = (h.fract() + 1.0).fract() * 6.0;
     let i = h.floor() as i32;
     let f = h - i as f32;
@@ -1181,7 +1258,10 @@ pub(crate) fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
         4 => (t, p, v),
         _ => (v, p, q),
     };
-    let u = |c: f32| ((c.clamp(0.0, 1.0)) * 255.0 + 0.5) as u32;
+    #[inline]
+    const fn u(c: f32) -> u32 {
+        (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u32
+    }
     (u(r) << 16) | (u(g) << 8) | u(b)
 }
 

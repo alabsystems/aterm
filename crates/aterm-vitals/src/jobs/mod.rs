@@ -218,6 +218,8 @@ pub enum FdKind {
     Device {
         /// A terminal.
         tty: bool,
+        /// Opened for reading; `true` where unread, `false` for one only written (`tee /dev/tty`).
+        read: bool,
     },
     /// One end of a pipe.
     Pipe {
@@ -304,6 +306,9 @@ pub struct JobProc {
     pub wchan: Option<String>,
     /// Its descriptors, when asked for; `None` when not asked or refused.
     pub fds: Option<Vec<Fd>>,
+    /// The descriptor it sleeps reading or writing, read with its descriptors (Linux
+    /// `/proc/<pid>/syscall`); `None` elsewhere, where unread, or in no read or write.
+    pub blocked_fd: Option<i32>,
     /// Whether macOS's program check holds it before its first instruction
     /// (`aterm_sysprobe::jobs::AtStart::Held`).
     pub program_check: bool,

@@ -31,7 +31,7 @@ use aterm_effects::aos_momentum::m4::{Evaluator, Job, Spread};
 use aterm_effects::aos_momentum::plan::{PLAN_LEN, SchedulePlan};
 use aterm_uds::spawnfd::{Child, Rusage, Stdio};
 
-use crate::aos_search::LAB_BUILD;
+use crate::lab_build::LAB_BUILD;
 use crate::stop;
 
 /// The hidden pre-dispatch verb a worker runs as (beside `slot-hold`).
@@ -62,31 +62,6 @@ const MONOTONIC: &str = "the shell's clock is monotonic";
 
 fn nanos(d: Duration) -> Nanos {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
-}
-
-/// A [`Spread`] over `n` scoped threads: each takes the next index until none is left, so a spread
-/// changes only speed.
-#[derive(Clone, Copy, Debug)]
-pub struct Threads(pub usize);
-
-impl Spread for Threads {
-    fn run(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
-        let next = AtomicUsize::new(0);
-        let width = self.0.clamp(1, n.max(1));
-        std::thread::scope(|s| {
-            for _ in 0..width {
-                s.spawn(|| {
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= n {
-                            break;
-                        }
-                        job(i);
-                    }
-                });
-            }
-        });
-    }
 }
 
 /// A [`Spread`] that times each of its calls (measured, never scored).

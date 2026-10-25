@@ -886,8 +886,9 @@ bounded() {
 # it first: a group already gone (CMD ended just before the signal) answers
 # kill with 1. A QUIT ends it by <status>, as run_cut ends the run: die_of's
 # self-kill of it on bash 3.2 is a death by a core-dump signal, for which macOS
-# writes a crash report, and the shell waiting on this one, which the terminal
-# sent the same Ctrl-\, ends the run itself (run_cut).
+# writes a crash report, and the run's own shell, which the terminal sent the
+# same Ctrl-\, ends the run (run_cut). A $(…) subshell between the two starts
+# with its QUIT at the default, so on bash 3.2 it still dies of that Ctrl-\.
 bounded_cut() { # <signal> <status>
 	kill -KILL -- "-$pid" 2>/dev/null || true
 	rm -f -- ${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"} 2>/dev/null || true
@@ -923,10 +924,11 @@ die_of() { # <signal> <status>
 # it with a syntax error or status 0, not by the signal. A Ctrl-\ (QUIT) in the
 # run is the same: bash 5 ignores it, so the run read a child's death of it as
 # an answer, and bash 3.2 died of it without running its EXIT trap. One while
-# the script still arrives under bash 5 ends it with status 0, having run
-# nothing: bash 5 ignores it, curl dies of it, and no trap can be set before
-# the script has arrived (a top-level one stays pending at the cut's end of
-# file, measured), so that one exception stands.
+# the script still arrives under bash 5 ends it as that Ctrl-C would, with a
+# syntax error or status 0 and nothing run: bash 5 ignores it, curl dies of
+# it, and no trap can be set before the script has arrived (a top-level one
+# stays pending at the cut's end of file, measured), so that one exception
+# stands.
 end_on_ctrl_c() {
 	trap 'run_cut INT 130' INT
 	trap 'run_cut QUIT 131' QUIT
@@ -950,15 +952,17 @@ run_cut() { # <signal> <status>
 # BOUNDED_TEMPS (a local array it declares first) before the file exists, so
 # run_cut removes it whenever the signal lands. Made by mktemp and named after,
 # one a Ctrl-C caught in between stayed (about one interrupt of a check in
-# twelve). mktemp -u draws the name, and a noclobber redirection makes the
-# file with mode 0600, as mktemp would: bash refuses a regular file at the
-# name (or a link to one), and opens a name where it finds nothing with
-# O_EXCL, which fails on a dangling link or on anything made there in
-# between. It opens anything else already there (a device, a FIFO, or a link
-# to either), which only a guess at that random name could have put there.
+# twelve). mktemp -u draws the name, with the signals ignored: macOS's makes
+# the file and removes it again (mkstemp, then unlink), and one cut in between
+# left a file nothing named. A noclobber redirection then makes the file, with
+# mode 0600 as mktemp would: bash refuses a regular file at the name (or a
+# link to one), and opens a name where it finds nothing with O_EXCL, which
+# fails on a dangling link or on anything made there in between. It opens
+# anything else already there (a device, a FIFO, or a link to either), which
+# only a guess at that random name could have put there.
 probe_temp() { # <var> <prefix>
 	local name
-	name="$(mktemp -u "${TMPDIR:-/tmp}/$2.XXXXXX")" || return 1
+	name="$(trap '' INT QUIT HUP TERM && exec mktemp -u "${TMPDIR:-/tmp}/$2.XXXXXX")" || return 1
 	BOUNDED_TEMPS+=("$name")
 	(umask 077 && set -C && : >"$name") 2>/dev/null || return 1
 	printf -v "$1" '%s' "$name"
@@ -4456,9 +4460,9 @@ root_entry() { # <path>
 # `curl … | bash` the inherited stdin is the rest of this script, which a binary
 # that reads it would swallow), in its own process group, and cut off at
 # VERIFY_WAIT_SECS. A run cut off answered nothing, whatever it printed first.
-# Every caller reads it through $(…), whose subshell starts with the run's
-# traps reset, so it sets them again (end_on_ctrl_c): a Ctrl-C then removes its
-# file there, which the run's own shell never named.
+# Every caller runs it in a subshell, a $(…) or a pipeline's, which starts
+# with the run's traps reset, so it sets them again (end_on_ctrl_c): a Ctrl-C
+# then removes its file there, which the run's own shell never named.
 first_line_bounded() {
 	local out s=0
 	may_run "$1" || return 0
@@ -4913,14 +4917,18 @@ persist_no_toolchain() { # <cfg>
 		printf '\n[packages]\nauto_install = false\n' >>"$cfg" || return 1
 		;;
 	insert)
-		local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
-		probe_temp tmp aterm-config || return 1
 		# cat's redirection empties the file before cat refills it, so cat runs
 		# with the signals that would cut it ignored: a Ctrl-C there ends the
 		# run once the file is whole again (run_cut, which removes the copy).
 		# A TERM or HUP to this shell alone is held to run_cut the same way
-		# (hold_kills): bash's own handler ended the run at once, the copy left.
+		# (hold_kills), from before the copy is made until it is gone: bash's
+		# own handler ended the run at once, the copy left.
+		local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
 		hold_kills
+		probe_temp tmp aterm-config || {
+			release_kills
+			return 1
+		}
 		awk '
 			{ print }
 			!done {
@@ -4928,8 +4936,8 @@ persist_no_toolchain() { # <cfg>
 				if (line ~ /^\[[ \t]*packages[ \t]*\]$/) { print "auto_install = false"; done = 1 }
 			}' "$cfg" >"$tmp" && (trap '' INT HUP TERM QUIT && exec cat "$tmp" >"$cfg")
 		local status=$?
-		release_kills
 		rm -f "$tmp"
+		release_kills
 		[[ $status -eq 0 ]] || return 1
 		;;
 	keep*)

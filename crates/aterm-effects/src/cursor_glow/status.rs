@@ -702,7 +702,7 @@ impl CursorGlow {
     /// Count of distinct hue bands among lit ribbon boundaries.
     #[inline]
     #[must_use]
-    pub fn ribbon_hue_bands(&self) -> usize {
+    pub const fn ribbon_hue_bands(&self) -> usize {
         if self.v2.engaged() {
             return self.v2.ribbon_hue_bands();
         }
@@ -733,32 +733,50 @@ impl CursorGlow {
     }
 
     /// Recompute [`Self::probed_spans`] after rotating or lifting the previous row probe.
-    pub(super) fn refresh_probed_text_spans(&mut self) {
+    pub(super) const fn refresh_probed_text_spans(&mut self) {
         let mut spans = TextSpans::EMPTY;
         let Some(m) = self.row_prev_meta.as_ref() else {
             self.probed_spans = spans;
             return;
         };
-        let row = i32::from(m.row);
+        let row = m.row as i32;
         let rows: [(i32, Option<&[char]>); 3] = [
             (
                 row - 1,
-                (m.above == NbrProbe::Probed).then_some(&self.row_above_prev[..]),
+                if matches!(m.above, NbrProbe::Probed) {
+                    Some(self.row_above_prev.as_slice())
+                } else {
+                    None
+                },
             ),
-            (row, Some(&self.row_prev[..])),
+            (row, Some(self.row_prev.as_slice())),
             (
                 row + 1,
-                (m.below == NbrProbe::Probed).then_some(&self.row_below_prev[..]),
+                if matches!(m.below, NbrProbe::Probed) {
+                    Some(self.row_below_prev.as_slice())
+                } else {
+                    None
+                },
             ),
         ];
-        for ((slot, read), (r, cols)) in spans.rows.iter_mut().zip(&mut spans.read).zip(rows) {
-            let Some(cols) = cols else { continue };
-            *read = Some(r);
-            if let Some(first) = cols.iter().position(|&g| g != ' ')
-                && let Some(rel_last) = cols[first..].iter().rposition(|&g| g != ' ')
-            {
-                *slot = Some((r, first as i32, (first + rel_last) as i32 + 1));
+        let mut i = 0;
+        while i < 3 {
+            let (r, cols) = rows[i];
+            if let Some(cols) = cols {
+                spans.read[i] = Some(r);
+                let mut first = 0;
+                while first < cols.len() && cols[first] == ' ' {
+                    first += 1;
+                }
+                if first < cols.len() {
+                    let mut end = cols.len();
+                    while end > first && cols[end - 1] == ' ' {
+                        end -= 1;
+                    }
+                    spans.rows[i] = Some((r, first as i32, end as i32));
+                }
             }
+            i += 1;
         }
         self.probed_spans = spans;
     }

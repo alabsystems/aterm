@@ -69,7 +69,7 @@ fn a_reader_hears_claudes_words_under_the_glass() {
             && heard
                 .value()
                 .contains(aterm_phase::anchor!("notice.updated_details"))
-            && !heard.value().contains(NOTICE.text)
+            && !heard.value().contains(NOTICE.short)
             && !heard.value().contains("YOLO")
             && !heard.value().contains(LOGO),
         "{}",
@@ -113,6 +113,39 @@ fn a_reader_hears_claudes_words_under_the_glass() {
     assert!(
         logo_nodes.is_empty(),
         "no node for the lockup: {logo_nodes:?}"
+    );
+    let links: Vec<_> = tree
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.role() == Role::Link)
+        .map(|(id, n)| {
+            (
+                crate::a11y_tree::chip_for(*id),
+                n.label().map(str::to_owned),
+                n.supports_action(aterm_a11y::model::Action::Click),
+            )
+        })
+        .collect();
+    assert_eq!(
+        links,
+        vec![(
+            Some((session, crate::a11y_tree::HarnessChip::Link)),
+            Some(NOTICE.text.to_owned()),
+            true
+        )],
+        "the banner's link is a link a reader can press, named by its words"
+    );
+    let _ = crate::platform::take_opened_urls();
+    app.press_claude_chip_for_reader(wid, session, crate::a11y_tree::HarnessChip::Link);
+    assert_eq!(
+        crate::platform::take_opened_urls(),
+        vec![NOTICE.url.to_string()],
+        "the reader's press opens it"
+    );
+    app.press_claude_chip_for_reader(wid, session + 1, crate::a11y_tree::HarnessChip::Link);
+    assert!(
+        crate::platform::take_opened_urls().is_empty(),
+        "CONTROL: no banner, nothing opened"
     );
     host.shutdown_and_join();
 }

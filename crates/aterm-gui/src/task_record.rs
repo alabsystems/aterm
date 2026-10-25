@@ -886,8 +886,10 @@ pub(crate) fn seed_carried(ctx: &SessionCtx, row: Option<&str>) {
     crate::session_timeline::keep_worker_autopilot(ctx);
 }
 
-/// Returns the session's published agent word and percent-encoded attention text.
-pub(crate) fn agent_and_attention(ctx: &SessionCtx) -> (&'static str, String) {
+/// Returns the session's published agent word, the program's own report as the timeline
+/// shows it (`program_state=`, [`crate::program_state::column`]: a claim beside `agent=`, read
+/// under the same lock) and the percent-encoded attention text.
+pub(crate) fn agent_program_and_attention(ctx: &SessionCtx) -> (&'static str, String, String) {
     let attention = ctx
         .meta
         .lock()
@@ -895,24 +897,25 @@ pub(crate) fn agent_and_attention(ctx: &SessionCtx) -> (&'static str, String) {
         .attention
         .as_deref()
         .map_or_else(|| "-".to_string(), crate::control::pct_encode);
-    let agent = ctx
-        .timeline
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .agent()
-        .word;
-    (agent, attention)
+    let (agent, program) = {
+        let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            timeline.agent().word,
+            crate::program_state::column(timeline.program_shown()),
+        )
+    };
+    (agent, program, attention)
 }
 
 /// The `task` reply line for `record`, unterminated: `OK task -` with none,
-/// else `OK task <fields> agent= attention=`.
+/// else `OK task <fields> agent= program_state= attention=`.
 fn task_reply(ctx: &SessionCtx, record: Option<&TaskRecord>) -> String {
     let Some(record) = record else {
         return "OK task -".to_string();
     };
-    let (agent, attention) = agent_and_attention(ctx);
+    let (agent, program, attention) = agent_program_and_attention(ctx);
     format!(
-        "OK task {} agent={agent} attention={attention}",
+        "OK task {} agent={agent} program_state={program} attention={attention}",
         record.wire_fields()
     )
 }
@@ -1114,12 +1117,14 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
 }
 
 /// Formats a single `await task` reply row (` fact= fact_rev=` at its end once the record's fact
-/// word was ever edited, [`TaskRecord::push_fact`]).
+/// word was ever edited, [`TaskRecord::push_fact`]); `program` is the `program_state=` column, a
+/// claim shown beside `agent=` that no wait reads.
 #[must_use]
 pub(crate) fn await_row(
     sid: &str,
     record: Option<&TaskRecord>,
     agent: &str,
+    program: &str,
     attention: &str,
     closed: bool,
 ) -> String {
@@ -1127,7 +1132,8 @@ pub(crate) fn await_row(
         record.map_or((0, "-", 0), |r| (r.rev, r.state.as_str(), r.result_bytes));
     let state = if closed { "closed" } else { state };
     let mut row = format!(
-        "@{sid} rev={rev} state={state} agent={agent} attention={attention} result_bytes={result_bytes}"
+        "@{sid} rev={rev} state={state} agent={agent} program_state={program} \
+         attention={attention} result_bytes={result_bytes}"
     );
     if let Some(record) = record {
         record.push_fact(&mut row);

@@ -21,7 +21,7 @@ use crate::session_timeline::{
 use crate::turn_ledger::TurnBy;
 use crate::{SessionCtx, term_lock};
 
-/// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0> nonce=<hex32> window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> … supervisor=<holder|-> autopilot=<off|cruise|land|-> path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|theirs|-> pause=<unix s|-> task_state=<working|done|exited|stalled|-> task_rev=<n>`.
+/// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0> nonce=<hex32> window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|-> agent_fp=<hex16|-> program_state=<word[:kind]|-> … supervisor=<holder|-> supervisor_proven=<0|1> autopilot=<off|cruise|land|-> path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|theirs|-> pause=<unix s|-> task_state=<working|done|exited|stalled|-> task_rev=<n>`.
 pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wake>>) -> String {
     let (snapshot, frozen, posture) = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
@@ -192,10 +192,19 @@ pub(crate) fn sessions_lines(
         let detail = session_detail(h)
             .as_deref()
             .map_or_else(|| "-".to_string(), pct_encode);
-        let (agent, (path, owner), task_record, (supervised_agent, group), face, pause) = {
+        let (
+            agent,
+            program_state,
+            (path, owner),
+            task_record,
+            (supervised_agent, group),
+            face,
+            pause,
+        ) = {
             let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
                 timeline.agent().wire_fields(),
+                crate::program_state::column(timeline.program_shown()),
                 timeline.owner_columns(frozen_path(h.local_id), crate::upgrade_host::now_s()),
                 crate::task_record::status_tokens(timeline.task()),
                 (
@@ -216,16 +225,17 @@ pub(crate) fn sessions_lines(
         let _ = writeln!(
             out,
             "{} {} {} {} {} meta={has_meta} nonce={nonce} window={window} active={active} \
-             wfocus={wfocus} detail={detail} path={path} {agent} \
+             wfocus={wfocus} detail={detail} path={path} {agent} program_state={program_state} \
              human_ms={human} role={role} attention={attention} user_title={user_title} \
-             supervisor={supervisor} autopilot={autopilot} {owner} land_at={land_at} task={task} \
-             pause={pause} {task_record}",
+             supervisor={supervisor} supervisor_proven={proven} autopilot={autopilot} {owner} \
+             land_at={land_at} task={task} pause={pause} {task_record}",
             h.local_id,
             h.sid.as_str(),
             parent,
             h.state.as_str(),
             title,
             nonce = h.nonce.to_hex(),
+            proven = flag(proven),
         );
     }
     out
@@ -1062,11 +1072,12 @@ fn task_wait_row(
     closed: bool,
     news: bool,
 ) -> String {
-    let (agent, attention) = crate::task_record::agent_and_attention(target.ctx);
+    let (agent, program, attention) = crate::task_record::agent_program_and_attention(target.ctx);
     let mut row = crate::task_record::await_row(
         target.ctx.self_id.as_str(),
         record,
         agent,
+        &program,
         &attention,
         closed,
     );
@@ -3657,7 +3668,7 @@ fn meta_status(
     )
 }
 
-/// `meta`'s `autopilot_by=` and `autopilot_since=` (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.7.2): who set the Autopilot pair — `human:chip`, `human:border`, `human:menu`, `human:settings`, `human:every`, `ctl`, `harness`, `bridge`, `aterm` (the timer's fire), a session's sid (its edge connection), `-` for none attributable ([`crate::session_timeline::AutopilotSetBy::word`]) — and when, unix seconds.
+/// `meta`'s `autopilot_by=` and `autopilot_since=` (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.7.2): who set the Autopilot pair — `human:chip`, `human:border`, `human:launch`, `human:menu`, `human:settings`, `human:every`, `ctl`, `harness`, `bridge`, `aterm` (the timer's fire), a session's sid (its edge connection), `-` for none attributable ([`crate::session_timeline::AutopilotSetBy::word`]) — and when, unix seconds.
 pub(crate) fn autopilot_by_fields(meta: &crate::session_timeline::SessionMeta) -> (String, String) {
     match (meta.autopilot_set_by, meta.autopilot.is_some()) {
         (Some(set_by), _) => (set_by.word(), set_by.since_ms.div_euclid(1000).to_string()),
@@ -5089,7 +5100,7 @@ mod tests {
         }
     }
 
-    const AGENT_COLUMNS: [&str; 21] = [
+    const AGENT_COLUMNS: [&str; 23] = [
         "program=",
         "agent=",
         "agent_detail=",
@@ -5097,11 +5108,13 @@ mod tests {
         "agent_since_ms=",
         "agent_gen=",
         "agent_fp=",
+        "program_state=",
         "human_ms=",
         "role=",
         "attention=",
         "user_title=",
         "supervisor=",
+        "supervisor_proven=",
         "autopilot=",
         "path_evidence=",
         "copy=",
@@ -5178,7 +5191,8 @@ mod tests {
         let line = out.lines().nth(1).unwrap();
         assert!(
             line.contains(
-                " role=reviewer attention=stuck%20on%20CI user_title=my%20build supervisor="
+                " role=reviewer attention=stuck%20on%20CI user_title=my%20build supervisor=- \
+                 supervisor_proven=0 "
             ),
             "{line}"
         );
@@ -5369,7 +5383,8 @@ mod tests {
         );
         assert!(
             quiet.contains(&format!(
-                "@{} rev=1 state=working agent=- attention=- result_bytes=0 task_news=0\n",
+                "@{} rev=1 state=working agent=- program_state=- attention=- result_bytes=0 \
+                 task_news=0\n",
                 workers[0].sid.as_str()
             )),
             "{quiet}"
@@ -5384,7 +5399,10 @@ mod tests {
             ("OK 3", vec!["working", "done", "working"])
         );
         assert!(
-            any.contains(" rev=2 state=done agent=- attention=- result_bytes=64 task_news=1\n"),
+            any.contains(
+                " rev=2 state=done agent=- program_state=- attention=- result_bytes=64 \
+                 task_news=1\n"
+            ),
             "{any}"
         );
         for (since, combine) in [
@@ -5414,6 +5432,179 @@ mod tests {
         assert_eq!(
             task_reply(&all),
             ("OK 3", vec!["stalled", "done", "exited"])
+        );
+    }
+
+    /// A CLAIM IS NO TASK NEWS: a codex's own report (`program_state=`) rides an `await task`
+    /// row but never wakes one. A wait parked past a working worker's rev sees the program
+    /// report `done`, then `blocked:permission`, and still answers only at its deadline, the
+    /// claim in its row and `task_news=0`, and the `task` reply carries it too; the harness's own
+    /// `task mark done` then is news.
+    #[test]
+    fn a_programs_own_report_rides_the_await_task_row_and_never_wakes_it() {
+        use crate::task_record::{Combine, TaskMark, TaskState, mark_session_task};
+        use aterm_core::terminal::program_state::{
+            ProgramBlockedKind, ProgramState, ProgramStateWord,
+        };
+        let store = crate::session_store::new_store();
+        let workers = three_workers(&store);
+        let w = &workers[0];
+        let one = |timeout_ms: u64| {
+            await_task(
+                &store,
+                &[TaskTarget {
+                    local_id: w.local_id,
+                    ctx: &w.ctx,
+                    since: Some(1),
+                    facts: false,
+                    fact_since: None,
+                }],
+                Combine::Any,
+                timeout_ms,
+            )
+        };
+        let report = |state, kind| {
+            w.ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .note_program_state(Some(ProgramState { state, kind }));
+        };
+        let sid = w.sid.as_str();
+        let parked = std::thread::scope(|s| {
+            let waiter = s.spawn(|| one(2_000));
+            let armed = std::time::Instant::now();
+            while w.ctx.watchers.count() == 0 {
+                assert!(
+                    armed.elapsed() < std::time::Duration::from_secs(60),
+                    "the waiter never parked"
+                );
+                std::thread::yield_now();
+            }
+            report(ProgramStateWord::Done, None);
+            report(
+                ProgramStateWord::Blocked,
+                Some(ProgramBlockedKind::Permission),
+            );
+            waiter.join().expect("the waiter")
+        });
+        assert_eq!(
+            parked,
+            format!(
+                "OK 1 status=timeout\n@{sid} rev=1 state=working agent=- \
+                 program_state=blocked:permission attention=- result_bytes=0 task_news=0\n"
+            ),
+        );
+        let task = crate::task_record::cmd_task(&w.ctx, w.local_id, Scope::Owner, "");
+        assert!(
+            task.starts_with("OK task rev=1 state=working ")
+                && task.ends_with(" agent=- program_state=blocked:permission attention=-\n"),
+            "the task reply carries the claim beside agent=: {task}"
+        );
+        mark_session_task(&w.ctx, w.local_id, &TaskMark::new(TaskState::Done)).expect("unfenced");
+        assert_eq!(
+            one(60_000),
+            format!(
+                "OK 1\n@{sid} rev=2 state=done agent=- program_state=blocked:permission \
+                 attention=- result_bytes=0 task_news=1\n"
+            ),
+            "the record's own news"
+        );
+    }
+
+    /// `supervisor_proven=` on `ls` is `status supervisor_proven=`: `1` only while the live claim
+    /// is a proven self-claim, `0` for an unproven one and for a tab nobody claims.
+    #[test]
+    fn the_roster_says_whether_the_live_claim_is_proven() {
+        let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let (proven, unproven, plain) = (handle(0, &t0), handle(1, &t0), handle(2, &t0));
+        for (h, proof) in [(&proven, true), (&unproven, false)] {
+            h.ctx.meta.lock().unwrap().supervisor =
+                Some(crate::session_timeline::SupervisorClaim {
+                    holder: "codex-alab@4242".to_string(),
+                    conn: Some(1),
+                    expires_us: None,
+                    proven: proof.then(|| crate::self_claim::Proven {
+                        pid: 4242,
+                        start: "Mon Oct 20 16:37:58 2026".to_string(),
+                    }),
+                });
+        }
+        let out = sessions_lines(
+            &[proven, unproven, plain],
+            Ok(&[]),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
+        let rows: Vec<&str> = out.lines().skip(1).collect();
+        for (row, want) in rows.iter().zip([
+            " supervisor=codex-alab@4242 supervisor_proven=1 autopilot=",
+            " supervisor=codex-alab@4242 supervisor_proven=0 autopilot=",
+            " supervisor=- supervisor_proven=0 autopilot=",
+        ]) {
+            assert!(row.contains(want), "{want}: {row}");
+        }
+    }
+
+    /// THE ROSTER'S FIXED COLUMN ORDER: a `sessions` row is five positional fields (`local sid
+    /// parent state title`) and then exactly these keys, in this order, as the SPECS row
+    /// roster-line-denotation names them.
+    #[test]
+    fn a_roster_row_keeps_its_fixed_column_order() {
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let h = handle(0, &term);
+        let out = sessions_lines(
+            std::slice::from_ref(&h),
+            Ok(&[]),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
+        let row = out.lines().nth(1).expect("one row");
+        let mut tokens = row.split(' ');
+        let positional: Vec<&str> = tokens.by_ref().take(5).collect();
+        assert_eq!(
+            positional,
+            ["0", h.sid.as_str(), "-", h.state.as_str(), "tab-0"],
+            "{row}"
+        );
+        let keys: Vec<&str> = tokens
+            .map(|t| t.split_once('=').map_or(t, |(k, _)| k))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "meta",
+                "nonce",
+                "window",
+                "active",
+                "wfocus",
+                "detail",
+                "path",
+                "program",
+                "agent",
+                "agent_detail",
+                "agent_rev",
+                "agent_since_ms",
+                "agent_gen",
+                "agent_fp",
+                "program_state",
+                "human_ms",
+                "role",
+                "attention",
+                "user_title",
+                "supervisor",
+                "supervisor_proven",
+                "autopilot",
+                "path_evidence",
+                "copy",
+                "upgrade",
+                "land_at",
+                "task",
+                "pause",
+                "task_state",
+                "task_rev",
+            ],
+            "{row}"
         );
     }
 
@@ -5463,7 +5654,8 @@ mod tests {
         let reply = one(&workers[1], 1);
         assert!(
             reply.ends_with(
-                " rev=2 state=working agent=- attention=a%20login result_bytes=0 task_news=1\n"
+                " rev=2 state=working agent=- program_state=- attention=a%20login \
+                 result_bytes=0 task_news=1\n"
             ),
             "{reply}"
         );
@@ -5578,7 +5770,7 @@ mod tests {
             assert_eq!(task_reply(&reply).0, "OK 1", "{reply}");
             assert!(
                 reply.ends_with(
-                    " rev=1 state=working agent=- attention=- result_bytes=0 \
+                    " rev=1 state=working agent=- program_state=- attention=- result_bytes=0 \
                      fact=hold-room@v1#1 fact_rev=1 task_news=1\n"
                 ),
                 "{reply}"
@@ -5856,7 +6048,7 @@ mod tests {
         );
         let line = out.lines().nth(1).unwrap();
         assert!(
-            line.contains(" supervisor=- autopilot=- "),
+            line.contains(" supervisor=- supervisor_proven=0 autopilot=- "),
             "no agent: {line}"
         );
         let (_, cols) = line.split_once(" path=live ").expect("after path=");
@@ -5903,8 +6095,9 @@ mod tests {
         );
         assert!(
             line.ends_with(
-                " human_ms=- role=- attention=- user_title=- supervisor=- autopilot=off \
-                 path_evidence=- copy=- upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"
+                " agent_fp=00000000000000ab program_state=- human_ms=- role=- attention=- \
+                 user_title=- supervisor=- supervisor_proven=0 autopilot=off path_evidence=- \
+                 copy=- upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"
             ),
             "{line}"
         );
@@ -5923,8 +6116,8 @@ mod tests {
         assert!(human.parse::<u64>().is_ok(), "{line}");
         assert!(
             line.ends_with(
-                " supervisor=- autopilot=off path_evidence=- copy=- upgrade=- land_at=- task=- \
-                 pause=- task_state=- task_rev=0"
+                " supervisor=- supervisor_proven=0 autopilot=off path_evidence=- copy=- \
+                 upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"
             ),
             "{line}"
         );

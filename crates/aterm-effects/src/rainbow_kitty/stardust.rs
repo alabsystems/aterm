@@ -3098,10 +3098,16 @@ impl Stardust {
     }
 
     #[inline]
-    fn free_sky_cell(&self, cell: (u16, u16), geom: Geom) -> Option<(u16, u16)> {
-        (0..=STRIKE_REACH_CELLS)
-            .map(|k| (cell.0, cell.1.saturating_add(k)))
-            .find(|&c| !self.sky_star_live(c, geom))
+    const fn free_sky_cell(&self, cell: (u16, u16), geom: Geom) -> Option<(u16, u16)> {
+        let mut k = 0;
+        while k <= STRIKE_REACH_CELLS {
+            let c = (cell.0, cell.1.saturating_add(k));
+            if !self.sky_star_live(c, geom) {
+                return Some(c);
+            }
+            k += 1;
+        }
+        None
     }
 
     #[inline]
@@ -4518,26 +4524,25 @@ fn sky_ground<'a>(
 
 #[inline]
 #[must_use]
-fn halo_weight_at(h: &RainHalo, x: i32, y: i32) -> u8 {
-    if !(i32::from(h.x)..i32::from(h.x) + i32::from(h.w)).contains(&x)
-        || !(i32::from(h.y)..i32::from(h.y) + i32::from(h.h)).contains(&y)
-    {
+const fn halo_weight_at(h: &RainHalo, x: i32, y: i32) -> u8 {
+    let (hx, hy) = (h.x as i32, h.y as i32);
+    if x < hx || x >= hx + h.w as i32 || y < hy || y >= hy + h.h as i32 {
         return 0;
     }
-    let ny = halo_row_ny(y - i32::from(h.cy), i32::from(h.ry) * i32::from(h.ry));
+    let ny = halo_row_ny(y - h.cy as i32, h.ry as i32 * h.ry as i32);
     if ny >= 256 {
         return 0;
     }
-    let wt = halo_weight(x - i32::from(h.cx), ny, i32::from(h.rx) * i32::from(h.rx));
+    let wt = halo_weight(x - h.cx as i32, ny, h.rx as i32 * h.rx as i32);
     if wt <= 0 {
         return 0;
     }
-    wt.min(255) as u8
+    if wt > 255 { 255 } else { wt as u8 }
 }
 
 #[inline]
 #[must_use]
-fn halo_add_at(h: &RainHalo, x: i32, y: i32) -> u32 {
+const fn halo_add_at(h: &RainHalo, x: i32, y: i32) -> u32 {
     let wt = halo_weight_at(h, x, y);
     if wt == 0 { 0 } else { premul_rgb(h.color, wt) }
 }
@@ -4934,7 +4939,7 @@ mod tests {
     use aterm_render::add_sat;
     use std::time::Duration;
 
-    fn geom() -> Geom {
+    const fn geom() -> Geom {
         Geom {
             cw: 9,
             ch: 18,
@@ -4948,7 +4953,7 @@ mod tests {
         }
     }
 
-    fn cfg(dark: bool) -> Config {
+    const fn cfg(dark: bool) -> Config {
         Config {
             dark_theme: dark,
             intensity: 1.0,
@@ -4961,7 +4966,7 @@ mod tests {
         }
     }
 
-    fn geom_cell(cw: usize, ch: usize) -> Geom {
+    const fn geom_cell(cw: usize, ch: usize) -> Geom {
         Geom {
             cw,
             ch,
@@ -4971,11 +4976,11 @@ mod tests {
         }
     }
 
-    fn ctx(now: Instant, cfg: &Config, caret: (u16, u16)) -> Ctx<'_> {
+    const fn ctx(now: Instant, cfg: &Config, caret: (u16, u16)) -> Ctx<'_> {
         ctx_in(geom(), now, cfg, caret)
     }
 
-    fn ctx_in(geom: Geom, now: Instant, cfg: &Config, caret: (u16, u16)) -> Ctx<'_> {
+    const fn ctx_in(geom: Geom, now: Instant, cfg: &Config, caret: (u16, u16)) -> Ctx<'_> {
         Ctx {
             now,
             geom,
@@ -4988,7 +4993,7 @@ mod tests {
             caret_walk: None,
             mend: None,
             surge: 0.0,
-            flow: Default::default(),
+            flow: Flow::EMPTY,
         }
     }
 
@@ -5002,14 +5007,14 @@ mod tests {
     }
 
     impl Scratch {
-        fn frame(&mut self) -> Frame<'_> {
+        const fn frame(&mut self) -> Frame<'_> {
             Frame {
                 under: &mut self.under,
                 out: &mut self.out,
                 halos: &mut self.halos,
                 beams: &mut self.beams,
                 cues: &mut self.cues,
-                caret: super::super::CaretSeam::default(),
+                caret: super::super::CaretSeam::EMPTY,
                 companion: None,
                 fp: 0,
             }
@@ -5040,8 +5045,12 @@ mod tests {
         dst
     }
 
-    fn lum(p: u32) -> u32 {
-        ((p >> 16) & 0xff).max((p >> 8) & 0xff).max(p & 0xff)
+    const fn lum(p: u32) -> u32 {
+        let r = (p >> 16) & 0xff;
+        let g = (p >> 8) & 0xff;
+        let b = p & 0xff;
+        let rg = if r >= g { r } else { g };
+        if rg >= b { rg } else { b }
     }
 
     fn peak_seed() -> u32 {
@@ -5139,7 +5148,7 @@ mod tests {
         }
     }
 
-    fn every_class() -> [(StarClass, StarLane, f32); 6] {
+    const fn every_class() -> [(StarClass, StarLane, f32); 6] {
         [
             (StarClass::M1, StarLane::Strike, 143.0),
             (StarClass::M2, StarLane::Strike, 130.0),
@@ -5150,7 +5159,7 @@ mod tests {
         ]
     }
 
-    fn typed(class: TypedClass) -> Event {
+    const fn typed(class: TypedClass) -> Event {
         Event::Typed {
             cells: 1,
             shifted: matches!(class, TypedClass::Capital),
@@ -5158,7 +5167,7 @@ mod tests {
         }
     }
 
-    fn col_of(s: &Star) -> i32 {
+    const fn col_of(s: &Star) -> i32 {
         px_col(s.x, geom())
     }
 
@@ -7819,7 +7828,7 @@ mod tests {
     }
 
     /// The row a sky star of row 5 is born in: the row above, under either anchor.
-    fn band_row(_: &Config) -> i32 {
+    const fn band_row(_: &Config) -> i32 {
         4
     }
 
@@ -8801,7 +8810,7 @@ mod tests {
     use crate::rainbow_kitty::companion::{CATCH_REACH_CELLS, PetOffer, PetOnGlass, StarCatch};
     use crate::rainbow_kitty::{Dir, Engine, Licence};
 
-    fn paw_geom() -> Geom {
+    const fn paw_geom() -> Geom {
         Geom {
             cw: 10,
             ch: 20,
@@ -8815,7 +8824,7 @@ mod tests {
         }
     }
 
-    fn paw_sense(now: Instant, caret: (u16, u16)) -> PetSense {
+    const fn paw_sense(now: Instant, caret: (u16, u16)) -> PetSense {
         PetSense {
             caret_drawn: true,
             now,
@@ -9028,7 +9037,7 @@ mod tests {
         sc.cues.clear();
     }
 
-    fn emitted(sc: &Scratch) -> (usize, usize, usize) {
+    const fn emitted(sc: &Scratch) -> (usize, usize, usize) {
         (sc.under.len() + sc.out.len(), sc.halos.len(), sc.cues.len())
     }
 

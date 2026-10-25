@@ -440,7 +440,7 @@ pub fn join_code(recipient: &Recipient) -> String {
     out
 }
 
-fn read_identity(paths: &Paths) -> crate::Result<Option<Identity>> {
+pub(crate) fn read_identity(paths: &Paths) -> crate::Result<Option<Identity>> {
     let Some(bytes) = fsx::read_private(&paths.identity_file(), 16 << 10)? else {
         return Ok(None);
     };
@@ -6968,6 +6968,59 @@ mod commons_tests {
         assert!(commons::cached(&paths).unwrap().is_none());
         drop(lock);
         assert!(commons::cached(&paths).unwrap().is_some());
+    }
+
+    #[test]
+    fn commons_bootstrap_uses_the_vault_cache_and_preserves_custody_through_handoff() {
+        use crate::commons::{
+            binding::Pending,
+            bootstrap::{Bootstrap, Descriptor, Device},
+            roster::{Enrollment, Role},
+        };
+        let (_root, paths, source) = fixture();
+        let admin = admin_open(&paths).unwrap();
+        let authority = admin.config.signer.unwrap();
+        let network = [39; 16];
+        let device = Device::open(&paths).unwrap().unwrap();
+        let request = device.request(network, authority).unwrap();
+        let (mut pending, challenge) = Pending::issue(&request, network, authority).unwrap();
+        let possession = pending
+            .verify(&device.answer(&request, &challenge).unwrap())
+            .unwrap();
+        let genesis = admin
+            .prepare_commons_genesis(
+                network,
+                vec![Enrollment::new("m1", possession, Role::Writer)],
+            )
+            .unwrap();
+        let descriptor = Descriptor::from_genesis(genesis).unwrap();
+        let mut document = admin.doc.clone();
+        document
+            .set_entry(
+                &Audience::Hosts(vec!["m1".into()]),
+                ENTRY,
+                &descriptor.bytes(),
+            )
+            .unwrap();
+        admin_publish(&paths, &admin, &document).unwrap();
+        let first = Bootstrap::cached(&paths).unwrap().unwrap();
+        assert_eq!(first.request().unwrap().bytes(), request.bytes());
+        assert!(first.witness().unwrap().is_some());
+        let access = first.access().unwrap().unwrap();
+        assert_eq!(access.local().binding(), request.binding());
+        let old = first.trust();
+        let admin = admin_open(&paths).unwrap();
+        admin_rotate(&paths, &admin, &admin.doc).unwrap();
+        assert_ne!(
+            commons::cached(&paths).unwrap().unwrap().signer(),
+            &authority
+        );
+        std::fs::remove_file(source).unwrap();
+        let restarted = Bootstrap::cached(&paths).unwrap().unwrap();
+        assert_eq!(restarted.trust(), old);
+        assert_eq!(restarted.request().unwrap().bytes(), request.bytes());
+        assert!(restarted.access().unwrap().is_some());
+        assert!(!paths.home.join(".secrets").join(ENTRY).exists());
     }
 
     #[test]

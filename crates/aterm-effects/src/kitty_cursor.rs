@@ -1865,7 +1865,7 @@ mod tests {
         const { assert!(EXIT_STAR_SCINT > 0.0, "the wink still glints") };
     }
 
-    fn geom() -> Geom {
+    const fn geom() -> Geom {
         Geom {
             cw: 8,
             ch: 16,
@@ -3392,7 +3392,7 @@ mod tests {
         assert_eq!(after.pose, CatPose::STILL);
     }
 
-    fn sync(drive: f32, beat: f32) -> SingSync {
+    const fn sync(drive: f32, beat: f32) -> SingSync {
         SingSync { drive, beat }
     }
 

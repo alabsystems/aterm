@@ -3036,13 +3036,38 @@ pub(crate) fn settings_refusal_of(key: &str) -> SettingsRefusal {
 pub(crate) fn control_settings_refusal(key: &str) -> String {
     match settings_refusal_of(key) {
         SettingsRefusal::CompatibilityOnly => compatibility_only_message(key),
-        SettingsRefusal::HandWritten => format!(
-            "{key} is set in aterm.toml by hand, not through Settings: edit the file or use \
-             Manual, which completes and checks it"
+        SettingsRefusal::HandWritten => fleet_writer(key).map_or_else(
+            || {
+                format!(
+                    "{key} is set in aterm.toml by hand, not through Settings: edit the file or \
+                     use Manual, which completes and checks it"
+                )
+            },
+            |writer| format!("{key} is written by `aterm fleet`, not through Settings: {writer}"),
         ),
         SettingsRefusal::Unknown => {
             format!("unknown key {key:?} (search Settings or use Manual for the complete schema)")
         }
+    }
+}
+
+/// The `aterm fleet` verbs that write a `[fleet]` key the fleet keeps (a grant names the key its
+/// book binds, which no hand edit has).
+fn fleet_writer(key: &str) -> Option<&'static str> {
+    match key {
+        "fleet.allow" => Some(
+            "`aterm fleet allow facts|content` sets the level, and `aterm fleet allow drive \
+             --from <host|node>` grants a drive",
+        ),
+        "fleet.drive_from" => Some(
+            "`aterm fleet allow drive --from <host|node>` writes it with the key the book binds \
+             that node to, and `aterm fleet allow facts|content` takes it back",
+        ),
+        "fleet.listen" => Some(
+            "`aterm fleet init` or `aterm fleet join` writes it (`--port <n>` names its port), \
+             and `aterm fleet leave` takes it out",
+        ),
+        _ => None,
     }
 }
 
@@ -5623,7 +5648,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · default true: while the harness's theme is on a Claude Code session (its composer border drawn), the agents panel under the footer wears the theme's rainbow — each row's name in its stripe at Claude's own lightness, a workflow's bar along the whole palette — and each agent's dot tells its work: hue = which agent, brightness and glow = how much work, saturation = how fresh, full hue with a dim steady glow = in its own tool call (inside that call's timeout plus 30 s, read from its transcript), a grey breath = stuck (no work for 150 s with nothing of its own in flight), a still amber ring = awaiting approval, Claude's own green or red = done or failed — glass only; false leaves the panel as Claude drew it · serious mode keeps the colours and drops the glow · read live"
         }
         "claude_footer.card" => {
-            " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by aterm harness <version> · autopilot ∞ cruise`, and under Autopilot off the same card in white (`· autopilot ○ off`) — glass only; false leaves the card bare · read live"
+            " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by aterm harness <harness version> · autopilot ∞ cruise`, and under Autopilot off the same card in white (`· autopilot ○ off`) — glass only; false leaves the card bare · read live"
         }
         "keeper.enabled" => {
             " · read at launch; on, every terminal is registered with this build's PTY keeper (`aterm keeper start` runs one) and a launch after a crash or kill reattaches the shells it held · macOS only"
@@ -6202,7 +6227,7 @@ pub(crate) mod tests {
 
     #[test]
     fn settings_set_names_a_hand_written_key_as_one() {
-        for key in ["conpty", "windowing_behavior", "fleet.listen"] {
+        for key in ["conpty", "windowing_behavior", "fleet.peers"] {
             let refusal = control_settings_refusal(key);
             assert_eq!(
                 refusal,
@@ -6210,6 +6235,22 @@ pub(crate) mod tests {
                     "{key} is set in aterm.toml by hand, not through Settings: edit the file or \
                      use Manual, which completes and checks it"
                 )
+            );
+        }
+        for (key, verb) in [
+            ("fleet.allow", "`aterm fleet allow facts|content`"),
+            (
+                "fleet.drive_from",
+                "`aterm fleet allow drive --from <host|node>`",
+            ),
+            ("fleet.listen", "`aterm fleet init` or `aterm fleet join`"),
+        ] {
+            let refusal = control_settings_refusal(key);
+            assert!(
+                refusal.starts_with(&format!("{key} is written by `aterm fleet`"))
+                    && refusal.contains(verb)
+                    && !refusal.contains("by hand"),
+                "{refusal}"
             );
         }
         assert_eq!(

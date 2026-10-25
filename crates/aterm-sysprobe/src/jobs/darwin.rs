@@ -420,6 +420,12 @@ impl VnodeFd {
         self.mode & S_IFMT == S_IFCHR
     }
 
+    /// Opened for reading (`FREAD`).
+    #[must_use]
+    pub const fn readable(&self) -> bool {
+        self.openflags & FREAD != 0
+    }
+
     /// A terminal: a character device whose path names one ([`super::terminal_path`]).
     #[must_use]
     pub fn terminal(&self) -> bool {

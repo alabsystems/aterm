@@ -315,7 +315,7 @@ mod tests {
     use crate::effect_util::ink;
     use std::time::Duration;
 
-    fn geom() -> Geom {
+    const fn geom() -> Geom {
         Geom {
             cw: 8,
             ch: 16,
@@ -328,7 +328,7 @@ mod tests {
             head: 0,
         }
     }
-    fn cfg() -> PhaserConfig {
+    const fn cfg() -> PhaserConfig {
         PhaserConfig {
             enabled: true,
             intensity: 1.0,

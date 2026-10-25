@@ -11,14 +11,15 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use aterm_net::fleet::{
-    DriveGrant, FleetOp, FleetScope, FleetSecret, KEY_FILE, NodeIdentity, NodeKey,
+    DriveGrant, FleetError, FleetOp, FleetScope, FleetSecret, KEY_FILE, NodeIdentity, NodeKey,
 };
 use aterm_net::fleet_member::{
     self as member, Began, BookRead, BookUnread, CODE_FILE, Held, HeldBook, ISSUER_BOOK_FILE,
-    JoinCode, Keyring, Leaving, NODE_KEY_FILE, PEERS_FILE, Peer, Recorded, Registration, Unreached,
-    Unwritten, Via, target_of,
+    JoinCode, Keyring, Leaving, NODE_FILE, NODE_KEY_FILE, PEERS_FILE, Peer, Recorded, Registration,
+    Unreached, Unwritten, Via, target_of,
 };
 use aterm_uds::atomic_file::ConfigFile;
+use aterm_uds::private_file::ANOTHER_LINK;
 
 /// The whole `aterm fleet --help` (`fleet_cli` prints it), and each verb's `--help`.
 pub(crate) const USAGE: &str = "\
@@ -56,12 +57,16 @@ cwds, branches, prompts, an agent's newest words, and a shell's command line
 and last rows as well); without --allow, either keeps the level [fleet] allow
 names, else facts (a join into another fleet turns drive into content). --port
 is this machine's fleet port: init's is 7100, join's the issuer's (the port its
-code names), and either keeps the port [fleet] listen already names. --host is
+code names), and either keeps the port [fleet] listen already names; a join
+that would listen at the issuer's own address (a loopback fleet's, with no
+--port) is refused, writing nothing. --host is
 the name the others dial this machine by: $HOSTNAME when set, else on a Mac the
 HostName an administrator set, else its Bonjour name (<LocalHostName>.local),
 else the OS host name; a member of a loopback fleet, which listens there
 alone, at the loopback address. Machines reach each other on loopback,
-private (10/8, 172.16/12, 192.168/16, fc00::/7) or link-local addresses only.
+private (10/8, 172.16/12, 192.168/16, fc00::/7) or link-local addresses only:
+`peers add` refuses any other address, and this machine's own listener,
+writing nothing.
 `allow drive` is the level above content: the nodes it names, each proved by
 the node key this machine's book binds, run `aterm ctl --host <this Mac> …`
 here (spawn agent=<word> and await task; any session's status, text, screen,
@@ -237,7 +242,8 @@ fn allow_of(word: &str) -> Result<FleetScope, Failure> {
     FleetScope::from_word(&word.to_ascii_lowercase()).ok_or_else(|| {
         Failure::Usage(
             "--allow is `facts` or `content`: driving this Mac is granted on it alone, to the \
-             nodes it names (`aterm fleet allow drive --from <host|node>`), never by a join"
+             nodes it names (`aterm fleet allow drive --from <host|node>`), never by an init or \
+             a join"
                 .to_owned(),
         )
     })
@@ -398,6 +404,16 @@ fn read_unshown(prompt: &str) -> io::Result<String> {
 
 fn short(node: &str) -> &str {
     node.get(..8).unwrap_or(node)
+}
+
+/// Whether hosts `a` and `b` name one machine as a join reads them: the same word, or both the
+/// loopback.
+fn same_host(a: &str, b: &str) -> bool {
+    let loopback = |host: &str| {
+        host.eq_ignore_ascii_case("localhost")
+            || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    };
+    a.eq_ignore_ascii_case(b) || (loopback(a) && loopback(b))
 }
 
 fn listen_on(issuer_host: &str, port: u16) -> String {
@@ -727,7 +743,7 @@ fn init_first(
     }))
 }
 
-/// An init again's `[fleet] listen`, written where aterm.toml has none on the port its join code names (an init or a rotate stopped before aterm.toml), at the level `--allow` names as the stopped init would, and the line saying so; refused, with nothing written, where the key cannot be read, the code is of another secret (a rotate stopped between its two writes), `--host` or `--port` names another than the code does, or any of them is given with nothing to write.
+/// An init again's `[fleet] listen`, written where aterm.toml has none on the port its join code names (an init or a rotate stopped before aterm.toml), at the level `--allow` names as the stopped init would, and the line saying so; refused, with nothing written, where the key cannot be read, the code is of another secret (a rotate stopped between its two writes) or cannot be read beside a flag, `--host` or `--port` names another than the code does, or `--allow` another level than `[fleet] allow` with nothing to write.
 fn init_again_listen(
     places: &Places,
     book: &HeldBook<'_>,
@@ -735,33 +751,19 @@ fn init_again_listen(
     opts: &Opts,
 ) -> Result<String, Failure> {
     let asked = opts.port.is_some() || opts.host.is_some() || opts.allow.is_some();
-    let issuer_already = || {
-        let level = opts.allow.map(|level| {
-            format!(
-                "a level is set by `aterm fleet allow {}`, not `init`",
-                level.word()
-            )
-        });
-        Failure::Usage(if opts.port.is_some() || opts.host.is_some() {
-            format!(
-                "this machine is already the fleet's issuer, and changes nothing without \
-                 `--rotate`: --host and --port are in its join code, so a new one takes \
-                 `--rotate` (every member joins again){}",
-                level.map_or_else(String::new, |level| format!("; {level}"))
-            )
-        } else {
-            format!(
-                "this machine is already the fleet's issuer: {}",
-                level.unwrap_or_default()
-            )
-        })
-    };
     let Held::Key(key) = book.held() else {
         return Err(unread_key(places));
     };
     let code = match member::read_join_code(&places.state) {
         Ok(code) => code,
-        Err(_) if asked => return Err(issuer_already()),
+        Err(why) if asked => {
+            return Err(Failure::Usage(format!(
+                "this machine is already the fleet's issuer, and its join code cannot be read \
+                 ({why}), so this init cannot tell what --host, --port or --allow would change: \
+                 `aterm fleet init --rotate --host <h> --port <n>` writes a new code (every \
+                 member joins again), and `aterm fleet allow` sets the level"
+            )));
+        }
         Err(_) if table.listen.is_some() => return Ok(String::new()),
         Err(why) => {
             return Ok(format!(
@@ -780,13 +782,6 @@ fn init_again_listen(
             places.state.join(KEY_FILE).display()
         )));
     }
-    if table.listen_port() == Some(code.port) {
-        return if asked {
-            Err(issuer_already())
-        } else {
-            Ok(String::new())
-        };
-    }
     if opts.host.as_ref().is_some_and(|host| *host != code.host)
         || opts.port.is_some_and(|port| port != code.port)
     {
@@ -796,6 +791,17 @@ fn init_again_listen(
              `--rotate` (every member joins again)",
             member::host_port(&code.host, code.port)
         )));
+    }
+    if table.listen_port() == Some(code.port) {
+        // The code's own host and port, and the level [fleet] allow names, change nothing.
+        return match opts.allow {
+            Some(level) if table.level() != Some(level.word()) => Err(Failure::Usage(format!(
+                "this machine is already the fleet's issuer: a level is set by `aterm fleet \
+                 allow {}`, not `init`",
+                level.word()
+            ))),
+            _ => Ok(String::new()),
+        };
     }
     let line = write_fleet(
         book,
@@ -872,6 +878,23 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
     };
     let config = ConfigFile::open(&places.config).map_err(failed)?;
     let table = fleet_table(text_of(&config)?).map_err(failed)?;
+    let port = opts
+        .port
+        .or_else(|| table.listen_port())
+        .unwrap_or(code.port);
+    // An issuer's own code is refused as its own fleet ([`not_an_issuer`]).
+    let issues = !matches!(
+        std::fs::symlink_metadata(places.state.join(CODE_FILE)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound
+    );
+    if !issues && port == code.port && same_host(&host, &code.host) {
+        return Err(Failure::Usage(format!(
+            "this machine would register and listen at {}, the issuer's own address (the code \
+             names it): a member listens on a port of its own there, so name one with `--port \
+             <n>`; nothing was written here",
+            member::host_port(&host, port)
+        )));
+    }
     let mut out = String::new();
     // Before any read of the state, so no read a loose directory refuses decides this join.
     private_state(places, &mut out)?;
@@ -882,10 +905,6 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
     // drive grants.
     let regrant = aterm_net::fleet::read_key_file(&places.state).ok().as_ref() != Some(&secret)
         || !names_issuer(places);
-    let port = opts
-        .port
-        .or_else(|| table.listen_port())
-        .unwrap_or(code.port);
     if let Err(why) = with_fleet(
         text_of(&config)?,
         &listen_on(&code.host, port),
@@ -896,6 +915,9 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         return Err(failed(why));
     }
     let listened = table.listen_port().is_some();
+    // The node key is minted before the dial, which proves it: it is the machine's own, kept
+    // whatever the join comes to.
+    let minted = matches!(member::read_node_identity(&places.state), Ok(None));
     let me = member::node_identity(&places.state)
         .map_err(failed)
         .inspect_err(|_| say(&out))?;
@@ -917,7 +939,7 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         Ok(registered) => registered,
         Err(why) => {
             say(&out);
-            return Err(failed(not_recorded(&issuer_at, &why)));
+            return Err(failed(not_recorded(&issuer_at, &why, minted)));
         }
     };
     at_step("lock");
@@ -959,11 +981,21 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
                     bound: node,
                     proved: issuer_key.map(|_| joined.issuer.node.clone()),
                 },
+                minted,
             )));
         }
         // Only a join of the fleet held here leaves the issuer it named.
         let named = same_fleet && names_issuer(places);
-        let replaced = held != Held::Nothing && !same_fleet;
+        let replaced = match held {
+            Held::Nothing => None,
+            Held::Key(_) if same_fleet => None,
+            Held::Key(_) => Some(Replaced::Other),
+            Held::Unreadable => Some(Replaced::Unusable(
+                aterm_net::fleet::read_key_file(&places.state)
+                    .err()
+                    .map_or_else(String::new, |e| e.to_string()),
+            )),
+        };
         // The key's one write moves this machine to another fleet: the old fleet's entries are
         // marked as its own first, which no read under the key held sees.
         if !same_fleet {
@@ -1103,10 +1135,16 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
              (0600)\n  node key   {} (0600) — this machine's own, which the issuer bound its \
              node to\n{config_line}",
             short(&registration.node),
-            if replaced {
-                ", in place of the one it held"
-            } else {
-                ""
+            match &replaced {
+                None => String::new(),
+                Some(Replaced::Other) => ", in place of another fleet's key it held".to_owned(),
+                Some(Replaced::Unusable(why)) if why.contains(ANOTHER_LINK) => format!(
+                    ", in a new file in place of one it could not use ({why}): that other link \
+                     still holds a copy of the secret the old file held, so remove it"
+                ),
+                Some(Replaced::Unusable(why)) => {
+                    format!(", in place of a key file it could not use ({why})")
+                }
             },
             places.state.join(KEY_FILE).display(),
             places.state.join(NODE_KEY_FILE).display(),
@@ -1123,12 +1161,13 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         out.push_str(GRANTS_GONE);
     }
     out.push_str(&format!(
-        "  issuer     {} at {issuer_at} recorded this machine as {} ({} peers in its book){}\n\
+        "  issuer     {} at {issuer_at} recorded this machine as {} ({} peer{} in its book){}\n\
          {FOLLOWS}\nOn a Mac, the local-network consent macOS asks for at aterm's first \
          connection into the LAN covers the survey's reads too.\n",
         aterm_codec::tty::one_line(&joined.issuer.host, 80),
         member::host_port(&registration.host, registration.port),
         joined.peers,
+        if joined.peers == 1 { "" } else { "s" },
         if issuer_key.is_some() {
             ", and proved its node key, which this machine binds it to"
         } else {
@@ -1146,10 +1185,18 @@ struct Keyed {
     same_fleet: bool,
     /// And the book named its issuer.
     named: bool,
-    /// Another key was held, which the write replaced.
-    replaced: bool,
+    /// The key the write replaced, when it was no key of the code's fleet.
+    replaced: Option<Replaced>,
     /// What a join stopped after the key holds ([`unfinished`]).
     holds: String,
+}
+
+/// The key file a join's write replaced ([`Keyed`]).
+enum Replaced {
+    /// Another fleet's key.
+    Other,
+    /// A key file it could not use, for this reason.
+    Unusable(String),
 }
 
 /// What a join stopped after its key's write holds: aterm.toml as `listened` had it (beside the
@@ -1191,8 +1238,10 @@ enum JoinFailed {
         /// The node the machine that answered proved, when it proved one.
         proved: Option<String>,
     },
-    /// It was; the exchange failed, or the issuer refused (its words).
+    /// It was; the issuer refused, or answered no join (its words).
     Registration(String),
+    /// It was; no answer to the registration came.
+    Unanswered(String),
 }
 
 impl std::fmt::Display for JoinFailed {
@@ -1226,7 +1275,7 @@ impl std::fmt::Display for JoinFailed {
                 "the machine that answered for the issuer this Mac binds (node {}) proved no node",
                 short(bound)
             ),
-            Self::Registration(why) => f.write_str(why),
+            Self::Registration(why) | Self::Unanswered(why) => f.write_str(why),
         }
     }
 }
@@ -1254,7 +1303,15 @@ enum Advice {
     NodeBound,
     /// The issuer recorded this machine's node from another address before keys came.
     BeforeKeys,
-    /// Anything else: the host and port the code names, and an aterm there.
+    /// An aterm answered at the code's address under another fleet's secret.
+    OtherSecret,
+    /// The issuer holds its share of connections from this machine's address already.
+    Busy,
+    /// The issuer proved itself and gave no answer to the registration.
+    Unanswered,
+    /// The issuer answered and did not record this machine, for the reason it gave.
+    Answered,
+    /// Anything else, before any proof: the host and port the code names, and an aterm there.
     CheckTheIssuer,
 }
 
@@ -1271,55 +1328,71 @@ impl JoinFailed {
             Self::Dial(e) if e.not_permitted() => Advice::Sandbox,
             Self::Dial(e) if e.no_route() => Advice::LocalNetwork,
             Self::Dial(e) if e.no_network() => Advice::NoNetwork,
-            _ => Advice::CheckTheIssuer,
+            Self::Dial(Unreached::Handshake(_, FleetError::ListenerWrongSecret)) => {
+                Advice::OtherSecret
+            }
+            Self::Dial(Unreached::Handshake(_, FleetError::AddressBusy)) => Advice::Busy,
+            Self::Unanswered(_) => Advice::Unanswered,
+            Self::Registration(_) => Advice::Answered,
+            Self::Dial(e) if !e.before_proof() => Advice::Answered,
+            Self::Dial(_) => Advice::CheckTheIssuer,
         }
     }
 }
 
-fn not_recorded(issuer_at: &str, why: &JoinFailed) -> String {
-    const NOTHING: &str = "Nothing of the fleet was written here.";
+fn not_recorded(issuer_at: &str, why: &JoinFailed, minted: bool) -> String {
+    let nothing = if minted {
+        format!(
+            "Nothing of the fleet was written here; this machine's node key ({NODE_FILE}, \
+             {NODE_KEY_FILE}), minted for the join, is kept: it is the machine's own, which any \
+             join reuses."
+        )
+    } else {
+        "Nothing of the fleet was written here.".to_owned()
+    };
+    let nothing = nothing.as_str();
     match why.advice() {
         Advice::NoIssuer => format!(
-            "{issuer_at} did not record this machine: {why}\n  {NOTHING} The code names a \
+            "{issuer_at} did not record this machine: {why}\n  {nothing} The code names a \
              machine that issues no fleet now — a member, or one that left — so no aterm there \
              will record this one. Copy the code from the machine whose `aterm fleet init` \
              wrote it (its `aterm fleet peers` lists the members), and join again."
         ),
         Advice::PastTheLan => format!(
-            "the issuer at {issuer_at} was not dialled: {why}\n  {NOTHING} A fleet's machines \
+            "the issuer at {issuer_at} was not dialled: {why}\n  {nothing} A fleet's machines \
              reach each other on loopback, private (10/8, 172.16/12, 192.168/16, fc00::/7) or \
              link-local addresses alone: on the issuer, `aterm fleet init --rotate --host \
              <its LAN address>` writes a code that names one."
         ),
         Advice::Sandbox => format!(
-            "the issuer at {issuer_at} was not reached: {why}\n  {NOTHING} Run `aterm fleet join` \
+            "the issuer at {issuer_at} was not reached: {why}\n  {nothing} Run `aterm fleet join` \
              where it may open network connections (outside the sandbox), and join again."
         ),
         Advice::LocalNetwork => format!(
-            "the issuer at {issuer_at} was not reached: {why}\n  {NOTHING} On a Mac that is \
+            "the issuer at {issuer_at} was not reached: {why}\n  {nothing} On a Mac that is \
              local-network privacy, which refuses an app's connections into the LAN until they \
              are allowed (System Settings › Privacy & Security › Local Network: aterm, or the \
              terminal this runs in); allow it, then join again."
         ),
         Advice::NoNetwork => format!(
-            "the issuer at {issuer_at} was not reached: {why}\n  {NOTHING} This machine is not \
+            "the issuer at {issuer_at} was not reached: {why}\n  {nothing} This machine is not \
              on the issuer's network: join again once it is on the LAN (Wi-Fi or Ethernet), with \
              any full-tunnel VPN off."
         ),
         Advice::IssuerKey => format!(
-            "the issuer at {issuer_at} is not the one this machine binds: {why}\n  {NOTHING} \
+            "the issuer at {issuer_at} is not the one this machine binds: {why}\n  {nothing} \
              Another machine answers at that host, or the issuer lost its node key (a \
              reinstall) or runs an older aterm (update it). If it is the issuer, `aterm fleet \
              peers rm <its node>` here takes the old binding out; then join again."
         ),
         Advice::BoundIssuer => format!(
-            "the issuer at {issuer_at} is not the one this machine binds: {why}\n  {NOTHING} \
+            "the issuer at {issuer_at} is not the one this machine binds: {why}\n  {nothing} \
              This machine joined this fleet before, and a join again is answered by the issuer \
              it joined, under the node key it bound then. To move this machine to a new issuer \
              on purpose, run `aterm fleet leave` here, then `aterm fleet join` with the code."
         ),
         Advice::BoundUnproved => format!(
-            "the issuer at {issuer_at} is not the one this machine binds: {why}\n  {NOTHING} \
+            "the issuer at {issuer_at} is not the one this machine binds: {why}\n  {nothing} \
              This machine joined this fleet before, and a join again is answered by the issuer \
              it joined, under the node key it bound then. If it is that issuer, it runs an \
              older aterm (update it there) or lost its node key (a reinstall: `aterm fleet \
@@ -1328,23 +1401,58 @@ fn not_recorded(issuer_at: &str, why: &JoinFailed) -> String {
              purpose, run `aterm fleet leave` here, then `aterm fleet join` with the code."
         ),
         Advice::NodeBound => format!(
-            "the issuer at {issuer_at} did not record this machine: {why}\n  {NOTHING} The \
+            "the issuer at {issuer_at} did not record this machine: {why}\n  {nothing} The \
              issuer holds this machine's node id to a key this machine did not prove: a machine \
              that lost its node key, or another one using its node id. If this is that machine, \
              a person at the issuer takes its entry out as it says."
         ),
         Advice::BeforeKeys => format!(
-            "the issuer at {issuer_at} did not record this machine: {why}\n  {NOTHING} The \
+            "the issuer at {issuer_at} did not record this machine: {why}\n  {nothing} The \
              issuer recorded this machine's node from another address before node keys came, \
              and binds its key only from there. If this machine moved since (a new address), \
              a person at the issuer takes its entry out as it says."
         ),
-        Advice::CheckTheIssuer => format!(
-            "the issuer at {issuer_at} did not record this machine: {why}\n  {NOTHING} Check \
-             the host and port the code names, start aterm on the issuer, and join again.\n  On \
-             a Mac, a first connection into the LAN asks to let aterm find devices on the local \
-             network: allow it, then join again."
+        Advice::OtherSecret => format!(
+            "the issuer at {issuer_at} did not record this machine: {why}\n  {nothing} An aterm \
+             answers there under another fleet's secret than the code's: the issuer rotated its \
+             fleet since this code was written (`aterm fleet init --rotate`, after which every \
+             member joins with the new code), or another fleet's Mac took that address. Copy the \
+             issuer's current code (the file its `aterm fleet init` names), and join again."
         ),
+        Advice::Busy => format!(
+            "the issuer at {issuer_at} did not take the join now: {why}\n  {nothing} It holds as \
+             many connections from this machine's address as it takes (other reads or joins from \
+             here in flight): join again once they end."
+        ),
+        Advice::Unanswered => format!(
+            "the issuer at {issuer_at} gave no answer to the registration: {why}\n  {nothing} \
+             Its handshake at the code's address passed, so the code is right; then no answer \
+             came: its aterm stopped or restarted its fleet listener mid-join, it is overloaded, \
+             or this machine's socket failed (as said). If the registration reached it, it may \
+             have recorded this machine: `aterm fleet join` again with the same code finishes \
+             either way."
+        ),
+        Advice::Answered => format!(
+            "the issuer at {issuer_at} did not record this machine: {why}\n  {nothing} The \
+             issuer answered, so the code's address and its aterm are right: what it said is the \
+             cause. Once that is put right on the issuer (`aterm fleet peers` there lists its \
+             book), join again."
+        ),
+        Advice::CheckTheIssuer => {
+            let loopback = member::parse_host_port(issuer_at, None)
+                .is_ok_and(|(host, _)| same_host(&host, "localhost"));
+            format!(
+                "the issuer at {issuer_at} did not record this machine: {why}\n  {nothing} \
+                 Check the host and port the code names, start aterm on the issuer, and join \
+                 again.{}",
+                if loopback {
+                    ""
+                } else {
+                    "\n  On a Mac, a first connection into the LAN asks to let aterm find \
+                     devices on the local network: allow it, then join again."
+                }
+            )
+        }
     }
 }
 
@@ -1479,8 +1587,11 @@ fn register_with(
         });
     }
     let deadline = (started + JOIN_WITHIN).max(Instant::now() + Duration::from_secs(1));
-    let joined = member::register_by(&mut reached, registration, deadline)
-        .map_err(JoinFailed::Registration)?;
+    let joined =
+        member::register_by(&mut reached, registration, deadline).map_err(|e| match e {
+            member::Unregistered::Answered(why) => JoinFailed::Registration(why),
+            member::Unregistered::Unanswered(why) => JoinFailed::Unanswered(why),
+        })?;
     let key = match &reached.peer {
         Some(proof) if proof.node == joined.issuer.node => Some(proof.key),
         Some(proof) => {
@@ -1510,6 +1621,7 @@ fn peers(places: &Places, args: &[String]) -> Result<String, Failure> {
                 .map_err(|why| Failure::Usage(format!("add <host[:port]>: {why}")))?;
             let peer = manual_peer(host, port);
             let target = peer.target();
+            unread_place(places, &peer)?;
             narrowing(places, || {
                 let recorded =
                     member::update_peers(&places.state, |book| member::record(book, peer))
@@ -1536,6 +1648,52 @@ fn peers(places: &Places, args: &[String]) -> Result<String, Failure> {
                 .to_owned(),
         )),
     }
+}
+
+/// `peers add` of a place no read would take as a peer, refused before anything is written: an
+/// address no fleet read dials, or this machine's own listener as a look tells it without a dial.
+fn unread_place(places: &Places, peer: &Peer) -> Result<(), Failure> {
+    let target = peer.target();
+    if let Some(ip) = peer.addr
+        && !aterm_net::fleet::is_fleet_source(ip)
+    {
+        return Err(Failure::Usage(format!(
+            "add {target}: {ip} is no LAN address (loopback, private, link-local), and a fleet \
+             is one LAN, so no read dials it: name the peer by its address on this LAN; \
+             nothing was written"
+        )));
+    }
+    let config = ConfigFile::open(&places.config).map_err(failed)?;
+    let table = fleet_table(text_of(&config)?).map_err(failed)?;
+    if table.listen_port() == Some(peer.port) && this_machine_is(&peer.host) {
+        return Err(Failure::Usage(format!(
+            "add {target}: that is this machine's own fleet listener ([fleet] listen = {:?}), \
+             which its own `aterm ctl survey` reads, so it is no peer: name another Mac's \
+             host:port; nothing was written",
+            table.listen.as_deref().unwrap_or_default()
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `host` names this machine without a dial: its loopback, an address on one of its
+/// interfaces, or its own host name.
+fn this_machine_is(host: &str) -> bool {
+    if same_host(host, "localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return aterm_uds::network::interfaces().is_ok_and(|up| {
+            up.iter()
+                .any(|interface| interface.address == ip.to_canonical())
+        });
+    }
+    let bare = |name: &str| {
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        name.strip_suffix(".local")
+            .map_or(name.clone(), str::to_owned)
+    };
+    aterm_uds::process::lan_host_name().is_some_and(|own| bare(&own) == bare(host))
 }
 
 /// `peers rm`: the entry `what` names out of the book, with the copy of the issuer's book where
@@ -1723,10 +1881,10 @@ fn check_peers(places: &Places, within: Duration) -> Result<Listing, Failure> {
     {
         // The book's entries of a fleet are read under its key: none would show.
         return Err(failed(format!(
-            "{} cannot be used ({e}), so the book cannot be read as its fleet's and no peer was \
-             checked: once it reads (0600, one link), run this again; `aterm fleet leave` \
-             leaves the fleet",
-            places.state.join(KEY_FILE).display()
+            "no peer was checked, since the book is read as the fleet of the key in {}: {}; \
+             `aterm fleet leave` leaves the fleet",
+            places.state.display(),
+            no_key(e)
         )));
     }
     let Known {
@@ -1792,6 +1950,11 @@ fn check_peers(places: &Places, within: Duration) -> Result<Listing, Failure> {
         table,
         skipped,
     })
+}
+
+/// Whether a read's answer is this machine's: its own node, proved under its own key.
+fn is_this_machine(node: Option<&str>, proven: bool, own: Option<&str>) -> bool {
+    proven && own.is_some() && node == own
 }
 
 fn own_node(places: &Places) -> Option<String> {
@@ -1942,6 +2105,7 @@ fn list_peers(places: &Places, within: Duration) -> Result<String, Failure> {
         return Ok(out);
     }
     let now_ms = aterm_time::unix_millis().unwrap_or(0);
+    let own = own_node(places);
     let mut no_route = 0;
     let mut unreached = 0;
     out.push_str(&format!(
@@ -1952,6 +2116,14 @@ fn list_peers(places: &Places, within: Duration) -> Result<String, Failure> {
         let peer = &row.peer;
         let check = match &row.check {
             None => "-".to_owned(),
+            Some(Ok(checked))
+                if is_this_machine(checked.node.as_deref(), checked.proven, own.as_deref()) =>
+            {
+                format!(
+                    "this machine itself, no peer: `aterm fleet peers rm {}` takes it out",
+                    peer.target()
+                )
+            }
             Some(Ok(checked)) => match (&peer.node, &checked.node) {
                 (None, Some(node)) => format!(
                     "ok, serves {} (node {}{})",
@@ -2477,9 +2649,15 @@ fn drive_fleet_in(
     let label = shown_name(&peer);
     let driven =
         member::drive(&target_of(&peer), &keys, (&secret, &me), within).map_err(|why| {
+            let said = why.to_string();
             aterm_ctl::DriveRefused {
                 again: drive_again(&why),
-                why: format!("{label}: {why}"),
+                // The peer is named once: a reason that names its host already goes alone.
+                why: if said.contains(&peer.host) {
+                    said
+                } else {
+                    format!("{label}: {said}")
+                },
             }
         })?;
     Ok(aterm_ctl::DriveLink {
@@ -2557,8 +2735,15 @@ fn survey_fleet_in(
         "survey",
     );
     let dropped = keep_book(places, &secret, &book_read, own.as_deref());
-    let (entries, answers): (Vec<Peer>, Vec<_>) =
-        reads.into_iter().map(|read| (read.peer, read.read)).unzip();
+    // A place this machine's own node answered at is this machine, which its own survey reads.
+    let (entries, answers): (Vec<Peer>, Vec<_>) = reads
+        .into_iter()
+        .filter(|read| {
+            !matches!(&read.read, Ok(surveyed)
+                if is_this_machine(surveyed.node.as_deref(), surveyed.proven, own.as_deref()))
+        })
+        .map(|read| (read.peer, read.read))
+        .unzip();
     let mut peers: Vec<aterm_ctl::PeerSurvey> = entries
         .iter()
         .zip(once_per_node(&entries, answers))
@@ -2672,15 +2857,32 @@ fn peer_survey(peer: &Peer, read: Result<member::Surveyed, Unreached>) -> aterm_
     }
 }
 
+/// Why this machine reads and drives no peer, and what puts it right, within a survey row's
+/// reason ([`aterm_ctl::UNANSWERED_REASON_CHARS`]).
 fn no_key(error: &aterm_net::fleet::KeyFileError) -> String {
+    use aterm_net::fleet::KeyFileError as E;
+    use aterm_uds::private_file::{ACL_OPEN, DIR_OPEN, FILE_OPEN};
     match error {
-        aterm_net::fleet::KeyFileError::Missing => "this machine is in no fleet: `aterm fleet \
-             init` on one machine, `aterm fleet join` on each other"
+        E::Missing => "this machine is in no fleet: `aterm fleet init` on one machine, `aterm \
+                       fleet join` on each other"
             .to_owned(),
-        other => format!(
-            "its fleet key cannot be used ({other}): once it reads (0600, one link), run this \
-             again"
+        E::NotPrivate(ANOTHER_LINK) => format!(
+            "{KEY_FILE} has another hard link, a second copy of the fleet's secret: remove that \
+             link, run this again"
         ),
+        E::NotPrivate(FILE_OPEN) => {
+            format!("{KEY_FILE} is open to other users: `chmod 600` it, then run this again")
+        }
+        E::NotPrivate(DIR_OPEN) => {
+            "aterm's state folder is open to other users: `chmod 700` it, then run this again"
+                .to_owned()
+        }
+        E::NotPrivate(ACL_OPEN) => format!(
+            "{KEY_FILE} or its folder has an access list (ACL) for others: `chmod -N` it, run \
+             this again"
+        ),
+        E::Malformed(_) => format!("{error}: `aterm fleet leave`, join again"),
+        other => format!("{other}: run this again once it reads"),
     }
 }
 

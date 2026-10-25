@@ -26,11 +26,11 @@ use aterm_effects::aos_momentum::search::{
     FileProposer, GridProposer, Mode, Proposer, ProposerId, SearchStats, TrainFeedback,
 };
 
-use crate::aos_workers::{
-    Fault, Pool, PoolArgs, PoolReport, Threads, Timed, available, percentiles,
-};
+use crate::aos_workers::{Fault, Pool, PoolArgs, PoolReport, Timed, available, percentiles};
 use crate::instance::{take_flag, take_value, take_values};
+use crate::lab_build::{LAB_BUILD, check_build};
 use crate::paths::{from_caller, paths};
+use crate::spread::Threads;
 use crate::{Fail, Res};
 
 /// The verb's own help (`aos-search --help`).
@@ -75,31 +75,6 @@ search had no outcome, a bundle did not verify, a file could not be written, or 
 (every bundle it wrote is removed); 2 usage; 128+N interrupted by signal N
 exit (--verify): 0 the bundle verified; 1 it was refused (the reason named); 2 usage, or FILE cannot be read
 ";
-
-/// The build the lab's evaluator judges in and its bundles name.
-pub const LAB_BUILD: &str = concat!(
-    "aterm-lab ",
-    env!("CARGO_PKG_VERSION"),
-    "+g",
-    env!("ATERM_LAB_GIT_COMMIT")
-);
-
-/// Refuses a build that names no commit.
-/// # Errors
-/// Exit 1, naming the build.
-pub fn check_build(build: &str) -> Result<(), Fail> {
-    let commit = build.rsplit_once("+g").map_or("", |(_, commit)| commit);
-    let hash = commit.strip_suffix("-dirty").unwrap_or(commit);
-    if hash.len() >= 12 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        Ok(())
-    } else {
-        Err(Fail::die(format!(
-            "aos-search: the build `{build}` names no commit (built without git; pin one with \
-             ATERM_BUILD_GIT_COMMIT), so its bundles could not name the interpreter that \
-             judged them"
-        )))
-    }
-}
 
 /// The label of the wall time a bundle records for its search.
 pub const SEARCH_TIMING: &str = "aos-search: select and held-out, wall time";
@@ -1550,42 +1525,6 @@ mod tests {
         assert!(usage_of(&["--grid", "--out", "o", "--toolchain", " "]).contains("non-empty"));
         assert!(usage_of(&["--grid", "--out", "o", "extra"]).contains("unexpected 'extra'"));
         assert!(LAB_BUILD.starts_with("aterm-lab "));
-    }
-
-    #[test]
-    fn the_lab_build_names_its_commit_and_a_build_that_names_none_is_refused() {
-        assert!(
-            LAB_BUILD.starts_with(concat!("aterm-lab ", env!("CARGO_PKG_VERSION"), "+g")),
-            "{LAB_BUILD}"
-        );
-        if let Err(f) = check_build(LAB_BUILD) {
-            panic!("{LAB_BUILD}: {:?}", f.msg);
-        }
-        let v = env!("CARGO_PKG_VERSION");
-        for commit in [
-            "0123456789ab",
-            "0123456789ab-dirty",
-            "0123456789abcdef0123456789abcdef01234567",
-        ] {
-            let build = format!("aterm-lab {v}+g{commit}");
-            assert!(check_build(&build).is_ok(), "{build}");
-        }
-        for build in [
-            format!("aterm-lab {v}+gunknown"),
-            format!("aterm-lab {v}"),
-            format!("aterm-lab {v}+g"),
-            format!("aterm-lab {v}+g0123456789a"),
-            format!("aterm-lab {v}+g0123456789AB"),
-            format!("aterm-lab {v}+g0123456789ab-dirty-dirty"),
-        ] {
-            let f = check_build(&build).expect_err(&build);
-            assert_eq!(f.code, 1, "{build}");
-            let msg = f.msg.unwrap_or_default();
-            assert!(
-                msg.contains(&format!("the build `{build}` names no commit")),
-                "{msg}"
-            );
-        }
     }
 
     #[test]

@@ -251,6 +251,9 @@ pub const RESTARTING_LABEL: &str = "restarting";
 /// The harness's label once it typed its resume after a full disk.
 pub const DISK_RESUME_LABEL: &str = "resuming after disk";
 
+/// The harness's label once it typed its ask to free disk space (`disk-free@v1`).
+pub const DISK_FREE_LABEL: &str = "asked to free disk";
+
 /// The harness's label once it typed its carry-on after a usage wall.
 pub const LIMIT_RESUME_LABEL: &str = "resuming after limit";
 
@@ -860,6 +863,7 @@ mod tests {
         for words in [
             RESTARTING_LABEL,
             DISK_RESUME_LABEL,
+            DISK_FREE_LABEL,
             LIMIT_RESUME_LABEL,
             "upgrading to 0.164.0-dev.12521",
             "upgrading to 1234567890123456789",

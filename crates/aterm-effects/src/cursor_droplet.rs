@@ -435,7 +435,7 @@ mod tests {
     use crate::effect_util::push_fx_rect;
     use std::time::Duration;
 
-    fn geom() -> Geom {
+    const fn geom() -> Geom {
         Geom {
             cw: 8,
             ch: 16,
@@ -448,7 +448,7 @@ mod tests {
             head: 0,
         }
     }
-    fn cfg() -> DropletConfig {
+    const fn cfg() -> DropletConfig {
         DropletConfig {
             enabled: true,
             intensity: 1.0,

@@ -223,6 +223,19 @@ fn the_first_run_packs_both_apple_targets_and_holds_the_rustc_group() {
         rendered(&o, "clean").starts_with("SKIP: not pinned by index-5"),
         "an unpinned program is a human decision"
     );
+    for h in [
+        "claude-code-alab",
+        "muse-alab",
+        "agy-alab",
+        "grok-alab",
+        "kimi-alab",
+    ] {
+        assert!(
+            rendered(&o, h).starts_with("SKIP: not pinned by index-5"),
+            "a harness row is inert until a person pins it: {}",
+            rendered(&o, h)
+        );
+    }
     let legs = w.fx.packer.legs();
     let out = w.state().dir.join("out/ay");
     assert_eq!(legs.len(), 3, "{legs:?}");

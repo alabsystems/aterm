@@ -530,18 +530,28 @@ static GLYPHS: [(u32, [u8; 8]); 499] = [
 /// The 8x8 bitmap for `c`, or `None` when no supported family covers it.
 #[must_use]
 #[inline]
-pub(crate) fn bitmap(c: char) -> Option<[u8; 8]> {
+pub(crate) const fn bitmap(c: char) -> Option<[u8; 8]> {
     let cp = c as u32;
-    if (0x0021..=0x007E).contains(&cp) {
+    if cp >= 0x0021 && cp <= 0x007E {
         return Some(GLYPHS[(cp - 0x0021) as usize].1);
     }
-    if !(0x00A1..=0x309E).contains(&cp) {
+    if cp < 0x00A1 || cp > 0x309E {
         return None;
     }
-    let idx = GLYPHS[94..]
-        .binary_search_by_key(&cp, |&(key, _)| key)
-        .ok()?;
-    Some(GLYPHS[94 + idx].1)
+    let mut lo = 94;
+    let mut hi = GLYPHS.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let key = GLYPHS[mid].0;
+        if key == cp {
+            return Some(GLYPHS[mid].1);
+        } else if key < cp {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    None
 }
 
 #[cfg(test)]

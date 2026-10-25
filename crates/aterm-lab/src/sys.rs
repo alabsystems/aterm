@@ -10,6 +10,8 @@ use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use aterm_aos::Digest;
+
 /// Whether `pid` (> 1) names a live process this user may signal (`kill(pid, 0)`).
 #[must_use]
 pub fn alive(pid: i32) -> bool {
@@ -466,6 +468,37 @@ pub fn mach_timebase() -> Option<(u32, u32)> {
     // SAFETY: `tb` is writable for one `mach_timebase_info`, which the call does not retain.
     let rc = unsafe { libc::mach_timebase_info(&raw mut tb) };
     (rc == 0 && tb.denom != 0).then_some((tb.numer, tb.denom))
+}
+
+/// The digest of the file at `path` in `domain` (an executable's identity, a lab copy's).
+/// # Errors
+/// The file cannot be read.
+pub fn digest_file(path: &std::path::Path, domain: &[u8]) -> Result<Digest, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    Ok(Digest::of(domain, &[&bytes]))
+}
+
+/// This process's lifetime-maximum physical footprint in bytes (`ri_lifetime_max_phys_footprint`
+/// of `proc_pid_rusage`), or `None` when the call fails.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn max_footprint() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    let pid = libc::c_int::try_from(std::process::id()).ok()?;
+    // SAFETY: `info` is writable for one `rusage_info_v4`, the flavor asked for.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: zeroed at creation, so initialized whatever the call did.
+    let info = unsafe { info.assume_init() };
+    Some(info.ri_lifetime_max_phys_footprint)
 }
 
 /// Block until `pid`, this process's own child, exits (a stop, trap or continue report Darwin's `waitid` gives under `WEXITED` is consumed by `WSTOPPED | WCONTINUED | WNOHANG`, which cannot reap, backing off while nothing is consumed), and leave it unreaped (`WNOWAIT`), so the pid names it until a wait reaps it.

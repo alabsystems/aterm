@@ -1316,6 +1316,382 @@ fn intent_handoff_check_and_restore_are_submitted_before_the_page_closes() {
     }
 }
 
+fn accepted_operation_survives_final_close(operation: SetupOperation) {
+    let mut app = App::headless_for_test();
+    let (wid, original, view) = page(&mut app);
+    app.set_system_state_handlers_for_test(InitialSetupHandlers {
+        apply: |_, _, _, _| {
+            note("apply".into());
+            false
+        },
+        ..handlers()
+    });
+    let key = match operation {
+        SetupOperation::Check => "system-state/check",
+        SetupOperation::Restore => "system-state/restore",
+    };
+    press(&mut app, wid, view, key);
+    assert!(indicators(&app, original, view).busy);
+    assert!(app.commit_glassless_native_frame(wid));
+    let headline_key = UiKey::new("settings/page-subtitle/system-state");
+    let headline = app.windows[&wid].leaf_render_cache[&view]
+        .native
+        .as_ref()
+        .unwrap()
+        .compiled
+        .semantic(&headline_key)
+        .unwrap()
+        .label
+        .clone();
+    let generation = app.system_state_host.generation;
+    calls();
+
+    // The worker accepted the operation, but its fresh status is still in
+    // flight when the final controller goes away and a new one is opened.
+    app.system_state_host.status_in_flight = true;
+    app.close_active_native_tab(wid).unwrap();
+    assert!(app.native_runtime.app(original).is_none());
+    assert!(app.open_system_state_tab());
+    let (reopened, view) = app.active_native_view(wid).unwrap();
+    assert_ne!(reopened, original);
+    app.tick_system_state(Instant::now());
+    calls(); // The newly shown controller starts its prompt-free observation.
+
+    // A native action already in the input queue must obey the operation
+    // even before the next status is delivered. Restore also holds groups.
+    if operation == SetupOperation::Restore {
+        press(&mut app, wid, view, "system-state/group/0/leave");
+    }
+    for key in [
+        "system-state/check",
+        "system-state/restore",
+        "system-state/vault/join",
+    ] {
+        press(&mut app, wid, view, key);
+    }
+    assert!(
+        calls().is_empty(),
+        "a reopened pending operation permits no second worker"
+    );
+    assert!(indicators(&app, reopened, view).busy);
+    press(&mut app, wid, view, "system-state/row/secrets/disclose");
+    assert!(app.commit_glassless_native_frame(wid));
+    let ui = &app.windows[&wid].leaf_render_cache[&view]
+        .native
+        .as_ref()
+        .unwrap()
+        .compiled;
+    assert_eq!(ui.semantic(&headline_key).unwrap().label, headline);
+    for key in [
+        "system-state/check",
+        "system-state/restore",
+        "system-state/vault/join",
+    ] {
+        assert!(
+            !ui.semantic(&UiKey::new(key))
+                .unwrap()
+                .state
+                .unwrap()
+                .enabled,
+            "{key}"
+        );
+    }
+    assert_eq!(
+        ui.semantic(&UiKey::new("system-state/group/0/leave"))
+            .unwrap()
+            .state
+            .unwrap()
+            .enabled,
+        operation == SetupOperation::Check,
+        "only Restore holds a newer group choice"
+    );
+
+    let idle = SetupStatus {
+        plan: Some(Plan::default()),
+        ..SetupStatus::default()
+    };
+    app.receive_system_state_status(Some(generation.wrapping_sub(1)), idle.clone());
+    assert!(
+        indicators(&app, reopened, view).busy,
+        "an old idle read cannot finish this operation"
+    );
+    fresh(
+        &mut app,
+        SetupStatus {
+            busy: true,
+            ..idle.clone()
+        },
+    );
+    assert!(indicators(&app, reopened, view).busy);
+    fresh(&mut app, idle);
+    assert!(!indicators(&app, reopened, view).busy);
+    assert!(app.system_state_host.operation.is_none());
+    press(&mut app, wid, view, "system-state/group/0/leave");
+    assert_eq!(
+        calls(),
+        ["apply"],
+        "a current idle result releases the group choice"
+    );
+    assert!(app.structural_invariants_ok());
+}
+
+#[test]
+fn nonrun_operation_restore_stays_reserved_across_final_close() {
+    accepted_operation_survives_final_close(SetupOperation::Restore);
+}
+
+#[test]
+fn nonrun_operation_check_stays_reserved_across_final_close() {
+    accepted_operation_survives_final_close(SetupOperation::Check);
+}
+
+#[test]
+fn nonrun_operation_refusal_or_reading_alone_reserves_no_check_slot() {
+    for (key, reading) in [
+        ("system-state/restore", false),
+        ("system-state/check", false),
+        ("system-state/check", true),
+    ] {
+        let mut app = App::headless_for_test();
+        let (wid, original, view) = page(&mut app);
+        app.set_system_state_handlers_for_test(InitialSetupHandlers {
+            restore: || false,
+            check: if reading {
+                |_| CheckStarted {
+                    reading: true,
+                    check: false,
+                }
+            } else {
+                |_| CheckStarted::default()
+            },
+            apply: |_, _, _, _| {
+                note("apply".into());
+                false
+            },
+            ..handlers()
+        });
+        press(&mut app, wid, view, key);
+        assert!(app.system_state_host.operation.is_none());
+        app.system_state_host.status_in_flight = true;
+        app.close_active_native_tab(wid).unwrap();
+        assert!(app.native_runtime.app(original).is_none());
+        assert!(app.open_system_state_tab());
+        let (reopened, view) = app.active_native_view(wid).unwrap();
+        app.tick_system_state(Instant::now());
+        assert!(!indicators(&app, reopened, view).busy);
+        calls();
+        press(&mut app, wid, view, "system-state/group/0/leave");
+        assert_eq!(calls(), ["apply"]);
+        assert!(app.structural_invariants_ok());
+    }
+}
+
+#[test]
+fn nonrun_operation_reopen_restore_is_disabled_before_the_first_tick() {
+    use crate::app_control::{ActRequest, OpenRequest};
+
+    let mut app = App::headless_for_test();
+    let (wid, original, view) = page(&mut app);
+    app.set_system_state_handlers_for_test(handlers());
+    let restore = |view| ActRequest {
+        view,
+        ui_key: "system-state/restore".into(),
+        action: "system-state/restore".into(),
+        value: None,
+    };
+    app.act_app(restore(view)).unwrap();
+    assert_eq!(calls(), ["restore"]);
+    let generation = app.system_state_host.generation;
+    app.system_state_host.status_in_flight = true;
+    let poll = (
+        app.system_state_host.status_in_flight,
+        app.system_state_host.next_status,
+        app.system_state_host.next_tick,
+    );
+    app.close_active_native_tab(wid).unwrap();
+    assert!(app.native_runtime.app(original).is_none());
+    app.open_app(OpenRequest::SystemState).unwrap();
+    let (reopened, view) = app.active_native_view(wid).unwrap();
+    // These are consecutive supported control requests: no park, periodic
+    // tick or fresh status has run between opening and this live action.
+    assert!(app.act_app(restore(view)).is_err());
+    assert!(
+        calls().is_empty(),
+        "the first compiled controls keep Restore disabled"
+    );
+    assert!(indicators(&app, reopened, view).busy);
+    assert_eq!(
+        (
+            app.system_state_host.status_in_flight,
+            app.system_state_host.next_status,
+            app.system_state_host.next_tick,
+        ),
+        poll,
+        "opening a controller does not restart or retire its status read"
+    );
+    assert!(
+        !app.system_state_host.latest_status.busy,
+        "the cached worker status stays raw"
+    );
+    let idle = SetupStatus {
+        plan: Some(Plan::default()),
+        ..SetupStatus::default()
+    };
+    app.receive_system_state_status(Some(generation.wrapping_sub(1)), idle.clone());
+    assert!(app.act_app(restore(view)).is_err());
+    assert!(calls().is_empty());
+    fresh(&mut app, idle);
+    app.act_app(restore(view)).unwrap();
+    assert_eq!(
+        calls(),
+        ["restore"],
+        "a current idle result enables one new Restore"
+    );
+    assert!(app.structural_invariants_ok());
+}
+
+fn queued_offer_respects_host_work(
+    start: impl Fn(&mut App, WindowId, ViewId),
+    reopen_before_tick: bool,
+) {
+    // A passive busy controller, then either no remaining controller or a
+    // freshly reopened controller that has not received its first tick yet.
+    for close in [false, true] {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let terminal = app.windows[&wid].tab_set.active_index().unwrap();
+        let (_, original, view) = page(&mut app);
+        app.set_system_state_handlers_for_test(handlers());
+        let offered = Plan {
+            vault_url: "http://queued-offer.invalid/v1/team".into(),
+            ..Plan::default()
+        };
+        let (send, receive) = mpsc::channel();
+        // Its worker already queued this request when the page started work.
+        let request = Request::new(offered.clone(), send);
+        start(&mut app, wid, view);
+        assert!(indicators(&app, original, view).busy);
+        let current = app.system_state_host.latest_status.plan.clone();
+        app.system_state_host.status_in_flight = true;
+        calls();
+        if close {
+            app.close_active_native_tab(wid).unwrap();
+            assert!(app.native_runtime.app(original).is_none());
+            if reopen_before_tick {
+                assert!(app.open_system_state_tab());
+            }
+        } else {
+            app.switch_tab_in(wid, terminal);
+        }
+        let before = (
+            app.windows[&wid].tab_set.active_id(),
+            app.windows[&wid].window_focus,
+            app.windows[&wid].tab_set.len(),
+        );
+        // Exercise the actual windowed preflight, with no OS surface and
+        // the headless fixture's inert platform reaches.
+        assert!(!app.apprt.probe_preferences);
+        assert!(app.windows[&wid].os_window.is_none());
+        app.headless = false;
+        app.offer_system_state(request.clone());
+        assert!(
+            !request.pending(),
+            "a queued offer must yield to accepted host work"
+        );
+        assert_eq!(
+            receive.try_recv().unwrap().decision,
+            WorkstationSetupDecision::Unavailable
+        );
+        assert_eq!(
+            (
+                app.windows[&wid].tab_set.active_id(),
+                app.windows[&wid].window_focus,
+                app.windows[&wid].tab_set.len(),
+            ),
+            before,
+            "a refused offer neither opens nor focuses a tab"
+        );
+        assert!(app.system_state_host.pending.is_none());
+        assert!(app.native_runtime.take_system_state_action().is_none());
+        assert!(calls().is_empty());
+
+        // The same offer is admissible after a current idle read releases
+        // the host reservation, including when no controller survived.
+        fresh(
+            &mut app,
+            SetupStatus {
+                plan: current,
+                ..SetupStatus::default()
+            },
+        );
+        let (send, receive) = mpsc::channel();
+        let request = Request::new(offered.clone(), send);
+        app.offer_system_state(request.clone());
+        assert!(request.pending());
+        assert!(app.system_state_host.pending.is_some());
+        let Some(NativeApp::SystemState(model)) = app
+            .native_runtime
+            .app(app.active_native_view(wid).unwrap().0)
+        else {
+            panic!("the idle offer opens its review")
+        };
+        assert_eq!(model.reviewed_plan(), offered);
+        request.finish(WorkstationSetupDecision::Unavailable);
+        assert_eq!(
+            receive.try_recv().unwrap().decision,
+            WorkstationSetupDecision::Unavailable
+        );
+        assert!(app.structural_invariants_ok());
+    }
+}
+
+#[test]
+fn queued_offer_cannot_take_a_pending_restore_after_controller_close() {
+    queued_offer_respects_host_work(
+        |app, wid, view| {
+            press(app, wid, view, "system-state/restore");
+        },
+        false,
+    );
+}
+
+#[test]
+fn queued_offer_cannot_take_a_pending_check_after_controller_close() {
+    queued_offer_respects_host_work(
+        |app, wid, view| {
+            press(app, wid, view, "system-state/check");
+        },
+        false,
+    );
+}
+
+#[test]
+fn queued_offer_cannot_take_an_admission_awaiting_its_run_after_controller_close() {
+    queued_offer_respects_host_work(
+        |app, wid, view| {
+            press(app, wid, view, "system-state/group/2/leave");
+            receipt().accept();
+            app.resolve_system_state_apply();
+        },
+        false,
+    );
+}
+
+#[test]
+fn queued_offer_cannot_take_an_observed_busy_worker_after_controller_close() {
+    queued_offer_respects_host_work(|app, _, _| fresh(app, running()), false);
+}
+
+#[test]
+fn queued_offer_cannot_take_a_reopened_restore_before_its_first_tick() {
+    queued_offer_respects_host_work(
+        |app, wid, view| {
+            press(app, wid, view, "system-state/restore");
+        },
+        true,
+    );
+}
+
 #[test]
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 fn intent_handoff_keeps_development_scenarios_inert() {
@@ -1394,15 +1770,32 @@ fn a_page_opened_by_hand_shows_and_reads_the_plan_in_force() {
     };
     assert_eq!(state.reviewed_plan(), saved);
 
-    // Opened after a read: the next tick gives it the plan that read named.
+    // Opened after a read: its first controls know that exact saved plan;
+    // showing the controller still asks for one fresh observation.
     let mut app = App::headless_for_test();
+    app.set_system_state_handlers_for_test(handlers());
     app.publish_system_state(in_force());
     assert!(app.open_system_state_tab());
-    assert!(!app.native_runtime.system_state_mut().unwrap().plan_known());
-    app.tick_system_state(Instant::now());
     let state = app.native_runtime.system_state_mut().unwrap();
     assert!(state.plan_known());
     assert_eq!(state.reviewed_plan(), saved);
+    assert!(calls().is_empty(), "bootstrap itself starts no worker");
+    let now = Instant::now();
+    app.system_state_host.next_status = Some(now + Duration::from_secs(3600));
+    app.tick_system_state(now);
+    assert_eq!(calls(), ["observe http://saved.local/v1/team"]);
+    app.tick_system_state(now + Duration::from_millis(250));
+    assert!(
+        calls().is_empty(),
+        "the accepted observation is not repeated"
+    );
+    assert_eq!(
+        app.native_runtime
+            .system_state_mut()
+            .unwrap()
+            .reviewed_plan(),
+        saved
+    );
 }
 
 mod observation_start {
@@ -1565,11 +1958,24 @@ fn unknown_plan_check_waits_for_the_saved_plan_after_reopen() {
     );
     app.close_active_native_tab(wid).unwrap();
     assert!(app.native_runtime.app(first_instance).is_none());
+    // A current read could not recover the saved plan while no controller
+    // existed. Reopening must keep Check gated rather than use its defaults.
+    fresh(
+        &mut app,
+        SetupStatus {
+            rows: vec![SetupStatusRow {
+                name: "Setup state".into(),
+                status: "error".into(),
+                detail: "The saved setup plan could not be read.".into(),
+            }],
+            ..SetupStatus::default()
+        },
+    );
     assert!(app.open_system_state_tab());
     let (_, view) = app.active_native_view(wid).unwrap();
     assert!(!app.native_runtime.system_state_mut().unwrap().plan_known());
 
-    // No tick has hydrated the new page from the last status yet.
+    // The new controller still has no trusted plan, even before any tick.
     press(&mut app, wid, view, "system-state/check");
     assert!(
         calls().is_empty(),
@@ -2763,6 +3169,124 @@ fn an_occluded_focused_window_is_not_in_front_for_on_screen_steps() {
         app.system_state_frontmost(),
         "back on screen, it is in front"
     );
+}
+
+fn page_publishing_front_with_a_background_copy() -> (App, WindowId, WindowId, AppInstanceId) {
+    // Each caller runs alone in a child: unrelated tests also publish this
+    // process-wide signal, which is the setup worker's on_screen port.
+    aterm_types::macos_setup::set_system_state_front(false);
+    let mut app = App::headless_for_test();
+    app.set_system_state_handlers_for_test(InitialSetupHandlers::inert_for_test());
+    let (front, instance, _) = page(&mut app);
+    let background = WindowId(1);
+    app.install_window_state(background, crate::stub_session(91), 90, 160);
+    app.stage_system_state_tab(background).unwrap();
+    app.switch_tab_in(background, 0);
+    app.windows.get_mut(&front).unwrap().os_window_for_test = true;
+    app.windows.get_mut(&front).unwrap().focused = true;
+    app.windows.get_mut(&background).unwrap().focused = false;
+    app.frontmost_window = Some(front);
+    fresh(&mut app, running());
+    assert!(app.commit_glassless_native_frame(front));
+    assert!(app.system_state_frontmost());
+    app.tick_system_state(Instant::now());
+    assert!(aterm_types::macos_setup::system_state_front());
+    (app, front, background, instance)
+}
+
+#[test]
+fn published_frontness_final_window_close_retires_on_screen_work() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let (mut app, front, background, instance) = page_publishing_front_with_a_background_copy();
+    // Disposing of a passive linked window must not withdraw the surviving
+    // focused page's authority.
+    assert_eq!(
+        app.close_window_logical(background),
+        crate::CloseOutcome::Stay
+    );
+    assert!(app.system_state_frontmost());
+    assert!(aterm_types::macos_setup::system_state_front());
+    assert!(app.structural_invariants_ok());
+    assert_eq!(app.close_window_logical(front), crate::CloseOutcome::Exit);
+    assert!(app.native_runtime.app(instance).is_none());
+    assert!(!app.system_state_frontmost());
+    assert!(
+        !aterm_types::macos_setup::system_state_front(),
+        "a worker must not start an on-screen step after the final window closes"
+    );
+    assert!(app.windows.is_empty());
+    assert!(app.frontmost_window.is_none());
+    assert!(app.view_store.iter().next().is_none());
+}
+
+#[test]
+fn published_frontness_front_tab_close_retires_work_with_a_background_copy() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let (mut app, front, _, instance) = page_publishing_front_with_a_background_copy();
+    app.close_active_native_tab(front).unwrap();
+    assert!(
+        app.native_runtime.app(instance).is_some(),
+        "the background copy survives"
+    );
+    assert!(!app.system_state_frontmost());
+    assert!(
+        !aterm_types::macos_setup::system_state_front(),
+        "a hidden linked controller cannot authorize an on-screen step"
+    );
+    assert!(app.structural_invariants_ok());
+}
+
+#[test]
+fn published_frontness_quit_retires_work_before_settling_workers() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let (mut app, front, _, instance) = page_publishing_front_with_a_background_copy();
+    app.set_system_state_handlers_for_test(InitialSetupHandlers {
+        settle: || {
+            assert!(
+                !aterm_types::macos_setup::system_state_front(),
+                "shutdown must withdraw on-screen work before it waits for workers"
+            );
+            note("settled".into());
+        },
+        ..InitialSetupHandlers::inert_for_test()
+    });
+    app.finish_system_state_shutdown();
+    assert_eq!(calls(), ["settled"]);
+    // Cmd-Q need not dispose of the windows/models before worker settlement.
+    assert!(app.windows.contains_key(&front));
+    assert!(app.native_runtime.app(instance).is_some());
+    assert!(app.system_state_frontmost());
+    assert!(!aterm_types::macos_setup::system_state_front());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn published_frontness_handoff_wait_holds_work_until_the_live_page_is_republished() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let (mut app, _, _, _) = page_publishing_front_with_a_background_copy();
+    app.set_system_state_handlers_for_test(InitialSetupHandlers {
+        settle: || {
+            assert!(!aterm_types::macos_setup::system_state_front());
+            note("settled".into());
+        },
+        ..InitialSetupHandlers::inert_for_test()
+    });
+    app.settle_system_state_before_handoff();
+    assert_eq!(calls(), ["settled"]);
+    assert!(!aterm_types::macos_setup::system_state_front());
+    assert!(app.system_state_frontmost());
+    // A handoff can be refused: the UI is still live, and an ordinary tick
+    // may publish its focused page again without inventing another admission.
+    app.tick_system_state(Instant::now());
+    assert!(aterm_types::macos_setup::system_state_front());
 }
 
 /// How many readings of the page's rows `calls` asked for.

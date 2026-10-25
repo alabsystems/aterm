@@ -1419,6 +1419,8 @@ pub(crate) enum NativeConfigOrigin {
     },
     HarnessSwitch {
         key: &'static str,
+        /// The value written: `true` turns the switch on, `false` off.
+        on: bool,
     },
     Control {
         request_id: u64,
@@ -1483,6 +1485,8 @@ impl DeferredNativeConfigGeneration {
     }
 }
 
+/// Whether harness switch `key` reads on in `config`: its effective value, every table that can
+/// hold it off joined.
 fn harness_switch_reads_on(key: &str, config: &crate::app_config::Config) -> bool {
     match key {
         crate::prefs::EDIT_HARNESS_ENABLED => config.harness.policy.enabled,
@@ -4388,38 +4392,43 @@ impl App {
         self.pump_native_config()
     }
 
-    /// Queue the durable settings write for a toggled harness switch `key`.
-    pub(crate) fn queue_harness_switch_write(&mut self, key: &'static str) {
+    /// Queue the durable settings write of harness switch `key` turned `on` (or off).
+    pub(crate) fn queue_harness_switch_write(&mut self, key: &'static str, on: bool) {
         let queued = (|| {
             self.proxy
                 .as_ref()
                 .ok_or_else(|| "config persistence needs an event-loop proxy".to_string())?;
             let _ = native_config_queue()?;
             self.native_config_pending.push_back(NativeConfigRequest {
-                origin: NativeConfigOrigin::HarnessSwitch { key },
+                origin: NativeConfigOrigin::HarnessSwitch { key, on },
                 work: NativeConfigWork::ControlField {
                     key: key.to_string(),
-                    value: Some("true".to_string()),
+                    value: Some(on.to_string()),
                 },
             });
             self.pump_native_config()
         })();
         if let Err(error) = queued {
-            self.harness_switch_not_saved(key, &error, false);
+            self.harness_switch_not_saved(key, on, &error, false);
         }
     }
 
     fn publish_harness_switch_completion(
         &mut self,
         key: &'static str,
+        on: bool,
         outcome: &ConfigPatchOutcome,
         authoritative: Option<&crate::native_config_service::ConfigSnapshot>,
     ) {
         let feedback = match outcome {
             ConfigPatchOutcome::Applied { .. } => match authoritative {
-                Some(snapshot) if harness_switch_reads_on(key, &snapshot.config) => None,
-                Some(_) => Some((
+                Some(snapshot) if harness_switch_reads_on(key, &snapshot.config) == on => None,
+                Some(_) if on => Some((
                     "the saved config still holds this switch off; correct the limiting harness setting in aterm.toml before pressing on again".to_string(),
+                    false,
+                )),
+                Some(_) => Some((
+                    "the saved config still reads this switch on; correct the harness setting in aterm.toml before pressing the switch again".to_string(),
                     false,
                 )),
                 None => Some((
@@ -4430,11 +4439,17 @@ impl App {
             other => write_not_saved_cause(other),
         };
         if let Some((cause, indeterminate)) = feedback {
-            self.harness_switch_not_saved(key, &cause, indeterminate);
+            self.harness_switch_not_saved(key, on, &cause, indeterminate);
         }
     }
 
-    fn harness_switch_not_saved(&mut self, key: &'static str, cause: &str, indeterminate: bool) {
+    fn harness_switch_not_saved(
+        &mut self,
+        key: &'static str,
+        on: bool,
+        cause: &str,
+        indeterminate: bool,
+    ) {
         for ws in self.windows.values_mut() {
             if ws.claude_lights.let_switches_go() {
                 crate::claude_lights::redraw(ws);
@@ -4442,6 +4457,7 @@ impl App {
         }
         self.post_message(crate::message_reporters::harness_switch_not_saved(
             key,
+            on,
             cause,
             indeterminate,
         ));
@@ -5354,8 +5370,8 @@ impl App {
             NativeConfigOrigin::DeckSize { pref } => {
                 self.publish_deck_size_completion(pref, &outcome)
             }
-            NativeConfigOrigin::HarnessSwitch { key } => {
-                self.publish_harness_switch_completion(key, &outcome, authoritative.as_ref());
+            NativeConfigOrigin::HarnessSwitch { key, on } => {
+                self.publish_harness_switch_completion(key, on, &outcome, authoritative.as_ref());
             }
             NativeConfigOrigin::ThemeChoice { request_id, id } => {
                 self.publish_theme_choice_completion(

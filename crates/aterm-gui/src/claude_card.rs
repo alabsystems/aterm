@@ -18,12 +18,12 @@ use aterm_core::render::{
     BandIcon, ChromeIcon, ChromeRaster, DecoBlend, DecoGlyph, FxLayer, GlowQuad, InkCell, PxRect,
     RainHalo, RenderInput, WordDecoration,
 };
-use aterm_core::terminal::RenderCell;
+use aterm_core::terminal::{RenderCell, UnderlineStyle};
 use aterm_effects::harness_card::{
     CardArts, CardFrames, CardPalette, CardScene, FRAME_MS, HarnessCard, LineAt, kitty_cols,
     line_star,
 };
-use aterm_phase::{CardPlace, NoticePlace};
+use aterm_phase::{CardPlace, CliHarness, NoticePlace};
 
 use aterm_agent::harness::acts::TaskFace;
 
@@ -54,13 +54,26 @@ const NO_STAR: WordDecoration = WordDecoration {
 /// Text and target URL for the harness banner over Claude Code's update notice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HarnessNotice {
+    /// The banner's words: the link as a link reads, its scheme included.
     pub(crate) text: &'static str,
+    /// The words where [`text`](Self::text) does not fit: the site's name alone.
+    pub(crate) short: &'static str,
     pub(crate) url: &'static str,
+}
+
+impl HarnessNotice {
+    /// The widest of the banner's words that fits `room` cells, if any does.
+    pub(crate) fn words_within(self, room: usize) -> Option<&'static str> {
+        [self.text, self.short]
+            .into_iter()
+            .find(|words| text_cells(words) <= room)
+    }
 }
 
 /// Harness banner configuration replacing Claude Code's update notice.
 pub(crate) const NOTICE: HarnessNotice = HarnessNotice {
-    text: aterm_types::identity::SITE,
+    text: aterm_types::identity::SITE_URL,
+    short: aterm_types::identity::SITE,
     url: aterm_types::identity::SITE_URL,
 };
 
@@ -573,6 +586,8 @@ pub(crate) struct WindowCards {
     no_px: Arc<[u32]>,
     panels: crate::claude_panel::WindowPanels,
     notice_hits: Vec<NoticeHit>,
+    /// The session whose banner link a press last opened, or would have, and when.
+    link_pressed: Option<(u64, Instant)>,
     away: Option<Instant>,
     composed: u64,
     outcomes: Vec<(u64, CardOutcome, u64)>,
@@ -646,6 +661,30 @@ impl WindowCards {
             }),
         }
         self.painted.icons.push((row, icon));
+    }
+
+    /// Record a press that opens `session`'s banner link at `now`, and say whether it repeats
+    /// the last such press within a double click's interval (`multi_click_ms`), so a double or
+    /// triple click opens the link once.
+    pub(crate) fn link_press_repeats(&mut self, session: u64, now: Instant) -> bool {
+        let repeats = self.link_pressed.is_some_and(|(last, at)| {
+            last == session
+                && now.saturating_duration_since(at).as_millis() <= crate::multi_click_ms()
+        });
+        self.link_pressed = Some((session, now));
+        repeats
+    }
+
+    /// Let a double click's interval pass since the banner link's last press, as a person's
+    /// next, separate click would: the press is stamped that long ago.
+    #[cfg(all(test, unix))]
+    pub(crate) fn age_link_press(&mut self) {
+        let interval = Duration::from_millis(
+            u64::try_from(crate::multi_click_ms()).expect("a double click's interval") + 1,
+        );
+        self.link_pressed = self
+            .link_pressed
+            .and_then(|(session, at)| Some((session, at.checked_sub(interval)?)));
     }
 
     /// Mark all cards in this window as hidden.
@@ -1225,7 +1264,9 @@ const fn untimed_end(view: AutopilotView, end: LineEnd) -> LineEnd {
 fn line_texts(view: AutopilotView, end: LineEnd) -> &'static [String] {
     static TEXTS: [OnceLock<Vec<String>>; 6] = [const { OnceLock::new() }; 6];
     let end = match (view, end) {
-        (AutopilotView::Cruise, LineEnd::CruiseUntil(at)) => return timed_line_texts(None, at),
+        (AutopilotView::Cruise, LineEnd::CruiseUntil(at)) => {
+            return timed_line_texts(CliHarness::ClaudeCode, at);
+        }
         _ => untimed_end(view, end),
     };
     let slot = match (view, end) {
@@ -1239,37 +1280,37 @@ fn line_texts(view: AutopilotView, end: LineEnd) -> &'static [String] {
     slot.get_or_init(|| make_line_texts(view, end))
 }
 
-fn timed_line_texts(agent: Option<&'static str>, at: LandAtGlass) -> &'static [String] {
-    type TimedFace = (Option<&'static str>, LandAtGlass, &'static [String]);
+fn timed_line_texts(harness: CliHarness, at: LandAtGlass) -> &'static [String] {
+    type TimedFace = (CliHarness, LandAtGlass, &'static [String]);
     static MADE: Mutex<Vec<TimedFace>> = Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(&(_, _, texts)) = made
         .iter()
-        .find(|(who, face, _)| *who == agent && *face == at)
+        .find(|(who, face, _)| *who == harness && *face == at)
     {
         return texts;
     }
     let texts: &'static [String] =
-        make_line_texts_for(agent, AutopilotView::Cruise, LineEnd::CruiseUntil(at)).leak();
-    made.push((agent, at, texts));
+        make_line_texts_for(harness, AutopilotView::Cruise, LineEnd::CruiseUntil(at)).leak();
+    made.push((harness, at, texts));
     texts
 }
 
 fn make_line_texts(view: AutopilotView, end: LineEnd) -> Vec<String> {
-    make_line_texts_for(None, view, end)
+    make_line_texts_for(CliHarness::ClaudeCode, view, end)
 }
 
 fn line_texts_for(rows_kind: usize, view: AutopilotView, end: LineEnd) -> &'static [String] {
     static AGY_TEXTS: [OnceLock<Vec<String>>; 6] = [const { OnceLock::new() }; 6];
     static MUSE_TEXTS: [OnceLock<Vec<String>>; 6] = [const { OnceLock::new() }; 6];
-    let (agent, table) = match rows_kind {
-        4 => ("agy", &AGY_TEXTS),
-        1 => ("muse", &MUSE_TEXTS),
+    let (harness, table) = match rows_kind {
+        4 => (CliHarness::Agy, &AGY_TEXTS),
+        1 => (CliHarness::Muse, &MUSE_TEXTS),
         _ => return line_texts(view, end),
     };
     let end = match (view, end) {
         (AutopilotView::Cruise, LineEnd::CruiseUntil(at)) => {
-            return timed_line_texts(Some(agent), at);
+            return timed_line_texts(harness, at);
         }
         _ => untimed_end(view, end),
     };
@@ -1281,44 +1322,38 @@ fn line_texts_for(rows_kind: usize, view: AutopilotView, end: LineEnd) -> &'stat
         (AutopilotView::MasterOff | AutopilotView::AgentOff(_), _) => &table[3],
         (AutopilotView::Unhosted, _) => &table[4],
     };
-    slot.get_or_init(|| make_line_texts_for(Some(agent), view, end))
+    slot.get_or_init(|| make_line_texts_for(harness, view, end))
 }
 
-fn make_line_texts_for(agent: Option<&str>, view: AutopilotView, end: LineEnd) -> Vec<String> {
+/// The card line's rungs, widest first, naming `harness`'s own version (never aterm's build).
+fn make_line_texts_for(harness: CliHarness, view: AutopilotView, end: LineEnd) -> Vec<String> {
     use crate::claude_lights::ChipFace;
-    use crate::menu::{VersionFacts, VersionRung, version_signature};
-    let facts = VersionFacts::this_build();
-    let mut texts = Vec::with_capacity(7);
-    let tag = agent.map_or_else(String::new, |a| {
-        match aterm_phase::harness_version_str_of(a) {
-            Some(v) => format!(" \u{b7} {a} v{v}"),
-            None => format!(" \u{b7} {a}"),
-        }
-    });
-    if let Some(full) = version_signature(facts, VersionRung::Full) {
-        let head = format!("enhanced by {HERO_WORD} harness {full}{tag}");
-        let (glyph, word) = end.words(view);
-        let mode = if agent == Some("agy") {
-            head.clone()
-        } else {
-            format!("{head} \u{b7} autopilot {glyph} {word}")
-        };
-        if let LineEnd::CruiseUntil(at) = end {
-            let mark = ChipFace::CruiseUntil
-                .word()
-                .unwrap_or(AutopilotView::Land.glyph());
-            texts.push(format!("{mode} {mark}{}", crate::autopilot_menu::when(at)));
-        }
-        if mode != head {
-            texts.push(mode);
-        }
-        texts.push(head);
-    }
-    if let Some(short) = version_signature(facts, VersionRung::Short) {
-        texts.push(format!("enhanced by {HERO_WORD} harness {short}{tag}"));
-    }
+    let mut texts = Vec::with_capacity(6);
+    let tag = match harness {
+        CliHarness::ClaudeCode => String::new(),
+        other => format!(" \u{b7} {}", other.id()),
+    };
+    let head = format!(
+        "enhanced by {HERO_WORD} harness v{}{tag}",
+        harness.version_str()
+    );
     let (glyph, word) = end.words(view);
-    if agent == Some("agy") {
+    let mode = if harness == CliHarness::Agy {
+        head.clone()
+    } else {
+        format!("{head} \u{b7} autopilot {glyph} {word}")
+    };
+    if let LineEnd::CruiseUntil(at) = end {
+        let mark = ChipFace::CruiseUntil
+            .word()
+            .unwrap_or(AutopilotView::Land.glyph());
+        texts.push(format!("{mode} {mark}{}", crate::autopilot_menu::when(at)));
+    }
+    if mode != head {
+        texts.push(mode);
+    }
+    texts.push(head);
+    if harness == CliHarness::Agy {
         texts.push(format!("{HERO_WORD} harness{tag}"));
     } else {
         texts.push(format!("{HERO_WORD} harness{tag} \u{b7} {glyph} {word}"));
@@ -1943,13 +1978,17 @@ fn make_notice(
     frame: Option<(Instant, bool, Option<u64>)>,
     animate: bool,
 ) {
-    let words = text_cells(NOTICE.text);
-    if place.text_col + LINE_LEAD + words > place.end.min(pane.cols.saturating_sub(1))
-        || place.rows == 0
-        || place.top + place.rows > pane.rows
-    {
+    let room = place
+        .end
+        .min(pane.cols.saturating_sub(1))
+        .saturating_sub(place.text_col + LINE_LEAD);
+    let Some(text) = NOTICE.words_within(room) else {
+        return;
+    };
+    if place.rows == 0 || place.top + place.rows > pane.rows {
         return;
     }
+    let words = text_cells(text);
     let key = NoticeKey {
         place: *place,
         pane,
@@ -1977,7 +2016,12 @@ fn make_notice(
             row.cells.clear();
             if k == 0 {
                 row.cells.resize(LINE_LEAD, ground);
-                push_words(NOTICE.text, key.base, &mut row.cells);
+                let link = RenderCell {
+                    underline: UnderlineStyle::Single,
+                    underline_color: None,
+                    ..key.base
+                };
+                push_words(text, link, &mut row.cells);
             }
             row.cells.resize(width, ground);
         }
@@ -2323,6 +2367,86 @@ impl App {
             .iter()
             .find(|hit| hit.frame_row == row && hit.cols.contains(&col))?;
         (!self.chrome_owns_terminal_row(wid, hit.term_row)).then_some((hit.session, hit.url))
+    }
+
+    /// Whether the pointer rests on a banner's link in `wid` ([`Self::claude_notice_at`]).
+    pub(crate) fn pointer_on_notice_link(&self, wid: WindowId) -> bool {
+        let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) else {
+            return false;
+        };
+        self.claude_notice_at(wid, x, y)
+            .is_some_and(|(_, url)| url.is_some())
+    }
+
+    /// Open `session`'s banner link for a screen reader's press on its node, where the glass
+    /// shows it: a tab name being edited settles first, as on a pointer's press.
+    pub(crate) fn open_claude_notice_for_reader(&mut self, wid: WindowId, session: u64) {
+        let url = self.windows.get(&wid).and_then(|ws| {
+            ws.claude_card
+                .notice_hits
+                .iter()
+                .find(|hit| {
+                    hit.session == session
+                        && hit.url.is_some()
+                        && !self.chrome_owns_terminal_row(wid, hit.term_row)
+                })
+                .and_then(|hit| hit.url)
+        });
+        let Some(url) = url.filter(|url| crate::is_safe_url(url)) else {
+            return;
+        };
+        if self.inline_rename_edit(wid).is_some() {
+            self.clear_strip_press(wid);
+            self.settle_rename_edit(wid);
+        }
+        crate::app_mouse::open_url_external(url);
+    }
+
+    /// The banners' links on `wid`'s glass as the accessibility tree publishes them, on grid
+    /// rows below the window's `strip` chrome rows: each a link named by the words it shows.
+    #[cfg(a11y_tree)]
+    pub(crate) fn claude_notice_links_a11y(
+        &self,
+        wid: WindowId,
+        strip: usize,
+    ) -> Vec<crate::a11y_tree::GridChip> {
+        let Some(ws) = self.windows.get(&wid) else {
+            return Vec::new();
+        };
+        let mut links = Vec::new();
+        for hit in &ws.claude_card.notice_hits {
+            let Some(url) = hit.url else {
+                continue;
+            };
+            let Some(row) = hit.frame_row.checked_sub(strip) else {
+                continue;
+            };
+            if self.chrome_owns_terminal_row(wid, hit.term_row) {
+                continue;
+            }
+            let words: String = ws
+                .input_scratch
+                .cells
+                .get(hit.frame_row)
+                .and_then(|cells| cells.get(hit.cols.clone()))
+                .map(|cells| cells.iter().map(|c| c.ch).collect())
+                .unwrap_or_default();
+            let label = words.trim().to_owned();
+            if label.is_empty() {
+                continue;
+            }
+            links.push(crate::a11y_tree::GridChip {
+                session: hit.session,
+                chip: crate::a11y_tree::HarnessChip::Link,
+                label,
+                description: Some(format!("Opens {url} in the browser")),
+                toggled: None,
+                row,
+                col: hit.cols.start,
+                width: hit.cols.len(),
+            });
+        }
+        links
     }
 
     /// Whether cards in `wid` are allowed to animate.

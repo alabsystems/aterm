@@ -349,7 +349,9 @@ fn authenticated_lan_exchange_is_symmetric_and_repairs_after_offline_edits() {
     let serve_dir = b.clone();
     let server = thread::spawn(move || {
         let (tcp, _) = listener.accept().unwrap();
-        network::serve_connection(&serve_dir, tcp).unwrap()
+        let connection =
+            aterm_net::lan::Connection::admit(tcp, aterm_net::lan::Scope::Loopback).unwrap();
+        network::serve_connection(&serve_dir, connection).unwrap()
     });
     let client = network::sync_round(&a, address).unwrap();
     let server = server.join().unwrap();

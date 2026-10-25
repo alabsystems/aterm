@@ -1267,11 +1267,13 @@ fn land(
         verified_at: lane.now,
         measured_sha256: agreed.map(|a| a.sha256.clone()),
         agreed_with: agreed.map(|a| a.url.clone()),
+        tree_from: None,
     };
     record
         .record_bytes()
         .map_err(|e| FlowError::VendorRefused(e.to_string()))?;
     let final_root: RefCell<Option<String>> = RefCell::new(None);
+    let tree_from: std::cell::Cell<Option<&'static str>> = std::cell::Cell::new(None);
     let gate =
         crate::install::developer_id_gate(spec.apple_team, spec.exposes, lane.trust.team_check);
     let pre_swap = |tree: &Path| -> Result<(), StageError> {
@@ -1299,6 +1301,7 @@ fn land(
             .borrow()
             .clone()
             .unwrap_or_else(|| root.to_string());
+        rec.tree_from = tree_from.get().map(str::to_string);
         let bytes = rec
             .record_bytes()
             .map_err(|e| StageError::Payload(e.to_string()))?;
@@ -1323,28 +1326,123 @@ fn land(
     };
     let exposes: Vec<String> = spec.exposes.iter().map(|t| (*t).to_string()).collect();
     let shim_env = spec.shim_env();
-    let landed = crate::flow::land_artifact(
-        lane.layout,
-        &Landing {
-            program,
-            build: c.version.build_id(),
-            artifact: art,
-            exposes: &exposes,
-            shim_env: &shim_env,
-            aliases: crate::activate::Aliases::Off,
-            installed: pending.active,
-            strategy: crate::dispatch::ApplyStrategy::Shim,
-            hooks: &hooks,
-            download_turn: lane.download_turn,
-        },
-        &|dl| {
-            lane.fetcher
-                .vendor_download(program, &art.url, dl, art.size)
-                .map_err(|e| e.to_string())
-        },
-    )?;
+    let landing = Landing {
+        program,
+        build: c.version.build_id(),
+        artifact: art,
+        exposes: &exposes,
+        shim_env: &shim_env,
+        aliases: crate::activate::Aliases::Off,
+        installed: pending.active,
+        strategy: crate::dispatch::ApplyStrategy::Shim,
+        hooks: &hooks,
+        download_turn: lane.download_turn,
+    };
+    let (mut copied, mut turn) = (None, lane.download_turn);
+    if let Some(sibling) = sibling_tree(lane.layout, spec, c) {
+        tree_from.set(Some(sibling.program));
+        let source = crate::flow::SourceTree {
+            program: sibling.program,
+            dir: &sibling.dir,
+            root: &sibling.root,
+        };
+        match crate::flow::land_from_tree(lane.layout, &landing, &source) {
+            Ok(landed) => copied = landed,
+            // The copy's stage failed on this machine, not on its bytes: no verdict, so the row
+            // downloads its own. The copy was laid, so its turn on the link is given up, and
+            // waiting on it would never end.
+            Err(FlowError::Stage(e @ (StageError::Io(_) | StageError::VerifyDeferred(_)))) => {
+                println!(
+                    "atpkg: {program}: {}'s build of the same bytes did not stage as a copy \
+                     ({e}); downloading its own",
+                    sibling.program
+                );
+                turn = None;
+            }
+            Err(e) => return Err(e),
+        }
+        if copied.is_none() {
+            tree_from.set(None);
+        }
+    }
+    let landed = match copied {
+        Some(landed) => landed,
+        None => crate::flow::land_artifact(
+            lane.layout,
+            &Landing {
+                download_turn: turn,
+                ..landing
+            },
+            &|dl| {
+                lane.fetcher
+                    .vendor_download(program, &art.url, dl, art.size)
+                    .map_err(|e| e.to_string())
+            },
+        )?,
+    };
     let root = final_root.borrow().clone().unwrap_or(landed.root);
     Ok((landed.shimmed, landed.refused, root))
+}
+
+/// Another row's complete build of exactly a candidate's signed bytes ([`sibling_tree`]),
+/// held from gc while its tree is copied.
+struct SiblingTree {
+    /// The row whose build it is.
+    program: &'static str,
+    /// Its build directory.
+    dir: std::path::PathBuf,
+    /// The `tree_root` its record names.
+    root: String,
+    /// Keeps gc from reclaiming the build until the copy is laid.
+    _lease: crate::lease::Lease,
+}
+
+/// The build whose tree `spec`'s landing of `c` copies in place of a download: one of a row that
+/// [lends its tree](VendorSpec::lends_tree_to) to `spec`, at the build `c`'s version names (not
+/// that row's active one), complete, its record naming `c`'s version, anchor, URL, digest and
+/// size and no vendor's copy agreed. A candidate with a vendor's copy to agree with is never
+/// copied, and off Unix nothing is ([`crate::install::stage_from_tree`] lays no clone there).
+/// The record is read again once the build's lease is held, which must be had at once: `None`
+/// when no build qualifies, or gc is reclaiming it.
+fn sibling_tree(layout: &Layout, spec: &'static VendorSpec, c: &Candidate) -> Option<SiblingTree> {
+    if !cfg!(unix) || c.companion.is_some() {
+        return None;
+    }
+    let art = c.artifact.artifact();
+    let build = c.version.build_id();
+    let names_c = |r: &VendorRecord| {
+        r.version == c.version
+            && r.anchor == c.anchor
+            && r.source_url == art.url
+            && r.sha256 == art.sha256
+            && r.sha512 == art.sha512
+            && r.size == art.size
+            && r.measured_sha256.is_none()
+            && r.agreed_with.is_none()
+    };
+    super::VENDORS
+        .iter()
+        .filter(|lender| lender.lends_tree_to(spec))
+        .find_map(|lender| {
+            let dir = layout.build_dir(lender.program, build);
+            complete_record(&dir).filter(|r| names_c(r))?;
+            let who = format!(
+                "atpkg (pid {}) \u{2014} {} copies this build's tree",
+                std::process::id(),
+                spec.program
+            );
+            let subject = crate::lease::Subject::build(lender.program, build)?;
+            let lease =
+                crate::lease::take(&layout.prefix, &subject, &who, std::time::Duration::ZERO)
+                    .ok()?;
+            let record = complete_record(&dir).filter(|r| names_c(r))?;
+            Some(SiblingTree {
+                program: lender.program,
+                dir,
+                root: record.tree_root,
+                _lease: lease,
+            })
+        })
 }
 
 fn yank_fallback(
@@ -4402,6 +4500,624 @@ mod tests {
             "codex-old",
             "0.163.0"
         )));
+    }
+
+    /// The files [`Fake::publish_codex_default`]'s package lays.
+    fn codex_default_files() -> [String; 4] {
+        [
+            world::bin("codex"),
+            "codex-path/rg".into(),
+            "codex-resources/voice/runtime.json".into(),
+            "codex-resources/voice/NOTICE.md".into(),
+        ]
+    }
+
+    /// Assert `pkg verify` passes `program`'s `version`, its tree copied from `lender`'s build or
+    /// (`None`) downloaded.
+    fn verified(l: &Layout, program: &str, version: &str, lender: Option<&str>) {
+        assert_eq!(
+            crate::verify::verify_program(l, program),
+            crate::verify::VerifyOutcome::VendorRoot {
+                build: v(version).build_id(),
+                vendor: "OpenAI".into(),
+                staged_from: lender.map_or(crate::verify::StagedFrom::Documents, |p| {
+                    crate::verify::StagedFrom::Sibling { program: p.into() }
+                }),
+                drift: None,
+            },
+            "{program}"
+        );
+    }
+
+    /// A store with codex `0.163.0` landed from OpenAI's package.
+    fn codex_landed(label: &str) -> (crate::testdir::ScratchLayout, Fake) {
+        let l = world::layout(label);
+        let f = Fake::default();
+        f.publish_codex_default("0.163.0");
+        let o = run(&l, &f, &Policy::default(), codex());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+        (l, f)
+    }
+
+    /// Where codex is OpenAI's build, codex-old copies codex's verified build of the same
+    /// release instead of fetching it again: one download for both rows, a tree of its own
+    /// (each file a clone on its own inode, nothing linked), its alias, shim and twin in its own
+    /// build, a record naming the lender, and otherwise exactly the tree, record and modes a
+    /// download of its own lays.
+    #[test]
+    fn codex_old_takes_codexs_verified_tree_and_downloads_nothing() {
+        let (l, f) = codex_landed("codex-old-taken");
+        let o = run(&l, &f, &Policy::default(), codex_old());
+        assert!(
+            matches!(
+                o.verdict,
+                Verdict::Installed {
+                    reason: InstallReason::Fresh,
+                    ..
+                }
+            ),
+            "{o:?}"
+        );
+        assert_eq!(
+            f.downloads.borrow().as_slice(),
+            [Fake::codex_payload_url("0.163.0")],
+            "one download lands both rows"
+        );
+        let (from, dir) = (
+            world::build_dir(&l, "codex", "0.163.0"),
+            world::build_dir(&l, "codex-old", "0.163.0"),
+        );
+        let record = complete_record(&dir).unwrap();
+        assert_eq!(record.tree_from.as_deref(), Some("codex"));
+        verified(&l, "codex-old", "0.163.0", Some("codex"));
+        assert!(
+            std::fs::symlink_metadata(&dir).unwrap().is_dir(),
+            "a tree of its own, never a link to codex's"
+        );
+        for rel in codex_default_files() {
+            let (lent, own) = (from.join(&rel), dir.join(&rel));
+            assert!(std::fs::symlink_metadata(&own).unwrap().is_file(), "{rel}");
+            assert!(
+                crate::clone::is_clone_of(&lent, &own),
+                "{rel}: a clone on an inode of its own"
+            );
+        }
+        let alias = dir.join(world::bin("codex-old"));
+        assert_eq!(std::fs::read(&alias).unwrap(), native_exe("codex 0.163.0"));
+        assert!(
+            std::fs::symlink_metadata(from.join(world::bin("codex-old"))).is_err(),
+            "codex's tree gained nothing"
+        );
+        let tool = |name: &str| crate::store::ToolName::new(name).unwrap();
+        assert_eq!(
+            crate::platform::resolve_shim(&l.shim(&tool("codex-old"))),
+            Some(alias.clone())
+        );
+        assert_eq!(crate::activate::twin_target(&l, "codex-old"), Some(alias));
+        verified(&l, "codex", "0.163.0", None);
+
+        let control = world::layout("codex-old-taken-control");
+        let o = run(&control, &f, &Policy::default(), codex_old());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+        let alone = world::build_dir(&control, "codex-old", "0.163.0");
+        assert_eq!(
+            complete_record(&alone),
+            Some(VendorRecord {
+                tree_from: None,
+                ..record
+            }),
+            "a download of its own records the same tree, only no lender"
+        );
+        assert_eq!(
+            crate::store::declared_modes(&dir).unwrap(),
+            crate::store::declared_modes(&alone).unwrap()
+        );
+    }
+
+    /// A codex build whose tree no longer folds to its record's root lends nothing: codex-old
+    /// downloads its own, lays OpenAI's bytes, and nothing is memoized against it.
+    #[test]
+    fn a_drifted_codex_tree_is_downloaded_not_shared() {
+        let (l, f) = codex_landed("codex-old-drift");
+        let from = world::build_dir(&l, "codex", "0.163.0");
+        std::fs::write(from.join("codex-path/rg"), native_exe("not rg")).unwrap();
+        let o = run(&l, &f, &Policy::default(), codex_old());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+        assert_eq!(
+            f.downloads.borrow().as_slice(),
+            [
+                Fake::codex_payload_url("0.163.0"),
+                Fake::codex_payload_url("0.163.0")
+            ]
+        );
+        let dir = world::build_dir(&l, "codex-old", "0.163.0");
+        assert_eq!(
+            std::fs::read(dir.join("codex-path/rg")).unwrap(),
+            native_exe("rg")
+        );
+        assert_eq!(complete_record(&dir).unwrap().tree_from, None);
+        verified(&l, "codex-old", "0.163.0", None);
+        assert!(
+            crate::store::stage_refusal(&dir).is_none(),
+            "a drifted lender is no verdict on the bytes"
+        );
+        let o = run(&l, &f, &Policy::default(), codex_old());
+        assert!(matches!(o.verdict, Verdict::Current(_)), "{o:?}");
+    }
+
+    /// Only a codex build of exactly codex-old's candidate is copied: a record naming another
+    /// digest or URL, or no codex build of the version codex-old lands, means a download.
+    #[test]
+    fn only_the_same_bytes_are_shared() {
+        let landed = |label: &str, edit: &dyn Fn(&mut VendorRecord)| {
+            let (l, f) = codex_landed(label);
+            let from = world::build_dir(&l, "codex", "0.163.0");
+            let mut record = complete_record(&from).unwrap();
+            edit(&mut record);
+            super::super::durable::write_durable(
+                &super::super::record_path(&from).unwrap(),
+                &record.record_bytes().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                complete_record(&from),
+                Some(record),
+                "PRECONDITION: a record codex's own lane reads"
+            );
+            let o = run(&l, &f, &Policy::default(), codex_old());
+            assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+            let dir = world::build_dir(&l, "codex-old", "0.163.0");
+            let downloads = f.downloads.borrow().len();
+            (downloads, complete_record(&dir).unwrap().tree_from)
+        };
+        assert_eq!(
+            landed("same-bytes", &|_| {}),
+            (1, Some("codex".into())),
+            "the control"
+        );
+        assert_eq!(
+            landed("other-digest", &|r| r.sha256 = "f".repeat(64)),
+            (2, None)
+        );
+        let other_url = format!(
+            "{}rust-v0.163.0/codex-package-other.tar.gz",
+            world::CODEX_DL
+        );
+        assert_eq!(
+            landed("other-url", &|r| r.source_url.clone_from(&other_url)),
+            (2, None)
+        );
+
+        let (l, f) = codex_landed("other-version");
+        f.publish_codex_default("0.164.0");
+        let o = run(&l, &f, &Policy::default(), codex_old());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+        assert_eq!(
+            f.downloads.borrow().as_slice(),
+            [
+                Fake::codex_payload_url("0.163.0"),
+                Fake::codex_payload_url("0.164.0")
+            ]
+        );
+        let dir = world::build_dir(&l, "codex-old", "0.164.0");
+        assert_eq!(complete_record(&dir).unwrap().tree_from, None);
+    }
+
+    /// A copied codex-old owns its tree outright: gc reclaiming the codex build it was copied
+    /// from, then codex's uninstall, leave its bytes, shim and verify as they were.
+    #[test]
+    fn codex_old_outlives_codex() {
+        let (l, f) = codex_landed("codex-old-outlives");
+        let o = run(&l, &f, &Policy::default(), codex_old());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+        let dir = world::build_dir(&l, "codex-old", "0.163.0");
+        assert_eq!(
+            complete_record(&dir).unwrap().tree_from.as_deref(),
+            Some("codex"),
+            "PRECONDITION: copied"
+        );
+        for version in ["0.164.0", "0.165.0"] {
+            f.publish_codex_default(version);
+            let o = run(&l, &f, &Policy::default(), codex());
+            assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+        }
+        let report = crate::gc::run(&l, None);
+        assert!(
+            std::fs::symlink_metadata(world::build_dir(&l, "codex", "0.163.0")).is_err(),
+            "PRECONDITION: gc reclaimed the build codex-old was copied from: {:?}",
+            report.reclaimed
+        );
+        let alias = dir.join(world::bin("codex-old"));
+        let tool = crate::store::ToolName::new("codex-old").unwrap();
+        let intact = |when: &str| {
+            verified(&l, "codex-old", "0.163.0", Some("codex"));
+            assert_eq!(
+                std::fs::read(&alias).ok(),
+                Some(native_exe("codex 0.163.0")),
+                "{when}"
+            );
+            for rel in codex_default_files() {
+                assert!(
+                    std::fs::symlink_metadata(dir.join(&rel)).is_ok_and(|m| m.is_file()),
+                    "{when}: {rel}"
+                );
+            }
+            assert_eq!(
+                crate::platform::resolve_shim(&l.shim(&tool)),
+                Some(alias.clone()),
+                "{when}"
+            );
+        };
+        intact("after gc");
+        crate::ops::uninstall(&l, "codex").unwrap();
+        assert!(
+            std::fs::symlink_metadata(l.prefix.join("store/codex")).is_err(),
+            "PRECONDITION: codex is gone"
+        );
+        intact("after codex's uninstall");
+    }
+
+    /// A codex-old the lane would not download is not copied either: a refusal of these exact
+    /// bytes, or a first-seen digest the candidate's differs from, refuses it before any codex
+    /// build is looked at.
+    #[test]
+    fn a_refused_or_conflicting_codex_old_is_never_shared() {
+        let (l, f) = codex_landed("codex-old-memo");
+        let sha256 = complete_record(&world::build_dir(&l, "codex", "0.163.0"))
+            .unwrap()
+            .sha256;
+        let digest =
+            AuthenticatedDigest::authenticated(crate::manifest::DigestAlg::Sha256, &sha256)
+                .unwrap();
+        ProgramStamp::record_refusal(
+            &l,
+            "codex-old",
+            "atpkg: codex-old 0.163.0 was refused",
+            v("0.163.0"),
+            &digest,
+        )
+        .unwrap();
+        let o = run(&l, &f, &Policy::default(), codex_old());
+        assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
+        assert!(
+            o.line()
+                .contains("an earlier pass refused these exact bytes"),
+            "{}",
+            o.line()
+        );
+        assert!(std::fs::symlink_metadata(world::build_dir(&l, "codex-old", "0.163.0")).is_err());
+        assert_eq!(shim_build(&l, "codex-old"), None);
+        assert_eq!(f.downloads.borrow().len(), 1);
+
+        let (l, f) = codex_landed("codex-old-recut");
+        let first =
+            AuthenticatedDigest::authenticated(crate::manifest::DigestAlg::Sha256, &"e".repeat(64))
+                .unwrap();
+        record_or_conflict(&l, "codex-old", v("0.163.0"), world::triple(), &first, true).unwrap();
+        let o = run(&l, &f, &Policy::default(), codex_old());
+        assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
+        assert!(o.line().contains("first seen for 0.163.0"), "{}", o.line());
+        assert!(std::fs::symlink_metadata(world::build_dir(&l, "codex-old", "0.163.0")).is_err());
+        assert_eq!(shim_build(&l, "codex-old"), None);
+        assert_eq!(f.downloads.borrow().len(), 1);
+    }
+
+    /// codex-old follows codex release by release, copying each: two releases, two downloads.
+    #[test]
+    fn codex_old_follows_codex_forward() {
+        let l = world::layout("codex-old-forward");
+        let f = Fake::default();
+        for version in ["0.163.0", "0.164.0"] {
+            f.publish_codex_default(version);
+            for spec in [codex(), codex_old()] {
+                let o = run(&l, &f, &Policy::default(), spec);
+                assert!(
+                    matches!(o.verdict, Verdict::Installed { .. }),
+                    "{version} {}: {o:?}",
+                    spec.program
+                );
+            }
+            let dir = world::build_dir(&l, "codex-old", version);
+            assert_eq!(
+                complete_record(&dir).unwrap().tree_from.as_deref(),
+                Some("codex"),
+                "{version}"
+            );
+        }
+        assert_eq!(
+            f.downloads.borrow().as_slice(),
+            [
+                Fake::codex_payload_url("0.163.0"),
+                Fake::codex_payload_url("0.164.0")
+            ]
+        );
+        assert_eq!(shim_build(&l, "codex-old"), Some(v("0.164.0").build_id()));
+        verified(&l, "codex-old", "0.164.0", Some("codex"));
+    }
+
+    /// The gate judges a copied tree where codex-old's own stage lays it, as it judges a
+    /// download: a team check refusing what sits under codex-old's store refuses the copy and
+    /// swaps nothing in, and codex's build, shim and stamp are as they were.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_gate_judges_a_taken_tree_at_codex_olds_paths() {
+        fn refuse_under_codex_old(
+            path: &Path,
+            _: &str,
+            _: std::time::Instant,
+        ) -> Result<(), aterm_update_core::codesign::CodesignError> {
+            if path.components().any(|c| c.as_os_str() == "codex-old") {
+                Err(aterm_update_core::codesign::CodesignError::Refused {
+                    code: Some(3),
+                    stderr: "test-requirement: code failed to satisfy specified code \
+                             requirement(s)\n"
+                        .into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        let refusing = Trust {
+            team_check: refuse_under_codex_old,
+            ..world::trust()
+        };
+        let l = world::layout("taken-gate");
+        let f = Fake::default();
+        f.publish_codex_default("0.163.0");
+        let o = run_with(&l, &f, &Policy::default(), &refusing, codex(), false);
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+        let o = run_with(&l, &f, &Policy::default(), &refusing, codex_old(), false);
+        assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
+        assert!(o.line().contains("signer refused"), "{}", o.line());
+        assert_eq!(
+            f.downloads.borrow().len(),
+            1,
+            "the copy was judged, no download"
+        );
+        assert!(
+            std::fs::symlink_metadata(world::build_dir(&l, "codex-old", "0.163.0")).is_err(),
+            "nothing swapped in"
+        );
+        assert_eq!(shim_build(&l, "codex-old"), None);
+        assert_eq!(shim_build(&l, "codex"), Some(v("0.163.0").build_id()));
+        verified(&l, "codex", "0.163.0", None);
+        let from = world::build_dir(&l, "codex", "0.163.0");
+        assert!(crate::store::stage_refusal(&from).is_none());
+        assert_eq!(ProgramStamp::read(&l, "codex").unwrap().refused, None);
+    }
+
+    /// The scratch a stage left beside `program`'s store builds: a copy or a swap not cleaned up.
+    fn scratch_left(l: &Layout, program: &str) -> Vec<String> {
+        let build = world::build_dir(l, program, "0.163.0");
+        let Ok(entries) = std::fs::read_dir(build.parent().unwrap()) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| n.contains(".incoming-") || n.contains(".superseded-"))
+            .collect()
+    }
+
+    /// Set the extended attribute `name` on `path` to `value`.
+    #[cfg(target_os = "macos")]
+    fn set_xattr(path: &Path, name: &str, value: &[u8]) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = std::ffi::CString::new(name).unwrap();
+        // SAFETY: `path` and `name` are NUL-terminated C strings and `value` a readable slice of
+        // the stated length, all outliving the call, which only reads them.
+        let rc = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast::<libc::c_void>(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "setxattr: {}", std::io::Error::last_os_error());
+    }
+
+    /// Finder information on a file of codex's build survives a clone and fails the Developer ID
+    /// gate's strict check, though the tree's root does not fold it: that build lends codex-old
+    /// nothing, and codex-old downloads its own, which carries none, leaving no scratch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_finder_tagged_codex_tree_is_downloaded_not_copied() {
+        let (l, f) = codex_landed("finder-tagged");
+        let from = world::build_dir(&l, "codex", "0.163.0").join(world::bin("codex"));
+        // Finder keeps only information that is not all zero: here, the file's hidden bit.
+        let mut info = [0u8; 32];
+        info[8] = 0x40;
+        set_xattr(&from, "com.apple.FinderInfo", &info);
+        let finder_info = |path: &Path| {
+            crate::platform::xattr_names(path)
+                .unwrap()
+                .iter()
+                .any(|name| name == b"com.apple.FinderInfo")
+        };
+        assert!(finder_info(&from), "the control");
+        let o = run(&l, &f, &Policy::default(), codex_old());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+        assert_eq!(
+            f.downloads.borrow().len(),
+            2,
+            "codex-old downloaded its own"
+        );
+        let dir = world::build_dir(&l, "codex-old", "0.163.0");
+        assert_eq!(complete_record(&dir).unwrap().tree_from, None);
+        verified(&l, "codex-old", "0.163.0", None);
+        assert_eq!(scratch_left(&l, "codex-old"), Vec::<String>::new());
+        assert!(!finder_info(&dir.join(world::bin("codex"))));
+    }
+
+    /// Clears every owner-binding flag under a tree when it drops, so a scratch layout a test
+    /// locked a file in can be removed, whether the test passed or not.
+    #[cfg(target_os = "macos")]
+    struct Unlock(std::path::PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Unlock {
+        fn drop(&mut self) {
+            fn walk(dir: &Path) {
+                use std::os::macos::fs::MetadataExt as _;
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for path in entries.flatten().map(|e| e.path()) {
+                    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                        continue;
+                    };
+                    if meta.file_type().is_symlink() {
+                        continue;
+                    }
+                    let bound = meta.st_flags() & crate::platform::OWNER_BINDING_FLAGS;
+                    if bound != 0 {
+                        let _ = crate::platform::set_file_flags(&path, meta.st_flags() & !bound);
+                    }
+                    if meta.is_dir() {
+                        walk(&path);
+                    }
+                }
+            }
+            walk(&self.0);
+        }
+    }
+
+    /// A clone keeps a file's BSD flags, so a locked file in codex's build would lay a copy no
+    /// cleanup can remove, and every later stage of codex-old would stop on that scratch: that
+    /// build lends nothing, nothing locked is laid, and codex-old downloads its own, leaving no
+    /// scratch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_locked_codex_file_is_downloaded_not_copied() {
+        use std::os::macos::fs::MetadataExt as _;
+        let (l, f) = codex_landed("locked");
+        let _unlock = Unlock(l.prefix.clone());
+        let notice = "codex-resources/voice/NOTICE.md";
+        let from = world::build_dir(&l, "codex", "0.163.0").join(notice);
+        crate::platform::set_file_flags(&from, libc::UF_IMMUTABLE).unwrap();
+        let o = run(&l, &f, &Policy::default(), codex_old());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+        assert_eq!(
+            f.downloads.borrow().len(),
+            2,
+            "codex-old downloaded its own"
+        );
+        let dir = world::build_dir(&l, "codex-old", "0.163.0");
+        assert_eq!(complete_record(&dir).unwrap().tree_from, None);
+        assert_eq!(scratch_left(&l, "codex-old"), Vec::<String>::new());
+        let laid = std::fs::symlink_metadata(dir.join(notice)).unwrap();
+        assert_eq!(
+            laid.st_flags() & crate::platform::OWNER_BINDING_FLAGS,
+            0,
+            "nothing locked is laid"
+        );
+    }
+
+    /// A copy holds the room its tree takes, as a download's second disk gate does: on a volume
+    /// that cannot clone it is a full copy. Short of room, codex-old's copy refuses as its
+    /// download does (the same verdict and sentence; only the room named differs, for a copy
+    /// needs none for the archive) and lays, fetches and memoizes nothing.
+    #[test]
+    fn a_copy_short_of_room_refuses_as_a_download_does() {
+        let (l, f) = codex_landed("copy-short");
+        let _full = crate::freespace::pinned::pin(&l.prefix, 0);
+        let copy = run(&l, &f, &Policy::default(), codex_old());
+        assert_eq!(f.downloads.borrow().len(), 1, "nothing fetched");
+        let dir = world::build_dir(&l, "codex-old", "0.163.0");
+        assert!(std::fs::symlink_metadata(&dir).is_err(), "nothing laid");
+        assert_eq!(scratch_left(&l, "codex-old"), Vec::<String>::new());
+        assert!(
+            crate::store::stage_refusal(&dir).is_none(),
+            "nothing memoized"
+        );
+        assert_eq!(shim_build(&l, "codex-old"), None);
+
+        let alone = world::layout("download-short");
+        let g = Fake::default();
+        g.publish_codex_default("0.163.0");
+        let _alone_full = crate::freespace::pinned::pin(&alone.prefix, 0);
+        let download = run(&alone, &g, &Policy::default(), codex_old());
+        assert!(g.downloads.borrow().is_empty(), "nothing fetched");
+        let refusal = |o: &Outcome| {
+            let Verdict::Failed { error, .. } = &o.verdict else {
+                panic!("not a disk refusal: {o:?}");
+            };
+            assert!(error.starts_with(crate::flow::DISK_REFUSAL_HEAD), "{error}");
+            let line = o.line();
+            line.split(": needs ").next().unwrap().to_string()
+        };
+        assert_eq!(refusal(&copy), refusal(&download));
+    }
+
+    /// When the copy's stage fails on this machine rather than on its bytes (the Developer ID
+    /// gate could not judge it), codex-old downloads its own instead of failing the pass, and
+    /// that download does not wait on the turn on the link the copy gave up once it was laid.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_copy_the_gate_cannot_judge_is_downloaded_instead() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static JUDGED: AtomicBool = AtomicBool::new(false);
+        fn cannot_judge_the_first(
+            path: &Path,
+            _: &str,
+            _: std::time::Instant,
+        ) -> Result<(), aterm_update_core::codesign::CodesignError> {
+            if path.components().any(|c| c.as_os_str() == "codex-old")
+                && !JUDGED.swap(true, Ordering::SeqCst)
+            {
+                return Err(aterm_update_core::codesign::CodesignError::Refused {
+                    code: Some(1),
+                    stderr: format!(
+                        "{}: resource fork, Finder information, or similar detritus not \
+                         allowed\n",
+                        path.display()
+                    ),
+                });
+            }
+            Ok(())
+        }
+        let (l, f) = codex_landed("copy-unjudged");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let trust = Trust {
+                team_check: cannot_judge_the_first,
+                ..world::trust()
+            };
+            let (policy, turns) = (Policy::default(), crate::flow::DownloadTurns::default());
+            let ticket = turns.ticket();
+            let lane = Lane {
+                layout: &l,
+                fetcher: &f,
+                triple: world::triple(),
+                policy: &policy,
+                trust: &trust,
+                legacy_index: None,
+                asked: false,
+                now: NOW,
+                download_turn: Some(&ticket),
+            };
+            let o = install_one(&lane, codex_old(), false);
+            let dir = world::build_dir(&l, "codex-old", "0.163.0");
+            let _ = tx.send((
+                format!("{o:?}"),
+                matches!(o.verdict, Verdict::Installed { .. }),
+                f.downloads.borrow().len(),
+                complete_record(&dir).map(|r| r.tree_from),
+                scratch_left(&l, "codex-old"),
+            ));
+        });
+        let (outcome, installed, downloads, tree_from, scratch) = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the landing hung: its download waited on the turn its copy gave up");
+        assert!(JUDGED.load(Ordering::SeqCst), "the copy reached the gate");
+        assert!(installed, "{outcome}");
+        assert_eq!(downloads, 2, "codex-old downloaded its own");
+        assert_eq!(tree_from, Some(None));
+        assert_eq!(scratch, Vec::<String>::new());
     }
 
     #[test]

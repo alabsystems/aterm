@@ -933,11 +933,13 @@ impl App {
         {
             self.install_native_tab(wid, instance, state, presentation)
         } else {
+            let (status, _) =
+                self.project_system_state_status(self.system_state_host.latest_status().clone());
+            let mut app = crate::system_state::SystemStateApp::opened();
+            app.publish(status);
             self.install_new_native_tab(
                 wid,
-                crate::native_app::NativeApp::SystemState(Box::new(
-                    crate::system_state::SystemStateApp::opened(),
-                )),
+                crate::native_app::NativeApp::SystemState(Box::new(app)),
                 state,
                 presentation,
             )
@@ -1149,6 +1151,7 @@ impl App {
             window.leaf_render_cache.remove(&view);
         }
         if let crate::tab_model::View::Native(native) = removed {
+            self.retire_native_ime_view(view);
             self.native_runtime.remove_view(view);
             let still_referenced = self.view_store.iter().any(|(_, candidate)| {
                 matches!(
@@ -1164,6 +1167,7 @@ impl App {
             self.native_documents.release_due = true;
         }
         self.edit_view_retired(view);
+        self.publish_system_state_front();
         Some(removed)
     }
 
@@ -2355,11 +2359,16 @@ impl App {
         let landing_tip = hold.and_then(|hold| {
             crate::harness_glass::hold_words(&hold, None, crate::harness_glass::HoldForm::Tip, None)
         });
-        let (verdict, agent, task, told) = {
+        let (verdict, agent, program, task, told) = {
             let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
                 tl.need().clone(),
                 tl.agent().word,
+                // The survey's render-time rule: a reader that names no state (codex's) leaves
+                // the word to what the program says itself.
+                tl.program_shown()
+                    .filter(|_| tl.agent().word == "unknown")
+                    .map(|shown| crate::program_state::survey_word(shown.state)),
                 tl.task().map(|t| crate::status_item::TaskRow {
                     state: t.state,
                     why: t.why,
@@ -2391,6 +2400,7 @@ impl App {
             unsupervised: verdict.recheck_unix.is_some(),
             held: verdict.held,
             agent,
+            program,
             task,
             need_since: self.presence.herald.need_since(h.local_id),
             held_since: self.presence.herald.held_since(h.local_id),
@@ -8016,6 +8026,95 @@ mod status_glance_tests {
                 .set(field, Some(value.to_string()));
         }
         app.publish_need(session);
+    }
+
+    /// A CODEX TAB AT REST RESTS ON THE GLANCE: where its reader names no state
+    /// (`agent=unknown`), the glance buckets the tab by the survey's word for the program's own
+    /// shown report (`program_state::survey_word`), so an `idle`, `done` or `error` report is
+    /// resting; with a `working` or `blocked` one, or none, it stays working, and a word its
+    /// reader names stands over any report. The herald sees the bucket move, so the menu bar is
+    /// rebuilt.
+    #[test]
+    fn a_codex_tabs_own_report_rests_it_only_where_its_reader_names_no_state() {
+        use aterm_core::terminal::program_state::{
+            ProgramBlockedKind as K, ProgramState, ProgramStateWord as W,
+        };
+        let mut app = App::headless_for_test();
+        let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+        let publish = |word: &'static str, reader: aterm_phase::Program, program: &str| {
+            let mut tl = ctx.timeline.lock().unwrap();
+            tl.note_foreground_group(4242);
+            tl.set_program(4242, Some(program.into()));
+            tl.publish_agent(
+                word,
+                None,
+                None,
+                Some(reader),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 7 },
+                    fp: 0xc0de,
+                },
+            );
+            assert_eq!(tl.agent().word, word);
+        };
+        let report_kind = |state: Option<W>, kind: Option<K>| {
+            ctx.timeline
+                .lock()
+                .unwrap()
+                .note_program_state(state.map(|state| ProgramState { state, kind }));
+        };
+        let report = |state: Option<W>| report_kind(state, None);
+        let here = |app: &App| {
+            let g = app.status_glance();
+            (g.here.resting, g.here.working)
+        };
+        publish("unknown", aterm_phase::Program::Codex, "codex");
+        report(None);
+        assert_eq!(here(&app), (0, 1), "no report: unknown stays working");
+        for state in [W::Idle, W::Done, W::Error] {
+            report(Some(state));
+            assert_eq!(here(&app), (1, 0), "{state:?}: a codex at rest rests");
+        }
+        report(Some(W::Working));
+        assert_eq!(here(&app), (0, 1), "a working report is work");
+        for kind in [None, Some(K::Permission), Some(K::Question), Some(K::Auth)] {
+            report_kind(Some(W::Blocked), kind);
+            assert_eq!(
+                here(&app),
+                (0, 1),
+                "blocked {kind:?}: a blocked codex is no rest"
+            );
+        }
+        report(Some(W::Idle));
+        let handle = app
+            .store
+            .read()
+            .unwrap()
+            .by_local(0)
+            .cloned()
+            .expect("registered");
+        let resting = app.status_session_row(&handle);
+        assert_eq!(resting.program, Some("idle"));
+        report(Some(W::Working));
+        let working = app.status_session_row(&handle);
+        let now = status_unix_now();
+        assert!(app.presence.herald.observe(0, Some(&resting), now));
+        assert!(
+            app.presence.herald.observe(0, Some(&working), now),
+            "the bucket moved with the report alone"
+        );
+        assert!(
+            !app.presence.herald.observe(0, Some(&working), now),
+            "control: no move"
+        );
+        publish("busy", aterm_phase::Program::Claude, "claude");
+        report(Some(W::Idle));
+        assert_eq!(
+            here(&app),
+            (0, 1),
+            "a word its reader names stands over the report"
+        );
+        assert_eq!(app.status_session_row(&handle).program, None);
     }
 
     #[test]

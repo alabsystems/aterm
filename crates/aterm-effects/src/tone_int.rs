@@ -60,7 +60,9 @@ pub enum DeriveError {
 }
 
 /// `x` rounded to the nearest integer with halves away from zero, by a truncating cast and an exact binary64 subtraction; `None` unless `|x| < 2⁵²`.
-pub fn round_half_away(x: f64) -> Option<i64> {
+#[must_use]
+#[inline]
+pub const fn round_half_away(x: f64) -> Option<i64> {
     const LIMIT: f64 = 4_503_599_627_370_496.0;
     if x.is_nan() || x <= -LIMIT || x >= LIMIT {
         return None;
@@ -77,11 +79,15 @@ pub fn round_half_away(x: f64) -> Option<i64> {
 }
 
 /// tanh by Lambert's continued fraction, evaluated bottom-up from t = 47 with binary64 `+`, `×` and `÷` alone (design §12.2).
-pub fn tanh(x: f64) -> f64 {
+#[must_use]
+#[inline]
+pub const fn tanh(x: f64) -> f64 {
     let x2 = x * x;
     let mut t = 47.0;
-    for k in (1..=23u32).rev() {
-        t = f64::from(2 * k - 1) + x2 / t;
+    let mut k = 23u32;
+    while k >= 1 {
+        t = (2 * k - 1) as f64 + x2 / t;
+        k -= 1;
     }
     x / t
 }
@@ -275,6 +281,8 @@ pub fn workload_digest() -> Digest {
 }
 
 /// A class as [`F_ARGMAX_371`] codes it: the tone's index, or C (abstain) for `None`.
+#[must_use]
+#[inline]
 pub const fn class_code(tone: Option<Tone>) -> u8 {
     match tone {
         Some(t) => t.index() as u8,

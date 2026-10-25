@@ -684,6 +684,7 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         login_at_wall: None,
         login_method: None,
         login_shared: None,
+        login_moved: false,
         roster: None,
         seat: Default::default(),
     }

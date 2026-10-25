@@ -235,6 +235,11 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         let _ = window;
         None
     }
+    /// The account the session's Claude Code profile is signed in to now
+    /// ([`crate::harness::profile::account_of`]), for a stored login alone.
+    fn login_account(&self) -> Option<crate::harness::profile::AccountKey> {
+        None
+    }
     fn inform(&self, text: &str) {
         let _ = text;
     }

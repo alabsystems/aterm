@@ -351,7 +351,7 @@ impl DensityRing {
 mod tests {
     use super::*;
 
-    fn params(rows: u32, tick_ms: u32, speed: u32, trail: u32) -> FieldParams {
+    const fn params(rows: u32, tick_ms: u32, speed: u32, trail: u32) -> FieldParams {
         let (mq, dq, sq) = FieldParams::quanta(tick_ms, 133);
         FieldParams {
             seed32: rain_hash32(0xC0FF_EE00),

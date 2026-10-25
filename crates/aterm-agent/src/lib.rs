@@ -456,7 +456,10 @@ MENTAL MODEL
     Driving a session is `aterm ctl` (`aterm ctl help`): `aterm ctl @self spawn
     agent=claude -` starts a worker, `aterm ctl await task @<sid>,… since=0` waits
     for it, `aterm ctl @<sid> result` reads its report; `turn`, `text`, `image` and
-    `await agent idle,prompt,question,wall` drive and watch it.
+    `await agent idle,prompt,question,wall` drive and watch a Claude Code, agy, Muse
+    Code or Gemini CLI session; for a codex (whose `agent=` stays `unknown`),
+    `await log kind=program since=<log_seq> ep=<log_ep>`, both read from `status`
+    before typing to it, waits on its own report.
     `aterm ctl @sid meta set questions ask|recommended|long-term|short-term` sets how
     the window answers that session's questions (`ask` leaves them to a person or
     `aterm drive answer`); `meta unset questions` hands them back to `[harness]`

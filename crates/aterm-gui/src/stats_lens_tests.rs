@@ -1470,6 +1470,45 @@ fn lens_gallery() {
     assert_eq!(written.len(), (6 + 10 + 3) * 2);
 }
 
+/// The card a reading splices (its body over the kept shell's raster) is the card one raster of
+/// the whole lens gives, byte for byte.
+#[test]
+fn the_body_over_the_shells_raster_is_the_whole_lens() {
+    use crate::tray_raster::{rasterize_tray, rasterize_tray_over};
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let spotlight = engine_1032();
+    let trouble = lens_scene(Scene::Trouble);
+    let calm = lens_scene(Scene::Calm);
+    for (snap, focus, inks) in [
+        (&spotlight, Instrument::Cpu, dark_inks()),
+        (&trouble, Instrument::Cpu, light_inks()),
+        (&trouble, Instrument::Disk, dark_inks()),
+        (&calm, Instrument::Memory, light_inks()),
+        (&calm, Instrument::HowToRead, dark_inks()),
+    ] {
+        let lg = shell(1024.0, 250.0, 2.0);
+        let (w, h) = (lg.w as u32, lg.h as u32);
+        let laid = lay_lens(
+            &lg,
+            &input(snap, inks),
+            &pinned(focus),
+            &deck_metrics(),
+            true,
+        );
+        let (head, body) = laid.prims.split_at(laid.shell);
+        assert!(
+            head.iter()
+                .all(|p| matches!(p, DrawPrim::Panel { .. } | DrawPrim::Stroke { .. })),
+            "{focus:?}: the shell is panels and its rim"
+        );
+        assert!(!body.is_empty(), "{focus:?}");
+        let (whole, ..) = rasterize_tray(&laid.prims, w, h, 1.0, [0, 0, 0, 0]);
+        let (ground, ..) = rasterize_tray(head, w, h, 1.0, [0, 0, 0, 0]);
+        let spliced = rasterize_tray_over(body, 1.0, ground, w, h);
+        assert!(whole == spliced, "{focus:?}: the spliced card differs");
+    }
+}
+
 #[test]
 fn a_cjk_line_of_the_lens_wraps_between_its_characters() {
     let m = FaceMetrics::helvetica_neue();

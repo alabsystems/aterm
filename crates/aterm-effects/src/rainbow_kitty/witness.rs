@@ -1976,11 +1976,11 @@ mod tests {
     use super::super::ribbon::Layer;
     use super::*;
 
-    fn cell(row: u16, col: u16, born: Instant) -> Cell {
+    const fn cell(row: u16, col: u16, born: Instant) -> Cell {
         cell_of(row, col, born, 0)
     }
 
-    fn cell_of(row: u16, col: u16, born: Instant, cohort: u32) -> Cell {
+    const fn cell_of(row: u16, col: u16, born: Instant, cohort: u32) -> Cell {
         Cell {
             row,
             col,
@@ -2066,7 +2066,7 @@ mod tests {
         out
     }
 
-    fn up(lo: u16, hi: u16) -> FollowRun {
+    const fn up(lo: u16, hi: u16) -> FollowRun {
         FollowRun {
             row: 5,
             cohort: 7,

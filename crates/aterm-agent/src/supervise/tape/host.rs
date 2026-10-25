@@ -16,6 +16,7 @@ use super::frame::Hint;
 use crate::harness::accounts::Sample;
 use crate::harness::acts::{Act, LandHeld, TaskFace};
 use crate::harness::disk::Level;
+use crate::harness::profile::AccountKey;
 use crate::harness::repo_work::{RepoRead, RepoWork};
 use crate::harness::upgrade::{LastTurn, StandingLimit};
 use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
@@ -467,6 +468,22 @@ impl TapeValue for Option<aterm_phase::LoginMethod> {
             .map(|w| {
                 aterm_phase::LoginMethod::of_word(&w)
                     .ok_or(bad("a login method this build does not know"))
+            })
+            .transpose()
+    }
+}
+
+/// The account the session's profile is signed in to
+/// ([`super::super::IdleHost::login_account`]) on a tape: its key's text.
+impl TapeValue for Option<AccountKey> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.map(|key| key.to_string()))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        of_json::<Option<String>>(bytes)?
+            .map(|text| {
+                AccountKey::parse(&text).ok_or(bad("an account key this build cannot read"))
             })
             .transpose()
     }

@@ -54,6 +54,8 @@ pub enum Shape {
     Plain {
         /// The Apple targets one build carries.
         darwin: &'static [Triple],
+        /// `Some` for an ALab harness row (`atpkg::harness`), packed to [`Harness`]'s rule.
+        harness: Option<Harness>,
     },
     /// A whole sysroot (bin/ + lib/), packed from a staged toolchain. The agent cutting it
     /// packs it on a release-credential machine; the lanes only say what is owed.
@@ -66,6 +68,19 @@ pub enum Shape {
     /// everywhere ALab does not build it; no lane reads it, and the index switches its block
     /// to this row only on an explicit `--pin` (`channel::index::plan`).
     Package(PackageDef),
+}
+
+/// What a harness row's pack is held to beyond a plain row's
+/// (`docs/DESIGN-harness-repos-2026-10-24.md` §5, §6.1). The pack refuses, before it builds:
+/// a repo `expose` naming anything but [`Self::tool`], any `bundle`, a program-named package
+/// that is absent or not at `MAJOR.MINOR.0`, a checkout that is not clean, and a build number
+/// that is not the checkout's `HEAD` commit count. It builds `--locked` and calls the pack
+/// `MAJOR.MINOR.0+g<9-hex HEAD>`, the publication rule's spelling of a dev build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Harness {
+    /// The one tool it ships and shims: the repo's binary. A repo that declares no `expose`
+    /// ships this one, never the uncurated name-token fallback.
+    pub tool: &'static str,
 }
 
 /// How a prebuilt package tree is packed.
@@ -111,13 +126,41 @@ const fn plain(
     group: Option<&'static str>,
     darwin: &'static [Triple],
 ) -> ProgramDef {
+    assert!(
+        !atpkg::harness::is_harness(name),
+        "a harness is a `harness` row: a plain row would pack it to the looser rule"
+    );
     ProgramDef {
         name,
         repo: name,
         group,
         system: None,
         unavailable_hint: None,
-        shape: Shape::Plain { darwin },
+        shape: Shape::Plain {
+            darwin,
+            harness: None,
+        },
+    }
+}
+
+/// An ALab harness: repo = program (the one-word rule), Apple silicon only, ungrouped, packed
+/// to [`Harness`]'s rule, and outside the client's default set
+/// (`atpkg::harness::in_default_set`).
+const fn harness(name: &'static str, tool: &'static str) -> ProgramDef {
+    assert!(
+        atpkg::harness::is_harness(name),
+        "a harness row is named `<agent>-alab`, or no client knows it is one"
+    );
+    ProgramDef {
+        name,
+        repo: name,
+        group: None,
+        system: None,
+        unavailable_hint: None,
+        shape: Shape::Plain {
+            darwin: ARM_DARWIN,
+            harness: Some(Harness { tool }),
+        },
     }
 }
 
@@ -172,6 +215,15 @@ pub static PROGRAMS: &[ProgramDef] = &[
             darwin: ARM_DARWIN,
         }),
     },
+    // The ALab harnesses, each its own repo's one binary
+    // (`docs/DESIGN-harness-repos-2026-10-24.md` §6.1). The tool is what the repo's
+    // `[workspace.metadata.atpkg] expose` names; kimi-alab declares none, so its row names
+    // its one `[[bin]]`.
+    harness("claude-code-alab", "claude-alab"),
+    harness("muse-alab", "muse-alab"),
+    harness("agy-alab", "agy-alab"),
+    harness("grok-alab", "grok-alab"),
+    harness("kimi-alab", "kimi-alab"),
 ];
 
 /// The program named `name`.
@@ -190,7 +242,7 @@ impl ProgramDef {
     #[must_use]
     pub const fn darwin_triples(&self) -> &'static [Triple] {
         match self.shape {
-            Shape::Plain { darwin } => darwin,
+            Shape::Plain { darwin, .. } => darwin,
             Shape::Bundle(b) => b.darwin,
             Shape::Package(p) => p.darwin,
         }
@@ -200,6 +252,15 @@ impl ProgramDef {
     #[must_use]
     pub const fn is_plain(&self) -> bool {
         matches!(self.shape, Shape::Plain { .. })
+    }
+
+    /// Its harness rule, when it is a harness row.
+    #[must_use]
+    pub const fn harness(&self) -> Option<Harness> {
+        match self.shape {
+            Shape::Plain { harness, .. } => harness,
+            Shape::Bundle(_) | Shape::Package(_) => None,
+        }
     }
 
     /// Whether the unattended lanes read it at all: a [`Shape::Package`] row is packed and

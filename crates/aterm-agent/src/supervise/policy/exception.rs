@@ -209,6 +209,18 @@ impl Exception {
         }
     }
 
+    /// Claude Code's own Settings panel, still open at the dialog canary's third rung and opened
+    /// by a hand other than the harness's: [`Self::dialog`]'s kind, in words that name the panel.
+    #[must_use]
+    pub fn settings_panel() -> Self {
+        Self {
+            why: "Claude Code's Settings panel stays open in this tab, and aterm did not open it."
+                .to_string(),
+            action: "Press Esc in this tab to close the panel.".to_string(),
+            ..Self::dialog()
+        }
+    }
+
     /// A conversation no `/compact` can shorten ([`exception_for`]'s full-context arm).
     #[must_use]
     pub fn context() -> Self {

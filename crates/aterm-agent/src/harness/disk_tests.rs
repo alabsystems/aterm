@@ -1860,6 +1860,7 @@ fn the_text_form_spells_paths_plain_and_the_row_keeps_its_own() {
         bytes: 1 << 20,
         bytes_partial: false,
         why: r"kept by \\?\Volume{6140fc3b-044f-43d7-b060-cb98170c7a63}\x".to_owned(),
+        serves: None,
     };
     let line = row.line();
     let hog_line = hog.line(Some(Path::new(r"C:\Users\u")));

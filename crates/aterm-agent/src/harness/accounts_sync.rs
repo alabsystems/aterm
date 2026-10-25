@@ -3233,14 +3233,20 @@ fn upkeep_pools(
                 (fx.fetch, &[]),
             );
         }
-        if renews {
+        if let Some(pending) = step
+            .renews()
+            .then(|| resume_pending_pin_for(cli, home, state_dir, &path, now, fx))
+            .flatten()
+        {
+            let _ = pending;
+        } else if renews {
             let _ = renew_pool_due(cli, home, state_dir, &path, now, fx);
         }
     }
 }
 
-/// Start one of `cli`'s due logins' renewal ([`accounts::renew_due`], [`spawn_row_renewal`]);
-/// whether one started.
+/// Start one of `cli`'s due or wall-recovery logins' renewal ([`auto_renew_candidates_for`],
+/// [`spawn_row_renewal`]); whether one started.
 fn renew_pool_due(
     cli: Cli,
     home: &Path,
@@ -3249,36 +3255,22 @@ fn renew_pool_due(
     now: i64,
     fx: &UpkeepEffects<'_>,
 ) -> bool {
+    if let Some(pending) = resume_pending_pin_for(cli, home, state_dir, roster_path, now, fx) {
+        return pending.progressed();
+    }
     let Ok(file_roster) = Roster::load_for(cli, roster_path) else {
         return false;
     };
+    if file_roster.rows.is_empty() {
+        return false;
+    }
     let store = accounts::Store::at_for(state_dir, cli, home);
     let recovered =
         recover_interrupted_staging_renewals_for(cli, &store, &file_roster, fx.renew_guard, now);
     let (Ok((state, _)), Ok((logins, _))) = (store.load(now), store.load_logins(now)) else {
         return recovered;
     };
-    let bound = accounts::bound(&file_roster, &logins);
-    let enrolled = accounts::enrolled_for(cli, &bound);
-    let mut due_labels: Vec<String> = accounts::renew_due(&bound, &logins, &state, &enrolled, now)
-        .into_iter()
-        .filter(|label| {
-            !state
-                .accounts
-                .get(label)
-                .is_some_and(|a| a.limited_until(now).is_some())
-        })
-        .collect();
-    due_labels.sort_by_key(|label| {
-        (
-            unaddressed_sign_in_task_at(&store, &logins, label),
-            logins.get(label).and_then(|b| b.wrong_at),
-        )
-    });
-    for label in due_labels {
-        let Some(row) = file_roster.row(&label).cloned() else {
-            continue;
-        };
+    for row in auto_renew_candidates_for(cli, Some(&store), &file_roster, &state, &logins, now) {
         if spawn_row_renewal(
             cli,
             home,
@@ -3402,7 +3394,7 @@ fn reconcile_browser_window_unpark(
 
 /// Notes how a background renewal of `label` ended: one that stopped for a person
 /// ([`super::cli::Renewal::NeedsPerson`]) parks the row until [`PERSON_BACKOFF`] has passed
-/// since `now`; any other end unparks it.
+/// since `now`; a contended lock leaves any park as it was; any other end unparks it.
 fn note_background_end(
     state: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     label: &str,
@@ -3414,9 +3406,20 @@ fn note_background_end(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if renewal == super::cli::Renewal::NeedsPerson {
         guard.parked.insert(label.to_owned(), now);
-    } else {
+    } else if renewal != super::cli::Renewal::Busy {
         guard.parked.remove(label);
     }
+}
+
+/// Whether Claude Code's store or any pooled CLI's store under `state_dir` holds a saved
+/// explicit account selection (`pending_pin`).
+#[must_use]
+pub fn any_pending_pin(state_dir: &Path, now: i64) -> bool {
+    accounts::Cli::ALL.into_iter().any(|cli| {
+        accounts::Store::at_for(state_dir, cli, Path::new(""))
+            .load(now)
+            .is_ok_and(|(state, _)| state.pending_pin.is_some())
+    })
 }
 
 static AUTO_RENEW_GUARD: std::sync::LazyLock<std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>> =
@@ -3482,13 +3485,23 @@ impl Drop for AutoRenewPermit {
             .in_flight = false;
         // Publish the wake only after admission is available to the next upkeep.
         if let Some(state_dir) = &self.wake_pending {
-            let store = accounts::Store::at(state_dir);
             let now = crate::supervise::limit::unix_now();
-            if store
+            let root_store = accounts::Store::at(state_dir);
+            let mut any_pending = root_store
                 .load(now)
-                .is_ok_and(|(state, _)| state.pending_pin.is_some())
-            {
-                let _ = store.touch_wake();
+                .is_ok_and(|(state, _)| state.pending_pin.is_some());
+            for cli in OTHER_CLIS {
+                let pool_store = accounts::Store::at_for(state_dir, cli, Path::new(""));
+                if pool_store
+                    .load(now)
+                    .is_ok_and(|(state, _)| state.pending_pin.is_some())
+                {
+                    let _ = pool_store.touch_wake();
+                    any_pending = true;
+                }
+            }
+            if any_pending {
+                let _ = root_store.touch_wake();
             }
         }
     }
@@ -3664,8 +3677,19 @@ pub(super) fn auto_renew_candidates(
     logins: &accounts::Logins,
     now: i64,
 ) -> Vec<accounts::Row> {
+    auto_renew_candidates_for(Cli::Claude, None, file_roster, state, logins, now)
+}
+
+pub(super) fn auto_renew_candidates_for(
+    cli: Cli,
+    store: Option<&accounts::Store>,
+    file_roster: &Roster,
+    state: &accounts::State,
+    logins: &accounts::Logins,
+    now: i64,
+) -> Vec<accounts::Row> {
     let roster = accounts::bound(file_roster, logins);
-    let enrolled = accounts::enrolled(&roster);
+    let enrolled = accounts::enrolled_for(cli, &roster);
     let is_walled_or_low = |label: &str| {
         state.accounts.get(label).is_some_and(|a| {
             a.limited_until(now).is_some() || a.low(now) || a.auth == accounts::Auth::SignedOut
@@ -3749,7 +3773,19 @@ pub(super) fn auto_renew_candidates(
             tiered.push((1, row.clone()));
         }
     }
-    tiered.sort_by_key(|(tier, row)| (*tier, logins.get(&row.label).and_then(|b| b.wrong_at)));
+    tiered.sort_by_key(|(tier, row)| {
+        let task_at = match store {
+            Some(store) => unaddressed_sign_in_task_at(store, logins, &row.label),
+            None => logins
+                .get(&row.label)
+                .and_then(|b| b.sign_in_task.map(|t| t.at)),
+        };
+        (
+            *tier,
+            task_at,
+            logins.get(&row.label).and_then(|b| b.wrong_at),
+        )
+    });
     tiered.into_iter().map(|(_, row)| row).collect()
 }
 
@@ -4141,7 +4177,14 @@ fn auto_renew_next_account(
     let Ok((logins, _)) = store.load_logins(now) else {
         return recovered;
     };
-    for next_row in auto_renew_candidates(&file_roster, &state, &logins, now) {
+    for next_row in auto_renew_candidates_for(
+        Cli::Claude,
+        Some(&store),
+        &file_roster,
+        &state,
+        &logins,
+        now,
+    ) {
         if spawn_row_renewal(
             accounts::Cli::Claude,
             home,
@@ -4186,33 +4229,45 @@ pub fn auto_renew_next_account_interactive(
     roster_path: &Path,
     now: i64,
 ) -> bool {
+    auto_renew_next_account_interactive_for(Cli::Claude, home, state_dir, roster_path, now)
+}
+
+/// [`auto_renew_next_account_interactive`] for `cli`'s pool.
+pub fn auto_renew_next_account_interactive_for(
+    cli: Cli,
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+) -> bool {
     let fx = UpkeepEffects {
         fetch: &fetch_source_text,
         spawn_renewal: &spawn_renewal_thread,
         sync_cooldown: &AUTO_SYNC_COOLDOWN,
         renew_guard: &AUTO_RENEW_GUARD,
     };
-    if let Some(pending) = resume_pending_pin(home, state_dir, roster_path, now, &fx) {
+    if let Some(pending) = resume_pending_pin_for(cli, home, state_dir, roster_path, now, &fx) {
         return pending.progressed();
     }
-    let Ok(file_roster) = Roster::load(roster_path) else {
+    let Ok(file_roster) = Roster::load_for(cli, roster_path) else {
         return false;
     };
     if file_roster.rows.is_empty() {
         return false;
     }
-    let store = accounts::Store::at(state_dir);
+    let store = accounts::Store::at_for(state_dir, cli, home);
     let recovered =
-        recover_interrupted_staging_renewals(&store, &file_roster, &AUTO_RENEW_GUARD, now);
+        recover_interrupted_staging_renewals_for(cli, &store, &file_roster, &AUTO_RENEW_GUARD, now);
     let Ok((state, _)) = store.load(now) else {
         return recovered;
     };
     let Ok((logins, _)) = store.load_logins(now) else {
         return recovered;
     };
-    for next_row in auto_renew_candidates(&file_roster, &state, &logins, now) {
+    for next_row in auto_renew_candidates_for(cli, Some(&store), &file_roster, &state, &logins, now)
+    {
         if spawn_row_renewal(
-            accounts::Cli::Claude,
+            cli,
             home,
             state_dir,
             file_roster.clone(),
@@ -4259,12 +4314,24 @@ fn resume_pending_pin(
     now: i64,
     fx: &UpkeepEffects<'_>,
 ) -> Option<RenewalDispatch> {
-    let store = accounts::Store::at(state_dir);
+    resume_pending_pin_for(Cli::Claude, home, state_dir, roster_path, now, fx)
+}
+
+fn resume_pending_pin_for(
+    cli: Cli,
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+    fx: &UpkeepEffects<'_>,
+) -> Option<RenewalDispatch> {
+    let store = accounts::Store::at_for(state_dir, cli, home);
     let request = match store.load(now) {
         Ok((state, _)) => state.pending_pin?,
         Err(_) => return Some(RenewalDispatch::Failed),
     };
-    let result = renew_requested_pin(
+    let result = renew_requested_pin_for(
+        cli,
         home,
         state_dir,
         roster_path,
@@ -4287,7 +4354,20 @@ pub fn auto_renew_account_by_label(
     request: accounts::PinRequest,
     now: i64,
 ) -> RenewalDispatch {
-    renew_requested_pin(
+    auto_renew_account_by_label_for(Cli::Claude, home, state_dir, roster_path, request, now)
+}
+
+/// [`auto_renew_account_by_label`] for `cli`'s pool.
+pub fn auto_renew_account_by_label_for(
+    cli: Cli,
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    request: accounts::PinRequest,
+    now: i64,
+) -> RenewalDispatch {
+    renew_requested_pin_for(
+        cli,
         home,
         state_dir,
         roster_path,
@@ -4298,6 +4378,7 @@ pub fn auto_renew_account_by_label(
     )
 }
 
+#[cfg(test)]
 fn renew_requested_pin(
     home: &Path,
     state_dir: &Path,
@@ -4307,16 +4388,42 @@ fn renew_requested_pin(
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     spawn_renewal: &SpawnRenewal,
 ) -> RenewalDispatch {
-    let Ok(file_roster) = Roster::load(roster_path) else {
+    renew_requested_pin_for(
+        Cli::Claude,
+        home,
+        state_dir,
+        roster_path,
+        request,
+        now,
+        renew_guard,
+        spawn_renewal,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "requested-pin renewal binds CLI, paths, saved request, clock, admission guard, and spawn seam"
+)]
+fn renew_requested_pin_for(
+    cli: Cli,
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    request: accounts::PinRequest,
+    now: i64,
+    renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    spawn_renewal: &SpawnRenewal,
+) -> RenewalDispatch {
+    let Ok(file_roster) = Roster::load_for(cli, roster_path) else {
         return RenewalDispatch::Failed;
     };
-    let store = accounts::Store::at(state_dir);
+    let store = accounts::Store::at_for(state_dir, cli, home);
     match store.load(now) {
         Ok((state, _)) if state.pending_pin.as_ref() == Some(&request) => {}
         Ok(_) => return RenewalDispatch::Superseded,
         Err(_) => return RenewalDispatch::Failed,
     }
-    recover_interrupted_staging_renewals(&store, &file_roster, renew_guard, now);
+    recover_interrupted_staging_renewals_for(cli, &store, &file_roster, renew_guard, now);
     let mut disposition = RenewalDispatch::Superseded;
     let mut target = None;
     if store
@@ -4325,7 +4432,7 @@ fn renew_requested_pin(
                 return Ok(Vec::new());
             }
             let roster = accounts::bound(&file_roster, logins);
-            let enrolled = accounts::enrolled(&roster);
+            let enrolled = accounts::enrolled_for(cli, &roster);
             let Some(next_row) = roster.row(request.label()).cloned() else {
                 return Err("selected account is no longer in the roster".into());
             };
@@ -4349,7 +4456,7 @@ fn renew_requested_pin(
         return disposition;
     };
     spawn_row_renewal(
-        accounts::Cli::Claude,
+        cli,
         home,
         state_dir,
         file_roster,
@@ -4379,13 +4486,14 @@ fn spawn_row_renewal(
     spawn_renewal: &SpawnRenewal,
 ) -> RenewalDispatch {
     if cli != accounts::Cli::Claude {
-        return spawn_vendor_renewal(
+        return spawn_vendor_renewal_with(
             cli,
             home,
             state_dir,
-            &file_roster,
+            file_roster,
             logins,
             next_row,
+            pin_request,
             now,
             renew_guard,
             spawn_renewal,
@@ -4613,12 +4721,7 @@ fn spawn_row_renewal(
     .map_or(RenewalDispatch::Failed, |()| RenewalDispatch::Started)
 }
 
-/// [`spawn_row_renewal`] for another CLI's row: its renewal ([`super::cli::renew_one_for`]: the
-/// vendor's own sign-in under the machine's sign-in lock, its page approved headlessly) started
-/// in the background, where a headless browser is installed, the row has an email and the CLI
-/// has a sign-in (one that opens the desk's browser runs under
-/// [`super::login_drive::NO_DESK`] there, [`crate::ai::connector::SignIn::no_desk`]). A row
-/// whose last one stopped for a person waits [`PERSON_BACKOFF`] ([`note_background_end`]).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn spawn_vendor_renewal(
     cli: accounts::Cli,
@@ -4631,6 +4734,42 @@ fn spawn_vendor_renewal(
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     spawn_renewal: &SpawnRenewal,
 ) -> RenewalDispatch {
+    spawn_vendor_renewal_with(
+        cli,
+        home,
+        state_dir,
+        file_roster.clone(),
+        logins,
+        next_row,
+        None,
+        now,
+        renew_guard,
+        spawn_renewal,
+    )
+}
+
+/// [`spawn_row_renewal`] for another CLI's row: its renewal ([`super::cli::renew_one_for`]: the
+/// vendor's own sign-in under the machine's sign-in lock, its page approved headlessly) started
+/// in the background, where a headless browser is installed, the row has an email and the CLI
+/// has a sign-in (one that opens the desk's browser runs under
+/// [`super::login_drive::NO_DESK`] there, [`crate::ai::connector::SignIn::no_desk`]). A row
+/// whose last one stopped for a person waits [`PERSON_BACKOFF`] ([`note_background_end`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "vendor row renewal binds CLI, paths, roster, logins, target row, optional pin request, clock, admission guard, and spawn seam"
+)]
+fn spawn_vendor_renewal_with(
+    cli: accounts::Cli,
+    home: &Path,
+    state_dir: &Path,
+    file_roster: Roster,
+    logins: &accounts::Logins,
+    next_row: accounts::Row,
+    pin_request: Option<accounts::PinRequest>,
+    now: i64,
+    renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    spawn_renewal: &SpawnRenewal,
+) -> RenewalDispatch {
     if next_row.email.is_none()
         || cli.accounts().signin.as_ref().is_none()
         || super::headless_oauth::find_headless_browser(Some(home)).is_none()
@@ -4638,7 +4777,8 @@ fn spawn_vendor_renewal(
         return RenewalDispatch::Failed;
     }
     let mailbox_mtime = latest_mailbox_mtime(Some(home), &accounts::Store::at(state_dir));
-    if let Some(wrong_at) = logins.get(&next_row.label).and_then(|b| b.wrong_at)
+    if pin_request.is_none()
+        && let Some(wrong_at) = logins.get(&next_row.label).and_then(|b| b.wrong_at)
         && now.saturating_sub(wrong_at) < 900
     {
         let mailbox_updated_since = mailbox_mtime
@@ -4656,7 +4796,10 @@ fn spawn_vendor_renewal(
             let token = (task.action == accounts::SignInAction::Browser)
                 .then(|| browser_window_signed_in_token(&store, &next_row.label, task.at))
                 .flatten();
-            if token.is_none() && now.saturating_sub(task.at) < PERSON_BACKOFF_SECS {
+            if pin_request.is_none()
+                && token.is_none()
+                && now.saturating_sub(task.at) < PERSON_BACKOFF_SECS
+            {
                 return RenewalDispatch::Held;
             }
             token
@@ -4693,15 +4836,16 @@ fn spawn_vendor_renewal(
     } else {
         reconcile_browser_window_unpark(renew_guard, &key, browser_token);
     }
-    let Some(permit) = AutoRenewPermit::claim_with_mailbox(
+    let Some(mut permit) = AutoRenewPermit::claim_with_mailbox(
         renew_guard,
         &key,
         Instant::now(),
-        false,
+        pin_request.is_some(),
         mailbox_mtime,
     ) else {
         return RenewalDispatch::Held;
     };
+    permit.wake_pending = Some(state_dir.to_path_buf());
     let own_dir = file_roster.row(&next_row.label).and_then(|r| r.dir.clone());
     let parker = std::sync::Arc::clone(renew_guard);
     start_auto_renew(
@@ -4718,6 +4862,32 @@ fn spawn_vendor_renewal(
                 &mut io::sink(),
             );
             note_background_end(&parker, &key, renewal, Instant::now());
+            if let Some(request) = &pin_request {
+                let now_done = crate::supervise::limit::unix_now().max(now);
+                match renewal {
+                    super::cli::Renewal::Renewed => {
+                        let mut note = None;
+                        let _ = store.transact_logins_within(
+                            &accounts::LOCK_LADDER,
+                            now_done,
+                            &mut note,
+                            |st, logins| {
+                                let bound = accounts::bound(&file_roster, logins);
+                                let enrolled = accounts::enrolled_for(cli, &bound);
+                                Ok(accounts::complete_requested_pin(
+                                    st, &bound, &enrolled, request, now_done,
+                                )
+                                .into_iter()
+                                .collect())
+                            },
+                        );
+                    }
+                    super::cli::Renewal::Busy => {}
+                    _ => {
+                        let _ = store.cancel_pin_request(request, now_done);
+                    }
+                }
+            }
         },
         spawn_renewal,
     )

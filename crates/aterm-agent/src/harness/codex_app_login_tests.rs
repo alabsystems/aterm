@@ -354,3 +354,52 @@ fn finished_ignores_unrelated_login_id_and_wakes_on_matching_completion_or_serve
         Some("https://auth.openai.com/codex/device")
     );
 }
+
+#[test]
+fn app_server_env_directs_sqlite_to_default_home_for_overlays_only() {
+    use crate::harness::accounts::Cli;
+    use std::ffi::OsString;
+
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let user_home = tmp.path().join("home");
+    let overlay = tmp.path().join("logins/codex/codex-1");
+    std::fs::create_dir_all(&user_home).expect("user home");
+    std::fs::create_dir_all(&overlay).expect("overlay");
+    let lookup = |name: &str| match name {
+        "PATH" => Some(OsString::from("/usr/bin:/bin")),
+        "HOME" => Some(user_home.as_os_str().to_os_string()),
+        _ => None,
+    };
+
+    // 1. Overlay home sets `CODEX_SQLITE_HOME` to `user_home/.codex` and creates that directory.
+    let default_home = user_home.join(".codex");
+    assert!(!default_home.exists());
+    let env = app_server_env(Cli::Codex, &overlay, &user_home, &lookup).expect("overlay env");
+    assert!(
+        default_home.is_dir(),
+        "default home created for shared sqlite"
+    );
+    let get = |k: &str| {
+        env.iter()
+            .find(|(n, _)| *n == k)
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+    };
+    assert_eq!(
+        get("CODEX_HOME").as_deref(),
+        Some(overlay.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        get("CODEX_SQLITE_HOME").as_deref(),
+        Some(default_home.to_string_lossy().as_ref())
+    );
+
+    // 2. CONTROL: default home itself omits `CODEX_SQLITE_HOME`; non-Codex CLIs return `None`.
+    let default_env =
+        app_server_env(Cli::Codex, &default_home, &user_home, &lookup).expect("default env");
+    assert!(
+        !default_env.iter().any(|(n, _)| *n == "CODEX_SQLITE_HOME"),
+        "default home must not set CODEX_SQLITE_HOME"
+    );
+    assert!(app_server_env(Cli::Grok, &overlay, &user_home, &lookup).is_none());
+    assert!(app_server_env(Cli::Kimi, &overlay, &user_home, &lookup).is_none());
+}

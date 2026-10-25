@@ -2071,19 +2071,46 @@ pub fn serve_join<S: Read + Write>(
     Ok(outcome)
 }
 
+/// Why a registration ([`register`]) recorded nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unregistered {
+    /// The issuer answered and recorded nothing: its refusal, or an answer that is no join's.
+    Answered(String),
+    /// No answer came: the registration was not sent, the exchange failed, or time ran out.
+    Unanswered(String),
+}
+
+impl fmt::Display for Unregistered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Answered(why) | Self::Unanswered(why) => f.write_str(why),
+        }
+    }
+}
+
 /// The member's end of a join, on a stream proved for op `join`: send `reg`, read the answer.
-pub fn register<S: Read + Write>(stream: &mut S, reg: &Registration) -> Result<Joined, String> {
+pub fn register<S: Read + Write>(
+    stream: &mut S,
+    reg: &Registration,
+) -> Result<Joined, Unregistered> {
+    let unanswered = Unregistered::Unanswered;
     stream
         .write_all(reg.line().as_bytes())
         .and_then(|()| stream.flush())
-        .map_err(|e| format!("the registration could not be sent: {e}"))?;
-    let line = read_record(stream).map_err(|e| format!("the issuer did not answer: {e}"))?;
+        .map_err(|e| unanswered(format!("the registration could not be sent: {e}")))?;
+    let line =
+        read_record(stream).map_err(|e| unanswered(format!("the issuer did not answer: {e}")))?;
     if let Some(why) = line.strip_prefix("ERR ") {
-        return Err(format!(
+        return Err(Unregistered::Answered(format!(
             "the issuer refused: {}",
             aterm_codec::tty::one_line(why, 400)
-        ));
+        )));
     }
+    joined_of(&line).map_err(Unregistered::Answered)
+}
+
+/// The issuer that a join's `OK` answer `line` names.
+fn joined_of(line: &str) -> Result<Joined, String> {
     let not_an_answer = || "the issuer's answer is no join answer (an older aterm?)".to_owned();
     let fields = fields(line.strip_prefix("OK ").ok_or_else(not_an_answer)?);
     let get = |key: &str| fields.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
@@ -2124,23 +2151,24 @@ pub fn register_by(
     reached: &mut Reached,
     reg: &Registration,
     deadline: Instant,
-) -> Result<Joined, String> {
+) -> Result<Joined, Unregistered> {
     let left = deadline.saturating_duration_since(Instant::now());
     let late = || {
-        format!(
+        Unregistered::Unanswered(format!(
             "the issuer did not answer within {:.1}s",
             left.as_secs_f64()
-        )
+        ))
     };
     if left.is_zero() {
         return Err(late());
     }
+    let unbounded =
+        |e: io::Error| Unregistered::Unanswered(format!("could not bound the registration: {e}"));
     let tcp = reached.transport.stream().get_ref();
     tcp.set_read_timeout(Some(left))
         .and_then(|()| tcp.set_write_timeout(Some(left)))
-        .map_err(|e| format!("could not bound the registration: {e}"))?;
-    let watchdog = HandshakeWatchdog::arm(tcp, left)
-        .map_err(|e| format!("could not bound the registration: {e}"))?;
+        .map_err(unbounded)?;
+    let watchdog = HandshakeWatchdog::arm(tcp, left).map_err(unbounded)?;
     let joined = register(reached.transport.stream(), reg);
     match (watchdog.finish(), joined) {
         (_, Ok(joined)) => Ok(joined),
@@ -2923,6 +2951,20 @@ impl Unreached {
                     | io::ErrorKind::ConnectionAborted
                     | io::ErrorKind::UnexpectedEof
             )
+        )
+    }
+
+    /// Whether the node's place said that node may drive this machine no more: it answered under
+    /// another fleet's secret, refused this machine's, or proved that node under another key than
+    /// this machine binds. Nothing else does: a node's drive is its own dial of this machine, so a
+    /// place that does not answer, answers late or busy, or answers as another node says nothing
+    /// of it.
+    #[must_use]
+    pub const fn disowns(&self) -> bool {
+        matches!(
+            self,
+            Self::Handshake(_, FleetError::ListenerWrongSecret | FleetError::Refused)
+                | Self::Impostor { .. }
         )
     }
 
@@ -4189,44 +4231,79 @@ pub fn drive(
     within: Duration,
 ) -> Result<Driven, Unreached> {
     let deadline = (Instant::now() + within, within);
-    match drive_at(target, keys, target.addr, (secret, me), deadline, &[]) {
+    let (reached, node) = reach_node(target, keys, (secret, me), FleetOp::Drive, deadline)?;
+    driven(reached, node, deadline)
+}
+
+/// Whether `target`'s node answers this machine as itself now: dialled as [`drive`] dials it,
+/// with [`FleetOp::Book`] (which a listener answers itself, at every level), it proves the node
+/// under the key `target` or `keys` binds it to, within `within`. The address it answered at.
+/// # Errors
+/// Why it did not: not reached, another node or none there, or another key.
+pub fn proves_itself(
+    target: &Target,
+    keys: &Keyring,
+    (secret, me): (&FleetSecret, &NodeIdentity),
+    within: Duration,
+) -> Result<SocketAddr, Unreached> {
+    let deadline = (Instant::now() + within, within);
+    reach_node(target, keys, (secret, me), FleetOp::Book, deadline).map(|(reached, _)| reached.addr)
+}
+
+/// `target`'s bound node reached for `op`: at its recorded address, then at its host name's
+/// others when the first that answers is not it.
+fn reach_node(
+    target: &Target,
+    keys: &Keyring,
+    (secret, me): (&FleetSecret, &NodeIdentity),
+    op: FleetOp,
+    deadline: (Instant, Duration),
+) -> Result<(Reached, String), Unreached> {
+    match node_at(target, keys, target.addr, (secret, me), op, deadline, &[]) {
         Err(
             other @ (Unreached::OtherNode { at, .. }
             | Unreached::Impostor { at, .. }
             | Unreached::Unproved { at, .. }
             | Unreached::Unbound { at, .. }),
-        ) => drive_at(target, keys, None, (secret, me), deadline, &[at]).map_err(|_| other),
+        ) => node_at(target, keys, None, (secret, me), op, deadline, &[at]).map_err(|_| other),
         done => done,
     }
 }
 
-fn drive_at(
+fn node_at(
     target: &Target,
     keys: &Keyring,
     addr: Option<IpAddr>,
     (secret, me): (&FleetSecret, &NodeIdentity),
-    (deadline, within): (Instant, Duration),
+    op: FleetOp,
+    deadline: (Instant, Duration),
     avoid: &[SocketAddr],
-) -> Result<Driven, Unreached> {
+) -> Result<(Reached, String), Unreached> {
     let reached = dial_avoiding(
         &target.host,
         addr,
         target.port,
         (secret, Some(me)),
-        FleetOp::Drive,
-        (deadline, within),
+        op,
+        deadline,
         (avoid, resolve),
     )?;
     let at = reached.addr;
-    let node = match answered_as(target, keys, at, reached.peer.as_ref())? {
-        Some((node, true)) => node,
-        claimed => {
-            return Err(Unreached::Unbound {
-                at,
-                node: claimed.map(|(node, _)| node),
-            });
-        }
-    };
+    match answered_as(target, keys, at, reached.peer.as_ref())? {
+        Some((node, true)) => Ok((reached, node)),
+        claimed => Err(Unreached::Unbound {
+            at,
+            node: claimed.map(|(node, _)| node),
+        }),
+    }
+}
+
+fn driven(
+    reached: Reached,
+    node: String,
+    (deadline, within): (Instant, Duration),
+) -> Result<Driven, Unreached> {
+    let at = reached.addr;
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return Err(Unreached::Deadline(Stage::Answer, within));

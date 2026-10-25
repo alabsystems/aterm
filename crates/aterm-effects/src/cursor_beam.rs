@@ -462,7 +462,7 @@ mod tests {
     use super::*;
     use crate::cursor_glow::BEAM_DEFAULT_COLOR;
 
-    fn geom() -> Geom {
+    const fn geom() -> Geom {
         Geom {
             cw: 10,
             ch: 20,
@@ -476,7 +476,7 @@ mod tests {
         }
     }
 
-    fn cfg(bar: bool) -> BeamRodConfig {
+    const fn cfg(bar: bool) -> BeamRodConfig {
         BeamRodConfig {
             enabled: true,
             intensity: 1.0,

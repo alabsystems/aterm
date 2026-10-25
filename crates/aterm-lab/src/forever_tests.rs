@@ -5618,16 +5618,16 @@ fn end_takes_agys_off_tab_as_its_switch_alone() {
         );
         (v.word(), v.why().to_string())
     };
-    let bare = "window=2 program=agy face=off drawn=- why=switch-only spoken=- description=-";
-    let (w, why) = end("agy", bare);
-    assert_eq!(w, "PASS", "{why}");
-    assert!(why.contains("off: drawn=- why=switch-only"), "{why}");
     for face in ["agent-off", "master-off"] {
         let line = format!(
             "window=2 program=agy face={face} drawn=- why=switch-only spoken=- description=-"
         );
         let (w, why) = end("agy", &line);
         assert_eq!(w, "PASS", "{face}: {why}");
+        assert!(
+            why.contains("off: drawn=- why=switch-only"),
+            "{face}: {why}"
+        );
     }
     let (w, why) = end(
         "agy",
@@ -5640,6 +5640,14 @@ fn end_takes_agys_off_tab_as_its_switch_alone() {
     let (w, why) = end(
         "agy",
         "window=2 program=agy face=off drawn=\"○ off\" spoken=\"x\"",
+    );
+    assert_eq!(
+        w, "PASS",
+        "agy under Autopilot Off keeps the harness on, and draws its chip: {why}"
+    );
+    let (w, why) = end(
+        "agy",
+        "window=2 program=agy face=master-off drawn=\"⊘ off\" spoken=\"x\"",
     );
     assert_eq!(
         w, "FAIL",
@@ -5658,6 +5666,10 @@ fn end_takes_agys_off_tab_as_its_switch_alone() {
         (
             "agy",
             "window=2 program=agy face=cruise drawn=- why=switch-only spoken=- description=-",
+        ),
+        (
+            "agy",
+            "window=2 program=agy face=off drawn=- why=switch-only spoken=- description=-",
         ),
         (
             "claude",

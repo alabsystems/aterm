@@ -435,6 +435,7 @@ label_enum! {
         SystemVitals => "system_vitals",
         StatsLens => "stats_lens",
         AgentsPanel => "agents_panel",
+        StatsLive => "stats_live",
     }
 }
 

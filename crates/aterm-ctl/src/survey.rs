@@ -361,6 +361,32 @@ fn shown(text: &str, cap: usize) -> String {
     aterm_codec::tty::one_line(text, cap)
 }
 
+/// A typed-by credit within `room`, and whether the line keeps it whole: a fleet credit keeps
+/// `(node <8 hex>) over the fleet`, its host cut to fit or dropped; any other is cut at 24.
+fn credit_shown(by: &str, room: usize) -> (String, bool) {
+    const FLEET: &str = " over the fleet";
+    let node = |word: &str| word.len() == 8 && word.bytes().all(|b| b.is_ascii_hexdigit());
+    let Some(named) = by.strip_suffix(FLEET) else {
+        return (shown(by, 24), false);
+    };
+    let bare = |short: &str| (format!("node {short}{FLEET}"), true);
+    if let Some(short) = named.strip_prefix("node ").filter(|short| node(short)) {
+        return bare(short);
+    }
+    if let Some((host, short)) = named.rsplit_once(" (node ")
+        && let Some(short) = short.strip_suffix(')').filter(|short| node(short))
+    {
+        let tail = format!(" (node {short}){FLEET}");
+        let (host, width) = (shown(host, 24), room.saturating_sub(tail.len()));
+        return match host.chars().count() {
+            fits if fits <= width => (format!("{host}{tail}"), true),
+            _ if width >= 8 => (format!("{}{tail}", fit(&host, width)), true),
+            _ => bare(short),
+        };
+    }
+    (shown(by, 24), false)
+}
+
 fn fit(line: &str, cap: usize) -> String {
     if line.chars().count() <= cap {
         return line.to_owned();
@@ -595,11 +621,25 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
     }
     // A name in words at content (a tab's name, `<host> (node <8 hex>) over the fleet`), shown as
     // the title is.
+    let mut kept = 0;
     if let (Some(by), Some(ms)) = (
         s.get("typed_by"),
         s.number("typed_ms").filter(|&ms| ms < NEWLY_DONE_MS),
     ) {
-        line.push_str(&format!(" typed by {} {} ago", shown(by, 24), age(ms)));
+        let (head, ago) = (" typed by ", format!(" {} ago", age(ms)));
+        let spent = line.chars().count() + head.len() + ago.len();
+        let (credit, whole) = credit_shown(by, LINE_CHARS.saturating_sub(spent));
+        let credit = format!("{head}{credit}{ago}");
+        if whole {
+            let before = LINE_CHARS.saturating_sub(credit.chars().count());
+            if line.chars().count() > before {
+                line = fit(&line, before);
+            }
+        }
+        line.push_str(&credit);
+        if whole {
+            kept = line.chars().count();
+        }
     }
     let about = match agent {
         Some(_) => s.get("user_title").or_else(|| s.get("title")),
@@ -636,7 +676,15 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
         line.push_str(" | ");
         line.push_str(&part);
     }
-    fit(&line, LINE_CHARS)
+    if kept == 0 || line.chars().count() <= LINE_CHARS {
+        return fit(&line, LINE_CHARS);
+    }
+    let mut whole: String = line.chars().take(kept).collect();
+    let rest: String = line.chars().skip(kept).collect();
+    if LINE_CHARS - kept >= 3 + 8 {
+        whole.push_str(&fit(&rest, LINE_CHARS - kept));
+    }
+    whole
 }
 
 fn newest_bell(s: &Fields) -> Option<(u64, &str, Option<&str>)> {

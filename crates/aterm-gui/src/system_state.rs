@@ -587,7 +587,7 @@ pub(crate) enum RowValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RowView {
     pub(crate) subject: Subject,
-    /// aterm manages the row: its group is set up and the plan needs it.
+    /// aterm manages the row: the selected settings need it.
     pub(crate) managed: bool,
     pub(crate) value: RowValue,
     pub(crate) chip: Option<Chip>,
@@ -630,14 +630,16 @@ impl RowView {
     }
 }
 
-/// Whether `selection` manages `subject`: its group's bit is set and, for a
-/// grant, the selection needs it.
-fn manages(selection: Selection, subject: Subject) -> bool {
-    selection.contains(subject.setting())
-        && match subject {
-            Subject::Access(access) => access.needed_for(selection),
-            Subject::Setting(_) => true,
+/// Whether the selected settings manage this row. Accessibility belongs to
+/// the account sign-outs; the other grants belong to Permissions.
+pub(crate) fn manages(selection: Selection, subject: Subject) -> bool {
+    match subject {
+        Subject::Access(Access::Accessibility) => Access::Accessibility.needed_for(selection),
+        Subject::Access(access) => {
+            selection.contains(Setting::Permissions) && access.needed_for(selection)
         }
+        Subject::Setting(setting) => selection.contains(setting),
+    }
 }
 
 /// THE ROW RULE (§3.3, pure): name, value and at most one chip from the
@@ -685,7 +687,7 @@ fn row_view_for_source(
     // waiting row is never without one ([`WAITING_NOTE`]).
     let explained = || reading.and_then(|o| o.note.clone().or_else(|| o.detail.clone()));
     let mut note = reading.and_then(|o| o.note.clone());
-    if !group_set_up {
+    if !group_set_up && !managed {
         return RowView {
             subject,
             managed,
@@ -1316,6 +1318,8 @@ struct Password {
     value: Option<SecretBytes>,
     anchor: usize,
     head: usize,
+    /// Marked text is never kept, but its presence owns the vault draft.
+    composing: bool,
 }
 
 impl Password {
@@ -1339,6 +1343,7 @@ impl Password {
     }
 
     fn replace(&mut self, text: SecretBytes) {
+        self.composing = false;
         let boundaries = self.boundaries();
         let start = boundaries[self.anchor.min(self.head).min(boundaries.len() - 1)];
         let end = boundaries[self.anchor.max(self.head).min(boundaries.len() - 1)];
@@ -1369,7 +1374,10 @@ impl Password {
     fn input(&mut self, event: TextInputEvent) {
         match event {
             TextInputEvent::Commit(text) => self.replace(SecretBytes::from(text)),
-            TextInputEvent::Preedit { text, .. } => drop(SecretBytes::from(text)),
+            TextInputEvent::Preedit { text, .. } => {
+                self.composing = !text.is_empty();
+                drop(SecretBytes::from(text));
+            }
             TextInputEvent::SelectAll => {
                 self.anchor = 0;
                 self.head = self.count();
@@ -1426,10 +1434,8 @@ impl Password {
                 self.anchor = self.count();
                 self.replace(SecretBytes::new(Vec::new()));
             }
-            TextInputEvent::Undo
-            | TextInputEvent::Redo
-            | TextInputEvent::Submit
-            | TextInputEvent::Cancel => {}
+            TextInputEvent::Undo | TextInputEvent::Redo | TextInputEvent::Submit => {}
+            TextInputEvent::Cancel => self.composing = false,
         }
     }
 
@@ -1447,6 +1453,7 @@ impl Password {
     fn take(&mut self) -> Option<SecretBytes> {
         self.anchor = 0;
         self.head = 0;
+        self.composing = false;
         self.value.take().filter(|value| !value.is_empty())
     }
 }
@@ -1506,6 +1513,9 @@ impl SystemStateApp {
     }
 
     pub(crate) fn cancel_preedit(&mut self, key: Option<&UiKey>) -> bool {
+        if key.is_some_and(|key| key.as_str() == "system-state/password") {
+            return std::mem::take(&mut self.password.composing);
+        }
         if key.is_some_and(|key| key.as_str() == "system-state/url") && self.url.preedit().is_some()
         {
             self.url.cancel_preedit();
@@ -1645,7 +1655,8 @@ impl SystemStateApp {
 
     /// A vault address or password typed and not joined yet.
     fn vault_draft(&self) -> bool {
-        !self.password.text().is_empty()
+        self.password.composing
+            || !self.password.text().is_empty()
             || self.url.value().trim() != self.submitted.vault_url
             || self
                 .url

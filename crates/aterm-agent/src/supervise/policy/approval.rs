@@ -1127,7 +1127,7 @@ fn rm_breaker_warn(reading: &Reading, rows: &[String], safe: String) -> Decision
     let Some(breaker) = p.rm_breaker() else {
         return Decision::escalate(safe);
     };
-    if resolvable_breaker(&breaker).is_err() || p.runs_on().is_some() {
+    if !warnable_breaker(&breaker) || p.runs_on().is_some() {
         return Decision::escalate(safe);
     }
     let once: Vec<&Opt> = p.options.iter().filter(|o| o.role == Role::Once).collect();
@@ -1215,7 +1215,18 @@ fn tall_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, why: String) 
         return handed_over(Some(not));
     }
     let breaker = rm_breaker_of(&note);
-    let fix = if breaker
+    let in_script = breaker.as_ref().is_some_and(|b| {
+        matches!(
+            b.kind,
+            RmBreakerKind::ShellScriptUnchecked | RmBreakerKind::ShellScriptValue
+        )
+    });
+    let fix = if in_script {
+        format!(
+            "Run the removal on its own as a short command, outside any shell -c script, \
+             {TALL_RM_PATHS}"
+        )
+    } else if breaker
         .as_ref()
         .is_some_and(|b| b.kind == RmBreakerKind::NotRuledOut)
     {
@@ -1947,6 +1958,20 @@ fn names_a_removal(line: &str) -> bool {
     })
 }
 
+/// The breakers [`rm_breaker_warn`] answers under `approve = "safe"`: an rm on a possibly-empty
+/// variable read whole ([`resolvable_breaker`]), and an rm inside a `-c` script the vendor could not
+/// check or whose target is a value known only when it runs. A note that names its target as a
+/// critical path, the working directory or an ancestor, a drive root or a mounted drive, and every
+/// `not ruled out` reason, stays with a person under `safe`.
+fn warnable_breaker(b: &RmBreaker) -> bool {
+    resolvable_breaker(b).is_ok()
+        || (b.command == RmCommand::Rm
+            && matches!(
+                b.kind,
+                RmBreakerKind::ShellScriptUnchecked | RmBreakerKind::ShellScriptValue
+            ))
+}
+
 fn resolvable_breaker(b: &RmBreaker) -> Result<(), String> {
     if b.command != RmCommand::Rm || !matches!(b.kind, RmBreakerKind::EmptyVariable { .. }) {
         return Err(format!(
@@ -1983,6 +2008,8 @@ pub fn rm_breaker_label(b: &RmBreaker) -> String {
         RmBreakerKind::TooManySubstitutions => "box.rm_breaker.too_many",
         RmBreakerKind::NestedUnanalyzed => "box.rm_breaker.nested_unanalyzed",
         RmBreakerKind::NotRuledOut => "",
+        RmBreakerKind::ShellScriptUnchecked => "box.rm_breaker.shell_unchecked",
+        RmBreakerKind::ShellScriptValue => "box.rm_breaker.shell_value",
     };
     let why = if id.is_empty() {
         b.target.trim()

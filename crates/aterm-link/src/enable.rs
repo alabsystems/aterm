@@ -3699,7 +3699,10 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
             remedies.push(PERSON_HOLD_LIFT.to_string());
         }
         if slots.remote {
-            remedies.push(REMOTE_HOLD_LIFT.to_string());
+            remedies.push(format!(
+                "{REMOTE_HOLD_LIFT}, and once its place answers under another fleet's secret or \
+                 key, so does {lift}"
+            ));
         }
         if slots.fleet {
             remedies.push(
@@ -3801,7 +3804,8 @@ pub const PERSON_HOLD_LIFT: &str = "the person at the window took it over (Take 
 /// What lifts another Mac's hold (`origin=remote`, the step-in).
 pub const REMOTE_HOLD_LIFT: &str = "another Mac holds it over the fleet: that Mac's `aterm ctl \
      --host <this Mac> hold <sid> off` lifts it, or the person here takes it with Take Over and \
-     hands it back; no command here does";
+     hands it back; once that Mac left the fleet, `aterm fleet peers rm <its node>` here (the \
+     survey's `held_from=`) ends its grant and lifts it";
 
 /// Which hold slots an `origin=` / `hold_origin=` list names (`person`,
 /// `remote`, `fleet`, `local`, comma-joined), each read as a whole word.
@@ -5710,8 +5714,11 @@ mod tests {
             "{beside}"
         );
         let remote = held("reason=- origin=remote");
-        assert_eq!(remote, REMOTE_HOLD_LIFT);
-        assert!(!remote.contains("hold s-a off"), "{remote}");
+        assert!(
+            remote.starts_with(REMOTE_HOLD_LIFT)
+                && remote.ends_with("so does `aterm ctl --pid 1 hold s-a off`"),
+            "{remote}"
+        );
         let beside = held("reason=- origin=remote,fleet");
         assert!(
             beside.starts_with(REMOTE_HOLD_LIFT) && beside.contains("aterm fabric halt"),

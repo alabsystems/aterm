@@ -3,26 +3,33 @@
 
 use aterm_phase::prompt::fixtures as f;
 
-const TYPED_BEFORE_MS: u64 = 22_000;
+/// A person's input inside every box's bound (`QUESTION_PERSON_GRACE`): they are at the keys now,
+/// so an untouched permission box is held through it as a question is, and the holds below run
+/// against the vendor's countdown.
+const TYPED_BEFORE_MS: u64 = 5_000;
+/// A person's input past that bound and inside their whole grace: it holds a permission box only
+/// once a person or another driver has touched the box
+/// (`an_untouched_box_is_held_by_older_input_no_longer_than_a_question`).
+const TYPED_LONG_BEFORE_MS: u64 = 22_000;
 const GRACE_S: u32 = 120;
 
 /// A person's input inside a question dialog's bound (`QUESTION_PERSON_GRACE`): they are answering
-/// now, so the question is held through it as a box is through the person's whole grace. Input
-/// older than the bound holds no question
-/// (`a_question_waits_a_short_fixed_quiet_for_a_person_never_their_whole_grace`).
+/// now, so the question is held through it as a box is. Input older than the bound holds no
+/// question (`a_question_waits_a_short_fixed_quiet_for_a_person_never_their_whole_grace`).
 const QUESTION_TYPED_BEFORE_MS: u64 = 5_000;
 const QUESTION_TYPED_BEFORE: &str = "5000";
 
 #[test]
-fn the_question_input_is_inside_the_questions_bound_and_the_box_input_past_it() {
+fn the_typed_inputs_sit_inside_and_past_the_bound_and_inside_the_grace() {
     use super::approval_loop::QUESTION_PERSON_GRACE;
     assert_eq!(
         QUESTION_TYPED_BEFORE.parse::<u64>().ok(),
         Some(QUESTION_TYPED_BEFORE_MS)
     );
     assert!(Duration::from_millis(QUESTION_TYPED_BEFORE_MS) < QUESTION_PERSON_GRACE);
-    assert!(Duration::from_millis(TYPED_BEFORE_MS) > QUESTION_PERSON_GRACE);
-    assert!(Duration::from_millis(TYPED_BEFORE_MS) < Duration::from_secs(u64::from(GRACE_S)));
+    assert!(Duration::from_millis(TYPED_BEFORE_MS) < QUESTION_PERSON_GRACE);
+    assert!(Duration::from_millis(TYPED_LONG_BEFORE_MS) > QUESTION_PERSON_GRACE);
+    assert!(Duration::from_millis(TYPED_LONG_BEFORE_MS) < Duration::from_secs(u64::from(GRACE_S)));
 }
 
 fn swapped(rows: &[String], edits: &[(&str, &[&str])]) -> Vec<String> {
@@ -215,6 +222,9 @@ enum Build {
     /// Every box other than the last read's starts an episode afresh
     /// ([`Session::set_episode_per_box`]: the model's `Lost`).
     EpisodePerBox,
+    /// An untouched permission box keeps the person's whole grace, as before
+    /// its bound ([`Session::set_bound_off`]).
+    BoundOff,
 }
 
 fn held_watch(
@@ -269,6 +279,7 @@ fn built<C: Ctl>(s: &mut Session<'_, C>, build: Build) {
         Build::CapOff => s.set_deny_cap_off(),
         Build::TouchOff => s.set_touch_off(),
         Build::EpisodePerBox => s.set_episode_per_box(),
+        Build::BoundOff => s.set_bound_off(),
     }
 }
 
@@ -339,9 +350,31 @@ fn the_incident_box_is_pressed_before_the_vendor_denies_it() {
     );
     let (until, deny) = held_times(held[1]);
     let (until, deny) = (past(&until), past(deny.as_deref().expect("the deny named")));
-    assert!((30..=88).contains(&until), "{until}: {}", held[1]);
     assert!((45..=103).contains(&deny), "{deny}: {}", held[1]);
-    assert!((14..=16).contains(&(deny - until)), "{}", held[1]);
+    assert!(
+        until <= 10 && deny - until > 16,
+        "the untouched box's bound ends the hold, not the deny: {until}: {}",
+        held[1]
+    );
+    assert!(!ended(&journal), "{journal:#?}");
+
+    let (m, journal) = held_watch(
+        watched(ticking(20, 2, incident)),
+        Some(TYPED_BEFORE_MS),
+        Build::Shipped,
+        |_, _| {},
+    );
+    assert_eq!(ones(&m), 0, "held above the margin: {:#?}", m.requests);
+    let held = held_lines(&journal);
+    assert_eq!(held.len(), 2, "{journal:#?}");
+    let (until, deny) = held_times(held[1]);
+    let (until, deny) = (past(&until), past(deny.as_deref().expect("the deny named")));
+    assert!((16..=20).contains(&deny), "{deny}: {}", held[1]);
+    assert!(
+        until < 9 && (14..=16).contains(&(deny - until)),
+        "the hold ends at the deny's margin, before the bound: {until}: {}",
+        held[1]
+    );
     assert!(!ended(&journal), "{journal:#?}");
 
     let at_the_margin = || watched(ticking(15, 2, incident));
@@ -389,6 +422,97 @@ fn the_incident_box_is_pressed_before_the_vendor_denies_it() {
         "{held:#?}"
     );
     assert!(!ended(&journal), "{journal:#?}");
+}
+
+/// The owner's incident (2026-10-25): a general-purpose subagent's `bash -c` rm box
+/// (`f::shell_c_rm_box`) came up 6 s after the owner's last keystroke into the tab, and full
+/// power's Yes was held for the rest of their 120 s grace (`HELD … a person is typing: hands off
+/// until …`). Input older than a permission box nobody has touched holds it no longer than a
+/// question (`QUESTION_PERSON_GRACE`), and input older than that not at all. A box a person
+/// touched, or whose touch cannot be told, keeps the whole grace, as ever.
+#[test]
+fn an_untouched_box_is_held_by_older_input_no_longer_than_a_question() {
+    use super::approval_loop::QUESTION_PERSON_GRACE;
+    let shell_c = || f::shell_c_rm_box(" │ This shell -c script runs rm and could not be checked");
+    let past = |stamp: &str| {
+        aterm_types::rfc3339::parse_utc_fractional(stamp).expect("a stamp") - TEST_NOW
+    };
+    let bound = i64::try_from(QUESTION_PERSON_GRACE.as_secs()).expect("the bound");
+    let six_s = 6_000;
+    let quiet_past_the_bound = |m: &mut Mock, _: &mut SuperviseOpts| {
+        m.status_human_from.insert(5, 16_000);
+    };
+    let (m, journal) = held_watch(
+        watched(vec![shell_c(); 6]),
+        Some(six_s),
+        Build::Shipped,
+        quiet_past_the_bound,
+    );
+    assert_eq!(
+        ones(&m),
+        1,
+        "pressed once the bound ran out: {:#?}",
+        m.requests
+    );
+    let held = held_lines(&journal);
+    assert!(!held.is_empty(), "held inside the bound: {journal:#?}");
+    let (until, deny) = held_times(held[0]);
+    assert_eq!(deny, None, "{}", held[0]);
+    assert!(
+        (bound - 7..=bound - 6).contains(&past(&until)),
+        "held to the bound, not the 120 s grace: {}",
+        held[0]
+    );
+    assert!(theirs(&journal).is_empty(), "{journal:#?}");
+
+    let (m, journal) = held_watch(
+        watched(vec![shell_c(); 6]),
+        Some(six_s),
+        Build::BoundOff,
+        quiet_past_the_bound,
+    );
+    assert_eq!(ones(&m), 0, "the whole grace: {:#?}", m.requests);
+    let held = held_lines(&journal);
+    let (until, _) = held_times(held[0]);
+    assert!(past(&until) > 100, "{}", held[0]);
+
+    let (m, journal) = held_watch(
+        watched(vec![shell_c(); 2]),
+        Some(TYPED_LONG_BEFORE_MS),
+        Build::Shipped,
+        |_, _| {},
+    );
+    assert_eq!(ones(&m), 1, "{:#?}", m.requests);
+    assert!(held_lines(&journal).is_empty(), "{journal:#?}");
+
+    let (m, journal) = held_watch(
+        watched(vec![shell_c(); 3]),
+        Some(TYPED_LONG_BEFORE_MS),
+        Build::Shipped,
+        |m, _| {
+            m.human_seq_from.insert(2, 1);
+        },
+    );
+    assert!(m.presses().is_empty(), "touched: {:#?}", m.requests);
+    let held = held_lines(&journal);
+    let (until, _) = held_times(held[0]);
+    assert!(
+        past(&until) > 90,
+        "a touched box keeps the whole grace: {}",
+        held[0]
+    );
+
+    let (m, _) = held_watch(
+        [vec![shell_c(); 2], vec![busy_screen()]].concat(),
+        Some(TYPED_LONG_BEFORE_MS),
+        Build::Shipped,
+        |_, _| {},
+    );
+    assert!(
+        m.presses().is_empty(),
+        "first read the box: {:#?}",
+        m.requests
+    );
 }
 
 #[test]
@@ -1543,6 +1667,17 @@ fn worlds() -> Vec<World> {
             lease_before: true,
             ..ticks("lease gone before the box", 15, person, true)
         },
+        ticks("1:44 older person", 104, Some(TYPED_LONG_BEFORE_MS), true),
+        World {
+            counts: &[(2, 1)],
+            counted: true,
+            ..ticks(
+                "touched, older person",
+                104,
+                Some(TYPED_LONG_BEFORE_MS),
+                true,
+            )
+        },
     ]
 }
 
@@ -1601,9 +1736,13 @@ fn box_hold_violations(build: Build) -> (Vec<String>, Vec<bool>) {
         let pressed = pressed_in(&w, build);
         presses.push(pressed);
         let mut st = model.init_state();
-        let grace = w.grace_over_from.is_none()
-            && w.typed_ms.is_some_and(|ms| ms < u64::from(GRACE_S) * 1000);
         let latched = w.counted || w.lease || w.blind;
+        let bound_ms = if latched {
+            u64::from(GRACE_S) * 1000
+        } else {
+            u64::try_from(approval_loop::QUESTION_PERSON_GRACE.as_millis()).unwrap_or(u64::MAX)
+        };
+        let grace = w.grace_over_from.is_none() && w.typed_ms.is_some_and(|ms| ms < bound_ms);
         for (k, v) in [
             ("up", 1),
             (
@@ -1639,11 +1778,18 @@ fn tier1_a_hold_goes_only_where_the_model_allows() {
     };
     let shipped = [
         false, false, true, true, false, false, false, false, false, false, true, false, false,
-        false, false, false, false, true, true,
+        false, false, false, false, true, true, true, false,
     ];
     let (bad, presses) = box_hold_violations(Build::Shipped);
     assert_eq!(bad, Vec::<String>::new());
     assert_eq!(presses, shipped);
+
+    let (bad, presses) = box_hold_violations(Build::BoundOff);
+    let mut want = shipped;
+    want[19] = false;
+    assert_eq!(presses, want);
+    assert_eq!(names(&bad), ["1:44 older person"], "{bad:#?}");
+    assert!(bad.iter().all(|b| b.contains(": Tick at ")), "{bad:#?}");
 
     let (bad, presses) = box_hold_violations(Build::CapOff);
     let mut want = shipped;
@@ -1660,7 +1806,7 @@ fn tier1_a_hold_goes_only_where_the_model_allows() {
 
     let (bad, presses) = box_hold_violations(Build::TouchOff);
     let mut want = shipped;
-    for i in [8, 9, 11, 12, 13, 14, 15, 16] {
+    for i in [8, 9, 11, 12, 13, 14, 15, 16, 20] {
         want[i] = true;
     }
     assert_eq!(presses, want);
@@ -1674,7 +1820,8 @@ fn tier1_a_hold_goes_only_where_the_model_allows() {
             "count started over",
             "lease, focus moved",
             "lease",
-            "relabelled once touched"
+            "relabelled once touched",
+            "touched, older person"
         ],
         "{bad:#?}"
     );

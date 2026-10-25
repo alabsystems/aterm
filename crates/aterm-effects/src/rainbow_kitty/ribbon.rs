@@ -1148,9 +1148,11 @@ pub(crate) fn bed_ink_unbent(rgb: u32, budget: f32) -> u32 {
 /// in → out.
 const DARK_HUE_BEND: [(f32, f32); 4] = [(0.0, 0.0), (30.0, 14.0), (60.0, 24.0), (90.0, 92.0)];
 
-fn dark_hue_bent(rgb: u32) -> u32 {
+#[inline]
+#[must_use]
+const fn dark_hue_bent(rgb: u32) -> u32 {
     let (h, s, v) = rgb2hsv(rgb);
-    if v <= 0.0 || s <= 0.0 || !(0.0..90.0).contains(&h) {
+    if v <= 0.0 || s <= 0.0 || !(h >= 0.0 && h < 90.0) {
         return rgb;
     }
     let mut bent = h;
@@ -1535,7 +1537,7 @@ impl BedInkLut {
     /// The ink at walk position `t`, folded through `meteor::tri`, so the station under the caret is the caret's stop by construction.
     #[inline]
     #[must_use]
-    pub fn at(&self, t: f32) -> u32 {
+    pub const fn at(&self, t: f32) -> u32 {
         if self.key.is_none() {
             return 0;
         }
@@ -1565,21 +1567,40 @@ impl BedInkLut {
     /// The colour floor at walk position `t`.
     #[inline]
     #[must_use]
-    pub fn seen_floor_at(&self, t: f32) -> f32 {
+    pub const fn seen_floor_at(&self, t: f32) -> f32 {
         if self.key.is_none() {
             return 0.0;
         }
         let x = clamp01(tri(t)) * (BED_INK_LUT_LEN - 1) as f32;
-        let i = (x as usize).min(BED_INK_LUT_LEN - 1);
-        let j = (i + 1).min(BED_INK_LUT_LEN - 1);
+        let idx = x as usize;
+        let i = if idx < BED_INK_LUT_LEN - 1 {
+            idx
+        } else {
+            BED_INK_LUT_LEN - 1
+        };
+        let j = if i + 1 < BED_INK_LUT_LEN - 1 {
+            i + 1
+        } else {
+            BED_INK_LUT_LEN - 1
+        };
         self.seen[i].max(self.seen[j])
     }
 
     #[inline]
-    fn sample(table: &[u32; BED_INK_LUT_LEN], t: f32) -> u32 {
+    #[must_use]
+    const fn sample(table: &[u32; BED_INK_LUT_LEN], t: f32) -> u32 {
         let x = clamp01(tri(t)) * (BED_INK_LUT_LEN - 1) as f32;
-        let i = (x as usize).min(BED_INK_LUT_LEN - 1);
-        let j = (i + 1).min(BED_INK_LUT_LEN - 1);
+        let idx = x as usize;
+        let i = if idx < BED_INK_LUT_LEN - 1 {
+            idx
+        } else {
+            BED_INK_LUT_LEN - 1
+        };
+        let j = if i + 1 < BED_INK_LUT_LEN - 1 {
+            i + 1
+        } else {
+            BED_INK_LUT_LEN - 1
+        };
         lerp_rgb(table[i], table[j], x - i as f32)
     }
 }
@@ -1605,7 +1626,7 @@ pub const CROSS_PACE_KNOTS: usize = 65;
 /// The arc position of a walk position.
 #[inline]
 #[must_use]
-pub fn walk_arc(t: f32) -> f32 {
+pub const fn walk_arc(t: f32) -> f32 {
     walk_pace(clamp01(tri(t)))
 }
 
@@ -5224,7 +5245,7 @@ struct RunSample {
 
 impl Ribbon {
     #[inline]
-    fn run_sample(
+    const fn run_sample(
         &self,
         ctx: &Ctx<'_>,
         row: u16,
@@ -5237,8 +5258,11 @@ impl Ribbon {
         let reduced = ctx.cfg.reduced_motion;
         let disp = clamp01(ctx.disp);
         let room = (DN_TOP_CH - DN_FLOOR_CH) * chf;
-        let span = coh.map_or(1.0, |c| f32::from(c.col1.saturating_sub(c.col0)).max(1.0));
-        let row_bot = f32::from(ctx.geom.origin_y) + (f32::from(row) + 1.0) * chf;
+        let span = match coh {
+            Some(c) => (c.col1.saturating_sub(c.col0) as f32).max(1.0),
+            None => 1.0,
+        };
+        let row_bot = ctx.geom.origin_y as f32 + (row as f32 + 1.0) * chf;
         let dn_floor = DN_FLOOR_CH * chf;
         let settle_scale = 1.0 - FLOW_SETTLE_SHARE * settle;
         let breath_scale = 1.0 - breath;
@@ -5451,7 +5475,7 @@ impl Ribbon {
     }
 
     #[inline]
-    fn ember_floor(&self, ctx: &Ctx<'_>, cell: &Cell, carried: f32) -> f32 {
+    const fn ember_floor(&self, ctx: &Ctx<'_>, cell: &Cell, carried: f32) -> f32 {
         self.ember_floor_of(
             cov_cap(ctx.cfg) * cell.cov0 * clamp01(ctx.cfg.intensity) * carried,
             cell.t,
@@ -5459,7 +5483,7 @@ impl Ribbon {
     }
 
     #[inline]
-    fn ember_floor_of(&self, full_cov: f32, t: f32) -> f32 {
+    const fn ember_floor_of(&self, full_cov: f32, t: f32) -> f32 {
         if !full_cov.is_finite() || full_cov <= 0.0 {
             return 0.0;
         }
@@ -7214,7 +7238,7 @@ mod tests {
     const SHIPPED_BG: u32 = 0x0011_1318;
     const SHIPPED_FG: u32 = 0x00D0_D0D0;
 
-    fn geom() -> Geom {
+    const fn geom() -> Geom {
         Geom {
             cw: 9,
             ch: 18,
@@ -7228,7 +7252,7 @@ mod tests {
         }
     }
 
-    fn geom2x() -> Geom {
+    const fn geom2x() -> Geom {
         Geom {
             cw: 18,
             ch: 36,
@@ -7242,7 +7266,7 @@ mod tests {
         }
     }
 
-    fn cfg(dark: bool, tall: bool) -> Config {
+    const fn cfg(dark: bool, tall: bool) -> Config {
         Config {
             dark_theme: dark,
             intensity: 1.0,
@@ -7255,13 +7279,19 @@ mod tests {
         }
     }
 
-    fn flat(dark: bool, tall: bool) -> Config {
+    const fn flat(dark: bool, tall: bool) -> Config {
         let mut c = cfg(dark, tall);
         c.ribbon_flat = true;
         c
     }
 
-    fn ctx_in<'a>(now: Instant, cfg: &'a Config, caret: (u16, u16), disp: f32, g: Geom) -> Ctx<'a> {
+    const fn ctx_in<'a>(
+        now: Instant,
+        cfg: &'a Config,
+        caret: (u16, u16),
+        disp: f32,
+        g: Geom,
+    ) -> Ctx<'a> {
         Ctx {
             now,
             geom: g,
@@ -7274,11 +7304,11 @@ mod tests {
             caret_walk: None,
             mend: None,
             surge: 0.0,
-            flow: Default::default(),
+            flow: crate::rainbow_kitty::spine::Flow::EMPTY,
         }
     }
 
-    fn ctx<'a>(now: Instant, cfg: &'a Config, caret: (u16, u16), disp: f32) -> Ctx<'a> {
+    const fn ctx<'a>(now: Instant, cfg: &'a Config, caret: (u16, u16), disp: f32) -> Ctx<'a> {
         ctx_in(now, cfg, caret, disp, geom())
     }
 
@@ -7314,7 +7344,7 @@ mod tests {
         t0.checked_add(Duration::from_millis(ms)).expect("clock")
     }
 
-    fn typed() -> Event {
+    const fn typed() -> Event {
         Event::Typed {
             cells: 1,
             shifted: false,
@@ -7322,7 +7352,7 @@ mod tests {
         }
     }
 
-    fn nav(from: (u16, u16), to: (u16, u16)) -> Event {
+    const fn nav(from: (u16, u16), to: (u16, u16)) -> Event {
         Event::Move {
             from,
             to,
@@ -7331,7 +7361,7 @@ mod tests {
         }
     }
 
-    fn pty(from: (u16, u16), to: (u16, u16)) -> Event {
+    const fn pty(from: (u16, u16), to: (u16, u16)) -> Event {
         Event::Move {
             from,
             to,
@@ -8399,7 +8429,7 @@ mod tests {
     }
 
     /// The trail gallery's glass: 72x14 cells of 14x26 px from (12, 2).
-    fn gallery_geom() -> Geom {
+    const fn gallery_geom() -> Geom {
         Geom {
             cw: 14,
             ch: 26,
@@ -10372,9 +10402,10 @@ mod tests {
         );
     }
 
-    fn census_paint(px: u32, light: bool) -> bool {
-        let c = |sh: u32| f32::from(((px >> sh) & 0xff) as u8);
-        let (r, g, b) = (c(16), c(8), c(0));
+    const fn census_paint(px: u32, light: bool) -> bool {
+        let r = ((px >> 16) & 0xff) as u8 as f32;
+        let g = ((px >> 8) & 0xff) as u8 as f32;
+        let b = (px & 0xff) as u8 as f32;
         let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
         let level = if light {
             mn <= 255.0 - 60.0
@@ -12317,7 +12348,7 @@ mod tests {
         }
     }
 
-    fn geom_codex() -> Geom {
+    const fn geom_codex() -> Geom {
         Geom {
             cw: 9,
             ch: 18,
@@ -13378,19 +13409,16 @@ mod tests {
         );
     }
 
-    fn typed_move(from: (u16, u16), to: (u16, u16)) -> Event {
+    const fn typed_move(from: (u16, u16), to: (u16, u16)) -> Event {
         Event::Move {
             from,
             to,
             licence: Licence::Typed,
-            dir: Dir::of(
-                i32::from(to.1) - i32::from(from.1),
-                i32::from(to.0) - i32::from(from.0),
-            ),
+            dir: Dir::of(to.1 as i32 - from.1 as i32, to.0 as i32 - from.0 as i32),
         }
     }
 
-    fn typed_space() -> Event {
+    const fn typed_space() -> Event {
         Event::Typed {
             cells: 1,
             shifted: false,
@@ -13658,15 +13686,12 @@ mod tests {
         t_next
     }
 
-    fn row_change(from: (u16, u16), to: (u16, u16), licence: Licence) -> Event {
+    const fn row_change(from: (u16, u16), to: (u16, u16), licence: Licence) -> Event {
         Event::Move {
             from,
             to,
             licence,
-            dir: Dir::of(
-                i32::from(to.1) - i32::from(from.1),
-                i32::from(to.0) - i32::from(from.0),
-            ),
+            dir: Dir::of(to.1 as i32 - from.1 as i32, to.0 as i32 - from.0 as i32),
         }
     }
 
@@ -14638,7 +14663,7 @@ mod tests {
         );
     }
 
-    fn geom_owner() -> Geom {
+    const fn geom_owner() -> Geom {
         Geom {
             cw: 30,
             ch: 56,
@@ -14652,7 +14677,7 @@ mod tests {
         }
     }
 
-    fn cfg_owner() -> Config {
+    const fn cfg_owner() -> Config {
         let mut c = cfg(true, true);
         c.intensity = 0.70;
         c

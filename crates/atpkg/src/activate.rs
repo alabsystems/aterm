@@ -15,7 +15,8 @@ use crate::store::{ToolName, split_exposed};
 pub enum Aliases {
     /// One of ALab's own programs: `alab-<tool>` beside every `<tool>`.
     Alab,
-    /// A vendor tool or a system-satisfiable member.
+    /// A vendor tool, a system-satisfiable member, or a harness, whose own name already says
+    /// it is ALab's.
     Off,
 }
 
@@ -24,7 +25,13 @@ impl Aliases {
     #[must_use]
     pub fn for_program(name: &str, program: Option<&crate::manifest::Program>) -> Self {
         match program {
-            Some(p) if p.system.is_none() && !crate::stub::is_agent_program(name) => Self::Alab,
+            Some(p)
+                if p.system.is_none()
+                    && !crate::stub::is_agent_program(name)
+                    && !crate::harness::is_harness(name) =>
+            {
+                Self::Alab
+            }
             _ => Self::Off,
         }
     }
@@ -1926,6 +1933,11 @@ mod tests {
             Aliases::for_program("gh", Some(&program(Some("gh")))),
             Aliases::Off,
             "gh/emacs: a system copy may satisfy it"
+        );
+        assert_eq!(
+            Aliases::for_program("claude-code-alab", Some(&program(None))),
+            Aliases::Off,
+            "a harness: `alab-claude-alab` would only repeat its own name"
         );
         assert_eq!(Aliases::for_program("x", None), Aliases::Off, "unlisted");
     }

@@ -47,6 +47,51 @@ pub(crate) fn selection_range_for(
     })
 }
 
+/// The single-slot per-row display-cell cache backing `cell_text`/`cell_is_wide`.
+#[derive(Default)]
+pub(crate) struct DisplayRowCache {
+    /// `(alt_screen, content_gen, display_offset, row)` the cached cells were
+    /// resolved at.
+    key: Option<(bool, u64, usize, u16)>,
+    /// `(grapheme, is_wide)` per display column of `key.row`.
+    cells: Vec<(String, bool)>,
+}
+
+impl WebTerminal {
+    /// Read one `(grapheme, is_wide)` display cell through the single-slot row
+    /// cache, refreshing it from [`Terminal::display_row_grapheme_cells`] only when
+    /// its key changes, so a host's per-cell walk of a scrolled-back row costs
+    /// O(cols), not O(cols²).
+    fn with_display_row_cell<T>(
+        &self,
+        row: u16,
+        col: u16,
+        read: impl FnOnce(&(String, bool)) -> T,
+    ) -> Option<T> {
+        let key = (
+            self.term.is_alternate_screen(),
+            self.term.grid().content_gen(),
+            self.term.grid().display_offset(),
+            row,
+        );
+        let mut cache = self.display_row_cache.borrow_mut();
+        if cache.key != Some(key) {
+            match self.term.display_row_grapheme_cells(row as usize) {
+                Some(cells) => {
+                    cache.cells = cells;
+                    cache.key = Some(key);
+                }
+                None => {
+                    cache.key = None;
+                    cache.cells.clear();
+                    return None;
+                }
+            }
+        }
+        cache.cells.get(col as usize).map(read)
+    }
+}
+
 /// Expand renderer-independent JS methods onto `$terminal` under `$export`.
 macro_rules! bind {
     ($terminal:ident, $export:ident) => {
@@ -885,6 +930,46 @@ web_terminal_impl!(bind);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A main-screen row cached at a key the alt screen comes to share is not served for the alt screen.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn display_row_cache_distinguishes_main_and_alt_screen() {
+        let mut t = crate::system_font_terminal(5, 20, 16.0);
+        for _ in 0..30 {
+            t.process(b"\r\n");
+        }
+        t.process(b"\x1b[HM");
+        let main_gen = t.term.grid().content_gen();
+        assert_eq!(t.cell_text(0, 0), "M", "primed main cell at (0,0)");
+
+        t.process(b"\x1b[?1049h");
+        t.process(b"\x1b[HA");
+        assert!(
+            t.term.grid().content_gen() <= main_gen,
+            "alt buffer starts below main_gen so we can drive it up to collide"
+        );
+        let mut guard = 0;
+        while t.term.grid().content_gen() != main_gen && guard < 10_000 {
+            let g: &[u8] = if guard % 2 == 0 {
+                b"\x1b[2;1Hx"
+            } else {
+                b"\x1b[2;1Hy"
+            };
+            t.process(g);
+            guard += 1;
+        }
+        assert_eq!(
+            t.term.grid().content_gen(),
+            main_gen,
+            "manufactured the content_gen collision across the swap"
+        );
+        assert_eq!(
+            t.cell_text(0, 0),
+            "A",
+            "alt-screen cell must not be served from the main-screen cache at a coinciding key"
+        );
+    }
 
     /// Extreme `i32` selection rows stay clipped to the viewport without wrapping.
     #[test]

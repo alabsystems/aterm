@@ -188,8 +188,8 @@ impl RainLayers {
     /// The ids of the layers the last publish put into the frame.
     #[inline]
     #[must_use]
-    pub fn ids(&self) -> &[u64] {
-        &self.ids
+    pub const fn ids(&self) -> &[u64] {
+        self.ids.as_slice()
     }
 }
 
@@ -197,10 +197,11 @@ impl RainLayers {
 /// [`FxSlot::Under`] layer that knocks nothing out (a companion under the text
 /// knocks its letters out, [`aterm_render::sprites::is_sprite_layer`]).
 #[must_use]
-pub fn is_rain_row(layer: &FxLayer) -> bool {
-    layer.slot == FxSlot::Under
-        && layer.blend == FxBlend::Linear
-        && layer.space == FxSpace::Grid
+#[inline]
+pub const fn is_rain_row(layer: &FxLayer) -> bool {
+    matches!(layer.slot, FxSlot::Under)
+        && matches!(layer.blend, FxBlend::Linear)
+        && matches!(layer.space, FxSpace::Grid)
         && !layer.knock
 }
 
@@ -249,7 +250,7 @@ mod tests {
         b
     }
 
-    fn cell(row: u16, col: u16, glyph: u8) -> RainCell {
+    const fn cell(row: u16, col: u16, glyph: u8) -> RainCell {
         RainCell {
             row,
             x: col * 8,

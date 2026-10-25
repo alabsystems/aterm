@@ -148,22 +148,25 @@ fn the_installed_bundle_gate_verifies_like_a_fresh_install() {
 /// without bounded, and the run's EXIT trap still runs. The group leader stands
 /// for a terminal's foreground group, which a Ctrl-C reaches whole, and the
 /// stand-in sends it one from inside bounded's job. Before, bounded's trap
-/// exited 130, bash went on (wait-and-cooperative-exit), and the installed-bundle
-/// gate read the 130 as a FAILED signature and reinstalled. The group SIGKILL
-/// may find CMD already gone (it ended just before the Ctrl-C), and kill's 1
-/// then ended the trap under set -e, a status 1 read as a definite answer. The
-/// callers' temporary files go with the run: first_line_bounded's, and those of
-/// a caller around it. The script resets the run's INT trap, as the subshells
-/// and command substitutions bounded mostly runs in do, so bounded's own traps
-/// are what end it. In every row CMD is killed. A Ctrl-\ (the quit row) kills
-/// it too: bounded's subshell used to die of the signal and leave CMD running,
-/// in a process group of its own the terminal's signal never reaches. CMD's
-/// output goes nowhere the call reads, so one that lives on is named (orphan)
-/// and killed once the call's minute is up; the call ticks the batch while it
-/// waits, so the batch's own detector, a minute too, never ends it first. A
-/// QUIT ends bounded's trap by exit 131, never by a death of it, for which
-/// macOS writes a crash report (the cut row runs the trap in the process the
-/// group leader waits on, which bash 3.2's self-kill of it would end by it).
+/// exited 130, bash went on (wait-and-cooperative-exit), and the
+/// installed-bundle gate read the 130 as a FAILED signature and reinstalled. The
+/// group SIGKILL may find CMD already gone (it ended just before the Ctrl-C),
+/// and kill's 1 then ended the trap under set -e, a status 1 read as a definite
+/// answer. The files callers name in BOUNDED_TEMPS go with the run, those of
+/// each caller a nested one extends. The script resets the run's INT trap, as
+/// the subshells and command substitutions bounded mostly runs in do, so
+/// bounded's own traps are what end it and what remove them (the temps row);
+/// first_line_bounded sets the run's again (end_on_ctrl_c), whose trap removes
+/// them as well, its own file among them (the line row). In every row CMD is
+/// killed. A Ctrl-\ (the quit row) kills it too: bounded's subshell used to die
+/// of the signal and leave CMD running, in a process group of its own the
+/// terminal's signal never reaches. CMD's output goes nowhere the call reads, so
+/// one that lives on is named (orphan) and killed once the call's minute is up;
+/// the call ticks the batch while it waits, so the batch's own detector, a
+/// minute too, never ends it first. A QUIT ends bounded's trap by exit 131,
+/// never by a death of it, for which macOS writes a crash report (the cut row
+/// runs the trap in the process the group leader waits on, which bash 3.2's
+/// self-kill of it would end by it).
 #[test]
 fn a_ctrl_c_while_bounded_waits_ends_the_run() {
     let scratch = Scratch::new();
@@ -202,7 +205,13 @@ around() {
 \tlocal t
 \tt=\"$(mktemp \"$TMPDIR/aterm-probe.around.XXXXXX\")\"
 \tlocal BOUNDED_TEMPS=(\"$t\")
-\tfirst_line_bounded ctrl_c
+\t\"$@\"
+}
+inner() {
+\tlocal t
+\tt=\"$(mktemp \"$TMPDIR/aterm-probe.inner.XXXXXX\")\"
+\tlocal BOUNDED_TEMPS=(\"${BOUNDED_TEMPS[@]}\" \"$t\")
+\tbounded 60 ctrl_c
 }
 s=0 SIG=INT
 case \"$1\" in
@@ -210,13 +219,14 @@ bounded) bounded 60 ctrl_c || s=$? ;;
 quit) SIG=QUIT; bounded 60 ctrl_c || s=$? ;;
 gate) installed_bundle_verified /nonexistent/aterm.app '' || s=$? ;;
 gone) kill() { if [[ \"$1\" == -KILL ]]; then builtin kill \"$@\"; return 1; fi; builtin kill \"$@\"; }; bounded 60 ctrl_c || s=$? ;;
-temps) around || s=$? ;;
+temps) around inner || s=$? ;;
+line) around first_line_bounded ctrl_c || s=$? ;;
 cut) set -m; /bin/sleep 300 >/dev/null 2>&1 & pid=$!; set +m; echo \"$pid\" >\"$TMPDIR/cmd-$row\"; bounded_cut QUIT 131 ;;
 esac
 echo \"went on ($s)\"
 EOF",
     );
-    let tags = ["bounded", "gate", "gone", "temps", "quit", "cut"];
+    let tags = ["bounded", "gate", "gone", "temps", "line", "quit", "cut"];
     let calls: Vec<usize> = tags
         .iter()
         .map(|tag| {
@@ -390,8 +400,13 @@ EOF",
 /// it could land after cat's redirection had emptied the file and before cat
 /// refilled it, which left the file empty and its only copy in TMPDIR. A Ctrl-\
 /// is the same, and so is a TERM or a HUP sent to the shell alone, which bash
-/// answered at once, leaving the copy. The cat stand-in sends each. Once the
-/// rewrite is done, a TERM ends the run at once again (the after row).
+/// answered at once, leaving the copy. The cat stand-in sends each. A TERM
+/// the instant the copy exists (the made row, sent from probe_temp's last
+/// step) ends the run with the copy gone and the file untouched, and one as
+/// the copy is about to go (the removed row) with it gone and the file whole:
+/// the hold began only once the copy was made and ended before its removal,
+/// and bash's own handler left it. Once the rewrite is done, a TERM ends the
+/// run at once again (the after row).
 #[test]
 fn a_ctrl_c_never_empties_the_config() {
     let scratch = Scratch::new();
@@ -412,12 +427,24 @@ cat >\"$TMPDIR/bin/later\" <<'EOF'
 kill -s TERM \"$PPID\"
 i=0
 while kill -0 \"$PPID\" 2>/dev/null && [ $i -lt 600 ]; do /bin/sleep 0.1; i=$((i + 1)); done
-if kill -0 \"$PPID\" 2>/dev/null; then echo waited >\"$TMPDIR/later\"; else echo ended >\"$TMPDIR/later\"; fi
+if kill -0 \"$PPID\" 2>/dev/null; then echo waited >\"$TMPDIR/later-$row\"; else echo ended >\"$TMPDIR/later-$row\"; fi
 EOF
 chmod +x \"$TMPDIR/bin/cat\" \"$TMPDIR/bin/later\" && cat >\"$TMPDIR/config.bash\" <<'EOF'
 ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
-export SIG=${1#after} row=$1
+export SIG=$1 row=$1
+case $1 in after | made | removed) SIG= ;; esac
+if [ \"$1\" = made ]; then
+\tprintf() {
+\t\t[ \"$1\" != -v ] || [ -e \"$TMPDIR/sent-made\" ] || { : >\"$TMPDIR/sent-made\"; kill -s TERM $$; }
+\t\tbuiltin printf \"$@\"
+\t}
+elif [ \"$1\" = removed ]; then
+\trm() {
+\t\tcase \"$*\" in */aterm-config.*) [ -e \"$TMPDIR/sent-removed\" ] || { : >\"$TMPDIR/sent-removed\"; kill -s TERM $$; } ;; esac
+\t\tcommand rm \"$@\"
+\t}
+fi
 cfg=\"$TMPDIR/aterm-$1.toml\"
 printf '[packages]\\nkeep = 1\\n' >\"$cfg\"
 PATH=\"$TMPDIR/bin:$PATH\"
@@ -432,6 +459,8 @@ EOF",
         ("HUP", "signal 1"),
         ("TERM", "signal 15"),
         ("after", "signal 15"),
+        ("made", "signal 15"),
+        ("removed", "signal 15"),
     ];
     let calls: Vec<usize> = rows
         .iter()
@@ -440,7 +469,8 @@ EOF",
                 format!(
                     "echo \"$({}) $(cat \"$TMPDIR/cleaned-{sig}\" 2>/dev/null)\" \
                      $(printf '[packages]\\nauto_install = false\\nkeep = 1\\n' | cmp -s - \"$TMPDIR/aterm-{sig}.toml\" && echo whole) \
-                     $(ls \"$TMPDIR\" | grep -c '^aterm-config') $(cat \"$TMPDIR/later\" 2>/dev/null)",
+                     $(printf '[packages]\\nkeep = 1\\n' | cmp -s - \"$TMPDIR/aterm-{sig}.toml\" && echo untouched) \
+                     $(ls \"$TMPDIR\" | grep -c '^aterm-config') $(cat \"$TMPDIR/later-{sig}\" 2>/dev/null)",
                     group_run(&format!("\"$TMPDIR/config.bash\" {sig}"))
                 ),
                 &[],
@@ -450,9 +480,10 @@ EOF",
     let recs = lib.run(&scratch);
     for ((sig, end), call) in rows.iter().zip(calls) {
         let later = if *sig == "after" { " ended" } else { "" };
+        let file = if *sig == "made" { "untouched" } else { "whole" };
         assert_eq!(
             recs[call].out,
-            format!("{end} cleaned whole 0{later}"),
+            format!("{end} cleaned {file} 0{later}"),
             "{sig}: {}",
             recs[call].err
         );
@@ -462,9 +493,12 @@ EOF",
 /// A Ctrl-C at any instant of a check leaves none of its temporary files: the
 /// mktemp stand-in sends it once mktemp has run. Before, mktemp made the file
 /// and the step named it in BOUNDED_TEMPS only after, so one caught in between
-/// stayed in TMPDIR. first_line_bounded runs in a command substitution, whose
-/// subshell starts with the run's traps reset, so its file stayed when the
-/// Ctrl-C landed outside bounded (the read row: in its head).
+/// stayed in TMPDIR. Asked for a name alone (-u), the stand-in makes the file
+/// and removes it again after the Ctrl-C, as macOS's mktemp does (mkstemp, then
+/// unlink), so one the Ctrl-C ended in between leaves a file nothing named,
+/// whatever mktemp the host has. first_line_bounded runs in a command
+/// substitution, whose subshell starts with the run's traps reset, so its file
+/// stayed when the Ctrl-C landed outside bounded (the read row: in its head).
 #[test]
 fn a_ctrl_c_in_a_check_leaves_none_of_its_files() {
     let scratch = Scratch::new();
@@ -473,8 +507,10 @@ fn a_ctrl_c_in_a_check_leaves_none_of_its_files() {
     lib.step(
         "mkdir -p \"$TMPDIR/bin\" \"$TMPDIR/app/Contents/MacOS\" && cat >\"$TMPDIR/bin/mktemp\" <<'EOF'
 #!/bin/sh
-\"$REAL_MKTEMP\" \"$@\"; s=$?
+s=0 f=
+if [ \"$1\" = -u ]; then shift; f=\"$(\"$REAL_MKTEMP\" \"$@\")\" || exit; else \"$REAL_MKTEMP\" \"$@\" || s=$?; fi
 [ \"$ROW\" = read ] || [ -e \"$TMPDIR/sent-$ROW\" ] || { : >\"$TMPDIR/sent-$ROW\"; kill -s INT 0; }
+[ -z \"$f\" ] || { rm -f \"$f\"; echo \"$f\"; }
 exit $s
 EOF
 cat >\"$TMPDIR/bin/head\" <<'EOF'
@@ -579,6 +615,25 @@ EOF",
             recs[call].err
         );
     }
+}
+
+/// A binary asked what it is answers with the first line it printed, and what
+/// it writes to stderr goes nowhere: bounded opens both of first_line_bounded's
+/// files in its own subshell (BOUNDED_OUT, BOUNDED_ERR). Off macOS this is the
+/// one check of BOUNDED_ERR: showed_it_ran, the other caller that names an
+/// error file, asks a program only there.
+#[test]
+fn a_binary_asked_what_it_is_answers_its_first_line_alone() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    let asked = lib.call(
+        "first_line_bounded /bin/sh -c 'echo said; echo noise >&2; echo later'",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[asked].rc, 0, "{}", recs[asked].err);
+    assert_eq!(recs[asked].out, "said");
+    assert_eq!(recs[asked].err, "");
 }
 
 /// One digest, two spellings: equality is case-blind, and an empty operand never matches.

@@ -3384,7 +3384,7 @@ fn subscription_account_and_weekly_outlast_workspace_details_without_overflow() 
 /// told one, `weekly unavailable` where none was told (a refused profile read), and a
 /// standing 7d wall over every reason. Each reason, like an aged figure, stays beside the
 /// account and the controls on an 80-column pane, in its narrow form (`weekly ?`, an aged
-/// figure's `61.5% left · 59m`) where the controls take the room; and on any rule where
+/// figure's `weekly 61.5% · 59m`) where the controls take the room; and on any rule where
 /// `weekly unavailable` beside the shortest account fits, the week stays.
 #[test]
 fn a_missing_weekly_figure_names_its_reason_beside_the_controls() {
@@ -3434,13 +3434,14 @@ fn a_missing_weekly_figure_names_its_reason_beside_the_controls() {
     for (facts, narrow) in [
         (with(Some(WeeklyGap::NoReply), None), "weekly ?"),
         (with(Some(WeeklyGap::Untapped), None), "weekly ?"),
-        (with(None, Some(aged)), "61.5% left \u{b7} 59m"),
+        (with(None, Some(aged)), "weekly 61.5% \u{b7} 59m"),
     ] {
         let words = weekly(&facts).expect("a weekly segment");
         let mut pair = [
             Segment::plain(ACCOUNT_MARK, "owner@example.com"),
-            Segment::plain(WEEKLY_MARK, narrow),
+            Segment::joined(WEEKLY_MARK, narrow),
         ];
+        elide_subscription_domain(&mut pair);
         shorten_subscription_account(&mut pair, 8);
         let reserved = rule_width(&pair, TitleFit::None, false, None);
         assert_eq!(
@@ -3468,7 +3469,7 @@ fn a_missing_weekly_figure_names_its_reason_beside_the_controls() {
         }
         let mut old_floor = [
             Segment::plain(ACCOUNT_MARK, "owner@example.com"),
-            Segment::plain(WEEKLY_MARK, "weekly unavailable"),
+            Segment::joined(WEEKLY_MARK, "weekly unavailable"),
         ];
         shorten_subscription_account(&mut old_floor, 8);
         let floor = rule_width(&old_floor, TitleFit::None, false, None);
@@ -3485,6 +3486,388 @@ fn a_missing_weekly_figure_names_its_reason_beside_the_controls() {
             }
         }
     }
+}
+
+/// AN AGED WEEK KEEPS ITS NAME ON THE NARROWEST RUNG: the rule draws the week behind the unit's
+/// `·`, with no mark of its own, so its narrow form keeps `weekly` and drops `left` and `ago`
+/// (`weekly 61.5% · 59m`, no wider than `weekly unavailable`); at no width, with the controls or
+/// without, does the figure stand beside the account as a bare share.
+#[test]
+fn an_aged_week_keeps_its_name_on_the_narrowest_rung() {
+    let aged = FooterFacts {
+        subscription: Some(super::super::profile::SubscriptionDisplay {
+            weekly: Some("weekly 61.5% left \u{b7} 59m ago".into()),
+            weekly_gap: None,
+            ..unit_facts(Some("owner@example.com"))
+                .subscription
+                .expect("a subscription")
+        }),
+        ..narrow_rule_facts()
+    };
+    let week = |rung: &[Segment]| {
+        rung.iter()
+            .find(|s| s.mark == WEEKLY_MARK)
+            .map(|s| s.text.clone())
+    };
+    let narrowest = facts_ladder(&aged)
+        .iter()
+        .rev()
+        .find_map(|rung| week(rung))
+        .expect("a rung with the week");
+    assert_eq!(narrowest, "weekly 61.5% \u{b7} 59m");
+    assert!(
+        text_width(&narrowest) <= text_width("weekly unavailable"),
+        "the narrow form fits where the old floor did"
+    );
+    let controls = Some(LightsWidth {
+        chips: 3,
+        title: 50,
+        lean: [0; LEAN_FORMS],
+        short: 20,
+        reason: true,
+    });
+    let mut shown = Vec::new();
+    for room in 0..=180 {
+        for lights in [None, controls] {
+            let fit = fit_rule(&aged, room, lights);
+            assert!(fit.width(lights) <= room, "{room}: {fit:?}");
+            let Some(text) = week(&fit.segments) else {
+                continue;
+            };
+            assert!(
+                text.starts_with("weekly "),
+                "{room}: the week reads as a bare share: {fit:?}"
+            );
+            if !shown.contains(&text) {
+                shown.push(text);
+            }
+        }
+    }
+    assert!(
+        shown.contains(&narrowest) && shown.len() > 1,
+        "the whole and the narrow forms both show: {shown:?}"
+    );
+}
+
+fn unit_facts(email: Option<&str>) -> FooterFacts {
+    use super::super::profile::{SubscriptionDisplay, WeeklyGap};
+    FooterFacts {
+        subscription: Some(SubscriptionDisplay {
+            email: email.map(str::to_owned),
+            plan: Some("Max 20x".into()),
+            weekly_gap: Some(WeeklyGap::Untapped),
+            ..Default::default()
+        }),
+        ..narrow_rule_facts()
+    }
+}
+
+/// The account unit as one rung shows it: the account's text, the plan's, the week's.
+fn unit_of(rung: &[Segment]) -> Option<(String, Option<String>, Option<String>)> {
+    let text = |mark: char| rung.iter().find(|s| s.mark == mark).map(|s| s.text.clone());
+    Some((text(ACCOUNT_MARK)?, text(PLAN_MARK), text(WEEKLY_MARK)))
+}
+
+/// Whether every part of `rung`'s account unit follows the account or another part of it.
+fn unit_whole(rung: &[Segment]) -> bool {
+    rung.iter().enumerate().all(|(at, s)| {
+        let part = matches!(s.mark, PLAN_MARK | WEEKLY_MARK);
+        part == s.joined
+            && (!part
+                || at
+                    .checked_sub(1)
+                    .and_then(|before| rung.get(before))
+                    .is_some_and(|b| b.mark == ACCOUNT_MARK || b.joined))
+    })
+}
+
+/// THE ACCOUNT, ITS PLAN AND ITS WEEK ARE ONE UNIT: one `⎆`, then the plan and the weekly
+/// words each behind a `·` one pitch on (`⎆ owner@example.com · Max 20x · weekly ? · until
+/// relaunch`), and the next fact the usual gap away; neither `◇` nor `◷` is drawn, and the unit is
+/// one fact's span.
+#[test]
+fn the_account_plan_and_week_are_one_unit() {
+    let facts = unit_facts(Some("owner@example.com"));
+    let segs = segments(&facts);
+    assert_eq!(
+        segs[..4]
+            .iter()
+            .map(|s| (s.mark, s.text.as_str(), s.joined))
+            .collect::<Vec<_>>(),
+        [
+            (ACCOUNT_MARK, "owner@example.com", false),
+            (PLAN_MARK, "Max 20x", true),
+            (
+                WEEKLY_MARK,
+                super::super::profile::WeeklyGap::Untapped.words(),
+                true
+            ),
+            (MODEL_MARK, "Opus 5.5 xhigh", false),
+        ]
+    );
+    let set = set_facts(&segs);
+    let marks: String = set.glyphs.iter().filter(|g| g.mark).map(|g| g.ch).collect();
+    assert_eq!(
+        marks,
+        format!("{ACCOUNT_MARK}{JOIN_MARK}{JOIN_MARK}{MODEL_MARK}{PATH_MARK}{BRANCH_MARK}")
+    );
+    assert!(
+        !set.glyphs
+            .iter()
+            .any(|g| g.ch == PLAN_MARK || g.ch == WEEKLY_MARK),
+        "the parts' own marks only name them"
+    );
+    let spans = fact_spans(&set, &segs);
+    let kinds: Vec<FactKind> = spans.iter().flatten().map(|s| s.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            FactKind::Account,
+            FactKind::Model,
+            FactKind::Effort,
+            FactKind::Path,
+            FactKind::Branch
+        ]
+    );
+    let unit = spans[0].expect("the unit's span");
+    let read: String = set
+        .glyphs
+        .iter()
+        .filter(|g| (usize::from(unit.cells.0)..usize::from(unit.cells.1)).contains(&g.cell))
+        .map(|g| g.ch)
+        .collect();
+    assert_eq!(
+        read,
+        format!(
+            "\u{2386}owner@example.com\u{b7}Max20x\u{b7}{}",
+            super::super::profile::WeeklyGap::Untapped
+                .words()
+                .replace(' ', "")
+        ),
+        "one span from the account's mark to the week's last word"
+    );
+    assert_eq!(unit.cells.0, 0);
+    assert!(unit.restores.is_empty());
+    // Where each glyph is drawn, in cells: its cell, half its width, and its nudge.
+    let centre = |g: &SetGlyph| {
+        g.cell as f32 + g.cols as f32 / 2.0 + f32::from(g.nudge) / f32::from(NUDGES_PER_CELL)
+    };
+    let at = |pick: &dyn Fn(&(usize, &SetGlyph)) -> bool| {
+        set.glyphs
+            .iter()
+            .enumerate()
+            .find(|g| pick(g))
+            .map(|(i, _)| i)
+            .expect("the glyph")
+    };
+    let first_join = at(&|(_, g)| g.mark && g.ch == JOIN_MARK);
+    let model = at(&|(_, g)| g.mark && g.ch == MODEL_MARK);
+    let between = |i: usize| centre(&set.glyphs[i]) - centre(&set.glyphs[i - 1]);
+    // `m·`: half a glyph, the join's pitch, half a glyph; `b◆`: the same around the gap.
+    let (joined, gapped) = (between(first_join), between(model));
+    assert!(
+        ((joined / gapped) - (1.0 + JOIN_GAP) / (1.0 + GAP)).abs() < 0.05,
+        "a joined part sits {joined} cells on, the next fact {gapped}"
+    );
+    assert!(
+        (between(first_join + 1) - joined).abs() < 0.1,
+        "the join sits as far from the plan as from the email"
+    );
+    let plain: Vec<Segment> = segs
+        .iter()
+        .map(|s| Segment {
+            joined: false,
+            ..s.clone()
+        })
+        .collect();
+    assert!(
+        segments_width(&plain) > segments_width(&segs),
+        "CONTROL: apart, the parts take the facts' gap"
+    );
+}
+
+/// THE UNIT NARROWS AS ONE, WIDEST FIRST, once the other facts have given way: whole, the
+/// email's domain elided, the plan dropped, the email cut to 12 and then 8 cells, the weekly
+/// words narrowed. No rung shows the plan or the week without the account before them.
+#[test]
+fn the_account_unit_narrows_as_one_widest_first() {
+    let facts = unit_facts(Some("pat.owner93@example.com"));
+    let week = super::super::profile::WeeklyGap::Untapped.words();
+    let unit = |account: &str, plan: bool, weekly: &str| {
+        (
+            account.to_owned(),
+            plan.then(|| "Max 20x".to_owned()),
+            Some(weekly.to_owned()),
+        )
+    };
+    let full = segments_width(&segments(&facts)) + 2;
+    let mut seen = Vec::new();
+    for room in (0..=full).rev() {
+        let fit = fit_rule(&facts, room, None);
+        assert!(fit.width(None) <= room, "{room}: {fit:?}");
+        assert!(
+            unit_whole(&fit.segments),
+            "{room}: the unit splits: {fit:?}"
+        );
+        let Some(shown) = unit_of(&fit.segments) else {
+            assert!(fit.segments.is_empty(), "{room}: {fit:?}");
+            continue;
+        };
+        if shown != unit("pat.owner93@example.com", true, week) {
+            assert!(
+                fit.segments
+                    .iter()
+                    .all(|s| matches!(s.mark, ACCOUNT_MARK | PLAN_MARK | WEEKLY_MARK)),
+                "{room}: the other facts give way first: {fit:?}"
+            );
+        }
+        if seen.last() != Some(&shown) {
+            seen.push(shown);
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            unit("pat.owner93@example.com", true, week),
+            unit("pat.owner93@\u{2026}", true, week),
+            unit("pat.owner93@\u{2026}", false, week),
+            unit("pat.owner93\u{2026}", false, week),
+            unit("pat.own\u{2026}", false, week),
+            unit("pat.own\u{2026}", false, "weekly ?"),
+        ]
+    );
+    for facts in [
+        facts.clone(),
+        unit_facts(None),
+        FooterFacts {
+            subscription: facts.subscription.clone(),
+            ..narrow_rule_walled()
+        },
+    ] {
+        for rung in facts_ladder(&facts) {
+            assert!(unit_whole(&rung), "{rung:?}");
+        }
+    }
+    let ladder = facts_ladder(&facts);
+    let at = |shown: &(String, Option<String>, Option<String>)| {
+        ladder
+            .iter()
+            .position(|rung| unit_of(rung).as_ref() == Some(shown))
+            .expect("the rung")
+    };
+    assert!(
+        ladder[..at(&unit("pat.owner93@\u{2026}", true, week))]
+            .iter()
+            .any(|rung| rung.iter().any(|s| s.mark == MODEL_MARK)),
+        "CONTROL: the model stood beside the whole unit"
+    );
+}
+
+/// A REASON OR AN UPGRADE NOTE MAY TAKE THE ROOM OF THE EMAIL'S DOMAIN AND OF THE PLAN, as a
+/// reason took the plan's before the three were one unit, and never of the email's name or the
+/// week: where a title makes facts give way, the name and the week stay whole.
+#[test]
+fn a_reason_takes_the_domain_and_the_plan_but_never_the_name_or_the_week() {
+    let facts = unit_facts(Some("pat.owner93@example.com"));
+    let week = super::super::profile::WeeklyGap::Untapped.words();
+    let reason = Some(LightsWidth {
+        chips: 6,
+        title: 50,
+        lean: [0; LEAN_FORMS],
+        short: 30,
+        reason: true,
+    });
+    let untitled = reason.map(|l| LightsWidth {
+        title: 0,
+        short: 0,
+        reason: false,
+        ..l
+    });
+    let mut took = (false, false);
+    for room in (0..=240).rev() {
+        let fit = fit_rule(&facts, room, reason);
+        assert!(fit.width(reason) <= room, "{room}: {fit:?}");
+        assert!(unit_whole(&fit.segments), "{room}: {fit:?}");
+        if fit.title == TitleFit::None || fit.segments == fit_rule(&facts, room, untitled).segments
+        {
+            continue;
+        }
+        let (account, plan, weekly) = unit_of(&fit.segments).expect("the unit beside a reason");
+        assert_eq!(email_name(&account), Some("pat.owner93"), "{room}: {fit:?}");
+        assert_eq!(weekly.as_deref(), Some(week), "{room}: {fit:?}");
+        took.0 |= account.ends_with('\u{2026}');
+        took.1 |= plan.is_none();
+    }
+    assert_eq!(
+        took,
+        (true, true),
+        "a reason took the domain's room and the plan's"
+    );
+    let noted = FooterFacts {
+        upgrade: Some(UpgradeWords {
+            whole: "Claude Code 2.1.286 is ready \u{b7} waits while you use this tab".into(),
+            short: "2.1.286 waits while you use this tab".into(),
+        }),
+        ..facts
+    };
+    let led: Vec<Vec<Segment>> = facts_ladder(&noted)
+        .into_iter()
+        .filter(|rung| rung.iter().any(|s| s.mark == UPGRADE_MARK))
+        .collect();
+    for rung in &led {
+        let (account, _, weekly) = unit_of(rung).expect("the unit beside the note");
+        assert_eq!(email_name(&account), Some("pat.owner93"), "{rung:?}");
+        assert_eq!(weekly.as_deref(), Some(week), "{rung:?}");
+    }
+    assert!(
+        led.iter()
+            .any(|rung| unit_of(rung).is_some_and(|(_, plan, _)| plan.is_none())),
+        "CONTROL: the note takes the plan's room: {led:?}"
+    );
+}
+
+/// THE DOMAIN GOES ONLY WHERE THERE IS TEXT ON BOTH SIDES OF ITS `@`: never from `account
+/// unavailable`, a bare `@example.com` or a dangling `owner@`.
+#[test]
+fn the_email_domain_is_elided_only_between_text() {
+    let elided = |text: &str| {
+        let mut rung = [
+            Segment::plain(ACCOUNT_MARK, text),
+            Segment::joined(WEEKLY_MARK, "weekly ?"),
+        ];
+        elide_subscription_domain(&mut rung).then(|| rung[0].text.clone())
+    };
+    assert_eq!(
+        elided("owner@example.com").as_deref(),
+        Some("owner@\u{2026}")
+    );
+    assert_eq!(elided("a@b@example.com").as_deref(), Some("a@b@\u{2026}"));
+    for text in ["account unavailable", "@example.com", "owner@", "owner"] {
+        assert_eq!(elided(text), None, "{text}");
+    }
+    let mut no_account = [Segment::plain(MODEL_MARK, "a@b")];
+    assert!(
+        !elide_subscription_domain(&mut no_account),
+        "only the account's"
+    );
+    let missing = unit_facts(None);
+    let full = segments_width(&segments(&missing)) + 2;
+    for room in (0..=full).rev() {
+        let fit = fit_rule(&missing, room, None);
+        if let Some((account, _, _)) = unit_of(&fit.segments) {
+            assert!(
+                "account unavailable".starts_with(account.trim_end_matches('\u{2026}')),
+                "{room}: {account}"
+            );
+        }
+    }
+    assert!(
+        fit_rule(&missing, full, None)
+            .segments
+            .iter()
+            .any(|s| s.text == "account unavailable"),
+        "CONTROL: whole where it fits"
+    );
 }
 
 #[test]
@@ -5120,6 +5503,7 @@ fn fact_spans_split_model_and_effort_by_their_glyphs() {
         [
             FactKind::Model,
             FactKind::Effort,
+            FactKind::Account,
             FactKind::Path,
             FactKind::Branch,
             FactKind::Usage
@@ -5696,6 +6080,7 @@ fn the_effort_split_survives_clusters_and_marks() {
             text: text.clone(),
             split: Some(head.len()),
             quiet: (true, false),
+            joined: false,
         }]);
         let spelled = |pick: &dyn Fn(&SetGlyph) -> bool| -> String {
             set.glyphs

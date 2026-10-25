@@ -192,9 +192,11 @@ impl InkLedger {
             return;
         };
         let table = crate::color_math::relative_luminance_table();
-        let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
-        if lum(rgb) > lum(self.under[cell]) {
-            self.under[cell] = rgb;
+        let under = self.under.as_mut_slice();
+        if crate::color_math::relative_luminance_with(table, rgb)
+            > crate::color_math::relative_luminance_with(table, under[cell])
+        {
+            under[cell] = rgb;
         }
     }
 
@@ -776,18 +778,34 @@ impl InkLedger {
         })
     }
 
-    fn dims_bounds(&self) -> (i32, i32, i32, i32) {
+    const fn dims_bounds(&self) -> (i32, i32, i32, i32) {
         let (_, _, cw, ch) = self.grid;
         let (fx, fy) = (
             (cw * Self::FEATHER_X).ceil() as i32,
             (ch * Self::FEATHER_Y).ceil() as i32,
         );
         let (mut min_x, mut min_y, mut max_x, mut max_y) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
-        for d in &self.dims {
-            min_x = min_x.min(d.x0 as i32 - fx);
-            min_y = min_y.min(d.y0 as i32 - fy);
-            max_x = max_x.max(d.x1 as i32 + fx);
-            max_y = max_y.max(d.y1 as i32 + fy);
+        let dims = self.dims.as_slice();
+        let mut i = 0;
+        while i < dims.len() {
+            let d = &dims[i];
+            let x0 = d.x0 as i32 - fx;
+            let y0 = d.y0 as i32 - fy;
+            let x1 = d.x1 as i32 + fx;
+            let y1 = d.y1 as i32 + fy;
+            if x0 < min_x {
+                min_x = x0;
+            }
+            if y0 < min_y {
+                min_y = y0;
+            }
+            if x1 > max_x {
+                max_x = x1;
+            }
+            if y1 > max_y {
+                max_y = y1;
+            }
+            i += 1;
         }
         (min_x, min_y, max_x, max_y)
     }

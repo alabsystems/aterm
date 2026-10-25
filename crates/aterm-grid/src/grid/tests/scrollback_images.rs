@@ -158,3 +158,61 @@ fn a_grid_that_never_drew_a_picture_never_scans_for_one() {
         "placing a picture must arm the scan that carries it into history"
     );
 }
+
+#[test]
+fn history_image_removal_releases_ring_and_cached_staged_payloads() {
+    for ring in [0, 128] {
+        let mut grid = Grid::with_tiered_scrollback(
+            4,
+            20,
+            ring,
+            aterm_scrollback::Scrollback::with_defaults(),
+        );
+        grid.set_compress_offload_active(true);
+        grid.write_char('t');
+        let image = placement(1, 2);
+        stamp(&mut grid, 0, &image, 0, 2);
+        grid.scroll_up(1);
+        assert_eq!(grid.ring_buffer_scrollback() > 0, ring > 0);
+        assert!(grid.history_any_image(&|_| true));
+        // This also materializes and caches the lazy row before deleting its source spans.
+        assert_eq!(grid.get_history_line(0).unwrap().image_count(), 1);
+        let text = grid.get_history_line(0).unwrap().to_string();
+        let generation = grid.content_gen();
+        let bytes = grid.storage.ring_extras.retained_bytes();
+        let staged = grid.storage.lazy_buffer.staged_bytes();
+        let references = Arc::strong_count(&image);
+        assert!(!grid.retain_history_images(&mut |_| true));
+        assert_eq!(
+            grid.content_gen(),
+            generation,
+            "no removal needs no invalidation"
+        );
+        assert_eq!(grid.storage.ring_extras.retained_bytes(), bytes);
+        assert_eq!(grid.storage.lazy_buffer.staged_bytes(), staged);
+        assert!(grid.retain_history_images(&mut |_| false));
+        assert!(!grid.history_any_image(&|_| true));
+        assert_eq!(
+            grid.get_history_line(0).unwrap().image_count(),
+            0,
+            "the cached materialization cannot resurrect a tile"
+        );
+        assert_eq!(grid.get_history_line(0).unwrap().to_string(), text);
+        assert_eq!(
+            Arc::strong_count(&image),
+            references - if ring == 0 { 2 } else { 1 },
+            "the history span and staged materialization release their own references"
+        );
+        assert!(grid.content_gen() > generation);
+        grid.storage.ring_extras.assert_running_sums();
+        if ring == 0 {
+            assert!(grid.storage.lazy_buffer.staged_bytes() < staged);
+        } else {
+            assert!(grid.storage.ring_extras.retained_bytes() < bytes);
+        }
+        // Full-screen scroll's O(1) extras offset can retain off-grid cell references
+        // until its next compaction; those are separate from the history's custody.
+        drop(grid);
+        assert_eq!(Arc::strong_count(&image), 1);
+    }
+}

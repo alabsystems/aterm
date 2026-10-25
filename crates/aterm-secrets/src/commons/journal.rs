@@ -314,11 +314,25 @@ impl Journal {
     /// A missing anchor file can be restored only to the caller's independently
     /// trusted value; replay still verifies every event against it.
     pub fn open(dir: &Path, trust: Trust) -> Result<Self> {
+        Self::open_mode(dir, trust, false)
+    }
+
+    /// Reopen an established journal. Missing anchor/log/checkpoint state is
+    /// damage, not permission to initialize an empty history. An outer durable
+    /// bootstrap pin uses this after the journal has first been initialized.
+    pub fn open_existing(dir: &Path, trust: Trust) -> Result<Self> {
+        Self::open_mode(dir, trust, true)
+    }
+
+    fn open_mode(dir: &Path, trust: Trust, established: bool) -> Result<Self> {
         let lock = lock(dir)?;
         let missing_anchor = match private_file::read_private(dir, "control.anchor", 84) {
             Ok(bytes) if bytes == trust.bytes() => false,
             Ok(_) => return Err(Error::new("control journal trust anchor changed")),
-            Err(PrivateFileError::Missing) => true,
+            Err(PrivateFileError::Missing) if !established => true,
+            Err(PrivateFileError::Missing) => {
+                return Err(Error::new("established control journal anchor is missing"));
+            }
             Err(_) => {
                 return Err(Error::new(
                     "control journal anchor is not a private regular file",
@@ -608,6 +622,58 @@ impl Journal {
                 self.nodes.values(),
             )?,
         }))
+    }
+
+    /// Open a data snapshot on the selected history, for historical validation
+    /// only. A recovery's unselected parents remain evidence, not positive grants.
+    /// The roster consumer must separately establish current local membership.
+    pub(crate) fn historical(&self, id: Digest, identity: &Identity) -> Result<Current> {
+        let State::Ready { head, .. } = self.state() else {
+            return Err(Error::new(
+                "historical access requires ready control history",
+            ));
+        };
+        let mut cursor = head;
+        let mut selected = false;
+        for _ in 0..self.nodes.len() {
+            let node = self
+                .nodes
+                .get(&cursor)
+                .ok_or_else(|| Error::new("missing selected history"))?;
+            if cursor == id && node.kind() != Kind::Recovery {
+                selected = true;
+                break;
+            }
+            let Some(parent) = node.selected().or_else(|| node.parents().first().copied()) else {
+                break;
+            };
+            cursor = parent;
+        }
+        if !selected {
+            return Err(Error::new("roster is outside the selected control history"));
+        }
+        let mut ancestors = BTreeSet::new();
+        let mut pending = vec![id];
+        while let Some(parent) = pending.pop() {
+            if ancestors.insert(parent) {
+                let node = self
+                    .nodes
+                    .get(&parent)
+                    .ok_or_else(|| Error::new("missing historical ancestor"))?;
+                pending.extend(node.parents());
+            }
+        }
+        Ok(Current {
+            head: id,
+            basis: id,
+            payload: self.nodes[&id].open(identity)?,
+            constraints: Constraints::collect(
+                self.trust.network,
+                self.trust.authority,
+                id,
+                ancestors.iter().map(|ancestor| &self.nodes[ancestor]),
+            )?,
+        })
     }
 
     /// Observe the union of restrictive facts without a decryption key, only

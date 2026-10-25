@@ -11,6 +11,8 @@ use aterm_types::macos_setup::{
     PassOutcome, PutBack, RestoreOutcome, Selection, Setting, Unfinished,
 };
 
+#[cfg(test)]
+mod accounts_visibility_tests;
 mod initial;
 pub use initial::{
     InitialSetupAdmission, InitialSetupAuthorization, InitialSetupObservation,
@@ -26,7 +28,8 @@ pub use initial::{
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{
-    ProvisionalSetupWatchTest, initial_setup_observation_at, initial_setup_snapshot_at,
+    InitialSetupAdmissionFault, InitialSetupAdmissionStopTest, ProvisionalSetupWatchTest,
+    initial_setup_observation_at, initial_setup_snapshot_at,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -446,23 +449,29 @@ fn apply_part_with(
             selected
         }
     };
-    if part == (Part::Accounts { on_screen: false })
-        && aterm_machines::init_accounts::accessibility_needed_selected(sys, selected) != Ok(false)
-    {
-        return Ok(Some(Report {
-            action: Action::Apply,
-            rows: vec![Row {
-                name: "Messages and FaceTime sign-out".into(),
-                status: initial::WAITING.into(),
-                detail: "runs while System State is on screen: it opens Messages and FaceTime, \
-                         and macOS may ask for Accessibility"
-                    .into(),
-            }],
-            manual_steps: Vec::new(),
-            backup: root.join("original-preferences.json"),
-            restore: None,
-            page: None,
-        }));
+    if part == (Part::Accounts { on_screen: false }) {
+        // An earlier read cannot authorize a later Apply: an unknown account can become
+        // readable, or a signed-out account can sign in, before that Apply probes it again.
+        // Off screen this pass only reads, through the same engine that verifies sign-out.
+        host.select(selected);
+        let mut report = execute(host, root, Action::Check)?;
+        report.action = Action::Apply;
+        if report.needs_attention() {
+            for row in &mut report.rows {
+                if row.status != "ok" {
+                    row.status = initial::WAITING.into();
+                    row.detail.push_str(
+                        "; runs while System State is on screen: it opens Messages and FaceTime, \
+                         and macOS may ask for Accessibility",
+                    );
+                }
+            }
+            // These are readings, not failed changes or rollbacks from this pass.
+            report.page = None;
+        } else {
+            initial::record_applied(root, selected)?;
+        }
+        return Ok(Some(report));
     }
     let accounts_selected =
         selected.contains(Setting::Messages) || selected.contains(Setting::FaceTime);
@@ -884,12 +893,26 @@ enum PersonScope {
 }
 
 impl PersonScope {
+    fn ready(self) -> Result<bool, String> {
+        match self {
+            Self::Person => Ok(true),
+            Self::Refused(_) => Ok(false),
+            Self::Unresolved(why) => Err(why),
+        }
+    }
+
     fn lasting(self) -> Option<String> {
         match self {
             Self::Refused(why) => Some(why),
             Self::Person | Self::Unresolved(_) => None,
         }
     }
+}
+
+/// Read scope readiness from scratch account paths without consulting this process's account.
+#[cfg(any(test, debug_assertions))]
+pub fn initial_setup_scope_ready_at(home: &Path, account_home: &Path) -> Result<bool, String> {
+    scope_of(false, 501, Some(home), || Ok(account_home.to_path_buf())).ready()
 }
 
 fn person_scope() -> PersonScope {
@@ -940,6 +963,12 @@ fn ensure_person_scope() -> Result<(), String> {
         PersonScope::Person => Ok(()),
         PersonScope::Refused(why) | PersonScope::Unresolved(why) => Err(why),
     }
+}
+
+/// Whether startup may bind this account's setup records. A lasting refusal is `false`;
+/// an unresolved account or home is an error to retry before observing those records.
+pub fn initial_setup_scope_ready() -> Result<bool, String> {
+    person_scope().ready()
 }
 
 /// Why this process may never change the person's macOS profile.

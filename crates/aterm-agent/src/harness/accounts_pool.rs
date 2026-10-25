@@ -264,15 +264,29 @@ pub fn live_usage(cli: Cli, home: &Path, now: i64) -> Option<Usage> {
     .flatten()
 }
 
-/// Whether `roster` holds two rows whose logins are here: one row is nothing to pick between.
-fn pooled(roster: &Roster, enrolled: &std::collections::BTreeSet<String>) -> bool {
-    let here = |row: &&Row| row.dir.is_none() || enrolled.contains(&row.label);
-    roster.rows.iter().filter(here).count() >= 2
+/// Whether `roster` gives [`launch_env`] a login to place or measure: at least one row's login is
+/// here, and it is not an unpinned single default-home row (nothing to pick between or rotate to).
+fn pool_acts(
+    roster: &Roster,
+    enrolled: &std::collections::BTreeSet<String>,
+    state: &accounts::State,
+) -> bool {
+    let here = |row: &Row| row.dir.is_none() || enrolled.contains(&row.label);
+    if !roster.rows.iter().any(here) {
+        return false;
+    }
+    if let [only] = roster.rows.as_slice()
+        && only.dir.is_none()
+        && !state.pinned
+    {
+        return false;
+    }
+    true
 }
 
 /// The login a launch aterm makes of `cli` starts under ([`accounts::launch_row`] over the bound
-/// roster, once [`record_usage`] read each row's usage with `read`): `None` with fewer than two
-/// rows here, with no row usable, for a CLI whose seam no lab pass measured
+/// roster, once [`record_usage`] read each row's usage with `read`): `None` with an unpinned lone
+/// default-home row, with no row here or usable, for a CLI whose seam no lab pass measured
 /// ([`crate::ai::connector::Accounts::measured`]), where the CLI keeps its login in the OS
 /// keyring ([`Seat::keyring_held`]), or where the pick's overlay home cannot be used
 /// ([`login_env`]). Under `[harness] accounts = "off"` only the owner's pin is honoured.
@@ -283,20 +297,20 @@ pub fn launch_env(seat: &Seat<'_>, cli: Cli, read: ReadUsage<'_>) -> Option<Logi
     }
     let roster = seat.bound_roster(cli).ok()?;
     let enrolled = accounts::enrolled_for(cli, &roster);
-    if !pooled(&roster, &enrolled) {
+    let store = seat.store(cli);
+    let (initial_state, _) = store.load(seat.now).ok()?;
+    if !pool_acts(&roster, &enrolled, &initial_state) {
         return None;
     }
-    let store = seat.store(cli);
     if seat.mode() == Mode::Off {
-        let (state, _) = store.load(seat.now).ok()?;
-        let pinned = state
+        let pinned = initial_state
             .active
             .as_deref()
-            .filter(|_| state.pinned)
+            .filter(|_| initial_state.pinned)
             .and_then(|label| roster.row(label))?;
         let cond = accounts::condition(
             pinned,
-            &state,
+            &initial_state,
             pinned.dir.is_none() || enrolled.contains(&pinned.label),
             seat.now,
         );

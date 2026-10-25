@@ -238,6 +238,7 @@ sid=$(aterm ctl spawn window=1 | cut -d' ' -f2)
 aterm ctl "@$sid" turn 'make test'
 aterm ctl "@$sid" await match 'result:'        # block until a regex appears (one token)
 aterm ctl "@$sid" await agent idle,prompt,question,wall   # a coding-agent peer's turn is over, a box waits, or a wall stops it
+aterm ctl "@$sid" await log kind=program since=<log_seq> ep=<log_ep>   # a codex peer (agent=unknown): its own report moved; read status log_seq=/log_ep= before typing
 aterm ctl subscribe "@$sid" events,cursor      # add screen,cells,bytes as needed
 aterm ctl "@$sid" close
 ```

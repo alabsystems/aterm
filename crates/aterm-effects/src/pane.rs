@@ -248,7 +248,7 @@ mod pane_free_crop_tests {
         }
     }
 
-    fn place(cols: u16) -> PanePlace {
+    const fn place(cols: u16) -> PanePlace {
         PanePlace {
             row_off: 1,
             col_off: 4,

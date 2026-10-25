@@ -10,6 +10,10 @@ mod abrew_admission;
 #[cfg(target_os = "macos")]
 mod aos_gpu_bench;
 #[cfg(target_os = "macos")]
+mod aos_learn;
+#[cfg(target_os = "macos")]
+mod aos_learn_bench;
+#[cfg(target_os = "macos")]
 mod aos_phase;
 #[cfg(target_os = "macos")]
 mod aos_repair;
@@ -75,6 +79,8 @@ mod instance;
 mod jail;
 #[cfg(target_os = "macos")]
 mod lab;
+#[cfg(target_os = "macos")]
+mod lab_build;
 #[cfg(target_os = "macos")]
 mod link;
 #[cfg(target_os = "macos")]
@@ -175,6 +181,8 @@ mod settings_witness;
 mod sleep;
 #[cfg(target_os = "macos")]
 mod slot_lane;
+#[cfg(target_os = "macos")]
+mod spread;
 #[cfg(target_os = "macos")]
 mod stats;
 #[cfg(target_os = "macos")]
@@ -432,6 +440,10 @@ Outside any lab (no jail, no stub):
                                  design §11.8's pre-registered M5b measurement: six aos-search arms in a Williams order, gates and criteria in DIR/record.txt (~60 min, ~70 with --faults; `--help` for details)
   aos-gpu-bench --harness PATH --out DIR [--rounds N]
                                  design §12.9's pre-registered M5a measurement: four aos_gpu arms (F I T G) in a Williams order, gates and criteria in DIR/record.md (~25 min; `--help` for details)
+  aos-learn VERB ...
+                                 Aos M6's learner: build, init, chain, train, rollback, verify, and session, the one verb that labels a held-out set (`--help` for details)
+  aos-learn-bench --lab PATH --out DIR PAIR --tests-log FILE
+                                 design §13.9's pre-registered M6 session on PAIR (a real pair, or --practice J; `--help` names both): child A, then child B replaying it, gates G0 to G5, the pair's void or record line, DIR/record.txt
   aos-phase TRACE --build BUILD [--plan PLAN_HEX]
                                  re-derive a windowed aos-repair run's measured phase from its kept trace (`--help` for details)
   resource-attribution [--aterm PATH]
@@ -662,6 +674,8 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "aos-search" => aos_search::cmd_aos_search(args),
         "aos-workers-bench" => aos_workers_bench::cmd_aos_workers_bench(args),
         "aos-gpu-bench" => aos_gpu_bench::cmd_aos_gpu_bench(args),
+        "aos-learn" => aos_learn::cmd_aos_learn(args),
+        "aos-learn-bench" => aos_learn_bench::cmd_aos_learn_bench(args),
         "aos-phase" => aos_phase::cmd_aos_phase(args),
         "presence-flap" => presence::cmd_presence_flap(args),
         "meta-keys" => meta_keys::cmd_meta_keys(args),

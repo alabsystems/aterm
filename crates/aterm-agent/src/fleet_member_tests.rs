@@ -375,6 +375,16 @@ fn init_then_join_registers_and_peers_checks_each_peer() {
             "{flags:?} on an issuer takes --rotate"
         );
     }
+    let again = ok(init(
+        &issuer.places,
+        &args(&["--host", "127.0.0.1", "--port", &port, "--allow", "content"]),
+    ));
+    assert!(again.contains("already the fleet's issuer"), "{again}");
+    let drive = init(&issuer.places, &args(&["--allow", "drive"]));
+    assert!(
+        matches!(&drive, Err(Failure::Usage(why)) if why.contains("never by an init or a join")),
+        "{drive:?}"
+    );
     assert_eq!(read_key_file(&issuer.places.state).unwrap(), key);
     assert_eq!(std::fs::read_to_string(&code_path).unwrap(), code);
     assert_eq!(fleet_table(&issuer.config()).unwrap(), table);
@@ -391,7 +401,8 @@ fn init_then_join_registers_and_peers_checks_each_peer() {
     let joined = ok(join(&member.places, &opts, &code));
     assert!(
         joined.contains("allow      facts:")
-            && joined.contains("`aterm fleet allow content` lets it"),
+            && joined.contains("`aterm fleet allow content` lets it")
+            && joined.contains("(1 peer in its book)"),
         "{joined}"
     );
     assert_eq!(
@@ -525,8 +536,12 @@ fn init_then_join_registers_and_peers_checks_each_peer() {
     assert!(!other.places.state.exists(), "nothing written for a typo");
 
     let fresh = World::new("unanswered");
+    let elsewhere_port = Opts {
+        port: Some(closed_port()),
+        ..Opts::default()
+    };
     assert!(matches!(
-        join(&fresh.places, &Opts::default(), &other_code),
+        join(&fresh.places, &elsewhere_port, &other_code),
         Err(Failure::Failed(_))
     ));
     assert!(!fresh.places.state.join(KEY_FILE).exists(), "no key");
@@ -2048,9 +2063,45 @@ fn a_join_to_an_issuer_past_the_lan_is_refused_by_its_kind() {
 }
 
 #[test]
+fn a_first_join_its_issuer_never_answers_says_it_kept_the_node_key() {
+    let port = closed_port();
+    let code = JoinCode {
+        secret: [7; member::SECRET_LEN],
+        host: "127.0.0.1".to_owned(),
+        port,
+    }
+    .text();
+    let fresh = World::new("unanswered-first");
+    let opts = Opts {
+        port: Some(port.wrapping_add(1).max(1)),
+        ..Opts::default()
+    };
+    let refused = || match join(&fresh.places, &opts, &code) {
+        Err(Failure::Failed(why)) => why,
+        other => panic!("{other:?}"),
+    };
+    let first = refused();
+    assert!(
+        first.contains(
+            "Nothing of the fleet was written here; this machine's node key (fleet-node, \
+             fleet-node-key), minted for the join, is kept"
+        ),
+        "{first}"
+    );
+    assert!(fresh.places.state.join(NODE_KEY_FILE).exists());
+    for file in [KEY_FILE, PEERS_FILE] {
+        assert!(!fresh.places.state.join(file).exists(), "{file}");
+    }
+    let again = refused();
+    assert!(
+        again.contains("Nothing of the fleet was written here.") && !again.contains("minted"),
+        "{again}"
+    );
+}
+
+#[test]
 fn every_reason_a_fleet_read_gives_fits_its_row() {
     use aterm_ctl::PeerFault;
-    use aterm_net::fleet::FleetError;
     use aterm_net::fleet_member::Stage;
     let at = std::net::SocketAddr::from(([192, 168, 100, 200], 7100));
     let host = "Andrews-MacBook-Pro.local".to_owned();
@@ -2282,6 +2333,94 @@ fn a_member_of_a_loopback_fleet_is_recorded_where_it_listens() {
 }
 
 #[test]
+fn a_join_that_would_take_the_issuers_own_address_writes_nothing() {
+    let (_issuer, code, _serving) = issuing("same-place-issuer");
+    let member = World::new("same-place-member");
+    for opts in [
+        Opts::default(),
+        Opts {
+            host: Some("localhost".to_owned()),
+            ..Opts::default()
+        },
+    ] {
+        match join(&member.places, &opts, &code) {
+            Err(Failure::Usage(why)) => assert!(
+                why.contains("the issuer's own address") && why.contains("`--port <n>`"),
+                "{opts:?}: {why}"
+            ),
+            other => panic!("{opts:?}: {other:?}"),
+        }
+    }
+    assert!(
+        !member.places.state.exists(),
+        "nothing of the fleet was written"
+    );
+    assert_eq!(member.config(), "");
+    let port = closed_port();
+    let joined = ok(join(
+        &member.places,
+        &Opts {
+            port: Some(port),
+            ..Opts::default()
+        },
+        &code,
+    ));
+    assert!(
+        joined.contains(&format!("as 127.0.0.1:{port} ")),
+        "{joined}"
+    );
+}
+
+#[test]
+fn a_place_no_read_takes_as_a_peer_is_refused_at_its_add_and_skipped_when_booked() {
+    let (issuer, _code, _serving) = issuing("unread-place");
+    let state = &issuer.places.state;
+    let port = fleet_table(&issuer.config())
+        .unwrap()
+        .listen_port()
+        .unwrap();
+    let book = read_peers(state).unwrap();
+    let own = [format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+    for place in ["8.8.8.8", "100.64.1.2:7100", "[2001:db8::1]:7100"]
+        .into_iter()
+        .chain(own.iter().map(String::as_str))
+    {
+        match peers(&issuer.places, &args(&["add", place])) {
+            Err(Failure::Usage(why)) => {
+                assert!(why.contains("nothing was written"), "{place}: {why}")
+            }
+            other => panic!("{place}: {other:?}"),
+        }
+    }
+    assert_eq!(read_peers(state).unwrap(), book, "nothing was written");
+    let other = format!("127.0.0.1:{}", closed_port());
+    assert!(ok(peers(&issuer.places, &args(&["add", &other]))).contains("added"));
+
+    member::update_peers(state, |book| {
+        member::record(book, manual_peer("127.0.0.1".to_owned(), port))
+    })
+    .unwrap();
+    let listed = ok(list_peers(&issuer.places, HANG));
+    assert!(
+        listed.contains(&format!(
+            "this machine itself, no peer: `aterm fleet peers rm 127.0.0.1:{port}`"
+        )),
+        "{listed}"
+    );
+    let whole = aterm_ctl::FleetAsk {
+        host: None,
+        within: HANG,
+    };
+    let read = survey_fleet_in(&issuer.places, &whole).unwrap_or_else(|why| panic!("{why}"));
+    let labels: Vec<&str> = read.peers.iter().map(|peer| peer.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        [other.as_str()],
+        "this machine is never its own peer"
+    );
+}
+
+#[test]
 fn peers_beside_a_key_it_cannot_use_refuses_saying_how_it_reads_again() {
     let (_issuer, code, _serving) = issuing("unusable-issuer");
     let member = World::new("unusable-member");
@@ -2295,9 +2434,23 @@ fn peers_beside_a_key_it_cannot_use_refuses_saying_how_it_reads_again() {
     std::fs::hard_link(member.places.state.join(KEY_FILE), &link).unwrap();
     let refused = peers(&member.places, &[]);
     assert!(
-        matches!(&refused, Err(Failure::Failed(why)) if why.contains("another link") && why.contains("(0600, one link)")),
+        matches!(&refused, Err(Failure::Failed(why)) if why.contains("no peer was checked") && why.contains("another hard link") && why.contains("remove that link")),
         "{refused:?}"
     );
+    let whole = aterm_ctl::FleetAsk {
+        host: None,
+        within: HANG,
+    };
+    let unread = survey_fleet_in(&member.places, &whole).expect_err("no key it can use");
+    assert!(unread.contains("remove that link"), "{unread}");
+    let rejoined = ok(join(&member.places, &opts, &code));
+    assert!(
+        rejoined.contains("in place of one it could not use")
+            && rejoined.contains("that other link still holds a copy")
+            && !rejoined.contains("in place of the one it held"),
+        "{rejoined}"
+    );
+    assert!(link.exists(), "a join never looks for the other link");
     std::fs::remove_file(&link).unwrap();
     let listed = ok(peers(&member.places, &[]));
     assert!(
@@ -2307,8 +2460,47 @@ fn peers_beside_a_key_it_cannot_use_refuses_saying_how_it_reads_again() {
 }
 
 #[test]
+fn every_reason_a_key_gives_fits_a_survey_row_and_names_its_act() {
+    use aterm_net::fleet::KeyFileError as E;
+    use aterm_uds::private_file::{ACL_OPEN, ANOTHER_LINK, DIR_OPEN, FILE_OPEN};
+    let reasons = [
+        (E::Missing, "aterm fleet join"),
+        (E::NotPrivate(ANOTHER_LINK), "remove that link"),
+        (E::NotPrivate(FILE_OPEN), "`chmod 600`"),
+        (E::NotPrivate(DIR_OPEN), "`chmod 700`"),
+        (E::NotPrivate(ACL_OPEN), "`chmod -N`"),
+        (E::NotPrivate("it is another user's"), "run this again"),
+        (
+            E::NotPrivate("the directory is another user's"),
+            "run this again",
+        ),
+        (E::Symlink, "run this again"),
+        (
+            E::Malformed("not 40 to 64 hex digits on one line"),
+            "`aterm fleet leave`",
+        ),
+        (
+            E::Malformed("longer than one secret"),
+            "`aterm fleet leave`",
+        ),
+        (
+            E::Io(io::Error::from_raw_os_error(libc::EACCES)),
+            "run this again",
+        ),
+    ];
+    for (error, act) in &reasons {
+        let text = no_key(error);
+        assert!(
+            text.chars().count() <= aterm_ctl::UNANSWERED_REASON_CHARS && text.contains(act),
+            "{} > {}, or no {act}: {text}",
+            text.chars().count(),
+            aterm_ctl::UNANSWERED_REASON_CHARS
+        );
+    }
+}
+
+#[test]
 fn a_drive_that_meets_a_listener_between_generations_is_asked_again() {
-    use aterm_net::fleet::FleetError;
     let at = std::net::SocketAddr::from(([127, 0, 0, 1], 7100));
     for again in [
         Unreached::Handshake(at, FleetError::Tls(io::ErrorKind::BrokenPipe.into())),
@@ -2376,13 +2568,62 @@ fn a_failed_join_is_advised_by_its_kind() {
         ),
         (dial(libc::ECONNREFUSED), Advice::CheckTheIssuer),
         (
+            JoinFailed::Dial(Unreached::Handshake(at, FleetError::ListenerWrongSecret)),
+            Advice::OtherSecret,
+        ),
+        (
             JoinFailed::Registration("ERR the book is full".to_owned()),
-            Advice::CheckTheIssuer,
+            Advice::Answered,
+        ),
+        (
+            JoinFailed::Dial(Unreached::Handshake(at, FleetError::AddressBusy)),
+            Advice::Busy,
+        ),
+        (
+            JoinFailed::Unanswered("the issuer did not answer within 2.9s".to_owned()),
+            Advice::Unanswered,
+        ),
+        (
+            JoinFailed::Unanswered("could not bound the registration: bad fd".to_owned()),
+            Advice::Unanswered,
         ),
     ];
     for (failed, advice) in cases {
         assert_eq!(failed.advice(), advice, "{failed:?}");
     }
+    for unanswered in [
+        JoinFailed::Unanswered("the issuer did not answer within 2.9s".to_owned()),
+        JoinFailed::Dial(Unreached::Handshake(at, FleetError::AddressBusy)),
+    ] {
+        let said = not_recorded("192.168.1.23:7100", &unanswered, false);
+        assert!(!said.contains("The issuer answered"), "{said}");
+    }
+    let rotated = not_recorded(
+        "192.168.1.23:7100",
+        &JoinFailed::Dial(Unreached::Handshake(at, FleetError::ListenerWrongSecret)),
+        false,
+    );
+    assert!(
+        rotated.contains("rotated") && !rotated.contains("start aterm on the issuer"),
+        "{rotated}"
+    );
+    let refused = |at: &str| {
+        let to: std::net::SocketAddr = at.parse().unwrap();
+        not_recorded(
+            at,
+            &JoinFailed::Dial(Unreached::Connect(
+                to,
+                io::Error::from_raw_os_error(libc::ECONNREFUSED),
+            )),
+            false,
+        )
+    };
+    assert!(refused("192.168.1.23:7100").contains("local network"));
+    let looped = refused("127.0.0.1:7100");
+    assert!(
+        looped.contains("start aterm on the issuer") && !looped.contains("local network"),
+        "a loopback dial asks no consent: {looped}"
+    );
 }
 
 #[test]
@@ -2538,6 +2779,14 @@ fn allow_drive_names_only_the_nodes_the_book_binds() {
         fleet_table(&world.config()).unwrap().level(),
         Some("facts"),
         "a refusal writes nothing"
+    );
+    let unanswered = drive_fleet_in(&world.places, &bound, HANG)
+        .err()
+        .expect("nothing listens there");
+    assert!(
+        unanswered.why.starts_with("nothing listens on 127.0.0.1:")
+            && unanswered.why.matches("127.0.0.1").count() == 1,
+        "the peer named once: {unanswered:?}"
     );
 
     ok(allow(&world.places, &args(&["drive", "--from=b0b0b0b0"])));
@@ -4725,12 +4974,19 @@ fn an_init_again_of_one_stopped_before_aterm_toml_writes_what_it_asked() {
         (table.listen_port(), table.level()),
         (Some(port), Some(FleetScope::Content.word()))
     );
-    let whole = init(places, &asked);
-    assert!(
-        matches!(&whole, Err(Failure::Usage(why)) if why.contains("changes nothing without") && why.contains("`aterm fleet allow content`")),
-        "{whole:?}"
-    );
     let config_after = world.config();
+    let whole = ok(init(places, &asked));
+    assert!(
+        whole.starts_with("aterm fleet init: this machine is already the fleet's issuer;")
+            && !whole.contains("written"),
+        "the first init's own flags again change nothing: {whole}"
+    );
+    assert_eq!(world.config(), config_after, "nothing written");
+    let moved = init(places, &args(&["--port", &(port ^ 1).to_string()]));
+    assert!(
+        matches!(&moved, Err(Failure::Usage(why)) if why.contains("takes `--rotate`")),
+        "{moved:?}"
+    );
     let level = init(places, &args(&["--allow", "facts"]));
     assert!(
         matches!(&level, Err(Failure::Usage(why)) if why.ends_with("already the fleet's issuer: a level is set by `aterm fleet allow facts`, not `init`")),

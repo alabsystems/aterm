@@ -86,6 +86,7 @@ fn a_vnode_answer_gives_mode_size_identity_and_path() {
     );
     let v = darwin::vnode(&b).unwrap();
     assert!(v.regular() && !v.char_device());
+    assert!(!v.readable(), "opened for writing only");
     assert_eq!((v.dev, v.ino, v.size), (16_777_232, 987_654, 36));
     assert_eq!(v.path, b"/private/tmp/t/1.output");
     put(&mut b, darwin::VNODE_SIZE_AT, &(-5i64).to_ne_bytes());
@@ -101,6 +102,12 @@ fn a_vnode_answer_gives_mode_size_identity_and_path() {
         v.char_device() && !v.terminal(),
         "a device at a file's path"
     );
+    put(
+        &mut b,
+        darwin::VNODE_OPENFLAGS_AT,
+        &(darwin::FREAD | darwin::FWRITE).to_ne_bytes(),
+    );
+    assert!(darwin::vnode(&b).unwrap().readable());
     for (path, terminal) in TERMINAL_PATHS {
         let mut at = path.as_bytes().to_vec();
         at.push(0);
@@ -541,6 +548,19 @@ fn io_status_schedstat_and_wchan_parse() {
     );
     assert_eq!(linux::parse_wchan("0"), None);
     assert_eq!(linux::parse_wchan(""), None);
+    let [read, write, _, writev] = linux::READ_WRITE;
+    let call =
+        |nr: u64, fd: &str| format!("{nr} {fd} 0x7ffd5e1c 0x10000 0x0 0x0 0x0 0x7ffd5e00 0x7f3a\n");
+    assert_eq!(linux::parse_syscall(&call(write, "0x4")), Some(4));
+    assert_eq!(linux::parse_syscall(&call(writev, "0x1c")), Some(28));
+    assert_eq!(linux::parse_syscall(&call(read, "0x2")), Some(2));
+    assert_eq!(linux::parse_syscall("running\n"), None);
+    assert_eq!(linux::parse_syscall("-1 0x7ffd5e00 0x7f3a\n"), None);
+    assert_eq!(
+        linux::parse_syscall(&call(7, "0x3")),
+        None,
+        "poll names no one descriptor"
+    );
     assert_eq!(
         linux::max_processes(
             "Limit                     Soft Limit           Hard Limit           Units\n\
@@ -693,6 +713,16 @@ fn the_linux_arm_reads_a_fixture_tree() {
         "pos:\t0\nflags:\t02\ntfd:        3 events:       19 data: 3\n",
     );
     link(r, "4711/fd/5", "anon_inode:inotify");
+    link(r, "4711/fd/6", "/dev/tty");
+    write(r, "4711/fdinfo/6", "pos:\t0\nflags:\t0100001\n");
+    write(
+        r,
+        "4711/syscall",
+        &format!(
+            "{} 0x0 0x7ffd5e1c 0x10000 0x0 0x0 0x0 0x7ffd5e00 0x7f3a\n",
+            linux::READ_WRITE[0]
+        ),
+    );
     write(r, "4711/net/tcp", NET_TCP);
     write(
         r,
@@ -754,7 +784,22 @@ fn the_linux_arm_reads_a_fixture_tree() {
             fresh_dylib: false
         })
     );
-    assert_eq!(kind(2), Some(FdKind::Device { tty: true }));
+    assert_eq!(
+        kind(2),
+        Some(FdKind::Device {
+            tty: true,
+            read: true
+        })
+    );
+    assert_eq!(
+        kind(6),
+        Some(FdKind::Device {
+            tty: true,
+            read: false
+        }),
+        "`tee /dev/tty` only writes it"
+    );
+    assert_eq!(f.blocked_fd, Some(0));
     assert_eq!(
         kind(3),
         Some(FdKind::Tcp {

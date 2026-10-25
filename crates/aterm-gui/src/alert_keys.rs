@@ -78,6 +78,36 @@ mod macos {
         !window_a.is_null() && window_a == window_b
     }
 
+    /// Is `panel` still outstanding on `parent`: attached, or queued behind another sheet?
+    /// AppKit queues a `beginSheetModalForWindow:` sent to a window that already presents a
+    /// sheet, and `-attachedSheet` names only the front one, so `-sheets` is walked too.
+    fn sheet_outstanding(parent: Id, panel: Id) -> bool {
+        if panel.is_null() {
+            return false;
+        }
+        // SAFETY: `-[NSWindow attachedSheet]` is `-(NSWindow *)` and `-[NSWindow sheets]` is
+        // `-(NSArray<NSWindow *> *)`, both +0 property reads on a retained window, borrowed only
+        // for the identity tests in this frame; `-[NSArray count]` is `-(NSUInteger)` and
+        // `-objectAtIndex:` is `-(id)(NSUInteger)`, +0, with every index below that count, on
+        // an array the window keeps alive for this frame. Main thread only: every caller holds
+        // its `Obj`s with `App`, and `Obj` is `!Send`.
+        unsafe {
+            if same_window(appkit::send_id(parent, sel!(attachedSheet)), panel) {
+                return true;
+            }
+            let sheets = appkit::send_id(parent, sel!(sheets));
+            if sheets.is_null() {
+                return false;
+            }
+            (0..appkit::send_usize(sheets, sel!(count))).any(|i| {
+                same_window(
+                    appkit::send_id_usize(sheets, sel!(objectAtIndex:), i),
+                    panel,
+                )
+            })
+        }
+    }
+
     fn confirmation_owns_event(event: Id, panel: Id, parent: Option<Id>, _mtm: MainThread) -> bool {
         // SAFETY: plain property reads on a live event and live retained windows, on
         // the main thread (`_mtm` proves it). `-[NSEvent window]` and
@@ -287,7 +317,7 @@ mod macos {
         pub(crate) id: u64,
         /// The logical window the sheet hangs off.
         pub(crate) wid: crate::WindowId,
-        /// That window's `NSWindow`, for the `attachedSheet` liveness test.
+        /// That window's `NSWindow`, for the [`sheet_outstanding`] liveness test.
         parent: Obj,
         /// The alert's own panel.
         panel: Obj,
@@ -313,13 +343,12 @@ mod macos {
             }
         }
 
-        /// Whether this sheet is still on screen, per AppKit.
+        /// Whether this sheet is still outstanding, per AppKit: attached, or queued behind
+        /// another sheet on its window ([`sheet_outstanding`]), such as the sudo password sheet
+        /// (`askpass_sheet`). A queued paste sheet still counts, so a second paste is refused
+        /// instead of dropping this live entry and its key interceptor.
         pub(crate) fn is_attached(&self) -> bool {
-            // SAFETY: `-attachedSheet` is `-(NSWindow *)`, a plain property read on a retained
-            // window, borrowed only for the comparison; `PasteConfirm` lives on the main thread
-            // with `App` (it holds `Obj`s, which are `!Send`).
-            let sheet = unsafe { appkit::send_id(self.parent.id(), sel!(attachedSheet)) };
-            same_window(sheet, self.panel.id())
+            sheet_outstanding(self.parent.id(), self.panel.id())
         }
     }
 }

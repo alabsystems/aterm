@@ -181,6 +181,28 @@ pub fn parse_schedstat(text: &str) -> Option<(u64, u64)> {
     Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
 }
 
+/// The `read`, `write`, `readv` and `writev` call numbers.
+#[cfg(target_arch = "x86_64")]
+pub const READ_WRITE: [u64; 4] = [0, 1, 19, 20];
+/// The `read`, `write`, `readv` and `writev` call numbers.
+#[cfg(any(target_arch = "x86", target_arch = "arm"))]
+pub const READ_WRITE: [u64; 4] = [3, 4, 145, 146];
+/// The `read`, `write`, `readv` and `writev` call numbers (the generic table: aarch64, riscv64, loongarch64).
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "arm")))]
+pub const READ_WRITE: [u64; 4] = [63, 64, 65, 66];
+
+/// `/proc/<pid>/syscall`: the descriptor a sleeping read or write names (its call number, then its first argument in hex); `None` for `running`, for `-1` (in no call), and for any other call.
+#[must_use]
+pub fn parse_syscall(text: &str) -> Option<i32> {
+    let mut f = text.split_whitespace();
+    let nr: u64 = f.next()?.parse().ok()?;
+    if !READ_WRITE.contains(&nr) {
+        return None;
+    }
+    let arg = f.next()?;
+    i32::try_from(u64::from_str_radix(arg.strip_prefix("0x").unwrap_or(arg), 16).ok()?).ok()
+}
+
 /// `/proc/<pid>/wchan`: the kernel function, `None` for `0` or empty (on a core, or not waiting).
 #[must_use]
 pub fn parse_wchan(text: &str) -> Option<String> {
@@ -527,8 +549,14 @@ fn fds(dir: &Path, sleeping: Option<bool>) -> Option<(Vec<FdReading>, bool)> {
                 ),
             },
             FdLink::Inotify => FdKind::Watch,
-            FdLink::Tty => FdKind::Device { tty: true },
-            FdLink::Device => FdKind::Device { tty: false },
+            FdLink::Tty => FdKind::Device {
+                tty: true,
+                read: !info().write_only(),
+            },
+            FdLink::Device => FdKind::Device {
+                tty: false,
+                read: true,
+            },
             FdLink::Path(_) => {
                 let i = info();
                 FdKind::File {
@@ -598,6 +626,9 @@ pub fn read(root: &Path, pid: u32, want_fds: bool, hz: u64) -> Option<ProcFacts>
         if let Some((list, cut)) = fds(&dir, sleeping) {
             facts.fds = Some(list);
             facts.fds_truncated = cut;
+        }
+        if state == RunState::Sleeping {
+            facts.blocked_fd = read_text(&dir.join("syscall")).and_then(|t| parse_syscall(&t));
         }
     }
     Some(facts)

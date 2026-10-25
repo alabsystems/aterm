@@ -2866,14 +2866,21 @@ impl WordDecorations {
     }
 
     /// The pet's ink probe, for hosts: `(spans, live_row)`, where `spansr` is viewport row `r`'s inked columns as a half-open `first, end)` span (`(0, 0)` = blank) and `live_row` is the newest inked row on glass, the output edge the pet's watch hugs.
+    #[inline]
     #[must_use]
-    pub fn pet_ink(&self) -> (&[(u16, u16)], Option<u16>) {
-        let live = self
-            .pet_ink_spans
-            .iter()
-            .rposition(|&(first, end)| end > first)
-            .map(|r| r as u16);
-        (&self.pet_ink_spans, live)
+    pub const fn pet_ink(&self) -> (&[(u16, u16)], Option<u16>) {
+        let spans = self.pet_ink_spans.as_slice();
+        let mut live = None;
+        let mut r = spans.len();
+        while r > 0 {
+            r -= 1;
+            let (first, end) = spans[r];
+            if end > first {
+                live = Some(r as u16);
+                break;
+            }
+        }
+        (spans, live)
     }
 
     const PET_MOTE_HOST_SALT: u64 = 0x7A3D_51C9_E60B_2F81;
@@ -3186,6 +3193,7 @@ impl WordDecorations {
 
     /// Diagnosable, allocation-free installed source identity for host conformance tests and capture/glass generation checks.
     #[doc(hidden)]
+    #[must_use]
     #[inline]
     pub const fn kitty_sprite_source_fingerprint(&self) -> Option<u64> {
         if self.kitty_disabled {
@@ -3200,6 +3208,7 @@ impl WordDecorations {
 
     /// Borrow the exact immutable RGBA Arc supplied by the host.
     #[doc(hidden)]
+    #[must_use]
     #[inline]
     pub const fn kitty_sprite_rgba(&self) -> Option<&Arc<[u8]>> {
         match &self.kitty_custom {
@@ -5268,6 +5277,7 @@ impl WordDecorations {
     }
 
     /// Whether any occurrence is still inside its animation window (profanity sparkle, a live ink sweep, or a granted, possibly queued, nova window).
+    #[must_use]
     pub fn is_active(&self, now: Instant) -> bool {
         self.active_until.is_some_and(|d| now < d)
             || self
@@ -5832,6 +5842,7 @@ struct CatGeom {
 }
 
 /// §5.2 base art height before age scaling: `Hart = round(1.7·ch)`.
+#[must_use]
 #[inline]
 pub const fn cat_hart(cell_h: u16) -> u16 {
     let h = (1.7 * (cell_h as f32)).round() as u16;
@@ -5839,6 +5850,7 @@ pub const fn cat_hart(cell_h: u16) -> u16 {
 }
 
 /// §5.2 chin slice: `floor(0.15·Hart)` — the part spilling into the word row (occluded by the word's ascenders: the cat is visibly behind the word).
+#[must_use]
 #[inline]
 pub const fn cat_chin(hart: u16) -> u16 {
     (0.15 * (hart as f32)).floor() as u16
@@ -16543,7 +16555,7 @@ mod tests {
 mod pet_handoff_emission_tests {
     use super::*;
 
-    fn pet_frame() -> crate::kitty_pet::PetFrame {
+    const fn pet_frame() -> crate::kitty_pet::PetFrame {
         crate::kitty_pet::PetFrame {
             alpha: 255,
             lane_alpha: 255,
@@ -17241,7 +17253,7 @@ mod pet_stays_inside_the_grid_tests {
         cols: 80,
     };
 
-    fn sleeper_on_the_top_row() -> crate::kitty_pet::PetFrame {
+    const fn sleeper_on_the_top_row() -> crate::kitty_pet::PetFrame {
         let mut motes = [None; crate::kitty_pet::PET_MOTES_MAX];
         motes[0] = Some(crate::kitty_pet::PetMoteSprite {
             kind: crate::kitty_pet::PetMoteKind::Zee,

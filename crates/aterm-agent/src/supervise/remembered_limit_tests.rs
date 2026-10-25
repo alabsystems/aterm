@@ -206,6 +206,7 @@ fn open_wall_of(w: &aterm_phase::Wall, scope: &Conversation) -> approvals::OpenW
         reset: w.reset.clone(),
         reset_unix: Some(TEST_NOW + LIMITED_RESET_IN),
         tap_unix: None,
+        login: None,
         kind: Some(w.kind),
         judged_ms: None,
         retry_ms: None,

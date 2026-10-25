@@ -73,6 +73,7 @@ impl Fact {
             Err(Error::new("invalid control restriction"))
         }
     }
+    #[cfg(unix)]
     pub(crate) fn encode(&self, wire: &mut Vec<u8>) {
         match self {
             Self::Retire { actor } => {

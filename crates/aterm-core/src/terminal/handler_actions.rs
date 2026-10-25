@@ -611,7 +611,7 @@ impl TerminalHandler<'_> {
         };
         if replacing {
             self.transient.kitty_virtual.remove(&id);
-            self.delete_kitty_where(&|tag, _| tag.image_id == id);
+            self.delete_kitty_history_where(&|tag, _| tag.image_id == id);
             self.prune_kitty_floating();
             let held = kitty_bytes_held(self.transient, id);
             let t = &mut *self.transient;
@@ -887,11 +887,12 @@ impl TerminalHandler<'_> {
         if self.transient.kitty_floating.len() != floating {
             self.grid.damage_mut().mark_full();
         }
-        !self
-            .clear_kitty_placements(&|tag, _| {
-                tag.image_id == id && tag.placement_id == placement_id
-            })
-            .is_empty()
+        let history = self
+            .clear_kitty_history(&|tag, _| tag.image_id == id && tag.placement_id == placement_id);
+        let visible = self.clear_kitty_placements(&|tag, _| {
+            tag.image_id == id && tag.placement_id == placement_id
+        });
+        !history.is_empty() || !visible.is_empty()
     }
 
     fn place_kitty_relative(
@@ -1321,11 +1322,50 @@ impl TerminalHandler<'_> {
         gone
     }
 
+    fn clear_kitty_history(
+        &mut self,
+        selected: &dyn Fn(&KittyPlacementTag, &ImageData) -> bool,
+    ) -> Vec<KittyPlacementTag> {
+        let mut gone = Vec::new();
+        self.grid.retain_history_images(&mut |span| {
+            let Some(tag) = span.kitty else { return true };
+            if !selected(&tag, &span.image) {
+                return true;
+            }
+            if !gone
+                .iter()
+                .any(|old: &KittyPlacementTag| old.serial == tag.serial)
+            {
+                gone.push(tag);
+            }
+            false
+        });
+        gone
+    }
+
     fn delete_kitty_where(
         &mut self,
         selected: &dyn Fn(&KittyPlacementTag, &ImageData) -> bool,
     ) -> Vec<u32> {
+        self.delete_kitty_selected(selected, false)
+    }
+
+    fn delete_kitty_history_where(
+        &mut self,
+        selected: &dyn Fn(&KittyPlacementTag, &ImageData) -> bool,
+    ) -> Vec<u32> {
+        self.delete_kitty_selected(selected, true)
+    }
+
+    fn delete_kitty_selected(
+        &mut self,
+        selected: &dyn Fn(&KittyPlacementTag, &ImageData) -> bool,
+        history: bool,
+    ) -> Vec<u32> {
         let mut gone = self.clear_kitty_placements(selected);
+        if history {
+            gone.extend(self.clear_kitty_history(selected));
+        }
         let mut touched: Vec<u32> = Vec::new();
         for tag in gone.iter().chain(&self.clear_kitty_floating(selected)) {
             push_unique(&mut touched, tag.image_id);
@@ -1343,6 +1383,7 @@ impl TerminalHandler<'_> {
             self.transient.kitty_relations = rest;
             let serials: HashSet<NonZeroU32> = children.iter().map(|r| r.child.serial).collect();
             self.clear_kitty_placements(&|tag, _| serials.contains(&tag.serial));
+            self.clear_kitty_history(&|tag, _| serials.contains(&tag.serial));
             for child in &children {
                 push_unique(&mut touched, child.child.image_id);
                 push_unique(&mut orphans, child.child.image_id);
@@ -1408,6 +1449,9 @@ impl TerminalHandler<'_> {
         self.transient.kitty_virtual.contains_key(&id)
             || self.kitty_image_floating(id)
             || self.kitty_image_on_screen(id)
+            || self
+                .grid
+                .history_any_image(&|span| span.kitty.is_some_and(|tag| tag.image_id == id))
     }
 
     #[inline]
@@ -1443,7 +1487,7 @@ impl TerminalHandler<'_> {
                 let placement = cmd.placement;
                 named.push(id);
                 self.remove_kitty_virtual(id, placement);
-                self.delete_kitty_where(&|tag, _| {
+                self.delete_kitty_history_where(&|tag, _| {
                     tag.image_id == id && placement.is_none_or(|p| tag.placement_id == p)
                 })
             }
@@ -1461,7 +1505,7 @@ impl TerminalHandler<'_> {
                 for &id in &named {
                     self.remove_kitty_virtual(id, None);
                 }
-                self.delete_kitty_where(&|tag, _| (lo..=hi).contains(&tag.image_id))
+                self.delete_kitty_history_where(&|tag, _| (lo..=hi).contains(&tag.image_id))
             }
             'z' => {
                 let z = cmd.z_index.unwrap_or(0);
@@ -1518,7 +1562,7 @@ impl TerminalHandler<'_> {
                 .kitty_images
                 .keys()
                 .copied()
-                .filter(|id| !self.transient.kitty_virtual.contains_key(id))
+                .filter(|id| !self.kitty_image_placed(*id))
                 .collect();
             for id in unplaced {
                 self.free_kitty_image(id);
@@ -1541,7 +1585,7 @@ impl TerminalHandler<'_> {
         if frames.len() < 2 {
             if image_too {
                 self.remove_kitty_virtual(id, None);
-                self.delete_kitty_where(&|tag, _| tag.image_id == id);
+                self.delete_kitty_history_where(&|tag, _| tag.image_id == id);
                 self.free_kitty_image(id);
             }
             return;

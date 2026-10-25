@@ -776,3 +776,246 @@ fn an_upload_without_the_staging_token_is_refused_before_anything_is_built() {
     std::fs::write(&ctx.tokens.staging, "t0ken\n").expect("token");
     upload::token_preflight(&ctx).expect("a token file");
 }
+
+/// A harness checkout at `w.root/<name>`: one commit, `/target/` ignored, as the five
+/// harness repos are.
+fn harness_checkout(w: &World, name: &str) -> PathBuf {
+    let dir = w.root.join(name);
+    fixture_checkout(
+        &dir,
+        &[
+            (".gitignore", b"/target/\n"),
+            ("Cargo.toml", b"[package]\nname = \"harness\"\n"),
+        ],
+    );
+    dir
+}
+
+/// `targo metadata` JSON for a one-package harness workspace: package `package` at
+/// `version`, declaring `expose` and `bundle` (no `[workspace.metadata.atpkg]` when both are
+/// empty).
+fn harness_metadata_json(
+    checkout: &Path,
+    package: &str,
+    version: &str,
+    expose: &[&str],
+    bundle: &[&str],
+) -> String {
+    let list = |v: &[&str]| {
+        v.iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let atpkg = if expose.is_empty() && bundle.is_empty() {
+        "null".to_string()
+    } else {
+        format!(
+            "{{\"atpkg\":{{\"expose\":[{}],\"bundle\":[{}]}}}}",
+            list(expose),
+            list(bundle)
+        )
+    };
+    format!(
+        "{{\"packages\":[{{\"name\":\"{package}\",\"version\":\"{version}\",\
+         \"manifest_path\":\"{}\"}}],\"metadata\":{atpkg}}}",
+        checkout.join("Cargo.toml").display()
+    )
+}
+
+fn harness_request(w: &World, program: &str, checkout: &Path) -> PackRequest {
+    PackRequest {
+        program: program.into(),
+        checkout: checkout.to_path_buf(),
+        build: Some(1),
+        ..w.request(AARCH64_APPLE_DARWIN)
+    }
+}
+
+fn arm_bins(names: &[&'static str]) -> Vec<(&'static str, Vec<u8>)> {
+    names
+        .iter()
+        .map(|n| (*n, bin_bytes(macho(CPU_ARM64), n)))
+        .collect()
+}
+
+fn harness_tools(checkout: &Path, meta: String, bins: Vec<(&'static str, Vec<u8>)>) -> FakeTools {
+    let mut t = FakeTools::new("aarch64-apple-darwin");
+    t.answer = cargo(checkout, meta, bins, false);
+    t
+}
+
+/// A HARNESS PACK SHIPS ITS ONE TOOL, CALLED BY ITS RELEASE LINE AND THE COMMIT BUILT: the
+/// repo declares `muse-alab`, a second bin it builds is not shipped, the build is `--locked`,
+/// and the signed manifest the client verifies says `0.1.0+g<9-hex HEAD>` at build 1 (the
+/// checkout's one commit).
+#[test]
+fn a_harness_pack_ships_its_one_tool_at_its_release_line_and_the_commit_built() {
+    let w = world("pack-harness");
+    let co = harness_checkout(&w, "muse-alab");
+    let meta = harness_metadata_json(&co, "muse-alab", "0.1.0", &["muse-alab"], &[]);
+    let t = harness_tools(&co, meta, arm_bins(&["muse-alab", "muse-alab-stand-in"]));
+    let out = pack::pack_with(&w.ctx, &harness_request(&w, "muse-alab", &co), &t)
+        .expect("a harness packs");
+    let sha = super::fixture::git(&co, &["rev-parse", "--short=9", "HEAD"]);
+    assert_eq!(sha.len(), 9);
+    assert_eq!(out.version, format!("0.1.0+g{sha}"));
+    assert_eq!(
+        (out.build, out.exposes.clone()),
+        (1, vec!["muse-alab".to_string()])
+    );
+    let parsed = client_verifies(
+        &w.ctx,
+        &out.manifest,
+        &out.signature.clone().expect("signed"),
+    )
+    .expect("the client accepts it");
+    assert_eq!(parsed.program, "muse-alab");
+    assert_eq!(parsed.version, format!("0.1.0+g{sha}"));
+    assert_eq!(parsed.exposes, vec!["muse-alab"]);
+    assert_eq!(parsed.artifacts.len(), 1);
+    assert_eq!(parsed.artifacts[0].target, "aarch64-apple-darwin");
+    let staged: Vec<String> = std::fs::read_dir(w.root.join("out/muse-alab/root/bin"))
+        .expect("staged bin/")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(staged, ["muse-alab"], "only the tool ships");
+    assert!(
+        t.runs_of("build")[0].argv().iter().any(|a| a == "--locked"),
+        "a harness builds the lock it committed: {:?}",
+        t.runs_of("build")[0].argv()
+    );
+}
+
+/// A HARNESS REPO THAT DECLARES NO `expose` SHIPS ITS ROW'S TOOL, never the name-token
+/// fallback's pick: kimi-alab declares none, and the helper bin its build also makes (which
+/// the fallback would ship and shim) stays out.
+#[test]
+fn a_harness_repo_declaring_no_expose_ships_its_rows_tool_and_nothing_else() {
+    let w = world("pack-harness-undeclared");
+    let co = harness_checkout(&w, "kimi-alab");
+    let meta = harness_metadata_json(&co, "kimi-alab", "0.1.0", &[], &[]);
+    let t = harness_tools(&co, meta, arm_bins(&["kimi-alab", "kimi-alab-helper"]));
+    let out = pack::pack_with(&w.ctx, &harness_request(&w, "kimi-alab", &co), &t)
+        .expect("the row's tool packs");
+    assert_eq!(out.exposes, vec!["kimi-alab"]);
+    assert!(w.root.join("out/kimi-alab/root/bin/kimi-alab").is_file());
+    assert!(
+        !w.root
+            .join("out/kimi-alab/root/bin/kimi-alab-helper")
+            .exists(),
+        "built, not the row's tool: dropped"
+    );
+    let parsed = client_verifies(
+        &w.ctx,
+        &out.manifest,
+        &out.signature.clone().expect("signed"),
+    )
+    .expect("the client accepts it");
+    assert_eq!(parsed.exposes, vec!["kimi-alab"]);
+}
+
+/// A HARNESS PACK REFUSES, BEFORE ANYTHING IS BUILT OR WRITTEN: an `expose` naming anything
+/// but the row's tool (the vendor's own name, or a second tool), a `bundle`, a version that
+/// is not `MAJOR.MINOR.0`, no program-named package, a build number that is not the
+/// checkout's HEAD count, and a checkout with an untracked file.
+#[test]
+fn a_harness_pack_refuses_every_departure_from_its_rule_before_the_build() {
+    let w = world("pack-harness-refusals");
+    let co = harness_checkout(&w, "muse-alab");
+    let refuses = |meta: String, req: PackRequest, says: &str| {
+        let t = harness_tools(&co, meta, arm_bins(&["muse-alab"]));
+        let err = pack::pack_with(&w.ctx, &req, &t).expect_err(says);
+        assert!(err.to_string().contains(says), "{says}: {err}");
+        assert!(
+            t.runs_of("build").is_empty(),
+            "{says}: refused before the build"
+        );
+        assert!(w.written(".toml").is_empty() && w.written(".tar.zst").is_empty());
+    };
+    let req = || harness_request(&w, "muse-alab", &co);
+    let meta = |package: &str, version: &str, expose: &[&str], bundle: &[&str]| {
+        harness_metadata_json(&co, package, version, expose, bundle)
+    };
+    refuses(
+        meta("muse-alab", "0.1.0", &["muse"], &[]),
+        req(),
+        "expose names muse, and its harness row (programs::PROGRAMS) ships exactly `muse-alab`",
+    );
+    refuses(
+        meta("muse-alab", "0.1.0", &["muse-alab", "muse-alab-lsp"], &[]),
+        req(),
+        "ships exactly `muse-alab`",
+    );
+    refuses(
+        meta("muse-alab", "0.1.0", &["muse-alab"], &["muse-alab-helper"]),
+        req(),
+        "bundles muse-alab-helper besides",
+    );
+    for v in [
+        "0.1.1",
+        "0.1",
+        "0.1.0-dev.3+gabcdef012",
+        "0.1.0+gabcdef012",
+        "00.1.0",
+    ] {
+        refuses(
+            meta("muse-alab", v, &["muse-alab"], &[]),
+            req(),
+            &format!("version `{v}` is not MAJOR.MINOR.0"),
+        );
+    }
+    refuses(
+        meta("muse-alab-core", "0.1.0", &["muse-alab"], &[]),
+        req(),
+        "has no package named muse-alab",
+    );
+    let mut later = req();
+    later.build = Some(9);
+    refuses(
+        meta("muse-alab", "0.1.0", &["muse-alab"], &[]),
+        later,
+        "build 9 is not the checkout's HEAD (it counts 1 commits)",
+    );
+    std::fs::write(co.join("notes.txt"), "uncommitted").expect("untracked");
+    refuses(
+        meta("muse-alab", "0.1.0", &["muse-alab"], &[]),
+        req(),
+        "has changes or untracked files",
+    );
+}
+
+#[test]
+fn a_release_line_is_major_minor_zero_and_a_dev_version_adds_the_short_sha() {
+    for (v, ok) in [
+        ("0.1.0", true),
+        ("1.20.0", true),
+        ("0.0.0", true),
+        ("0.1.1", false),
+        ("0.1", false),
+        ("0.1.0.0", false),
+        ("01.1.0", false),
+        ("0.01.0", false),
+        ("0.1.00", false),
+        ("v0.1.0", false),
+        ("0.1.0-dev.1", false),
+        ("0.1.0+g123456789", false),
+        ("", false),
+        ("0..0", false),
+    ] {
+        assert_eq!(pack::is_release_line(v), ok, "{v:?}");
+    }
+    assert_eq!(
+        pack::dev_version("0.1.0", "abcdef012").expect("dev"),
+        "0.1.0+gabcdef012"
+    );
+    assert!(
+        pack::dev_version("0.1.0", "abcdef01").is_err(),
+        "8 hex is short"
+    );
+    assert!(
+        pack::dev_version("0.1.0", "ABCDEF012").is_err(),
+        "lowercase only"
+    );
+    assert!(pack::dev_version("0.1.2", "abcdef012").is_err());
+}

@@ -306,3 +306,221 @@ fn a_url_composition_rejects_an_incoming_automatic_offer_without_losing_its_comm
     assert_eq!(values(&app, instance), draft);
     assert!(app.native_runtime.take_system_state_action().is_none());
 }
+
+#[test]
+fn a_password_composition_rejects_an_incoming_automatic_offer_without_losing_its_commit() {
+    let (mut app, wid, instance, view) = url_review(true);
+    focus(&mut app, wid, view, "system-state/password");
+    let source = values(&app, instance).0;
+    app.on_ime_preedit(wid, COMPOSED.into(), None);
+    assert_eq!(values(&app, instance), (source.clone(), String::new()));
+    assert!(app.windows[&wid].preedit.is_empty());
+    let (send, receive) = std::sync::mpsc::channel();
+    let request = crate::workstation_setup::Request::new(
+        aterm_types::macos_setup::Plan {
+            vault_url: "http://offered.invalid/v1/team".into(),
+            ..aterm_types::macos_setup::Plan::default()
+        },
+        send,
+    );
+    assert!(!app.apprt.probe_preferences);
+    assert!(app.windows[&wid].os_window.is_none());
+    app.headless = false;
+    app.offer_system_state(request.clone());
+    assert_eq!(
+        values(&app, instance),
+        (source.clone(), String::new()),
+        "an automatic offer cannot replace a composing password's vault"
+    );
+    assert_eq!(
+        receive.try_recv().unwrap().decision,
+        crate::WorkstationSetupDecision::Unavailable
+    );
+    assert!(!request.pending());
+    commit(&mut app, wid);
+    assert_eq!(
+        values(&app, instance),
+        (source, "•".repeat(COMPOSED.chars().count()))
+    );
+    assert!(app.windows[&wid].preedit.is_empty());
+    assert!(app.native_runtime.take_system_state_action().is_none());
+}
+
+#[test]
+fn a_password_composition_survives_saved_plan_hydration_and_vault_updates() {
+    let source = aterm_types::macos_setup::Plan::default();
+    let updated = aterm_types::macos_setup::Plan {
+        vault_url: "http://newer.invalid/v1/team".into(),
+        ..source.clone()
+    };
+    for known in [false, true] {
+        let (mut app, wid, instance, view) = url_review(known);
+        focus(&mut app, wid, view, "system-state/password");
+        app.on_ime_preedit(wid, COMPOSED.into(), None);
+        app.publish_system_state(crate::SetupStatus {
+            plan: Some(updated.clone()),
+            ..crate::SetupStatus::default()
+        });
+        assert_eq!(
+            values(&app, instance),
+            (source.vault_url.clone(), String::new()),
+            "a saved vault update must preserve the composing password's review"
+        );
+        commit(&mut app, wid);
+        assert_eq!(
+            values(&app, instance),
+            (
+                source.vault_url.clone(),
+                "•".repeat(COMPOSED.chars().count())
+            )
+        );
+        assert!(app.windows[&wid].preedit.is_empty());
+        assert!(app.native_runtime.take_system_state_action().is_none());
+    }
+}
+
+#[test]
+fn a_cleared_password_composition_allows_an_offer_without_leaking_its_text() {
+    for cancelled in [false, true] {
+        let (mut app, wid, instance, view) = url_review(true);
+        focus(&mut app, wid, view, "system-state/password");
+        if cancelled {
+            app.on_ime_preedit(wid, COMPOSED.into(), None);
+            app.on_ime_enablement_changed(wid);
+        } else {
+            app.on_ime_preedit(wid, String::new(), None);
+        }
+        let offered = aterm_types::macos_setup::Plan {
+            vault_url: "http://offered.invalid/v1/team".into(),
+            ..aterm_types::macos_setup::Plan::default()
+        };
+        let (send, receive) = std::sync::mpsc::channel();
+        let request = crate::workstation_setup::Request::new(offered.clone(), send);
+        app.headless = false;
+        app.offer_system_state(request.clone());
+        assert!(request.pending(), "no composition still owns a draft");
+        assert!(receive.try_recv().is_err());
+        assert_eq!(
+            values(&app, instance),
+            (offered.vault_url.clone(), String::new())
+        );
+        commit(&mut app, wid);
+        assert_eq!(
+            values(&app, instance),
+            (offered.vault_url, String::new()),
+            "the retired password must never reach the offered URL or password"
+        );
+        assert!(app.windows[&wid].preedit.is_empty());
+        request.finish(crate::WorkstationSetupDecision::Unavailable);
+    }
+}
+
+#[test]
+fn a_retired_password_composition_preserves_committed_text_and_clears_its_draft() {
+    let (mut app, wid, instance, view) = url_review(true);
+    app.dispatch_native_event(
+        wid,
+        AppEvent::Action(ActionInvocation {
+            id: ActionId::new("system-state/password"),
+            value: Some(SemanticInput::Text("kept".into())),
+        }),
+    )
+    .unwrap();
+    let before = values(&app, instance);
+    app.on_ime_preedit(wid, COMPOSED.into(), None);
+    focus(&mut app, wid, view, "system-state/url");
+    commit(&mut app, wid);
+    assert_eq!(values(&app, instance), before);
+    assert!(
+        !app.native_runtime.cancel_preedit(
+            instance,
+            view,
+            Some(&UiKey::new("system-state/password")),
+        ),
+        "recipient retirement already cleared the password composition"
+    );
+    assert!(app.windows[&wid].preedit.is_empty());
+}
+
+fn close_linked_composition(field: &str, close_owner: bool) {
+    let (mut app, wid, instance, owner) = url_review(true);
+    app.windows.get_mut(&wid).unwrap().cols = 240;
+    let sibling = app
+        .split_active_with_native(
+            wid,
+            SplitAxis::Horizontal,
+            instance,
+            AppViewState::SystemState(Default::default()),
+        )
+        .unwrap();
+    focus(&mut app, wid, owner, field);
+    let before = values(&app, instance);
+    app.on_ime_preedit(wid, COMPOSED.into(), None);
+    let composing = values(&app, instance);
+    let closing = if close_owner { owner } else { sibling };
+    assert!(
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .tab_set
+            .active_mut()
+            .unwrap()
+            .set_focus(closing)
+    );
+    app.close_focused_mixed_leaf(wid).unwrap();
+    assert!(app.view_store.get(closing).is_none());
+    let survivor = if close_owner { sibling } else { owner };
+    assert_eq!(app.active_native_view(wid), Some((instance, survivor)));
+    assert!(app.structural_invariants_ok());
+    let Some(NativeApp::SystemState(model)) = app.native_runtime.app(instance) else {
+        panic!("the linked page survives");
+    };
+    if close_owner {
+        assert_eq!(
+            values(&app, instance),
+            before,
+            "the closed owner's marked text is retired"
+        );
+        assert!(
+            model.can_offer(),
+            "no orphaned composition can hold the surviving review"
+        );
+        commit(&mut app, wid);
+        assert_eq!(
+            values(&app, instance),
+            before,
+            "a late commit cannot move to the surviving view"
+        );
+    } else {
+        assert_eq!(values(&app, instance), composing);
+        assert!(
+            !model.can_offer(),
+            "the surviving owner's draft still belongs to it"
+        );
+        commit(&mut app, wid);
+        let expected = if field.ends_with("password") {
+            (before.0, "•".repeat(COMPOSED.chars().count()))
+        } else {
+            (format!("{}{COMPOSED}", before.0), before.1)
+        };
+        assert_eq!(values(&app, instance), expected);
+    }
+    assert!(app.windows[&wid].preedit.is_empty());
+}
+
+#[test]
+fn linked_composition_close_retires_the_url_owner() {
+    close_linked_composition("system-state/url", true);
+}
+
+#[test]
+fn linked_composition_close_retires_the_password_owner() {
+    close_linked_composition("system-state/password", true);
+}
+
+#[test]
+fn linked_composition_close_preserves_the_surviving_owner() {
+    for field in ["system-state/url", "system-state/password"] {
+        close_linked_composition(field, false);
+    }
+}

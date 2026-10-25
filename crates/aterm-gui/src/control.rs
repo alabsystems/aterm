@@ -3818,6 +3818,15 @@ fn dispatch_hold_verb(
         );
         return "ERR denied\n".to_string();
     }
+    #[cfg(unix)]
+    if issuer == HoldIssuer::Owner
+        && let Some(sid) = local_off_sid(rest)
+        && let Some(reply) = crate::fleet_listen::local_off_of_remote(store, sid, &|sid| {
+            wake_sid_watchers(store, sid);
+        })
+    {
+        return reply;
+    }
     let reply = cmd_hold_waking(store, rest, issuer, &|sid| {
         wake_sid_watchers(store, sid);
     });
@@ -3835,6 +3844,18 @@ fn dispatch_hold_verb(
     } else {
         reply
     }
+}
+
+/// The session an Owner's `hold <sid> off` names, where it names the local slot.
+#[cfg(unix)]
+fn local_off_sid(rest: &str) -> Option<&str> {
+    let mut words = rest.split_whitespace();
+    let (Some(sid), Some("off")) = (words.next(), words.next()) else {
+        return None;
+    };
+    words
+        .all(|word| word.starts_with("reason=") || word == "origin=local")
+        .then_some(sid)
 }
 
 fn hold_names_local_slot(rest: &str, issuer: crate::fabric::HoldIssuer) -> bool {

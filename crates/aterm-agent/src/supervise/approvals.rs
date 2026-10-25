@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use super::journal::{Journal, json_str};
 use super::policy::sleeps::{Boot, SleepStamp};
 use super::policy::turn_end::{Conversation, Kept, LimitTry, Replies};
+use crate::harness::profile::AccountKey;
 
 /// How much of a command a row keeps.
 pub const COMMAND_BYTES: usize = 4096;
@@ -2721,13 +2722,46 @@ pub fn wall_wait_reason_tapped(
     kind: aterm_phase::WallKind,
     message: &str,
 ) -> String {
+    wall_wait_reason_of(reset_unix, tap_unix, None, reset, kind, message)
+}
+
+/// [`wall_wait_reason_tapped`] with THE ACCOUNT THE LIMIT WAS READ UNDER
+/// (`login`, the session's profile's [`AccountKey`]): written after the tap's
+/// reset (`; login=`) only where it was read, so a loop that takes the
+/// session over sets its own read of the login against it
+/// ([`OpenWall::login`], [`RULE_LOGIN_MOVED`]).
+#[must_use]
+pub fn wall_wait_reason_of(
+    reset_unix: Option<i64>,
+    tap_unix: Option<i64>,
+    login: Option<AccountKey>,
+    reset: Option<&str>,
+    kind: aterm_phase::WallKind,
+    message: &str,
+) -> String {
     format!(
-        "the turn-end policy (wall: reset_unix={}; reset={}; kind={}{}; message={})",
+        "the turn-end policy (wall: reset_unix={}; reset={}; kind={}{}{}; message={})",
         reset_unix.map_or_else(|| "-".to_string(), |s| s.to_string()),
         reset.unwrap_or("-"),
         kind.name(),
         tap_unix.map_or_else(String::new, |t| format!("; tap_unix={t}")),
+        login.map_or_else(String::new, |k| format!("; login={k}")),
         message.replace(['\n', '\r'], " ")
+    )
+}
+
+/// Records the session's login moving off the account its standing limit
+/// was read under ([`super::policy::turn_end::TurnEndReading::login_moved`]):
+/// the limit's reset binds no longer, and one resume is owed. A record only.
+pub const RULE_LOGIN_MOVED: &str = "login-moved@v1";
+
+/// A [`RULE_LOGIN_MOVED`] row's reason: the account the limit was read
+/// under and the one the profile names now, as their keys (no secret).
+#[must_use]
+pub fn login_moved_reason(from: AccountKey, to: AccountKey) -> String {
+    format!(
+        "the session's login moved off the account its limit was read under (from={from}; \
+         to={to}): the limit's reset binds no longer; one resume is owed"
     )
 }
 
@@ -2769,6 +2803,8 @@ pub struct OpenWall {
     pub reset_unix: Option<i64>,
     /// The reset the usage tap timed the wall to ([`wall_wait_reason_tapped`], unix seconds); `None` where no tap timed it, and in an older build's row.
     pub tap_unix: Option<i64>,
+    /// The account the limit was read under ([`wall_wait_reason_of`]); `None` where it was not read, and in an older build's row.
+    pub login: Option<AccountKey>,
     pub kind: Option<aterm_phase::WallKind>,
     pub judged_ms: Option<i64>,
     pub retry_ms: Option<i64>,
@@ -2841,6 +2877,7 @@ pub fn open_wall_in(body: &str, sid: Option<&str>) -> Option<OpenWall> {
                     reset: row.reset,
                     reset_unix: row.reset_unix,
                     tap_unix: row.tap_unix,
+                    login: row.login,
                     kind: row.kind,
                     judged_ms: None,
                     retry_ms,
@@ -2860,6 +2897,7 @@ pub fn open_wall_in(body: &str, sid: Option<&str>) -> Option<OpenWall> {
 struct WallRow<'a> {
     reset_unix: Option<i64>,
     tap_unix: Option<i64>,
+    login: Option<AccountKey>,
     reset: Option<String>,
     kind: Option<aterm_phase::WallKind>,
     older: bool,
@@ -2872,18 +2910,24 @@ fn wall_wait_of(reason: &str) -> Option<WallRow<'_>> {
         .and_then(|r| r.strip_suffix(')'))?;
     let (unix, rest) = body.split_once("; reset=")?;
     let (head, message) = rest.split_once("; message=")?;
-    let (reset, kind, tap_unix) = match head.split_once("; kind=") {
+    let (reset, kind, tap_unix, login) = match head.split_once("; kind=") {
         Some((reset, named)) => {
+            let (named, login) = named
+                .split_once("; login=")
+                .map_or((named, None), |(named, key)| {
+                    (named, AccountKey::parse(key))
+                });
             let (name, tap) = named
                 .split_once("; tap_unix=")
                 .map_or((named, None), |(name, tap)| (name, tap.parse().ok()));
-            (reset, kind_named(name), tap)
+            (reset, kind_named(name), tap, login)
         }
-        None => (head, None, None),
+        None => (head, None, None, None),
     };
     Some(WallRow {
         reset_unix: unix.parse().ok(),
         tap_unix,
+        login,
         reset: (reset != "-").then(|| reset.to_string()),
         kind,
         older: !head.contains("; kind="),

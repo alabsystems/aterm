@@ -1506,12 +1506,19 @@ pub(crate) fn stats_bars_not_saved(form: &str, detail: &str, indeterminate: bool
     .key("sys.stats-bars-save")
 }
 
-/// Builds the error message when a harness switch toggle fails to persist to `aterm.toml`.
-pub(crate) fn harness_switch_not_saved(key: &str, detail: &str, indeterminate: bool) -> Message {
+/// Builds the error message when a harness switch toggle, turning `key` `on` (or off), fails to
+/// persist to `aterm.toml`.
+pub(crate) fn harness_switch_not_saved(
+    key: &str,
+    on: bool,
+    detail: &str,
+    indeterminate: bool,
+) -> Message {
+    let to = if on { "on" } else { "off" };
     let title = if indeterminate {
-        "Couldn't confirm the harness was turned on"
+        format!("Couldn't confirm the harness was turned {to}")
     } else {
-        "Couldn't turn the harness on"
+        format!("Couldn't turn the harness {to}")
     };
     gesture_failure(
         tags::HARNESS,
@@ -1520,9 +1527,13 @@ pub(crate) fn harness_switch_not_saved(key: &str, detail: &str, indeterminate: b
         } else {
             Severity::Error
         },
-        title,
-        &format!("{key} = true: {detail}"),
-        Then::step("Press on again"),
+        &title,
+        &format!("{key} = {on}: {detail}"),
+        Then::step(if on {
+            "Press on again"
+        } else {
+            "Press the switch again"
+        }),
     )
     .key(format!("harness.switch-save.{key}").as_str())
 }
@@ -3790,8 +3801,16 @@ pub(crate) fn disk_low_record(free_gib: u64, floor_gib: u64, hogs: &[String]) ->
         .key("system.disk.low")
 }
 
-/// Builds the exceptions digest entry when the home volume remains low after automatic cleanup.
-pub(crate) fn disk_low_entry(free_gib: u64, floor_gib: u64, hogs: &[String]) -> Entry {
+/// Builds the exceptions digest entry when the home volume remains low after automatic cleanup;
+/// `asked`, what the ask to free space (`disk-free@v1`) did, is its last line, with one holder
+/// fewer so the entry's lines (`MORE_LINES`) keep that sentence.
+pub(crate) fn disk_low_entry(
+    free_gib: u64,
+    floor_gib: u64,
+    hogs: &[String],
+    asked: Option<&str>,
+) -> Entry {
+    let shown = if asked.is_some() { 1 } else { 2 };
     let mut entry = Entry::new(
         Family::Disk,
         "",
@@ -3807,13 +3826,16 @@ pub(crate) fn disk_low_entry(free_gib: u64, floor_gib: u64, hogs: &[String]) -> 
     .more(format!(
         "{free_gib} GiB free; aterm reclaims below {floor_gib} GiB"
     ));
-    let rest = hogs.len().saturating_sub(2);
-    for (i, hog) in hogs.iter().take(2).enumerate() {
-        entry = entry.more(if i == 1 && rest > 0 {
+    let rest = hogs.len().saturating_sub(shown);
+    for (i, hog) in hogs.iter().take(shown).enumerate() {
+        entry = entry.more(if i + 1 == shown && rest > 0 {
             format!("{LARGEST}{hog}; {rest}{AND_MORE}")
         } else {
             format!("{LARGEST}{hog}")
         });
+    }
+    if let Some(asked) = asked {
+        entry = entry.more(asked);
     }
     entry.log_line(format!(
         "disk-low free_gib={free_gib} floor_gib={floor_gib} hogs={}",

@@ -1572,7 +1572,7 @@ mod tests {
         );
     }
 
-    fn frame_input(now: Instant) -> CursorFxInput {
+    const fn frame_input(now: Instant) -> CursorFxInput {
         CursorFxInput {
             now,
             cur: Some((2, 3)),
@@ -1668,7 +1668,7 @@ mod tests {
         }
     }
 
-    fn comet_cfgs(knob: f32) -> (GlowConfig, TrailConfig) {
+    const fn comet_cfgs(knob: f32) -> (GlowConfig, TrailConfig) {
         let glow = resolve_glow_config(
             GlowKnobs {
                 enabled: true,
@@ -1757,7 +1757,7 @@ mod tests {
         assert_eq!(off_cells, 0, "a zero dial lays no bed");
     }
 
-    fn classic_cfg(enabled: bool) -> (GlowConfig, TrailConfig) {
+    const fn classic_cfg(enabled: bool) -> (GlowConfig, TrailConfig) {
         let glow = GlowConfig {
             ribbon_tall: false,
             ribbon_flat: false,

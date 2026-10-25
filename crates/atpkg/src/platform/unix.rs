@@ -181,6 +181,44 @@ pub fn exclude_from_backup(dir: &Path) {
     }
 }
 
+/// The names of the extended attributes on `path` itself, a link not followed (`listxattr(2)`
+/// with `XATTR_NOFOLLOW`).
+///
+/// # Errors
+/// `path` holds a NUL byte, or `listxattr` fails, the list outgrowing its first answer
+/// before the second call included.
+#[cfg(target_os = "macos")]
+pub fn xattr_names(path: &Path) -> io::Result<Vec<Vec<u8>>> {
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c` is a NUL-terminated C string that outlives the call; a null buffer of size 0
+    // asks only for the list's length, and nothing is written.
+    let want =
+        unsafe { libc::listxattr(c.as_ptr(), std::ptr::null_mut(), 0, libc::XATTR_NOFOLLOW) };
+    let want = usize::try_from(want).map_err(|_| io::Error::last_os_error())?;
+    if want == 0 {
+        return Ok(Vec::new());
+    }
+    let mut list = vec![0u8; want];
+    // SAFETY: `c` is as above and `list` is a writable buffer of the stated length; `listxattr`
+    // writes at most that many bytes and returns how many it wrote, or -1.
+    let got = unsafe {
+        libc::listxattr(
+            c.as_ptr(),
+            list.as_mut_ptr().cast::<libc::c_char>(),
+            list.len(),
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    let got = usize::try_from(got).map_err(|_| io::Error::last_os_error())?;
+    list.truncate(got);
+    Ok(list
+        .split(|&b| b == 0)
+        .filter(|name| !name.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
 /// The `defaults(1)` domain of macOS Universal Control, per-host (`-currentHost`).
 #[cfg(target_os = "macos")]
 pub const UNIVERSAL_CONTROL_DOMAIN: &str = "com.apple.universalcontrol";

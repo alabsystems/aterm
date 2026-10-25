@@ -16113,8 +16113,10 @@ fn the_supervisor_key_is_owner_only_shown_in_the_roster_and_released_with_its_co
             owner.ends_with(" copy=- upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"),
             "{line}"
         );
-        head.strip_suffix(" autopilot=-")
-            .unwrap_or_else(|| panic!("autopilot= beside supervisor=: {line}"))
+        head.strip_suffix(" supervisor_proven=0 autopilot=-")
+            .unwrap_or_else(|| {
+                panic!("an unproven claim's supervisor_proven=0, then autopilot=: {line}")
+            })
             .to_string()
     };
     assert!(row().ends_with(" supervisor=-"), "{}", row());

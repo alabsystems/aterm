@@ -970,8 +970,7 @@ pub(crate) fn land_artifact(
     l: &Landing<'_>,
     fetch: &dyn Fn(&Path) -> Result<(), String>,
 ) -> Result<Landed, FlowError> {
-    let (program, pinned, artifact, installed, strategy) =
-        (l.program, l.build, l.artifact, l.installed, l.strategy);
+    let (program, pinned, artifact) = (l.program, l.build, l.artifact);
     let turn = TurnHeld(l.download_turn);
     if let Some(note) = digest_refusal_note(layout, program, pinned, artifact, false) {
         return Err(FlowError::StageRefused(note));
@@ -1048,6 +1047,107 @@ pub(crate) fn land_artifact(
         }
     };
     let _ = std::fs::remove_file(&dl);
+    activate_landed(layout, l, build_dir, was_live, root)
+}
+
+/// Another row's complete build that holds exactly the tree a [`Landing`]'s signed bytes stage
+/// to ([`land_from_tree`]).
+pub(crate) struct SourceTree<'a> {
+    /// The row whose build it is.
+    pub program: &'a str,
+    /// The build's directory.
+    pub dir: &'a Path,
+    /// The `tree_root` its record names.
+    pub root: &'a str,
+}
+
+/// [`land_artifact`] with no download: stage a copy of `source`
+/// ([`crate::install::stage_from_tree`], every step of the stage from its aliases on run at
+/// this landing's own paths), activate the build and lay its shims. `Ok(None)` when the copy is
+/// not exactly the tree `source`'s record names, or this platform lays no copy: nothing was
+/// laid, memoized or fetched, the landing's turn on the link is still its own, and the caller
+/// lands by download.
+///
+/// # Errors
+/// [`land_artifact`]'s past its download: a refusal memo that binds the digest, the disk gate
+/// on the room the tree takes, the shim-env sidecar, a step of the stage (memoized as a
+/// download's would be) and activation. A step of the stage fails only once the copy was laid,
+/// so the landing's turn on the link is given up by then.
+pub(crate) fn land_from_tree(
+    layout: &Layout,
+    l: &Landing<'_>,
+    source: &SourceTree<'_>,
+) -> Result<Option<Landed>, FlowError> {
+    let (program, pinned, artifact) = (l.program, l.build, l.artifact);
+    if let Some(note) = digest_refusal_note(layout, program, pinned, artifact, false) {
+        return Err(FlowError::StageRefused(note));
+    }
+    let build_dir = layout.build_dir(program, pinned);
+    let was_live =
+        std::fs::read_link(layout.program_current(program)).is_ok_and(|t| t == build_dir);
+    // A clone on APFS takes no new blocks, but on a volume that cannot clone it is a full copy
+    // of the tree: the room the tree takes is held as a download's second gate holds it.
+    disk_gate(
+        artifact.cost.disk_installed,
+        crate::freespace::available_bytes(&build_dir),
+    )?;
+    if let Err(e) = crate::shim_env::write_sidecar(&build_dir, l.shim_env) {
+        let mut why = String::from("shim_env sidecar: ");
+        why.push_str(&e.to_string());
+        return Err(FlowError::Activate(why));
+    }
+    crate::progress::note_build(program, pinned);
+    crate::progress::note_phase(program, crate::progress::Phase::Verify);
+    // A copy that holds the tree needs no transfer: the next landing's may start.
+    let laid = || {
+        if let Some(ticket) = l.download_turn {
+            ticket.release();
+        }
+    };
+    let staged = crate::install::stage_from_tree(
+        source.dir,
+        source.root,
+        artifact,
+        &build_dir,
+        l.hooks,
+        &laid,
+    );
+    if !matches!(staged, Ok(crate::install::FromTree::Staged(_))) && !build_dir.exists() {
+        crate::shim_env::remove_sidecar(&build_dir);
+    }
+    let root = match staged {
+        Ok(crate::install::FromTree::Staged(root)) => root,
+        Ok(crate::install::FromTree::Drift(why)) => {
+            println!(
+                "atpkg: {program}: {}'s build of the same bytes is not copied: {why}; \
+                 downloading its own",
+                source.program
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            record_digest_refusal(&build_dir, artifact, &e);
+            return Err(FlowError::Stage(e));
+        }
+    };
+    println!(
+        "atpkg: {program}: copied {}'s verified build of the same bytes; nothing downloaded",
+        source.program
+    );
+    activate_landed(layout, l, build_dir, was_live, root).map(Some)
+}
+
+/// The back half of a landing whose tree is staged at `build_dir` and folds to `root`: forget
+/// its stage refusal, activate it, record and shim what it exposes.
+fn activate_landed(
+    layout: &Layout,
+    l: &Landing<'_>,
+    build_dir: PathBuf,
+    was_live: bool,
+    root: String,
+) -> Result<Landed, FlowError> {
+    let (program, pinned, artifact, installed, strategy) =
+        (l.program, l.build, l.artifact, l.installed, l.strategy);
     crate::store::clear_stage_refusal(&build_dir);
 
     if strategy == crate::dispatch::ApplyStrategy::SysrootBundle {

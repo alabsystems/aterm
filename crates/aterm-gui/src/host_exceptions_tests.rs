@@ -83,7 +83,7 @@ fn roster() -> Vec<Entry> {
             ));
         }
     }
-    all.push(mr::disk_low_entry(7, 20, &[]));
+    all.push(mr::disk_low_entry(7, 20, &[], None));
     for feature in mr::REMOVED_FEATURES {
         all.push(mr::removed_setting_entry(feature, Some(12), &[]));
         all.push(mr::removed_setting_entry(feature, None, &[]));
@@ -843,11 +843,13 @@ fn a_volume_aterm_could_not_help_is_one_line_and_space_ends_it() {
         free_gib: 7,
         floor_gib: 20,
         hogs: hogs.clone(),
+        asked: None,
     });
     app.note_harness_host(HostNote::DiskLow {
         free_gib: 6,
         floor_gib: 20,
         hogs: hogs.clone(),
+        asked: None,
     });
     let keys: Vec<String> = app
         .messages
@@ -917,6 +919,7 @@ fn a_full_disk_is_one_standing_alert_and_what_was_freed_is_a_fact() {
         hogs: vec!["$HOME/trust/build 94.0 GiB (x.py bootstrap)".into()],
         cause: crate::message_reporters::DiskFullCause::Spent,
         thresholds: aterm_agent::harness::disk::Config::default().thresholds(None),
+        asked: None,
     };
     app.note_harness_host(full());
     app.note_harness_host(full());
@@ -981,6 +984,7 @@ fn a_disk_setting_that_turns_cleanup_off_is_one_line_until_it_reads_again() {
     let short = HostNote::DiskLowCleanupOff {
         free_gib: 2,
         floor_gib: 10,
+        asked: None,
     };
     for _ in 0..2 {
         app.note_harness_host(HostNote::DiskSettingsOff {
@@ -1027,6 +1031,7 @@ fn a_disk_setting_that_turns_cleanup_off_is_one_line_until_it_reads_again() {
         free_gib: 2,
         floor_gib: 10,
         hogs: Vec::new(),
+        asked: None,
     });
     app.note_harness_host(HostNote::DiskSettingsRead);
     assert_eq!(keys(&app), [mr::DISK_LOW_KEY]);
@@ -1057,10 +1062,12 @@ fn a_short_volume_is_one_low_disk_line_in_the_form_last_told() {
         free_gib: 3,
         floor_gib: 10,
         hogs: Vec::new(),
+        asked: None,
     };
     let off = HostNote::DiskLowCleanupOff {
         free_gib: 2,
         floor_gib: 10,
+        asked: None,
     };
     app.note_harness_host(passes.clone());
     assert_eq!(keys(&app), [mr::DISK_LOW_KEY]);
@@ -3237,7 +3244,7 @@ fn the_ends_of_the_event_families_end_lines_an_earlier_process_raised() {
     let mut app = App::headless_for_test();
     let spot = &places()[0];
     let (session, sid) = session_with_open_epoch(&mut app, 43);
-    app.except(&mr::disk_low_entry(7, 20, &[]));
+    app.except(&mr::disk_low_entry(7, 20, &[], None));
     app.except(&mr::disk_settings_entry(&[
         "disk.apply is not read".to_string()
     ]));

@@ -428,7 +428,7 @@ fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
 
 /// A `0..=1` share as a byte of opacity.
 #[inline]
-fn alpha_byte(share: f32) -> u8 {
+const fn alpha_byte(share: f32) -> u8 {
     (share.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 

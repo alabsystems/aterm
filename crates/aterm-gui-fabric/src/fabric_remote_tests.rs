@@ -174,3 +174,79 @@ fn no_local_connection_names_the_remote_slot_and_no_carry_writes_it() {
     assert!(render_holds(&ctx.fabric.holds()).is_empty());
     assert_eq!(ctx.fabric.holds().origins(), REMOTE_ORIGIN);
 }
+
+#[test]
+fn a_local_off_lifts_a_nodes_hold_once_that_node_may_drive_this_mac_no_more() {
+    let store = new_store();
+    let (sid, ctx) = registered_as(&store, 1);
+    let m03 = mac(0x03, "mac-03 (node 03030303)");
+    let off = |holder: Holder| {
+        owner_off_remote(
+            &store,
+            sid.as_str(),
+            &|hold: &RemoteHold| {
+                assert_eq!(hold.node, m03.node);
+                holder.clone()
+            },
+            &|_| {},
+        )
+    };
+    assert_eq!(off(Holder::Gone("left".into())), None, "no hold stands");
+    assert_eq!(remote(&store, &m03, &format!("{sid} on")), "OK hold=1\n");
+    let refused = refusal_to(&ctx, None, "send").expect("held");
+    assert!(
+        refused.starts_with("ERR halted reason=- origin=remote (held by mac-03 (node 03030303)")
+            && refused.contains("`aterm fleet peers rm 03030303` once that Mac left the fleet")
+            && refused.contains(&format!("`aterm ctl hold {sid} off` on this session's Mac")),
+        "the refusal names who holds it and what lifts it: {refused}"
+    );
+    for (holder, says) in [
+        (Holder::Drives, "which still drives this Mac"),
+        (
+            Holder::Again("nothing listens".into()),
+            "which may still drive this Mac: its place did not prove it just now (nothing listens)",
+        ),
+    ] {
+        match off(holder) {
+            Some(RemoteOff::Stands(reply)) => assert!(
+                reply.starts_with("ERR halted reason=- origin=remote") && reply.contains(says),
+                "{reply}"
+            ),
+            other => panic!("a node that may still drive keeps its hold: {other:?}"),
+        }
+        assert!(ctx.fabric.holds().remote().is_some());
+    }
+    assert_eq!(
+        cmd_hold(&store, &format!("{sid} on reason=mine"), HoldIssuer::Owner),
+        "OK hold=1\n"
+    );
+    assert_eq!(
+        off(Holder::Gone("left".into())),
+        None,
+        "an off lifts the local slot first"
+    );
+    assert_eq!(
+        cmd_hold(&store, &format!("{sid} off"), HoldIssuer::Owner),
+        "OK hold=1\n"
+    );
+    match off(Holder::Gone("another secret".into())) {
+        Some(RemoteOff::Lifted { hold, why, reply }) => {
+            assert_eq!(
+                (hold.node, why.as_str()),
+                (m03.node.clone(), "another secret")
+            );
+            assert_eq!(reply, "OK hold=0 lifted=remote\n");
+        }
+        other => panic!("a node that may drive no more keeps its hold: {other:?}"),
+    }
+    assert!(!ctx.fabric.holds().is_held());
+    assert!(refusal_to(&ctx, None, "send").is_none());
+
+    assert_eq!(remote(&store, &m03, &format!("{sid} on")), "OK hold=1\n");
+    assert_eq!(person_hold(&ctx, true, &|| {}), PersonHoldOutcome::Moved);
+    assert_eq!(
+        off(Holder::Gone("left".into())),
+        None,
+        "the person's Take Over took the tab"
+    );
+}

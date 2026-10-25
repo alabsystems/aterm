@@ -14,8 +14,9 @@ const LIT: SwitchPaint = SwitchPaint {
     version: None,
 };
 
+/// An off face: its agent's own switch holds the harness off (the master's reads the same).
 const OFF: SwitchPaint = SwitchPaint {
-    face: HarnessSwitch::Off(SwitchOff::Session),
+    face: HarnessSwitch::Off(SwitchOff::Agent(aterm_phase::Program::Claude)),
     hover: false,
     version: None,
 };
@@ -28,6 +29,12 @@ const MASTER_OFF: SwitchPaint = SwitchPaint {
 
 const TURNING: SwitchPaint = SwitchPaint {
     face: HarnessSwitch::Turning,
+    hover: false,
+    version: None,
+};
+
+const TURNING_OFF: SwitchPaint = SwitchPaint {
+    face: HarnessSwitch::TurningOff,
     hover: false,
     version: None,
 };
@@ -209,18 +216,18 @@ fn top_rules(cols: usize) -> Vec<(&'static str, String)> {
     rules
 }
 
-const CASES: [(Option<SwitchPaint>, Option<CardPalette>); 8] = [
+/// Every switch and theme a top line meets: the harness on is lit under every Autopilot (Off's
+/// white included), and an off or turning-on face is bare.
+const CASES: [(Option<SwitchPaint>, Option<CardPalette>); 9] = [
     (None, None),
     (Some(LIT), Some(CardPalette::Cruise)),
     (Some(LIT), Some(CardPalette::Land)),
-    (Some(OFF), Some(CardPalette::Off)),
-    (
-        Some(SwitchPaint { hover: true, ..OFF }),
-        Some(CardPalette::Off),
-    ),
+    (Some(LIT), Some(CardPalette::Off)),
+    (Some(SwitchPaint { hover: true, ..OFF }), None),
     (Some(MASTER_OFF), None),
     (Some(LIT), None),
     (Some(TURNING), None),
+    (Some(TURNING_OFF), Some(CardPalette::Off)),
 ];
 
 fn key_for(
@@ -802,7 +809,7 @@ fn the_lockup_stands_two_rule_cells_in() {
         let word: Vec<char> = mark.name(build).chars().collect();
         for (switch, palette) in [
             (Some(LIT), Some(CardPalette::Cruise)),
-            (Some(OFF), Some(CardPalette::Off)),
+            (Some(LIT), Some(CardPalette::Off)),
             (Some(MASTER_OFF), None),
             (Some(TURNING), None),
             (None, None),
@@ -1301,6 +1308,12 @@ fn hb_int_faces(paint: SwitchPaint, word: &str) -> Vec<String> {
             " \u{25d0} turning on ".into(),
             " \u{25d0} on ".into(),
         ],
+        HarnessSwitch::TurningOff => vec![
+            format!(" {word} harness \u{25d0} turning off "),
+            format!(" {word} \u{25d0} turning off "),
+            " \u{25d0} turning off ".into(),
+            " \u{25d0} off ".into(),
+        ],
     }
 }
 
@@ -1314,7 +1327,7 @@ fn a_switch_stands_wherever_it_stood() {
         (aterm_phase::Program::Codex, Build::Alab),
     ] {
         let mark = cli_mark(program).expect("a mark");
-        for paint in [LIT, OFF, MASTER_OFF, TURNING] {
+        for paint in [LIT, OFF, MASTER_OFF, TURNING, TURNING_OFF] {
             let old = hb_int_faces(paint, mark.word());
             for span in 0..=200 {
                 let stood = old.iter().any(|f| f.chars().count() + 4 <= span);
@@ -1450,7 +1463,7 @@ fn flows(
     let letter = |t: f32| {
         let l = brand_letter_fg(palette, t, blank());
         match face {
-            HarnessSwitch::Turning => turning_ink(l, blank().bg),
+            HarnessSwitch::Turning | HarnessSwitch::TurningOff => turning_ink(l, blank().bg),
             _ => l,
         }
     };
@@ -1486,15 +1499,18 @@ fn the_rule_flows_into_the_switch() {
         KeyFace::default(),
     );
     let land = composed(run, Some(LIT), Some(CardPalette::Land), KeyFace::default());
-    let off = composed(run, Some(OFF), Some(CardPalette::Off), KeyFace::default());
+    let off = composed(run, Some(LIT), Some(CardPalette::Off), KeyFace::default());
+    let turning_off = composed(
+        run,
+        Some(TURNING_OFF),
+        Some(CardPalette::Off),
+        KeyFace::default(),
+    );
     for (top, palette, face) in [
         (&cruise, CardPalette::Cruise, HarnessSwitch::On),
         (&land, CardPalette::Land, HarnessSwitch::On),
-        (
-            &off,
-            CardPalette::Off,
-            HarnessSwitch::Off(SwitchOff::Session),
-        ),
+        (&off, CardPalette::Off, HarnessSwitch::On),
+        (&turning_off, CardPalette::Off, HarnessSwitch::TurningOff),
     ] {
         let switch = top.switch.clone().expect("the switch");
         flows(&top.cells, &switch, top.col, palette, face)
@@ -1526,6 +1542,11 @@ fn the_rule_flows_into_the_switch() {
     }
     let layout = |t: &ComposedTop| t.cells.iter().map(|c| c.ch).collect::<String>();
     assert_eq!(layout(&cruise), layout(&land), "one layout");
+    assert_eq!(
+        layout(&cruise),
+        layout(&off),
+        "Autopilot Off's switch is the lit one, `alab harness ● on`"
+    );
     let lockup = cruise.lockup.clone();
     for (k, (a, b)) in cruise.cells.iter().zip(&land.cells).enumerate() {
         if lockup.contains(&(cruise.col + k)) || a.ch == ' ' {
@@ -1533,7 +1554,7 @@ fn the_rule_flows_into_the_switch() {
         }
         assert_ne!(a.fg, b.fg, "cell {k} {:?}: Cruise and Land apart", a.ch);
     }
-    let switch = off.switch.clone().expect("the off switch");
+    let switch = off.switch.clone().expect("Off's lit switch");
     let glyphs: Vec<usize> = switch
         .switch
         .clone()
@@ -2136,8 +2157,9 @@ fn the_bare_switch_reads_on_every_ground() {
             for face in [
                 HarnessSwitch::On,
                 HarnessSwitch::Off(SwitchOff::Master),
-                HarnessSwitch::Off(SwitchOff::Session),
+                HarnessSwitch::Off(SwitchOff::Agent(aterm_phase::Program::Claude)),
                 HarnessSwitch::Turning,
+                HarnessSwitch::TurningOff,
             ] {
                 for hover in [false, true] {
                     let paint = SwitchPaint {
@@ -2229,7 +2251,7 @@ fn the_themed_switch_reads_on_every_ground() {
         };
         let mut least = (f32::MAX, String::new());
         for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
-            for paint in [LIT, OFF, MASTER_OFF, TURNING] {
+            for paint in [LIT, OFF, MASTER_OFF, TURNING, TURNING_OFF] {
                 for stop in (0..=255u8).step_by(3) {
                     let c = switch_cell(
                         'a',

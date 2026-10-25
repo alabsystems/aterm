@@ -541,8 +541,10 @@ fn harness_update_rows(
     vec![
         (
             "Claude harness".to_string(),
+            // The Claude Code harness's own version, built into this aterm build.
             format!(
-                "aterm {} ({})",
+                "v{} (built-in) · in aterm {} ({})",
+                aterm_phase::CliHarness::ClaudeCode.version_str(),
                 crate::build_info::version(),
                 crate::build_info::git_commit()
             ),

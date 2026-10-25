@@ -766,6 +766,23 @@ pub fn answers_to(env: &[String], user_home: &Path, email: &str) -> Option<bool>
     .flatten()
 }
 
+/// The key of the account signed in to the profile Claude Code reads for the home `env` names
+/// (`oauthAccount.accountUuid`), read afresh each call: a `/login` in another tab or a shell
+/// rewrites it while a process of that home runs.
+#[must_use]
+pub fn account_of(env: &[String], user_home: &Path) -> Option<AccountKey> {
+    let path = effective_of(env, user_home)?;
+    read_with(&path, |bytes| {
+        let Obj(raw) =
+            aterm_json::from_slice::<Obj<RawKey>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+        Ok(raw
+            .and_then(|file| file.oauth.0)
+            .and_then(|oauth| oauth.key.0))
+    })
+    .ok()
+    .flatten()
+}
+
 /// How long a cached `/usage` reading stays current ([`current_windows`]).
 const USAGE_CURRENT_S: i64 = 15 * 60;
 
@@ -918,18 +935,20 @@ impl WeeklyGap {
 }
 
 /// The footer's narrow form of the weekly words [`WeeklyFigure::words`] or [`WeeklyGap::words`]
-/// said, for a rule too narrow for them beside the account: an aged figure without its `weekly `
-/// and ` ago` (`61.5% left \u{b7} 59m`, after the week's own mark), any reason's `weekly ?`;
-/// `None` for words that are already their narrowest (a current figure, a wall's
-/// `weekly 0% left`).
+/// said, for a rule too narrow for them beside the account: an aged figure without its ` left`
+/// and ` ago` but with its `weekly` (`weekly 61.5% \u{b7} 59m`), since the rule draws the week
+/// behind the account unit's `\u{b7}` and no mark of its own names it, and no wider than
+/// `weekly unavailable`; any reason's `weekly ?`; `None` for words that are already their
+/// narrowest (a current figure, a wall's `weekly 0% left`).
 #[must_use]
 pub fn narrow_weekly(words: &str) -> Option<String> {
-    if let Some(aged) = words
+    if let Some((share, age)) = words
         .strip_prefix("weekly ")
         .and_then(|rest| rest.strip_suffix(" ago"))
-        .filter(|aged| aged.contains('%'))
+        .and_then(|aged| aged.split_once(" left \u{b7} "))
+        .filter(|(share, _)| share.ends_with('%'))
     {
-        return Some(aged.to_owned());
+        return Some(format!("weekly {share} \u{b7} {age}"));
     }
     words
         .starts_with("weekly ? ")
@@ -2719,6 +2738,21 @@ struct RawMuseMeta {
 #[serde(default)]
 struct RawMuseSettings {
     provider: Leaf,
+}
+
+/// The account-key-only allowlist [`account_of`] reads.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawKey {
+    #[serde(rename = "oauthAccount")]
+    oauth: Obj<RawKeyOauth>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawKeyOauth {
+    #[serde(rename = "accountUuid")]
+    key: Hashed,
 }
 
 /// The email-only allowlist shared by the login check and volatile footer display.

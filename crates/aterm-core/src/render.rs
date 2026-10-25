@@ -691,7 +691,8 @@ pub enum BandIcon {
     Disc,
     /// `○` — a ring: the harness switch off, Autopilot off.
     Ring,
-    /// `◐` — the ring with its left half filled: the harness switch turning on, a chip's click in flight.
+    /// `◐` — the ring with its left half filled: the harness switch turning on or off, a chip's click
+    /// in flight.
     HalfDisc,
     /// `◌` — the ring drawn as dots: a light whose mode is not known.
     DottedRing,

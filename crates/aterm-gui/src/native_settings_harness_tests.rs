@@ -283,7 +283,16 @@ fn the_harness_route_renders_its_cards_and_controls() {
         );
     }
     let harness_build = node(&pages, "harness/updates/row/claude-harness");
-    assert!(harness_build.label.contains(crate::build_info::version()));
+    let own = format!(
+        "v{} (built-in) · in aterm {}",
+        aterm_phase::CliHarness::ClaudeCode.version_str(),
+        crate::build_info::version()
+    );
+    assert!(
+        harness_build.label.contains(&own),
+        "the harness's own version, then the aterm it ships in: {:?}",
+        harness_build.label
+    );
     assert!(
         harness_build
             .label

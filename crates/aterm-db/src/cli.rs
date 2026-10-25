@@ -11,12 +11,7 @@ use crate::{
 use aterm_codec::hex;
 use aterm_json::{Value, json};
 use std::{
-    collections::BTreeMap,
-    ffi::OsString,
-    io::Write,
-    net::{SocketAddr, TcpListener},
-    path::Path,
-    process::ExitCode,
+    collections::BTreeMap, ffi::OsString, io::Write, net::SocketAddr, path::Path, process::ExitCode,
 };
 
 /// Command help. Mutation request IDs are caller-held, so lost replies are safely retried.
@@ -385,7 +380,12 @@ pub fn run(words: &[String]) -> Result<Value> {
                 .unwrap_or_default();
             empty(&options)?;
             Credentials::load(dir)?;
-            let listener = TcpListener::bind(listen)?;
+            let scope = if listen.ip().is_loopback() {
+                aterm_net::lan::Scope::Loopback
+            } else {
+                aterm_net::lan::Scope::Lan
+            };
+            let listener = aterm_net::lan::Listener::bind(listen, scope)?;
             crate::network::serve(dir, listener, peers)?;
             json!({"stopped":true})
         }

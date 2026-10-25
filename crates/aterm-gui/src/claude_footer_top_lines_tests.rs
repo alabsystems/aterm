@@ -379,11 +379,9 @@ fn the_switchs_accent_reads_on_a_slab_the_theme_did_not_choose() {
     let (mut app, wid, session) = pane_of(24, cols as u16, "codex");
     let _host = hosted(&mut app);
     set_proven(&app, session, true);
-    assert!(app.set_session_autopilot(
-        session,
-        Some(aterm_agent::supervise::Autopilot::Off),
-        crate::autopilot::Surface::Chip
-    ));
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+    );
     let light = aterm_types::scheme::builtin("Default Light").expect("a built-in");
     app.theme = aterm_render::Theme::from(&light);
     bytes(&app, session, codex_screen(cols, Some(SLAB)).as_bytes());
@@ -595,8 +593,19 @@ fn codex_gets_a_switch_only_as_codex_alab() {
     app.press_harness_switch(wid, session, HarnessSwitch::On);
     assert_eq!(
         app.session_autopilot(session).0,
-        Some(aterm_agent::supervise::Autopilot::Off),
-        "the press turned the session off"
+        None,
+        "the press writes no Autopilot word"
+    );
+    let wrote = app
+        .messages
+        .log()
+        .records()
+        .rfind(|r| r.key.as_deref() == Some("harness.switch-save.harness.enabled"))
+        .map(|r| r.detail.join(" "))
+        .expect("the master switch's write was made");
+    assert!(
+        wrote.contains("harness.enabled = false"),
+        "the press turned the whole harness off: {wrote:?}"
     );
     assert!(app.set_session_autopilot(
         session,
@@ -773,7 +782,7 @@ const LIT: SwitchPaint = SwitchPaint {
 };
 
 const OFF: SwitchPaint = SwitchPaint {
-    face: HarnessSwitch::Off(SwitchOff::Session),
+    face: HarnessSwitch::Off(SwitchOff::Master),
     hover: false,
     version: None,
 };
@@ -894,7 +903,8 @@ fn the_hover_title_never_moves_the_switch() {
         let mut seen = [0usize; 3];
         for (switch, palette) in [
             (Some(LIT), Some(CardPalette::Cruise)),
-            (Some(OFF), Some(CardPalette::Off)),
+            (Some(LIT), Some(CardPalette::Off)),
+            (Some(OFF), None),
             (Some(LIT), None),
             (None, None),
         ] {
@@ -1326,7 +1336,8 @@ fn a_regrid_brings_the_hover_title_under_a_still_pointer() {
 /// switch's own cells, never the off face's `on` button. A screen reader
 /// meets one `Role::Switch` over the words and the pill, toggled on and
 /// named as drawn, and its press does what a click on the pill does: the
-/// harness turns off. NEGATIVE CONTROL: the off face keeps its `on`
+/// whole harness turns off (`harness.enabled = false`, no Autopilot word).
+/// NEGATIVE CONTROL: once that reads back, the off face keeps its `on`
 /// button, a second node named for what a press on it does.
 #[cfg(a11y_tree)]
 #[test]
@@ -1369,7 +1380,7 @@ fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
             b.switch.len()
         )
     );
-    assert_eq!(lit[0].label, "alab harness v0.1 on: Antigravity CLI");
+    assert_eq!(lit[0].label, "alab harness v0.1 on");
     let carried = app.session_autopilot(session).1;
     assert!(
         matches!(carried, AutopilotView::Cruise | AutopilotView::Land),
@@ -1378,8 +1389,19 @@ fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Switch);
     assert_eq!(
         app.session_autopilot(session).1,
-        AutopilotView::Off,
-        "the reader's press is the pill's click"
+        carried,
+        "the reader's press writes no Autopilot word"
+    );
+    let wrote = app
+        .messages
+        .log()
+        .records()
+        .rfind(|r| r.key.as_deref() == Some("harness.switch-save.harness.enabled"))
+        .map(|r| r.detail.join(" "))
+        .expect("the reader's press is the pill's click: the master switch's write");
+    assert!(wrote.contains("harness.enabled = false"), "{wrote:?}");
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
     );
     for _ in 0..2 {
         refill(&mut app, wid);
@@ -1394,15 +1416,74 @@ fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
             (
                 HarnessChip::Switch,
                 Some(Toggled::False),
-                "alab harness v0.1 off: Antigravity CLI"
+                "alab harness v0.1 off"
             ),
             (
                 HarnessChip::SwitchOn,
                 None,
-                "on: turn the Antigravity CLI harness on"
+                "on: turn the harness on (Supervise coding agents)"
             ),
         ],
         "NEGATIVE CONTROL: the off face's `on` button"
+    );
+}
+
+/// AGY'S LIT PILL WEARS THE WHITE UNDER AUTOPILOT OFF: on the white line (`CardPalette::Off`)
+/// the versioned switch's `▐ ● on ▌` is drawn in the moonbow's white like the words before it,
+/// one white under the pill's letters and in its caps. CONTROL: under Cruise the pill keeps agy's
+/// accent.
+#[test]
+fn agys_lit_pill_wears_the_white_under_autopilot_off() {
+    let rows = fixture_rows(include_str!(
+        "../../aterm-phase/src/fixtures/agy-1.4.0-idle.txt"
+    ));
+    let (mut app, wid, session) = pane_of(40, 120, "agy");
+    let _host = held(&mut app, session);
+    feed(&app, session, &rows);
+    let settle = |app: &mut App| {
+        for _ in 0..2 {
+            refill(app, wid);
+            let _ = pass(app, wid);
+        }
+    };
+    settle(&mut app);
+    let pill = |app: &App| -> Vec<RenderCell> {
+        let b = switch_of(app, wid, session).expect("agy's switch");
+        assert_eq!(b.face, HarnessSwitch::On, "lit");
+        let cells = &app.windows[&wid].input_scratch.cells[b.frame_row][b.switch.clone()];
+        let cap = cells
+            .iter()
+            .position(|c| c.ch == '\u{2590}')
+            .expect("the pill's cap");
+        cells[cap..].to_vec()
+    };
+    let cruise = pill(&app);
+    assert!(app.set_session_autopilot(
+        session,
+        Some(aterm_agent::supervise::Autopilot::Off),
+        crate::autopilot::Surface::Chip
+    ));
+    settle(&mut app);
+    let white = pill(&app);
+    assert_eq!(
+        white.iter().map(|c| c.ch).collect::<String>(),
+        "\u{2590} \u{25cf} on \u{258c}"
+    );
+    let (caps, inside) = (
+        [white[0], white[white.len() - 1]],
+        &white[1..white.len() - 1],
+    );
+    let fill = inside[0].bg;
+    let spread = fill.iter().max().unwrap() - fill.iter().min().unwrap();
+    assert!(spread <= 24, "the pill's fill is white: {fill:?}");
+    assert!(
+        inside.iter().all(|c| c.bg == fill),
+        "one fill under the pill's letters: {inside:?}"
+    );
+    assert_eq!(caps.map(|c| c.fg), [fill, fill], "its caps the same white");
+    assert_ne!(
+        cruise[1].bg, fill,
+        "CONTROL: under Cruise the pill wears the accent"
     );
 }
 

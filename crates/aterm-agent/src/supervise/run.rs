@@ -1987,11 +1987,15 @@ pub struct Session<'a, C: Ctl> {
     /// The usage tap's read of the walled process and the reset the wall waits for, from it and
     /// the notice together ([`turn_end_loop::WallTap`]); dropped with the wall.
     wall_tap: Option<turn_end_loop::WallTap>,
+    /// The account the standing limit was read under ([`turn_end_loop::WallLogin`]); dropped with the wall.
+    wall_login: Option<turn_end_loop::WallLogin>,
+    /// When the profile was last read for a moved login during a wait ([`Session::login_edge`]).
+    login_looked_at: Option<Instant>,
     stuck_asked: Option<Instant>,
     stuck_rung: wall_memory::StuckRung,
     stuck_raised: Option<(Instant, super::policy::outlook::ExceptionKind)>,
     stuck_told: Option<(Instant, Option<u32>)>,
-    stuck_dialog: Option<(String, Instant)>,
+    stuck_dialog: Option<((String, wall_memory::StuckOn), Instant)>,
     stuck_still: Option<(String, Instant)>,
     reprint_jumps: u32,
     wall_answered: Option<(Instant, String)>,
@@ -2076,6 +2080,8 @@ pub struct Session<'a, C: Ctl> {
     touch_off: bool,
     #[cfg(test)]
     episode_per_box: bool,
+    #[cfg(test)]
+    bound_off: bool,
     #[cfg(test)]
     last_box: Option<String>,
     #[cfg(test)]
@@ -2268,6 +2274,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             running: super::policy::turn_end::RunningTurn::default(),
             wall_reset: None,
             wall_tap: None,
+            wall_login: None,
+            login_looked_at: None,
             reprint_jumps: 0,
             wall_answered: None,
             stuck_asked: None,
@@ -2345,6 +2353,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             touch_off: false,
             #[cfg(test)]
             episode_per_box: false,
+            #[cfg(test)]
+            bound_off: false,
             #[cfg(test)]
             last_box: None,
             #[cfg(test)]
@@ -2617,6 +2627,14 @@ impl<'a, C: Ctl> Session<'a, C> {
     pub(crate) fn set_episode_per_box(&mut self) {
         self.episode_per_box = true;
         self.seeds_learned_state("the loop that starts an episode at every box");
+    }
+
+    /// Holds an untouched permission box for a person's whole grace, as before its bound: the
+    /// bound's negative control.
+    #[cfg(test)]
+    pub(crate) fn set_bound_off(&mut self) {
+        self.bound_off = true;
+        self.seeds_learned_state("the loop before the untouched box's bound");
     }
 
     /// Places each `text` read a second after the one before, the clock its countdowns tick on.
@@ -5524,6 +5542,10 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(None);
             }
             if self.tap_edge(opts, seen.screen.seq) {
+                self.turn_end_now(&seen, opts, allow, review)?;
+                return Ok(None);
+            }
+            if self.login_edge(opts) {
                 self.turn_end_now(&seen, opts, allow, review)?;
                 return Ok(None);
             }

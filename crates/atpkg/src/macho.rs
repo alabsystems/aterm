@@ -506,23 +506,34 @@ pub(crate) fn executable_files(root: &Path) -> Result<Vec<PathBuf>, StageError> 
     Ok(found)
 }
 
+/// Returns the regular files under `root` with an execute bit that are not this platform's
+/// native executables, sorted: what [`demote_foreign_executables`] demotes.
+///
+/// # Errors
+/// [`StageError::Io`] when the tree or a file's head cannot be read.
+pub(crate) fn foreign_executables(root: &Path) -> Result<Vec<PathBuf>, StageError> {
+    let mut foreign = Vec::new();
+    for path in executable_files(root)? {
+        let head = crate::metadata_io::read_head(&path, 8).map_err(StageError::Io)?;
+        if !is_native_executable(&head) {
+            foreign.push(path);
+        }
+    }
+    Ok(foreign)
+}
+
 /// Clears execute bits on non-native regular files under `root`.
 ///
 /// # Errors
 /// [`StageError::Io`] when the tree cannot be read or a mode cannot be set.
 pub(crate) fn demote_foreign_executables(root: &Path) -> Result<bool, StageError> {
-    let mut changed = false;
-    for path in executable_files(root)? {
-        let head = crate::metadata_io::read_head(&path, 8).map_err(StageError::Io)?;
-        if is_native_executable(&head) {
-            continue;
-        }
-        let meta = std::fs::symlink_metadata(&path).map_err(StageError::Io)?;
+    let foreign = foreign_executables(root)?;
+    for path in &foreign {
+        let meta = std::fs::symlink_metadata(path).map_err(StageError::Io)?;
         let mode = crate::platform::permission_mode(&meta) & 0o7777;
-        crate::platform::set_mode(&path, mode & !0o111).map_err(StageError::Io)?;
-        changed = true;
+        crate::platform::set_mode(path, mode & !0o111).map_err(StageError::Io)?;
     }
-    Ok(changed)
+    Ok(!foreign.is_empty())
 }
 
 /// Mach-O fixtures built from their load commands, for this reader's tests and for the

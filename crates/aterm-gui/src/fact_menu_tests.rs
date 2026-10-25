@@ -1154,6 +1154,126 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
     }
 }
 
+#[test]
+fn select_menu_account_for_pins_enrolled_rows_and_dispatches_auto_login_per_cli_pool() {
+    use aterm_agent::harness::accounts::{self, Cli};
+    const NOW: i64 = 1_792_660_000;
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let (config, state, home) = (
+        tmp.path().join("config"),
+        tmp.path().join("state"),
+        tmp.path().join("home"),
+    );
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let login_1 = home.join(".aterm/logins/codex/codex-1");
+    let login_2 = home.join(".aterm/logins/codex/codex-2");
+    let login_3 = home.join(".aterm/logins/codex/codex-3");
+    for d in [&login_1, &login_2, &login_3] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(login_1.join("auth.json"), "{}").unwrap();
+    let roster_path = config.join("accounts-codex.toml");
+    std::fs::write(
+        &roster_path,
+        format!(
+            "[[account]]\nlabel = \"codex-1\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             email = \"codex-one@example.com\"\n\n\
+             [[account]]\nlabel = \"codex-2\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             email = \"codex-two@example.com\"\n\n\
+             [[account]]\nlabel = \"codex-3\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+            login_1.display(),
+            login_2.display(),
+            login_3.display(),
+        ),
+    )
+    .unwrap();
+    let codex_store = accounts::Store::at_for(&state, Cli::Codex, &home);
+    let claude_store = accounts::Store::at(&state);
+
+    // 1. Enrolled vendor row pins immediately without dispatching a sign-in worker, and never
+    // touches Claude Code's store.
+    let mut dispatched = Vec::new();
+    assert!(super::select_menu_account_for(
+        Cli::Codex,
+        (&roster_path, &state, Some(&home)),
+        &AccountLabel::new("codex-1").unwrap(),
+        NOW,
+        true,
+        |req, _| {
+            dispatched.push(req);
+            Ok(())
+        },
+    ));
+    assert!(dispatched.is_empty());
+    let (s1, _) = codex_store.load(NOW).unwrap();
+    assert_eq!(s1.active.as_deref(), Some("codex-1"));
+    assert!(s1.pinned);
+    assert!(claude_store.load(NOW).unwrap().0.active.is_none());
+
+    // 2. CONTROL: unenrolled vendor row under `Inert` upkeep (`upkeep_live = false`) cancels
+    // `pending_pin` immediately and dispatches nothing.
+    assert!(super::select_menu_account_for(
+        Cli::Codex,
+        (&roster_path, &state, Some(&home)),
+        &AccountLabel::new("codex-2").unwrap(),
+        NOW + 1,
+        false,
+        |req, _| {
+            dispatched.push(req);
+            Ok(())
+        },
+    ));
+    assert!(dispatched.is_empty());
+    assert!(codex_store.load(NOW + 1).unwrap().0.pending_pin.is_none());
+
+    // 3. Unenrolled `(auto-login)` vendor row under `Live` upkeep saves `pending_pin` in Codex's
+    // store and dispatches the exact `PinRequest`.
+    assert!(super::select_menu_account_for(
+        Cli::Codex,
+        (&roster_path, &state, Some(&home)),
+        &AccountLabel::new("codex-2").unwrap(),
+        NOW + 2,
+        true,
+        |req, h| {
+            assert_eq!(h, home);
+            dispatched.push(req);
+            Ok(())
+        },
+    ));
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(dispatched[0].label(), "codex-2");
+    assert_eq!(
+        codex_store.load(NOW + 2).unwrap().0.pending_pin.as_ref(),
+        Some(&dispatched[0])
+    );
+
+    // 4. CONTROL: dispatch failure cancels `pending_pin`; no-email row never saves one.
+    assert!(super::select_menu_account_for(
+        Cli::Codex,
+        (&roster_path, &state, Some(&home)),
+        &AccountLabel::new("codex-2").unwrap(),
+        NOW + 3,
+        true,
+        |_, _| Err(()),
+    ));
+    assert!(codex_store.load(NOW + 3).unwrap().0.pending_pin.is_none());
+    assert!(super::select_menu_account_for(
+        Cli::Codex,
+        (&roster_path, &state, Some(&home)),
+        &AccountLabel::new("codex-3").unwrap(),
+        NOW + 4,
+        true,
+        |req, _| {
+            dispatched.push(req);
+            Ok(())
+        },
+    ));
+    assert_eq!(dispatched.len(), 1);
+    assert!(codex_store.load(NOW + 4).unwrap().0.pending_pin.is_none());
+}
+
 /// THE ACCOUNT MENU'S WHY NEVER ASKS THE PERSON FOR THE WEEK (owner ruling R-12): no line under
 /// the footer's reason names `/usage` or a command for the person to type; it says why the
 /// harness has no figure.

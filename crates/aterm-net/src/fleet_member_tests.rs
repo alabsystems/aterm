@@ -1574,7 +1574,80 @@ fn join_as(
         .get_ref()
         .set_read_timeout(Some(HANG))
         .unwrap();
-    (register(reached.transport.stream(), reg), reached.peer)
+    let joined = register(reached.transport.stream(), reg).map_err(|refused| match refused {
+        Unregistered::Answered(why) => why,
+        Unregistered::Unanswered(why) => panic!("the issuer answers every join: {why}"),
+    });
+    (joined, reached.peer)
+}
+
+#[test]
+fn a_registration_tells_an_issuers_refusal_from_no_answer() {
+    let reg = Registration {
+        node: "ab".repeat(16),
+        host: "lab-mini".to_owned(),
+        port: 7101,
+        version: "0.95.0+g1a2b3c4".to_owned(),
+        key: None,
+    };
+    for said in [Some("ERR the book is full\n"), None] {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let running = Arc::new(AtomicBool::new(true));
+        let listening = Listening {
+            secret: secret(6),
+            scope: FleetScope::Content,
+            node: None,
+            serves: &[FleetOp::Join],
+            slots: 8,
+            per_source: 8,
+            lifetime: HANG,
+        };
+        let serving = std::thread::spawn({
+            let running = Arc::clone(&running);
+            move || {
+                serve(
+                    &listener,
+                    &listening,
+                    &running,
+                    move |served, _| {
+                        served.answer(|stream| {
+                            stream.set_read_timeout(Some(HANG))?;
+                            let mut byte = [0u8; 1];
+                            while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {}
+                            if let Some(said) = said {
+                                stream.write_all(said.as_bytes())?;
+                            }
+                            stream.flush()
+                        })
+                    },
+                    |_: FleetEvent| {},
+                );
+            }
+        });
+        let mut reached = dial(
+            "127.0.0.1",
+            None,
+            port,
+            (&secret(6), None),
+            FleetOp::Join,
+            HANG,
+        )
+        .expect("it proves join");
+        let refused =
+            register_by(&mut reached, &reg, Instant::now() + HANG).expect_err("nothing recorded");
+        match (said, refused) {
+            (Some(_), Unregistered::Answered(why)) => {
+                assert_eq!(why, "the issuer refused: the book is full");
+            }
+            (None, Unregistered::Unanswered(why)) => {
+                assert!(why.starts_with("the issuer did not answer"), "{why}");
+            }
+            (said, refused) => panic!("{said:?}: {refused:?}"),
+        }
+        running.store(false, Ordering::Release);
+        serving.join().unwrap();
+    }
 }
 
 #[test]
@@ -3848,10 +3921,11 @@ impl Answering {
         std::thread::spawn({
             let running = Arc::clone(&running);
             move || {
-                serve(
+                crate::fleet::serve_with_handshake(
                     &listener,
                     &listening,
                     &running,
+                    HANG,
                     move |served, _| {
                         served.answer(|stream| {
                             stream.set_read_timeout(Some(HANG))?;
@@ -4696,48 +4770,53 @@ fn a_listener_names_only_the_node_its_book_binds_the_proved_key_to() {
     serving.join().unwrap();
 }
 
+fn node_listener(
+    me: NodeIdentity,
+    serves: &'static [FleetOp],
+) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let running = Arc::new(AtomicBool::new(true));
+    let listening = Listening {
+        secret: secret(6),
+        scope: FleetScope::Content,
+        node: Some(me),
+        serves,
+        slots: 8,
+        per_source: 8,
+        lifetime: HANG,
+    };
+    let serving = std::thread::spawn({
+        let running = Arc::clone(&running);
+        move || {
+            serve(
+                &listener,
+                &listening,
+                &running,
+                move |served, op| {
+                    served.answer(|stream| {
+                        stream.set_read_timeout(Some(HANG))?;
+                        let mut line = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {
+                            line.push(byte[0]);
+                        }
+                        let said = String::from_utf8_lossy(&line).into_owned();
+                        stream.write_all(format!("OK {} {said}\n", op.word()).as_bytes())?;
+                        stream.flush()
+                    })
+                },
+                |_: FleetEvent| {},
+            );
+        }
+    });
+    (port, running, serving)
+}
+
 #[test]
 fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
     let host = identity(&node_of(0xd7), 4);
-    let listen = |me: NodeIdentity, serves: &'static [FleetOp]| {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let running = Arc::new(AtomicBool::new(true));
-        let listening = Listening {
-            secret: secret(6),
-            scope: FleetScope::Content,
-            node: Some(me),
-            serves,
-            slots: 8,
-            per_source: 8,
-            lifetime: HANG,
-        };
-        let serving = std::thread::spawn({
-            let running = Arc::clone(&running);
-            move || {
-                serve(
-                    &listener,
-                    &listening,
-                    &running,
-                    move |served, op| {
-                        served.answer(|stream| {
-                            stream.set_read_timeout(Some(HANG))?;
-                            let mut line = Vec::new();
-                            let mut byte = [0u8; 1];
-                            while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {
-                                line.push(byte[0]);
-                            }
-                            let said = String::from_utf8_lossy(&line).into_owned();
-                            stream.write_all(format!("OK {} {said}\n", op.word()).as_bytes())?;
-                            stream.flush()
-                        })
-                    },
-                    |_: FleetEvent| {},
-                );
-            }
-        });
-        (port, running, serving)
-    };
+    let listen = node_listener;
     let target = |port| Target {
         host: "127.0.0.1".to_owned(),
         addr: None,
@@ -4800,6 +4879,88 @@ fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
     }
     running.store(false, Ordering::Release);
     serving.join().unwrap();
+}
+
+#[test]
+fn a_holder_proves_itself_at_any_level_and_only_another_fleet_or_key_disowns_it() {
+    let host = identity(&node_of(0xd7), 4);
+    let me = identity(&node_of(0x3a), 8);
+    let bound = Keyring::of(&[keyed(0xd7, host.key(), [127, 0, 0, 1], 7100)]);
+    let target = |port| Target {
+        host: "127.0.0.1".to_owned(),
+        addr: None,
+        port,
+        node: Some(host.node().to_owned()),
+        key: None,
+    };
+    let refused = |port, secret: &FleetSecret| {
+        proves_itself(&target(port), &bound, (secret, &me), HANG).expect_err("it is refused")
+    };
+
+    let (port, running, serving) = node_listener(host.clone(), &[FleetOp::Survey, FleetOp::Book]);
+    assert_eq!(
+        proves_itself(&target(port), &bound, (&secret(6), &me), HANG).expect("it proves itself"),
+        SocketAddr::from(([127, 0, 0, 1], port)),
+        "a listener that lets no one drive it still proves its node"
+    );
+    let rotated = refused(port, &secret(7));
+    assert!(
+        matches!(rotated, Unreached::Handshake(..)) && rotated.disowns(),
+        "another fleet's secret there: {rotated:?}"
+    );
+    running.store(false, Ordering::Release);
+    serving.join().unwrap();
+    let stopped = refused(port, &secret(6));
+    assert!(
+        matches!(stopped, Unreached::Connect(..)) && !stopped.disowns(),
+        "nothing listening says nothing of its drives: {stopped:?}"
+    );
+
+    let (port, running, serving) =
+        node_listener(identity(host.node(), 5), &[FleetOp::Survey, FleetOp::Book]);
+    let rekeyed = refused(port, &secret(6));
+    assert!(
+        matches!(rekeyed, Unreached::Impostor { .. }) && rekeyed.disowns(),
+        "{rekeyed:?}"
+    );
+    running.store(false, Ordering::Release);
+    serving.join().unwrap();
+
+    let (port, running, serving) = node_listener(
+        identity(&node_of(0xe8), 9),
+        &[FleetOp::Survey, FleetOp::Book],
+    );
+    let moved = refused(port, &secret(6));
+    assert!(
+        matches!(moved, Unreached::OtherNode { .. }) && !moved.disowns(),
+        "another node at its place says nothing of where it went: {moved:?}"
+    );
+    running.store(false, Ordering::Release);
+    serving.join().unwrap();
+
+    let at = SocketAddr::from(([192, 168, 1, 23], 7100));
+    let connect = |errno| Unreached::Connect(at, io::Error::from_raw_os_error(errno));
+    assert!(Unreached::Handshake(at, FleetError::Refused).disowns());
+    for undecided in [
+        connect(libc::ECONNREFUSED),
+        connect(libc::EHOSTUNREACH),
+        connect(libc::ENETUNREACH),
+        connect(libc::EPERM),
+        connect(libc::ETIMEDOUT),
+        Unreached::Deadline(Stage::Connect, HANG),
+        Unreached::Deadline(Stage::Handshake, HANG),
+        Unreached::Deadline(Stage::Book, HANG),
+        Unreached::Handshake(at, FleetError::AddressBusy),
+        Unreached::Handshake(at, FleetError::Io(io::ErrorKind::ConnectionReset.into())),
+        Unreached::Lookup("lab-mini.local".to_owned(), HANG),
+        Unreached::Local("no socket".to_owned()),
+        Unreached::Unproved {
+            at,
+            node: node_of(0xd7),
+        },
+    ] {
+        assert!(!undecided.disowns(), "{undecided:?}");
+    }
 }
 
 #[test]

@@ -79,15 +79,17 @@ const fn smoothstep01(x: f64) -> f64 {
 /// HSV of a `0x00RRGGBB`: hue in degrees, saturation and value in `0..1`.
 #[must_use]
 #[inline]
-pub fn spectrum_hsv(rgb: u32) -> (f64, f64, f64) {
-    let chan = |sh: u32| ((rgb >> sh) & 0xff) as f64 / 255.0;
-    let (r, g, b) = (chan(16), chan(8), chan(0));
+pub const fn spectrum_hsv(rgb: u32) -> (f64, f64, f64) {
+    let r = ((rgb >> 16) & 0xff) as f64 / 255.0;
+    let g = ((rgb >> 8) & 0xff) as f64 / 255.0;
+    let b = (rgb & 0xff) as f64 / 255.0;
     let hi = r.max(g).max(b);
     let d = hi - r.min(g).min(b);
     let hue = if d <= 0.0 {
         0.0
     } else if hi == r {
-        60.0 * ((g - b) / d).rem_euclid(6.0)
+        let q = (g - b) / d;
+        60.0 * if q < 0.0 { q + 6.0 } else { q }
     } else if hi == g {
         60.0 * ((b - r) / d + 2.0)
     } else {
@@ -99,8 +101,9 @@ pub fn spectrum_hsv(rgb: u32) -> (f64, f64, f64) {
 /// HSV → unquantized sRGB `0..1`, hue in degrees; the generator rounds once,
 /// when it commits an entry.
 #[cfg(test)]
-fn hsv_srgb(hue_deg: f64, s: f64, v: f64) -> [f64; 3] {
-    let h = hue_deg.rem_euclid(360.0) / 60.0;
+const fn hsv_srgb(hue_deg: f64, s: f64, v: f64) -> [f64; 3] {
+    let rem = hue_deg % 360.0;
+    let h = (if rem < 0.0 { rem + 360.0 } else { rem }) / 60.0;
     let c = v * s;
     let x = c * (1.0 - ((h % 2.0) - 1.0).abs());
     let m = v - c;
@@ -118,9 +121,17 @@ fn hsv_srgb(hue_deg: f64, s: f64, v: f64) -> [f64; 3] {
 /// The path at any real position `x` in path slots, `0 ..= 510` (`85 * i` is
 /// anchor `i`): the arc as drawn, before the pace spends the table on it.
 #[cfg(test)]
-fn spectrum_path(x: f64) -> [f64; 3] {
+const fn spectrum_path(x: f64) -> [f64; 3] {
+    const fn chan(c: u32, sh: u32) -> f64 {
+        ((c >> sh) & 0xff) as f64 / 255.0
+    }
     let x = x.clamp(0.0, (SPECTRUM_LUT_LEN - 1) as f64);
-    let seg = ((x / SPECTRUM_STRIDE as f64).floor() as usize).min(SPECTRUM_STOPS - 2);
+    let seg_raw = (x / SPECTRUM_STRIDE as f64).floor() as usize;
+    let seg = if seg_raw < SPECTRUM_STOPS - 2 {
+        seg_raw
+    } else {
+        SPECTRUM_STOPS - 2
+    };
     let slot = x - (seg * SPECTRUM_STRIDE) as f64;
     let k = smoothstep01(slot / SPECTRUM_STRIDE as f64);
     if seg == SPECTRUM_CROSSING_SEG {
@@ -128,7 +139,6 @@ fn spectrum_path(x: f64) -> [f64; 3] {
         let (h1, s1, v1) = spectrum_hsv(SPECTRUM_ANCHORS[seg + 1]);
         return hsv_srgb(h0 + (h1 - h0) * k, s0 + (s1 - s0) * k, v0 + (v1 - v0) * k);
     }
-    let chan = |c: u32, sh: u32| f64::from((c >> sh) & 0xff) / 255.0;
     let (a, b) = (SPECTRUM_ANCHORS[seg], SPECTRUM_ANCHORS[seg + 1]);
     [
         chan(a, 16) + (chan(b, 16) - chan(a, 16)) * k,
@@ -139,9 +149,11 @@ fn spectrum_path(x: f64) -> [f64; 3] {
 
 /// The path colour as the byte triple an entry commits (the one rounding).
 #[cfg(test)]
-fn spectrum_path_byte(x: f64) -> u32 {
+const fn spectrum_path_byte(x: f64) -> u32 {
+    const fn byte(v: f64) -> u32 {
+        (v.clamp(0.0, 1.0) * 255.0).round() as u32
+    }
     let c = spectrum_path(x);
-    let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
     (byte(c[0]) << 16) | (byte(c[1]) << 8) | byte(c[2])
 }
 
@@ -170,7 +182,7 @@ fn spectrum_oklab(c: [f64; 3]) -> [f64; 3] {
 /// The HSV hue of an unquantized triple, in degrees — [`spectrum_hsv`]'s hue,
 /// asked of the path rather than of a committed byte.
 #[cfg(test)]
-fn spectrum_path_hue(c: [f64; 3]) -> f64 {
+const fn spectrum_path_hue(c: [f64; 3]) -> f64 {
     let (r, g, b) = (c[0], c[1], c[2]);
     let hi = r.max(g).max(b);
     let d = hi - r.min(g).min(b);
@@ -178,7 +190,8 @@ fn spectrum_path_hue(c: [f64; 3]) -> f64 {
         return 0.0;
     }
     if hi == r {
-        60.0 * ((g - b) / d).rem_euclid(6.0)
+        let q = (g - b) / d;
+        60.0 * if q < 0.0 { q + 6.0 } else { q }
     } else if hi == g {
         60.0 * ((b - r) / d + 2.0)
     } else {
@@ -339,17 +352,19 @@ pub(crate) fn spectrum_table_at_cap(cap: f64) -> SpectrumTable {
 /// Where the green→blue crossing sits in `t`.
 #[cfg(test)]
 #[must_use]
-pub(crate) fn spectrum_crossing_position() -> f32 {
+pub(crate) const fn spectrum_crossing_position() -> f32 {
     let mid = 0.5
         * (spectrum_hsv(SPECTRUM_ANCHORS[SPECTRUM_CROSSING_SEG]).0
             + spectrum_hsv(SPECTRUM_ANCHORS[SPECTRUM_CROSSING_SEG + 1]).0);
     let (mut best, mut near) = (0usize, f64::MAX);
-    for (i, &c) in SPECTRUM_LUT.iter().enumerate() {
-        let d = (spectrum_hsv(c).0 - mid).abs();
+    let mut i = 0;
+    while i < SPECTRUM_LUT.len() {
+        let d = (spectrum_hsv(SPECTRUM_LUT[i]).0 - mid).abs();
         if d < near {
             near = d;
             best = i;
         }
+        i += 1;
     }
     best as f32 / (SPECTRUM_LUT_LEN - 1) as f32
 }

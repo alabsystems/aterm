@@ -1695,6 +1695,10 @@ type BehindFn = dyn Fn(&str, u64) -> Behind + Send + Sync;
 type HoldFn = dyn Fn(&str, u64) -> bool + Send + Sync;
 /// Type a text into a tab, the step's word back ([`Acts::disk_resume`]): `(sid, text)`.
 type DiskResumeFn = dyn Fn(&str, &str) -> String + Send + Sync;
+/// Type or release the `disk-free@v1` line owed a tab, the step's word back ([`Acts::disk_free`]):
+/// `(sid, owed, unfit)`, `unfit` naming why the session may not be asked.
+type DiskFreeFn =
+    dyn Fn(&str, &crate::disk_board::AskOwed, Option<&'static str>) -> String + Send + Sync;
 type SnapshotFn = dyn Fn(&str) -> Option<Snapshot> + Send + Sync;
 /// The occupancy facts board as session `sid`'s host reads it ([`Acts::occupancy`]).
 type OccupancyFn =
@@ -1878,9 +1882,15 @@ pub(crate) enum HostNote {
         free_gib: u64,
         floor_gib: u64,
         hogs: Vec<String>,
+        /// What the ask to free space (`disk-free@v1`) did ([`disk_ask::owner_said`]).
+        asked: Option<String>,
     },
     /// A `[disk]` value aterm cannot read turns every removal off.
-    DiskLowCleanupOff { free_gib: u64, floor_gib: u64 },
+    DiskLowCleanupOff {
+        free_gib: u64,
+        floor_gib: u64,
+        asked: Option<String>,
+    },
     /// The volume is at or above the floor.
     DiskPlenty,
     /// `aterm.toml` does not say what the owner meant by a `[disk]` removal knob.
@@ -1894,6 +1904,8 @@ pub(crate) enum HostNote {
         hogs: Vec<String>,
         cause: crate::message_reporters::DiskFullCause,
         thresholds: aterm_agent::harness::disk::Thresholds,
+        /// What the ask to free space (`disk-free@v1`) did ([`disk_ask::owner_said`]).
+        asked: Option<String>,
     },
     /// The volume is back above the emergency line: the alert ends.
     DiskFullOver,
@@ -2170,6 +2182,8 @@ pub(crate) struct Acts {
     pub(crate) settle: Arc<SettleFn>,
     /// The disk resume ([`WorkerIdle::at_idle`]).
     pub(crate) disk_resume: Arc<DiskResumeFn>,
+    /// The ask to free disk space ([`WorkerIdle::at_idle`], `harness_disk_ask.rs`).
+    pub(crate) disk_free: Arc<DiskFreeFn>,
     /// The disk board the worker reads its session's episode from ([`disk_withholds`], [`disk_owed`]) and spends the resume on ([`disk_resume_stepped`]).
     pub(crate) disk_board: &'static Shelf,
     /// The jobs board the worker reads its agent's background calls from ([`WorkerIdle::background_jobs`], the stall canary's evidence).
@@ -3261,6 +3275,7 @@ impl IdleHost for WorkerIdle {
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_some_and(|at| at <= Instant::now())
             || (self.on() && disk_owed(self.hooks.acts.disk_board, &self.sid).is_some())
+            || (self.on() && disk_ask_owed(self.hooks.acts.disk_board, &self.sid).is_some())
             || (self.on()
                 && host_carries_relaunch(self.agent)
                 && with_kept_of(&self.kept, |k| k.carry_asked))
@@ -3792,6 +3807,22 @@ impl IdleHost for WorkerIdle {
             figure,
             read_at: mtime,
         })
+    }
+
+    /// The account this tab's Claude Code profile is signed in to now ([`IdleHost::login_account`]).
+    fn login_account(&self) -> Option<profile::AccountKey> {
+        if !accounts_for(self.agent) {
+            return None;
+        }
+        let snap = with_kept_of(&self.kept, |k| k.snapshot.clone())?;
+        let env = (self.hooks.acts.account_env)(snap.pid)?;
+        if !accounts::ProcessLogin::of_exec_env(&env)?.stored_login
+            || !self.settled(snap.pid, &snap.start, &snap.argv, &snap.cwd)
+        {
+            return None;
+        }
+        let seat = (self.hooks.acts.account_seat)()?;
+        profile::account_of(&env, &seat.home)
     }
 
     /// Whether the host started this worker as the session's Autopilot left Off ([`HostState::was_off`]).
@@ -4582,6 +4613,32 @@ impl WorkerIdle {
                 });
             }
         }
+        // Whether the ask to free space may seat this session, as of this turn break: the look
+        // nominates none the board names unfit, and one owed a line is released.
+        let unfit = self.disk_free_unfit();
+        disk_ask_fit(self.hooks.acts.disk_board, &self.sid, unfit);
+        if let Some(owed) = disk_ask_owed(self.hooks.acts.disk_board, &self.sid) {
+            let step = (self.hooks.acts.disk_free)(&self.sid, &owed, unfit);
+            if !step.starts_with("wait:") {
+                disk_ask_stepped(self.hooks.acts.disk_board, &self.sid);
+            }
+            aterm_log::info!(
+                "harness @{}: {} step={step}",
+                self.sid,
+                aterm_agent::harness::disk::ask::RULE_DISK_FREE
+            );
+            if step == "typed" {
+                return Some(HostStep {
+                    line: format!(
+                        "{} step={step}",
+                        aterm_agent::harness::disk::ask::RULE_DISK_FREE
+                    ),
+                    moved: true,
+                    typed: Some(aterm_agent::supervise::policy::turn_end::HostTurn::Fact),
+                    repeat: false,
+                });
+            }
+        }
         laps::lap("disk");
         if with_kept_of(&self.kept, |k| k.account.reset_owed.is_some())
             && let Some(seat) = (self.hooks.acts.account_seat)()
@@ -4796,6 +4853,21 @@ impl WorkerIdle {
     /// The session's Autopilot now.
     fn autopilot(&self) -> Autopilot {
         OffSessions::read(&self.hooks, self.switches.autopilot()).mode(&self.sid)
+    }
+
+    /// Why the session may not be asked to free disk space (`disk-free@v1`): its Autopilot is
+    /// off, its task finished or landed, or nobody gave it one. Landing is no bar: a landing
+    /// session still works in its checkout.
+    fn disk_free_unfit(&self) -> Option<&'static str> {
+        if self.autopilot() == Autopilot::Off {
+            Some("autopilot-off")
+        } else if self.finished() == Some(true) {
+            Some("finished")
+        } else if self.taskless() {
+            Some("taskless")
+        } else {
+            None
+        }
     }
 
     /// Why the disk resume is owed no longer, by the gates a continuation keeps.
@@ -13516,6 +13588,8 @@ fn live_acts(store: Store, sock: String) -> Acts {
     let fact_store = store.clone();
     let resume_sock = sock.clone();
     let disk_store = store.clone();
+    let free_sock = sock.clone();
+    let free_store = store.clone();
     let home = aterm_primer::home_dir();
     let place = home.clone().zip(harness_state());
     let exit_home = home.clone();
@@ -13603,6 +13677,9 @@ fn live_acts(store: Store, sock: String) -> Acts {
                     text,
                 ),
             )
+        }),
+        disk_free: Arc::new(move |sid, owed, unfit| {
+            disk_ask::act(&free_store, &free_sock, sid, owed, unfit)
         }),
         disk_board: &crate::disk_board::SHELF,
         jobs_board: &crate::vitals_jobs::BOARD,
@@ -15725,7 +15802,8 @@ fn disk_private_said(said: &Mutex<Option<String>>, line: Option<String>) -> Opti
     line
 }
 
-/// One look of the disk watch over `cwds` and `agents` (off the host thread).
+/// One look of the disk watch over `cwds` and `agents` (off the host thread), then the ask's
+/// step over what it left ([`disk_ask::after_look`]).
 fn disk_look(
     sids: &[String],
     cwds: &[std::path::PathBuf],
@@ -15733,6 +15811,21 @@ fn disk_look(
     seen: &[(String, aterm_phase::disk_full::DiskFull)],
     store: &Store,
     note: &NoteFn,
+) {
+    let mut looked = disk_ask::Looked::default();
+    disk_look_pass(sids, cwds, agents, seen, store, note, &mut looked);
+    disk_ask::after_look(&looked, sids, store, note);
+}
+
+/// The look's pass ([`disk_look`]): what it read for the ask goes in `looked`.
+fn disk_look_pass(
+    sids: &[String],
+    cwds: &[std::path::PathBuf],
+    agents: &[u32],
+    seen: &[(String, aterm_phase::disk_full::DiskFull)],
+    store: &Store,
+    note: &NoteFn,
+    looked: &mut disk_ask::Looked,
 ) {
     let (Some(home), Some(state)) = (aterm_primer::home_dir(), harness_state()) else {
         return;
@@ -15778,6 +15871,8 @@ fn disk_look(
     let thresholds = reading.thresholds_with(total, room);
     let level = thresholds.level(free, stats.as_ref().and_then(|s| s.files_free));
     let private = disk_private(&home);
+    looked.thresholds = Some(thresholds);
+    looked.private = private.is_some();
     disk_publish_look(
         &table,
         stats.as_ref().map(|r| crate::disk_board::VolumeRow {
@@ -15853,10 +15948,18 @@ fn disk_look(
         let cause = if let Some(private) = private {
             DiskFullCause::Private(private)
         } else if config.auto_free_gib == 0 {
+            looked.done = Some(aterm_agent::harness::disk::ask::Done::CleanupOff);
             DiskFullCause::CleanupOff {
                 fault: reading.off_by_fault,
             }
         } else {
+            // Only a volume truly out of inodes: free bytes at or above a `warn` set below the
+            // floor is no sign aterm is done.
+            looked.done = stats
+                .as_ref()
+                .and_then(|s| s.files_free)
+                .is_some_and(|f| f < thresholds.files_emergency)
+                .then_some(aterm_agent::harness::disk::ask::Done::Inodes);
             DiskFullCause::Inodes
         };
         disk_alert(
@@ -15915,6 +16018,7 @@ fn disk_look(
                 "harness disk watch: another instance's pass holds {}; this look runs none",
                 lock_path.display()
             );
+            looked.contended = true;
             disk_episode_after(board, level, 0, &[]);
             return;
         }
@@ -16030,6 +16134,7 @@ fn disk_look(
                 free_gib,
                 floor_gib: config.auto_free_gib,
                 hogs: Vec::new(),
+                asked: disk_ask::owner_said(),
             }),
         }
         return;
@@ -16238,6 +16343,7 @@ fn disk_look(
                 free_gib,
                 floor_gib: config.auto_free_gib,
                 hogs: glass,
+                asked: disk_ask::owner_said(),
             });
         }
     }
@@ -17064,6 +17170,7 @@ fn disk_alert(
             hogs: hogs.to_vec(),
             cause,
             thresholds: *thresholds,
+            asked: disk_ask::owner_said(),
         });
     } else if was {
         note(HostNote::DiskFullOver);
@@ -17082,6 +17189,30 @@ fn disk_owed(board: &Shelf, sid: &str) -> Option<String> {
         .owed
         .get(sid)
         .map(|(text, _)| text.clone())
+}
+
+/// The `disk-free@v1` line owed tab `sid`, if one is.
+fn disk_ask_owed(board: &Shelf, sid: &str) -> Option<crate::disk_board::AskOwed> {
+    board.board_lock().asks.get(sid).cloned()
+}
+
+/// Why tab `sid` may not be asked to free space now (`None`: it may), for the look's seats.
+fn disk_ask_fit(board: &Shelf, sid: &str, unfit: Option<&'static str>) {
+    let mut b = board.board_lock();
+    match unfit {
+        Some(why) => {
+            b.unfit.insert(sid.to_owned(), why);
+        }
+        None => {
+            b.unfit.remove(sid);
+        }
+    }
+}
+
+/// The ask's step at tab `sid` ended other than in a wait: owed no more until the lease names it
+/// again.
+fn disk_ask_stepped(board: &Shelf, sid: &str) {
+    board.board_lock().asks.remove(sid);
 }
 
 /// The resume's step at tab `sid` ended `typed` (or tries ran out): owed no more.
@@ -17189,6 +17320,7 @@ fn disk_look_without_pass(
             Some(HostNote::DiskLowCleanupOff {
                 free_gib,
                 floor_gib,
+                asked: disk_ask::owner_said(),
             })
         }
     }
@@ -17727,11 +17859,30 @@ fn spawn_activation_wake_on(
 fn activation_wake(host: &HostHandle) -> ActivationWake {
     let home = aterm_primer::home_dir();
     let news = host.clone();
+    let state_dir = harness_state();
+    let wake_state = state_dir.clone();
     let mut wake = ActivationWake::new(home.as_deref())
-        .with_word(harness_state().map(|state| upgrade_drive::word_marker(&state)))
+        .with_word(
+            state_dir
+                .as_ref()
+                .map(|state| upgrade_drive::word_marker(state)),
+        )
         .with_side(
-            harness_state().map(|state| accounts::Store::at(&state).wake_path()),
-            Box::new(move || news.note_accounts()),
+            state_dir
+                .as_ref()
+                .map(|state| accounts::Store::at(state).wake_path()),
+            Box::new(move || {
+                news.note_accounts();
+                let now = aterm_time::unix_secs()
+                    .and_then(|n| i64::try_from(n).ok())
+                    .unwrap_or(0);
+                if wake_state.as_deref().is_some_and(|dir| {
+                    aterm_agent::harness::accounts_sync::any_pending_pin(dir, now)
+                }) && let Some(trigger) = news.shared.wake.get()
+                {
+                    trigger.pull();
+                }
+            }),
         );
     for secret_mark in [
         aterm_types::dirs::aterm_config_dir().map(|d| d.join("secrets/state.toml")),
@@ -18007,6 +18158,7 @@ impl Acts {
             resume: Arc::new(|_, _, _| "current".to_string()),
             settle: Arc::new(|_| "current".to_string()),
             disk_resume: Arc::new(|_, _| "wait:inert".to_string()),
+            disk_free: Arc::new(|_, _, _| "wait:inert".to_string()),
             disk_board: {
                 static INERT: Shelf = Shelf::new();
                 &INERT
@@ -18320,6 +18472,9 @@ impl HostHandle {
             .running
     }
 }
+
+#[path = "harness_disk_ask.rs"]
+mod disk_ask;
 
 #[cfg(test)]
 #[path = "harness_host_tests.rs"]

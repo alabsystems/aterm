@@ -246,8 +246,9 @@ const LEAP_SPREAD: f32 = 1.4;
 /// The night arc's hue, degrees, for a hue `h`.
 #[inline]
 #[must_use]
-pub(crate) fn night_hue(h: f32) -> f32 {
-    let u = (h - 90.0).rem_euclid(360.0);
+pub(crate) const fn night_hue(h: f32) -> f32 {
+    let r = (h - 90.0) % 360.0;
+    let u = if r < 0.0 { r + 360.0 } else { r };
     if u <= 180.0 {
         195.0 + 75.0 * u / 180.0
     } else if u <= 300.0 {
@@ -260,7 +261,7 @@ pub(crate) fn night_hue(h: f32) -> f32 {
 /// `rgb` on the night arc ([`night_hue`]), its saturation and value kept.
 #[inline]
 #[must_use]
-pub(crate) fn night_rgb(rgb: u32) -> u32 {
+pub(crate) const fn night_rgb(rgb: u32) -> u32 {
     let (h, s, v) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
     crate::color_math::hsv2rgb(night_hue(h), s, v)
 }

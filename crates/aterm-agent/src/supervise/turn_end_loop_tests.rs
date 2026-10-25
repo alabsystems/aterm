@@ -29,6 +29,9 @@ mod seed_matrix;
 #[path = "tap_clock_loop_tests.rs"]
 mod tap_clock_loop;
 
+#[path = "login_moved_loop_tests.rs"]
+mod login_moved_loop;
+
 #[path = "log_wake_loop_tests.rs"]
 mod log_wake_loop;
 
@@ -10488,10 +10491,12 @@ fn the_wait_places_a_reset_across_a_dst_change_with_the_offset_there() {
 
 /// A host that only listens for the canary's ladder, and answers its jobs
 /// reading with `evidence` (`Unknown` by default: no reading), or with `then`
-/// once it was told a call that made no progress.
+/// once it was told a call that made no progress. `raised` keeps each
+/// exception it was told, whole.
 #[derive(Debug, Default)]
 struct LadderHost {
     told: std::sync::Mutex<Vec<String>>,
+    raised: std::sync::Mutex<Vec<crate::supervise::policy::exception::Exception>>,
     evidence: crate::supervise::background::BackgroundEvidence,
     then: Option<crate::supervise::background::BackgroundEvidence>,
 }
@@ -10511,6 +10516,7 @@ impl IdleHost for LadderHost {
             "exception:{}",
             standing.map_or("none", |e| e.kind.word())
         ));
+        self.raised.lock().unwrap().extend(standing.cloned());
     }
     fn stall_unread(&self, stall: Option<StallSeen>) {
         self.told.lock().unwrap().push(match stall {
@@ -11402,6 +11408,146 @@ fn a_dialog_no_reader_names_climbs_to_a_record_and_a_line_and_its_end_withdraws_
         "{:?}",
         heard.noted
     );
+}
+
+/// THE DIALOG CANARY NAMES CLAUDE CODE'S OWN SETTINGS PANEL (2026-10-19: a tab stood on the
+/// panel's Status tab in a weekly-limit wait, opened by no write of the harness's (INFERRED: a
+/// person's `/status`), and the canary called it "a dialog this build does not read": a STALLED
+/// record and an `aterm.log` error at 30 min, though `aterm_phase::settings_panel` reads that
+/// panel). The canary still climbs over the panel, since nothing else notes one left open in an
+/// unattended tab, but in words that name it: no record of an unread screen reaches the host, and
+/// the third rung is [`Exception::settings_panel`], whose words fit the digest. The Status rows
+/// are the tail that tab's STUCK note kept, verbatim; the rule and header above them are the
+/// measured 2.1.301 panel's, in both renderers. The control is the same rows with no panel around
+/// them: a dialog no reader names still climbs in its own words, and the canary types nothing
+/// either way.
+#[test]
+fn the_dialog_canary_names_claude_codes_own_settings_panel() {
+    use super::super::wall_memory::{SETTINGS_PANEL, StuckRung, UNREAD_DIALOG};
+    use crate::supervise::fx::{ClockSource, Fx, VirtualClock};
+    use crate::supervise::policy::exception::Exception;
+    use aterm_messages::need::{REASON_CAP, Reason, STEP_CAP, Step};
+    use aterm_phase::prompt::fixtures as fx;
+    const STATUS_TAIL: [&str; 4] = [
+        "Model:             claude-opus-5-5",
+        "MCP servers:       1 connected, 1 disabled · /mcp",
+        "Setting sources:   User settings, Project local settings",
+        "Auto mode server:  Disabled",
+    ];
+    let words = Exception::settings_panel();
+    assert!(
+        words.why.chars().count() <= REASON_CAP
+            && Reason::new(&words.why).fault().is_none()
+            && words.action.chars().count() <= STEP_CAP
+            && Step::new(&words.action).fault().is_none(),
+        "the digest's words: {words:?}"
+    );
+    let status_tab = |column: usize| {
+        let pad = " ".repeat(column);
+        let mut rows: Vec<String> = STATUS_TAIL.iter().map(|r| format!("{pad}{r}")).collect();
+        rows.push(String::new());
+        rows.push(format!("{pad}Esc to cancel"));
+        rows
+    };
+    let panel = |measured: &str, column: usize| {
+        let mut rows = fx::screen(measured);
+        let header = rows
+            .iter()
+            .position(|r| r.trim_start().starts_with("Settings  Status"))
+            .expect("the measured header");
+        rows.truncate(header + 1);
+        for row in &mut rows {
+            if row.trim_end() == "❯ /usage" {
+                *row = "❯ /status".to_string();
+            }
+        }
+        rows.push(String::new());
+        rows.extend(status_tab(column));
+        rows
+    };
+    let ladder = |rows: Vec<String>| {
+        let unit = Duration::from_secs(30 * 60);
+        let host = Arc::new(LadderHost::default());
+        let mut m = Mock::new(vec![busy_screen()]);
+        m.title = Some("✳ Claude Code".to_string());
+        m.program = "claude";
+        let mut s = session(&mut m, None);
+        s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+        s.set_fx(Fx::over(ClockSource::Virtual(Arc::new(VirtualClock::new(
+            Instant::now(),
+            1_790_000_000_000,
+        )))));
+        s.setup.stuck_after = unit;
+        let shown = Screen {
+            rows,
+            ..Screen::default()
+        };
+        let mut heard = Heard::default();
+        s.dialog_note(&shown, &mut heard);
+        for _ in 0..7 {
+            s.fx.sleep(unit / 3);
+            s.dialog_note(&shown, &mut heard);
+        }
+        let rung = s.stuck_rung;
+        drop(s);
+        let told = host.told.lock().unwrap().clone();
+        let raised = host.raised.lock().unwrap().clone();
+        let typed = ["turn", "key", "send"].map(|verb| count(&m, verb));
+        (rung, heard.noted, told, raised, typed.iter().sum::<usize>())
+    };
+    let rungs = |noted: &[String]| -> Vec<String> {
+        noted
+            .iter()
+            .filter(|l| l.starts_with("STUCK") || l.starts_with("STALLED"))
+            .cloned()
+            .collect()
+    };
+    for (renderer, measured, column) in [
+        (
+            "fullscreen",
+            fx::USAGE_HEADER_READINGS_FULLSCREEN_2_1_301,
+            3,
+        ),
+        ("inline", fx::USAGE_HEADER_READINGS_INLINE_2_1_301, 2),
+    ] {
+        let rows = panel(measured, column);
+        assert!(
+            aterm_phase::settings_panel(&rows).is_some(),
+            "{renderer}: the panel's reader names it\n{rows:#?}"
+        );
+        let (rung, noted, told, raised, typed) = ladder(rows);
+        assert_eq!(rung, StuckRung::Raised, "{renderer}: {noted:#?}");
+        let said = rungs(&noted);
+        assert!(
+            said.len() == 2
+                && said
+                    .iter()
+                    .all(|l| l.contains(SETTINGS_PANEL) && !l.contains(UNREAD_DIALOG)),
+            "{renderer}: STUCK and STALLED name the panel: {noted:#?}"
+        );
+        assert_eq!(
+            told,
+            ["exception:dialog"],
+            "{renderer}: no record of an unread screen reaches the host"
+        );
+        assert_eq!(raised, [Exception::settings_panel()], "{renderer}");
+        assert_eq!(typed, 0, "{renderer}: the canary types nothing");
+        let bare = status_tab(column);
+        assert_eq!(aterm_phase::settings_panel(&bare), None, "{renderer}");
+        let (rung, noted, told, raised, typed) = ladder(bare);
+        assert_eq!(rung, StuckRung::Raised, "{renderer}: {noted:#?}");
+        let said = rungs(&noted);
+        assert!(
+            said.len() == 2
+                && said
+                    .iter()
+                    .all(|l| l.contains(UNREAD_DIALOG) && !l.contains(SETTINGS_PANEL)),
+            "{renderer}: the control climbs in its own words: {noted:#?}"
+        );
+        assert_eq!(told, ["unread:some", "exception:dialog"], "{renderer}");
+        assert_eq!(raised, [Exception::dialog()], "{renderer}");
+        assert_eq!(typed, 0, "{renderer}: the canary types nothing");
+    }
 }
 
 /// A host whose probe of the session's repository answers from a script
@@ -16816,6 +16962,7 @@ fn a_bucket_its_rate_limit_type_named_is_that_bucket_in_the_ledgers_wall() {
             reset: Some("4pm (America/Los_Angeles)".to_string()),
             reset_unix: Some(RESET),
             tap_unix: None,
+            login: None,
             kind: named,
             judged_ms: None,
             retry_ms: None,
@@ -16952,6 +17099,7 @@ fn an_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
                 reset: wall.reset.clone(),
                 reset_unix: Some(RESET),
                 tap_unix: None,
+                login: None,
                 kind: Some(wall.kind),
                 judged_ms: None,
                 retry_ms: None,
@@ -19563,6 +19711,7 @@ fn a_limits_try_at_a_bucket_is_the_try_a_successor_backs_off_from() {
             reset: wall.reset.clone(),
             reset_unix: Some(RESET),
             tap_unix: None,
+            login: None,
             kind: Some(wall.kind),
             judged_ms: None,
             retry_ms: None,

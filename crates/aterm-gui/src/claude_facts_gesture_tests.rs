@@ -402,6 +402,111 @@ fn hovering_a_fact_moves_no_fact() {
     );
 }
 
+/// THE POINTER ON ANY PART OF THE ACCOUNT UNIT LIGHTS THE WHOLE UNIT: on the week as on the
+/// email, the unit is one fact on the glass, its mark and both joins take the lit accent, one
+/// underline lies under the whole of it, and no other fact changes.
+#[test]
+fn hovering_any_part_of_the_account_lights_the_whole_unit() {
+    let (mut app, wid, session, _reader) = wider_app();
+    {
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.note_foreground_group(PGID);
+        assert!(timeline.set_claude_footer(
+            PGID,
+            None,
+            Some(aterm_agent::harness::footer::FooterFacts {
+                model: Some("Opus 5.5".into()),
+                effort: Some("xhigh".into()),
+                path: Some("~/aterm".into()),
+                subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
+                    email: Some("owner@example.com".into()),
+                    plan: Some("Max 20x".into()),
+                    weekly: Some("weekly 61% left".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        ));
+    }
+    draw_claude(&app, session, BYPASS);
+    frame(&mut app, wid);
+    let row = footer_row(&app, wid);
+    let account = fact_hit(&app, wid, Fact::Account);
+    assert_eq!(
+        glyphs(&app, wid, &account),
+        "\u{2386}owner@example.com\u{b7}Max20x\u{b7}weekly61%left",
+        "one fact from the mark to the week's last word"
+    );
+    assert_eq!(
+        app.windows[&wid]
+            .claude_lights
+            .fact_hits
+            .iter()
+            .filter(|h| h.fact == Fact::Account)
+            .count(),
+        1
+    );
+    // Each glyph of `fact`: its column, its char, its ink, and whether it is underlined.
+    let glyph_cells = |app: &App, fact: Fact| -> Vec<(usize, char, [u8; 3], bool)> {
+        let hit = fact_hit(app, wid, fact);
+        let cells = &app.windows[&wid].input_scratch.cells[row];
+        (hit.cols.0..hit.cols.1)
+            .filter(|&c| cells[c].ch != ' ')
+            .map(|c| {
+                let cell = cells[c];
+                (
+                    c,
+                    cell.ch,
+                    cell.fg,
+                    cell.underline == UnderlineStyle::Single,
+                )
+            })
+            .collect()
+    };
+    let marks = |glyphs: &[(usize, char, [u8; 3], bool)]| -> Vec<(usize, [u8; 3])> {
+        glyphs
+            .iter()
+            .filter(|g| matches!(g.1, '\u{2386}' | '\u{b7}'))
+            .map(|g| (g.0, g.2))
+            .collect()
+    };
+    let rest = glyph_cells(&app, Fact::Account);
+    let model_rest = glyph_cells(&app, Fact::Model);
+    assert!(rest.iter().all(|g| !g.3), "CONTROL: nothing lit at rest");
+    assert_eq!(marks(&rest).len(), 3, "the account's mark and two joins");
+    for col in [account.cols.0, account.cols.1 - 1] {
+        let (x, y) = px_of(&app, wid, (account.frame_row, col));
+        app.on_cursor_moved(wid, x, y);
+        frame(&mut app, wid);
+        assert_eq!(
+            app.windows[&wid].claude_lights.hover,
+            Some((session, Target::Fact(Fact::Account))),
+            "{col}"
+        );
+        let lit = glyph_cells(&app, Fact::Account);
+        let (lit_marks, rest_marks) = (marks(&lit), marks(&rest));
+        assert!(
+            lit_marks
+                .iter()
+                .zip(&rest_marks)
+                .all(|(l, r)| l.0 == r.0 && l.1 != r.1 && l.1 == lit_marks[0].1),
+            "{col}: the mark and every join take the lit accent: {lit_marks:?}, at rest {rest_marks:?}"
+        );
+        // The underline lies under the ink, so an end glyph nudged off its cell's middle may
+        // stand past it; every glyph between, the joins among them, is under it.
+        assert!(
+            lit[1..lit.len() - 1].iter().all(|g| g.3),
+            "{col}: the whole unit is underlined: {lit:?}"
+        );
+        assert_eq!(
+            glyph_cells(&app, Fact::Model),
+            model_rest,
+            "{col}: no other fact"
+        );
+    }
+}
+
 #[test]
 fn any_other_button_on_a_fact_reaches_no_program() {
     let (mut app, wid, session, mut reader) = app();

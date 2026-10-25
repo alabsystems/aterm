@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 
 use super::access::ScrollbackAccess;
-use super::{Line, Scrollback, ScrollbackError, WatermarkLevel};
+use super::{ImageSpan, Line, Scrollback, ScrollbackError, WatermarkLevel};
 
 /// Iterator over scrollback storage lines (oldest to newest).
 pub struct ScrollbackStorageIter<'a> {
@@ -91,6 +91,30 @@ macro_rules! dispatch {
 }
 
 impl ScrollbackStorage {
+    /// Whether retained history holds an image accepted by `selected`.
+    /// Compressed tiers contain no image spans.
+    #[must_use]
+    pub fn any_image(&self, selected: &dyn Fn(&ImageSpan) -> bool) -> bool {
+        match self {
+            Self::Memory(sb) => sb.hot.any_image(selected),
+        }
+    }
+
+    /// Retains accepted image spans without changing history's text, order or retention horizon.
+    /// Returns whether any image span was removed.
+    pub fn retain_images(&mut self, keep: &mut dyn FnMut(&ImageSpan) -> bool) -> bool {
+        match self {
+            Self::Memory(sb) => {
+                let changed = sb.hot.retain_images(keep);
+                if changed {
+                    sb.sync_accounting();
+                    sb.assert_bytes_used_invariant();
+                }
+                changed
+            }
+        }
+    }
+
     /// Get the total number of lines.
     #[must_use]
     #[inline]

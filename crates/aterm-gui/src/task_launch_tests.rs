@@ -786,3 +786,135 @@ fn a_pooled_worker_runs_on_its_rows_login_alone() {
         "a relative GROK_HOME"
     );
 }
+
+#[test]
+fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_homes() {
+    use aterm_agent::harness::accounts::{self, Cli};
+    use aterm_agent::harness::accounts_pool::Seat;
+    use aterm_agent::harness::codex_app_login::Usage;
+    use aterm_agent::harness::worker::Starter;
+
+    const NOW: i64 = 1_792_700_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().canonicalize().expect("canonical");
+    let (cfg, state, home) = (root.join("cfg"), root.join("state"), root.join("home"));
+    for dir in [&cfg, &state, &home] {
+        std::fs::create_dir_all(dir).expect("dir");
+    }
+    let c1 = root.join("logins/codex/codex-1");
+    let c2 = root.join("logins/codex/codex-2");
+    for dir in [&c1, &c2] {
+        std::fs::create_dir_all(dir).expect("login dir");
+        std::fs::write(dir.join("auth.json"), "{}").expect("auth");
+    }
+    std::fs::write(
+        cfg.join("accounts-codex.toml"),
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+             [[account]]\nlabel = \"codex-1\"\nclass = \"dedicated\"\ndir = \"{}\"\n\n\
+             [[account]]\nlabel = \"codex-2\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+            c1.display(),
+            c2.display()
+        ),
+    )
+    .expect("roster");
+    let seat = Seat {
+        config_dir: &cfg,
+        state: &state,
+        home: &home,
+        now: NOW,
+    };
+    let no_usage = |_: Cli, _: &Path, _: i64| -> Option<Usage> { None };
+
+    // Wall `main` and `codex-1` so the pool's next usable row is `codex-2`.
+    let mut note = None;
+    seat.store(Cli::Codex)
+        .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |s| {
+            let mut ev = accounts::note_wall(s, "main", "seven_day", Some(NOW + 3600), NOW, NOW);
+            ev.extend(accounts::note_wall(
+                s,
+                "codex-1",
+                "seven_day",
+                Some(NOW + 3600),
+                NOW,
+                NOW,
+            ));
+            Ok(ev)
+        })
+        .expect("wall main + codex-1");
+
+    let starter_on = |pairs: &[(&str, &str)]| Starter {
+        exe: PathBuf::from("/opt/twin/codex"),
+        env: pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect(),
+        args: Ok(Vec::new()),
+        unset: Vec::new(),
+    };
+    let c1_str = c1.to_string_lossy().into_owned();
+    let c2_str = c2.to_string_lossy().into_owned();
+
+    // 1. Manager running on pooled row `codex-1` spawns a child worker -> rotates to `codex-2`
+    //    with a single replaced `CODEX_HOME` entry.
+    let rotated = super::pooled_starter_in(
+        starter_on(&[("CODEX_HOME", &c1_str)]),
+        Cli::Codex,
+        &seat,
+        &no_usage,
+        1,
+    );
+    assert_eq!(rotated.env, vec![("CODEX_HOME".to_string(), c2_str)]);
+
+    // 2. When `main` (default home, `dir = None`) is pinned, a starter carrying `codex-1` drops
+    //    `CODEX_HOME` completely so the child worker runs in the default home.
+    seat.store(Cli::Codex)
+        .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |s| {
+            s.active = Some("main".to_string());
+            s.pinned = true;
+            s.proven = true;
+            Ok(Vec::new())
+        })
+        .expect("pin main");
+    let to_main = super::pooled_starter_in(
+        starter_on(&[("CODEX_HOME", &c1_str)]),
+        Cli::Codex,
+        &seat,
+        &no_usage,
+        2,
+    );
+    assert!(to_main.env.is_empty(), "{:?}", to_main.env);
+
+    // 3. CONTROL: a custom scratch `CODEX_HOME` outside the bound roster, a non-default CLI home
+    //    (`GROK_HOME`), or an explicit credential override (`CODEX_API_KEY`, with or without
+    //    `CODEX_HOME`) is left untouched without reading usage.
+    let panic_read =
+        |_: Cli, _: &Path, _: i64| -> Option<Usage> { panic!("custom home must not read usage") };
+    let custom_dir = root.join("custom-scratch-codex").display().to_string();
+    let custom = starter_on(&[("CODEX_HOME", &custom_dir)]);
+    assert_eq!(
+        super::pooled_starter_in(custom.clone(), Cli::Codex, &seat, &panic_read, 3),
+        custom
+    );
+    let overridden = starter_on(&[("CODEX_HOME", &c1_str), ("CODEX_API_KEY", "sk-override")]);
+    assert_eq!(
+        super::pooled_starter_in(overridden.clone(), Cli::Codex, &seat, &panic_read, 4),
+        overridden
+    );
+    let default_overridden = starter_on(&[("CODEX_API_KEY", "sk-override")]);
+    assert_eq!(
+        super::pooled_starter_in(
+            default_overridden.clone(),
+            Cli::Codex,
+            &seat,
+            &panic_read,
+            5,
+        ),
+        default_overridden
+    );
+    let custom_grok = starter_on(&[("GROK_HOME", "/g/custom")]);
+    assert_eq!(
+        super::pooled_starter_in(custom_grok.clone(), Cli::Grok, &seat, &panic_read, 6),
+        custom_grok
+    );
+}

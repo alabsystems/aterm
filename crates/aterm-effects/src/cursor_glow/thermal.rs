@@ -54,6 +54,7 @@ impl CursorGlow {
 
     /// The forge cursor fill for the fire style, always warm metal on the black-body ramp: a glowing ember at rest, climbing toward the hot end with sustained momentum, inside the page's [`ForgeBand`].
     #[inline]
+    #[must_use]
     pub fn forge_fill(&self) -> Option<u32> {
         let band = self
             .forge_band

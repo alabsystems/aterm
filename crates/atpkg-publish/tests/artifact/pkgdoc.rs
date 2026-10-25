@@ -303,3 +303,47 @@ fn the_writer_refuses_an_exposed_shell_fresh_or_merged() {
     pkgdoc::merge(base.bytes().to_vec(), &header(), &x86).expect("and merge");
     pkgdoc::check_exposes("ay", &header().exposes).expect("tool names pass the gate");
 }
+
+/// NO PACK SHADOWS A VENDOR'S TOOL: a client's `bin/` holds one shim per name, so a plain
+/// pack or a harness exposing `claude`, `muse`, `agy`, `grok` or `kimi` (in any case) is
+/// refused, fresh or merged; the vendor program's own ALab pack (codex) keeps its name, and a
+/// harness's own name passes.
+#[test]
+fn the_writer_refuses_a_vendor_rows_tool_for_any_other_program() {
+    let r = row(AARCH64_APPLE_DARWIN, Kind::Binary);
+    let as_program = |program: &str, names: &[&str]| Header {
+        program: program.to_string(),
+        exposes: names.iter().map(|n| (*n).to_string()).collect(),
+        ..header()
+    };
+    for (program, tool) in [
+        ("claude-code-alab", "claude"),
+        ("muse-alab", "muse"),
+        ("agy-alab", "agy"),
+        ("grok-alab", "grok"),
+        ("kimi-alab", "kimi"),
+        ("ay", "codex"),
+        ("ay", "Claude"),
+    ] {
+        let err = pkgdoc::fresh(&as_program(program, &[tool]), &r)
+            .expect_err("a vendor's tool is refused");
+        assert!(
+            err.to_string()
+                .contains(&format!("{program} exposes `{tool}`"))
+                && err.to_string().contains("a vendor row shims that name"),
+            "{err}"
+        );
+        assert_eq!(err.exit_code(), 1);
+    }
+    let base = pkgdoc::fresh(&as_program("ay", &["ay"]), &r).expect("base");
+    let err = pkgdoc::merge(
+        base.bytes().to_vec(),
+        &as_program("ay", &["ay", "agy"]),
+        &row(X86_64_APPLE_DARWIN, Kind::Binary),
+    )
+    .expect_err("never merged in either");
+    assert!(err.to_string().contains("`agy` (agy)"), "{err}");
+    pkgdoc::check_exposes("codex", &["codex".to_string()]).expect("codex's own ALab pack");
+    pkgdoc::check_exposes("claude-code-alab", &["claude-alab".to_string()])
+        .expect("a harness's own tool");
+}

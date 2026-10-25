@@ -299,28 +299,56 @@ fn spawn_exchange(link: DriveLink, head: &str, task: &[u8]) -> io::Result<ExitCo
     stream.write_all(b"\n")?;
     stream.flush()?;
     let mut reader = BufReader::new(stream);
-    let mut answer = read_frame_answer(&mut reader).map_err(|e| closed(&label, e))?;
+    let mut answer = read_frame_answer(&mut reader).map_err(|e| closed(&label, head, e))?;
     if answer != go {
         return print_frame_answer(&answer);
     }
     reader.get_mut().write_all(task)?;
     reader.get_mut().flush()?;
     while answer == go {
-        answer = read_frame_answer(&mut reader).map_err(|e| closed(&label, e))?;
+        answer = read_frame_answer(&mut reader).map_err(|e| closed(&label, head, e))?;
     }
     print_frame_answer(&answer)
 }
 
-/// A connection the peer closed before it answered, said as the peer's.
-fn closed(label: &str, e: io::Error) -> io::Error {
-    if e.kind() == io::ErrorKind::UnexpectedEof {
-        io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            format!("{label} closed the drive connection without answering"),
-        )
-    } else {
-        e
+/// A connection the peer closed or cut before it answered `request`, said as the peer's: what
+/// cuts one, and how to learn whether what it sent landed.
+fn closed(label: &str, request: &str, e: io::Error) -> io::Error {
+    use io::ErrorKind::{ConnectionAborted, ConnectionReset, UnexpectedEof};
+    if !matches!(
+        e.kind(),
+        UnexpectedEof | ConnectionReset | ConnectionAborted
+    ) {
+        return e;
     }
+    let mut words = request.split_whitespace();
+    let (verb, session) = match (words.next(), words.next()) {
+        (Some(sel), Some(verb)) if sel.starts_with('@') => (verb, Some(sel.to_owned())),
+        (Some("hold"), sid) => ("hold", sid.map(|sid| format!("@{sid}"))),
+        (Some(verb), _) => (verb, None),
+        (None, _) => ("request", None),
+    };
+    let landed = match (verb, session) {
+        ("turn" | "key" | "send" | "hold" | "close", Some(session)) => format!(
+            ", so what this `{verb}` sent may have landed: `aterm ctl --host {label} {session} \
+             status` shows whether it did, or why it is refused"
+        ),
+        ("spawn", _) => format!(
+            ", so the worker may have started: `aterm ctl --host {label} survey` lists it, or \
+             says why it is refused"
+        ),
+        (_, session) => {
+            let at = session.map_or_else(String::new, |session| format!("{session} "));
+            format!(": `aterm ctl --host {label} {at}{verb} …` again says which")
+        }
+    };
+    io::Error::new(
+        e.kind(),
+        format!(
+            "{label} cut the drive connection before it answered (its person took back this \
+             Mac's grant, or its aterm stopped or restarted){landed}"
+        ),
+    )
 }
 
 /// One request over `link` and its answer, framed as on one Mac: an `ERR`
@@ -333,9 +361,12 @@ fn exchange(link: DriveLink, request: &str, verb: &str) -> io::Result<ExitCode> 
     stream.flush()?;
     let mut reader = BufReader::new(stream);
     let mut status = String::new();
-    if read_status_line(&mut reader, &mut status)? == 0 {
+    let read =
+        read_status_line(&mut reader, &mut status).map_err(|e| closed(&label, request, e))?;
+    if read == 0 {
         return Err(closed(
             &label,
+            request,
             io::Error::from(io::ErrorKind::UnexpectedEof),
         ));
     }
@@ -355,7 +386,7 @@ fn exchange(link: DriveLink, request: &str, verb: &str) -> io::Result<ExitCode> 
         } else if count == 0 {
             stderr_line(&format!("{status} ({verb}: no results)"))?;
         }
-        print_payload(&mut reader, count)?;
+        print_payload(&mut reader, count).map_err(|e| closed(&label, request, e))?;
     } else if bytes_payload(verb, request) {
         return Err(io::Error::other(format!(
             "{label} answered `{verb}` with a body no drive carries"

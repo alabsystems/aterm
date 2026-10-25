@@ -378,11 +378,10 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
         lights.border_toggles.extend_from_slice(drew);
         lights.drawn_chip(3, 0, |row| Some(row) == covered)
     };
-    let off = HarnessSwitch::Off(SwitchOff::Session);
+    let off = HarnessSwitch::Off(SwitchOff::Master);
     for face in [
         off,
         HarnessSwitch::Off(SwitchOff::Agent(Program::Agy)),
-        HarnessSwitch::Off(SwitchOff::Master),
         HarnessSwitch::Turning,
     ] {
         assert_eq!(
@@ -397,11 +396,13 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
         Drawn::NoRule,
         "no switch drawn: a tab behind"
     );
-    assert_eq!(
-        read(&[switch(Program::Agy, HarnessSwitch::On, 3)], None),
-        Drawn::NoRule,
-        "an on switch leaves no footer bare"
-    );
+    for face in [HarnessSwitch::On, HarnessSwitch::TurningOff] {
+        assert_eq!(
+            read(&[switch(Program::Agy, face, 3)], None),
+            Drawn::NoRule,
+            "{face:?}: a switch the harness is on under leaves no footer bare"
+        );
+    }
     for program in [Program::Claude, Program::Muse] {
         assert_eq!(
             read(&[switch(program, off, 3)], None),

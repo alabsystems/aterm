@@ -236,8 +236,8 @@ impl RomMaster {
     /// Scanline `y` of `glyph` (low 24 bits valid).
     #[must_use]
     #[inline]
-    pub fn row(&self, glyph: usize, y: usize) -> u32 {
-        self.rows[glyph * MASTER_H + y]
+    pub const fn row(&self, glyph: usize, y: usize) -> u32 {
+        self.rows.as_slice()[glyph * MASTER_H + y]
     }
 }
 
@@ -267,7 +267,7 @@ pub(crate) fn decorative_master() -> &'static RomMaster {
 /// Returns the embedded 8×8 bitmap for a supported terminal-output character.
 #[must_use]
 #[inline]
-pub fn material_bitmap(c: char) -> Option<[u8; 8]> {
+pub const fn material_bitmap(c: char) -> Option<[u8; 8]> {
     super::bitmap_font::bitmap(c)
 }
 
@@ -320,8 +320,8 @@ pub fn reauthor_material_glyph(master: &mut RomMaster, slot: usize, ch: Option<c
 
 /// Set pixel `(x, y)` if in bounds.
 #[inline]
-fn plot(glyph: &mut [u32], x: i32, y: i32) {
-    if (0..MASTER_W as i32).contains(&x) && (0..MASTER_H as i32).contains(&y) {
+const fn plot(glyph: &mut [u32], x: i32, y: i32) {
+    if x >= 0 && x < MASTER_W as i32 && y >= 0 && y < MASTER_H as i32 {
         glyph[y as usize] |= 1 << x;
     }
 }
@@ -329,15 +329,19 @@ fn plot(glyph: &mut [u32], x: i32, y: i32) {
 /// Stamp a `THICK×THICK` square centered-ish on `(x, y)` (offset −1 keeps the
 /// stroke visually centered on the authored line).
 #[inline]
-fn stamp_thick(glyph: &mut [u32], x: i32, y: i32) {
-    for dy in -1..THICK - 1 {
-        for dx in -1..THICK - 1 {
+const fn stamp_thick(glyph: &mut [u32], x: i32, y: i32) {
+    let mut dy = -1;
+    while dy < THICK - 1 {
+        let mut dx = -1;
+        while dx < THICK - 1 {
             plot(glyph, x + dx, y + dy);
+            dx += 1;
         }
+        dy += 1;
     }
 }
 
-fn stamp_line(glyph: &mut [u32], x0: i32, y0: i32, x1: i32, y1: i32) {
+const fn stamp_line(glyph: &mut [u32], x0: i32, y0: i32, x1: i32, y1: i32) {
     let (dx, dy) = ((x1 - x0).abs(), (y1 - y0).abs());
     let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
     let mut err = dx - dy;
@@ -359,13 +363,17 @@ fn stamp_line(glyph: &mut [u32], x0: i32, y0: i32, x1: i32, y1: i32) {
     }
 }
 
-fn stamp_dot(glyph: &mut [u32], x: i32, y: i32) {
-    for dy in -2..=2 {
-        for dx in -2..=2 {
+const fn stamp_dot(glyph: &mut [u32], x: i32, y: i32) {
+    let mut dy = -2;
+    while dy <= 2 {
+        let mut dx = -2;
+        while dx <= 2 {
             if dx * dx + dy * dy <= DOT_R2 {
                 plot(glyph, x + dx, y + dy);
             }
+            dx += 1;
         }
+        dy += 1;
     }
 }
 

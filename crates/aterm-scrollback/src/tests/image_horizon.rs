@@ -34,6 +34,69 @@ fn store(hot: usize) -> Scrollback {
 }
 
 #[test]
+fn retaining_hot_images_preserves_order_and_reconciles_payload_accounting() {
+    let image = placement(4, 2, 4096);
+    let mut line = Line::from("kept text");
+    line.set_images(
+        (0..4)
+            .map(|row| ImageSpan::new(0, 2, row, 0, Arc::clone(&image)))
+            .collect(),
+    );
+    let mut storage: ScrollbackStorage = store(16).into();
+    storage.push_line(line).unwrap();
+    assert_eq!(Arc::strong_count(&image), 5);
+    let before = storage.total_memory_used();
+    let budget = storage.budgeted_memory_used();
+    let pointer = storage
+        .get_line(0)
+        .unwrap()
+        .unwrap()
+        .images()
+        .unwrap()
+        .as_ptr();
+    assert!(!storage.retain_images(&mut |_| true));
+    assert_eq!(storage.total_memory_used(), before);
+    assert_eq!(storage.budgeted_memory_used(), budget);
+    assert_eq!(
+        storage
+            .get_line(0)
+            .unwrap()
+            .unwrap()
+            .images()
+            .unwrap()
+            .as_ptr(),
+        pointer,
+        "a no-match delete keeps the allocation"
+    );
+    assert!(storage.retain_images(&mut |span| span.image_row % 2 == 1));
+    assert_eq!(Arc::strong_count(&image), 3);
+    let line = storage.get_line(0).unwrap().unwrap();
+    assert_eq!(line.to_string(), "kept text");
+    assert_eq!(
+        line.images()
+            .unwrap()
+            .iter()
+            .map(|span| span.image_row)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    drop(line);
+    assert!(storage.total_memory_used() < before);
+    assert!(storage.budgeted_memory_used() < budget);
+    assert!(storage.retain_images(&mut |_| false));
+    assert_eq!(
+        Arc::strong_count(&image),
+        1,
+        "all history payload references were released"
+    );
+    assert!(!storage.any_image(&|_| true));
+    let ScrollbackStorage::Memory(sb) = &storage;
+    sb.assert_bytes_used_invariant();
+    assert_eq!(sb.bytes_used, sb.recompute_total_memory_used());
+    assert_eq!(sb.budgeted_bytes, sb.recompute_budgeted_bytes());
+}
+
+#[test]
 fn a_picture_is_retained_for_exactly_as_long_as_its_line_is_uncompressed() {
     let image = placement(2, 4, 8_192);
     let mut sb = store(4);

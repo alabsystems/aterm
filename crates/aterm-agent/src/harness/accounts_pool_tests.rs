@@ -1123,3 +1123,146 @@ fn record_usage_reads_the_default_home_before_linking_overlays_so_startup_sqlite
         "pre-drifted work is still refused when main is full"
     );
 }
+
+#[test]
+fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_until_walled() {
+    // 1. Fleet-synced roster (`codex-1` + `codex-2`, both `dir = Some(...)`, no default row)
+    //    where `upkeep_pools` enrolled only `codex-1` so far: `launch_env` places launches on
+    //    `codex-1`, reads its usage, records its weekly wall when full, and rolls over to
+    //    `codex-2` once `codex-2` is bound.
+    let world = World::new("fleet-single-enrolled");
+    let c1 = world.root.join("logins/codex/codex-1");
+    let c2 = world.root.join("logins/codex/codex-2");
+    std::fs::create_dir_all(&c1).expect("c1 dir");
+    std::fs::create_dir_all(&c2).expect("c2 dir");
+    std::fs::write(c1.join("auth.json"), "{}").expect("c1 enrolled");
+    std::fs::write(
+        world.cfg.join("accounts-codex.toml"),
+        format!(
+            "[[account]]\nlabel = \"codex-1\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             email = \"one@example.com\"\n\n\
+             [[account]]\nlabel = \"codex-2\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             email = \"two@example.com\"\n",
+            c1.display(),
+            c2.display(),
+        ),
+    )
+    .expect("roster");
+
+    let ok_usage = Usage {
+        sample: Sample {
+            session_pct: Some(25),
+            session_reset: Some(NOW + 2 * HOUR),
+            week_pct: Some(40),
+            week_reset: Some(NOW + 3 * 24 * HOUR),
+            at: NOW,
+            ..Sample::default()
+        },
+        wall: None,
+    };
+    let pick = launch_env(&world.seat(), Cli::Codex, &|_, _, _| Some(ok_usage.clone()))
+        .expect("single enrolled dedicated row must launch");
+    assert_eq!(pick.label, "codex-1");
+    assert_eq!(pick.value, Some(c1.display().to_string()));
+
+    // Advance past USAGE_FRESH_S so `codex-1` is read again and hits its 7d weekly wall.
+    let later = Seat {
+        now: NOW + USAGE_FRESH_S + 10,
+        ..world.seat()
+    };
+    let week_walled = Usage {
+        sample: Sample {
+            week_pct: Some(100),
+            week_reset: Some(later.now + 24 * HOUR),
+            at: later.now,
+            ..Sample::default()
+        },
+        wall: Some((accounts::WEEK_LIMIT, Some(later.now + 24 * HOUR))),
+    };
+    assert_eq!(
+        launch_env(&later, Cli::Codex, &|_, _, _| Some(week_walled.clone())),
+        None,
+        "codex-1 is now walled and codex-2 is not yet enrolled"
+    );
+    let roster = later.roster(Cli::Codex).expect("roster");
+    let (s_after_wall, _) = later.store(Cli::Codex).load(later.now).expect("store");
+    assert!(
+        matches!(
+            accounts::condition(
+                roster.row("codex-1").expect("c1"),
+                &s_after_wall,
+                true,
+                later.now
+            ),
+            Condition::Limited { .. }
+        ),
+        "codex-1's weekly wall was persisted in state.json so upkeep can auto-enroll codex-2"
+    );
+
+    // Bind `codex-2+1` as `upkeep_pools` does on seeing `codex-1` Limited; next launch takes it.
+    let c2_staged = world.root.join("logins/codex/codex-2+1");
+    std::fs::create_dir_all(&c2_staged).expect("c2 staged");
+    std::fs::write(c2_staged.join("auth.json"), "{}").expect("c2 staged auth");
+    let mut note = None;
+    later
+        .store(Cli::Codex)
+        .transact_logins(later.now, &mut note, |state, logins| {
+            Ok(accounts::note_renewed(
+                state,
+                logins,
+                "codex-2",
+                Some(c2.to_str().expect("utf8")),
+                c2_staged.to_str().expect("utf8"),
+                Some("two@example.com"),
+                later.now,
+            ))
+        })
+        .expect("bind codex-2");
+    let pick2 = launch_env(&later, Cli::Codex, &no_usage).expect("rolls over to codex-2");
+    assert_eq!(pick2.label, "codex-2");
+    assert_eq!(pick2.value, Some(c2_staged.display().to_string()));
+
+    // 2. Adopted default row + lazy unenrolled backup (`[main, backup]`): `launch_env` reads
+    //    `main`'s usage and persists its wall even while `backup` is still `NotEnrolled`.
+    let lazy = World::new("default-plus-lazy");
+    let backup = lazy.root.join("logins/codex/backup");
+    std::fs::create_dir_all(&backup).expect("backup dir");
+    std::fs::write(
+        lazy.cfg.join("accounts-codex.toml"),
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+             [[account]]\nlabel = \"backup\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             email = \"backup@example.com\"\n",
+            backup.display()
+        ),
+    )
+    .expect("lazy roster");
+    assert_eq!(
+        launch_env(&lazy.seat(), Cli::Codex, &|_, _, _| {
+            Some(week_walled.clone())
+        }),
+        None
+    );
+    assert!(matches!(
+        condition_of(&lazy, Cli::Codex, "main"),
+        Condition::Limited { .. }
+    ));
+
+    // 3. CONTROL: an unpinned lone default row (`[main]`) neither reads usage nor rewrites launch
+    //    env, whereas pinning that lone default row honours the owner's pin.
+    let lone = World::new("lone-default-pin");
+    std::fs::write(
+        lone.cfg.join("accounts-codex.toml"),
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
+    )
+    .expect("lone roster");
+    let panic_read = |_: Cli, _: &Path, _: i64| -> Option<Usage> {
+        panic!("unpinned lone default row must not read usage")
+    };
+    assert_eq!(launch_env(&lone.seat(), Cli::Codex, &panic_read), None);
+    pin(&lone, Cli::Codex, "main").expect("pin main");
+    let pinned_pick =
+        launch_env(&lone.seat(), Cli::Codex, &no_usage).expect("pinned lone default row");
+    assert_eq!(pinned_pick.label, "main");
+    assert_eq!(pinned_pick.value, None);
+}

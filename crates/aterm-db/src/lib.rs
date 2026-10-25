@@ -25,6 +25,10 @@ pub mod local;
 pub mod machines;
 #[cfg(unix)]
 pub mod network;
+#[cfg(unix)]
+pub mod runtime;
+#[cfg(unix)]
+pub mod table;
 
 /// A refusal that identifies the failed boundary without quoting payloads or keys.
 #[derive(Debug)]

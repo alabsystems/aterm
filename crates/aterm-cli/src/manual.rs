@@ -664,9 +664,11 @@ WHAT IT IS
   * Recovery: retries transient API and overload errors, runs `/compact` on a context
     wall, renews expired logins, and relaunches a crashed agent on its conversation.
   * Human grace: after a person types, clicks or scrolls, it holds off for
-    `human_grace_s` (`status human_ms=`), but on an untouched box Claude Code will
-    deny on a timer (`⚠ … deny this request in M:SS`) only until 15 s before the
-    deny, and a question dialog only 15 s past the person's last input. While a hold stands (`hold=1`) or an external supervisor holds the lease
+    `human_grace_s` (`status human_ms=`), but a permission box nobody has touched
+    since it appeared, and a choice dialog that grants and spends nothing (a
+    question, a plan or goal dialog, a model switch), only 15 s past the person's
+    last input, and an untouched box Claude Code will deny on a timer (`⚠ … deny
+    this request in M:SS`) only until 15 s before the deny. While a hold stands (`hold=1`) or an external supervisor holds the lease
     (`supervisor=external`), the window only watches. A worker frozen past
     `stall_term_after_s` (`input=stalled`) is warned about once, or restarted under
     `stall_term = true`.
@@ -753,9 +755,10 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   upgrade [true]                  move idle sessions onto newer builds/models
   upgrade_ask [false]             true: ask the agent before restarting for an upgrade;
                                   false: restart quietly at a genuinely idle point
-  human_grace_s [120]             seconds to keep hands off after a person's input (to
-                                  15 s before an untouched box's auto-deny at most; a
-                                  question dialog: 15 s at most)
+  human_grace_s [120]             seconds to keep hands off after a person's input (a
+                                  permission box nobody touched since it appeared, or a
+                                  choice dialog that grants and spends nothing: 15 s at
+                                  most; to 15 s before an untouched box's auto-deny)
   occupancy ["observe"]           wait measurement: `"observe"`, `"off"` or `"prompt"`
                                   (`"prompt"` alone types its lines: one fenced line
                                   at a drawn break, after every guard)
@@ -2467,8 +2470,9 @@ MEMBERSHIP
   `[fleet]` (port 7100). `aterm fleet join` on each other machine reads the code from
   stdin, `--code-file F` or a hidden prompt, never an argument. `init --rotate` mints
   a new secret; `peers` checks every known peer (3 s) and `peers add|rm` edits the
-  book of peers; `leave` removes the fleet secret, the join code, both books and
-  `[fleet]`'s listen, allow and drive_from (the node id and node key stay).
+  book of peers (`add` refuses an address past the LAN, and this machine's own
+  listener, writing nothing); `leave` removes the fleet secret, the join code, both
+  books and `[fleet]`'s listen, allow and drive_from (the node id and node key stay).
 
 READING & DRIVING ACROSS THE FLEET
   aterm ctl survey --fleet
@@ -3727,6 +3731,8 @@ THE MOVES (see -> decide -> drive -> observe)
           aterm ctl @sid send '...' | key enter | paste | resize <r> <c>
           Claude Code peer: `turn typed=1 settle=submitted '<line>'`, then in background
           `await agent idle,prompt,question,wall since=<agent_rev>`
+          codex peer (`agent=` stays `unknown`): read `status` log_seq=/log_ep= BEFORE
+          typing, then `await log kind=program since=<log_seq> ep=<log_ep>` (its own claim)
   OBSERVE aterm ctl @sid await idle <ms> | await match <re> | await gone <re> | ready | wait
           | await agent <word,…> [since=<rev>]
   WATCH   aterm ctl subscribe @a,@b,@c events     (instance-local stream on one fd)
@@ -3814,7 +3820,10 @@ fn agent_page(sid: Option<&str>) -> String {
          idle,prompt,question,wall since=<n>`, n the turn's `agent_rev=` (the server's verdict\n  \
          past the one its Enter found: its turn is over, a box waits, or a wall stops it), as a\n  \
          background command: Claude Code's Bash ends one at 2 min, and the client re-arms the\n  \
-         wait to its timeout=, else an hour.\n  \
+         wait to its timeout=, else an hour. A codex peer's `agent=` stays `unknown` (aterm\n  \
+         reads no Codex screen): read `status` log_seq=/log_ep= BEFORE typing to it, then wait\n  \
+         on its own report, a claim, with `await log kind=program since=<log_seq>\n  \
+         ep=<log_ep>` (re-arm from the reply's seq=/ep=).\n  \
          Watch THIS instance's sessions on one fd with `subscribe @a,@b events` (one\n  \
          unresolvable selector fails it all; `aterm ctl survey` reads every instance).\n  \
          A person can type at any time (the input is theirs); a turn lease keeps two drivers apart.\n  \
@@ -4027,7 +4036,11 @@ THE HALT (`hold=1`)
     the person's Hand Back lifts it.
   * `origin=remote` — held by another Mac over the fleet (the survey's `held_from=`
     names its node): its own `hold <sid> off` or the person's Take Over lifts it, and
-    it ends here once that Mac may drive this one no more (`aterm help fleet`).
+    it ends here once that Mac may drive this one no more (`aterm help fleet`): once it
+    left the fleet, `aterm fleet peers rm <its node>` here ends its grant, and once its
+    place answers under another fleet's secret or key, `aterm ctl hold <sid> off` here
+    lifts it too. Its own CLI drives with no aterm running there, so a Mac that does not
+    answer keeps its hold.
   * `origin=fleet` — fleet-wide halt via `aterm fabric halt --cap-file <cap> <reason>`
     (lifted by `aterm fabric halt --cap-file <cap> off`).
   * `origin=local` — set/lifted by `aterm ctl hold <sid> on|off [reason=<r>]`.

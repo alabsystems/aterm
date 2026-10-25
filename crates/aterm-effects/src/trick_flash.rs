@@ -944,7 +944,7 @@ mod tests {
     }
     const BOTH: [Path; 2] = [Path::Cold, Path::Snapshot];
 
-    fn ms(n: u64) -> Duration {
+    const fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
     }
 
@@ -978,7 +978,7 @@ mod tests {
             }
         }
 
-        fn unwired(mut self) -> Self {
+        const fn unwired(mut self) -> Self {
             self.wired = false;
             self
         }

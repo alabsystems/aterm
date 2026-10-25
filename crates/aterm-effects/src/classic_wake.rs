@@ -97,11 +97,11 @@ pub(crate) struct WakeInk<'a> {
 /// Returns the comet colour at path position `pos` (`0` tail to `1` head).
 #[must_use]
 #[inline]
-pub fn comet_color(mono: bool, color: u32, accent: u32, hue: f32, pos: f32) -> u32 {
+pub const fn comet_color(mono: bool, color: u32, accent: u32, hue: f32, pos: f32) -> u32 {
     if mono {
         lerp_rgb(accent, color, pos)
     } else {
-        hsv2rgb((hue + pos * 0.5).fract(), 0.95, 1.0)
+        hsv2rgb((hue + pos * 0.5) % 1.0, 0.95, 1.0)
     }
 }
 
@@ -199,8 +199,11 @@ impl ClassicWake {
 
     /// Returns the landing ring's cell.
     #[cfg(test)]
-    pub(crate) fn ring_cell(&self) -> Option<(u16, u16)> {
-        self.ring.map(|r| (r.row, r.col))
+    pub(crate) const fn ring_cell(&self) -> Option<(u16, u16)> {
+        match self.ring {
+            Some(r) => Some((r.row, r.col)),
+            None => None,
+        }
     }
 
     /// Drops all in-flight light and forgets the last cursor position.
@@ -1053,7 +1056,7 @@ impl ClassicWake {
     }
 
     #[inline]
-    fn comet_color(&self, cfg: &GlowConfig, pos: f32) -> u32 {
+    const fn comet_color(&self, cfg: &GlowConfig, pos: f32) -> u32 {
         comet_color(cfg.classic_mono, cfg.color, cfg.accent, self.hue, pos)
     }
 }
@@ -1070,7 +1073,7 @@ mod tests {
     use crate::cursor_glow::GlowStyle;
     use aterm_render::{HaloMode, halo_over_cap, over_premul};
 
-    fn geom() -> Geom {
+    const fn geom() -> Geom {
         Geom {
             cw: 8,
             ch: 16,
@@ -1084,7 +1087,7 @@ mod tests {
         }
     }
 
-    fn cfg() -> GlowConfig {
+    const fn cfg() -> GlowConfig {
         GlowConfig {
             enabled: true,
             style: GlowStyle::Classic,
@@ -1110,7 +1113,7 @@ mod tests {
     const PAPER: u32 = 0x00FF_FFFF;
     const INK: u32 = 0x001F_2328;
 
-    fn light_cfg() -> GlowConfig {
+    const fn light_cfg() -> GlowConfig {
         GlowConfig {
             dark_theme: false,
             theme_fg: INK,
@@ -1595,7 +1598,7 @@ mod tests {
         );
     }
 
-    fn shipped_dark_at(length: usize, intensity: f32) -> GlowConfig {
+    const fn shipped_dark_at(length: usize, intensity: f32) -> GlowConfig {
         crate::cursor_fx::resolve_glow_config(
             crate::cursor_fx::GlowKnobs {
                 enabled: true,
@@ -1616,7 +1619,7 @@ mod tests {
         )
     }
 
-    fn shipped_dark(length: usize) -> GlowConfig {
+    const fn shipped_dark(length: usize) -> GlowConfig {
         shipped_dark_at(
             length,
             crate::cursor_fx::default_trail_intensity(Some(GlowStyle::Classic), false),

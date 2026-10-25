@@ -4088,6 +4088,7 @@ mod tests {
             verified_at: NOW - 7200,
             measured_sha256: None,
             agreed_with: None,
+            tree_from: None,
         };
         std::fs::write(
             atpkg::vendor_direct::record_path(&build).unwrap(),

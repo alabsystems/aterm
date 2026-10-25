@@ -233,6 +233,9 @@ pub enum Class {
     Bundle,
     /// Vendor-direct (`atpkg::vendor_direct::is_vendor`).
     Vendor,
+    /// A harness row (`crate::programs::Harness`): Apple silicon only, so no Linux row is
+    /// built, staged or fetched for it.
+    AppleOnly,
     /// Not a [`crate::programs::PROGRAMS`] row.
     Unknown,
 }
@@ -243,6 +246,9 @@ impl Class {
             return Self::Vendor;
         }
         match def.map(|d| d.shape) {
+            Some(Shape::Plain {
+                harness: Some(_), ..
+            }) => Self::AppleOnly,
             Some(Shape::Plain { .. }) => Self::Plain,
             Some(Shape::Bundle(_)) => Self::Bundle,
             Some(Shape::Package(_)) => Self::Vendor,
@@ -255,6 +261,7 @@ impl Class {
             Self::Plain => "plain",
             Self::Bundle => "bundle",
             Self::Vendor => "vendor",
+            Self::AppleOnly => "apple-only",
             Self::Unknown => "unknown",
         }
     }
@@ -306,6 +313,8 @@ pub enum Decision {
     ManualBundle,
     /// Vendor-direct: nothing to do.
     Vendor,
+    /// A harness, Apple silicon only: nothing to do.
+    AppleOnly,
     /// Not a PROGRAMS row: a human decision.
     Unknown,
     /// Build these targets (and which are held by the group).
@@ -333,6 +342,7 @@ impl Decision {
             Self::Ok => "OK",
             Self::ManualBundle => "MANUAL-BUNDLE",
             Self::Vendor => "VENDOR",
+            Self::AppleOnly => "APPLE-ONLY",
             Self::Unknown => "UNKNOWN",
             Self::Build { .. } => "BUILD",
             Self::Blocked => "BLOCKED",
@@ -350,6 +360,9 @@ pub fn decide(p: &Program, holds: &Holds) -> Decision {
     }
     if p.class == Class::Vendor {
         return Decision::Vendor;
+    }
+    if p.class == Class::AppleOnly {
+        return Decision::AppleOnly;
     }
     let held = |states: &[RowState]| -> Vec<Triple> {
         p.group.as_deref().map_or_else(Vec::new, |g| {
@@ -614,7 +627,7 @@ impl Run<'_> {
                 published: None,
                 published_rows: BTreeSet::new(),
             };
-            if class != Class::Vendor {
+            if !matches!(class, Class::Vendor | Class::AppleOnly) {
                 let sl = ctx.staging_slug(&repo);
                 match rows::fetch(
                     &ctx.hosts.staging,
@@ -1485,6 +1498,9 @@ fn render(p: &Program, d: &Decision, staged_name: &str) -> String {
         ),
         Decision::Vendor => {
             "VENDOR: vendor-direct — the client follows the vendor; no lane packs it".into()
+        }
+        Decision::AppleOnly => {
+            "APPLE-ONLY: a harness ships Apple silicon only — no Linux row is built".into()
         }
         Decision::Unknown => format!("UNKNOWN: not a PROGRAMS row — human decision{note}"),
         Decision::Build { held } => format!(

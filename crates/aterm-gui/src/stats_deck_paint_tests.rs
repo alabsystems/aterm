@@ -645,6 +645,7 @@ pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
         form,
         contrast: false,
         locale: MAC,
+        live: crate::stats_live::DeckLive::STILL,
         needs: Vec::new(),
     }
 }
@@ -891,8 +892,9 @@ fn key(d: &Swept<'_>) -> Vec<String> {
     if !fits && !both_states {
         why.push(format!("no span fits \"over max\": {:?}", head.key.spans));
     }
-    if d.form == DeckForm::Folded && drawn("10 min ago") != 1 {
-        why.push(format!("the time label {} times", drawn("10 min ago")));
+    let time = drawn("10 min ago") + drawn("\u{2013}10 min");
+    if d.form == DeckForm::Folded && time != 1 {
+        why.push(format!("the time label {time} times"));
     }
     let _ = (d.face, d.s);
     why

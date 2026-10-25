@@ -54,6 +54,8 @@ pub struct Proc {
     /// Descriptors 1 and 2 on this output file `(dev, ino)`.
     pub out: Option<(u64, u64)>,
     pub wchan: Option<String>,
+    /// The descriptor it sleeps reading or writing (Linux).
+    pub blocked_fd: Option<i32>,
     /// A thread in an uninterruptible wait.
     pub d_state: bool,
     /// Its one thread never ran past 20 s: `wait` says what keeps it.
@@ -104,6 +106,7 @@ impl Proc {
             fds: Vec::new(),
             out: None,
             wchan: None,
+            blocked_fd: None,
             d_state: false,
             held: false,
             wait: aterm_vitals::jobs::StartWait::ProgramCheck,
@@ -589,6 +592,7 @@ impl World {
             }),
             wchan: p.wchan.clone(),
             fds: (want_fds && !zombie && !p.refused).then_some(fds),
+            blocked_fd: p.blocked_fd.filter(|_| want_fds && !zombie && !p.refused),
             program_check: p.held
                 && p.wait == aterm_vitals::jobs::StartWait::ProgramCheck
                 && !zombie,

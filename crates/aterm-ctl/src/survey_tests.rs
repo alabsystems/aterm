@@ -1910,18 +1910,102 @@ fn a_peers_typist_reads_in_its_own_words() {
         ])
     };
     for remote in [false, true] {
-        for by in [
-            "127.0.0.1 (node bc104d9c) over the fleet",
-            "the message bus",
-            "lab-sweep",
+        for (by, shows) in [
+            (
+                "127.0.0.1 (node bc104d9c) over the fleet",
+                "127.0.0.1 (node bc104d9c) over the fleet",
+            ),
+            (
+                "Andrews-MacBook-Pro.local (node bc104d9c) over the fleet",
+                "Andrews-MacBook-Pro.loca… (node bc104d9c) over the fleet",
+            ),
+            (
+                "node bc104d9c over the fleet",
+                "node bc104d9c over the fleet",
+            ),
+            ("the message bus", "the message bus"),
+            ("lab-sweep", "lab-sweep"),
         ] {
             let mut answer = reply(1, vec![typed(by)]);
             answer.remote = remote;
             let text = render_text(&[answer], DEFAULT_BUDGET, None);
             assert!(
-                text.contains(&format!(" typed by {} 1m ago", shown(by, 24))),
+                text.contains(&format!(" typed by {shows} 1m ago")),
                 "remote={remote} {by}: {text}"
             );
         }
+    }
+    let typed_worker = |by: &str, busy: &[(&str, &str)]| {
+        let mut row = vec![
+            ("local", "1"),
+            ("sid", "s-619e74991ac44c8c764e"),
+            ("program", "claude"),
+            ("agent", "busy"),
+            ("agent_ms", "180000"),
+        ];
+        row.extend_from_slice(busy);
+        row.extend([
+            ("typed_by", by),
+            ("typed_ms", "60000"),
+            ("title", "Fix the footer rendering on narrow panes"),
+            ("cwd", "~/Developer/aterm"),
+        ]);
+        wire_row(&row)
+    };
+    let mac = "Andrews-MacBook-Pro.local (node bc104d9c) over the fleet";
+    let task = [("doing", "Bash"), ("task", "t1"), ("task_rev", "2")];
+    let ctx = [
+        ("doing", "Bash"),
+        ("task", "t1"),
+        ("task_rev", "2"),
+        ("ctx_left_pct", "40"),
+    ];
+    let long = [
+        ("doing", "mcp__claude_docs__update"),
+        ("task", "t1"),
+        ("task_rev", "2"),
+        ("ctx_left_pct", "40"),
+    ];
+    for (by, busy, shows) in [
+        (
+            "127.0.0.1 (node bc104d9c) over the fleet",
+            &task[..],
+            " typed by 127.0.0.1 (node bc104d9c) over the fleet 1m ago",
+        ),
+        (
+            mac,
+            &[][..],
+            " typed by Andrews-MacBook-Pro.loca… (node bc104d9c) over the fleet 1m ago",
+        ),
+        (
+            mac,
+            &task[..],
+            " typed by Andrews-M… (node bc104d9c) over the fleet 1m ago",
+        ),
+        (
+            mac,
+            &ctx[..],
+            " typed by node bc104d9c over the fleet 1m ago",
+        ),
+        (
+            mac,
+            &long[..],
+            " typed by node bc104d9c over the fleet 1m ago",
+        ),
+    ] {
+        let text = render_text(
+            &[reply(1, vec![typed_worker(by, busy)])],
+            DEFAULT_BUDGET,
+            None,
+        );
+        assert_line_caps(&text);
+        let line = text
+            .lines()
+            .find(|line| line.contains(" typed by "))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            line.contains(shows) && line.starts_with("s-619e74991ac44c8c764e claude busy 3m"),
+            "{busy:?}: {line}"
+        );
     }
 }

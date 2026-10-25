@@ -69,6 +69,7 @@ pub mod flow;
 pub mod freespace;
 pub mod gate;
 pub mod gc;
+pub mod harness;
 pub mod hooks;
 /// Which program and build a running image is, from the executable the kernel mapped.
 pub mod image;

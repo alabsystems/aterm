@@ -169,6 +169,82 @@ fn a_new_program_is_a_table_row_and_a_vendor_program_is_never_pinned() {
     }
 }
 
+const HARNESSES: [(&str, &str); 5] = [
+    ("claude-code-alab", "claude-alab"),
+    ("muse-alab", "muse-alab"),
+    ("agy-alab", "agy-alab"),
+    ("grok-alab", "grok-alab"),
+    ("kimi-alab", "kimi-alab"),
+];
+
+/// THE FIVE HARNESS ROWS (`docs/DESIGN-harness-repos-2026-10-24.md` §6.1): each is its own
+/// repo's Apple-silicon plain row, held to the harness rule with the repo's one binary as its
+/// one tool (a tool a client lays and no vendor row's), and no other row is named like one.
+#[test]
+fn the_harness_rows_are_the_five_harnesses_each_shipping_its_one_binary() {
+    use atpkg_publish::programs::{ARM_DARWIN, PROGRAMS};
+    let rows: Vec<(&str, &str)> = PROGRAMS
+        .iter()
+        .filter_map(|d| d.harness().map(|h| (d.name, h.tool)))
+        .collect();
+    assert_eq!(rows, HARNESSES);
+    for (name, tool) in HARNESSES {
+        let d = atpkg_publish::programs::get(name).expect("a row");
+        assert_eq!((d.repo, d.group, d.system), (name, None, None));
+        assert!(d.is_plain() && d.lane_tracked(), "{name}");
+        assert_eq!(d.darwin_triples(), ARM_DARWIN, "{name}");
+        assert!(atpkg_publish::programs::alab_package(name).is_none());
+        assert!(atpkg::store::shim_allowed(tool), "{tool}");
+        assert!(
+            atpkg::vendor_direct::VENDORS
+                .iter()
+                .all(|v| !v.exposes.contains(&tool)),
+            "{tool} would shadow a vendor's shim"
+        );
+    }
+    assert!(
+        PROGRAMS
+            .iter()
+            .filter(|d| d.harness().is_none())
+            .all(|d| !atpkg::harness::is_harness(d.name)),
+        "a program named like a harness is packed as one"
+    );
+}
+
+/// A HARNESS IS PINNED LIKE ANY ROW AND INSTALLED ONLY BY NAME: `--pin` of each is admitted
+/// (it is a table row), its block names its own repo with no group, and the index it makes is
+/// one whose client installs it only when asked.
+#[test]
+fn each_harness_pins_under_its_own_repo_and_stays_out_of_the_default_set() {
+    let b = base(21, &[("ay", 1)]);
+    let pins: Vec<String> = HARNESSES
+        .iter()
+        .flat_map(|(h, _)| ["--pin".to_string(), format!("{h}=7")])
+        .collect();
+    let pins: Vec<&str> = pins.iter().map(String::as_str).collect();
+    let (p, _) = ok(&b, &delta(&pins));
+    for (h, _) in HARNESSES {
+        assert_eq!(p.channel.pin.get(h), Some(&7), "{h}");
+        let (_, block) = p
+            .programs
+            .iter()
+            .find(|(n, _)| n == h)
+            .unwrap_or_else(|| panic!("no [programs.{h}]"));
+        assert_eq!(block.repo, h);
+        assert_eq!(block.coherence_group, None);
+        assert_eq!(block.policy, "prebuilt-only");
+    }
+    let index = index_of(&p);
+    for (h, _) in HARNESSES {
+        assert!(
+            index.installable(&[]).contains(h),
+            "{h}: a person may install it"
+        );
+        assert!(!index.default_set(&[]).contains(h), "{h}: never unasked");
+    }
+    assert!(index.default_set(&[]).contains("ay"));
+}
+
 #[test]
 fn a_head_program_the_table_lacks_keeps_the_heads_block() {
     let mut b = base(21, &[("ay", 1), ("orca-alab", 4)]);

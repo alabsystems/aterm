@@ -3408,11 +3408,43 @@ pub fn hold_refusal(ctx: &dyn FabricSession) -> Option<String> {
 
 fn standing_refusal(ctx: &dyn FabricSession) -> Option<(String, String)> {
     let driver = serving_driver().map(|driver| driver.node);
-    let hold = ctx.fabric().holds().first_against(driver.as_deref())?;
-    Some((
-        format!("ERR halted reason={} origin={}\n", hold.reason, hold.origin),
-        hold.origin,
-    ))
+    let holds = ctx.fabric().holds();
+    let hold = holds.first_against(driver.as_deref())?;
+    Some((halted(ctx, &holds, &hold, None), hold.origin))
+}
+
+/// The `ERR halted` line of `hold`, one of `holds`: a remote one names who holds it and what
+/// lifts it, by what a local `hold off` found of its node where one met it (`found`).
+fn halted(ctx: &dyn FabricSession, holds: &Holds, hold: &Hold, found: Option<&Holder>) -> String {
+    let lifts = match holds.remote().filter(|_| hold.origin == REMOTE_ORIGIN) {
+        Some(remote) => {
+            let (host, sid) = (&remote.host, ctx.self_id().as_str());
+            let short = remote.node.get(..8).unwrap_or(&remote.node);
+            let lifts = format!(
+                "that node's own `hold {sid} off`, or the person here (Take Over, or `aterm fleet \
+                 peers rm {short}` once that Mac left the fleet), lifts it"
+            );
+            match found {
+                Some(Holder::Drives) => format!(
+                    " (held by {host} over the fleet, which still drives this Mac: {lifts})"
+                ),
+                Some(Holder::Again(why)) => format!(
+                    " (held by {host} over the fleet, which may still drive this Mac: its place \
+                     did not prove it just now ({why}), and its drives are its own dials of this \
+                     Mac; {lifts})"
+                ),
+                Some(Holder::Gone(_)) | None => format!(
+                    " (held by {host} over the fleet: {lifts}; so does `aterm ctl hold {sid} off` \
+                     on this session's Mac once that node may drive it no more)"
+                ),
+            }
+        }
+        None => String::new(),
+    };
+    format!(
+        "ERR halted reason={} origin={}{lifts}\n",
+        hold.reason, hold.origin
+    )
 }
 
 /// [`halt_refusal`] for an app-target verb, which has no session to check.
@@ -4011,10 +4043,13 @@ pub fn cmd_hold_within_waking(
     match apply_hold(&ctx, act, issuer, Some(fence_wait), &|| wake(ctx.self_id())) {
         Applied::FleetHeld => HOLD_DENIED.to_string(),
         Applied::NotItsSlot => HOLD_PERSON_USAGE.to_string(),
-        Applied::Taken => match ctx.fabric().hold() {
-            Some(hold) => format!("ERR halted reason={} origin={}\n", hold.reason, hold.origin),
-            None => HOLD_DENIED.to_string(),
-        },
+        Applied::Taken => {
+            let holds = ctx.fabric().holds();
+            match holds.first() {
+                Some(hold) => halted(ctx.as_ref(), &holds, &hold, None),
+                None => HOLD_DENIED.to_string(),
+            }
+        }
         Applied::Fenced => HOLD_BUSY.to_string(),
         Applied::Changed { held } | Applied::Unchanged { held } => {
             format!("OK hold={}\n", u8::from(held))
@@ -4056,6 +4091,80 @@ pub fn lift_ungranted_remote_holds(
         }
     }
     lifted
+}
+
+/// What this Mac found of the node of a remote hold a local `hold off` met ([`owner_off_remote`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Holder {
+    /// It proved itself to this Mac just now: it still drives it.
+    Drives,
+    /// It did not prove itself just now, for this reason, which says nothing of its own drives.
+    Again(String),
+    /// It may drive this Mac no more, for this reason.
+    Gone(String),
+}
+
+/// What a local `hold off` did to a remote hold ([`owner_off_remote`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteOff {
+    /// It lifted the hold.
+    Lifted {
+        /// The hold lifted.
+        hold: RemoteHold,
+        /// Why its node may drive this Mac no more.
+        why: String,
+        /// The `hold` verb's answer.
+        reply: String,
+    },
+    /// The hold stands: the refusal, naming why and what lifts it.
+    Stands(String),
+}
+
+/// An Owner's `hold <sid> off` that finds no local slot and a remote one standing: `holder` asks
+/// whether that node may still drive this Mac, and its hold is lifted, as its own `hold off`
+/// would, once it may not. `None` where the `off` meets no such hold.
+pub fn owner_off_remote(
+    store: &impl AsStore,
+    sid: &str,
+    holder: &dyn Fn(&RemoteHold) -> Holder,
+    wake: &dyn Fn(&SessionId),
+) -> Option<RemoteOff> {
+    let store = &store.as_store();
+    let ctx = {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        g.session(&SessionId::new(sid))?
+    };
+    let holds = ctx.fabric().holds();
+    let remote = holds.remote().filter(|_| !holds.has("local"))?.clone();
+    let why = match holder(&remote) {
+        Holder::Gone(why) => why,
+        found => {
+            let holds = ctx.fabric().holds();
+            let hold = holds.first()?;
+            return Some(RemoteOff::Stands(halted(
+                ctx.as_ref(),
+                &holds,
+                &hold,
+                Some(&found),
+            )));
+        }
+    };
+    let applied = apply_hold(
+        ctx.as_ref(),
+        HoldAct::LiftRemote(Some(&remote.node)),
+        HoldIssuer::Remote,
+        Some(ctx.fabric().fence_wait()),
+        &|| wake(ctx.self_id()),
+    );
+    match applied {
+        Applied::Changed { held } => Some(RemoteOff::Lifted {
+            hold: remote,
+            why,
+            reply: format!("OK hold={} lifted=remote\n", u8::from(held)),
+        }),
+        Applied::Fenced => Some(RemoteOff::Stands(HOLD_BUSY.to_string())),
+        _ => None,
+    }
 }
 
 /// What the window's Take Over or Hand Back did ([`person_hold`]).

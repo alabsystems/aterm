@@ -22,7 +22,7 @@ pub(crate) enum PreviewHold {
     /// `theme preview [ttl=]`: reverts by itself at this instant.
     Until(Instant),
     /// The command palette's highlighted Theme row: no TTL; it stands while a palette highlights it and reverts when the palette closes or the highlight leaves the Theme section.
-    Palette,
+    Palette { window: crate::WindowId },
     /// Chosen in the palette (Enter): its `theme` write is in flight.
     Committing,
     /// Settings ▸ Themes' trial ([`App::sync_settings_theme_trial`]): it stands while a Settings view tries it, with no TTL, and reverts when none does (Revert, Esc, leaving the page, closing Settings).
@@ -43,7 +43,7 @@ impl PreviewHold {
     const fn word(self) -> &'static str {
         match self {
             Self::Until(_) => "ttl",
-            Self::Palette => "palette",
+            Self::Palette { .. } => "palette",
             Self::Committing => "commit",
             Self::Settings { .. } => "settings",
         }
@@ -240,7 +240,7 @@ impl App {
                         .saturating_duration_since(now)
                         .as_millis()
                         .to_string(),
-                    PreviewHold::Palette
+                    PreviewHold::Palette { .. }
                     | PreviewHold::Committing
                     | PreviewHold::Settings { .. } => "-".to_string(),
                 }
@@ -421,7 +421,9 @@ impl App {
     pub(crate) fn next_theme_preview_wake(&self) -> Option<Instant> {
         match self.theme_preview.as_ref()?.hold {
             PreviewHold::Until(expires) => Some(expires),
-            PreviewHold::Palette | PreviewHold::Committing | PreviewHold::Settings { .. } => None,
+            PreviewHold::Palette { .. }
+            | PreviewHold::Committing
+            | PreviewHold::Settings { .. } => None,
         }
     }
 

@@ -72,6 +72,7 @@ impl ToneTracker {
 
     /// Chars currently in the window.
     #[inline]
+    #[must_use]
     pub fn window_chars(&self) -> usize {
         self.buf.len()
     }

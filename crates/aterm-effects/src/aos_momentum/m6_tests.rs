@@ -16,11 +16,11 @@ use super::m4::{Evaluator, LabelRefusal, LabelScope, Serial, Spread, TrainLabel}
 use super::m4_tests::evaluator;
 use super::m6::{
     Alter, Arm, ChainPin, Comparison, DurableLog, DurableStore, EvalRecord, GridRecord, Labeller,
-    LearnRefusal, Ledger, LedgerRefusal, Line, LogFault, Manifest, ManifestRefusal, ModelRefusal,
-    Moved, Pair, PairLines, Ranker, Reason, SessionEnv, SessionRefusal, SessionRun, Sets, State,
-    StateRefusal, Step, Store, StoreFault, StoreRefusal, Version, VersionRefusal, VoidCause,
-    VoidClass, chain, cross_pair, data, derive, forcing, label_budget, look_pair, next_line,
-    run_look, run_replay, session_a, session_b, sign_test, train, void_class,
+    LearnRefusal, Ledger, LedgerRefusal, Line, LogFault, M6_CHAIN_V1, Manifest, ManifestRefusal,
+    ModelRefusal, Moved, Pair, PairLines, Ranker, Reason, SessionEnv, SessionRefusal, SessionRun,
+    Sets, State, StateRefusal, Step, Store, StoreFault, StoreRefusal, Version, VersionRefusal,
+    VoidCause, VoidClass, chain, cross_pair, data, derive, forcing, label_budget, look_pair,
+    next_line, run_look, run_replay, session_a, session_b, sign_test, train, void_class,
 };
 use super::m6_policy::{
     EPOCHS, FEATURES, JUDGED, LOOKS, MAX_LABELS, MAX_REVISIONS, MAX_STEPS, MAX_VERSIONS, POOLS,
@@ -67,6 +67,18 @@ fn fixture() -> &'static Fixture {
 
 fn pin() -> ChainPin {
     ChainPin::of(&fixture().chain).expect("five members")
+}
+
+#[test]
+fn the_pinned_chain_reproduces_on_the_v1_sets() {
+    let pin = M6_CHAIN_V1.expect("stage E pins the chain");
+    assert_eq!(
+        pin.digest().hex(),
+        "ed3cfd79d82728f86eb6def01c1935713907abfa22a7d283003eca65e6670322"
+    );
+    assert_eq!(pin.ids[0], Version::base().id());
+    let members = chain(&Sets::v1(), &Labeller::new(evaluator(), &Threads)).expect("the v1 chain");
+    assert_eq!(ChainPin::of(&members), Some(pin));
 }
 
 /// One version root's ledgers and chain file, shared by every ledger over it.
@@ -1985,6 +1997,63 @@ fn allowlist(file: &str) -> Vec<String> {
             );
             out
         }
+        "aos_learn.rs" | "aos_learn_bench.rs" => {
+            let effects = concat!("aterm_", "effects::aos_momentum::");
+            let mut out: Vec<String> = [
+                "m4::Evaluator",
+                "m4::Spread",
+                concat!("m4::Real", "Sets"),
+                "m4::held_out_judged",
+                "m6::",
+                "m6_policy::",
+            ]
+            .iter()
+            .map(|i| format!("{effects}{i}"))
+            .collect();
+            out.extend(
+                [
+                    "crate::Res",
+                    "crate::Fail",
+                    "crate::lab_build::LAB_BUILD",
+                    "crate::lab_build::check_build",
+                    "crate::spread::Threads",
+                    "crate::sys::digest_file",
+                    "crate::sys::await_exit",
+                    "crate::stop::install",
+                    "crate::stop::ring",
+                    "crate::paths::paths",
+                    "crate::paths::from_caller",
+                    "crate::instance::take_value",
+                    "crate::aos_gpu_bench::watch",
+                    "crate::aos_gpu_bench::Watch",
+                    "crate::aos_gpu_bench::clean_commit",
+                    "crate::trail_gallery::checkouts",
+                    "crate::trail_gallery::resolve_out",
+                    // Reviewed in stage D: the child's footprint self-report (G4).
+                    "crate::sys::max_footprint",
+                ]
+                .map(str::to_owned),
+            );
+            if file == "aos_learn_bench.rs" {
+                // The ledger's file I/O, as designed, and (reviewed in stage D) the store's, for
+                // G2's comparison, the children's summary, the exit's held_out_judged guard, the
+                // durable directory maker, and the stop rule's check and sleep, so an interrupt
+                // ends the runner's wait for the ledger and voids its session.
+                out.extend(
+                    [
+                        "crate::aos_learn::LabLog",
+                        "crate::aos_learn::LabStore",
+                        "crate::aos_learn::Summary",
+                        "crate::aos_learn::guarded",
+                        "crate::aos_learn::make_dirs",
+                        "crate::stop::check",
+                        "crate::stop::sleep",
+                    ]
+                    .map(str::to_owned),
+                );
+            }
+            out
+        }
         _ => Vec::new(),
     }
 }
@@ -2247,6 +2316,64 @@ fn m6_imports_only_its_allowlist() {
             Vec::<String>::new(),
             "{file}"
         );
+    }
+}
+
+#[test]
+fn the_lab_files_import_only_their_allowlist() {
+    let lab = crate_root().join("../aterm-lab/src");
+    for file in ["aos_learn.rs", "aos_learn_bench.rs"] {
+        let src = std::fs::read_to_string(lab.join(file)).expect("a readable source");
+        assert_eq!(
+            scan_file(&src, &allowlist(file)),
+            Vec::<String>::new(),
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn the_lab_allowlists_refuse_what_they_do_not_list() {
+    let learn = allowlist("aos_learn.rs");
+    let bench = allowlist("aos_learn_bench.rs");
+    let refused = |src: &str, allowed: &[String]| !scan_file(src, allowed).is_empty();
+    for ok in [
+        concat!(
+            "use aterm_",
+            "effects::aos_momentum::m6::{Ledger, Store};\n"
+        ),
+        concat!(
+            "use aterm_",
+            "effects::aos_momentum::m4::{Evaluator, held_out_judged};\n"
+        ),
+        "use crate::{Fail, Res};\nuse crate::sys::{digest_file, max_footprint};\n",
+        "use aterm_aos::Digest;\nuse std::fs;\n",
+    ] {
+        assert!(!refused(ok, &learn), "{ok}");
+        assert!(!refused(ok, &bench), "{ok}");
+    }
+    assert!(refused("use crate::aos_learn::LabLog;\n", &learn));
+    assert!(refused("use crate::stop::sleep;\n", &learn));
+    assert!(!refused(
+        "use crate::aos_learn::{LabLog, LabStore, Summary, guarded, make_dirs};\n\
+         use crate::stop::{check, install, ring, sleep};\n",
+        &bench
+    ));
+    for planted in [
+        concat!("use aterm_", "effects::aos_momentum::m4::TrainLabel;\n"),
+        concat!("use aterm_", "effects::aos_momentum::policy::GRID_V1;\n"),
+        concat!("use aterm_", "effects::aos_momentum::", "m6 as k;\n"),
+        "use crate::sys::kill;\n",
+        "use crate::aos_learn::version_root;\n",
+        concat!("use crate::aos_", "search::LAB_BUILD;\n"),
+        concat!("fn f() { let _ = crate::", "sys::kill(1, 9); }\n"),
+        concat!(
+            "fn f() { let _ = aterm_",
+            "effects::aos_momentum::policy::measure; }\n"
+        ),
+    ] {
+        assert!(refused(planted, &bench), "{planted}");
+        assert!(refused(planted, &learn), "{planted}");
     }
 }
 

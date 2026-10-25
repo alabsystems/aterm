@@ -62,7 +62,7 @@ fn spec_xref_closure() {
         aterm_db::control::Endpoint::exchange
             as fn(
                 &aterm_db::control::Endpoint,
-                std::net::TcpStream,
+                _,
                 aterm_db::control::Side,
                 &mut aterm_db::control::Repair,
             ) -> aterm_db::Result<aterm_db::control::Report>,

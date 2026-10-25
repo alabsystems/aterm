@@ -543,7 +543,7 @@ mod tests {
     use crate::effect_util::ink;
     use std::time::Duration;
 
-    fn geom() -> Geom {
+    const fn geom() -> Geom {
         Geom {
             cw: 8,
             ch: 16,
@@ -556,7 +556,7 @@ mod tests {
             head: 0,
         }
     }
-    fn cfg() -> CometConfig {
+    const fn cfg() -> CometConfig {
         CometConfig {
             enabled: true,
             intensity: 1.0,
@@ -660,7 +660,7 @@ mod tests {
         );
     }
 
-    fn light_cfg() -> CometConfig {
+    const fn light_cfg() -> CometConfig {
         CometConfig {
             color: 0x0009_69DA,
             accent: 0x0040_90F0,

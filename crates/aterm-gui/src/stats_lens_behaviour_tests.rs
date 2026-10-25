@@ -879,6 +879,118 @@ fn no_lens_opens_or_stays_where_none_can_show() {
     assert_eq!(r.lens(), None);
 }
 
+/// A new reading draws the lens's body over the shell's kept raster, and a move of what the shell
+/// is drawn from (Increase Contrast's rim, the theme's inks, the window's width) draws the shell
+/// again: after each splice the card is the bytes one raster of the whole lens gives.
+#[test]
+fn a_reading_keeps_the_lens_shell_and_a_move_of_its_inks_or_width_redraws_it() {
+    use crate::native_appearance::{
+        AppearancePreferences, current_preferences, install_preferences,
+    };
+    /// Splice `wid`'s lens; the card is held to one raster of the whole lens. The kept shell
+    /// raster and the fingerprint of the prims that drew it.
+    fn spliced(app: &mut App, wid: WindowId, why: &str) -> (Arc<[u8]>, u64) {
+        app.splice_stats_lens(wid);
+        let (lg, lens, f) = app.lens_frame(wid).expect("the lens is open");
+        let laid = super::lay_lens(
+            &lg,
+            &app.lens_input(&f),
+            &lens,
+            &super::deck_metrics(),
+            true,
+        );
+        let (whole, ..) =
+            crate::tray_raster::rasterize_tray(&laid.prims, lg.w as u32, lg.h as u32, 1.0, [0; 4]);
+        let ws = &app.windows[&wid];
+        let card = ws.lens_card.as_ref().expect("the lens's card");
+        assert!(
+            card.rgba == whole,
+            "{why}: the card is not one raster of the whole lens"
+        );
+        let shell = ws
+            .stats_lens
+            .shell
+            .as_ref()
+            .expect("the shell's kept raster");
+        (
+            Arc::clone(&shell.rgba),
+            crate::stats_deck::prims_fp(&laid.prims[..laid.shell]),
+        )
+    }
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut r = rig("sill");
+    let wid = r.wid;
+    let scratch = aterm_tempfile::tempdir().expect("scratch dir");
+    let dir = scratch.path().to_path_buf();
+    let prefs = current_preferences();
+    assert!(r.app.toggle_stats_lens(), "⌘I opens the lens");
+    let (opened, shell) = spliced(&mut r.app, wid, "opened");
+    let card_fp = |app: &App| app.windows[&wid].lens_card.as_ref().map(|c| c.fp);
+    let before = card_fp(&r.app);
+
+    let mut next = (*r.app.vitals.snapshot.clone().expect("a snapshot")).clone();
+    next.seq += 1;
+    r.app.vitals.snapshot = Some(Arc::new(next));
+    let (mut kept, mut was) = spliced(&mut r.app, wid, "a new reading");
+    assert_ne!(
+        card_fp(&r.app),
+        before,
+        "PRECONDITION: the reading moved the card"
+    );
+    assert_eq!(
+        was, shell,
+        "PRECONDITION: a reading leaves the shell's prims"
+    );
+    assert!(
+        Arc::ptr_eq(&kept, &opened),
+        "a new reading keeps the shell's raster"
+    );
+
+    type Move<'a> = Box<dyn Fn(&mut App) + 'a>;
+    let moves: [(&str, Move<'_>); 3] = [
+        (
+            "Increase Contrast",
+            Box::new(|_| {
+                let _ = install_preferences(AppearancePreferences {
+                    high_contrast: true,
+                    ..prefs
+                });
+            }),
+        ),
+        (
+            "the theme",
+            Box::new(|app| {
+                crate::app_colorscheme::install_resolved_colors::apply_config_text(
+                    app,
+                    &dir,
+                    "theme = \"Dracula\"\n[sys]\nstats_bars = \"sill\"\n",
+                );
+            }),
+        ),
+        (
+            "the window's width",
+            Box::new(move |app| {
+                app.windows.get_mut(&wid).expect("the window").cols /= 2;
+            }),
+        ),
+    ];
+    for (step, apply) in &moves {
+        apply(&mut r.app);
+        assert!(
+            r.lens().is_some(),
+            "PRECONDITION: {step} leaves the lens open"
+        );
+        let (raster, fp) = spliced(&mut r.app, wid, step);
+        assert_ne!(fp, was, "PRECONDITION: {step} moves the shell's prims");
+        assert!(
+            !Arc::ptr_eq(&raster, &kept),
+            "{step}: the shell is drawn again"
+        );
+        (kept, was) = (raster, fp);
+    }
+    let _ = install_preferences(prefs);
+}
+
 #[test]
 fn the_sills_instruments_take_motion_presses_and_the_wheel_before_the_grid() {
     let mut r = rig("sill");

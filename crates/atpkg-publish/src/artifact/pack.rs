@@ -16,7 +16,7 @@ use crate::api::{Build, PackOutcome, PackRequest, Packer, Signing};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::identity::MachineKey;
-use crate::programs::{self, Shape};
+use crate::programs::{self, Harness, Shape};
 use crate::triple::{Os, Triple};
 
 /// The plain-program packer.
@@ -125,6 +125,9 @@ pub struct Metadata {
     pub bundle_only: bool,
     /// The program's own crate version (else the first member's, else `0.0.0`).
     pub version: String,
+    /// The version of the package named like the program, when there is one: the only
+    /// version a harness row reads ([`held_to_harness`]).
+    pub own_version: Option<String>,
 }
 
 fn strings(v: Option<&aterm_json::Value>) -> Vec<String> {
@@ -179,13 +182,15 @@ pub fn parse_metadata(json: &[u8], program: &str) -> Result<Metadata> {
                 .and_then(aterm_json::Value::as_bool)
                 == Some(true)
         });
-    let version = packages
+    let own_version = packages
         .iter()
         .find(|p| p.get("name").and_then(aterm_json::Value::as_str) == Some(program))
-        .and_then(version_of)
+        .and_then(version_of);
+    let version = own_version
         .or_else(|| packages.first().and_then(version_of))
         .unwrap_or("0.0.0")
         .to_string();
+    let own_version = own_version.map(str::to_string);
     Ok(Metadata {
         manifests: packages
             .iter()
@@ -197,7 +202,113 @@ pub fn parse_metadata(json: &[u8], program: &str) -> Result<Metadata> {
         build_args: strings(ws.and_then(|a| a.get("build-args"))),
         bundle_only,
         version,
+        own_version,
     })
+}
+
+/// Whether `v` is a release line, `MAJOR.MINOR.0`: decimal, no leading zero, the patch `0`,
+/// and no pre-release or build metadata (the publication versioning rule).
+#[must_use]
+pub fn is_release_line(v: &str) -> bool {
+    let canonical = |p: Option<&str>| {
+        p.is_some_and(|p| {
+            !p.is_empty()
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && (p == "0" || !p.starts_with('0'))
+                && p.parse::<u64>().is_ok()
+        })
+    };
+    let mut parts = v.split('.');
+    let (major, minor, patch) = (parts.next(), parts.next(), parts.next());
+    canonical(major) && canonical(minor) && patch == Some("0") && parts.next().is_none()
+}
+
+/// `meta` held to a harness row's rule ([`Harness`]): its `expose` is the row's tool, or
+/// becomes it when the repo declares none; nothing is bundled; the program-named package is
+/// at a release line ([`is_release_line`]); and the build is `--locked`.
+/// # Errors
+/// A refusal naming the first rule `meta` breaks.
+pub fn held_to_harness(program: &str, h: Harness, mut meta: Metadata) -> Result<Metadata> {
+    if !meta.bundle.is_empty() {
+        return Err(Error::refused(format!(
+            "{program} is a harness: it ships its one tool `{}`, and its repo's \
+             [workspace.metadata.atpkg] bundles {} besides",
+            h.tool,
+            meta.bundle.join(" ")
+        )));
+    }
+    if !meta.expose.is_empty() && meta.expose != [h.tool] {
+        return Err(Error::refused(format!(
+            "{program}'s [workspace.metadata.atpkg] expose names {}, and its harness row \
+             (programs::PROGRAMS) ships exactly `{}` — one of them is wrong; fix it before \
+             anything is built",
+            meta.expose.join(" "),
+            h.tool
+        )));
+    }
+    meta.expose = vec![h.tool.to_string()];
+    let Some(own) = meta.own_version.as_deref() else {
+        return Err(Error::refused(format!(
+            "{program} has no package named {program}: a harness's version is its own \
+             package's [workspace.package] version, never another member's"
+        )));
+    };
+    if !is_release_line(own) {
+        return Err(Error::refused(format!(
+            "{program}'s version `{own}` is not MAJOR.MINOR.0 (the patch is always 0, and a \
+             dev build's `+g<sha>` is the pack's to stamp, never the manifest's)"
+        )));
+    }
+    if !meta.build_args.iter().any(|a| a == "--locked") {
+        meta.build_args.push("--locked".to_string());
+    }
+    Ok(meta)
+}
+
+/// A harness pack's version: the release line `own` with the dev build's `+g<sha>`, where
+/// `sha` is `git rev-parse --short=9` of the commit built.
+/// # Errors
+/// A refusal when `own` is not a release line or `sha` is not at least 9 lowercase hex.
+pub fn dev_version(own: &str, sha: &str) -> Result<String> {
+    if !is_release_line(own) {
+        return Err(Error::refused(format!("`{own}` is not MAJOR.MINOR.0")));
+    }
+    if sha.len() < 9 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(Error::refused(format!(
+            "`{sha}` is not a short commit sha (9 or more lowercase hex)"
+        )));
+    }
+    Ok(format!("{own}+g{sha}"))
+}
+
+/// A harness pack's checked metadata and version, from `checkout` at `build`: refused unless
+/// the checkout is clean and `build` is its `HEAD` commit count, so the `+g<sha>` and the
+/// build number both name the commit built.
+fn mint_harness(
+    program: &str,
+    h: Harness,
+    meta: Metadata,
+    checkout: &Path,
+    build: Build,
+) -> Result<(Metadata, String)> {
+    let meta = held_to_harness(program, h, meta)?;
+    let own = meta.own_version.clone().unwrap_or_default();
+    if !crate::git::is_clean(checkout)? {
+        return Err(Error::refused(format!(
+            "{program}: the checkout {} has changes or untracked files — a harness version \
+             is minted from a clean tree or not at all",
+            checkout.display()
+        )));
+    }
+    let count = crate::git::rev_count(checkout, "HEAD")?;
+    if count != build {
+        return Err(Error::refused(format!(
+            "{program}: build {build} is not the checkout's HEAD (it counts {count} commits) — \
+             a harness's build number and its +g<sha> name one commit"
+        )));
+    }
+    let sha = crate::git::run(checkout, &["rev-parse", "--short=9", "HEAD"])?;
+    Ok((meta, dev_version(&own, &sha)?))
 }
 
 /// The workspace members' freshly built bin executables, from a `--message-format=json` stream: sorted, each once.
@@ -645,6 +756,13 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
              updating user's PATH. Use `atpkg-publish pack-bundle {program}`"
         )));
     }
+    let (meta, version) = match def.harness() {
+        Some(h) => mint_harness(program, h, meta, &request.checkout, build_number)?,
+        None => {
+            let version = meta.version.clone();
+            (meta, version)
+        }
+    };
     pkgdoc::check_exposes(program, &meta.expose)?;
     let exes = build(tools, &tc, request, &meta, &stage_dir)?;
     let gated = arch::gate(request.triple, &exes)?;
@@ -672,7 +790,7 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
     let packed = tarwrite::write_with(&stage_root, &asset, tools.compressor())?;
     let header = Header {
         program: program.clone(),
-        version: meta.version.clone(),
+        version,
         build: build_number,
         exposes: sel.exposes.clone(),
     };

@@ -865,6 +865,45 @@ pub(crate) fn pool_menu_rows(
     )
 }
 
+/// Selects `label` in `cli`'s pool from the fact menu: pins an eligible row at once, or saves a
+/// sign-in request and hands it to `dispatch` when `upkeep_live` holds (cancelling it otherwise).
+pub(crate) fn select_menu_account_for(
+    cli: aterm_agent::harness::accounts::Cli,
+    (roster_path, state_dir, home): (&std::path::Path, &std::path::Path, Option<&std::path::Path>),
+    label: &AccountLabel,
+    now: i64,
+    upkeep_live: bool,
+    dispatch: impl FnOnce(
+        aterm_agent::harness::accounts::PinRequest,
+        std::path::PathBuf,
+    ) -> Result<(), ()>,
+) -> bool {
+    use aterm_agent::harness::accounts;
+    let store = match (cli, home) {
+        (accounts::Cli::Claude, _) => accounts::Store::at(state_dir),
+        (_, Some(home)) => accounts::Store::at_for(state_dir, cli, home),
+        (_, None) => return false,
+    };
+    let Ok(roster) = accounts::Roster::load_for(cli, roster_path) else {
+        return false;
+    };
+    if label.row(&roster).is_none() {
+        return false;
+    }
+    if let Ok(accounts::PinSelection::Renew(request)) =
+        store.select_account_for(cli, &roster, label.as_str(), now)
+    {
+        if let (true, Some(home)) = (upkeep_live, home) {
+            if dispatch(request.clone(), home.to_path_buf()).is_err() {
+                let _ = store.cancel_pin_request(&request, now);
+            }
+        } else {
+            let _ = store.cancel_pin_request(&request, now);
+        }
+    }
+    true
+}
+
 /// The session's own week as the footer holds it, for its own account's row only
 /// ([`account_menu_rows_from`]): the row [`Self::label`] names, else the one whose email the
 /// session's profile names.
@@ -1000,35 +1039,6 @@ impl App {
             })
             .and_then(crate::harness_host::pool_cli)
             .unwrap_or(aterm_agent::harness::accounts::Cli::Claude)
-    }
-
-    /// `aterm harness accounts use <label> --cli <id>` (`--auto` where `label` is `None`) for
-    /// another CLI's pool, from its fact menu: the pin lands in that CLI's own store, where aterm's
-    /// next launch of the CLI reads it ([`aterm_agent::harness::cli::run_accounts_of`]).
-    fn use_pool_account(cli: aterm_agent::harness::accounts::Cli, label: Option<&str>) {
-        use aterm_agent::harness::cli::{
-            AccountsCmd, AccountsOf, Env, LiveAccounts, run_accounts_of,
-        };
-        let Ok(env) = Env::from_process() else {
-            return;
-        };
-        let form = label.map_or(AccountsCmd::Auto, |label| AccountsCmd::Use {
-            label: label.to_string(),
-        });
-        let of = AccountsOf {
-            cli,
-            form,
-            vendor: aterm_agent::harness::accounts::Vendor::default(),
-        };
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let _ = run_accounts_of(&of, &env, &LiveAccounts, &mut out, &mut err);
-        if !err.is_empty() {
-            aterm_log::info!(
-                "fact-menu: accounts use --cli {}: {}",
-                cli.id(),
-                String::from_utf8_lossy(&err).trim()
-            );
-        }
     }
 
     fn fact_menu_facts(&self, session: u64, fact: Fact) -> FactMenuFacts {
@@ -1402,98 +1412,115 @@ impl App {
                 let off = self.fact_mask(session).with(kind, hide);
                 self.set_fact_mask(session, off);
             }
-            FactAct::UseAccount(label)
-                if self.session_cli(session) != aterm_agent::harness::accounts::Cli::Claude =>
-            {
-                Self::use_pool_account(self.session_cli(session), Some(label.as_str()));
-                self.redraw_claude_footer(session);
-            }
-            FactAct::AutoRotate
-                if self.session_cli(session) != aterm_agent::harness::accounts::Cli::Claude =>
-            {
-                Self::use_pool_account(self.session_cli(session), None);
-                self.redraw_claude_footer(session);
-            }
             FactAct::UseAccount(label) => {
                 use aterm_agent::harness::accounts;
+                let cli = self.session_cli(session);
                 let now = aterm_time::unix_secs()
                     .and_then(|n| i64::try_from(n).ok())
                     .unwrap_or(0);
-                if let (Some(roster_path), Some(state_dir)) = (
-                    accounts::default_roster_path(),
-                    crate::harness_host::harness_state(),
-                ) {
-                    let store = accounts::Store::at(&state_dir);
-                    if let Ok(roster) = accounts::Roster::load(&roster_path)
-                        && label.row(&roster).is_some()
-                    {
-                        if let Ok(accounts::PinSelection::Renew(request)) =
-                            store.select_account(&roster, label.as_str(), now)
-                        {
-                            if let (crate::harness_host::AccountsUpkeep::Live, Some(home)) = (
-                                crate::harness_host::live_accounts_upkeep(),
-                                aterm_primer::home_dir(),
-                            ) {
-                                let worker_request = request.clone();
-                                let started = std::thread::Builder::new()
+                let roster_path = if cli == accounts::Cli::Claude {
+                    accounts::default_roster_path()
+                } else {
+                    aterm_types::dirs::aterm_config_path()
+                        .and_then(|cfg| accounts::roster_beside_for(&cfg, cli))
+                };
+                if let (Some(roster_path), Some(state_dir)) =
+                    (roster_path, crate::harness_host::harness_state())
+                {
+                    let home = aterm_primer::home_dir();
+                    let upkeep_live = matches!(
+                        crate::harness_host::live_accounts_upkeep(),
+                        crate::harness_host::AccountsUpkeep::Live
+                    );
+                    if select_menu_account_for(
+                        cli,
+                        (&roster_path, &state_dir, home.as_deref()),
+                        &label,
+                        now,
+                        upkeep_live,
+                        |worker_request, worker_home| {
+                            let worker_state = state_dir.clone();
+                            let worker_roster = roster_path.clone();
+                            std::thread::Builder::new()
                                 .name("aterm-acct-renew".to_string())
                                 .spawn(move || {
-                                    let worker_store = accounts::Store::at(&state_dir);
-                                    let dispatched = aterm_agent::harness::accounts_sync::auto_renew_account_by_label(
-                                        &home,
-                                        &state_dir,
-                                        &roster_path,
+                                    let worker_store =
+                                        accounts::Store::at_for(&worker_state, cli, &worker_home);
+                                    let dispatched = aterm_agent::harness::accounts_sync::auto_renew_account_by_label_for(
+                                        cli,
+                                        &worker_home,
+                                        &worker_state,
+                                        &worker_roster,
                                         worker_request.clone(),
                                         now,
                                     );
-                                    if dispatched == aterm_agent::harness::accounts_sync::RenewalDispatch::Failed {
-                                        let now_done = aterm_agent::supervise::limit::unix_now().max(now);
-                                        let _ = worker_store.cancel_pin_request(&worker_request, now_done);
+                                    if dispatched
+                                        == aterm_agent::harness::accounts_sync::RenewalDispatch::Failed
+                                    {
+                                        let now_done =
+                                            aterm_agent::supervise::limit::unix_now().max(now);
+                                        let _ = worker_store
+                                            .cancel_pin_request(&worker_request, now_done);
                                     }
-                                });
-                                if started.is_err() {
-                                    let _ = store.cancel_pin_request(&request, now);
-                                }
-                            } else {
-                                let _ = store.cancel_pin_request(&request, now);
-                            }
-                        }
+                                })
+                                .map(|_| ())
+                                .map_err(|_| ())
+                        },
+                    ) {
                         self.redraw_claude_footer(session);
                     }
                 }
             }
             FactAct::AutoRotate => {
                 use aterm_agent::harness::accounts;
+                let cli = self.session_cli(session);
                 let now = aterm_time::unix_secs()
                     .and_then(|n| i64::try_from(n).ok())
                     .unwrap_or(0);
                 if let Some(state_dir) = crate::harness_host::harness_state() {
-                    let store = accounts::Store::at(&state_dir);
-                    let mut note = None;
-                    let _ =
-                        store.transact_within(&accounts::LOCK_LADDER, now, &mut note, |state| {
-                            Ok(accounts::unpin(state, "fact-menu", now)
-                                .into_iter()
-                                .collect())
-                        });
-                    let upkeep = crate::harness_host::live_accounts_upkeep();
-                    let _ = std::thread::Builder::new()
-                        .name("aterm-acct-rotate".to_string())
-                        .spawn(move || {
-                            upkeep.make(aterm_agent::harness::accounts_sync::UpkeepStep::Both);
-                            if matches!(upkeep, crate::harness_host::AccountsUpkeep::Live)
-                                && let (Some(home), Some(roster_path)) =
-                                    (aterm_primer::home_dir(), accounts::default_roster_path())
-                            {
-                                let _ = aterm_agent::harness::accounts_sync::auto_renew_next_account_interactive(
-                                    &home,
-                                    &state_dir,
-                                    &roster_path,
-                                    now,
-                                );
-                            }
-                        });
-                    self.redraw_claude_footer(session);
+                    let home = aterm_primer::home_dir();
+                    let store = match (cli, home.as_deref()) {
+                        (accounts::Cli::Claude, _) => Some(accounts::Store::at(&state_dir)),
+                        (_, Some(h)) => Some(accounts::Store::at_for(&state_dir, cli, h)),
+                        (_, None) => None,
+                    };
+                    if let Some(store) = store {
+                        let mut note = None;
+                        let _ = store.transact_within(
+                            &accounts::LOCK_LADDER,
+                            now,
+                            &mut note,
+                            |state| {
+                                Ok(accounts::unpin(state, "fact-menu", now)
+                                    .into_iter()
+                                    .collect())
+                            },
+                        );
+                        let roster_path = if cli == accounts::Cli::Claude {
+                            accounts::default_roster_path()
+                        } else {
+                            aterm_types::dirs::aterm_config_path()
+                                .and_then(|cfg| accounts::roster_beside_for(&cfg, cli))
+                        };
+                        let upkeep = crate::harness_host::live_accounts_upkeep();
+                        let _ = std::thread::Builder::new()
+                            .name("aterm-acct-rotate".to_string())
+                            .spawn(move || {
+                                upkeep.make(aterm_agent::harness::accounts_sync::UpkeepStep::Both);
+                                if matches!(upkeep, crate::harness_host::AccountsUpkeep::Live)
+                                    && let (Some(home), Some(roster_path)) = (home, roster_path)
+                                {
+                                    let _ = aterm_agent::harness::accounts_sync::auto_renew_next_account_interactive_for(
+                                        cli,
+                                        &home,
+                                        &state_dir,
+                                        &roster_path,
+                                        now,
+                                    );
+                                }
+                            });
+                        self.redraw_claude_footer(session);
+                    }
                 }
             }
             FactAct::AccountSettings => {

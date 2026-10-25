@@ -14,9 +14,11 @@ use aterm_effects::aos_momentum::lease::{LIMITS_V1, Token, WorkerId};
 use aterm_effects::aos_momentum::m4::Spread;
 use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
+use crate::spread::Threads;
+
 use super::{
-    Fault, FaultKind, PoolArgs, STDERR_TAIL, Tail, Threads, Timed, frame_bytes, frame_step,
-    percentiles, read_frame, read_worker,
+    Fault, FaultKind, PoolArgs, STDERR_TAIL, Tail, Timed, frame_bytes, frame_step, percentiles,
+    read_frame, read_worker,
 };
 
 fn progress(k: u16) -> Vec<u8> {

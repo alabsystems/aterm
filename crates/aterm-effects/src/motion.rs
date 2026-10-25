@@ -60,12 +60,17 @@ pub enum MotionEffect {
     BandProgress,
     /// The harness card's motion (`HarnessCard::tick`'s `animate`): its intro — the border's drift and specular head, the trail's step wave and shimmer, the kitty's blink and tail flick, the stars' twinkle and burst — and the FLOW after it, for as long as this verdict allows: the border's hue travelling on and Claude's mascot ripple running out from its wand across the card (`crate::ripple`).
     HarnessCard,
+    /// The stats deck's live edge (`aterm-gui`'s `stats_live`): its strips' glide to the left
+    /// between readings and the beat of its now marker at each reading. At 0 the columns stand in
+    /// their slots and the marker stands still; it still turns grey when readings stop, since that
+    /// is information, not motion.
+    DeckLive,
 }
 
 impl MotionEffect {
     /// The complete governed-effect set, which the totality proof iterates.
     #[cfg(test)]
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::CursorGlow,
         Self::WordSparkles,
         Self::SmoothScroll,
@@ -75,6 +80,7 @@ impl MotionEffect {
         Self::UpgradeSurge,
         Self::BandProgress,
         Self::HarnessCard,
+        Self::DeckLive,
     ];
 
     /// Whether this effect is functional motion the host's load-shed latch (`perf_reduced`) must
@@ -90,7 +96,8 @@ impl MotionEffect {
             | Self::OutputStreak
             | Self::UpgradeSurge
             | Self::BandProgress
-            | Self::HarnessCard => false,
+            | Self::HarnessCard
+            | Self::DeckLive => false,
         }
     }
 }
@@ -125,11 +132,13 @@ pub enum SeriousEffect {
     HarnessTicker,
     /// Prism wake's comet over new program output: decoration, so serious mode takes it with the rest (its pip goes with [`Self::TerminalSound`]).
     OutputStreak,
+    /// The beat of the stats deck's now marker at each reading: decoration, so serious mode takes it; the marker, its grey when readings stop and the strips' glide stay.
+    DeckBeat,
 }
 
 impl SeriousEffect {
     #[cfg(test)]
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::TerminalSound,
         Self::CursorTrail,
         Self::CursorGlow,
@@ -144,6 +153,7 @@ impl SeriousEffect {
         Self::HarnessCard,
         Self::HarnessTicker,
         Self::OutputStreak,
+        Self::DeckBeat,
     ];
 }
 
@@ -177,7 +187,8 @@ impl SeriousModePolicy {
             | SeriousEffect::BandProgress
             | SeriousEffect::HarnessCard
             | SeriousEffect::HarnessTicker
-            | SeriousEffect::OutputStreak => !self.serious,
+            | SeriousEffect::OutputStreak
+            | SeriousEffect::DeckBeat => !self.serious,
         }
     }
 }
@@ -217,7 +228,8 @@ impl MotionPolicy {
                 | MotionEffect::OutputStreak
                 | MotionEffect::UpgradeSurge
                 | MotionEffect::BandProgress
-                | MotionEffect::HarnessCard => 0.0,
+                | MotionEffect::HarnessCard
+                | MotionEffect::DeckLive => 0.0,
             },
         }
     }

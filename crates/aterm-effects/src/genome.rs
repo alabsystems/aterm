@@ -1122,15 +1122,17 @@ mod tests {
     }
 
     /// Deterministic voter-set stream for the §3.2 kernel-equivalence battery.
-    fn voter_set(i: u64, present: u16) -> VoterSet {
+    const fn voter_set(i: u64, present: u16) -> VoterSet {
         let mut v = VoterSet {
             hash: [0; 9],
             present,
         };
-        for (s, h) in v.hash.iter_mut().enumerate() {
-            *h = mix(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        let mut s = 0usize;
+        while s < 9 {
+            v.hash[s] = mix(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
                 ^ (s as u64) << 56
                 ^ 0x5851_F42D_4C95_7F2D);
+            s += 1;
         }
         v
     }

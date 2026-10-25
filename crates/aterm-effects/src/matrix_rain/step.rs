@@ -69,12 +69,20 @@ impl RainLatches {
     /// Exit status → weather (OSC 133/633): `Some(failed)` once per new
     /// completion in the same session; a tab switch re-baselines silently.
     #[inline]
-    fn take_new_completion(&mut self, session: u64, cmd_done: Option<(u64, i32)>) -> Option<bool> {
-        let key = (session, cmd_done.map_or(0, |(seq, _)| seq));
-        if self.last_cmd == Some(key) {
+    const fn take_new_completion(
+        &mut self,
+        session: u64,
+        cmd_done: Option<(u64, i32)>,
+    ) -> Option<bool> {
+        let seq = match cmd_done {
+            Some((s, _)) => s,
+            None => 0,
+        };
+        let key = (session, seq);
+        if matches!(self.last_cmd, Some(k) if k.0 == key.0 && k.1 == key.1) {
             return None;
         }
-        let same_session = self.last_cmd.is_some_and(|(sid, _)| sid == session);
+        let same_session = matches!(self.last_cmd, Some((sid, _)) if sid == session);
         self.last_cmd = Some(key);
         match cmd_done {
             Some((_, code)) if same_session => Some(code != 0),

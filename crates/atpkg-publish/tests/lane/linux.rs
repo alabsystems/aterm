@@ -943,3 +943,58 @@ fn a_signed_manifest_the_client_would_refuse_is_never_uploaded() {
     assert!(!w.staged().join("READY.md").exists());
     assert_eq!(w.fx.indexer.count(), 0);
 }
+
+#[test]
+fn a_pinned_harness_is_apple_only_and_the_linux_lane_builds_and_fetches_nothing_for_it() {
+    let w = World::new("linux-harness");
+    let _ = w.fx.dev_repo("muse-alab", 3);
+    w.fx.publish_pkg(
+        "muse-alab",
+        3,
+        &manifest("muse-alab", 3, &[AARCH64_APPLE_DARWIN]),
+    );
+    w.fx.publish_head(
+        8,
+        &[
+            ("ay", 10),
+            ("clean", 20),
+            ("trust", 30),
+            ("trust-ir", 40),
+            ("muse-alab", 3),
+        ],
+    );
+    let (o, tx) = ok(w.run(true));
+    assert_eq!(*decision(&o, "muse-alab"), Decision::AppleOnly);
+    assert!(
+        table_row(&tx, "muse-alab").contains("APPLE-ONLY: a harness ships Apple silicon only"),
+        "{}",
+        tx.text()
+    );
+    assert_eq!(
+        *decision(&o, "clean"),
+        Decision::Build { held: vec![] },
+        "the other rows are planned as before"
+    );
+    w.keyless();
+    let (o, tx) = ok(w.run(false));
+    assert!(
+        !o.staged.contains(&"muse-alab".to_string()),
+        "{}",
+        tx.text()
+    );
+    assert!(
+        w.fx.packer.legs().iter().all(|(p, _, _)| p != "muse-alab"),
+        "no Linux row is packed: {:?}",
+        w.fx.packer.legs()
+    );
+    let touched: Vec<String> =
+        w.fx.host
+            .calls()
+            .into_iter()
+            .filter(|c| c.contains("muse-alab"))
+            .collect();
+    assert!(
+        touched.is_empty(),
+        "its staging manifest is never fetched nor its repo cloned: {touched:?}"
+    );
+}

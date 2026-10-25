@@ -985,7 +985,7 @@ impl App {
             .map_or((false, false), |palette| palette.pointer_release(hit));
         self.repaint_palette_pointer(wid, changed);
         if activate {
-            self.palette_activate();
+            self.palette_activate_in(wid);
         }
     }
 
@@ -2900,15 +2900,15 @@ impl App {
             crate::claude_lights::OverChips::No => {}
         }
         if let Some((session, url)) = self.claude_notice_at(wid, px, py) {
-            let held = self
-                .windows
-                .get(&wid)
-                .is_some_and(|ws| link_modifier_held(ws.mods));
+            let mods = self.windows.get(&wid).map(|ws| ws.mods).unwrap_or_default();
+            let held = link_modifier_held(mods);
             let tracking = self
                 .pool
                 .get(session)
                 .is_some_and(|owner| owner.ctx.modes.mouse_tracking_enabled());
-            if url.is_some() && held {
+            // The hand where a press opens the link (`press_claude_notice`): with the link
+            // modifier, or with no modifier in the focused pane.
+            if url.is_some() && (held || (mods.is_empty() && self.session_is_front(wid, session))) {
                 self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
             } else if tracking {
                 self.set_hover_cursor(wid, CursorIcon::Default, false, false);

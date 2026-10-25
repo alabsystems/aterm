@@ -666,8 +666,10 @@ impl MatrixRain {
     }
 
     /// PTY content mutation observed (`Terminal::content_seq()`): sustained deltas drive WORKING.
-    pub fn note_activity(&mut self, content_seq: u64) {
-        let Some(previous) = self.last_seq.replace(content_seq) else {
+    pub const fn note_activity(&mut self, content_seq: u64) {
+        let previous = self.last_seq;
+        self.last_seq = Some(content_seq);
+        let Some(previous) = previous else {
             return;
         };
         if content_seq < previous {
@@ -678,11 +680,14 @@ impl MatrixRain {
         }
         let delta = content_seq.saturating_sub(previous);
         if delta > 0 {
-            let credit = delta.min(u64::from(CONTENT_CREDIT_CAP)) as u8;
-            self.pending_content_credit = self
-                .pending_content_credit
-                .saturating_add(credit)
-                .min(CONTENT_CREDIT_CAP);
+            let cap = CONTENT_CREDIT_CAP as u64;
+            let credit = (if delta < cap { delta } else { cap }) as u8;
+            let sum = self.pending_content_credit.saturating_add(credit);
+            self.pending_content_credit = if sum < CONTENT_CREDIT_CAP {
+                sum
+            } else {
+                CONTENT_CREDIT_CAP
+            };
         }
     }
 
@@ -766,21 +771,33 @@ impl MatrixRain {
 
     /// Ingest one payload-free observable-work pulse.
     #[inline]
-    pub fn note_signal(&mut self, code: u32, weight: u32) {
+    pub const fn note_signal(&mut self, code: u32, weight: u32) {
         let Some(signal) = RainSignal::from_code(code) else {
             return;
         };
-        if signal == RainSignal::TurnStart {
+        if matches!(signal, RainSignal::TurnStart) {
             self.material_editing = false;
         }
         if !self.cfg.enabled || self.reduced_motion {
             return;
         }
-        self.pending_turn_start |= signal == RainSignal::TurnStart;
-        let weight = weight.clamp(1, u32::from(SEMANTIC_ENERGY_CAP)) as u8;
+        self.pending_turn_start |= matches!(signal, RainSignal::TurnStart);
+        let cap = SEMANTIC_ENERGY_CAP as u32;
+        let weight = if weight < 1 {
+            1
+        } else if weight > cap {
+            SEMANTIC_ENERGY_CAP
+        } else {
+            weight as u8
+        };
         match self.pending_signal {
             Some((current, current_weight)) if current.priority() > signal.priority() => {
-                self.pending_signal = Some((current, current_weight.max(weight)));
+                let max_w = if current_weight > weight {
+                    current_weight
+                } else {
+                    weight
+                };
+                self.pending_signal = Some((current, max_w));
             }
             _ => self.pending_signal = Some((signal, weight)),
         }
@@ -794,15 +811,23 @@ impl MatrixRain {
 
     /// Host-reported pane visibility (drain-on-unfocus policy).
     #[inline]
-    pub fn set_visibility(&mut self, v: RainVisibility) {
-        if v == self.visibility {
+    pub const fn set_visibility(&mut self, v: RainVisibility) {
+        if matches!(
+            (v, self.visibility),
+            (RainVisibility::Focused, RainVisibility::Focused)
+                | (
+                    RainVisibility::VisibleUnfocused,
+                    RainVisibility::VisibleUnfocused
+                )
+                | (RainVisibility::Hidden, RainVisibility::Hidden)
+        ) {
             return;
         }
         self.visibility = v;
         match v {
             RainVisibility::Hidden => self.drain_ticks = DRAIN_TICKS,
             RainVisibility::Focused => {
-                if self.weather != RainWeather::Sleep {
+                if !matches!(self.weather, RainWeather::Sleep) {
                     self.drain_ticks = 0;
                 }
             }
@@ -1050,7 +1075,7 @@ impl MatrixRain {
     /// Clockless core of [`Self::tick_suspended`] (web hosts pair it with [`Self::advance_ms`],
     /// exactly like `emit`).
     #[inline]
-    pub fn step_suspended(&mut self) {
+    pub const fn step_suspended(&mut self) {
         self.pending_key = false;
         self.pending_content_credit = 0;
         self.advance_engine_ticks();
@@ -1108,7 +1133,7 @@ impl MatrixRain {
     /// Whether the host should keep the rain timer armed.
     #[must_use]
     #[inline]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         if !self.cfg.enabled || self.reduced_motion {
             return false;
         }
@@ -1123,7 +1148,7 @@ impl MatrixRain {
         }
         match self.visibility {
             RainVisibility::Focused => {
-                self.eff_weather() != RainWeather::Sleep || self.drain_ticks < DRAIN_TICKS
+                !matches!(self.eff_weather(), RainWeather::Sleep) || self.drain_ticks < DRAIN_TICKS
             }
             _ => self.drain_ticks < DRAIN_TICKS,
         }
@@ -1196,29 +1221,31 @@ impl MatrixRain {
         self.cfg
     }
 
-    fn apply_pending_notes(&mut self) {
+    const fn apply_pending_notes(&mut self) {
         let now = self.clock_ms;
         if self.pending_key {
             self.pending_key = false;
             self.last_key_ms = Some(now);
         }
-        if std::mem::take(&mut self.pending_turn_start) {
+        let turn_start = self.pending_turn_start;
+        self.pending_turn_start = false;
+        if turn_start {
             self.last_key_ms = None;
             self.last_content_ms = None;
             self.content_streak = 0;
         }
-        let credit = std::mem::take(&mut self.pending_content_credit);
+        let credit = self.pending_content_credit;
+        self.pending_content_credit = 0;
         if credit > 0 {
-            let echo = self
-                .last_key_ms
-                .is_some_and(|k| now.saturating_sub(k) < ECHO_DISCOUNT_MS);
+            let echo =
+                matches!(self.last_key_ms, Some(k) if now.saturating_sub(k) < ECHO_DISCOUNT_MS);
             let content_credit = if echo { 0 } else { credit };
             if content_credit > 0 {
                 self.content_streak = match self.last_content_ms {
-                    Some(prev) if now.saturating_sub(prev) <= STREAK_WINDOW_MS => self
-                        .content_streak
-                        .saturating_add(u32::from(content_credit)),
-                    _ => u32::from(content_credit),
+                    Some(prev) if now.saturating_sub(prev) <= STREAK_WINDOW_MS => {
+                        self.content_streak.saturating_add(content_credit as u32)
+                    }
+                    _ => content_credit as u32,
                 };
                 self.last_content_ms = Some(now);
             }
@@ -1229,7 +1256,9 @@ impl MatrixRain {
                 self.bell_until_ms = now + BELL_ALERT_MS;
             }
         }
-        if let Some(failed) = self.pending_exit.take() {
+        let exit = self.pending_exit;
+        self.pending_exit = None;
+        if let Some(failed) = exit {
             // Exit status: success rides the turn-wave machinery
             // (limiter-bounded); failure holds the ember ramp.
             if self.cfg.exit_tint {
@@ -1240,10 +1269,16 @@ impl MatrixRain {
                 }
             }
         }
-        if let Some((signal, energy)) = self.pending_signal.take() {
-            let phase_changed = self.semantic_phase != signal;
+        let pending_sig = self.pending_signal;
+        self.pending_signal = None;
+        if let Some((signal, energy)) = pending_sig {
+            let phase_changed = (self.semantic_phase as u8) != (signal as u8);
             self.semantic_phase = signal;
-            self.semantic_energy = energy.min(SEMANTIC_ENERGY_CAP);
+            self.semantic_energy = if energy < SEMANTIC_ENERGY_CAP {
+                energy
+            } else {
+                SEMANTIC_ENERGY_CAP
+            };
             self.semantic_ticks_left = SEMANTIC_HOLD_TICKS;
             self.semantic_started_ms = now;
             if phase_changed {
@@ -1301,7 +1336,7 @@ impl MatrixRain {
         }
     }
 
-    fn advance_engine_ticks(&mut self) -> bool {
+    const fn advance_engine_ticks(&mut self) -> bool {
         let mut ticked = false;
         let backlog = self.clock_ms.saturating_sub(self.consumed_ms);
         if backlog > CATCHUP_MS {
@@ -1321,7 +1356,7 @@ impl MatrixRain {
         }
     }
 
-    fn step_engine_tick(&mut self) {
+    const fn step_engine_tick(&mut self) {
         self.tick += 1;
         let now = self.consumed_ms;
         if self.semantic_ticks_left > 0 && now >= self.semantic_started_ms {
@@ -1332,15 +1367,17 @@ impl MatrixRain {
             }
         }
         let desired = self.desired_weather(now);
-        if desired != self.weather && now.saturating_sub(self.weather_since_ms) >= DWELL_MS {
+        if (desired as u8) != (self.weather as u8)
+            && now.saturating_sub(self.weather_since_ms) >= DWELL_MS
+        {
             // Any transition out of Working is a completed turn, including a
             // direct Working→Sleep jump at the idle_secs minimum (where Calm is
             // skipped).
-            if self.weather == RainWeather::Working
-                && desired != RainWeather::Working
+            if matches!(self.weather, RainWeather::Working)
+                && !matches!(desired, RainWeather::Working)
                 && self.cfg.turn_wave
                 && !self.reduced_motion
-                && self.visibility == RainVisibility::Focused
+                && matches!(self.visibility, RainVisibility::Focused)
             {
                 self.wave_pending = true;
             }
@@ -1348,7 +1385,7 @@ impl MatrixRain {
             self.weather_since_ms = now;
         }
         let eff = self.eff_weather();
-        let target = i32::from(self.cfg.density)
+        let target = (self.cfg.density as i32)
             * match eff {
                 RainWeather::Working => 21,
                 RainWeather::Calm => 7,
@@ -1361,11 +1398,15 @@ impl MatrixRain {
             self.ring.push(self.tick, byte);
         }
         if self.wave_pending && self.drain_ticks == 0 {
-            let live = self
-                .ign_ms
-                .iter()
-                .filter(|&&t| t != u64::MAX && now.saturating_sub(t) < 1000)
-                .count();
+            let mut live = 0usize;
+            let mut i = 0;
+            while i < WAVE_IGNITIONS_PER_SEC {
+                let t = self.ign_ms[i];
+                if t != u64::MAX && now.saturating_sub(t) < 1000 {
+                    live += 1;
+                }
+                i += 1;
+            }
             if live < WAVE_IGNITIONS_PER_SEC {
                 let idx = if self.ign_ms[0] == u64::MAX {
                     0
@@ -1377,30 +1418,38 @@ impl MatrixRain {
                     1
                 };
                 self.ign_ms[idx] = now;
-                let len = (WAVE_MS / self.current_period_ms()).max(1) as u32;
+                let raw_len = (WAVE_MS / self.current_period_ms()) as u32;
+                let len = if raw_len > 1 { raw_len } else { 1 };
                 self.wave = Some((self.tick, len));
                 self.wave_pending = false;
             }
         }
-        if self.visibility == RainVisibility::Hidden {
+        if matches!(self.visibility, RainVisibility::Hidden) {
             self.drain_ticks = DRAIN_TICKS;
-        } else if self.visibility != RainVisibility::Focused || eff == RainWeather::Sleep {
-            self.drain_ticks = (self.drain_ticks + 1).min(DRAIN_TICKS);
+        } else if !matches!(self.visibility, RainVisibility::Focused)
+            || matches!(eff, RainWeather::Sleep)
+        {
+            let next_drain = self.drain_ticks + 1;
+            self.drain_ticks = if next_drain < DRAIN_TICKS {
+                next_drain
+            } else {
+                DRAIN_TICKS
+            };
         } else {
             self.drain_ticks = 0;
         }
         if let Some((start, len)) = self.wave
-            && self.tick.saturating_sub(start) > u64::from(len)
+            && self.tick.saturating_sub(start) > len as u64
         {
             self.wave = None;
         }
     }
 
-    fn desired_weather(&self, now: u64) -> RainWeather {
-        let content_recent = self
-            .last_content_ms
-            .is_some_and(|t| now.saturating_sub(t) < WORKING_HOLD_MS)
-            && self.content_streak >= 2;
+    const fn desired_weather(&self, now: u64) -> RainWeather {
+        let content_recent = matches!(
+            self.last_content_ms,
+            Some(t) if now.saturating_sub(t) < WORKING_HOLD_MS
+        ) && self.content_streak >= 2;
         if content_recent {
             return RainWeather::Working;
         }
@@ -1419,11 +1468,9 @@ impl MatrixRain {
                 RainSignal::AssistantStream => {}
             }
         }
-        let idle_ms = u64::from(self.cfg.idle_secs) * 1000;
-        let any_recent = [self.last_content_ms, self.last_key_ms]
-            .iter()
-            .flatten()
-            .any(|&t| now.saturating_sub(t) < idle_ms);
+        let idle_ms = (self.cfg.idle_secs as u64) * 1000;
+        let any_recent = matches!(self.last_content_ms, Some(t) if now.saturating_sub(t) < idle_ms)
+            || matches!(self.last_key_ms, Some(t) if now.saturating_sub(t) < idle_ms);
         if any_recent {
             RainWeather::Calm
         } else {
@@ -1587,7 +1634,7 @@ impl MatrixRain {
 
     /// Apply the drain penalty + flicker dither to a base trail level.
     #[inline]
-    fn drained_level(
+    const fn drained_level(
         &self,
         ctx: &EmitCtx<'_>,
         cp: &ColParams,
@@ -1595,12 +1642,13 @@ impl MatrixRain {
         row: u32,
         is_head: bool,
     ) -> Option<u32> {
-        let mut lvl = i64::from(lvl0) - i64::from(ctx.pen);
+        let mut lvl = lvl0 as i64 - ctx.pen as i64;
         if lvl < 0 {
             return None;
         }
         if !is_head {
-            lvl = (lvl - i64::from(dither(cp.h, row, ctx.dither_epoch))).max(0);
+            let d = lvl - dither(cp.h, row, ctx.dither_epoch) as i64;
+            lvl = if d > 0 { d } else { 0 };
         }
         Some(lvl as u32)
     }
@@ -1608,7 +1656,7 @@ impl MatrixRain {
     /// One resolved rain cell quad (tile rect from the baker, tint/alpha from
     /// the ramp, `flip_x` from the glyph hash).
     #[inline]
-    fn cell_quad(
+    const fn cell_quad(
         &self,
         ctx: &EmitCtx<'_>,
         col: u16,
@@ -1619,16 +1667,21 @@ impl MatrixRain {
     ) -> RainCell {
         let (cw, ch) = (ctx.geom.cell_w, ctx.geom.cell_h);
         let (g, flip_x) = match material_start {
-            None => glyph_from_epoch(self.seed32, row, u32::from(col), ctx.glyph_epoch),
+            None => glyph_from_epoch(self.seed32, row, col as u32, ctx.glyph_epoch),
             Some(start) => {
                 let ix = self.semantic_material_index(start, col, row, ctx.glyph_epoch);
-                (u32::from(self.material[ix]), false)
+                (self.material.as_slice()[ix] as u32, false)
             }
         };
         let alpha = if head {
             self.head_alpha
         } else {
             self.alpha_of(lvl)
+        };
+        let ramp_ix = if (lvl as usize) < 15 {
+            lvl as usize
+        } else {
+            15
         };
         RainCell {
             row: row as u16,
@@ -1637,7 +1690,7 @@ impl MatrixRain {
             w: cw,
             h: ch,
             glyph: (g % rom::ROM_GLYPHS as u32) as u8,
-            tint: ctx.ramp[(lvl as usize).min(15)],
+            tint: ctx.ramp[ramp_ix],
             alpha,
             flip_x,
         }
@@ -1645,11 +1698,18 @@ impl MatrixRain {
 
     /// Map an emitted cell onto the output tape.
     #[inline]
-    fn semantic_material_index(&self, start: usize, col: u16, row: u32, glyph_epoch: u32) -> usize {
+    const fn semantic_material_index(
+        &self,
+        start: usize,
+        col: u16,
+        row: u32,
+        glyph_epoch: u32,
+    ) -> usize {
         let len = self.material.len();
         debug_assert!(len > 0);
         let row = row as usize;
         let epoch = glyph_epoch as usize;
+        let third = if len / 3 > 1 { len / 3 } else { 1 };
         let offset = match self.semantic_phase {
             RainSignal::Inspect => row.wrapping_add(epoch),
             RainSignal::Modify if col % 2 == 1 => len.wrapping_sub(row.wrapping_add(epoch) % len),
@@ -1658,7 +1718,7 @@ impl MatrixRain {
             RainSignal::Network => row / 2 + epoch,
             RainSignal::Branch => row
                 .wrapping_add(epoch)
-                .wrapping_add(usize::from(col % 3) * (len / 3).max(1)),
+                .wrapping_add((col % 3) as usize * third),
             RainSignal::Waiting => row.wrapping_add(epoch / 4),
             RainSignal::Success
             | RainSignal::Failure
@@ -1673,9 +1733,9 @@ impl MatrixRain {
     /// column (or, under a semantic pulse, of its lane) — constant for every
     /// row of the column this frame.
     #[inline]
-    fn material_start(&self, col: u16) -> usize {
-        if self.semantic_phase == RainSignal::AssistantStream {
-            return field::rain_hash32(u32::from(col) ^ self.seed32 ^ 0x00C0_FFEE) as usize;
+    const fn material_start(&self, col: u16) -> usize {
+        if matches!(self.semantic_phase, RainSignal::AssistantStream) {
+            return field::rain_hash32((col as u32) ^ self.seed32 ^ 0x00C0_FFEE) as usize;
         }
         let base_width = match self.semantic_phase {
             RainSignal::Inspect | RainSignal::Modify => 2,
@@ -1688,9 +1748,10 @@ impl MatrixRain {
             | RainSignal::TurnStart => 4,
             RainSignal::AssistantStream => 1,
         };
-        let lane_width =
-            (base_width + u16::from(self.semantic_energy.saturating_sub(1) / 3)).min(8);
-        let lane = u32::from(col / lane_width.max(1));
+        let raw_w = base_width + (self.semantic_energy.saturating_sub(1) / 3) as u16;
+        let lane_width = if raw_w < 8 { raw_w } else { 8 };
+        let denom = if lane_width > 1 { lane_width } else { 1 };
+        let lane = (col / denom) as u32;
         field::rain_hash32(
             lane ^ self.seed32 ^ self.semantic_seq.wrapping_mul(0x9E37_79B9) ^ 0x005E_A11C,
         ) as usize
@@ -1886,11 +1947,26 @@ impl MatrixRain {
     /// (first enable, resize, full damage), the bottom
     /// [`HIDDEN_CURSOR_BAND_ROWS`] rows.
     #[inline]
-    fn row_banded(r: usize, rows: usize, cursor: Option<(u16, u16)>, hidden_band: &[u16]) -> bool {
+    const fn row_banded(
+        r: usize,
+        rows: usize,
+        cursor: Option<(u16, u16)>,
+        hidden_band: &[u16],
+    ) -> bool {
         let row = r as u16;
-        cursor.is_some_and(|(cr, _)| i32::from(cr.abs_diff(row)) <= CURSOR_BAND_ROWS)
-            || hidden_band.contains(&row)
-            || (cursor.is_none() && hidden_band.is_empty() && r + HIDDEN_CURSOR_BAND_ROWS >= rows)
+        if let Some((cr, _)) = cursor
+            && (cr.abs_diff(row) as i32) <= CURSOR_BAND_ROWS
+        {
+            return true;
+        }
+        let mut i = 0;
+        while i < hidden_band.len() {
+            if hidden_band[i] == row {
+                return true;
+            }
+            i += 1;
+        }
+        cursor.is_none() && hidden_band.is_empty() && r + HIDDEN_CURSOR_BAND_ROWS >= rows
     }
 
     fn emit_halos(&mut self, ctx: &EmitCtx<'_>, add: &mut Vec<RainHalo>) {
@@ -2141,41 +2217,48 @@ fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
 /// Which of the 64 dynamic-ROM slots change character between two sorted slot
 /// tables (bit `i` ⇒ slot `i` must be re-authored and re-baked).
 #[inline]
-fn slot_change_mask(old: &[char], new: &[char]) -> u64 {
+const fn slot_change_mask(old: &[char], new: &[char]) -> u64 {
     let mut mask = 0u64;
-    for slot in 0..rom::ROM_GLYPHS {
-        if old.get(slot) != new.get(slot) {
+    let mut slot = 0;
+    while slot < rom::ROM_GLYPHS {
+        let same = match (slot < old.len(), slot < new.len()) {
+            (true, true) => old[slot] == new[slot],
+            (false, false) => true,
+            _ => false,
+        };
+        if !same {
             mask |= 1u64 << slot;
         }
+        slot += 1;
     }
     mask
 }
 
-fn fingerprint(quads: &[RainCell], add: &[RainHalo], tick: u64, atlas_version: u64) -> u64 {
+const fn fingerprint(quads: &[RainCell], add: &[RainHalo], tick: u64, atlas_version: u64) -> u64 {
     if quads.is_empty() && add.is_empty() {
         return 0;
     }
     let mut h = fnv_mix_u64(FNV64_OFFSET, atlas_version);
-    for q in quads {
-        let a = u64::from(q.row)
-            | (u64::from(q.x) << 16)
-            | (u64::from(q.y) << 32)
-            | (u64::from(q.w) << 48);
-        let b = u64::from(q.h) | (u64::from(q.glyph) << 16);
-        let c = u64::from(q.tint) | (u64::from(q.alpha) << 48) | (u64::from(q.flip_x) << 56);
+    let mut i = 0;
+    while i < quads.len() {
+        let q = &quads[i];
+        let a = (q.row as u64) | ((q.x as u64) << 16) | ((q.y as u64) << 32) | ((q.w as u64) << 48);
+        let b = (q.h as u64) | ((q.glyph as u64) << 16);
+        let c = (q.tint as u64) | ((q.alpha as u64) << 48) | ((q.flip_x as u64) << 56);
         h = fnv_mix_u64(h, a);
         h = fnv_mix_u64(h, b);
         h = fnv_mix_u64(h, c);
+        i += 1;
     }
     h = fnv_mix_u64(h, tick.wrapping_mul(0x9E37_79B1));
-    for g in add {
-        let a = u64::from(g.row)
-            | (u64::from(g.x) << 16)
-            | (u64::from(g.y) << 32)
-            | (u64::from(g.w) << 48);
-        let b = u64::from(g.h) | (u64::from(g.color) << 16);
+    let mut j = 0;
+    while j < add.len() {
+        let g = &add[j];
+        let a = (g.row as u64) | ((g.x as u64) << 16) | ((g.y as u64) << 32) | ((g.w as u64) << 48);
+        let b = (g.h as u64) | ((g.color as u64) << 16);
         h = fnv_mix_u64(h, a);
         h = fnv_mix_u64(h, b);
+        j += 1;
     }
     h
 }
@@ -2187,23 +2270,23 @@ mod tests {
 
     use super::*;
 
-    fn cfg_on() -> RainConfig {
+    const fn cfg_on() -> RainConfig {
         RainConfig {
             enabled: true,
             output_material: false,
             seed: 7,
-            ..RainConfig::default()
+            ..RainConfig::DEFAULT
         }
     }
 
-    fn literal_cfg_on() -> RainConfig {
+    const fn literal_cfg_on() -> RainConfig {
         RainConfig {
             output_material: true,
             ..cfg_on()
         }
     }
 
-    fn geom(rows: u16, cols: u16, cw: u16, ch: u16) -> EffectGeom {
+    const fn geom(rows: u16, cols: u16, cw: u16, ch: u16) -> EffectGeom {
         EffectGeom {
             cell_w: cw,
             cell_h: ch,
@@ -2212,7 +2295,7 @@ mod tests {
         }
     }
 
-    fn space_cell(bg: [u8; 3]) -> RenderCell {
+    const fn space_cell(bg: [u8; 3]) -> RenderCell {
         RenderCell {
             ch: ' ',
             fg: [0xD0, 0xD0, 0xD0],
@@ -2233,7 +2316,7 @@ mod tests {
 
     const BG: u32 = 0x0011_1318;
 
-    fn bg3() -> [u8; 3] {
+    const fn bg3() -> [u8; 3] {
         [0x11, 0x13, 0x18]
     }
 
@@ -2243,11 +2326,11 @@ mod tests {
         e.rescan_from_cells(&cells, &sizes, &[], rows, cols, BG, 1);
     }
 
-    fn idle() -> RainTickInput<'static> {
-        RainTickInput::default()
+    const fn idle() -> RainTickInput<'static> {
+        RainTickInput::EMPTY
     }
 
-    fn pour(e: &mut MatrixRain) {
+    const fn pour(e: &mut MatrixRain) {
         e.density_byte = 252;
         e.ring.push(e.tick, 252);
     }

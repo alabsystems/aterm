@@ -21,6 +21,10 @@ pub mod fleet;
 #[cfg(unix)]
 pub mod fleet_member;
 
+/// Physical-link locality for applications that require LAN-only transport.
+#[cfg(unix)]
+pub mod lan;
+
 const MAX_HEX: usize = 4096;
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {

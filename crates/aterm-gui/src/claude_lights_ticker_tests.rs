@@ -605,7 +605,6 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     use crate::a11y_tree::{GridChip, HarnessChip};
     use crate::autopilot::AutopilotView;
     use aterm_agent::harness::lights::{Mode, SHIFT_TAB};
-    use aterm_agent::supervise::Autopilot;
     let of = |chips: &[GridChip], chip| chips.iter().find(|c| c.chip == chip).cloned();
     let (mut app, wid, session, (_hosted, mut reader)) = ticker_app(120);
     {
@@ -646,7 +645,7 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
         ))
     );
     let switch = of(&chips, HarnessChip::Switch).unwrap_or_else(|| panic!("{chips:?}"));
-    assert_eq!(switch.label, "alab harness on: Claude Code");
+    assert_eq!(switch.label, "alab harness on");
     assert_eq!(switch.toggled, Some(aterm_a11y::model::Toggled::True));
     assert!(switch.description.is_some(), "{switch:?}");
     let drawn = app.windows[&wid]
@@ -687,18 +686,35 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     );
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Mode);
     assert_eq!(pty(&mut reader, SHIFT_TAB.len()), SHIFT_TAB);
+    let carried = autopilot(&app, session);
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Switch);
     assert_eq!(
         autopilot(&app, session),
-        (Some(Autopilot::Off), AutopilotView::Off)
+        carried,
+        "the press turns the whole harness off, never the session's word"
+    );
+    let wrote = app
+        .messages
+        .log()
+        .records()
+        .rfind(|r| r.key.as_deref() == Some("harness.switch-save.harness.enabled"))
+        .map(|r| r.detail.join(" "))
+        .expect("the master switch's write was made");
+    assert!(wrote.contains("harness.enabled = false"), "{wrote:?}");
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
     );
     frame(&mut app, wid);
+    assert_eq!(autopilot(&app, session).1, AutopilotView::MasterOff);
     let chips = app.claude_chips_a11y(wid);
     let switch = of(&chips, HarnessChip::Switch).expect("the off switch");
-    assert_eq!(switch.label, "alab harness off: Claude Code");
+    assert_eq!(switch.label, "alab harness off");
     assert_eq!(switch.toggled, Some(aterm_a11y::model::Toggled::False));
     let on = of(&chips, HarnessChip::SwitchOn).expect("the on button");
-    assert_eq!(on.label, "on: turn the Claude Code harness on");
+    assert_eq!(
+        on.label,
+        "on: turn the harness on (Supervise coding agents)"
+    );
 }
 
 #[cfg(a11y_tree)]

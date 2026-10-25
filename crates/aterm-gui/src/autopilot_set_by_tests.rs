@@ -238,10 +238,11 @@ fn a_wire_write_says_the_timer_it_dropped() {
     host.shutdown_and_join();
 }
 
-/// THE SURFACES, A TABLE (§11.7.5): the chip, the composer border, the
-/// Autopilot menu (a mode and its cancel), a SESSIONS row (a mode and its
-/// Timer), the `Every session` row and the timer's fire each store their own
-/// setter — `meta`'s word for it — and end the record with their own words.
+/// THE SURFACES, A TABLE (§11.7.5): the chip, the Autopilot menu (a mode
+/// and its cancel), a SESSIONS row (a mode and its Timer), the `Every
+/// session` row and the timer's fire each store their own setter — `meta`'s
+/// word for it — and end the record with their own words. The composer
+/// border's switch writes `aterm.toml`, never the pair, so it moves nothing.
 #[test]
 fn every_surface_names_itself() {
     use crate::autopilot_menu::{MenuAct, MenuRow};
@@ -272,14 +273,6 @@ fn every_surface_names_itself() {
             }),
             "human:chip",
             "set from the chip".into(),
-        ),
-        (
-            "the composer border",
-            Box::new(|app: &mut App| {
-                app.toggle_session_harness(0);
-            }),
-            "human:border",
-            "set from the composer border".into(),
         ),
         (
             "the menu's mode",
@@ -331,6 +324,13 @@ fn every_surface_names_itself() {
             .unwrap()
             .autopilot_revision
     };
+    let before = revision(&app);
+    app.toggle_session_harness(0);
+    assert_eq!(
+        revision(&app),
+        before,
+        "the composer border's switch moves no Autopilot pair"
+    );
     for (name, step, word, line) in &steps {
         let before = revision(&app);
         step(&mut app);
@@ -424,6 +424,50 @@ fn meta_says_who_set_the_word_and_when() {
     host.shutdown_and_join();
 }
 
+/// A `--no-harness` LAUNCH NAMES ITSELF (§11.7.1): the Off it writes once its program
+/// resolves is stored `human:launch` and its record says `set by its --no-harness launch`,
+/// never the composer border, nothing on which writes the pair since 2026-10-24; the request is
+/// taken once. CONTROL: a leader started without it writes nothing.
+#[test]
+fn a_no_harness_launch_names_itself() {
+    let (mut app, host) = hosted();
+    set_fake_clocks(Some((Instant::now(), FRI_19Z * 1000)));
+    let revision = |app: &App| {
+        app.pool
+            .get(0)
+            .unwrap()
+            .ctx
+            .meta
+            .lock()
+            .unwrap()
+            .autopilot_revision
+    };
+    let before = revision(&app);
+    assert!(
+        !app.apply_launch_no_harness(0),
+        "CONTROL: a leader started without --no-harness writes nothing"
+    );
+    assert_eq!(revision(&app), before, "CONTROL");
+    let ctx = app.pool.get(0).unwrap().ctx.clone();
+    assert!(ctx.timeline.lock().unwrap().set_leader_no_harness(7, true));
+    assert!(app.apply_launch_no_harness(0), "the launch's Off");
+    assert_eq!(revision(&app), before + 1);
+    let (reply, _) = wire(&mut app, 0, "");
+    assert_eq!(field(&reply, "autopilot").as_deref(), Some("off"));
+    assert_eq!(
+        field(&reply, "autopilot_by").as_deref(),
+        Some("human:launch")
+    );
+    assert_eq!(
+        last_line(&app, 0).as_deref(),
+        Some("set by its --no-harness launch")
+    );
+    assert!(!app.apply_launch_no_harness(0), "taken once");
+    assert_eq!(revision(&app), before + 1, "taken once");
+    set_fake_clocks(None);
+    host.shutdown_and_join();
+}
+
 /// THE SETTER'S CARRIED FORM (§11.7.3, item 5): `<setter> <unix ms>`, read
 /// back to the setter it was written from, in its one form; a setter this
 /// build cannot read — an unknown surface or word, no time — is none, so
@@ -444,6 +488,10 @@ fn the_setter_is_carried_in_one_form_and_dropped_with_its_word() {
         (
             format!("human:border {since}"),
             Some((Actor::Human, Some(Surface::Border))),
+        ),
+        (
+            format!("human:launch {since}"),
+            Some((Actor::Human, Some(Surface::Launch))),
         ),
         (
             format!("human:menu {since}"),

@@ -432,11 +432,38 @@ pub fn read_account(server: AppServer, deadline: Instant) -> Option<Account> {
     account_of(&result)
 }
 
+/// Builds the environment for Codex's app server in `home` under `user_home`:
+/// [`super::login_drive::PASSED`], `PATH`, `CODEX_HOME`, and — when `home` is an overlay home
+/// apart from the default Codex home — `CODEX_SQLITE_HOME` pointing at that default home so the
+/// server never creates standalone `*.sqlite` files inside the overlay.
+pub(crate) fn app_server_env(
+    cli: crate::harness::accounts::Cli,
+    home: &std::path::Path,
+    user_home: &std::path::Path,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<Vec<(&'static str, std::ffi::OsString)>> {
+    if cli != crate::harness::accounts::Cli::Codex {
+        return None;
+    }
+    let default_home = user_home.join(cli.accounts().default_home);
+    let mut env: Vec<(&'static str, std::ffi::OsString)> = super::login_drive::PASSED
+        .iter()
+        .filter_map(|name| lookup(name).filter(|v| !v.is_empty()).map(|v| (*name, v)))
+        .collect();
+    env.push(("PATH", lookup("PATH").unwrap_or_default()));
+    env.push(("CODEX_HOME", home.as_os_str().to_os_string()));
+    if home != default_home {
+        aterm_types::fs_restricted::create_dir_restricted(&default_home).ok()?;
+        env.push(("CODEX_SQLITE_HOME", default_home.into_os_string()));
+    }
+    Some(env)
+}
+
 /// Runs `f` over Codex's app server (`codex app-server`, the program its sign-in runs:
 /// [`super::login_drive::program_of`]) started in `home` with only
-/// [`super::login_drive::PASSED`], the caller's `PATH` and `CODEX_HOME`, its standard error
-/// discarded, given `wait` (`f`'s deadline); the server is ended once `f` returns. `None` where
-/// the server did not start, or `cli` is not Codex.
+/// [`super::login_drive::PASSED`], the caller's `PATH`, `CODEX_HOME` (plus `CODEX_SQLITE_HOME` on
+/// an overlay home), its standard error discarded, given `wait` (`f`'s deadline); the server is
+/// ended once `f` returns. `None` where the server did not start, or `cli` is not Codex.
 pub fn run_app_server<T>(
     cli: crate::harness::accounts::Cli,
     home: &std::path::Path,
@@ -444,21 +471,13 @@ pub fn run_app_server<T>(
     f: impl FnOnce(AppServer, Instant) -> T,
 ) -> Option<T> {
     use aterm_uds::spawnfd::Stdio;
-    if cli != crate::harness::accounts::Cli::Codex {
-        return None;
-    }
     let user_home = aterm_types::dirs::home_dir()?;
+    let env = app_server_env(cli, home, &user_home, &|name| std::env::var_os(name))?;
     let program = super::login_drive::program_of(cli, &user_home);
     let mut cmd = aterm_uds::spawnfd::command(&program);
     cmd.arg("app-server")
         .env_clear()
-        .envs(super::login_drive::PASSED.iter().filter_map(|name| {
-            std::env::var_os(name)
-                .filter(|v| !v.is_empty())
-                .map(|v| (*name, v))
-        }))
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("CODEX_HOME", home)
+        .envs(env)
         .current_dir(home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

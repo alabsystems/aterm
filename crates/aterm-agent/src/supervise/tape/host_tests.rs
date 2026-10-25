@@ -130,6 +130,8 @@ fn every_host_answer_reads_back_as_written() {
         row: None,
     }));
     same(None::<TapWindow>);
+    same(None::<crate::harness::profile::AccountKey>);
+    same(crate::harness::profile::AccountKey::claude("u-invented"));
     for figure in [
         None,
         Some(crate::harness::tap::Window {

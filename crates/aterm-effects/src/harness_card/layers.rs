@@ -34,29 +34,43 @@ pub struct CardShape {
 impl CardShape {
     /// `scene`'s shape.
     #[must_use]
-    pub fn of(scene: &CardScene) -> (Self, (i32, i32)) {
+    pub const fn of(scene: &CardScene) -> (Self, (i32, i32)) {
+        const fn min_i64(a: i64, b: i64) -> i64 {
+            if a < b { a } else { b }
+        }
+        const fn space(v: i32) -> i64 {
+            sat_u16(v as i64) as i64
+        }
+        const fn sat_u16(v: i64) -> u16 {
+            if v < 0 {
+                0
+            } else if v > u16::MAX as i64 {
+                u16::MAX
+            } else {
+                v as u16
+            }
+        }
         let s = scene;
-        let (cw, ch) = (i64::from(s.cw), i64::from(s.ch));
-        let pad = i64::from(s.pad_left).min(cw / 2);
+        let (cw, ch) = (s.cw as i64, s.ch as i64);
+        let pad = min_i64(s.pad_left as i64, cw / 2);
         let above = if s.top > 0 {
-            i64::from(s.pad_above).min(ch / 2)
+            min_i64(s.pad_above as i64, ch / 2)
         } else {
             0
         };
-        let below = i64::from(s.pad_below).min(ch / 2);
+        let below = min_i64(s.pad_below as i64, ch / 2);
         let origin = (
-            sat_i32(i64::from(s.origin_x) - pad),
-            sat_i32(i64::from(s.origin_y) + i64::from(s.top) * ch - above),
+            sat_i32(s.origin_x as i64 - pad),
+            sat_i32(s.origin_y as i64 + s.top as i64 * ch - above),
         );
-        let (ox, oy) = (i64::from(origin.0), i64::from(origin.1));
+        let (ox, oy) = (origin.0 as i64, origin.1 as i64);
         let outer = Rect {
             x0: 0,
             y0: 0,
-            x1: pad + (i64::from(s.cols) + 1) * cw,
-            y1: above + i64::from(s.rows) * ch + below,
+            x1: pad + (s.cols as i64 + 1) * cw,
+            y1: above + s.rows as i64 * ch + below,
         };
         let (cx0, cy0, cx1, cy1) = s.clip;
-        let space = |v: i32| i64::from(v).clamp(0, i64::from(u16::MAX));
         let clip = Rect {
             x0: space(cx0) - ox,
             y0: space(cy0) - oy,
@@ -78,12 +92,15 @@ impl CardShape {
             origin_x: sat_i32(pad),
             origin_y: sat_i32(above - ch),
             row_base: 0,
-            pad_left: u16::try_from(pad).unwrap_or(u16::MAX),
-            pad_above: u16::try_from(above).unwrap_or(u16::MAX),
-            pad_below: u16::try_from(below).unwrap_or(u16::MAX),
+            pad_left: sat_u16(pad),
+            pad_above: sat_u16(above),
+            pad_below: sat_u16(below),
             top: 1,
             clip,
-            wand: s.wand.map(|(c, r)| (c, (r + 1).saturating_sub(s.top))),
+            wand: match s.wand {
+                Some((c, r)) => Some((c, (r + 1).saturating_sub(s.top))),
+                None => None,
+            },
             ..*s
         };
         (Self { local }, origin)
@@ -104,8 +121,14 @@ impl CardShape {
 
 /// `v` clamped into `i32`.
 #[inline]
-fn sat_i32(v: i64) -> i32 {
-    i32::try_from(v).unwrap_or(if v < 0 { i32::MIN } else { i32::MAX })
+const fn sat_i32(v: i64) -> i32 {
+    if v < i32::MIN as i64 {
+        i32::MIN
+    } else if v > i32::MAX as i64 {
+        i32::MAX
+    } else {
+        v as i32
+    }
 }
 
 /// One frame of a card.
@@ -201,8 +224,11 @@ impl KeptFrame {
     /// The flow step the kept frame is (`None`: the settled frame).
     #[must_use]
     #[inline]
-    pub fn step(&self) -> Option<u64> {
-        self.step.map(|(step, _)| step)
+    pub const fn step(&self) -> Option<u64> {
+        match self.step {
+            Some((step, _)) => Some(step),
+            None => None,
+        }
     }
 
     /// The kept frame laid at `origin`.
@@ -443,8 +469,9 @@ pub struct CardArts {
 
 /// Which of the six kitty frames `art` (two rows or three) in `pose` is.
 #[inline]
-fn kitty_slot(art: &KittyArt, pose: KittyPose) -> usize {
-    (art.rows() - 2).min(1) * 3 + pose as usize
+const fn kitty_slot(art: &KittyArt, pose: KittyPose) -> usize {
+    let r = art.rows() - 2;
+    (if r < 1 { r } else { 1 }) * 3 + pose as usize
 }
 
 impl CardArts {
@@ -531,12 +558,12 @@ impl CardArts {
     }
 
     #[inline]
-    fn kitty(&self, art: &KittyArt, pose: KittyPose) -> &Arc<FxArt> {
+    const fn kitty(&self, art: &KittyArt, pose: KittyPose) -> &Arc<FxArt> {
         &self.kitty[kitty_slot(art, pose)]
     }
 
     #[inline]
-    fn rim(&self, art: &KittyArt, pose: KittyPose) -> Option<&RimArt> {
+    const fn rim(&self, art: &KittyArt, pose: KittyPose) -> Option<&RimArt> {
         self.rim[kitty_slot(art, pose)].as_ref()
     }
 

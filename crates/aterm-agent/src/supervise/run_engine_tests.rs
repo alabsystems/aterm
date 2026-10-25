@@ -1686,6 +1686,67 @@ fn a_recent_persons_trust_dialog_keeps_their_grace() {
     held_for_the_person("the ordinary Bash hold", &mut m);
 }
 
+/// The review of 9744af4ee8: only a question dialog had the short bound on a person's grace, so a
+/// keystroke 60 s old held a plan-mode switch, a plan approval or a goal proposal for the whole
+/// 120 s. Every choice that grants nothing waits at most `QUESTION_PERSON_GRACE` of the person's
+/// quiet and is answered; a permission box with the same input whose touch cannot be told (it is
+/// the session's first read) keeps the whole grace (the ordinary Bash hold, the positive control;
+/// an untouched one takes the bound: `an_untouched_box_is_held_by_older_input_no_longer_than_a_question`).
+#[test]
+fn a_choice_dialog_waits_a_short_fixed_quiet_and_a_permission_box_the_whole_grace() {
+    use aterm_phase::prompt::fixtures as f;
+    let typed = Duration::from_millis(60_000);
+    assert!(
+        typed > super::approval_loop::QUESTION_PERSON_GRACE
+            && typed < Duration::from_secs(u64::from(SupervisorConfig::default().human_grace_s)),
+        "PRECONDITION: recent_person's input is past the bound and inside the default grace"
+    );
+    for (what, fixture) in [
+        ("plan enter", f::PLAN_ENTER),
+        ("plan ready", f::PLAN_READY),
+        ("goal", f::GOAL_PROPOSAL),
+    ] {
+        let mut m = recent_person(
+            vec![f::screen(fixture)],
+            "prompt agent_rev=1 agent_since_ms=1000",
+        );
+        let (_, noted) = full_power_watch(&mut m, "choice-grace");
+        assert!(
+            !noted.iter().any(|l| l.starts_with("HELD ")),
+            "{what}: no hold for input older than the bound: {noted:#?}"
+        );
+        assert!(
+            !noted.iter().any(|l| l.starts_with("LAUNCH ")),
+            "{what}: answered past the bound, not as a launch: {noted:#?}"
+        );
+        assert!(!m.presses().is_empty(), "{what}: {:#?}", m.requests);
+    }
+    let mut m = recent_person(
+        vec![bash_box(&["⏺ Cleaning."], "rm -rf build")],
+        "prompt agent_detail=bash:not-read-only agent_rev=1 agent_since_ms=1000",
+    );
+    held_for_the_person(
+        "a permission box whose touch cannot be told keeps the whole grace",
+        &mut m,
+    );
+    let mut m = recent_person(
+        vec![
+            f::screen(f::LIMIT_OPTIONS_DIALOG),
+            limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_UPGRADE], 1),
+            idle_screen(),
+        ],
+        "prompt agent_detail=usage-limit agent_rev=1 agent_since_ms=1000",
+    );
+    let (_, noted) = full_power_watch_with(&mut m, "choice-grace-limit", |s| {
+        s.set_approval_env(owner_env());
+    });
+    assert_held(
+        "the usage-limit menu, whose answer can spend, keeps the whole grace",
+        &m,
+        &noted,
+    );
+}
+
 #[test]
 fn unknown_input_keeps_the_persons_trust_dialog_held() {
     for input in [
@@ -2017,7 +2078,17 @@ fn a_launch_answers_no_box_but_its_trust_dialog() {
             ],
         ),
     ] {
+        // The autocompact offer is a choice dialog, which a person's input holds for
+        // `QUESTION_PERSON_GRACE` at most (the usage-limit menu keeps the whole grace): the input
+        // stands inside that bound, so only the launch witness could answer either.
+        const TYPED_INSIDE_THE_CHOICE_BOUND_MS: u64 = 5_000;
+        assert!(
+            Duration::from_millis(TYPED_INSIDE_THE_CHOICE_BOUND_MS)
+                < super::approval_loop::QUESTION_PERSON_GRACE,
+            "PRECONDITION: the person's input holds a choice dialog"
+        );
         let mut m = launched(screens, "claude");
+        m.human_ms = Some(TYPED_INSIDE_THE_CHOICE_BOUND_MS);
         m.agent = agent;
         m.input = INPUT_CLEAR;
         let (_, noted) = full_power_watch_with(&mut m, "launch-not-trust", |s| {

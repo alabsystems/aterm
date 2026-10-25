@@ -1466,6 +1466,52 @@ fn a_fifo_is_not_a_profile_and_does_not_block() {
     reader.join().expect("reader");
 }
 
+/// The account a home is signed in to is read afresh each call, its key
+/// alone: a login rewritten under it reads as the new account, and a home
+/// of its own (`CLAUDE_CONFIG_DIR`) reads its own profile, not the plain one.
+#[test]
+fn the_account_a_home_is_signed_in_to_is_read_afresh_each_call() {
+    let tmp = tmp_dir("account-of");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let env = vec![format!("HOME={}", home.display())];
+    let plain = home.join(".claude.json");
+    assert_eq!(account_of(&env, &home), None);
+    std::fs::write(
+        &plain,
+        r#"{"oauthAccount":{"accountUuid":"u-first","emailAddress":"a@example.com"}}"#,
+    )
+    .expect("profile");
+    assert_eq!(account_of(&env, &home), AccountKey::claude("u-first"));
+    std::fs::write(
+        &plain,
+        r#"{"numStartups":3,"oauthAccount":{"emailAddress":"b@example.com","accountUuid":"u-second"}}"#,
+    )
+    .expect("profile");
+    assert_eq!(account_of(&env, &home), AccountKey::claude("u-second"));
+    for text in [
+        r#"{"oauthAccount":{"emailAddress":"b@example.com"}}"#,
+        r#"{"oauthAccount":{"accountUuid":7}}"#,
+        r#"{"oauthAccount":"u-second"}"#,
+        "not JSON",
+    ] {
+        std::fs::write(&plain, text).expect("profile");
+        assert_eq!(account_of(&env, &home), None, "{text}");
+    }
+    let own = tmp.path().join("own");
+    std::fs::create_dir_all(&own).expect("own home");
+    std::fs::write(&plain, r#"{"oauthAccount":{"accountUuid":"u-plain"}}"#).expect("plain");
+    std::fs::write(
+        own.join(".claude.json"),
+        r#"{"oauthAccount":{"accountUuid":"u-own"}}"#,
+    )
+    .expect("own");
+    let mut in_own = env.clone();
+    in_own.push(format!("CLAUDE_CONFIG_DIR={}", own.display()));
+    assert_eq!(account_of(&in_own, &home), AccountKey::claude("u-own"));
+    assert_eq!(account_of(&env, &home), AccountKey::claude("u-plain"));
+}
+
 #[test]
 fn a_login_answers_to_its_rows_address_alone() {
     let tmp = tmp_dir("answers");

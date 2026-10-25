@@ -314,11 +314,12 @@ pub use system_state_host::{
     CheckStarted, InitialSetupApplyReceipt, InitialSetupHandlers, publish_initial_setup_status,
     set_initial_setup_handlers,
 };
-#[cfg(any(test, debug_assertions))]
-pub use workstation_setup::drive_initial_setup_answer_for_test;
 pub use workstation_setup::{
     SetupAnswer, WorkstationSetupDecision, await_initial_setup_answer_while,
+    await_window_focus_after, on_window_focus_gained, window_focus_gains,
 };
+#[cfg(any(test, debug_assertions))]
+pub use workstation_setup::{drive_initial_setup_answer_for_test, gain_window_focus_for_test};
 mod devtools_watch;
 mod harness_policy_cell;
 #[cfg(feature = "bench-support")]
@@ -695,6 +696,7 @@ mod split_regrid_hold;
 mod startup_token;
 mod stats_deck;
 mod stats_lens;
+mod stats_live;
 mod stats_merged;
 mod stats_paint;
 mod stats_plan;
@@ -3399,6 +3401,7 @@ enum Wake {
     MenuAction {
         action: menu::MenuAction,
         mark: tab_spawn::MenuMark,
+        origin: Option<tab_spawn::MenuOrigin>,
     },
     ConfirmedClose {
         replay: close_confirm::CloseReplay,
@@ -6859,6 +6862,14 @@ struct WindowState {
     deck_card: Option<SettingsCard>,
     deck_fold: Option<SettingsCard>,
     deck_memo: std::cell::Cell<(u64, u64)>,
+    /// The deck's live edge as its last layout drew it ([`crate::stats_live`]): its key, what
+    /// the card's raster holds, the card's rects that move with it, and how fast its strips
+    /// glide (device px a second).
+    deck_live_drawn: std::cell::Cell<Option<u64>>,
+    deck_live_card: std::cell::Cell<(u64, crate::stats_live::DeckLive)>,
+    deck_live_rects:
+        std::cell::RefCell<Vec<(crate::stats_live::LiveLayer, crate::stats_paint::Rect)>>,
+    deck_glide: std::cell::Cell<f64>,
     stats_hits: std::cell::RefCell<Vec<crate::stats_paint::Hit>>,
     lens_card: Option<SettingsCard>,
     stats_lens: crate::stats_lens::LensSlot,
@@ -7829,6 +7840,10 @@ impl WindowState {
             deck_card: None,
             deck_fold: None,
             deck_memo: std::cell::Cell::new((0, 0)),
+            deck_live_drawn: std::cell::Cell::new(None),
+            deck_live_card: std::cell::Cell::new((0, crate::stats_live::DeckLive::STILL)),
+            deck_live_rects: std::cell::RefCell::new(Vec::new()),
+            deck_glide: std::cell::Cell::new(0.0),
             stats_hits: std::cell::RefCell::new(Vec::new()),
             lens_card: None,
             stats_lens: crate::stats_lens::LensSlot::default(),
@@ -10045,6 +10060,7 @@ impl App {
         // A control client's act on the Local Network or Accessibility row, at the
         // same step moment, after the pages.
         self.tick_queued_pane(now);
+        self.warm_debugger_reading();
         #[expect(
             clippy::disallowed_methods,
             reason = "the event loop's tick: the launch warm-up's one caller"
@@ -11290,7 +11306,14 @@ impl App {
         }
         let facts = self.debugger_access_facts();
         if facts.self_hardened != SelfHardening::Hardened {
-            aterm_log::info!("debugger access: not needed on an aterm that is not hardened");
+            if facts.self_hardened == SelfHardening::Unknown {
+                aterm_log::info!(
+                    "debugger access: Turn On… came before this window's first reading of it; \
+                     nothing started"
+                );
+            } else {
+                aterm_log::info!("debugger access: not needed on an aterm that is not hardened");
+            }
             return false;
         }
         if aterm_types::macos_setup::macos_dialog_up() {
@@ -15143,6 +15166,7 @@ impl App {
 
     fn window_focus_event(&mut self, wid: WindowId, focused: bool) {
         if focused {
+            workstation_setup::window_focus_gained();
             if cfg!(target_os = "macos") && !self.headless {
                 self.consent.invalidate();
                 let _ = self.consent_panel_facts();
@@ -15337,8 +15361,10 @@ impl App {
         };
         let previous = std::mem::replace(&mut ws.mods, mods);
         let pointer_inside = ws.pointer_position_known;
+        // A banner's link shows the hand to a plain pointer too (`claude_card::NOTICE`).
         if pointer_inside
-            && app_mouse::link_modifier_held(previous) != app_mouse::link_modifier_held(mods)
+            && (app_mouse::link_modifier_held(previous) != app_mouse::link_modifier_held(mods)
+                || (previous.is_empty() != mods.is_empty() && self.pointer_on_notice_link(wid)))
         {
             self.update_hover_cursor(wid);
         }
@@ -16617,6 +16643,7 @@ impl ApplicationHandler<Wake> for App {
         self.service_kitty_animations(Instant::now());
         self.service_vitals(Instant::now());
         self.service_stats_lens(Instant::now());
+        self.service_stats_live(Instant::now());
         self.service_diskwalk(Instant::now());
         let present_now = Instant::now();
         let app_frame_interval = self.frame_interval;
@@ -17678,6 +17705,14 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::StatsLens,
             );
         }
+        if let Some(live_wake) = self.stats_live_deadline(Instant::now()) {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                live_wake,
+                metrics::DeadlineOwner::StatsLive,
+            );
+        }
         if let Some(log_wake) = self.next_session_log_wake() {
             fold_owned_deadline(
                 &mut deadline,
@@ -17852,11 +17887,13 @@ impl ApplicationHandler<Wake> for App {
     fn user_event(&mut self, el: &ActiveEventLoop, ev: Wake) {
         self.on_user_event(el, ev);
         self.sync_option_as_alt();
+        self.publish_system_state_front();
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: WinitWindowId, event: WindowEvent) {
         self.on_window_event(el, id, event);
         self.sync_option_as_alt();
+        self.publish_system_state_front();
     }
 }
 
@@ -17893,21 +17930,7 @@ impl App {
         match ev {
             Wake::ProgramResolved { session } => {
                 self.session_status.note_program_answered(session);
-                let disable = self.pool.get(session).is_some_and(|entry| {
-                    entry
-                        .ctx
-                        .timeline
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .take_leader_no_harness()
-                });
-                if disable {
-                    let _ = self.set_session_autopilot(
-                        session,
-                        Some(aterm_agent::supervise::Autopilot::Off),
-                        crate::autopilot::Surface::Border,
-                    );
-                }
+                let _ = self.apply_launch_no_harness(session);
             }
             Wake::QueuedKeyDelivered { session, at } => {
                 let now = Instant::now();
@@ -19263,8 +19286,12 @@ impl App {
                     self.deliver_paste_confirmed(wid, session, text, source, framing);
                 }
             }
-            Wake::MenuAction { action, mark } => {
-                self.dispatch_marked_menu_action(el, action, mark);
+            Wake::MenuAction {
+                action,
+                mark,
+                origin,
+            } => {
+                self.dispatch_marked_menu_action(el, action, mark, origin);
             }
             #[cfg(target_os = "macos")]
             Wake::StatusAction { action } => {
@@ -25127,17 +25154,19 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         crash_journal.set_predecessor(parent.pid(), parent.birth_unix_nanos());
         keeper_link::set_predecessor(parent.pid());
     }
-    let (rows, cols) = match restore_manifest.as_ref().and_then(|m| m.windows.first()) {
-        Some(wl) if carry_frame.is_none() && wl.maximized != Some(true) => (
-            app_config::explicit_initial_lines()
-                .unwrap_or(wl.rows)
-                .clamp(5, 300),
-            app_config::explicit_initial_columns()
-                .unwrap_or(wl.cols)
-                .clamp(20, 500),
-        ),
-        _ => (rows, cols),
-    };
+    let cold_first = restore_manifest
+        .as_ref()
+        .and_then(|m| m.windows.first())
+        .filter(|_| carry_frame.is_none())
+        .and_then(|wl| {
+            crate::app_window::CarriedFrame::cold_first_seed(
+                wl,
+                app_config::explicit_initial_lines(),
+                app_config::explicit_initial_columns(),
+            )
+        });
+    let (rows, cols) = cold_first.map_or((rows, cols), |seed| seed.grid);
+    let cold_first_frame = cold_first.and_then(|seed| seed.frame);
     if let Some(layout) = restore_manifest.as_ref() {
         session_log::Epochs::process().note_leaves(layout);
     }
@@ -25702,7 +25731,8 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         seamless_window
             .as_ref()
             .and_then(|w| w.inner_px)
-            .map(|[width, height]| PhysicalSize::new(width, height)),
+            .map(|[width, height]| PhysicalSize::new(width, height))
+            .or(cold_first_frame),
     );
     let mut pool = SessionPool::default();
     pool.insert(session0);

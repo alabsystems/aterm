@@ -1516,13 +1516,6 @@ thread_local! {
 
 /// The URLs this thread's [`AppRt::open_url`] and `app_mouse::open_url_external` calls named, drained (test-only).
 #[cfg(test)]
-#[cfg_attr(
-    not(unix),
-    expect(
-        dead_code,
-        reason = "its readers, the status item's and the harness banner's press tests, are unix's"
-    )
-)]
 pub(crate) fn take_opened_urls() -> Vec<String> {
     OPENED_URLS.with(|urls| std::mem::take(&mut *urls.borrow_mut()))
 }

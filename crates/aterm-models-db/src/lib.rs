@@ -5,6 +5,123 @@
 #![cfg_attr(trust_verify, register_tool(trust))]
 use aterm_spec::derive::Model;
 
+/// Bounded envelope admission scenarios executed against real encryption,
+/// signatures and secrets-backed sessions; not a proof of cryptographic security.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn table_envelope_model() -> Model {
+    aterm_spec::ty_model! {
+        DbTableEnvelope {
+            const Buggy = 0;
+            var scenario = 0;
+            var accepted = 0;
+            action Valid when (scenario == 0) { scenario = 1; accepted = if Buggy == 1 { 0 } else { 1 }; }
+            action UnknownTable when (scenario == 0) { scenario = 2; accepted = if Buggy == 2 { 1 } else { 0 }; }
+            action ForgedReader when (scenario == 0) { scenario = 3; accepted = if Buggy == 3 { 1 } else { 0 }; }
+            action WrongEpoch when (scenario == 0) { scenario = 4; accepted = if Buggy == 4 { 1 } else { 0 }; }
+            action Tampered when (scenario == 0) { scenario = 5; accepted = if Buggy == 5 { 1 } else { 0 }; }
+            action Malformed when (scenario == 0) { scenario = 6; accepted = if Buggy == 6 { 1 } else { 0 }; }
+            action ReaderWrites when (scenario == 0) { scenario = 7; accepted = if Buggy == 7 { 1 } else { 0 }; }
+            action OldEpoch when (scenario == 0) { scenario = 8; accepted = if Buggy == 8 { 0 } else { 1 }; }
+            invariant ExactWriterEvidenceOnly: accepted == 0 || scenario == 1 || scenario == 8;
+            invariant ValidHistoryWorks: scenario == 0 || (scenario > 1 && 8 > scenario) || accepted == 1;
+        }
+    }
+}
+
+/// A historical read key needs current local membership and a selected signed
+/// ancestor. It never supplies current write permission. Cases use real rosters.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn historical_access_model() -> Model {
+    aterm_spec::ty_model! {
+        DbHistoricalAccess {
+            const Buggy = 0;
+            var scenario = 0;
+            var exposed = 0;
+            action Current when (scenario == 0) { scenario = 1; exposed = if Buggy == 1 { 0 } else { 1 }; }
+            action Rotated when (scenario == 0) { scenario = 2; exposed = if Buggy == 2 { 0 } else { 1 }; }
+            action Stale when (scenario == 0) { scenario = 3; exposed = if Buggy == 3 { 1 } else { 0 }; }
+            action Missing when (scenario == 0) { scenario = 4; exposed = if Buggy == 4 { 1 } else { 0 }; }
+            action ForeignRecipient when (scenario == 0) { scenario = 5; exposed = if Buggy == 5 { 1 } else { 0 }; }
+            action Forked when (scenario == 0) { scenario = 6; exposed = if Buggy == 6 { 1 } else { 0 }; }
+            action RetiredLocal when (scenario == 0) { scenario = 7; exposed = if Buggy == 7 { 1 } else { 0 }; }
+            action Selected when (scenario == 0) { scenario = 8; exposed = if Buggy == 8 { 0 } else { 1 }; }
+            action Discarded when (scenario == 0) { scenario = 9; exposed = if Buggy == 9 { 1 } else { 0 }; }
+            invariant OnlyCurrentSelectedReleases: exposed == 0 || scenario == 1 || scenario == 2 || scenario == 8;
+            invariant SelectedHistoryWorks: scenario == 0 || (scenario > 2 && (8 > scenario || scenario > 8)) || exposed == 1;
+        }
+    }
+}
+
+/// Native lease admission is exclusive, transfers after close, and is withdrawn
+/// if the private inode disappears or is replaced. Worker drainage is tested
+/// separately against real TCP; this finite model claims only lease admission.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn transport_owner_model() -> Model {
+    aterm_spec::ty_model! {
+        DbTransportOwner {
+            const Buggy = 0;
+            var scenario = 0;
+            var usable = 0;
+            action Acquire when (scenario == 0) { scenario = 1; usable = if Buggy == 1 { 0 } else { 1 }; }
+            action Contend when (scenario == 0) { scenario = 2; usable = if Buggy == 2 { 1 } else { 0 }; }
+            action Transfer when (scenario == 0) { scenario = 3; usable = if Buggy == 3 { 0 } else { 1 }; }
+            action Replace when (scenario == 0) { scenario = 4; usable = if Buggy == 4 { 1 } else { 0 }; }
+            action Remove when (scenario == 0) { scenario = 5; usable = if Buggy == 5 { 1 } else { 0 }; }
+            invariant OnlyExclusiveIntactOwner: usable == 0 || scenario == 1 || scenario == 3;
+            invariant OwnerCanStartAndTransfer: scenario == 0 || scenario == 2 || scenario > 3 || usable == 1;
+        }
+    }
+}
+
+/// A returned local writer always has an intact, decryptable key matching its
+/// durable public claim. A crash before the first claim can reuse the key;
+/// established key loss, corruption or substitution cannot mint a new writer.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn device_custody_model() -> Model {
+    aterm_spec::ty_model! {
+        DbDeviceCustody {
+            const Buggy = 0;
+            var scenario = 0;
+            var usable = 0;
+            action Fresh when (scenario == 0) { scenario = 1; usable = if Buggy == 1 { 0 } else { 1 }; }
+            action Restart when (scenario == 0) { scenario = 2; usable = if Buggy == 2 { 0 } else { 1 }; }
+            action UnclaimedKey when (scenario == 0) { scenario = 3; usable = if Buggy == 3 { 0 } else { 1 }; }
+            action MissingKey when (scenario == 0) { scenario = 4; usable = if Buggy == 4 { 1 } else { 0 }; }
+            action DamagedKey when (scenario == 0) { scenario = 5; usable = if Buggy == 5 { 1 } else { 0 }; }
+            action WrongRecipient when (scenario == 0) { scenario = 6; usable = if Buggy == 6 { 1 } else { 0 }; }
+            action ChangedClaim when (scenario == 0) { scenario = 7; usable = if Buggy == 7 { 1 } else { 0 }; }
+            action MissingIdentity when (scenario == 0) { scenario = 8; usable = if Buggy == 8 { 1 } else { 0 }; }
+            invariant InvalidCustodyWithholds: usable == 0 || (scenario > 0 && scenario <= 3);
+            invariant IntactKeyRemainsUsable: scenario == 0 || scenario > 3 || usable == 1;
+        }
+    }
+}
+
+/// Once bootstrapped, missing history and changed trust cannot initialize a new
+/// network. A vault signer handoff preserves the independent control authority.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn bootstrap_history_model() -> Model {
+    aterm_spec::ty_model! {
+        DbBootstrapHistory {
+            const Buggy = 0;
+            var scenario = 0;
+            var opened = 0;
+            action FirstBoot when (scenario == 0) { scenario = 1; opened = if Buggy == 1 { 0 } else { 1 }; }
+            action Reopen when (scenario == 0) { scenario = 2; opened = if Buggy == 2 { 0 } else { 1 }; }
+            action VaultHandoff when (scenario == 0) { scenario = 3; opened = if Buggy == 3 { 0 } else { 1 }; }
+            action LostHistory when (scenario == 0) { scenario = 4; opened = if Buggy == 4 { 1 } else { 0 }; }
+            action ChangedTrust when (scenario == 0) { scenario = 5; opened = if Buggy == 5 { 1 } else { 0 }; }
+            invariant EstablishedHistoryNeverResets: opened == 0 || (scenario > 0 && scenario <= 3);
+            invariant ValidBootstrapWorks: scenario == 0 || scenario > 3 || opened == 1;
+        }
+    }
+}
+
 /// Historical repair approval still needs an exact live channel identity.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]

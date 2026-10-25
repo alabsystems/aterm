@@ -51,11 +51,12 @@ const MAX_UNSETTLED_WAITS: u32 = 3;
 
 const QUESTION_STANDIN_QUIET: Duration = Duration::from_secs(10);
 
-/// THE MOST QUIET A PERSON'S INPUT BUYS BEFORE THE LOOP ANSWERS A QUESTION DIALOG: their grace
-/// (`[harness] human_grace_s`, 120 s by default, any length the owner sets), but never more than
-/// this. A keystroke this recent is a person answering now, and their keys are never raced; one
-/// older is no reason to leave the question to them (owner, 2026-10-24: "THE HARNESS MUST DO THIS
-/// STOP ASKING THE USER"), so the dialog is answered without them.
+/// THE MOST QUIET A PERSON'S INPUT BUYS BEFORE THE LOOP ANSWERS A CHOICE DIALOG (a question, or
+/// any other dialog that grants and spends nothing: [`Dialog::of`]): their grace (`[harness] human_grace_s`,
+/// 120 s by default, any length the owner sets), but never more than this. A keystroke this recent
+/// is a person answering now, and their keys are never raced; one older is no reason to leave the
+/// dialog to them (owner, 2026-10-24: "THE HARNESS MUST DO THIS STOP ASKING THE USER"), so it is
+/// answered without them.
 pub(super) const QUESTION_PERSON_GRACE: Duration = Duration::from_secs(15);
 
 /// The quiet a person's input buys before the loop acts: `[harness] human_grace_s`.
@@ -67,27 +68,60 @@ fn person_grace(opts: &SuperviseOpts) -> Duration {
 /// only under Cruise or Land (under Off it parks), so this is Autopilot's rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dialog {
-    /// A question dialog: [`QUESTION_PERSON_GRACE`] at most.
-    Question,
-    /// A permission box or any other dialog: the person's whole grace.
-    Other,
+    /// A choice that grants nothing and spends nothing (a question, a plan-mode switch, a goal, a
+    /// model or effort switch, the autocompact offer): [`QUESTION_PERSON_GRACE`] at most.
+    Choice,
+    /// A permission box, which grants a command, a tool, a file, the network, a folder, an app or
+    /// a server its reach: [`QUESTION_PERSON_GRACE`] at most while nobody has touched it since it
+    /// appeared, the person's whole grace once a person or another driver has
+    /// ([`Session::answer_grace`]).
+    Permission,
+    /// The usage-limit menu, whose answer can spend a reset or credits; a held message, another
+    /// session's text, which becomes the worker's prompt; or a box not recognized: the person's
+    /// whole grace.
+    Grant,
 }
 
 impl Dialog {
-    fn of(kind: PromptKind) -> Self {
-        if kind == PromptKind::Question {
-            Self::Question
-        } else {
-            Self::Other
+    /// Which `kind` is. Every kind is named, so a new one is placed here by hand. An unrecognized
+    /// box ([`PromptKind::Other`]), a held message and the usage-limit menu (under `usage_credits`
+    /// its answer spends, which stays at a person's pace) keep the whole grace.
+    const fn of(kind: PromptKind) -> Self {
+        match kind {
+            PromptKind::Question
+            | PromptKind::PlanEnter
+            | PromptKind::PlanExit
+            | PromptKind::GoalProposal
+            | PromptKind::ModelSwitch
+            | PromptKind::AutocompactOffer => Self::Choice,
+            PromptKind::Bash
+            | PromptKind::Edit
+            | PromptKind::Write
+            | PromptKind::Overwrite
+            | PromptKind::Read
+            | PromptKind::Workflow
+            | PromptKind::Trust
+            | PromptKind::PowerShell
+            | PromptKind::Fetch
+            | PromptKind::NetworkRequest
+            | PromptKind::Browser
+            | PromptKind::Skill
+            | PromptKind::Monitor
+            | PromptKind::Tool
+            | PromptKind::ComputerUse
+            | PromptKind::ReadOutsideSetting
+            | PromptKind::McpServer => Self::Permission,
+            PromptKind::UsageLimit | PromptKind::HeldMessage | PromptKind::Other => Self::Grant,
         }
     }
 }
 
-/// The quiet a person's input buys before the loop answers `dialog` ([`QUESTION_PERSON_GRACE`]).
+/// The quiet a person's input buys before the loop answers `dialog` ([`QUESTION_PERSON_GRACE`]),
+/// a permission box counted as touched ([`Session::answer_grace`] reads its episode).
 fn dialog_grace(opts: &SuperviseOpts, dialog: Dialog) -> Duration {
     match dialog {
-        Dialog::Question => person_grace(opts).min(QUESTION_PERSON_GRACE),
-        Dialog::Other => person_grace(opts),
+        Dialog::Choice => person_grace(opts).min(QUESTION_PERSON_GRACE),
+        Dialog::Permission | Dialog::Grant => person_grace(opts),
     }
 }
 
@@ -1698,7 +1732,25 @@ impl<C: Ctl> Session<'_, C> {
         if self.hold_over(screen) {
             Duration::ZERO
         } else {
-            dialog_grace(opts, dialog)
+            self.answer_grace(opts, dialog)
+        }
+    }
+
+    /// The quiet a person's input buys before the loop answers `dialog` on this read. A permission
+    /// box nobody has touched since it appeared is held by input older than it no longer than a
+    /// choice dialog is ([`QUESTION_PERSON_GRACE`]): that input answered something else (owner,
+    /// 2026-10-25, of a subagent's `bash -c` rm box held 114 s for a keystroke 6 s older than it:
+    /// "the claude harness needs to immediately auto-approve these messages!"). A box a person or
+    /// another driver touched, or whose touch cannot be told, keeps the whole grace, as ever.
+    fn answer_grace(&self, opts: &SuperviseOpts, dialog: Dialog) -> Duration {
+        #[cfg(test)]
+        if self.bound_off {
+            return dialog_grace(opts, dialog);
+        }
+        let untouched = self.episode.is_some() && self.touched().is_none();
+        match dialog {
+            Dialog::Permission if untouched => person_grace(opts).min(QUESTION_PERSON_GRACE),
+            Dialog::Choice | Dialog::Permission | Dialog::Grant => dialog_grace(opts, dialog),
         }
     }
 
@@ -1831,7 +1883,7 @@ impl<C: Ctl> Session<'_, C> {
             Decision::Approve { .. } | Decision::Decline { .. }
         ) && !carried_pick;
         let dialog = Dialog::of(p.kind);
-        let grace = dialog_grace(opts, dialog);
+        let grace = self.answer_grace(opts, dialog);
         let launch = if answers && self.hands_off_for(grace).is_some() {
             self.launch_call(&turn.screen, &p, &decision, opts)?
         } else {
@@ -1920,7 +1972,7 @@ impl<C: Ctl> Session<'_, C> {
                     .enter_target()
                     .is_some_and(|target| answers(&dialog, target));
                 let this_question = question_key(&dialog, &turn.screen.rows);
-                let asked = Dialog::Question;
+                let asked = Dialog::Choice;
                 let grace = self.box_grace(opts, &turn.screen, asked);
                 let text_word = self.question.deciding.is_some_and(|w| w.text().is_some());
                 let reask = (answering || text_word).then_some(this_question.as_str());
@@ -2008,7 +2060,8 @@ impl<C: Ctl> Session<'_, C> {
         };
         let dialog = Dialog::of(p.kind);
         let grace = self.box_grace(opts, &turn.screen, dialog);
-        let past_hold = self.hold_over(&turn.screen)
+        let past_hold = (self.hold_over(&turn.screen)
+            || self.answer_grace(opts, dialog) < dialog_grace(opts, dialog))
             && self.hands_off_for(dialog_grace(opts, dialog)).is_some();
         let person = past_hold.then(|| self.person_fence(&turn.screen)).flatten();
         let pressing = match &act {

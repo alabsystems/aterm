@@ -408,6 +408,29 @@ impl Line {
         };
     }
 
+    /// Retains the inline-image spans accepted by `keep`, leaving text and other spans intact.
+    /// Returns whether any image span was removed.
+    pub fn retain_images(&mut self, keep: &mut dyn FnMut(&ImageSpan) -> bool) -> bool {
+        let Some(images) = self.images.as_deref_mut() else {
+            return false;
+        };
+        let before = images.len();
+        let mut kept = 0;
+        for read in 0..before {
+            if keep(&images[read]) {
+                images.as_mut_slice().swap(kept, read);
+                kept += 1;
+            }
+        }
+        while images.len() > kept {
+            let _ = images.pop();
+        }
+        if kept == 0 {
+            self.images = None;
+        }
+        kept != before
+    }
+
     /// Returns the inline-image span covering `col`, if any.
     #[must_use]
     #[allow(

@@ -3,11 +3,18 @@
 
 //! Shared `0x00RRGGBB` color math.
 
-/// Rotate a `0x00RRGGBB` color's hue by the §4.2 nudge code, preserving saturation and value.
 #[inline]
-pub fn hue_nudge(rgb: u32, code: u8) -> u32 {
+const fn rem_euclid_pos(x: f32, rhs: f32) -> f32 {
+    let r = x % rhs;
+    if r < 0.0 { r + rhs } else { r }
+}
+
+/// Rotate a `0x00RRGGBB` color's hue by the §4.2 nudge code, preserving saturation and value.
+#[must_use]
+#[inline]
+pub const fn hue_nudge(rgb: u32, code: u8) -> u32 {
     let (h, s, v) = rgb2hsv(rgb);
-    hsv2rgb(h + (-18.0 + f32::from(code) * 2.4), s, v)
+    hsv2rgb(h + (-18.0 + code as f32 * 2.4), s, v)
 }
 
 /// The hues a light page cannot show cleanly, in turns: deep orange through yellow to chartreuse.
@@ -16,12 +23,12 @@ pub const LIGHT_MUDDY_HUES: (f32, f32) = (36.0 / 360.0, 96.0 / 360.0);
 /// `hue` (turns) as a spectrum laid on a light page shows it.
 #[must_use]
 #[inline]
-pub fn light_spectrum_hue(hue: f32) -> f32 {
+pub const fn light_spectrum_hue(hue: f32) -> f32 {
     let (b0, b1) = LIGHT_MUDDY_HUES;
-    let h = if (0.0..1.0).contains(&hue) {
+    let h = if hue >= 0.0 && hue < 1.0 {
         hue
     } else if hue.is_finite() {
-        hue.rem_euclid(1.0)
+        rem_euclid_pos(hue, 1.0)
     } else {
         0.0
     } * (1.0 - (b1 - b0));
@@ -29,8 +36,9 @@ pub fn light_spectrum_hue(hue: f32) -> f32 {
 }
 
 /// `0x00RRGGBB` → HSV (`h` degrees, `s`/`v` in `0..=1`); the inverse of [`hsv2rgb`].
+#[must_use]
 #[inline]
-pub fn rgb2hsv(rgb: u32) -> (f32, f32, f32) {
+pub const fn rgb2hsv(rgb: u32) -> (f32, f32, f32) {
     let r = ((rgb >> 16) & 0xff) as f32 / 255.0;
     let g = ((rgb >> 8) & 0xff) as f32 / 255.0;
     let b = (rgb & 0xff) as f32 / 255.0;
@@ -41,7 +49,7 @@ pub fn rgb2hsv(rgb: u32) -> (f32, f32, f32) {
         0.0
     } else if max == r {
         let d = (g - b) / c;
-        60.0 * if d >= 0.0 { d } else { d.rem_euclid(6.0) }
+        60.0 * if d >= 0.0 { d } else { d + 6.0 }
     } else if max == g {
         60.0 * ((b - r) / c + 2.0)
     } else {
@@ -105,6 +113,7 @@ pub(crate) const fn relative_luminance_with(table: &RelativeLuminanceTable, rgb:
 }
 
 /// WCAG relative luminance of a `0x00RRGGBB` colour.
+#[must_use]
 #[inline]
 pub fn relative_luminance(rgb: u32) -> f32 {
     relative_luminance_with(relative_luminance_table(), rgb)
@@ -215,7 +224,7 @@ const LIGHT_DEPTH_MAX: f32 = 0.40;
 /// A caret body's fill on a LIGHT page at `heat` `0..=1`: the hue concentrated instead of whitened.
 #[must_use]
 #[inline]
-pub fn light_body_fill(rgb: u32, heat: f32) -> u32 {
+pub const fn light_body_fill(rgb: u32, heat: f32) -> u32 {
     let heat = if heat.is_finite() {
         heat.clamp(0.0, 1.0)
     } else {
@@ -233,7 +242,7 @@ pub fn light_body_fill(rgb: u32, heat: f32) -> u32 {
 /// A caret colour `rgb` charged by `k` `0..=1` on a LIGHT page.
 #[must_use]
 #[inline]
-pub fn light_charge_in_hue(rgb: u32, k: f32) -> u32 {
+pub const fn light_charge_in_hue(rgb: u32, k: f32) -> u32 {
     let k = if k.is_finite() {
         k.clamp(0.0, 1.0)
     } else {
@@ -322,15 +331,19 @@ pub(crate) fn oklab_distance(a: u32, b: u32) -> f32 {
 }
 
 /// HSV (`h` degrees, `s`/`v` in `0..=1`) → `0x00RRGGBB`.
+#[must_use]
 #[inline]
-pub fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
+pub const fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
+    const fn q(f: f32, m: f32) -> u32 {
+        ((f + m).clamp(0.0, 1.0) * 255.0).round() as u32
+    }
     let c = v * s;
-    let h_deg = if (0.0..360.0).contains(&h) {
+    let h_deg = if h >= 0.0 && h < 360.0 {
         h
-    } else if (360.0..720.0).contains(&h) {
+    } else if h >= 360.0 && h < 720.0 {
         h - 360.0
     } else {
-        h.rem_euclid(360.0)
+        rem_euclid_pos(h, 360.0)
     };
     let hp = h_deg / 60.0;
     let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
@@ -343,8 +356,7 @@ pub fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
         _ => (c, 0.0, x),
     };
     let m = v - c;
-    let q = |f: f32| ((f + m).clamp(0.0, 1.0) * 255.0).round() as u32;
-    (q(r) << 16) | (q(g) << 8) | q(b)
+    (q(r, m) << 16) | (q(g, m) << 8) | q(b, m)
 }
 
 #[cfg(test)]

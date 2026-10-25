@@ -65,6 +65,11 @@ pub struct VendorRecord {
     /// The vendor's own copy the staged binary agreed with, beside [`Self::measured_sha256`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agreed_with: Option<String>,
+    /// The row whose complete build of these same signed bytes the tree was copied from in
+    /// place of a download, one that [lends its tree](VendorSpec::lends_tree_to) to this
+    /// record's; `None` for a tree staged from its own download.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_from: Option<String>,
 }
 
 impl VendorRecord {
@@ -110,11 +115,16 @@ impl VendorRecord {
             (Some(sha256), Some(url)) => super::is_hex64(sha256) && under_row(url),
             _ => false,
         };
+        let lender_ok = self
+            .tree_from
+            .as_deref()
+            .is_none_or(|from| spec(from).is_some_and(|lender| lender.lends_tree_to(row)));
         self.schema == RECORD_SCHEMA
             && self.vendor == row.vendor
             && row.anchor.reads_record_of(self.anchor)
             && under_row(&self.source_url)
             && agreement_ok
+            && lender_ok
             && one_digest(&self.sha256, &self.sha512)
                 .is_some_and(|(alg, hex)| alg.is_lower_hex(hex))
             && super::is_hex64(&self.tree_root)
@@ -189,6 +199,7 @@ mod tests {
             verified_at: 1_790_000_000,
             measured_sha256: None,
             agreed_with: None,
+            tree_from: None,
         }
     }
 
@@ -441,6 +452,53 @@ mod tests {
             assert_eq!(read_record(&dir), None, "{rec:?}");
             assert_eq!(complete_record(&dir), None, "{rec:?}");
         }
+    }
+
+    /// A record names as the tree's lender only a row that lends its tree to its own: codex for
+    /// codex-old, never itself, a row with an alias of its own, another head's row or no row.
+    #[test]
+    fn a_record_names_only_a_row_that_lends_it_its_tree() {
+        let l = layout("lender");
+        let version = Version::parse("0.163.0").unwrap();
+        let codex_old = VendorRecord {
+            program: "codex-old".into(),
+            version,
+            vendor: "OpenAI".into(),
+            source_url: "https://github.com/openai/codex/releases/download/rust-v0.163.0/codex-package-aarch64-apple-darwin.tar.gz".into(),
+            anchor: Anchor::OpenAiTwoHost,
+            apple_team: team("codex-old"),
+            build_date: None,
+            tree_from: Some("codex".into()),
+            ..record()
+        };
+        let dir = place(&l, "codex-old", version.build_id(), &codex_old);
+        assert_eq!(read_record(&dir), Some(codex_old.clone()));
+        let text = std::fs::read_to_string(record_path(&dir).unwrap()).unwrap();
+        assert!(text.ends_with("tree_from = \"codex\"\n"), "{text}");
+        for lender in ["codex-old", "claude", "grok", "", "codex2"] {
+            let bad = VendorRecord {
+                tree_from: Some(lender.into()),
+                ..codex_old.clone()
+            };
+            assert!(bad.record_bytes().is_err(), "{lender:?}");
+        }
+        let codex = VendorRecord {
+            program: "codex".into(),
+            tree_from: Some("codex-old".into()),
+            ..codex_old.clone()
+        };
+        assert!(
+            codex.record_bytes().is_err(),
+            "codex-old's tree carries its alias"
+        );
+        assert!(
+            VendorRecord {
+                tree_from: None,
+                ..codex
+            }
+            .record_bytes()
+            .is_ok()
+        );
     }
 
     /// A grok record, from either lane: the one an earlier aterm wrote when xAI's Developer ID

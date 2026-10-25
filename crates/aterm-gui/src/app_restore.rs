@@ -1900,9 +1900,11 @@ impl App {
     ) -> std::ops::ControlFlow<()> {
         // The first persisted window maps onto the bootstrap window: session 0 already runs in
         // the persisted first-leaf cwd (seeded in `main`), so its layout is rebuilt in place
-        // around it. Its geometry is not applied here: the grid seeded the window's creation
-        // (`run`) and position/maximize were applied post-attach in `resumed`, both before this
-        // deferred pass, so the bootstrap frame never visibly hops.
+        // around it. Its geometry is not applied here: the grid and the carried frame seeded the
+        // window's creation (`run`, `CarriedFrame::cold_first_seed`) and `resumed` applied its
+        // position/maximize (post-attach, or staged for `attach_os_window` where a window is
+        // placed before it is shown), both before this deferred pass, so the bootstrap frame
+        // never visibly hops.
         if first {
             self.restore_bootstrap_window(wl, placed, sliced);
             return std::ops::ControlFlow::Continue(());

@@ -788,13 +788,19 @@ pub(crate) fn push_twinkle_star(
 
 /// Channel-weighted lit-pixel sum of a quad batch.
 #[cfg(test)]
-pub(crate) fn ink(out: &[GlowQuad]) -> u64 {
-    out.iter()
-        .map(|q| {
-            let px = (q.w as u64) * (q.h as u64);
-            px * (((q.color >> 16) & 0xff) + ((q.color >> 8) & 0xff) + (q.color & 0xff)) as u64
-        })
-        .sum()
+#[inline]
+#[must_use]
+pub(crate) const fn ink(out: &[GlowQuad]) -> u64 {
+    let mut sum = 0u64;
+    let mut i = 0;
+    while i < out.len() {
+        let q = &out[i];
+        let px = (q.w as u64) * (q.h as u64);
+        let ch = (((q.color >> 16) & 0xff) + ((q.color >> 8) & 0xff) + (q.color & 0xff)) as u64;
+        sum += px * ch;
+        i += 1;
+    }
+    sum
 }
 
 /// Worst WCAG contrast against `ground` over one caret cell at `(x, y, w, h)`.
@@ -834,7 +840,7 @@ pub(crate) fn caret_cell_worst_contrast(
 mod tests {
     use super::*;
 
-    fn geom() -> Geom {
+    const fn geom() -> Geom {
         Geom {
             cw: 8,
             ch: 16,
@@ -1031,15 +1037,17 @@ mod tests {
 
     /// The windowed-walk ramp (`windows(2)` walk, divide guard, raw-crest fall-through): the
     /// byte-identity oracle for the branchless [`ramp_5stop`].
-    fn walked_ramp(stops: &[(f32, u32); 5], t: f32) -> u32 {
+    const fn walked_ramp(stops: &[(f32, u32); 5], t: f32) -> u32 {
         let t = t.clamp(0.0, 1.0);
-        for w in stops.windows(2) {
-            let (t0, c0) = w[0];
-            let (t1, c1) = w[1];
+        let mut i = 0;
+        while i + 1 < stops.len() {
+            let (t0, c0) = stops[i];
+            let (t1, c1) = stops[i + 1];
             if t <= t1 {
                 let local = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
                 return lerp_rgb(c0, c1, local);
             }
+            i += 1;
         }
         stops[stops.len() - 1].1
     }

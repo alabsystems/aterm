@@ -2379,8 +2379,8 @@ mod tests {
 
     const CELL_H: u16 = 19;
 
-    fn pet_natural_size(cell_h: u16) -> (u16, u16) {
-        let nat_h = (crate::kitty_pet::ART_ROWS * f32::from(cell_h)).round();
+    const fn pet_natural_size(cell_h: u16) -> (u16, u16) {
+        let nat_h = (crate::kitty_pet::ART_ROWS * cell_h as f32).round();
         let nat_w = (nat_h * crate::kitty_pet::ART_ASPECT).round();
         (nat_w as u16, nat_h as u16)
     }

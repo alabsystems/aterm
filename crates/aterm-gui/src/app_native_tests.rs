@@ -9462,9 +9462,8 @@ fn the_harness_switch_writes_turn_every_switch_on() {
         let mut app = App::headless_for_test();
         app.native_config_service =
             crate::native_config_service::VersionedConfigService::new(text.to_string()).unwrap();
-        let plan = switch_on_plan(&policy(text), headless, Some(Program::Claude), None);
+        let plan = switch_on_plan(&policy(text), headless, Some(Program::Claude));
         assert_eq!(plan.keys.len(), writes, "{text:?}: {plan:?}");
-        assert!(!plan.cruise, "{text:?}: the default carries the session");
         for key in plan.keys {
             let result = app
                 .reduce_native_config_work(NativeConfigWork::ControlField {
@@ -9480,7 +9479,7 @@ fn the_harness_switch_writes_turn_every_switch_on() {
                 unreachable!("asserted applied above")
             };
             app.publish_native_config_origin(
-                NativeConfigOrigin::HarnessSwitch { key },
+                NativeConfigOrigin::HarnessSwitch { key, on: true },
                 ConfigPatchOutcome::Applied {
                     revision: snapshot.revision,
                     undo: Some(undo.get()),
@@ -9522,7 +9521,7 @@ fn the_harness_switch_writes_turn_every_switch_on() {
         let mut app = App::headless_for_test();
         app.native_config_service =
             crate::native_config_service::VersionedConfigService::new(text.to_string()).unwrap();
-        let plan = switch_on_plan(&policy(text), headless, Some(Program::Claude), None);
+        let plan = switch_on_plan(&policy(text), headless, Some(Program::Claude));
         assert_eq!(plan.keys, [key]);
         assert!(
             !carried(text, headless),
@@ -9548,7 +9547,7 @@ fn the_harness_switch_writes_turn_every_switch_on() {
             "the limit must remain effective"
         );
         app.publish_native_config_origin(
-            NativeConfigOrigin::HarnessSwitch { key },
+            NativeConfigOrigin::HarnessSwitch { key, on: true },
             ConfigPatchOutcome::Applied {
                 revision: snapshot.revision,
                 undo,
@@ -9571,6 +9570,7 @@ fn the_harness_switch_writes_turn_every_switch_on() {
     app.publish_native_config_origin(
         NativeConfigOrigin::HarnessSwitch {
             key: crate::prefs::EDIT_HARNESS_ENABLED,
+            on: true,
         },
         ConfigPatchOutcome::Applied {
             revision: 1,
@@ -9583,7 +9583,95 @@ fn the_harness_switch_writes_turn_every_switch_on() {
     assert!(app.messages.log().records().any(|r| {
         r.key.as_deref() == Some("harness.switch-save.harness.enabled")
             && r.severity == aterm_messages::Severity::Warn
+            && r.title == "Couldn't confirm the harness was turned on"
     }));
+}
+
+/// THE LIT SWITCH'S WRITE TURNS THE WHOLE HARNESS OFF: `harness.enabled = false` through the
+/// switch's own lane reads back off and says nothing; the same lane's unconfirmed save says
+/// it could not confirm the harness was turned OFF, and a refused one that it could not turn it
+/// off, each naming `harness.enabled = false`. CONTROL: the policy carried Claude Code before.
+#[test]
+fn the_harness_switch_write_turns_the_whole_harness_off() {
+    use crate::autopilot::HarnessPosture;
+    use aterm_phase::Program;
+    let carried = |text: &str| {
+        matches!(
+            HarnessPosture::of(
+                true,
+                &crate::app_config::HarnessPolicy::read(text).policy,
+                false
+            )
+            .for_agent(Some(Program::Claude)),
+            HarnessPosture::On(_)
+        )
+    };
+    let key = crate::prefs::EDIT_HARNESS_ENABLED;
+    let said = |app: &App| {
+        app.messages
+            .log()
+            .records()
+            .rfind(|r| r.key.as_deref() == Some("harness.switch-save.harness.enabled"))
+            .map(|r| (r.severity, r.title.clone(), r.detail.join(" ")))
+    };
+    for text in ["[harness]\n", "[harness]\nautopilot = \"off\"\n"] {
+        assert!(carried(text), "CONTROL: {text:?} carries the harness");
+        let mut app = App::headless_for_test();
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::new(text.to_string()).unwrap();
+        let ConfigPatchResult::Applied { snapshot, undo } = app
+            .reduce_native_config_work(NativeConfigWork::ControlField {
+                key: key.to_string(),
+                value: Some(false.to_string()),
+            })
+            .unwrap()
+        else {
+            panic!("{text:?}: the master switch's off-write applies");
+        };
+        app.publish_native_config_origin(
+            NativeConfigOrigin::HarnessSwitch { key, on: false },
+            ConfigPatchOutcome::Applied {
+                revision: snapshot.revision,
+                undo: Some(undo.get()),
+            },
+            Some(snapshot),
+            false,
+            None,
+        );
+        let after = app.native_config_service.snapshot().text.to_string();
+        assert!(!carried(&after), "{text:?} became {after:?}");
+        assert_eq!(
+            said(&app),
+            None,
+            "{text:?}: a confirmed off-write says nothing"
+        );
+    }
+
+    let mut app = App::headless_for_test();
+    app.publish_native_config_origin(
+        NativeConfigOrigin::HarnessSwitch { key, on: false },
+        ConfigPatchOutcome::Applied {
+            revision: 1,
+            undo: None,
+        },
+        None,
+        false,
+        None,
+    );
+    let (severity, title, detail) = said(&app).expect("an unconfirmed off-write is reported");
+    assert_eq!(severity, aterm_messages::Severity::Warn);
+    assert_eq!(title, "Couldn't confirm the harness was turned off");
+    assert!(detail.contains("harness.enabled = false"), "{detail:?}");
+
+    let mut app = App::headless_for_test();
+    app.queue_harness_switch_write(key, false);
+    let (severity, title, detail) = said(&app).expect("a refused off-write is reported");
+    assert_eq!(severity, aterm_messages::Severity::Error);
+    assert_eq!(title, "Couldn't turn the harness off");
+    assert!(
+        detail.contains("harness.enabled = false: config persistence needs an event-loop proxy"),
+        "{detail:?}"
+    );
 }
 
 #[test]

@@ -1901,7 +1901,7 @@ impl App {
                         {
                             p.select(idx);
                         }
-                        self.palette_activate();
+                        self.palette_activate_in(wid);
                     }
                     _ => {}
                 }

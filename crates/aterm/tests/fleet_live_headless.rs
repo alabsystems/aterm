@@ -15,8 +15,8 @@ use aterm_net::fleet::{
     FleetError, FleetOp, FleetScope, FleetSecret, KEY_FILE, NodeIdentity, NodeKey, client_handshake,
 };
 use aterm_net::fleet_member::{
-    BookRead, BookUnread, Keyring, Registration, Target, Via, dial, fetch_book, read_node_identity,
-    read_peers, read_whole, register_by,
+    BookRead, BookUnread, Keyring, Registration, Target, Unregistered, Via, dial, fetch_book,
+    read_node_identity, read_peers, read_whole, register_by,
 };
 
 use crate::headless_boot::{self, Instance, POLL_GAP, boot_session, ctl, ctl_ok, field, status};
@@ -592,7 +592,7 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         Instant::now() + HANG,
     );
     assert!(
-        refused.as_ref().is_err_and(|why| why.contains(&format!(
+        matches!(&refused, Err(Unregistered::Answered(why)) if why.contains(&format!(
             "`aterm fleet peers rm {}` on the issuer",
             &node[..8]
         ))),
@@ -1184,4 +1184,121 @@ fn a_grant_taken_back_while_aterm_toml_does_not_load_still_ends_the_drive() {
     fleet_ok(&member.tmp, &["allow", "content"], None);
     hold_ends(&member, &worker);
     drive_refused(&issuer.tmp, &target, &[&format!("@{worker}"), "status"]);
+}
+
+#[test]
+fn a_local_hold_off_keeps_a_hold_its_node_may_still_drive_and_lifts_one_it_may_not() {
+    let (holder, port) = hold_a_port();
+    drop(holder);
+    let port_word = port.to_string();
+    let held = headless_boot::boot_with(
+        "afli",
+        |tmp, cmd| {
+            fleet_ok(
+                tmp,
+                &["init", "--host", "127.0.0.1", "--port", &port_word],
+                None,
+            );
+            cmd.env("ATERM_STATE_HOME", tmp.join("state"))
+                .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
+                .args(["--lines", "24", "--columns", "80"]);
+        },
+        |_| true,
+    );
+    let (_, sid) = boot_session(&held);
+    fleet_reads(&held, &sid, "listening");
+    let code = std::fs::read_to_string(held.tmp.join("state/fleet-join-code")).expect("a code");
+    let (holder, member_port) = hold_a_port();
+    drop(holder);
+    let member_port_word = member_port.to_string();
+    let driver = headless_boot::boot_with(
+        "aflm",
+        |tmp, cmd| {
+            fleet_ok(
+                tmp,
+                &["join", "--host", "127.0.0.1", "--port", &member_port_word],
+                Some(&code),
+            );
+            cmd.env("ATERM_STATE_HOME", tmp.join("state"))
+                .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
+                .args(["--lines", "24", "--columns", "80"]);
+        },
+        |_| true,
+    );
+    let (_, driver_sid) = boot_session(&driver);
+    fleet_reads(&driver, &driver_sid, "listening");
+    let node = std::fs::read_to_string(driver.tmp.join("state/fleet-node")).expect("its node id");
+    let node = node.trim().to_owned();
+    fleet_ok(&held.tmp, &["allow", "drive", "--from", &node], None);
+    let target = format!("127.0.0.1:{port}");
+    let mut last = None;
+    let took = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        let out = drive_in(&driver.tmp, &target, &["hold", &sid, "on"]);
+        let took = out.status.success().then_some(());
+        last = Some(out);
+        took
+    });
+    assert!(took.is_some(), "the grant never let it hold: {last:?}");
+    let at = format!("@{sid}");
+    let by = format!("held by 127.0.0.1 (node {}) over the fleet", &node[..8]);
+
+    let local = ctl(&held, &[&at, "send", "x"]);
+    let said = String::from_utf8_lossy(&local.stderr);
+    assert_eq!(local.status.code(), Some(1), "{local:?}");
+    assert!(
+        said.contains("origin=remote")
+            && said.contains(&by)
+            && said.contains(&format!("`aterm fleet peers rm {}`", &node[..8]))
+            && said.contains(&format!("`aterm ctl hold {sid} off`")),
+        "the refusal names who holds it and what lifts it: {said}"
+    );
+    let stands = |says: &str| {
+        let off = ctl(&held, &["hold", &sid, "off"]);
+        let said = String::from_utf8_lossy(&off.stderr);
+        assert_eq!(off.status.code(), Some(1), "{off:?}");
+        assert!(
+            said.contains(says),
+            "a node that may still drive keeps its hold: {said}"
+        );
+        assert_eq!(field(&status(&held, &sid), "hold_by"), Some("remote"));
+    };
+    stands("which still drives this Mac");
+
+    let cfg = driver.tmp.join("cfg/aterm/aterm.toml");
+    let text = std::fs::read_to_string(&cfg).expect("the driver's config");
+    let unlistened: String = text
+        .lines()
+        .filter(|line| !line.starts_with("listen = "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_ne!(
+        unlistened, text,
+        "the driver's [fleet] listen was taken out"
+    );
+    std::fs::write(&cfg, unlistened).expect("write the driver's config");
+    fleet_reads(&driver, &driver_sid, "off");
+    stands(&format!(
+        "which may still drive this Mac: its place did not prove it just now (nothing listens on \
+         127.0.0.1:{member_port}"
+    ));
+    let (off, _) = drive_ok(&driver.tmp, &target, &["hold", &sid, "off"]);
+    assert_eq!(
+        off.trim(),
+        "OK hold=0",
+        "its own CLI drives with no listener there: {off}"
+    );
+    let (on, _) = drive_ok(&driver.tmp, &target, &["hold", &sid, "on"]);
+    assert_eq!(on.trim(), "OK hold=1", "{on}");
+
+    fleet_ok(&driver.tmp, &["leave"], None);
+    fleet_ok(
+        &driver.tmp,
+        &["init", "--host", "127.0.0.1", "--port", &member_port_word],
+        None,
+    );
+    fleet_reads(&driver, &driver_sid, "listening");
+    let lifted = ctl_ok(&held, &["hold", &sid, "off"]);
+    assert_eq!(lifted.trim(), "OK hold=0 lifted=remote", "{lifted}");
+    assert_eq!(field(&status(&held, &sid), "hold_by"), Some("-"));
+    ctl_ok(&held, &[&at, "send", "y"]);
 }

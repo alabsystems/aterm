@@ -6107,6 +6107,84 @@ fn the_pass_refuses_a_program_naming_the_retired_requires_and_installs_the_rest(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An index naming and pinning `ay` and the harness `muse-alab` at `harness_build`.
+fn write_registry_with_harness(dir: &Path, index_build: u64, harness_build: u64) {
+    let index_body = format!(
+        "schema = 2\nindex_build = {index_build}\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
+         machine_id = \"{id}\"\nroster_seq = {seq}\n\
+         [programs.ay]\nrepo = \"ay\"\n[programs.muse-alab]\nrepo = \"muse-alab\"\n\
+         [[channels]]\nname = \"stable\"\nchannel_build = {index_build}\nmin_build = 0\n\
+         pin = {{ ay = 18, muse-alab = {harness_build} }}\n",
+        id = testkit::MACHINE_ID,
+        seq = testkit::SEQ
+    );
+    std::fs::write(dir.join("index.toml"), index_body.as_bytes()).unwrap();
+    std::fs::write(
+        dir.join("index.toml.sig"),
+        sign(&RELEASE_SEED, index_body.as_bytes()),
+    )
+    .unwrap();
+    write_roster(dir);
+    write_pkg(dir, "ay", 18);
+    write_pkg(dir, "muse-alab", harness_build);
+}
+
+/// A HARNESS LANDS ONLY WHEN A PERSON NAMES IT, AND IS KEPT CURRENT ONCE IT HAS: the pass
+/// that completes the default set installs `ay` and leaves the pinned `muse-alab` alone (no
+/// build, no stub, no failure), a typed install lands it, and the next update pass moves it
+/// to the index's newer pin.
+#[cfg(unix)]
+#[test]
+fn a_harness_installs_only_when_named_and_is_kept_current_once_installed() {
+    let dir = scratch("harness-opt-in");
+    write_registry_with_harness(&dir, 41, 4);
+    let layout = temp_layout("harness-opt-in");
+    let cfg = crate::config::PackagesConfig::default();
+    let fetcher = crate::DirFetcher::new(dir.clone());
+    let out = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
+    assert_eq!(out.failures, 0);
+    let active = crate::active_builds(&layout);
+    assert_eq!(active.get("ay").copied(), Some(18), "the default set lands");
+    assert!(
+        !active.contains_key("muse-alab"),
+        "a harness is never installed by the set: {active:?}"
+    );
+    assert!(
+        !crate::stub::pending_stub_exists(&layout, "muse-alab"),
+        "and no stub promises it"
+    );
+
+    crate::flow::install(
+        &fetcher,
+        &layout,
+        &test_anchor(),
+        &crate::InstallRequest {
+            channel: "stable",
+            program: "muse-alab",
+            triple: current_triple(),
+            installed: None,
+        },
+        build_floor(&layout),
+        0,
+    )
+    .expect("a typed install lands the harness");
+    assert_eq!(
+        crate::active_builds(&layout).get("muse-alab").copied(),
+        Some(4)
+    );
+
+    write_registry_with_harness(&dir, 42, 5);
+    let (_, failures) = update_pass(&layout, &fetcher);
+    assert_eq!(failures, 0);
+    assert_eq!(
+        crate::active_builds(&layout).get("muse-alab").copied(),
+        Some(5),
+        "an installed harness follows its pin"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn update_pass(
     layout: &crate::store::Layout,
     fetcher: &crate::DirFetcher,

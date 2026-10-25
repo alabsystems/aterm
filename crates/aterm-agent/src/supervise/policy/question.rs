@@ -49,9 +49,13 @@ enum Chosen {
     Wrapped(Vec<usize>),
     /// None is marked: option 1.
     Unmarked,
-    /// None is marked and option 1 names a destructive act (`why`, as "would <word>"): `took`,
-    /// the first option that names none and keeps no answer ([`unmarked_pick`]).
+    /// None is marked and option 1 cannot be taken (`why`: it "would <word>", keeps its answer, or
+    /// approves what it does not say beside an option that names an act): `took`, the first
+    /// option that can ([`unmarked_pick`]).
     FirstSafe { why: String, took: String },
+    /// None is marked and an option names `act` only to decline it, so the others may do it: the
+    /// one option that refuses it ([`unmarked_pick`]).
+    Declined { act: &'static str },
 }
 
 /// What a key's ledger row says where its option was chosen as marked `(Recommended)`.
@@ -63,6 +67,13 @@ pub const CHOSE_UNMARKED: &str = "no option is marked (Recommended): option 1";
 /// Ledger label when no option was marked and option 1 was passed over for the first option that
 /// names no destructive act and keeps no answer ([`Chosen::FirstSafe`]).
 pub const CHOSE_FIRST_SAFE: &str = "no option is marked (Recommended), and option 1 is passed over";
+
+fn declined(act: &str) -> String {
+    format!(
+        "no option is marked (Recommended), and an option names `{act}` only to decline it, so \
+         the others may {act}: its one refusal"
+    )
+}
 
 impl Chosen {
     fn unproven(&self) -> String {
@@ -80,6 +91,7 @@ impl Chosen {
                 "{CHOSE_FIRST_SAFE}: option 1 {why}, so {took}, the first that names no \
                  destructive act and keeps no answer"
             ),
+            Chosen::Declined { act } => declined(act),
         }
     }
 }
@@ -115,10 +127,12 @@ fn recommended(options: &[QuestionOption]) -> (Vec<u8>, Chosen) {
 #[must_use]
 pub fn recommended_set(options: &[QuestionOption]) -> Vec<u8> {
     match recommended(options) {
-        (_, Chosen::Unmarked) => {
-            unmarked_pick(options, |o| (o.label.as_str(), o.description.as_str()))
-                .map_or_else(|_| vec![1], |(k, _)| vec![options[k].n])
-        }
+        (_, Chosen::Unmarked) => unmarked_pick(
+            options,
+            |o| (o.label.as_str(), o.description.as_str()),
+            |_| String::new(),
+        )
+        .map_or_else(|_| vec![1], |(k, _)| vec![options[k].n]),
         (marked, _) => marked,
     }
 }
@@ -384,45 +398,245 @@ fn asks_to(question: &QuestionText) -> Option<&'static str> {
     super::turn_end::destructive_word(&question.text.to_lowercase())
 }
 
-/// The destructive word one option's own label or description names.
-fn option_would(label: &str, description: &str) -> Option<&'static str> {
-    super::turn_end::destructive_word(&format!("{label}\n{description}").to_lowercase())
+/// How one option's own words bear on a destructive act ([`super::turn_end::destructive_word`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Bears {
+    /// The first act its words name outside a negation: what taking it would do.
+    does: Option<&'static str>,
+    /// The acts its words name only under a negation (`Don't drop the staging table`, `Do not
+    /// delete any branch`, `nothing gets removed`): acts it declines, which the dialog's other
+    /// options may then do.
+    declines: Vec<&'static str>,
+}
+
+/// Where one clause of an option's words ends: a negation reaches no further.
+const CLAUSE_ENDS: &[char] = &[
+    '\n', ',', ';', ':', '.', '!', '?', '(', ')', '[', ']', '"', '—', '–',
+];
+
+/// Words that negate the act right after them (with any word ending `n't`).
+const NEGATORS: &[&str] = &[
+    "no", "not", "never", "without", "nothing", "none", "nor", "neither", "dont", "cannot",
+];
+
+/// Words a negation reaches across to its act (`do not ever delete`, `nothing gets removed`,
+/// `don't delete or drop`); any other word between them ends its reach.
+const NEGATION_REACHES: &[&str] = &[
+    "is", "are", "was", "were", "be", "been", "being", "will", "would", "should", "gets", "get",
+    "got", "to", "ever", "any", "anything", "or",
+];
+
+fn negates(word: &str) -> bool {
+    NEGATORS.contains(&word) || word.ends_with("n't")
+}
+
+/// The destructive act that starts at `words[k]`: the word itself, or it and the next where the
+/// act is two words (`rewrite history`, `push -f`).
+fn act_at(words: &[&str], k: usize) -> Option<&'static str> {
+    super::turn_end::destructive_word(words[k]).or_else(|| {
+        let next = words.get(k + 1)?;
+        super::turn_end::destructive_word(next)
+            .is_none()
+            .then(|| super::turn_end::destructive_word(&format!("{} {next}", words[k])))
+            .flatten()
+    })
+}
+
+/// Whether the act at `words[k]` is negated: a negator before it, with only
+/// [`NEGATION_REACHES`] words and other acts between them.
+fn negated(words: &[&str], k: usize) -> bool {
+    (0..k)
+        .rev()
+        .find(|&i| !(NEGATION_REACHES.contains(&words[i]) || act_at(words, i).is_some()))
+        .is_some_and(|i| negates(words[i]))
+}
+
+/// What one option's own label and description do and decline ([`Bears`]).
+fn bears(label: &str, description: &str) -> Bears {
+    let text = format!("{label}\n{description}")
+        .to_lowercase()
+        .replace('’', "'");
+    let mut read = Bears::default();
+    for clause in text.split(CLAUSE_ENDS) {
+        let words: Vec<&str> = clause
+            .split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '-'))
+            .map(|w| w.trim_matches('\''))
+            .filter(|w| !w.is_empty())
+            .collect();
+        for k in 0..words.len() {
+            let Some(act) = act_at(&words, k) else {
+                continue;
+            };
+            if negated(&words, k) {
+                if !read.declines.contains(&act) {
+                    read.declines.push(act);
+                }
+            } else if read.does.is_none() {
+                read.does = Some(act);
+            }
+        }
+    }
+    if read.does.is_none() && read.declines.is_empty() {
+        read.does = super::turn_end::destructive_word(&text);
+    }
+    read
+}
+
+/// Label openings that approve without saying what: their act is whatever the rest of the dialog
+/// names (`Yes`, `Go ahead`, `As planned`, `Both of the above`).
+const ASSENTS: &[&str] = &[
+    "yes",
+    "ok",
+    "okay",
+    "sure",
+    "go ahead",
+    "proceed",
+    "continue",
+    "approve",
+    "confirm",
+    "accept",
+    "do it",
+    "sounds good",
+    "as planned",
+    "as proposed",
+    "as described",
+    "as above",
+    "both",
+    "all of",
+    "all the above",
+];
+
+/// Words anywhere in an option that point at an act named elsewhere.
+const POINTS_ELSEWHERE: &[&str] = &[
+    "as planned",
+    "as proposed",
+    "as described",
+    "described above",
+    "the above",
+    "go ahead",
+    "proceed with",
+    "the plan",
+];
+
+/// Whether one option approves what it does not say ([`ASSENTS`], [`POINTS_ELSEWHERE`]).
+fn approves_unsaid(label: &str, description: &str) -> bool {
+    let l = label.trim().to_lowercase().replace('’', "'");
+    let opens = ASSENTS.iter().any(|a| {
+        l.strip_prefix(a)
+            .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()))
+    });
+    let text = format!("{l}\n{}", description.to_lowercase().replace('’', "'"));
+    opens || POINTS_ELSEWHERE.iter().any(|p| text.contains(p))
+}
+
+/// One option as [`unmarked_pick`] and [`the_refusal`] read it.
+struct OptionReading {
+    bears: Bears,
+    kept: bool,
+    refuses: bool,
+    unsaid: bool,
+}
+
+fn read_options<T>(options: &[T], said: impl Fn(&T) -> (&str, &str)) -> Vec<OptionReading> {
+    options
+        .iter()
+        .map(|o| {
+            let (label, description) = said(o);
+            OptionReading {
+                bears: bears(label, description),
+                kept: kept(label, description).is_some(),
+                refuses: refuses(label),
+                unsaid: approves_unsaid(label, description),
+            }
+        })
+        .collect()
 }
 
 /// THE OPTION AN UNMARKED QUESTION IS ANSWERED WITH, where its own row names no destructive act
-/// ([`asks_to`]): option 1 (the documented fallback, `Ok((0, None))`), unless option 1's own
-/// words name one; then the first option whose own words name none and keep no answer
-/// ([`kept`]), with why option 1 was passed over (`Ok((k, Some("would <word>")))`).
+/// ([`asks_to`]), and how it was chosen ([`Chosen`]).
 ///
-/// A destructive word in one option's text is a fact about that option alone: answering with
-/// another option approves none of it. Before 2026-10-24 any such word anywhere in the dialog sent
-/// the whole question to a person; under Land a question whose option 1 described a bug in words
-/// holding `reset` waited 44 minutes that way (`claude-2.1.310-question-reset-in-description.txt`).
-/// `Err` only where every option names a destructive act or keeps its answer: then no option
-/// refuses the act either (a refusal names none), and a person answers it.
+/// 1. An option that names an act only to decline it (`No / Don't drop the staging table`, `Keep
+///    them / Do not delete any branch`) shows the act is what the question is about: the other
+///    options may well do it, `Yes / Go ahead with it` above all. The answer is the one option
+///    that refuses every such act (it declines each, or opens with `No`) and names no act it would
+///    do and keeps no answer ([`Chosen::Declined`]); with none, or more than one, a person
+///    answers.
+/// 2. Otherwise option 1 is the documented fallback ([`Chosen::Unmarked`]), unless its own words
+///    name an act it would do, it keeps its answer for every later ask ([`kept`]), or it approves
+///    what it does not say ([`approves_unsaid`]) beside an option that names an act. Then the
+///    first option that can be taken ([`Chosen::FirstSafe`]); with none, a person answers.
+///
+/// An act an option's own words name outside a negation is that option's: before 2026-10-24 any
+/// destructive word anywhere sent the whole question to a person, and under Land a question whose
+/// option 1 described a bug in words holding `reset` waited 44 minutes that way
+/// (`claude-2.1.310-question-reset-in-description.txt`). The question's own row and a declining
+/// option still bear on every answer.
 fn unmarked_pick<T>(
     options: &[T],
     said: impl Fn(&T) -> (&str, &str),
-) -> Result<(usize, Option<String>), String> {
-    let Some(first) = options.first() else {
+    took: impl Fn(usize) -> String,
+) -> Result<(usize, Chosen), String> {
+    let reads = read_options(options, said);
+    let Some(first) = reads.first() else {
         return Err("a question with no option to answer".to_string());
     };
-    let (label, description) = said(first);
-    let Some(w) = option_would(label, description) else {
-        return Ok((0, None));
+    let mut in_play: Vec<&'static str> = Vec::new();
+    for act in reads.iter().flat_map(|r| r.bears.declines.iter().copied()) {
+        if !in_play.contains(&act) {
+            in_play.push(act);
+        }
+    }
+    if let Some(&act) = in_play.first() {
+        let refusing: Vec<usize> = reads
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                r.bears.does.is_none()
+                    && !r.kept
+                    && (r.refuses || in_play.iter().all(|a| r.bears.declines.contains(a)))
+            })
+            .map(|(k, _)| k)
+            .collect();
+        return match refusing.as_slice() {
+            [k] => Ok((*k, Chosen::Declined { act })),
+            _ => Err(format!(
+                "a question with no recommended option where an option names `{act}` only to \
+                 decline it, so the others may {act}, and no one option that refuses it: a \
+                 person answers that"
+            )),
+        };
+    }
+    let named = reads.iter().find_map(|r| r.bears.does);
+    let takes =
+        |r: &OptionReading| r.bears.does.is_none() && !r.kept && !(named.is_some() && r.unsaid);
+    if takes(first) {
+        return Ok((0, Chosen::Unmarked));
+    }
+    let why = match (first.bears.does, named) {
+        (Some(w), _) => format!("would {w}"),
+        _ if first.kept => "keeps its answer for every later ask".to_string(),
+        (None, Some(w)) => {
+            format!("approves what it does not say, beside an option that would {w}")
+        }
+        (None, None) => "cannot be taken".to_string(),
     };
-    options
+    reads
         .iter()
-        .position(|o| {
-            let (label, description) = said(o);
-            option_would(label, description).is_none() && kept(label, description).is_none()
+        .position(takes)
+        .map(|k| {
+            (
+                k,
+                Chosen::FirstSafe {
+                    why: why.clone(),
+                    took: took(k),
+                },
+            )
         })
-        .map(|k| (k, Some(format!("would {w}"))))
         .ok_or_else(|| {
             format!(
                 "a question with no recommended option whose every option names a destructive \
-                 act or a kept answer (option 1 would {w}), and no one option that refuses it: a \
-                 person answers that"
+                 act, keeps its answer or approves what it does not say (option 1 {why}), and no \
+                 one option that refuses it: a person answers that"
             )
         })
 }
@@ -444,17 +658,19 @@ fn refuses(label: &str) -> bool {
         .is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_alphanumeric()))
 }
 
+/// The one option that refuses `w`, the act the question's own row names: it opens with `No` or
+/// names `w` only to decline it, and names no act it would do ([`Bears`]).
 fn the_refusal<'a, T>(
-    w: &str,
+    w: &'static str,
     options: &'a [T],
-    label: impl Fn(&T) -> String,
+    said: impl Fn(&T) -> (&str, &str),
 ) -> Result<&'a T, String> {
+    let reads = read_options(options, said);
     let refusing: Vec<&T> = options
         .iter()
-        .filter(|o| {
-            let text = label(o);
-            refuses(&text) && super::turn_end::destructive_word(&text.to_lowercase()).is_none()
-        })
+        .zip(&reads)
+        .filter(|(_, r)| r.bears.does.is_none() && (r.refuses || r.bears.declines.contains(&w)))
+        .map(|(o, _)| o)
         .collect();
     match refusing.as_slice() {
         [one] => Ok(one),
@@ -1147,7 +1363,7 @@ fn answer_by_role(prompt: &PromptV2, rows: &[String]) -> Decision {
     if chosen.is_none() {
         let asked = format!("{}\n{}", prompt.title, prompt.description).to_lowercase();
         if let Some(w) = super::turn_end::destructive_word(&asked) {
-            match the_refusal(w, &answers, |o| o.label.clone()) {
+            match the_refusal(w, &answers, |o| (o.label.as_str(), "")) {
                 Ok(refusal) => {
                     o = refusal;
                     how = refused(w);
@@ -1155,15 +1371,14 @@ fn answer_by_role(prompt: &PromptV2, rows: &[String]) -> Decision {
                 Err(why) => return Decision::escalate(why),
             }
         } else {
-            match unmarked_pick(&answers, |o| (o.label.as_str(), "")) {
-                Ok((_, None)) => {}
-                Ok((k, Some(why))) => {
+            match unmarked_pick(
+                &answers,
+                |o| (o.label.as_str(), ""),
+                |k| format!("`{}`", answers[k].label),
+            ) {
+                Ok((k, chosen)) => {
                     o = answers[k];
-                    how = Chosen::FirstSafe {
-                        why,
-                        took: format!("`{}`", o.label),
-                    }
-                    .unproven();
+                    how = chosen.unproven();
                 }
                 Err(why) => return Decision::escalate(why),
             }
@@ -1307,15 +1522,13 @@ fn choose(dialog: &QuestionDialog) -> Result<(AnswerTarget, String, String), Str
                 if let Some(why) = no_mark_that_would(question) {
                     return Err(why);
                 }
-                if let (k, Some(why)) =
-                    unmarked_pick(options, |o| (o.label.as_str(), o.description.as_str()))?
-                {
-                    marked = vec![options[k].n];
-                    how = Chosen::FirstSafe {
-                        why,
-                        took: format!("option {}", options[k].n),
-                    };
-                }
+                let (k, chosen) = unmarked_pick(
+                    options,
+                    |o| (o.label.as_str(), o.description.as_str()),
+                    |k| format!("option {}", options[k].n),
+                )?;
+                marked = vec![options[k].n];
+                how = chosen;
             }
             if let Some(why) = options
                 .iter()
@@ -1389,21 +1602,16 @@ fn choose_one(
     let (marked, how) = recommended(options);
     let (o, unproven) = match (&how, asks_to(question)) {
         (Chosen::Unmarked, Some(w)) => (
-            the_refusal(w, options, |o| format!("{}\n{}", o.label, o.description))?,
+            the_refusal(w, options, |o| (o.label.as_str(), o.description.as_str()))?,
             refused(w),
         ),
         (Chosen::Unmarked, None) => {
-            let (k, passed) =
-                unmarked_pick(options, |o| (o.label.as_str(), o.description.as_str()))?;
-            let o = &options[k];
-            let how = match passed {
-                None => Chosen::Unmarked,
-                Some(why) => Chosen::FirstSafe {
-                    why,
-                    took: format!("option {}", o.n),
-                },
-            };
-            (o, how.unproven())
+            let (k, chosen) = unmarked_pick(
+                options,
+                |o| (o.label.as_str(), o.description.as_str()),
+                |k| format!("option {}", options[k].n),
+            )?;
+            (&options[k], chosen.unproven())
         }
         _ => (
             options

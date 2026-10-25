@@ -86,6 +86,9 @@ pub mod beat;
 #[path = "disk_versions.rs"]
 pub mod versions;
 
+#[path = "disk_ask.rs"]
+pub mod ask;
+
 #[cfg(windows)]
 #[path = "disk_win.rs"]
 pub(crate) mod win;
@@ -879,6 +882,9 @@ pub struct Hog {
     pub bytes_partial: bool,
     /// What it is, and what frees it.
     pub why: String,
+    /// The checkout or workspace whose builds it holds, where its origin says one: a session
+    /// working under it is the one to ask to free it ([`ask`]).
+    pub serves: Option<PathBuf>,
 }
 
 impl Hog {
@@ -1552,6 +1558,7 @@ fn hogs(
             bytes: 0,
             bytes_partial: false,
             why,
+            serves: serves_of(&t.origin, &t.path),
         });
         h.bytes = h.bytes.saturating_add(left);
         h.bytes_partial |= partial;
@@ -1624,6 +1631,20 @@ pub fn hogs_left(
         })
         .collect();
     hogs(survey, rep.config, &rows, &notes, there)
+}
+
+/// The checkout or workspace build directory `build_dir` (of `origin`) holds builds for.
+fn serves_of(origin: &discover::Origin, build_dir: &Path) -> Option<PathBuf> {
+    use discover::Origin;
+    match origin {
+        Origin::Checkout { .. } => idle::checkout_of(origin, build_dir),
+        Origin::BuildCache { workspace, .. } => Some(workspace.clone()),
+        Origin::Bootstrap { repo, .. } => Some(repo.clone()),
+        Origin::Named
+        | Origin::AgentTargetDir
+        | Origin::ClaudeScratch { .. }
+        | Origin::Linked { .. } => None,
+    }
 }
 
 fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (PathBuf, String) {

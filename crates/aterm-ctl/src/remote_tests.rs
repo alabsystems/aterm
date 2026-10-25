@@ -284,3 +284,69 @@ fn an_await_over_a_drive_waits_in_short_legs() {
         ]
     );
 }
+
+struct Cut;
+
+impl Read for Cut {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify: https://docs.rs/rustls",
+        ))
+    }
+}
+
+impl Write for Cut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_drive_cut_before_its_answer_says_what_cuts_one_and_what_may_have_landed() {
+    let cut = || DriveLink {
+        stream: Box::new(Cut),
+        label: "lab-mini".to_owned(),
+    };
+    let turned = exchange(cut(), "@s-a1 turn timeout=20000 go\n", "turn")
+        .expect_err("cut")
+        .to_string();
+    assert!(
+        turned.starts_with(
+            "lab-mini cut the drive connection before it answered (its person took back"
+        ) && turned.contains(
+            "what this `turn` sent may have landed: `aterm ctl --host lab-mini @s-a1 status`"
+        ) && !turned.contains("docs.rs"),
+        "{turned}"
+    );
+    let held = exchange(cut(), "hold s-a1 on\n", "hold")
+        .expect_err("cut")
+        .to_string();
+    assert!(
+        held.contains("`aterm ctl --host lab-mini @s-a1 status`"),
+        "{held}"
+    );
+    let read = exchange(cut(), "@s-a1 text\n", "text")
+        .expect_err("cut")
+        .to_string();
+    assert!(
+        read.contains("`aterm ctl --host lab-mini @s-a1 text …` again says which")
+            && !read.contains("landed"),
+        "{read}"
+    );
+    let surveyed = exchange(cut(), "survey\n", "survey")
+        .expect_err("cut")
+        .to_string();
+    assert!(
+        surveyed.contains("`aterm ctl --host lab-mini survey …` again says which"),
+        "{surveyed}"
+    );
+    let spawned = spawn_exchange(cut(), "spawn agent=claude len=2", b"go")
+        .expect_err("cut")
+        .to_string();
+    assert!(spawned.contains("the worker may have started"), "{spawned}");
+}

@@ -159,15 +159,32 @@ impl CatBaker {
     /// How many tiles are baked.
     #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.slots.iter().flatten().count()
+    pub const fn len(&self) -> usize {
+        let slots = self.slots.as_slice();
+        let mut n = 0;
+        let mut i = 0;
+        while i < slots.len() {
+            if slots[i].is_some() {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
     }
 
     /// Whether no tile is baked.
     #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.slots.iter().all(Option::is_none)
+    pub const fn is_empty(&self) -> bool {
+        let slots = self.slots.as_slice();
+        let mut i = 0;
+        while i < slots.len() {
+            if slots[i].is_some() {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
     /// Whether a [`BakeKeyV4`] glyph tile fits inside the current slot dimensions.
@@ -1023,13 +1040,18 @@ const fn closest_eye_bounds(
 }
 
 #[cfg(test)]
-fn closest_eye_path(eyes: &Layer, pcx: f32, pcy: f32) -> Option<(usize, (f32, f32, f32, f32))> {
+const fn closest_eye_path(
+    eyes: &Layer,
+    pcx: f32,
+    pcy: f32,
+) -> Option<(usize, (f32, f32, f32, f32))> {
     let mut inline_bounds = [None; MAX_GLYPH_EYE_PATHS];
-    let bounds = &mut inline_bounds[..eyes.paths.len()];
-    for (slot, eye) in bounds.iter_mut().zip(eyes.paths.iter()) {
-        *slot = path_bounds(eye);
+    let mut i = 0;
+    while i < eyes.paths.len() {
+        inline_bounds[i] = path_bounds(eyes.paths[i]);
+        i += 1;
     }
-    closest_eye_bounds(bounds, pcx, pcy)
+    closest_eye_bounds(inline_bounds.split_at(eyes.paths.len()).0, pcx, pcy)
 }
 
 const MAX_GLYPH_EYE_PATHS: usize = 8;
@@ -1423,13 +1445,16 @@ mod tests {
     use super::*;
     use crate::cat_glyphs_gen::GLYPH_IDS;
 
-    fn vk(coat: u8) -> BakeKeyV4 {
+    const fn vk(coat: u8) -> BakeKeyV4 {
         BakeKeyV4 {
             variant: CatGlyphId::S100,
             accessory: None,
             coat,
             iris: 3,
-            colors: CatColorKey::default(),
+            colors: CatColorKey {
+                accent: 12,
+                background: 0,
+            },
             w: 40,
             h: 24,
             eyes: EyesFrame::Open,

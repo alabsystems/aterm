@@ -153,7 +153,16 @@ fn a_vendor_answer_is_kept_only_as_a_whole_label() {
         })
         .collect();
     let d = decide_rows(&rows);
-    assert!(reason(&d).contains("`Enable selected`"), "{d:?}");
+    let (steps, target, _, _, unproven) = answer(&d);
+    assert_eq!(
+        (steps, target),
+        (1, AnswerTarget::Option(2)),
+        "the vendor's whole label `Enable selected` is kept: passed over, never taken: {d:?}"
+    );
+    assert!(
+        unproven.contains("option 1 keeps its answer for every later ask"),
+        "{unproven}"
+    );
     let rows: Vec<String> = screen(f::QUESTION_RECOMMENDED_SECOND)
         .iter()
         .map(|r| {
@@ -180,16 +189,21 @@ fn the_security_model_switch_stays_on_the_current_model() {
     );
 }
 
+/// Without the alert's words the owner's ruling does not fire; the generic unmarked rule passes
+/// over option 1, whose `from now on` keeps its answer, for option 2.
 #[test]
-fn a_model_switch_without_the_alert_words_still_escalates() {
+fn a_model_switch_without_the_alert_words_is_not_the_rulings() {
     let rows: Vec<String> = screen(f::QUESTION_MODEL_SWITCH_PREFERENCE)
         .iter()
         .map(|r| r.replace("safeguards flagged", "preferences changed"))
         .collect();
     let d = decide_rows(&rows);
+    let (steps, target, _, _, unproven) = answer(&d);
+    assert_eq!((steps, target), (1, AnswerTarget::Option(2)), "{d:?}");
     assert!(
-        reason(&d).starts_with("a question whose answer `Switch automatically`"),
-        "{d:?}"
+        unproven.starts_with(CHOSE_FIRST_SAFE)
+            && unproven.contains("option 1 keeps its answer for every later ask"),
+        "the generic rule, not the ruling: {unproven}"
     );
 }
 
@@ -584,6 +598,210 @@ fn the_reset_in_a_description_incident_is_answered_under_every_priority() {
             (steps, target),
             (1, AnswerTarget::Option(2)),
             "{priority:?}"
+        );
+    }
+}
+
+/// `QUESTION_DO_YOU_WANT_LIVE` ("Do you want to proceed?", `1. Yes` / `2. No`) with `edits` made.
+fn proceed_with(edits: &[(&str, &str)]) -> Vec<String> {
+    let rows = screen(f::QUESTION_DO_YOU_WANT_LIVE);
+    let edited: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            edits
+                .iter()
+                .fold(r.clone(), |r, (from, to)| r.replace(from, to))
+        })
+        .collect();
+    assert_ne!(edited, rows, "PRECONDITION: the edits landed: {edits:?}");
+    edited
+}
+
+/// The review of 9744af4ee8: an option's own words were read as a fact about that option alone,
+/// so option 1 (`Yes / Go ahead with it.`) was pressed although option 2 names the act only to
+/// decline it (`Don't drop the staging table.`): option 1 is the drop. Before that commit the
+/// whole question went to a person; now the harness answers with the one option that refuses it.
+#[test]
+fn an_option_that_declines_an_act_makes_the_question_that_acts() {
+    let sibling = proceed_with(&[
+        ("Run the migration now.", "Go ahead with it."),
+        (
+            "Leave the schema as it is.",
+            "Don't drop the staging table.",
+        ),
+    ]);
+    let d = decide_rows(&sibling);
+    let (steps, target, _, subject, unproven) = answer(&d);
+    assert_eq!(
+        (steps, target),
+        (1, AnswerTarget::Option(2)),
+        "never option 1, which approves the drop option 2 declines"
+    );
+    assert!(subject.ends_with("→ No"), "{subject}");
+    assert_eq!(unproven, declined("drop"));
+    let branches = proceed_with(&[
+        (
+            "Do you want to proceed?",
+            "How should I handle the merged branches?",
+        ),
+        ("1. Yes", "1. As planned"),
+        ("Run the migration now.", "Go ahead as described above."),
+        ("2. No", "2. Keep them"),
+        (
+            "Leave the schema as it is.",
+            "Do not delete any branch; leave them for you.",
+        ),
+    ]);
+    let d = decide_rows(&branches);
+    let (steps, target, _, subject, unproven) = answer(&d);
+    assert_eq!((steps, target), (1, AnswerTarget::Option(2)), "{subject}");
+    assert!(subject.ends_with("→ Keep them"), "{subject}");
+    assert_eq!(unproven, declined("delete"));
+    let also_does = proceed_with(&[
+        ("Run the migration now.", "Go ahead with it."),
+        ("2. No", "2. Instead"),
+        (
+            "Leave the schema as it is.",
+            "Don't drop the table: truncate it.",
+        ),
+    ]);
+    assert!(
+        reason(&decide_rows(&also_does))
+            .contains("names `drop` only to decline it, so the others may drop"),
+        "an option that declines one act and does another refuses nothing"
+    );
+    let negation_ends = proceed_with(&[
+        ("Run the migration now.", "Go ahead with it."),
+        ("Leave the schema as it is.", "No, drop it later."),
+    ]);
+    assert!(
+        reason(&decide_rows(&negation_ends)).contains("every option names a destructive act"),
+        "a comma ends the negation: option 2 drops, and option 1's `Yes` approves what it does \
+         not say beside it"
+    );
+}
+
+/// An option that approves without saying what (`Yes / Go ahead with it.`) beside an option that
+/// names an act is never taken: its act may be that one. With no act named it is option 1, the
+/// documented fallback.
+#[test]
+fn an_assent_beside_an_act_is_never_taken_blind() {
+    let assent = |second: &str| -> Vec<String> {
+        screen(f::QUESTION_NO_RECOMMENDATION)
+            .iter()
+            .map(|r| {
+                r.replace("1. Top", "1. Yes")
+                    .replace("Above the tab strip.", "Go ahead with it.")
+                    .replace("Below the last terminal row.", second)
+            })
+            .collect()
+    };
+    let d = decide_rows(&assent("Removes the old band."));
+    let (steps, target, _, subject, unproven) = answer(&d);
+    assert_eq!((steps, target), (2, AnswerTarget::Option(3)), "{subject}");
+    assert!(subject.ends_with("→ Floating"), "{subject}");
+    assert!(
+        unproven.starts_with(CHOSE_FIRST_SAFE)
+            && unproven.contains(
+                "option 1 approves what it does not say, beside an option that would remove"
+            ),
+        "{unproven}"
+    );
+    let d = decide_rows(&assent("Below the tab strip."));
+    let (steps, target, _, _, unproven) = answer(&d);
+    assert_eq!(
+        (steps, target, unproven),
+        (0, AnswerTarget::Option(1), CHOSE_UNMARKED),
+        "CONTROL: with no act named, `Yes` is option 1, the documented fallback"
+    );
+}
+
+/// The review of 9744af4ee8: option 1 whose words keep its answer (`from now on`) was still taken
+/// first, and then escalated by the kept check, though options 2 and 3 are clean. It is passed
+/// over like a destructive one; only an all-kept set goes to a person.
+#[test]
+fn a_kept_option_one_is_passed_over_for_the_first_clean_option() {
+    let rows = screen(f::QUESTION_NO_RECOMMENDATION);
+    let kept_first: Vec<String> = rows
+        .iter()
+        .map(|r| r.replace("Above the tab strip.", "Above the tab strip, from now on."))
+        .collect();
+    assert_ne!(kept_first, rows, "PRECONDITION: the edit landed");
+    let d = decide_rows(&kept_first);
+    let (steps, target, _, subject, unproven) = answer(&d);
+    assert_eq!((steps, target), (1, AnswerTarget::Option(2)), "{subject}");
+    assert!(subject.ends_with("→ Bottom"), "{subject}");
+    assert!(
+        unproven.starts_with(CHOSE_FIRST_SAFE)
+            && unproven.contains("option 1 keeps its answer for every later ask, so option 2"),
+        "{unproven}"
+    );
+    let all_kept: Vec<String> = kept_first
+        .iter()
+        .map(|r| {
+            r.replace("Below the last terminal row.", "Below it, from now on.")
+                .replace("An overlay in the corner.", "An overlay, from now on.")
+        })
+        .collect();
+    assert_ne!(all_kept, kept_first, "PRECONDITION: the edit landed");
+    assert!(
+        reason(&decide_rows(&all_kept)).contains("option 1 keeps its answer for every later ask"),
+        "every option kept: a person answers"
+    );
+}
+
+/// The act the question's own row names is refused by the one option that names it only to
+/// decline it, not only by one that opens with `No`.
+#[test]
+fn a_question_asking_an_act_is_refused_by_the_option_that_declines_it() {
+    let asked = proceed_with(&[
+        ("Do you want to proceed?", "Drop the staging table?"),
+        ("Run the migration now.", "Drop it now."),
+        ("2. No", "2. Keep it"),
+        (
+            "Leave the schema as it is.",
+            "Don't drop it; leave the schema.",
+        ),
+    ]);
+    let d = decide_rows(&asked);
+    let (steps, target, _, subject, unproven) = answer(&d);
+    assert_eq!((steps, target), (1, AnswerTarget::Option(2)), "{subject}");
+    assert_eq!(unproven, refused("drop"));
+    let does_it: Vec<String> = asked
+        .iter()
+        .map(|r| r.replace("Don't drop it; leave the schema.", "Drop only its rows."))
+        .collect();
+    assert!(
+        reason(&decide_rows(&does_it)).contains("no one option that refuses it"),
+        "CONTROL: an option that does the act refuses nothing"
+    );
+}
+
+#[test]
+fn an_options_words_are_read_for_what_they_do_and_what_they_decline() {
+    for (text, does, declines) in [
+        ("Don't drop the staging table", None, &["drop"][..]),
+        ("Do not delete any branch", None, &["delete"]),
+        ("nothing gets removed", None, &["remove"]),
+        ("Never force-push", None, &["force-push"]),
+        ("don't delete or drop anything", None, &["delete", "drop"]),
+        ("No, delete it", Some("delete"), &[]),
+        ("Don't wait, drop it now", Some("drop"), &[]),
+        ("Not only delete the branches", Some("delete"), &[]),
+        ("Delete without asking", Some("delete"), &[]),
+        ("after the usage limit reset", Some("reset"), &[]),
+        (
+            "Delete the old ones and don't drop the rest",
+            Some("delete"),
+            &["drop"],
+        ),
+        ("Keep everything as it is", None, &[]),
+    ] {
+        let read = super::bears(text, "");
+        assert_eq!(
+            (read.does, read.declines.as_slice()),
+            (does, declines),
+            "{text}"
         );
     }
 }

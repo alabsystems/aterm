@@ -189,6 +189,12 @@ impl VendorSpec {
         super::resolve::serves(self.anchor, triple)
     }
 
+    /// Whether a complete vendor build of `self`'s may stand in for `other`'s download of the same signed bytes ([`super::lane`]'s landing): another row under the same head whose tree has no alias of its own folded in. Today that is codex's build lending its tree to codex-old.
+    #[must_use]
+    pub(crate) fn lends_tree_to(&self, other: &Self) -> bool {
+        self.program != other.program && self.head_url == other.head_url && self.aliases.is_empty()
+    }
+
     /// [`Self::shim_env`] admitted under [`crate::shim_env::ShimEnv::admit`]'s rule (pinned by a test, so the fallback never fires).
     #[must_use]
     pub fn shim_env(&self) -> crate::shim_env::ShimEnv {

@@ -15,6 +15,7 @@ use crate::deck_face::Boxed;
 use crate::deck_face::{
     ASCENT_EM, BoxKind, Boxes, DESCENT_EM, FaceMetrics, Txt, deck_metrics, fit, txts,
 };
+use crate::stats_live::{self as live, DeckLive, LiveLayer};
 use crate::stats_paint::{Bar, Hit, Instrument, Painter, Rect, StatsMark, WellMark, panel};
 use crate::stats_plan::{
     self as plan, BlockKind, BlockPlan, Cluster, Col, CoresAt, CoresMode, DeckForm, DeckSizePref,
@@ -483,6 +484,9 @@ pub(crate) struct DeckInput<'a> {
     pub(crate) contrast: bool,
     /// Whose wording and which clock the words say times on.
     pub(crate) locale: Locale,
+    /// The live edge this frame draws ([`crate::stats_live`]): the glide, the beat, and
+    /// whether readings keep coming.
+    pub(crate) live: DeckLive,
     /// What needs the owner in the window's tabs, worst first ([`crate::App::deck_needs`]): the
     /// merged deck's needs rail; empty for v2, the sill and the lens.
     #[cfg_attr(
@@ -565,7 +569,8 @@ struct RowWords {
     /// The sentence in the strip's place (§6.2, §6.6), or "reading…": its
     /// forms, longest first (rule F).
     strip_text: Option<Vec<Txt>>,
-    /// The strip's columns at each of [`STRIP_PERIODS`].
+    /// The strip's columns at each of [`STRIP_PERIODS`]: the span's, oldest first and the open
+    /// one last, and the one before them, which the glide slides out at the left.
     cols: [Vec<HeatCell>; 3],
     bar: Option<BarFill>,
     /// The amount's forms on each ladder: Det (with the compact forms that
@@ -731,7 +736,7 @@ impl RowWords {
             pct: Txt::new(words::pct(view.heat_now), m),
             strip_text,
             cols: STRIP_PERIODS
-                .map(|per| view.heat_columns(per, (600 / per) as usize, snap.at_unix_ms)),
+                .map(|per| view.heat_columns(per, (600 / per) as usize + 1, snap.at_unix_ms)),
             bar: bar_fill(res, &view, snap),
             amount: [txts(det, m), txts(cols, m), txts(forms(Ladder::NoCols), m)],
             state,
@@ -908,6 +913,13 @@ struct Deck<'a> {
     draw: bool,
     /// Strip cells drawn (T-G9).
     cells: usize,
+    /// The live edge drawn ([`DeckInput::live`]) and the snapshot's wall clock, unix ms.
+    live: DeckLive,
+    at_ms: Option<i64>,
+    /// The card's rects the live edge moves, device px (`App::splice_stats_deck` re-rasters
+    /// only these), and the fastest strip's glide, device px a second.
+    live_rects: Vec<(LiveLayer, Rect)>,
+    glide_px_per_s: f64,
     tab: &'a str,
     machine: &'static str,
     /// Hits by precedence: the first containing the pointer wins.
@@ -939,6 +951,10 @@ impl<'a> Deck<'a> {
             dwc: input.dwc,
             draw,
             cells: 0,
+            live: input.live,
+            at_ms: input.snap.map(|snap| snap.at_unix_ms),
+            live_rects: Vec::new(),
+            glide_px_per_s: 0.0,
             tab: &input.tab_label,
             machine: input.locale.platform.machine(),
             hits_first: Vec::new(),
@@ -1110,6 +1126,15 @@ impl<'a> Deck<'a> {
         self.px(strip.cell) < 4.0 || self.px(cell_h) < 4.0
     }
 
+    /// How far `strip`'s open column has run in this frame: 1 (every column in its slot)
+    /// unless the strips glide ([`DeckLive::glide_ms`]).
+    fn glide(&self, strip: &Strip) -> f64 {
+        match (self.live.glide_ms, self.at_ms) {
+            (Some(now), Some(at)) => live::open_frac(at, now, strip.period_s),
+            _ => 1.0,
+        }
+    }
+
     fn strip(&mut self, strip: &Strip, top: f64, cell_h: f64, cols: &[HeatCell]) {
         let cap_room = self
             .cap_px()
@@ -1121,7 +1146,8 @@ impl<'a> Deck<'a> {
             None,
         );
         let n = strip.cols as usize;
-        self.cells += n;
+        let f = self.glide(strip);
+        self.cells += if f < 1.0 { n + 1 } else { n };
         if !self.draw {
             return;
         }
@@ -1130,10 +1156,25 @@ impl<'a> Deck<'a> {
         let radius = if self.s < 2.0 { 0.0 } else { 1.0 };
         let small = self.small_cells(strip, cell_h);
         let cap = self.cap_px();
-        let unread = n.saturating_sub(cols.len());
-        for i in 0..n {
-            let x = x0 + i as f32 * pitch;
-            let cell = i
+        // `cols` holds the span's columns and the one before (`RowWords::cols`), oldest first;
+        // a short ring leaves the oldest unread.
+        let unread = (n + 1).saturating_sub(cols.len());
+        let clip = f < 1.0;
+        if clip {
+            let right = x0 + n.saturating_sub(1) as f32 * pitch + cw;
+            let h_card = self.px(self.h_pt);
+            self.p.prims.push(DrawPrim::ClipPush {
+                x: x0,
+                y: 0.0,
+                w: right - x0,
+                h: h_card,
+            });
+        }
+        for (k, x) in live::column_xs(x0, pitch, cw, n, f).into_iter().enumerate() {
+            let Some(x) = x else {
+                continue;
+            };
+            let cell = k
                 .checked_sub(unread)
                 .and_then(|j| cols.get(j))
                 .copied()
@@ -1156,6 +1197,9 @@ impl<'a> Deck<'a> {
                     None => self.rect((x, y, cw, h.min(2.0)), 0.0, over),
                 }
             }
+        }
+        if clip {
+            self.p.prims.push(DrawPrim::ClipPop);
         }
     }
 
@@ -1182,8 +1226,19 @@ impl<'a> Deck<'a> {
         }
         let per_min = (60 / strip.period_s.max(1)).max(1) as usize;
         let pitch = self.px(strip.pitch);
-        let gap = pitch - self.px(strip.cell);
+        let cw = self.px(strip.cell);
+        let gap = pitch - cw;
         let x0 = self.px(strip.x);
+        let n = strip.cols as usize;
+        let xs = live::column_xs(x0, pitch, cw, n, self.glide(strip));
+        // Each line stands in the gap before a column that opens a wall-clock minute, so it
+        // travels with the columns; before the first reading, every minute from the left.
+        let starts: Vec<usize> = match self.at_ms {
+            Some(at) => {
+                live::minute_columns(live::open_start_ms(at, strip.period_s), strip.period_s, n)
+            }
+            None => (per_min..n).step_by(per_min).map(|j| j + 1).collect(),
+        };
         let mut spans = Vec::new();
         let mut y = y0;
         for &(a, b) in holes {
@@ -1196,13 +1251,106 @@ impl<'a> Deck<'a> {
             spans.push((y, y1));
         }
         let grid = self.inks.grid;
-        for c in (per_min..strip.cols as usize).step_by(per_min) {
-            let gx = x0 + c as f32 * pitch - gap;
+        for k in starts {
+            let Some(cx) = xs.get(k).copied().flatten() else {
+                continue;
+            };
+            let gx = cx - gap;
+            if gx < x0 {
+                continue;
+            }
             for &(a, b) in &spans {
                 let (ya, yb) = (self.px(a), self.px(b));
                 self.rect((gx, ya, gap.max(1.0), yb - ya), 0.0, grid);
             }
         }
+    }
+
+    /// `strip`'s live edge: its glide's rect, and the now marker at its right end, a line from
+    /// the dot on the header line at `base` down to `last` (the strip rows' bottom), the dot
+    /// beating while readings keep coming, grey and hollow when they stop.
+    fn live_edge(&mut self, strip: &Strip, base: f64, last: f64) {
+        let s = self.s;
+        let card_h = self.px(self.h_pt);
+        let (sx0, sx1) = (self.px(strip.x) - 2.0, self.px(strip.end()) + 2.0);
+        self.live_rects
+            .push((LiveLayer::Glide, (sx0, 0.0, sx1 - sx0, card_h)));
+        let pitch_px = f64::from(self.px(strip.pitch));
+        self.glide_px_per_s = self
+            .glide_px_per_s
+            .max(pitch_px / f64::from(strip.period_s.max(1)));
+        let x = strip.end() + live::LINE_DX;
+        let cy = base - live::DOT_RISE;
+        let reach = live::DOT_R + live::BEAT_REACH;
+        let (rx0, rx1) = (
+            ((x - reach) * s).floor() as f32 - 1.0,
+            ((x + reach) * s).ceil() as f32 + 1.0,
+        );
+        self.live_rects
+            .push((LiveLayer::Marker, (rx0, 0.0, rx1 - rx0, card_h)));
+        let r_pt = live::DOT_R;
+        self.note(
+            BoxKind::Mark,
+            [x - r_pt, cy - r_pt, x + r_pt, cy + r_pt],
+            "now",
+            None,
+        );
+        if !self.draw {
+            return;
+        }
+        let fresh = self.live.fresh;
+        let ink = if fresh {
+            self.inks.words
+        } else {
+            self.inks.hollow
+        };
+        let lw = (0.75 * s).round().max(1.0) as f32;
+        let (cx, cyp, r) = ((x * s) as f32, (cy * s) as f32, (r_pt * s) as f32);
+        let y1 = self.px(last);
+        let y0 = (cyp + r).min(y1);
+        let line_alpha = if fresh { live::LINE_ALPHA } else { 0xFF };
+        self.p.prims.push(panel(
+            (cx - lw / 2.0).round(),
+            y0,
+            lw,
+            y1 - y0,
+            0.0,
+            rgba(ink, line_alpha),
+        ));
+        let clear = [0, 0, 0, 0];
+        if !fresh {
+            self.p.prims.push(DrawPrim::Ring {
+                cx,
+                cy: cyp,
+                r_outer: r,
+                thickness: lw,
+                track: clear,
+                frac: 1.0,
+                fill: rgba(ink, 0xFF),
+            });
+            return;
+        }
+        if let Some(phase) = self.live.beat {
+            let (grow, alpha) = live::beat_ring(phase);
+            let a = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+            if a > 0 {
+                self.p.prims.push(DrawPrim::Ring {
+                    cx,
+                    cy: cyp,
+                    r_outer: ((r_pt + grow) * s) as f32,
+                    thickness: (0.9 * s).max(1.0) as f32,
+                    track: clear,
+                    frac: 1.0,
+                    fill: rgba(ink, a),
+                });
+            }
+        }
+        self.p.prims.push(DrawPrim::Dot {
+            cx,
+            cy: cyp,
+            r,
+            color: rgba(ink, 0xFF),
+        });
     }
 
     fn bar(&mut self, col: Col, top: f64, h_pt: f64, fill: &BarFill) {
@@ -1719,6 +1867,21 @@ impl<'a> Deck<'a> {
         for &(item, x) in &head.key.placed {
             self.key(item, x, base, small);
         }
+        for tick in &head.ruler {
+            self.text(
+                tick.left,
+                base,
+                tick.text.clone(),
+                SMALL_PT,
+                false,
+                words2,
+                None,
+            );
+            let w = (0.5 * self.s).round().max(1.0) as f32;
+            let (y0, y1) = (self.px(base + 1.0), self.px(base + 2.5));
+            let x = (tick.x * self.s) as f32 - w / 2.0;
+            self.rect((x.round(), y0, w, (y1 - y0).max(1.0)), 0.0, words2);
+        }
     }
 
     fn two_inks(&mut self, x: f64, base: f64, text: &str, sep: &str) {
@@ -1872,6 +2035,7 @@ impl<'a> Deck<'a> {
         for (row, r) in words.rows.iter().zip(0_u32..) {
             self.row(&t, r, row, words.reading);
         }
+        self.live_edge(&plan.strip, HEADER_BASE_FULL, last);
         let text = HeaderText {
             tab: self.tab,
             machine: self.machine,
@@ -1913,6 +2077,7 @@ impl<'a> Deck<'a> {
             for (row, r) in ours.iter().zip(0_u32..) {
                 self.row(&t, r, row, words.reading);
             }
+            self.live_edge(&block.strip, HEADER_BASE_FOLDED, last);
             if let Some(st) = block_state(&ours, block.name.x) {
                 states.push(st);
             }
@@ -2009,14 +2174,38 @@ fn block_state<'w>(rows: &[&'w RowWords], x: f64) -> Option<HeadState<'w>> {
     })
 }
 
-/// Lay the Deck out and paint it.
+/// What a layout says of its live edge ([`crate::stats_live`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct LiveOut {
+    /// The card's rects the live edge moves, device px, and what moves each.
+    pub(crate) rects: Vec<(LiveLayer, Rect)>,
+    /// The fastest strip's glide, device px a second.
+    pub(crate) glide_px_per_s: f64,
+}
+
+/// Lay the Deck out and paint it (the tests' and the frame-cost probe's form of
+/// [`deck_paint_live`]).
+#[cfg(any(test, all(feature = "bench-support", debug_assertions)))]
 pub(crate) fn deck_paint(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<Hit>) {
+    let (prims, hits, _) = deck_paint_live(g, input);
+    (prims, hits)
+}
+
+/// Lay the Deck out and paint it, with what the layout says of its live edge.
+pub(crate) fn deck_paint_live(
+    g: &DeckGeom,
+    input: &DeckInput<'_>,
+) -> (Vec<DrawPrim>, Vec<Hit>, LiveOut) {
     let m = deck_metrics();
     let words = DeckWords::new(input, &m);
     let mut deck = Deck::new(g, input, &m, true);
     deck.paint(&words, input.form);
     let hits = deck.hits();
-    (deck.p.prims, hits)
+    let out = LiveOut {
+        rects: std::mem::take(&mut deck.live_rects),
+        glide_px_per_s: deck.glide_px_per_s,
+    };
+    (deck.p.prims, hits, out)
 }
 
 /// A laid-out deck as the tests read it.
@@ -2090,6 +2279,8 @@ pub(crate) struct DeckFrame {
     pub(crate) deck: DeckForm,
     /// Increase Contrast.
     pub(crate) contrast: bool,
+    /// The live edge this frame draws ([`crate::App::deck_live`]); still for the sill.
+    pub(crate) live: DeckLive,
     /// [`DeckInput::needs`], read only where the merged deck draws them.
     pub(crate) needs: Vec<DeckNeed>,
 }
@@ -2173,6 +2364,7 @@ impl crate::App {
                     dwc,
                     deck: ws.deck_form,
                     contrast,
+                    live: self.deck_live(wid),
                     needs,
                 })
             }
@@ -2210,6 +2402,7 @@ impl crate::App {
                     dwc,
                     deck: ws.deck_form,
                     contrast,
+                    live: DeckLive::STILL,
                     needs: Vec::new(),
                 })
             }
@@ -2305,19 +2498,36 @@ impl crate::App {
                 platform: Platform::host(),
                 utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
             },
+            live: f.live,
             needs: f.needs.clone(),
         };
-        let (prims, hits) = match (f.form, f.style) {
-            (StatsBars::Sill, _) => crate::stats_sill::sill_paint(&f.geom, &input),
-            (_, DeckStyle::Merged) => crate::stats_merged::merged_paint(&f.geom, &input),
-            _ => deck_paint(&f.geom, &input),
+        let (prims, hits, out) = match (f.form, f.style) {
+            (StatsBars::Sill, _) => {
+                let (prims, hits) = crate::stats_sill::sill_paint(&f.geom, &input);
+                (prims, hits, LiveOut::default())
+            }
+            (_, DeckStyle::Merged) => {
+                let (prims, hits) = crate::stats_merged::merged_paint(&f.geom, &input);
+                (prims, hits, LiveOut::default())
+            }
+            _ => deck_paint_live(&f.geom, &input),
         };
         if let Some(ws) = self.windows.get(&wid) {
             ws.deck_memo
                 .set((key, prims_fp(&prims) ^ u64::from(f.dy).rotate_left(40)));
             *ws.stats_hits.borrow_mut() = hits;
+            ws.deck_live_drawn.set(Some(f.live.key()));
+            ws.deck_glide.set(out.glide_px_per_s);
+            *ws.deck_live_rects.borrow_mut() = out.rects;
         }
         prims
+    }
+
+    /// The deck card's key for frame `f`: what its layout reads ([`Self::deck_input_key`]) and
+    /// its live edge, never `0`.
+    fn deck_key(&self, f: &DeckFrame) -> (u64, u64) {
+        let base = self.deck_input_key(f);
+        (base, (base ^ f.live.key().rotate_left(17)) | 1)
     }
 
     /// The stats card's fingerprint for `wid` (`0` when it shows none), the `RepaintKey`
@@ -2327,7 +2537,7 @@ impl crate::App {
         let Some(f) = self.deck_frame(wid) else {
             return lens;
         };
-        let key = self.deck_input_key(&f);
+        let (_, key) = self.deck_key(&f);
         if let Some((k, fp)) = self.windows.get(&wid).map(|ws| ws.deck_memo.get())
             && k == key
         {
@@ -2338,7 +2548,8 @@ impl crate::App {
     }
 
     /// Rasterize the stats card into `wid`'s paint-only `deck_card`, again only when its prims
-    /// or placement moved, and the lens into its own card.
+    /// or placement moved, and the lens into its own card. A frame that moved only the live
+    /// edge re-rasters only the card's rects it moved ([`patch_live`]).
     pub(crate) fn splice_stats_deck(&mut self, wid: crate::WindowId) {
         self.splice_stats_lens(wid);
         let Some(f) = self.deck_frame(wid) else {
@@ -2346,10 +2557,11 @@ impl crate::App {
                 ws.deck_card = None;
                 ws.deck_fold = None;
                 ws.stats_hits.borrow_mut().clear();
+                ws.deck_live_drawn.set(None);
             }
             return;
         };
-        let key = self.deck_input_key(&f);
+        let (base, key) = self.deck_key(&f);
         if self
             .windows
             .get(&wid)
@@ -2363,12 +2575,32 @@ impl crate::App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let (card_base, card_live) = ws.deck_live_card.get();
         if let Some(card) = ws.deck_card.as_mut()
             && card.fp == fp
         {
             card.geom = key;
+            ws.deck_live_card.set((base, f.live));
             return;
         }
+        if let Some(card) = ws.deck_card.as_mut()
+            && card_base == base
+            && card.dy == f.dy
+            && patch_live(
+                card,
+                &prims,
+                &ws.deck_live_rects.borrow(),
+                &card_live,
+                &f.live,
+            )
+        {
+            card.fp = fp;
+            card.geom = key;
+            card.raster_fingerprint_once = std::sync::OnceLock::new();
+            ws.deck_live_card.set((base, f.live));
+            return;
+        }
+        ws.deck_live_card.set((base, f.live));
         let (rgba, pw, ph) = crate::tray_raster::rasterize_tray(
             &prims,
             f.geom.w as u32,
@@ -2428,6 +2660,58 @@ impl crate::App {
         }
         ws.deck_fold = fold_cards(&cards, fp);
     }
+}
+
+/// Re-raster into `card` only the rects of `rects` whose layer moved from `was` to `now`
+/// ([`LiveLayer::moved`]), from the frame's whole `prims`: each rect's pixels are what the whole
+/// raster would give there, since every prim is drawn into it, clipped. `false` (and `card`
+/// untouched) when a rect leaves the card, so the caller rasters it whole.
+pub(crate) fn patch_live(
+    card: &mut crate::SettingsCard,
+    prims: &[DrawPrim],
+    rects: &[(LiveLayer, Rect)],
+    was: &DeckLive,
+    now: &DeckLive,
+) -> bool {
+    let (pw, ph) = (card.pw, card.ph);
+    let mut regions = Vec::new();
+    for &(layer, (x, y, w, h)) in rects {
+        if !layer.moved(was, now) {
+            continue;
+        }
+        let x0 = x.floor().max(0.0) as u32;
+        let y0 = y.floor().max(0.0) as u32;
+        let x1 = ((x + w).ceil().max(0.0) as u32).min(pw);
+        let y1 = ((y + h).ceil().max(0.0) as u32).min(ph);
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        regions.push(crate::tray_raster::RasterRect {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        });
+    }
+    let stride = pw as usize * 4;
+    if card.rgba.len() != stride * ph as usize {
+        return false;
+    }
+    for r in regions {
+        let px = crate::tray_raster::rasterize_tray_region(prims, 1.0, [0, 0, 0, 0], r);
+        let row = r.width as usize * 4;
+        if px.len() != row * r.height as usize {
+            return false;
+        }
+        for (i, src) in px.chunks_exact(row).enumerate() {
+            let at = (r.y as usize + i) * stride + r.x as usize * 4;
+            let Some(dst) = card.rgba.get_mut(at..at + row) else {
+                return false;
+            };
+            dst.copy_from_slice(src);
+        }
+    }
+    true
 }
 
 /// `cards` composited in order onto one surface over their union, the fold the backends present
@@ -3871,6 +4155,7 @@ pub(crate) mod tests {
                 platform: Platform::MacOs,
                 utc_offset_s: 0,
             },
+            live: DeckLive::STILL,
             needs: Vec::new(),
         }
     }
@@ -4345,6 +4630,10 @@ pub(crate) mod tests {
 #[cfg(test)]
 #[path = "stats_deck_paint_tests.rs"]
 pub(crate) mod paint_tests;
+
+#[cfg(test)]
+#[path = "stats_live_paint_tests.rs"]
+mod live_paint_tests;
 
 #[cfg(any(test, debug_assertions))]
 #[path = "stats_deck_fixtures.rs"]

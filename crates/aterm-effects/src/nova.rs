@@ -736,20 +736,22 @@ mod tests {
     use super::*;
     use crate::genome::nova_features;
 
-    fn worst_feats() -> NovaFeatures {
-        let mut best: Option<NovaFeatures> = None;
-        for g in 0..(1u64 << 15) {
+    const fn worst_feats() -> NovaFeatures {
+        let mut g = 0u64;
+        while g < (1u64 << 15) {
             let f = nova_features(g);
             if f.rays == 8 && f.radius > 2.19 && f.chroma > 2.49 && f.ring_thick > 3.49 {
-                best = Some(f);
-                break;
+                return f;
             }
+            g += 1;
         }
-        best.expect("genome-max feature combination is reachable (§3.4 reachability)")
+        panic!("genome-max feature combination is reachable (§3.4 reachability)");
     }
 
-    fn env_at(ch: i32, magic: Option<NovaMagic>) -> NovaEnv {
-        let feats = worst_feats();
+    const WORST_FEATS: NovaFeatures = worst_feats();
+
+    const fn env_at(ch: i32, magic: Option<NovaMagic>) -> NovaEnv {
+        let feats = WORST_FEATS;
         let cw = ch / 2;
         NovaEnv {
             grid_w: 200 * cw,

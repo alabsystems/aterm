@@ -135,6 +135,7 @@ pub(crate) fn notes(asked: &Asked, sid: &str) -> Vec<HostNote> {
             hogs: Vec::new(),
             cause: *cause,
             thresholds: aterm_agent::harness::disk::Config::default().thresholds(None),
+            asked: None,
         }],
         Asked::Back => vec![HostNote::LoginBack {
             sid: sid.to_string(),

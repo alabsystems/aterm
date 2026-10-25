@@ -275,6 +275,23 @@ impl InitialSetupUpgrade {
         self.attempt.as_ref().map(|(ticket, _)| ticket.revision())
     }
 
+    /// The held attempt's exact published target. A read failure leaves its ownership unknown.
+    pub fn published(&self) -> Result<Option<SetupUpgrade>, String> {
+        self.published_at(&state_root()?)
+    }
+
+    fn published_at(&self, root: &Path) -> Result<Option<SetupUpgrade>, String> {
+        match &self.attempt {
+            Some((ticket, _)) => ticket.published_upgrade_at(root),
+            None => Ok(None),
+        }
+    }
+
+    /// Retire a definitively unpublished or replaced attempt without creating another revision.
+    pub fn forget(&mut self) {
+        self.attempt = None;
+    }
+
     /// Widen the provisional plan ([`upgrade_provisional_setup`]), or finish the held
     /// attempt's commit: what it widened, or `None` when nothing changed.
     pub fn persist(&mut self) -> Result<Option<SetupUpgrade>, String> {
@@ -311,9 +328,14 @@ impl InitialSetupUpgrade {
         let Some((ticket, full)) = self.attempt.as_mut() else {
             return Ok(None);
         };
+        if ticket.publication_unknown() {
+            // Generic authorization is terminal, but a watch must retain the
+            // unresolved shutdown debt and must not rebind a later publication.
+            return Err("the failed setup publication could not be identified".into());
+        }
         let from = ticket.revision();
         let result = admit(ticket, full);
-        if result.is_ok() || !ticket.pending() {
+        if result.is_ok() || (!ticket.pending() && !ticket.publication_unknown()) {
             self.attempt = None;
         }
         result.map(|to| to.map(|to| SetupUpgrade { from, to }))

@@ -253,7 +253,8 @@ fn render_row(row: &Row) -> Result<String> {
     Ok(s)
 }
 
-/// Validates that `exposes` is non-empty and every tool name is permitted by `shim_allowed`.
+/// Validates that `exposes` is non-empty and every tool name is permitted by `shim_allowed`
+/// and is no other program's vendor tool.
 ///
 /// # Errors
 /// Returns an error listing any disallowed tool names.
@@ -264,7 +265,7 @@ pub fn check_exposes(program: &str, exposes: &[String]) -> Result<()> {
         .map(|e| format!("`{}`", e.escape_debug()))
         .collect();
     if refused.is_empty() {
-        return Ok(());
+        return vendor_tools_left_alone(program, exposes);
     }
     Err(Error::refused(format!(
         "{program} exposes {}: no shim may carry {} (a shell, another core command, or no \
@@ -277,6 +278,31 @@ pub fn check_exposes(program: &str, exposes: &[String]) -> Result<()> {
             "those names"
         },
         if refused.len() == 1 { "it" } else { "them" },
+    )))
+}
+
+/// Refuses an exposed name that a vendor row of the client shims for another program
+/// (`atpkg::vendor_direct::VENDORS`): `bin/` holds one shim per name, so a pack naming
+/// `claude` would shadow the vendor's. The vendor program's own ALab pack (codex) keeps its
+/// name. Compared case-blind, as a case-insensitive volume compares them.
+fn vendor_tools_left_alone(program: &str, exposes: &[String]) -> Result<()> {
+    let taken: Vec<String> = exposes
+        .iter()
+        .filter_map(|e| {
+            atpkg::vendor_direct::VENDORS
+                .iter()
+                .find(|v| v.exposes.iter().any(|t| t.eq_ignore_ascii_case(e)))
+                .filter(|v| v.program != program)
+                .map(|v| format!("`{e}` ({})", v.program))
+        })
+        .collect();
+    if taken.is_empty() {
+        return Ok(());
+    }
+    Err(Error::refused(format!(
+        "{program} exposes {}: a vendor row shims that name, and one `bin/` holds one shim per \
+         name, so a client would shadow the vendor's tool — expose the program's own name",
+        taken.join(", ")
     )))
 }
 

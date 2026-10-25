@@ -1466,6 +1466,58 @@ impl Proof {
             ),
             held,
         );
+        self.roster_leg(leg)
+    }
+
+    /// A codex-alab row in `sessions` (what `ls` prints) and in `status` carries codex-alab's own
+    /// report in a column of its own, `program_state=`, beside an `agent=` that stays aterm's own
+    /// reading (`unknown`: aterm reads no Codex screen), says the claim is proven, and ages the
+    /// report (`status program_state_ms=`).
+    fn roster_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
+        let row = |p: &Self| {
+            p.inst
+                .ctl(&["sessions"])
+                .stdout
+                .lines()
+                .find(|l| l.split(' ').nth(1) == Some(leg.sid.as_str()))
+                .map(str::to_string)
+        };
+        let reported = |v: &str| {
+            matches!(
+                v.split(':').next(),
+                Some("idle" | "working" | "blocked" | "done" | "error")
+            )
+        };
+        let holds = |row: &str, status: &str| {
+            field(row, "agent").as_deref() == Some("unknown")
+                && field(row, "program_state").as_deref().is_some_and(reported)
+                && field(row, "supervisor_proven").as_deref() == Some("1")
+                && field(status, "program_state")
+                    .as_deref()
+                    .is_some_and(reported)
+                && field(status, "program_state_ms").is_some_and(|v| v.parse::<u64>().is_ok())
+        };
+        let mut last = (None, String::new());
+        let held = Self::wait_for(Duration::from_secs(60), Duration::from_millis(500), || {
+            last = (row(self), self.status(&leg.sid));
+            last.0.as_deref().is_some_and(|r| holds(r, &last.1))
+        })?;
+        let (row, status) = (last.0.unwrap_or_default(), last.1);
+        let read = |line: &str, k: &str| field(line, k).unwrap_or_else(|| "-".to_string());
+        self.check(
+            &format!(
+                "{}: its ls row carries codex-alab's own report in a column of its own, beside \
+                 aterm's own reading (agent={} program_state={} supervisor_proven={}; status \
+                 program_state={} program_state_ms={})",
+                leg.name,
+                read(&row, "agent"),
+                read(&row, "program_state"),
+                read(&row, "supervisor_proven"),
+                read(&status, "program_state"),
+                read(&status, "program_state_ms"),
+            ),
+            held,
+        );
         Ok(())
     }
 
@@ -2434,6 +2486,39 @@ impl Proof {
                     ms.map_or_else(|| "-".to_string(), |m| m.to_string())
                 ),
                 t.stamped_nothing(),
+            );
+            let (seq, ep) = (field(&t.before, "log_seq"), field(&t.before, "log_ep"));
+            let answer = match (&seq, &ep) {
+                (Some(seq), Some(ep)) => {
+                    let (since, ep) = (format!("since={seq}"), format!("ep={ep}"));
+                    let wait = ["await", "log", "kind=program", &since, &ep, "timeout=60000"];
+                    self.on(&control.sid, &wait).stdout
+                }
+                _ => String::new(),
+            };
+            let mark = answer
+                .lines()
+                .find(|l| l.contains(" program state="))
+                .unwrap_or("none")
+                .trim()
+                .to_string();
+            // A wait whose position went stale (a reset, a handoff) answers from the log's new
+            // start with `gap=`: only a report past the position, in its epoch, is this turn's.
+            let past = field(&mark, "seq")
+                .and_then(|at| at.parse::<u64>().ok())
+                .zip(seq.as_deref().and_then(|s| s.parse::<u64>().ok()))
+                .is_some_and(|(at, since)| at > since);
+            self.check(
+                &format!(
+                    "control: a supervisor's wait on a codex answers on codex-alab's own report \
+                     past the position read before typing, in its epoch, with no gap (`await \
+                     log kind=program since=<log_seq> ep=<log_ep>`; log_seq={} log_ep={}): {mark}",
+                    seq.as_deref().unwrap_or("-"),
+                    ep.as_deref().unwrap_or("-")
+                ),
+                past && field(&mark, "ep") == ep
+                    && field(&mark, "gap").is_none()
+                    && (mark.ends_with("conf=claim") || mark.contains(" conf=claim ")),
             );
         }
         Ok((theirs, ours))

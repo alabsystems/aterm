@@ -672,6 +672,13 @@ impl MenuMarks {
 
 static NATIVE_MENU_MARKS: OnceLock<Arc<MenuMarks>> = OnceLock::new();
 
+/// The window and focused leaf from which a palette posted a menu command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MenuOrigin {
+    window: WindowId,
+    content: Option<crate::front_content::FrontContent>,
+}
+
 /// Serve `marks` to the native menu and toolbar's posts.
 pub(crate) fn serve_native_menu_marks(marks: &Arc<MenuMarks>) {
     let _ = NATIVE_MENU_MARKS.set(Arc::clone(marks));
@@ -683,8 +690,23 @@ pub(crate) fn post_menu_action(
     marks: Option<&MenuMarks>,
     action: crate::menu::MenuAction,
 ) -> bool {
+    post_menu_action_from(proxy, marks, action, None)
+}
+
+fn post_menu_action_from(
+    proxy: &EventLoopProxy<Wake>,
+    marks: Option<&MenuMarks>,
+    action: crate::menu::MenuAction,
+    origin: Option<MenuOrigin>,
+) -> bool {
     let mark = marks.map_or(MenuMark::NONE, |marks| marks.mint(Instant::now()));
-    let sent = proxy.send_event(Wake::MenuAction { action, mark }).is_ok();
+    let sent = proxy
+        .send_event(Wake::MenuAction {
+            action,
+            mark,
+            origin,
+        })
+        .is_ok();
     if !sent && let Some(marks) = marks {
         marks.settle(mark);
     }
@@ -1305,15 +1327,55 @@ impl App {
             .is_some_and(|proxy| post_menu_action(proxy, Some(&self.tab_spawns.menu), action))
     }
 
+    pub(crate) fn palette_menu_origin(&self, window: WindowId) -> Option<MenuOrigin> {
+        self.windows.get(&window).map(|state| MenuOrigin {
+            window,
+            content: state.front_content,
+        })
+    }
+
+    /// A palette command cannot follow a later focus, tab or pane change.
+    pub(crate) fn post_palette_menu_action(
+        &self,
+        window: WindowId,
+        action: crate::menu::MenuAction,
+    ) -> bool {
+        let Some(origin) = self.palette_menu_origin(window) else {
+            return false;
+        };
+        self.proxy.as_ref().is_some_and(|proxy| {
+            post_menu_action_from(proxy, Some(&self.tab_spawns.menu), action, Some(origin))
+        })
+    }
+
+    pub(crate) fn menu_action_for_origin(
+        &mut self,
+        action: crate::menu::MenuAction,
+        origin: Option<MenuOrigin>,
+    ) -> Option<crate::menu::MenuAction> {
+        if let Some(origin) = origin
+            && (self.frontmost_window != Some(origin.window)
+                || self.palette_menu_origin(origin.window) != Some(origin))
+        {
+            self.pending_action_refusal =
+                Some("palette command cancelled because its active content changed".to_string());
+            return None;
+        }
+        Some(action)
+    }
+
     /// Dispatch `action`, claim input held under `mark`, and replay released events.
     pub(crate) fn dispatch_marked_menu_action(
         &mut self,
         el: &ActiveEventLoop,
         action: crate::menu::MenuAction,
         mark: MenuMark,
+        origin: Option<MenuOrigin>,
     ) {
         let booked = self.tab_spawns.in_flight.len();
-        self.dispatch_menu_action(el, action);
+        if let Some(action) = self.menu_action_for_origin(action, origin) {
+            self.dispatch_menu_action(el, action);
+        }
         if self.tab_spawns.menu.settle(mark) {
             let release = self.claim_menu_held_input(mark, booked);
             self.replaying(false, |app| {
@@ -3768,6 +3830,7 @@ pub(crate) mod tests {
         replay(&mut app, wid, events);
         assert_eq!(drain(&new_pty), b"ls", "into the tab the menu opened");
 
+        let origin = app.palette_menu_origin(wid).unwrap();
         let mark = marks.mint(Instant::now());
         for text in ["q", "r"] {
             assert!(
@@ -3776,10 +3839,16 @@ pub(crate) mod tests {
             );
         }
         let booked = app.tab_spawns.in_flight.len();
+        app.frontmost_window = None;
+        assert!(
+            app.menu_action_for_origin(crate::menu::MenuAction::Copy, Some(origin))
+                .is_none()
+        );
         assert!(marks.settle(mark));
         let back = app.claim_menu_held_input(mark, booked);
         assert_eq!(named(&back), ["q", "r"]);
         assert!(app.tab_spawns.held.is_empty());
+        app.frontmost_window = Some(wid);
 
         let first = marks.mint(Instant::now());
         assert!(

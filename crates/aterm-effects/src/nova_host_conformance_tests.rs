@@ -26,7 +26,7 @@ fn state(phase: i64, steps: i64, flashes: i64, arms: i64) -> State {
     .collect()
 }
 
-fn phase_index(p: NovaPhase) -> i64 {
+const fn phase_index(p: NovaPhase) -> i64 {
     match p {
         NovaPhase::Armed => 0,
         NovaPhase::Dip => 1,

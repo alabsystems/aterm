@@ -35,6 +35,7 @@ impl Tone {
     ];
 
     /// The model output index (softmax slot) of this tone.
+    #[must_use]
     #[inline]
     pub const fn index(self) -> usize {
         match self {
@@ -47,6 +48,7 @@ impl Tone {
     }
 
     /// Inverse of [`Tone::index`]; out-of-range folds to the neutral [`Tone::Technical`] rather than panicking on an audio-adjacent path.
+    #[must_use]
     #[inline]
     pub const fn from_index(i: usize) -> Tone {
         if i < Tone::ALL.len() {
@@ -57,6 +59,7 @@ impl Tone {
     }
 
     /// Corpus label string (the TSV files' first column).
+    #[must_use]
     #[inline]
     pub const fn label(self) -> &'static str {
         match self {
@@ -245,48 +248,56 @@ pub struct RawTone<'a> {
 
 impl<'a> RawTone<'a> {
     /// The embedding scale, finite and positive.
+    #[must_use]
     #[inline]
     pub const fn emb_scale(&self) -> f32 {
         self.emb_scale
     }
 
     /// The first layer's scale, finite and positive.
+    #[must_use]
     #[inline]
     pub const fn w1_scale(&self) -> f32 {
         self.w1_scale
     }
 
     /// The output layer's scale, finite and positive.
+    #[must_use]
     #[inline]
     pub const fn w2_scale(&self) -> f32 {
         self.w2_scale
     }
 
     /// The `BUCKETS × EMBED` embedding table, row-major, one two's-complement i8 per byte.
+    #[must_use]
     #[inline]
     pub const fn emb(&self) -> &'a [u8] {
         self.emb
     }
 
     /// The `EMBED × HIDDEN` first-layer weights, row-major, one two's-complement i8 per byte.
+    #[must_use]
     #[inline]
     pub const fn w1(&self) -> &'a [u8] {
         self.w1
     }
 
     /// The `HIDDEN × TONE_COUNT` output weights, row-major, one two's-complement i8 per byte.
+    #[must_use]
     #[inline]
     pub const fn w2(&self) -> &'a [u8] {
         self.w2
     }
 
     /// The first layer's biases, each finite.
+    #[must_use]
     #[inline]
     pub const fn b1(&self) -> &[f32; HIDDEN] {
         &self.b1
     }
 
     /// The output layer's biases, each finite.
+    #[must_use]
     #[inline]
     pub const fn b2(&self) -> &[f32; TONE_COUNT] {
         &self.b2
@@ -294,72 +305,86 @@ impl<'a> RawTone<'a> {
 }
 
 /// Verify a weight asset (length, magic, checksum, dimensions, scales and finite biases) and view its quantized contents.
-pub fn raw(bytes: &[u8]) -> Result<RawTone<'_>, ToneModelError> {
+pub const fn raw(bytes: &[u8]) -> Result<RawTone<'_>, ToneModelError> {
+    const fn has_magic(bytes: &[u8]) -> bool {
+        let mut i = 0;
+        while i < MAGIC.len() {
+            if bytes[i] != MAGIC[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    const fn u32_at(bytes: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+    }
+    const fn f32_at(bytes: &[u8], off: usize) -> f32 {
+        f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+    }
     if bytes.len() < HEADER_LEN {
         return Err(ToneModelError::Truncated);
     }
     if bytes.len() != ASSET_LEN {
         // Magic first for a friendlier error on foreign files.
-        if bytes.get(..8) != Some(&MAGIC[..]) {
+        if !has_magic(bytes) {
             return Err(ToneModelError::BadMagic);
         }
         return Err(ToneModelError::BadLength);
     }
-    if bytes.get(..8) != Some(&MAGIC[..]) {
+    if !has_magic(bytes) {
         return Err(ToneModelError::BadMagic);
     }
     let payload_end = ASSET_LEN - 4;
-    let stored = u32::from_le_bytes(
-        bytes[payload_end..]
-            .try_into()
-            .map_err(|_| ToneModelError::Truncated)?,
-    );
-    if fnv1a32(&bytes[..payload_end]) != stored {
+    let stored = u32_at(bytes, payload_end);
+    if fnv1a32(bytes.split_at(payload_end).0) != stored {
         return Err(ToneModelError::BadChecksum);
     }
-    let u32_at = |off: usize| -> u32 {
-        let mut b = [0u8; 4];
-        b.copy_from_slice(&bytes[off..off + 4]);
-        u32::from_le_bytes(b)
-    };
-    let f32_at = |off: usize| -> f32 {
-        let mut b = [0u8; 4];
-        b.copy_from_slice(&bytes[off..off + 4]);
-        f32::from_le_bytes(b)
-    };
-    if u32_at(8) as usize != BUCKETS
-        || u32_at(12) as usize != EMBED
-        || u32_at(16) as usize != HIDDEN
-        || u32_at(20) as usize != TONE_COUNT
+    if u32_at(bytes, 8) as usize != BUCKETS
+        || u32_at(bytes, 12) as usize != EMBED
+        || u32_at(bytes, 16) as usize != HIDDEN
+        || u32_at(bytes, 20) as usize != TONE_COUNT
     {
         return Err(ToneModelError::DimensionMismatch);
     }
-    let emb_scale = f32_at(24);
-    let w1_scale = f32_at(28);
-    let w2_scale = f32_at(32);
-    for s in [emb_scale, w1_scale, w2_scale] {
+    let emb_scale = f32_at(bytes, 24);
+    let w1_scale = f32_at(bytes, 28);
+    let w2_scale = f32_at(bytes, 32);
+    let scales = [emb_scale, w1_scale, w2_scale];
+    let mut s_idx = 0;
+    while s_idx < scales.len() {
+        let s = scales[s_idx];
         if !s.is_finite() || s <= 0.0 {
             return Err(ToneModelError::BadScale);
         }
+        s_idx += 1;
     }
-    let (emb, rest) = bytes[HEADER_LEN..].split_at(EMB_LEN);
+    let (_, after_header) = bytes.split_at(HEADER_LEN);
+    let (emb, rest) = after_header.split_at(EMB_LEN);
     let (w1, rest) = rest.split_at(W1_LEN);
     let (w2, _) = rest.split_at(W2_LEN);
-    let floats = |out: &mut [f32], at: usize| -> Result<(), ToneModelError> {
-        for (k, slot) in out.iter_mut().enumerate() {
-            let x = f32_at(at + k * 4);
-            if !x.is_finite() {
-                return Err(ToneModelError::BadScale);
-            }
-            *slot = x;
-        }
-        Ok(())
-    };
     let b1_at = HEADER_LEN + EMB_LEN + W1_LEN + W2_LEN;
     let mut b1 = [0.0f32; HIDDEN];
-    floats(&mut b1, b1_at)?;
+    let mut k = 0;
+    while k < HIDDEN {
+        let x = f32_at(bytes, b1_at + k * 4);
+        if !x.is_finite() {
+            return Err(ToneModelError::BadScale);
+        }
+        b1[k] = x;
+        k += 1;
+    }
+    let b2_at = b1_at + HIDDEN * 4;
     let mut b2 = [0.0f32; TONE_COUNT];
-    floats(&mut b2, b1_at + HIDDEN * 4)?;
+    let mut c = 0;
+    while c < TONE_COUNT {
+        let x = f32_at(bytes, b2_at + c * 4);
+        if !x.is_finite() {
+            return Err(ToneModelError::BadScale);
+        }
+        b2[c] = x;
+        c += 1;
+    }
     Ok(RawTone {
         emb_scale,
         w1_scale,

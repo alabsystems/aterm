@@ -488,7 +488,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn ms(n: u64) -> Duration {
+    const fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
     }
 

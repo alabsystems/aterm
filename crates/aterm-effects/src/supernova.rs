@@ -478,8 +478,12 @@ fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
 }
 
 #[cfg(test)]
-fn max_channel(rgb: u32) -> u32 {
-    ((rgb >> 16) & 0xff).max((rgb >> 8) & 0xff).max(rgb & 0xff)
+const fn max_channel(rgb: u32) -> u32 {
+    let r = (rgb >> 16) & 0xff;
+    let g = (rgb >> 8) & 0xff;
+    let b = rgb & 0xff;
+    let rg = if r > g { r } else { g };
+    if rg > b { rg } else { b }
 }
 
 #[inline]
@@ -924,8 +928,8 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn env(ch: i32, light: bool, rows: i32) -> SuperEnv {
-        let cw = (ch / 2).max(1);
+    const fn env(ch: i32, light: bool, rows: i32) -> SuperEnv {
+        let cw = if ch / 2 > 1 { ch / 2 } else { 1 };
         let cols = 240i32;
         SuperEnv {
             grid_w: cols * cw,

@@ -2,7 +2,7 @@
 name: drive-aterm
 description: Drive, observe and screenshot another aterm session (a tab or window on this machine, or a session on another fleet Mac that lets this one drive it) over its control socket. Use when asked to watch or control another terminal or another agent's session, wait for a command to really finish, or run several sessions at once.
 ---
-<!-- aterm skill v9 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v10 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Driving another aterm session
 
@@ -161,7 +161,9 @@ settle=submitted` types key by key, returns `task_rev=<n>` once the composer cle
   footer leaving (`await gone esc.to.interrupt timeout=600000` while the footer is up, or
   `turn settle=gone:…`), or on the server's latched verdict `await agent
   idle,prompt,question,wall` with `since=<agent_rev>` from the turn's verdict (the client
-  re-arms up to `timeout=`, default 1h).
+  re-arms up to `timeout=`, default 1h). A codex's `agent=` stays `unknown`: read
+  `log_seq=`/`log_ep=` from `status` before you type to it, then wait on its own report
+  with `await log kind=program since=<log_seq> ep=<log_ep>` (a claim).
 - `await seq <n> timeout=0` checks whether the grid changed (`seq` resets on alt-screen
   re-entry). `wait`, `await block` and `blocks` require OSC-133; on a plain shell use
   `<cmd>; echo SENTINEL` and `await match '^SENTINEL$'` (anchored: the echoed command line
@@ -190,7 +192,8 @@ settle=submitted` types key by key, returns `task_rev=<n>` once the composer cle
   supervised by `supervisor=aterm-harness@<pid>` (`codex-alab` supervises itself); acquire
   a `lease` before driving one yourself. aterm does not parse Codex screens (`agent=unknown`,
   `program_state=` is its own report, `drive phase` always reads `idle` and `drive answer`
-  answers `NO-BOX` there).
+  answers `NO-BOX` there): wait on its own report with `await log kind=program
+  since=<log_seq> ep=<log_ep>`, both read from `status` before you type to it.
 - Rating survey (`● How is Claude doing this session?` over `1: Bad 2: Fine 3: Good 0:
   Dismiss`): `phase` ends `survey 0`; dismiss with `aterm ctl "@$SID" key
   'if=^●.How.is.Claude.doing' 0` (the drafted-feedback card, transcript-share question and

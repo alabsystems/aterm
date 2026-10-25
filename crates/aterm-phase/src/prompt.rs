@@ -641,6 +641,12 @@ pub enum RmBreakerKind {
     NestedUnanalyzed,
     /// Any other `not ruled out — <why>` reason not covered by a dedicated variant.
     NotRuledOut,
+    /// A `bash -c`/`sh -c` script that runs rm, which the vendor could not check for
+    /// dangerous removals (`This shell -c script runs rm and could not be checked`).
+    ShellScriptUnchecked,
+    /// An rm inside a `-c` script whose target is built from a value known only when it runs
+    /// (`Dangerous rm operation in a shell -c script, on a target built from …`).
+    ShellScriptValue,
 }
 
 /// Parsed vendor `rm`/`rmdir` circuit-breaker warning note.
@@ -652,10 +658,19 @@ pub struct RmBreaker {
     pub target: String,
 }
 
-/// Parses a `Dangerous rm/rmdir operation ...` note into an [`RmBreaker`].
+/// Parses a `Dangerous rm/rmdir operation ...` note, or the vendor's `This shell -c script runs
+/// rm and could not be checked` (the same `dangerousRemoval` breaker, worded without the head),
+/// into an [`RmBreaker`].
 #[must_use]
 pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
     let note = crate::text::trim(note);
+    if note == const { crate::anchor!("box.rm_breaker.shell_unchecked") } {
+        return Some(RmBreaker {
+            command: RmCommand::Rm,
+            kind: RmBreakerKind::ShellScriptUnchecked,
+            target: note.to_string(),
+        });
+    }
     if note.matches("Dangerous").count() != 1 {
         return None;
     }
@@ -665,6 +680,13 @@ pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
     ]
     .into_iter()
     .find_map(|(c, head)| note.strip_prefix(head).map(|r| (c, r)))?;
+    if rest == const { crate::anchor!("box.rm_breaker.shell_value") } {
+        return Some(RmBreaker {
+            command,
+            kind: RmBreakerKind::ShellScriptValue,
+            target: rest.to_string(),
+        });
+    }
     const SUFFIXES: &[(&str, &str, RmBreakerKind)] = &[
         (
             crate::anchor!("box.rm_breaker.empty_var_in_substitution"),
@@ -4327,6 +4349,57 @@ pub mod fixtures {
         lines.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The owner's screenshot of 2026-10-25: a general-purpose subagent's `bash -c` script whose
+    /// rm Claude Code 2.1.310 could not check, drawn in the 2.1.309 layout of
+    /// [`BOX_RM_PARSE_DIVERGED_2_1_309`] with `note` as its note row (the note's text and the
+    /// script are the screenshot's; the rows around them are that capture's).
+    #[must_use]
+    pub fn shell_c_rm_box(note: &str) -> Vec<String> {
+        const SCRIPT: &[&str] = &[
+            " bash -c '",
+            " fk() { df -k /System/Volumes/Data | tail -1 | awk \"{print \\$4}\"; }",
+            " for P in /Users/_owner/trust/crates/a/target.noindex \
+             /Users/_owner/trust/crates/b/target.noindex; do",
+            "   b=$(fk); rm -rf \"${P:?}/debug/incremental\"; a=$(fk); echo \"$P $((a - b)) KiB\"",
+            " done",
+            " '",
+        ];
+        let captured = screen(BOX_RM_PARSE_DIVERGED_2_1_309);
+        let top = captured
+            .iter()
+            .rposition(|r| r.starts_with("──"))
+            .expect("the capture's top rule");
+        let mut r: Vec<String> = captured[..top]
+            .iter()
+            .map(|row| {
+                if row == "⏺ Bash(echo $()" {
+                    "⏺ Agent(Delete two crate incremental caches)".to_string()
+                } else {
+                    row.clone()
+                }
+            })
+            .collect();
+        let dash = "╌".repeat(144);
+        r.push("─".repeat(144));
+        r.extend(rows(&[
+            " Bash command · from the general-purpose agent",
+            " Delete two crate incremental caches, measuring each",
+        ]));
+        r.push(dash.clone());
+        r.extend(rows(SCRIPT));
+        r.push(dash);
+        r.push(note.to_string());
+        r.extend(rows(&[
+            "",
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. No",
+            "",
+            " Esc to cancel · Tab to amend",
+        ]));
+        r
+    }
+
     #[must_use]
     pub fn bash_one_row() -> Vec<String> {
         let mut r = rows(&[
@@ -4612,6 +4685,8 @@ pub enum ReviewKind {
     AutoModeRule,
     /// Pre-tool or workspace hook requiring confirmation.
     Hook,
+    /// A deny rule matching a command inside a `-c` script: approving runs that command.
+    DenyRule,
 }
 
 impl ReviewKind {
@@ -4622,6 +4697,7 @@ impl ReviewKind {
             ReviewKind::Rule => "a permission rule",
             ReviewKind::AutoModeRule => "an ask rule that overrides auto mode",
             ReviewKind::Hook => "a hook",
+            ReviewKind::DenyRule => "a deny rule, which a Yes would override",
         }
     }
 }
@@ -4636,7 +4712,9 @@ pub struct OwnerReview {
 
 fn review_kind_of(row: &str) -> Option<ReviewKind> {
     let t = unbarred(row);
-    if t.contains(crate::anchor!("box.reason_auto_rule")) {
+    if t == crate::anchor!("box.reason_shell_deny") {
+        Some(ReviewKind::DenyRule)
+    } else if t.contains(crate::anchor!("box.reason_auto_rule")) {
         Some(ReviewKind::AutoModeRule)
     } else if t.starts_with(crate::anchor!("box.reason_rule"))
         && t.contains(crate::anchor!("box.reason_confirm"))
@@ -5505,6 +5583,18 @@ mod tests {
                 CriticalPath,
                 "/tmp",
             ),
+            (
+                "This shell -c script runs rm and could not be checked",
+                RmCommand::Rm,
+                ShellScriptUnchecked,
+                "This shell -c script runs rm and could not be checked",
+            ),
+            (
+                "Dangerous rm operation in a shell -c script, on a target built from a value known only when it runs",
+                RmCommand::Rm,
+                ShellScriptValue,
+                "in a shell -c script, on a target built from a value known only when it runs",
+            ),
         ] {
             let b = rm_breaker_of(note).unwrap_or_else(|| panic!("{note}"));
             assert_eq!(
@@ -5532,6 +5622,11 @@ mod tests {
             "Dangerous rm operation not ruled out some nested commands or function substitutions could not be analyzed",
             "This command requires approval",
             "Permission rule Bash(rm:*) requires confirmation for this command.",
+            "This shell -c script runs rm and could not be checked (2)",
+            "This shell -c script runs rmdir and could not be checked",
+            "A permission rule denies a command in this shell -c script",
+            "Dangerous rm operation in a shell -c script",
+            "Dangerous rm operation in a shell -c script, on a target built from a value known only when it runs: /x",
         ] {
             assert_eq!(rm_breaker_of(not), None, "{not}");
         }
@@ -5539,6 +5634,61 @@ mod tests {
         assert!(p.rm_breaker().is_some());
         p.notes.push("This command requires approval".to_string());
         assert_eq!(p.rm_breaker(), None);
+    }
+
+    #[test]
+    fn a_subagents_shell_c_rm_box_is_the_rm_breaker_and_a_deny_rule_the_owners() {
+        let unchecked = "This shell -c script runs rm and could not be checked";
+        let valued = "Dangerous rm operation in a shell -c script, on a target built from a value \
+                      known only when it runs";
+        for (row, note, kind) in [
+            (
+                format!(" {unchecked}"),
+                unchecked,
+                RmBreakerKind::ShellScriptUnchecked,
+            ),
+            (
+                format!(" │ {unchecked}"),
+                unchecked,
+                RmBreakerKind::ShellScriptUnchecked,
+            ),
+            (
+                format!(" │ {valued}"),
+                valued,
+                RmBreakerKind::ShellScriptValue,
+            ),
+        ] {
+            let p = parse_prompt_v2(&shell_c_rm_box(&row)).expect("the box");
+            assert_eq!(p.kind, PromptKind::Bash, "{row}");
+            assert_eq!(
+                p.origin(),
+                Some(Origin::Subagent {
+                    name: Some("general-purpose".to_string())
+                }),
+                "{row}"
+            );
+            assert_eq!(p.base_title().as_deref(), Some("Bash command"), "{row}");
+            assert!(p.command.starts_with("bash -c '"), "{row}: {p:?}");
+            assert!(
+                p.command.contains("rm -rf \"${P:?}/debug/incremental\""),
+                "{row}: {p:?}"
+            );
+            assert_eq!(p.notes, [note], "{row}");
+            let b = p.rm_breaker().unwrap_or_else(|| panic!("{row}: {p:?}"));
+            assert_eq!((b.command, b.kind), (RmCommand::Rm, kind), "{row}");
+            assert_eq!(p.owner_review(), None, "{row}");
+            let roles: Vec<Role> = p.options.iter().map(|o| o.role).collect();
+            assert_eq!(roles, [Role::Once, Role::Deny], "{row}");
+        }
+        let deny = "A permission rule denies a command in this shell -c script";
+        let p = parse_prompt_v2(&shell_c_rm_box(&format!(" │ {deny}"))).expect("the box");
+        assert_eq!(p.notes, [deny]);
+        assert_eq!(p.rm_breaker(), None);
+        let review = p.owner_review().expect("the owner's deny rule");
+        assert_eq!(
+            (review.kind, review.text.as_str()),
+            (ReviewKind::DenyRule, deny)
+        );
     }
 
     #[test]

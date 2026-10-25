@@ -3,7 +3,7 @@
 
 //! The first-launch Mac setup's offer, which System State answers once it is on screen.
 
-use std::sync::{Arc, Mutex, Weak, mpsc};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use aterm_types::macos_setup::{Plan, Selection};
@@ -17,7 +17,7 @@ pub enum WorkstationSetupDecision {
     /// Begin with this plan: the page applied the offer once it was presented
     /// in an active window, or a person changed a group first.
     Begin(Plan),
-    /// This process has no live window, or its window closed before a decision.
+    /// This process has no live, focused window, or its window closed before a decision.
     Unavailable,
 }
 
@@ -83,6 +83,83 @@ pub fn await_initial_setup_answer_while(
         return WorkstationSetupDecision::Unavailable.into();
     }
     wait_for_decision(pending, receive, finished, Duration::from_secs(1))
+}
+
+/// Focus gains of this process's windows ([`await_window_focus_after`]).
+static FOCUS_GAINS: FocusGains = FocusGains::new();
+
+/// The worker notified when a window returns to the person.
+static FOCUS_WAKE: Mutex<Option<fn()>> = Mutex::new(None);
+
+/// Register the setup worker's wake alongside its other recovery signals.
+pub fn on_window_focus_gained(wake: fn()) {
+    *FOCUS_WAKE.lock().unwrap_or_else(PoisonError::into_inner) = Some(wake);
+}
+
+/// A count of focus gains and the condition a worker waits on for the next one.
+struct FocusGains {
+    count: Mutex<u64>,
+    gained: Condvar,
+}
+
+impl FocusGains {
+    const fn new() -> Self {
+        Self {
+            count: Mutex::new(0),
+            gained: Condvar::new(),
+        }
+    }
+
+    fn count(&self) -> u64 {
+        *self.count.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn gain(&self) {
+        {
+            let mut count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
+            *count = count.wrapping_add(1);
+        }
+        self.gained.notify_all();
+    }
+
+    fn wait_after(&self, seen: u64, limit: Duration) -> bool {
+        let count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
+        let (count, waited) = self
+            .gained
+            .wait_timeout_while(count, limit, |count| *count == seen)
+            .unwrap_or_else(PoisonError::into_inner);
+        drop(count);
+        !waited.timed_out()
+    }
+}
+
+/// How many times a window of this process has gained focus ([`await_window_focus_after`]).
+pub fn window_focus_gains() -> u64 {
+    FOCUS_GAINS.count()
+}
+
+/// Wait until a window of this process gains focus after `seen` ([`window_focus_gains`]), or
+/// `limit` passes; `true` when one did. A window turns the first-launch offer away while none
+/// of this process's windows is focused: on a fresh Mac, macOS's Local Network alert, which
+/// the ALab vault probe raises, holds the focus until the person answers it. The worker offers
+/// again once the focus is back, rather than at its next retry.
+pub fn await_window_focus_after(seen: u64, limit: Duration) -> bool {
+    FOCUS_GAINS.wait_after(seen, limit)
+}
+
+/// A window of this process gained focus.
+pub(crate) fn window_focus_gained() {
+    FOCUS_GAINS.gain();
+    let wake = *FOCUS_WAKE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(wake) = wake {
+        wake();
+    }
+}
+
+/// Count a focus gain, as a window's `Focused(true)` does.
+#[cfg(any(test, debug_assertions))]
+pub fn gain_window_focus_for_test() {
+    window_focus_gained();
 }
 
 /// Drive the real first-launch answer channel without an event loop or native window.
@@ -183,7 +260,7 @@ impl Request {
             let on_begin = self
                 .on_begin
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(PoisonError::into_inner)
                 .take();
             if let Some(on_begin) = on_begin {
                 on_begin();
@@ -1074,6 +1151,38 @@ mod tests {
             WorkstationSetupDecision::Unavailable
         );
         assert!(!app.workstation_setup.pending());
+    }
+
+    #[test]
+    fn a_focus_gain_ends_the_wait_of_a_worker_whose_offer_was_turned_away() {
+        let gains = Arc::new(FocusGains::new());
+        let seen = gains.count();
+        assert!(
+            !gains.wait_after(seen, Duration::ZERO),
+            "no gain yet: the wait runs out"
+        );
+        let waiter = {
+            let gains = Arc::clone(&gains);
+            std::thread::spawn(move || gains.wait_after(seen, Duration::from_secs(60)))
+        };
+        gains.gain();
+        assert!(waiter.join().unwrap(), "the gain ends the wait");
+        assert!(
+            gains.wait_after(seen, Duration::from_secs(60)),
+            "a gain after the offer and before the wait ends it at once"
+        );
+        assert!(
+            !gains.wait_after(gains.count(), Duration::ZERO),
+            "a gain already seen does not"
+        );
+    }
+
+    #[test]
+    fn a_window_gaining_focus_counts_as_a_focus_gain() {
+        let mut app = App::headless_for_test();
+        let seen = window_focus_gains();
+        app.window_focus_event(crate::WindowId(0), true);
+        assert!(await_window_focus_after(seen, Duration::ZERO));
     }
 
     #[test]

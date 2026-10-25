@@ -349,7 +349,7 @@ pub(crate) enum HarnessChip {
     Context,
     /// Token/time usage fact.
     Usage,
-    /// The subscription and account fact (`⎆ email · ◇ plan · ◷ weekly`).
+    /// The subscription and account fact (`⎆ email · plan · weekly`).
     Account,
     /// Permission-mode indicator.
     Mode,
@@ -359,6 +359,8 @@ pub(crate) enum HarnessChip {
     SwitchOn,
     /// Passive status title beside the chips.
     Title,
+    /// The harness banner's link over Claude Code's update notice (`claude_card::NOTICE`).
+    Link,
 }
 
 impl HarnessChip {
@@ -380,6 +382,7 @@ impl HarnessChip {
             Self::Context => 11,
             Self::SwitchOn => 12,
             Self::Account => 13,
+            Self::Link => 14,
         }
     }
 
@@ -399,6 +402,7 @@ impl HarnessChip {
             11 => Self::Context,
             12 => Self::SwitchOn,
             13 => Self::Account,
+            14 => Self::Link,
             _ => return None,
         })
     }
@@ -435,7 +439,8 @@ impl HarnessChip {
             | Self::Mode
             | Self::Switch
             | Self::SwitchOn
-            | Self::Title => None,
+            | Self::Title
+            | Self::Link => None,
         }
     }
 }
@@ -577,6 +582,8 @@ fn push_chips(
         let title = chip.chip == HarnessChip::Title;
         let mut node = Node::new(if title {
             Role::Status
+        } else if chip.chip == HarnessChip::Link {
+            Role::Link
         } else if chip.toggled.is_some() {
             Role::Switch
         } else {
@@ -2452,6 +2459,7 @@ mod tests {
             HarnessChip::Context,
             HarnessChip::SwitchOn,
             HarnessChip::Account,
+            HarnessChip::Link,
         ];
         let mut ids = std::collections::HashSet::new();
         for session in [0, 1, 7] {
@@ -2491,6 +2499,7 @@ mod tests {
                 "Permission mode: click for bypass or auto",
                 8,
             ),
+            at(HarnessChip::Link, "https://alab.systems", 28),
         ];
         let update = grid_tree(
             &snap,
@@ -2503,7 +2512,12 @@ mod tests {
         for chip in &chips {
             let n = node(&update, chip_node_id(2, chip.chip).expect("an id"));
             let title = chip.chip == HarnessChip::Title;
-            assert_eq!(n.role(), if title { Role::Status } else { Role::Button });
+            let role = match chip.chip {
+                HarnessChip::Title => Role::Status,
+                HarnessChip::Link => Role::Link,
+                _ => Role::Button,
+            };
+            assert_eq!(n.role(), role, "{:?}", chip.chip);
             assert_eq!(n.supports_action(Action::Click), !title, "{:?}", chip.chip);
             assert!(
                 !n.supports_action(Action::ShowContextMenu),

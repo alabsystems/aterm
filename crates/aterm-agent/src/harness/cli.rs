@@ -68,6 +68,7 @@ USAGE:
     aterm harness limits [@<sid>] [--json]       wall and painted /usage windows on the session's screen
     aterm harness disk [<build-dir> ...] [--apply <class>] [--json]
                                                  report or reclaim stale build directories and caches
+    aterm harness disk why [--json]              which agent session was asked to free disk space, and why
     aterm harness ledger [@<sid>] [<n>] [--json] supervisor approval ledger for a session
     aterm harness ledger disk [<n>] [--json]     disk cleanup journal
     aterm harness ledger upgrade [<n>] [--json]  live upgrade ledger
@@ -228,6 +229,21 @@ WINDOW AUTOMATIC TIERS (cheapest first, re-measuring free space before each item
 
 `--apply cargo-targets` takes tier 1 (when `low`), tier 2 (at any free level), and tier 4
 (when `short`); tier 3 (`idle_whole_up_to=`) is emptied only by the window's pass.
+
+ASKING AN AGENT (`rule disk-free@v1`):
+  When the home volume stays `short` or `emergency` and aterm's own freeing is done (a pass
+  ran every tier it may, `disk.auto_free_gib = 0`, or it is out of inodes), ONE Claude Code
+  session on the whole machine is asked to free space, at its turn break, by one line: the
+  volume, how full, the largest build directories left, what is safe to remove, and how to
+  confirm. Every aterm process steps one lease (`<state>/disk-ask.json`): each nominates its
+  best session (its checkout holds most of what is left; at a turn break first; Autopilot not
+  off; its task not done, and not found finished, landed or taskless at its last turn break)
+  for 150 s, and the best is elected. An elected session found unfit at its turn break is
+  released, which costs no election. A session that frees under 1 GiB in 20 minutes, ends,
+  or reaches no turn break in 30 hands the ask to one other session; after two lines (or four
+  elections) no more agents are asked and the owner's disk line says so. The episode ends back at or above the floor; no new one opens within
+  6 hours of the last line. `disk why` prints the lease and its recent decisions (the
+  `free-ask` rows of `<state>/disk.jsonl`); `--json` prints the lease, then the rows.
 ";
 
 const HELP_TAP: &str = "\
@@ -279,8 +295,9 @@ const HELP_LEDGER: &str = "\
 (`--json`: verbatim):
   - `ledger [@<sid>] [<n>]`: supervisor approval decisions (`<aterm state>/drive/<sid>.jsonl`;
     `self.jsonl` with neither `@<sid>` nor a parent session)
-  - `ledger disk [<n>]`: disk reports, removal intents, removals, and refusals
-    (`<state>/disk.jsonl`, always verbatim)
+  - `ledger disk [<n>]`: disk reports, removal intents, removals, refusals, and the
+    `free-ask` rows of `disk-free@v1` (`<state>/disk.jsonl`, always verbatim; `disk why`
+    reads the last)
   - `ledger upgrade [<n>]`: live upgrade steps and owner requests (`<state>/upgrade/ledger.jsonl`)
   - `ledger accounts [<n>]`: account walls, samples, rotations, pins, and auth checks
     (`<state>/accounts/ledger.jsonl`)
@@ -873,6 +890,12 @@ pub enum Cmd {
         /// The JSON form.
         json: bool,
     },
+    /// `disk why`: which agent session the ask (`disk-free@v1`) chose and why
+    /// ([`run_disk_why`]).
+    DiskWhy {
+        /// The lease and the rows verbatim.
+        json: bool,
+    },
     /// The newest rows of one ledger.
     Ledger {
         /// Which file.
@@ -1297,6 +1320,12 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             sid: sid_operand(&rest[1..])?,
             json,
         },
+        "disk" if rest.get(1) == Some(&"why") => {
+            if rest.len() > 2 || apply.is_some() {
+                return Err(format!("disk why takes only --json, not {:?}", &rest[2..]));
+            }
+            Cmd::DiskWhy { json }
+        }
         "disk" => Cmd::Disk {
             targets: rest[1..].iter().map(PathBuf::from).collect(),
             apply,
@@ -3408,6 +3437,55 @@ pub fn disk_reserve_look(
         journal.append_raw(&row, &mut sink);
     }
     moved
+}
+
+/// Journal rows of the ask ([`disk::ask::row`], [`disk::ask::step_row`]) into `<state>/disk.jsonl`.
+pub fn disk_ask_journal(state: &Path, rows: &[String]) {
+    if rows.is_empty() {
+        return;
+    }
+    let path = state.join(DISK_LEDGER);
+    let mut sink = io::sink();
+    if std::fs::create_dir_all(state).is_ok() {
+        let mut journal = Journal::open(Some(&path), None, &mut sink);
+        for row in rows {
+            journal.append_raw(row, &mut sink);
+        }
+    }
+}
+
+/// The ledger rows `disk why` scans for the ask's own, and the most it prints.
+const DISK_WHY_SCAN: usize = 4096;
+const DISK_WHY_ROWS: usize = 24;
+
+/// `disk why`: the ask's lease ([`disk::ask::read`]) as it stands, and the newest of its
+/// ledger rows ([`disk::ask::why_lines`]); `--json` prints the lease, then the rows verbatim.
+fn run_disk_why(env: &Env, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let path = env.disk_ledger();
+    let rows = match tail_lines(&path, DISK_WHY_SCAN) {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = writeln!(err, "aterm harness disk why: {}: {e}", path.display());
+            return ExitCode::from(1);
+        }
+    };
+    let mut rows: Vec<String> = rows
+        .into_iter()
+        .filter(|r| disk::ask::row_line(r).is_some())
+        .collect();
+    rows.drain(..rows.len().saturating_sub(DISK_WHY_ROWS));
+    let lease = disk::ask::read(&env.state);
+    if json {
+        let _ = writeln!(out, "{}", lease.encode());
+        for row in &rows {
+            let _ = writeln!(out, "{row}");
+        }
+    } else {
+        for line in disk::ask::why_lines(&lease, &rows, env.now.saturating_mul(1000)) {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Journal a poke ([`disk::poke`]) into `<state>/disk.jsonl`: what saw the disk full, the free figure measured on it and where that stands.
@@ -6748,6 +6826,8 @@ pub(super) enum Renewal {
     AuthFailed,
     WrongAccount,
     Failed,
+    /// Another process held `signin.lock` past `signin_within`, so nothing ran.
+    Busy,
     /// Another CLI's sign-in stopped where only a person can go on (its page waits on one, or a
     /// block page, or its time ran out), so a background renewal of the row waits for one
     /// ([`super::accounts_sync`]'s backoff).
@@ -7390,7 +7470,7 @@ fn sign_in_plan(
                 "{label}: held: {}; nothing was run",
                 accounts::SIGNIN_HELD
             );
-            return Err(Renewal::Failed);
+            return Err(Renewal::Busy);
         }
         Err(e) => {
             say(
@@ -7910,9 +7990,38 @@ fn run_accounts_renew_for(
                 logins.get(label).and_then(|b| b.wrong_at),
             )
         });
+        let has_non_limited_due = due_labels.iter().any(|label| {
+            !state
+                .accounts
+                .get(label)
+                .is_some_and(|a| a.limited_until(now).is_some())
+        });
         for label in due_labels {
             if !chosen.contains(&label) {
                 chosen.push(label);
+            }
+        }
+        if !has_non_limited_due && cli.accounts().signin.is_some() {
+            let candidates = super::accounts_sync::auto_renew_candidates_for(
+                cli,
+                Some(&store),
+                &file_roster,
+                &state,
+                &logins,
+                now,
+            );
+            if let Some(target) = candidates.first()
+                && !chosen.contains(&target.label)
+            {
+                if labels.is_empty() {
+                    chosen.retain(|label| {
+                        !state
+                            .accounts
+                            .get(label)
+                            .is_some_and(|a| a.limited_until(now).is_some())
+                    });
+                }
+                chosen.push(target.label.clone());
             }
         }
     }
@@ -8929,6 +9038,7 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
             apply,
             json,
         } => run_disk(env, targets, *apply, *json, out, err),
+        Cmd::DiskWhy { json } => run_disk_why(env, *json, out, err),
         Cmd::Ledger { file, count, json } => run_ledger(env, file, *count, *json, out, err),
         Cmd::Upgrade { sid, dry_run, json } => run_upgrade(env, sid, *dry_run, *json, out, err),
         Cmd::UpgradeOwner { sid, ask, json } => run_upgrade_owner(env, sid, *ask, *json, out, err),

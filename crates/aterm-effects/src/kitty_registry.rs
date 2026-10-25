@@ -513,8 +513,8 @@ mod tests {
     use super::*;
 
     /// The raw ramp stop `i` as 0–255 float channels.
-    fn raw_stop(i: u8) -> (f32, f32, f32) {
-        let hex = crate::cat_baker::COAT_RAMP[usize::from(i)];
+    const fn raw_stop(i: u8) -> (f32, f32, f32) {
+        let hex = crate::cat_baker::COAT_RAMP[i as usize];
         (
             ((hex >> 16) & 0xff) as f32,
             ((hex >> 8) & 0xff) as f32,

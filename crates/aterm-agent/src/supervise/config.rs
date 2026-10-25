@@ -336,8 +336,12 @@ pub struct SupervisorConfig {
     /// The live upgrade asks first.
     pub upgrade_ask: bool,
     /// Seconds the supervisor keeps its hands off a session after a person's keystroke into it.
-    /// A question dialog waits the shorter of this and `approval_loop::QUESTION_PERSON_GRACE`
-    /// (15 s): a question nobody is answering is answered, never held for the whole grace.
+    /// A choice dialog that grants and spends nothing (a question, a plan-mode switch, a goal, a
+    /// model or effort switch, the autocompact offer) waits the shorter of this and
+    /// `approval_loop::QUESTION_PERSON_GRACE` (15 s): a dialog nobody is answering is answered,
+    /// never held for the whole grace. A permission box nobody has touched since it appeared waits
+    /// the same 15 s at most; one a person or another driver touched, a held message, an
+    /// unrecognized box and the usage-limit menu wait the whole grace.
     pub human_grace_s: u32,
     /// What the harness does with a session's measured wait ([`Occupancy`]).
     pub occupancy: Occupancy,

@@ -315,6 +315,21 @@ pub const ANCHORS: &[Anchor] = &[
         "some nested commands or function substitutions could not be analyzed",
         "2.1.307",
     ),
+    lit(
+        "box.rm_breaker.shell_unchecked",
+        "This shell -c script runs rm and could not be checked",
+        "2.1.302",
+    ),
+    lit(
+        "box.rm_breaker.shell_value",
+        "in a shell -c script, on a target built from a value known only when it runs",
+        "2.1.302",
+    ),
+    lit(
+        "box.reason_shell_deny",
+        "A permission rule denies a command in this shell -c script",
+        "2.1.302",
+    ),
     composed(
         "box.auto_deny",
         "Claude Code will automatically deny this request in",

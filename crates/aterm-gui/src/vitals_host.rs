@@ -621,6 +621,12 @@ pub(crate) struct VitalsHost {
     /// age from (`App::post_jobs_reading`).
     read_began: Option<Instant>,
     full_adopted_at: Option<Instant>,
+    /// When the held snapshot landed (any new reading, whatever its jobs view): what the deck's
+    /// live edge counts its beat and its staleness from (`crate::stats_live`).
+    pub(crate) landed_at: Option<Instant>,
+    /// The bars' cadence when it landed (`None` with no window showing them): a reading speaks
+    /// for [`crate::stats_live::STALE_PERIODS`] of the slower of this and the cadence now.
+    pub(crate) landed_period: Option<Duration>,
     /// When the next reading is due: the bars' cadence while a window in view shows them.
     pub(crate) next_due: Option<Instant>,
     asked_at: Option<Instant>,
@@ -668,6 +674,8 @@ impl Default for VitalsHost {
             adopted_at: None,
             read_began: None,
             full_adopted_at: None,
+            landed_at: None,
+            landed_period: None,
             next_due: None,
             asked_at: None,
             jobs_due: None,
@@ -748,6 +756,7 @@ impl VitalsHost {
                 if !snap.machine_only {
                     self.full_adopted_at = Some(now);
                 }
+                self.landed_at = Some(now);
                 self.read_began = began;
                 self.snapshot = Some(snap);
                 true
@@ -2739,7 +2748,7 @@ fn free_of(text: &str, now_unix_ms: i64) -> Option<FreeHistory> {
 }
 
 impl crate::App {
-    fn vitals_audience(&self) -> Audience {
+    pub(crate) fn vitals_audience(&self) -> Audience {
         if self.proxy.is_none() && self.vitals.tx.is_none() {
             return Audience::None;
         }
@@ -3056,6 +3065,9 @@ impl crate::App {
         if !adopted {
             return false;
         }
+        self.vitals.landed_period = audience
+            .cadence(self.any_stats_lens_open())
+            .map(|(period, _)| period);
         self.post_jobs_reading();
         self.note_held_episode(before.as_deref());
         if !audience.in_view() {

@@ -18,7 +18,9 @@ aterm-json.workspace = true
 aterm-net.workspace = true
 aterm-uds.workspace = true
 aterm-time.workspace = true
+aterm-toml.workspace = true
 ring.workspace = true
+zeroize = { version = "1", default-features = false }
 astream-broker = { path = "../../vendor/astream/crates/astream-broker" }
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 [dev-dependencies]

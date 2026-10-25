@@ -60,14 +60,15 @@ pub const COLOUR_TRAIN_COV: f32 = TRANSIENT_STAR_COV_CEIL;
 /// Reflected triangle wave on `[0, 1]`.
 #[inline]
 #[must_use]
-pub fn tri(x: f32) -> f32 {
+pub const fn tri(x: f32) -> f32 {
     if !x.is_finite() {
         return 0.0;
     }
-    let r = if (0.0..2.0).contains(&x) {
+    let r = if x >= 0.0 && x < 2.0 {
         x
     } else {
-        x.rem_euclid(2.0)
+        let rem = x % 2.0;
+        if rem < 0.0 { rem + 2.0 } else { rem }
     };
     1.0 - (1.0 - r).abs()
 }
@@ -88,7 +89,7 @@ pub const fn arc_gain(cells: f32) -> f32 {
 /// The landing's walk off any band.
 #[inline]
 #[must_use]
-pub fn landing_field(t_land: f32, dx_cells: f32) -> f32 {
+pub const fn landing_field(t_land: f32, dx_cells: f32) -> f32 {
     if !dx_cells.is_finite() {
         return tri(t_land);
     }
@@ -115,7 +116,7 @@ impl LandingWalk {
     /// The folded arc position `dx_cells` to the right of the landing cell.
     #[inline]
     #[must_use]
-    pub fn at(&self, dx_cells: f32) -> f32 {
+    pub const fn at(&self, dx_cells: f32) -> f32 {
         if !dx_cells.is_finite() {
             return tri(self.t_land);
         }
@@ -801,7 +802,7 @@ impl Meteor {
     /// The train's spectrum position `cells_behind_landing` cells short of the landing.
     #[inline]
     #[must_use]
-    pub fn arc(&self, cells_behind_landing: f32) -> f32 {
+    pub const fn arc(&self, cells_behind_landing: f32) -> f32 {
         tri(self.t_land - cells_behind_landing * WALK_LAY_RATE * arc_gain(self.cells))
     }
 
@@ -1025,15 +1026,17 @@ impl SkyMask {
 
     #[inline]
     #[must_use]
-    fn probe(x: f32, y: f32, probe: &GlyphProbe, geom: Geom) -> Self {
+    const fn probe(x: f32, y: f32, probe: &GlyphProbe, geom: Geom) -> Self {
         let cw = (geom.cw as f32).max(1.0);
         let py = y.round() as i32;
         let mut mask = Self::EMPTY;
-        for k in -JET_PROBE_CELLS..=JET_PROBE_CELLS {
+        let mut k = -JET_PROBE_CELLS;
+        while k <= JET_PROBE_CELLS {
             let px = (x + k as f32 * cw).round() as i32;
-            if probe.at_px(px, py, geom) == Some(false) {
+            if matches!(probe.at_px(px, py, geom), Some(false)) {
                 mask.row |= 1_u32 << (k + JET_PROBE_CELLS);
             }
+            k += 1;
         }
         mask
     }
@@ -1083,7 +1086,7 @@ impl Landing {
     /// The band's walk through this landing ([`LandingWalk::at`]) `dx_cells` right of the landing.
     #[inline]
     #[must_use]
-    pub fn field(&self, dx_cells: f32) -> f32 {
+    pub const fn field(&self, dx_cells: f32) -> f32 {
         self.walk.at(dx_cells)
     }
 
@@ -1835,7 +1838,9 @@ const DARK_WARM_TRAIN_GAIN: f32 = 1.8;
 
 /// [`DARK_WARM_TRAIN_GAIN`]'s share for `stop`: whole from red through
 /// yellow, easing out across yellow-green and across magenta.
-fn dark_warm_gain(stop: u32) -> f32 {
+#[inline]
+#[must_use]
+const fn dark_warm_gain(stop: u32) -> f32 {
     let (hue, sat, _) = crate::color_math::rgb2hsv(stop);
     let warm = if hue >= 300.0 {
         smoothstep01((hue - 300.0) / 45.0)
@@ -1853,7 +1858,9 @@ const PAPER_GOLD_WIDTH: f32 = 0.4;
 /// [`PAPER_GOLD_WIDTH`]'s share for a paper train's `ink`: whole from a
 /// darkened orange (30 degrees) through olive (80), easing out toward red
 /// and across a yellowish green into green (100).
-fn paper_gold_width(ink: u32) -> f32 {
+#[inline]
+#[must_use]
+const fn paper_gold_width(ink: u32) -> f32 {
     let (hue, sat, _) = crate::color_math::rgb2hsv(ink);
     let gold = smoothstep01((hue - 20.0) / 10.0) * (1.0 - smoothstep01((hue - 80.0) / 20.0));
     1.0 - (1.0 - PAPER_GOLD_WIDTH) * gold * smoothstep01(sat / 0.3)
@@ -1877,9 +1884,11 @@ const fn white_printed_share(dy: f32, rows_off: f32, ch: f32) -> f32 {
     WHITE_PRINTED_SHARE + (1.0 - WHITE_PRINTED_SHARE) * smoothstep01(u.clamp(0.0, 1.0))
 }
 
-fn dark_petal_rgb(stop: u32) -> u32 {
+#[inline]
+#[must_use]
+const fn dark_petal_rgb(stop: u32) -> u32 {
     let (h, _, _) = crate::color_math::rgb2hsv(stop & 0x00FF_FFFF);
-    if (40.0..=100.0).contains(&h) {
+    if h >= 40.0 && h <= 100.0 {
         night_rgb(stop)
     } else {
         stop
@@ -1889,27 +1898,57 @@ fn dark_petal_rgb(stop: u32) -> u32 {
 /// A dark head's light for spectrum `stop`: a warm stop that dims to brown
 /// (orange) or olive (yellow, lime) walks the night arc ([`night_rgb`]),
 /// and every other stop is itself.
-fn dark_head_rgb(stop: u32) -> u32 {
+#[inline]
+#[must_use]
+const fn dark_head_rgb(stop: u32) -> u32 {
     let (h, _, _) = crate::color_math::rgb2hsv(stop & 0x00FF_FFFF);
-    if (15.0..=100.0).contains(&h) {
+    if h >= 15.0 && h <= 100.0 {
         night_rgb(stop)
     } else {
         stop
     }
 }
 
+const DARK_HEAD_STOP_LUT: [u32; COMA_PETALS] = {
+    let mut lut = [0u32; COMA_PETALS];
+    let mut i = 0;
+    while i < COMA_PETALS {
+        lut[i] = dark_head_rgb(spectrum_stop(i));
+        i += 1;
+    }
+    lut
+};
+
+const DARK_PETAL_STOP_LUT: [u32; COMA_PETALS] = {
+    let mut lut = [0u32; COMA_PETALS];
+    let mut i = 0;
+    while i < COMA_PETALS {
+        lut[i] = dark_petal_rgb(spectrum_stop(i));
+        i += 1;
+    }
+    lut
+};
+
 #[inline]
-fn dark_head_stop_rgb(i: usize) -> u32 {
-    static LUT: OnceLock<[u32; COMA_PETALS]> = OnceLock::new();
-    LUT.get_or_init(|| std::array::from_fn(|i| dark_head_rgb(spectrum_stop(i))))
-        [i.min(COMA_PETALS - 1)]
+#[must_use]
+const fn dark_head_stop_rgb(i: usize) -> u32 {
+    let idx = if i < COMA_PETALS - 1 {
+        i
+    } else {
+        COMA_PETALS - 1
+    };
+    DARK_HEAD_STOP_LUT[idx]
 }
 
 #[inline]
-fn dark_petal_stop_rgb(i: usize) -> u32 {
-    static LUT: OnceLock<[u32; COMA_PETALS]> = OnceLock::new();
-    LUT.get_or_init(|| std::array::from_fn(|i| dark_petal_rgb(spectrum_stop(i))))
-        [i.min(COMA_PETALS - 1)]
+#[must_use]
+const fn dark_petal_stop_rgb(i: usize) -> u32 {
+    let idx = if i < COMA_PETALS - 1 {
+        i
+    } else {
+        COMA_PETALS - 1
+    };
+    DARK_PETAL_STOP_LUT[idx]
 }
 
 struct Flight {
@@ -3560,7 +3599,7 @@ mod tests {
     use crate::rainbow_kitty::{CaretSeam, Config};
     use crate::spectrum::SPECTRUM_ANCHORS;
 
-    fn geom() -> Geom {
+    const fn geom() -> Geom {
         Geom {
             cw: 9,
             ch: 18,
@@ -3574,7 +3613,7 @@ mod tests {
         }
     }
 
-    fn config() -> Config {
+    const fn config() -> Config {
         Config {
             dark_theme: true,
             intensity: 1.0,
@@ -3597,14 +3636,14 @@ mod tests {
     }
 
     impl Scratch {
-        fn frame(&mut self) -> Frame<'_> {
+        const fn frame(&mut self) -> Frame<'_> {
             Frame {
                 under: &mut self.under,
                 out: &mut self.out,
                 halos: &mut self.halos,
                 beams: &mut self.beams,
                 cues: &mut self.cues,
-                caret: CaretSeam::default(),
+                caret: CaretSeam::EMPTY,
                 companion: None,
                 fp: 0,
             }
@@ -3623,7 +3662,7 @@ mod tests {
         }
     }
 
-    fn ctx_with(
+    const fn ctx_with(
         now: Instant,
         cfg: &Config,
         caret: (u16, u16),
@@ -3643,31 +3682,28 @@ mod tests {
             caret_walk: None,
             mend: None,
             surge: 0.0,
-            flow: Default::default(),
+            flow: crate::rainbow_kitty::spine::Flow::EMPTY,
         }
     }
 
-    fn ctx_at(now: Instant, cfg: &Config, caret: (u16, u16), caret_t: f32) -> Ctx<'_> {
+    const fn ctx_at(now: Instant, cfg: &Config, caret: (u16, u16), caret_t: f32) -> Ctx<'_> {
         ctx_with(now, cfg, caret, caret_t, 0.5, 0.5)
     }
 
-    fn mv_as(from: (u16, u16), to: (u16, u16), licence: Licence) -> Event {
+    const fn mv_as(from: (u16, u16), to: (u16, u16), licence: Licence) -> Event {
         Event::Move {
             from,
             to,
             licence,
-            dir: Dir::of(
-                i32::from(to.1) - i32::from(from.1),
-                i32::from(to.0) - i32::from(from.0),
-            ),
+            dir: Dir::of(to.1 as i32 - from.1 as i32, to.0 as i32 - from.0 as i32),
         }
     }
 
-    fn mv(from: (u16, u16), to: (u16, u16)) -> Event {
+    const fn mv(from: (u16, u16), to: (u16, u16)) -> Event {
         mv_as(from, to, Licence::Nav)
     }
 
-    fn ms(n: u64) -> Duration {
+    const fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
     }
 
@@ -3691,24 +3727,26 @@ mod tests {
         dust.live_iter().filter(|s| s.lane == lane).collect()
     }
 
-    fn lum(c: u32) -> f32 {
+    const fn lum(c: u32) -> f32 {
         0.2126 * ((c >> 16) & 0xFF) as f32
             + 0.7152 * ((c >> 8) & 0xFF) as f32
             + 0.0722 * (c & 0xFF) as f32
     }
 
-    fn chan(c: u32) -> (u32, u32, u32) {
+    const fn chan(c: u32) -> (u32, u32, u32) {
         ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)
     }
 
-    fn is_white(c: u32) -> bool {
+    const fn is_white(c: u32) -> bool {
         let (r, g, b) = chan(c);
         r == g && g == b && r > 0
     }
 
-    fn is_chromatic(c: u32) -> bool {
+    const fn is_chromatic(c: u32) -> bool {
         let (r, g, b) = chan(c);
-        r.max(g).max(b) > 0 && !(r == g && g == b)
+        let m = if r > g { r } else { g };
+        let m = if m > b { m } else { b };
+        m > 0 && !(r == g && g == b)
     }
 
     fn stop_of(c: u32) -> usize {
@@ -3773,9 +3811,10 @@ mod tests {
     }
 
     /// The brightest light in a halo's colour: its largest channel.
-    fn peak_of(c: u32) -> f32 {
+    const fn peak_of(c: u32) -> f32 {
         let (r, g, b) = chan(c);
-        r.max(g).max(b) as f32
+        let rg = if r >= g { r } else { g };
+        (if rg >= b { rg } else { b }) as f32
     }
 
     fn nucleus(halos: &[RainHalo]) -> Option<&RainHalo> {
@@ -5332,7 +5371,7 @@ mod tests {
         );
     }
 
-    fn owner_geom() -> Geom {
+    const fn owner_geom() -> Geom {
         Geom {
             cw: 20,
             ch: 38,
@@ -5346,7 +5385,7 @@ mod tests {
         }
     }
 
-    fn ctx_on(now: Instant, cfg: &Config, caret: (u16, u16), g: Geom) -> Ctx<'_> {
+    const fn ctx_on(now: Instant, cfg: &Config, caret: (u16, u16), g: Geom) -> Ctx<'_> {
         let mut c = ctx_at(now, cfg, caret, 0.25);
         c.geom = g;
         c
@@ -5975,7 +6014,7 @@ mod tests {
 
     type PoolPatch = fn(&mut Meteors, PoolStep, &[Landing]);
 
-    fn no_pool_patch(_: &mut Meteors, _: PoolStep, _: &[Landing]) {}
+    const fn no_pool_patch(_: &mut Meteors, _: PoolStep, _: &[Landing]) {}
 
     fn drop_the_arrival_at(site: PoolStep, m: &mut Meteors, step: PoolStep, before: &[Landing]) {
         if step == site && before.len() == LANDING_POOL {
@@ -6193,7 +6232,7 @@ mod tests {
     }
 
     /// The trail gallery's glass: 72x14 cells of 14x26 px from (12, 2).
-    fn gallery_geom() -> Geom {
+    const fn gallery_geom() -> Geom {
         Geom {
             cw: 14,
             ch: 26,

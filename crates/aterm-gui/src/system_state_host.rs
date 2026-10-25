@@ -208,7 +208,8 @@ pub(crate) struct Host {
     /// A test's own handlers, in place of the binary's ([`App::system_state_handlers`]).
     #[cfg(test)]
     handlers: Option<InitialSetupHandlers>,
-    /// What the worker is busy with for the page when it is not a run.
+    /// An accepted nonrun operation, reserved across controller closure until
+    /// a fresh status says it ended or a setup pass takes over.
     operation: Option<SetupOperation>,
     next_status: Option<Instant>,
     status_in_flight: bool,
@@ -320,12 +321,16 @@ impl App {
     /// before its write, since the window handles input in between.
     #[cfg(target_os = "macos")]
     pub(crate) fn settle_system_state_before_handoff(&self) {
+        aterm_types::macos_setup::set_system_state_front(false);
         if let Some(handlers) = self.system_state_handlers() {
             (handlers.settle)();
         }
     }
 
     fn finish_system_state_shutdown_with(&mut self, handlers: Option<InitialSetupHandlers>) {
+        // Cmd-Q can keep the models and windows until after settlement, but
+        // their old frontness no longer authorizes an on-screen worker step.
+        aterm_types::macos_setup::set_system_state_front(false);
         if let Some(request) = self.system_state_host.pending.take() {
             request.finish(WorkstationSetupDecision::Unavailable);
         }
@@ -379,10 +384,13 @@ impl App {
     }
 
     fn can_offer_system_state(&self) -> bool {
-        // A person's choice still being admitted answers for this launch: the
-        // startup shows no offer over it, and the window keeps waiting for its
-        // answer (design §3.3).
-        self.system_state_host.pending.is_none()
+        // The host keeps accepted work and admissions after their final view
+        // closes. A queued startup offer must yield before opening a new
+        // review, just as it does while a busy controller survives (§3.3).
+        self.system_state_host.operation.is_none()
+            && !self.system_state_host.awaiting_run
+            && !self.system_state_host.latest_status.busy
+            && self.system_state_host.pending.is_none()
             && self.system_state_host.pending_apply.is_none()
             && self
                 .native_runtime
@@ -432,9 +440,15 @@ impl App {
         self.request_redraw_all_windows();
     }
 
-    pub(crate) fn publish_system_state(&mut self, mut status: SetupStatus) {
-        self.system_state_host.latest_status = status.clone();
-        if self.system_state_host.awaiting_run
+    /// Project the worker's status for a controller without changing its
+    /// cached reading or poll state. The active step is returned separately
+    /// because a fixture can keep its own displayed step.
+    pub(crate) fn project_system_state_status(
+        &self,
+        mut status: SetupStatus,
+    ) -> (SetupStatus, Option<Access>) {
+        if self.system_state_host.operation.is_some()
+            || self.system_state_host.awaiting_run
             || self
                 .system_state_host
                 .pending_apply
@@ -443,13 +457,7 @@ impl App {
         {
             status.busy = true;
         }
-        // A stage running is a setup pass, whatever the window asked for last:
-        // Check again and Restore never run one. A pass that took the worker
-        // as a Check ended (or woke by it) is a run, with its Stop and meter.
-        if !status.running.is_empty() {
-            self.system_state_host.operation = None;
-        }
-        status.operation = if status.busy {
+        status.operation = if status.busy && status.running.is_empty() {
             self.system_state_host.operation
         } else {
             None
@@ -458,10 +466,22 @@ impl App {
             status.rows.insert(0, refusal.clone());
         }
         let step = self.system_state_access_step();
-        self.system_state_host.access_step = step;
         if step.is_some() || !self.system_state_host.showing_fixture() {
             status.access_step = step;
         }
+        (status, step)
+    }
+
+    pub(crate) fn publish_system_state(&mut self, status: SetupStatus) {
+        self.system_state_host.latest_status = status.clone();
+        let (status, step) = self.project_system_state_status(status);
+        // A stage running is a setup pass, whatever the window asked for last:
+        // Check again and Restore never run one. A pass that took the worker
+        // as a Check ended (or woke by it) is a run, with its Stop and meter.
+        if !status.running.is_empty() {
+            self.system_state_host.operation = None;
+        }
+        self.system_state_host.access_step = step;
         self.refresh_system_state_menu_line();
         let changed = self.native_runtime.publish_system_state(status);
         self.system_state_host.status_in_flight = false;
@@ -572,7 +592,7 @@ impl App {
     pub(crate) fn tick_system_state(&mut self, now: Instant) {
         // The setup worker runs its on-screen steps (the sign-outs) only while
         // System State is in front (design §6); its arrival wakes a parked run.
-        aterm_types::macos_setup::set_system_state_front(self.system_state_frontmost());
+        self.publish_system_state_front();
         if self.publish_access_opt_outs() {
             // The worker's rows were read with other opt-outs (a `[privacy]`
             // switch, or a debugger turned off that the record read at launch
@@ -691,6 +711,13 @@ impl App {
         self.system_state_host.status_in_flight = false;
         self.system_state_host.next_status = Some(now);
         self.system_state_host.next_tick = None;
+    }
+
+    /// Publish visibility before another event or worker step can use it.
+    /// Closing a passive copy keeps the visible page's authority; losing the
+    /// last front page withdraws it even while a hidden controller survives.
+    pub(crate) fn publish_system_state_front(&self) {
+        aterm_types::macos_setup::set_system_state_front(self.system_state_frontmost());
     }
 
     /// Whether a System State view is the visible, active view of a focused,

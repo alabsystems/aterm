@@ -40,7 +40,9 @@ pub enum ExceptionKind {
     /// words that stood still ([`super::exception::Exception::stalled_on_work`]).
     Stalled,
     /// A dialog no reader names, unchanged for an hour while Claude's title
-    /// says idle ([`super::exception::Exception::dialog`]).
+    /// says idle ([`super::exception::Exception::dialog`]); and Claude Code's
+    /// own Settings panel, which a reader names, left open as long by a hand
+    /// other than the harness's ([`super::exception::Exception::settings_panel`]).
     Dialog,
 }
 

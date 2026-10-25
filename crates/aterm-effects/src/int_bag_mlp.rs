@@ -173,6 +173,7 @@ pub struct Dims {
 
 impl Dims {
     /// The out words per row: C logits then the class.
+    #[must_use]
     #[inline]
     pub const fn out_stride(self) -> u32 {
         self.classes + 1
@@ -221,6 +222,7 @@ impl Tensor {
     ];
 
     /// The header indices of its byte offset and its length.
+    #[must_use]
     #[inline]
     pub const fn fields(self) -> (usize, usize) {
         match self {
@@ -234,6 +236,7 @@ impl Tensor {
     }
 
     /// The bytes one element takes.
+    #[must_use]
     #[inline]
     pub const fn elem_bytes(self) -> u32 {
         match self {
@@ -244,6 +247,7 @@ impl Tensor {
 }
 
 /// `⌊(2³¹ − 1) / mult⌋`, the step-5 clamp, or 0 for a zero `mult`.
+#[must_use]
 #[inline]
 pub const fn qmax(mult: u32) -> u32 {
     match (i32::MAX as u32).checked_div(mult) {
@@ -467,10 +471,9 @@ impl fmt::Debug for ParamsView<'_> {
 
 /// The little-endian u32 at word `i` of `bytes`, which holds it.
 #[inline]
-fn word_at(bytes: &[u8], i: usize) -> u32 {
-    let mut b = [0u8; 4];
-    b.copy_from_slice(&bytes[i * 4..i * 4 + 4]);
-    u32::from_le_bytes(b)
+const fn word_at(bytes: &[u8], i: usize) -> u32 {
+    let off = i * 4;
+    u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
 }
 
 /// Refuse, by name, every params blob outside the profile's bounds (design §12.2), before any buffer exists.
@@ -649,102 +652,130 @@ pub fn check(bytes: &[u8]) -> Result<ParamsView<'_>, ParamsError> {
 
 impl<'a> ParamsView<'a> {
     /// The whole blob, header included: the bytes the GPU's `params` buffer holds.
+    #[must_use]
     #[inline]
     pub const fn bytes(&self) -> &'a [u8] {
         self.bytes
     }
 
     /// B, E, H and C.
+    #[must_use]
     #[inline]
     pub const fn dims(&self) -> Dims {
         self.dims
     }
 
     /// The fewest ids a row needs not to abstain, at least 1.
+    #[must_use]
     #[inline]
     pub const fn min_ids(&self) -> u32 {
         self.min_ids
     }
 
     /// The step-5 multiplier.
+    #[must_use]
     #[inline]
     pub const fn mult(&self) -> u32 {
         self.mult
     }
 
     /// The step-5 clamp, as recomputed from MULT.
+    #[must_use]
     #[inline]
     pub const fn qmax(&self) -> u32 {
         self.qmax
     }
 
     /// The step-5 shift.
+    #[must_use]
     #[inline]
     pub const fn g(&self) -> u32 {
         self.g
     }
 
     /// The step-6 clamp.
+    #[must_use]
     #[inline]
     pub const fn t(&self) -> i32 {
         self.t
     }
 
     /// `⌊QMAX·MULT / 2^G⌋`, the largest step-5 magnitude before the bias.
+    #[must_use]
     #[inline]
     pub const fn m(&self) -> u32 {
         ((self.qmax as u64 * self.mult as u64) >> self.g) as u32
     }
 
     /// The largest `|b1[k]|`.
+    #[must_use]
     #[inline]
-    pub fn max_abs_b1(&self) -> u32 {
-        self.b1()
-            .iter()
-            .map(|x| x.unsigned_abs())
-            .max()
-            .unwrap_or(0)
+    pub const fn max_abs_b1(&self) -> u32 {
+        let b1 = self.b1();
+        let mut max = 0u32;
+        let mut i = 0;
+        while i < b1.len() {
+            let v = b1[i].unsigned_abs();
+            if v > max {
+                max = v;
+            }
+            i += 1;
+        }
+        max
     }
 
     /// The header's words.
-    pub fn header(&self) -> [u32; PARAMS_WORDS] {
-        core::array::from_fn(|i| word_at(self.bytes, i))
+    #[must_use]
+    pub const fn header(&self) -> [u32; PARAMS_WORDS] {
+        let mut out = [0u32; PARAMS_WORDS];
+        let mut i = 0;
+        while i < PARAMS_WORDS {
+            out[i] = word_at(self.bytes, i);
+            i += 1;
+        }
+        out
     }
 
     /// The embedding table, B × E row-major, one two's-complement i8 per byte.
+    #[must_use]
     #[inline]
     pub const fn emb(&self) -> &'a [u8] {
         self.emb
     }
 
     /// The first layer, E × H row-major, one two's-complement i8 per byte.
+    #[must_use]
     #[inline]
     pub const fn w1(&self) -> &'a [u8] {
         self.w1
     }
 
     /// The output layer, H × C row-major, one two's-complement i8 per byte.
+    #[must_use]
     #[inline]
     pub const fn w2(&self) -> &'a [u8] {
         self.w2
     }
 
     /// The activation table, 2T + 1 entries, one two's-complement i8 per byte.
+    #[must_use]
     #[inline]
     pub const fn lut(&self) -> &'a [u8] {
         self.lut
     }
 
     /// The first-layer biases, H of them.
+    #[must_use]
     #[inline]
-    pub fn b1(&self) -> &[i32] {
-        &self.b1[..self.dims.hidden as usize]
+    pub const fn b1(&self) -> &[i32] {
+        self.b1.split_at(self.dims.hidden as usize).0
     }
 
     /// The output biases, C of them.
+    #[must_use]
     #[inline]
-    pub fn b2(&self) -> &[i32] {
-        &self.b2[..self.dims.classes as usize]
+    pub const fn b2(&self) -> &[i32] {
+        self.b2.split_at(self.dims.classes as usize).0
     }
 }
 
@@ -763,6 +794,7 @@ pub struct JobBytes {
 
 impl JobBytes {
     /// The buffers of a batch of `rows` rows, `total_ids` ids and `classes` classes.
+    #[must_use]
     pub const fn of(rows: u64, total_ids: u64, classes: u32) -> JobBytes {
         const fn at_least_4(n: u64) -> u64 {
             if n < 4 { 4 } else { n }
@@ -776,6 +808,7 @@ impl JobBytes {
     }
 
     /// The four summed, which [`JOB_BYTES_MAX`] bounds.
+    #[must_use]
     #[inline]
     pub const fn total(&self) -> u64 {
         self.job
@@ -900,57 +933,75 @@ impl Batch {
     }
 
     /// The dimensions it was validated against.
+    #[must_use]
     #[inline]
     pub const fn dims(&self) -> Dims {
         self.dims
     }
 
     /// ROWS, at least 1.
+    #[must_use]
     #[inline]
-    pub fn rows(&self) -> u32 {
+    pub const fn rows(&self) -> u32 {
         (self.offsets.len() - 1) as u32
     }
 
     /// TOTAL_IDS.
+    #[must_use]
     #[inline]
-    pub fn total_ids(&self) -> u32 {
+    pub const fn total_ids(&self) -> u32 {
         self.ids.len() as u32
     }
 
     /// The CSR row starts, ROWS + 1 of them.
+    #[must_use]
     #[inline]
-    pub fn offsets(&self) -> &[u32] {
-        &self.offsets
+    pub const fn offsets(&self) -> &[u32] {
+        self.offsets.as_slice()
     }
 
     /// Every row's ids, end to end.
+    #[must_use]
     #[inline]
-    pub fn ids(&self) -> &[u16] {
-        &self.ids
+    pub const fn ids(&self) -> &[u16] {
+        self.ids.as_slice()
     }
 
     /// Row `row`'s ids, or `None` past the last row.
+    #[must_use]
     #[inline]
-    pub fn row(&self, row: u32) -> Option<&[u16]> {
+    pub const fn row(&self, row: u32) -> Option<&[u16]> {
         let r = row as usize;
-        let (&start, &end) = (self.offsets.get(r)?, self.offsets.get(r + 1)?);
-        self.ids.get(start as usize..end as usize)
+        let offsets = self.offsets.as_slice();
+        if r + 1 >= offsets.len() {
+            return None;
+        }
+        let start = offsets[r] as usize;
+        let end = offsets[r + 1] as usize;
+        let ids = self.ids.as_slice();
+        if start > end || end > ids.len() {
+            return None;
+        }
+        Some(ids.split_at(end).0.split_at(start).1)
     }
 
     /// The out words per row, C + 1.
+    #[must_use]
     #[inline]
     pub const fn out_stride(&self) -> u32 {
         self.dims.out_stride()
     }
 
     /// The out words of the whole batch, ROWS × OUT_STRIDE.
+    #[must_use]
     #[inline]
-    pub fn out_words(&self) -> usize {
+    pub const fn out_words(&self) -> usize {
         self.rows() as usize * self.out_stride() as usize
     }
 
     /// The `job` header's words.
-    pub fn header(&self) -> [u32; JOB_WORDS] {
+    #[must_use]
+    pub const fn header(&self) -> [u32; JOB_WORDS] {
         let mut h = [0u32; JOB_WORDS];
         h[job::MAGIC] = JOB_MAGIC_VALUE;
         h[job::LAYOUT_VERSION] = LAYOUT_VERSION;
@@ -961,16 +1012,18 @@ impl Batch {
     }
 
     /// The byte size of each job buffer it fills.
+    #[must_use]
     #[inline]
-    pub fn bytes(&self) -> JobBytes {
+    pub const fn bytes(&self) -> JobBytes {
         JobBytes::of(
-            u64::from(self.rows()),
-            u64::from(self.total_ids()),
+            self.rows() as u64,
+            self.total_ids() as u64,
             self.dims.classes,
         )
     }
 
     /// Give back `offsets` and `ids`, so a later batch can reuse their capacity.
+    #[must_use]
     #[inline]
     pub fn into_parts(self) -> (Vec<u32>, Vec<u16>) {
         (self.offsets, self.ids)

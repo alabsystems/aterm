@@ -153,6 +153,15 @@ impl Index {
         }
         set
     }
+
+    /// The default set: the installable set less every program outside it
+    /// ([`crate::harness::in_default_set`]), which installs only when a person names it.
+    #[must_use]
+    pub fn default_set(&self, exclude: &[String]) -> BTreeSet<String> {
+        let mut set = self.installable(exclude);
+        set.retain(|p| crate::harness::in_default_set(p));
+        set
+    }
 }
 
 /// A machine-signed `pkg-<program>-<build>.toml` (§4.2): the per-triple artifact matrix for one program build.
@@ -746,6 +755,29 @@ pin = {{ trust = 7100, nn = 108 }}
             "a private-config repo can never be in the installable set"
         );
         assert!(idx.is_program("trust") && idx.is_program("ay") && idx.is_program("aterm"));
+    }
+
+    /// A HARNESS IS INSTALLABLE AND OUTSIDE THE DEFAULT SET: the index names it, so a person
+    /// may install it, and the set the passes complete leaves it out; `exclude` still
+    /// narrows the rest.
+    #[test]
+    fn the_default_set_is_the_installable_set_less_the_harnesses() {
+        let body = full_index().replace(
+            "[programs.ay]",
+            "[programs.muse-alab]\nrepo = \"muse-alab\"\n\n[programs.ay]",
+        );
+        let idx = parse_index(&verified(&body)).unwrap();
+        assert!(idx.is_program("muse-alab"));
+        assert!(idx.installable(&[]).contains("muse-alab"));
+        let all = idx.installable(&[]);
+        let mut rest = all.clone();
+        rest.remove("muse-alab");
+        assert_eq!(idx.default_set(&[]), rest);
+        assert!(!idx.default_set(&[]).contains("muse-alab"));
+        assert!(
+            !idx.default_set(&["ay".into()]).contains("ay"),
+            "exclude narrows the default set too"
+        );
     }
 
     #[test]

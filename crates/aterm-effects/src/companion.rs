@@ -1067,18 +1067,22 @@ impl CompanionOwner {
     /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.3): the room names
     /// a task end no pet has cheered (`landed`, its serial).
     #[inline]
-    fn take_landed(
+    const fn take_landed(
         &mut self,
         session: u64,
         landed: Option<u32>,
         presentable: bool,
         owned: bool,
     ) -> Option<(u64, u32)> {
-        let key = (session, landed?);
+        let Some(landed) = landed else {
+            return None;
+        };
+        let key = (session, landed);
         if !presentable {
             return None;
         }
-        if owned && self.landed_taken != Some(key) {
+        let same = matches!(self.landed_taken, Some((s, l)) if s == key.0 && l == key.1);
+        if owned && !same {
             self.landed_taken = Some(key);
             self.pet.note_room_landed();
         }
@@ -1752,7 +1756,7 @@ mod law_tests {
         );
     }
 
-    fn cell(ch: char, fg: [u8; 3], bg: [u8; 3]) -> RenderCell {
+    const fn cell(ch: char, fg: [u8; 3], bg: [u8; 3]) -> RenderCell {
         RenderCell {
             ch,
             fg,
@@ -1969,7 +1973,7 @@ mod owner_tests {
         origin_px: (0, 0),
     };
 
-    fn host_at(now: Instant) -> HostFrameInput {
+    const fn host_at(now: Instant) -> HostFrameInput {
         HostFrameInput {
             now,
             visibility: Visibility::Focused,
@@ -1983,7 +1987,7 @@ mod owner_tests {
         }
     }
 
-    fn facts_with(caret: Option<(u16, u16)>) -> TerminalFacts {
+    const fn facts_with(caret: Option<(u16, u16)>) -> TerminalFacts {
         TerminalFacts {
             session: 1,
             caret,
@@ -2002,7 +2006,7 @@ mod owner_tests {
         }
     }
 
-    fn pet_glow() -> GlowOwnership {
+    const fn pet_glow() -> GlowOwnership {
         GlowOwnership {
             enabled: true,
             style: GlowStyle::RainbowKitty,
@@ -2010,12 +2014,12 @@ mod owner_tests {
         }
     }
 
-    fn pet_facts<'a>(facts: &'a TerminalFacts, host: &'a HostFrameInput) -> PetFacts<'a> {
+    const fn pet_facts<'a>(facts: &'a TerminalFacts, host: &'a HostFrameInput) -> PetFacts<'a> {
         PetFacts {
             facts,
             host,
             glow: pet_glow(),
-            sing: SingFacts::default(),
+            sing: SingFacts::EMPTY,
             focused: true,
             obscured: false,
             pane: None,
@@ -2023,9 +2027,13 @@ mod owner_tests {
         }
     }
 
-    fn an_enabled_owner() -> CompanionOwner {
-        let mut owner = CompanionOwner::default();
-        owner.set_enabled_seed(true, 0x5EED);
+    const fn an_enabled_owner() -> CompanionOwner {
+        let mut owner = CompanionOwner::new();
+        let look = KittyLook::for_launch(0x5EED);
+        owner.pair = (look.coat, look.iris);
+        owner.arrival = PetArrival::Quiet;
+        owner.rung = CompanionRung::Launch;
+        owner.enabled = true;
         owner
     }
 

@@ -427,7 +427,7 @@ fn closed_row(last: Option<&str>, target: &Target) -> String {
             .collect::<Vec<_>>()
             .join(" "),
         None => format!(
-            "@{} rev={} state=closed agent=- attention=- result_bytes=0",
+            "@{} rev={} state=closed agent=- program_state=- attention=- result_bytes=0",
             target.selector,
             target.since.unwrap_or(0)
         ),
@@ -994,7 +994,7 @@ mod tests {
         );
         assert_eq!(row_fact_rev("@s-a rev=7 fact=- fact_rev=3"), 3);
         assert_eq!(row_fact_rev("@s-a rev=7 state=done"), 0, "never edited");
-        let row = "@s-a rev=7 state=done agent=- attention=- result_bytes=1";
+        let row = "@s-a rev=7 state=done agent=- program_state=idle attention=- result_bytes=1";
         assert_eq!(row_rev(row), Some(7));
         assert_eq!(row_rev("garbage"), None);
         assert_eq!(row_sid(row), Some("s-a"));
@@ -1002,7 +1002,13 @@ mod tests {
         assert!(!row_closed(row));
         assert_eq!(
             closed_row(Some(row), &targets[0]),
-            "@s-a rev=7 state=closed agent=- attention=- result_bytes=1"
+            "@s-a rev=7 state=closed agent=- program_state=idle attention=- result_bytes=1",
+            "the server's last row stands, its program's report with it"
+        );
+        assert_eq!(
+            closed_row(None, &targets[0]),
+            "@s-a rev=3 state=closed agent=- program_state=- attention=- result_bytes=0",
+            "a row the client writes has every column a server row has"
         );
         assert!(row_closed(&closed_row(None, &targets[0])));
         let refusal = io::Error::other("ERR no such session @s-a");

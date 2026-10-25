@@ -321,6 +321,8 @@ pub enum FdKind {
     Device {
         /// A terminal (a pty or a console).
         tty: bool,
+        /// Opened for reading (`O_RDONLY`, `O_RDWR`); `true` where unread (a Linux device that is no terminal), `false` for one only written (`tee /dev/tty`).
+        read: bool,
     },
     /// One end of a pipe.
     Pipe {
@@ -495,6 +497,8 @@ pub struct ProcFacts {
     pub threads_truncated: bool,
     /// The kernel function it waits in (Linux `wchan`); `None` elsewhere or when it waits in none.
     pub wchan: Option<String>,
+    /// The descriptor its main thread sleeps reading or writing (Linux `/proc/<pid>/syscall`, read with its descriptors); `None` elsewhere, where unread, or when it sleeps in no read or write.
+    pub blocked_fd: Option<i32>,
     /// Its descriptors, when asked for; `None` when not asked or refused.
     pub fds: Option<Vec<FdReading>>,
     /// Whether it holds more descriptors than were read.

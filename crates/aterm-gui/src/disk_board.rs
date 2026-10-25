@@ -265,8 +265,24 @@ pub(crate) struct Board {
     pub(crate) episode: DiskEpisode,
     /// Today's freed-bytes tally.
     pub(crate) freed: FreedTally,
+    /// The `disk-free@v1` line owed a session of this process (`sid -> line`), as the lease
+    /// last read elected it (`crate::harness_host`'s ask).
+    pub(crate) asks: BTreeMap<String, AskOwed>,
+    /// Why a session of this process may not be asked to free space (`sid -> why`: its task
+    /// finished or landed, or it has none), as its worker read at its last turn break: the ask
+    /// seats none of these.
+    pub(crate) unfit: BTreeMap<String, &'static str>,
     /// The next demand's id.
     next_demand: u64,
+}
+
+/// A `disk-free@v1` line owed one session ([`Board::asks`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AskOwed {
+    /// The volume's lease key ([`VolumeKey::spelled`]).
+    pub(crate) key: String,
+    /// The line.
+    pub(crate) text: String,
 }
 
 impl Board {
@@ -294,6 +310,8 @@ impl Board {
                 alerted: false,
             },
             freed: FreedTally::new(),
+            asks: BTreeMap::new(),
+            unfit: BTreeMap::new(),
             next_demand: 1,
         }
     }
@@ -852,6 +870,7 @@ mod tests {
             bytes: 212 * GIB,
             bytes_partial: false,
             why: "a live checkout's build directory".to_owned(),
+            serves: None,
         };
         b.last_pass = Some(pass(
             home.clone(),

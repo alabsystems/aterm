@@ -244,6 +244,30 @@ impl DeferredLine {
         freed
     }
 
+    /// Whether this deferred row holds an image accepted by `selected`.
+    fn any_image(&self, selected: &dyn Fn(&ImageSpan) -> bool) -> bool {
+        self.extras
+            .as_deref()
+            .is_some_and(|extras| extras.images.iter().any(selected))
+    }
+
+    /// Retain accepted image spans and invalidate a previously materialized copy.
+    fn retain_images(&mut self, keep: &mut dyn FnMut(&ImageSpan) -> bool) -> bool {
+        let Some(extras) = self.extras.as_deref_mut() else {
+            return false;
+        };
+        let count = extras.images.len();
+        extras.images.retain(|span| keep(span));
+        if count == extras.images.len() {
+            return false;
+        }
+        if extras.is_empty() {
+            self.extras = None;
+        }
+        self.cached = OnceCell::new();
+        true
+    }
+
     /// Convert into an owned [`Line`], dropping the cell body.
     #[cfg(test)]
     pub(crate) fn into_line(self) -> Line {
@@ -549,6 +573,27 @@ impl CellPool {
 }
 
 impl LazyBuffer {
+    /// Whether a staged row holds an image accepted by `selected`.
+    pub(crate) fn any_image(&self, selected: &dyn Fn(&ImageSpan) -> bool) -> bool {
+        self.lines.iter().any(|line| line.any_image(selected))
+    }
+
+    /// Retain accepted image spans without materializing or draining staged text.
+    pub(crate) fn retain_images(&mut self, keep: &mut dyn FnMut(&ImageSpan) -> bool) -> bool {
+        let mut changed = false;
+        for line in &mut self.lines {
+            let before = line.staged_bytes();
+            if line.retain_images(keep) {
+                self.staged_bytes = self
+                    .staged_bytes
+                    .saturating_sub(before)
+                    .saturating_add(line.staged_bytes());
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Create a new empty lazy buffer.
     pub(crate) fn new() -> Self {
         Self {

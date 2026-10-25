@@ -1835,8 +1835,12 @@ pub const VERBS: &[VerbSpec] = &[
          agent=<busy|prompt|question|idle|survey|unknown|wall:<kind>|-> agent_detail= \
          agent_rev= agent_since_ms= agent_gen= agent_fp= \
          program_state=<idle|working|blocked|done|error>[:<permission|question|auth>] \
-         last_act=` (`agent_detail=bash:read-only` is the read-only rule's advisory verdict on a \
-         Bash box's command alone). Theme: `os_appearance= theme_side= reported_scheme= \
+         program_state_ms= last_act=` (`agent_detail=bash:read-only` is the read-only rule's \
+         advisory verdict on a Bash box's command alone; `program_state=` is a codex's own OSC \
+         7501 report, a claim beside an `agent=` it never moves, `-` under any other program, and \
+         `program_state_ms=` how long it has stood, counted through sleep as the survey's \
+         `agent_ms=` is; `agent_since_ms=` and `human_ms=` stop while the Mac sleeps, so across \
+         a sleep it is not comparable with them). Theme: `os_appearance= theme_side= reported_scheme= \
          scheme_from=<theme|program> bg_dark= session_theme= theme_origin=` (`conpty=` on \
          Windows). Input and host: `integration=<on|off|degraded> \
          input=<clear|pending|typeahead|stalled|stopped|-> input_bytes= input_wait_ms= \
@@ -2157,8 +2161,9 @@ pub const VERBS: &[VerbSpec] = &[
              Reply: a verdict line (`id= \
              submitted=<0|1> status=settled|timeout|submitted seq= dur_ms= hash=<FNV16>[ \
              task_rev=<n>][ agent_rev=<n>][ frame=open][ trimmed=<k>]`; `agent_rev=` feeds \
-             `await agent <words> since=<n>`), then the rows (`trim=1` drops trailing blank rows; \
-             `hash=` covers the untrimmed screen)."
+             `await agent <words> since=<n>`, except on a codex, whose `agent=` stays `unknown`: \
+             read `status log_seq= log_ep=` before the `turn` and wait with `await log \
+             kind=program since=<log_seq> ep=<log_ep>`), then the rows (`trim=1` drops trailing blank rows; `hash=` covers the untrimmed screen)."
         ),
     )
     .lane(Wait)
@@ -2770,8 +2775,9 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "task [mark <state> …]: a worker's task record: OK task rev= state= from= since_ms=",
-        "— `result_bytes= [why=] [exit=] [result_path=] [fact= fact_rev=] agent= attention=` (or \
-         `OK task -` when the session has no task). `state=`: `working`, `done` (under Land, work landed on remote \
+        "— `result_bytes= [why=] [exit=] [result_path=] [fact= fact_rev=] agent= program_state= \
+         attention=` (or `OK task -` when the session has no task; `program_state=` is `status \
+         program_state=`, a codex's own report, `-` otherwise). `state=`: `working`, `done` (under Land, work landed on remote \
          `main` and defended with `Nothing left:`), `exited` (`exit=<code>`), or `stalled` \
          (`why=startup|shell|held`; it resumes `working why=moved` or `working why=turn`). `why=` \
          is `landed|marker|done-check|exit|shell|startup|held|turn|moved`. `rev=` increments on \
@@ -2856,13 +2862,19 @@ pub const VERBS: &[VerbSpec] = &[
          agent <word>[,<word>…] [since=<rev>]`: `status agent=` is one of \
          `busy|prompt|question|idle|survey|unknown|-|wall|wall:<kind>` at a `rev` past \
          `since=`, such as a `settle=submitted` turn's `agent_rev=` (`OK agent <word> \
-         rev=<n>`). `await task [@<sel>[:<rev>[:<fact_rev>]][,...]] [any|all] [since=<rev>] [facts=1 \
+         rev=<n>`). A codex's `agent=` stays `unknown` (aterm reads no Codex screen), so `await \
+         agent` never answers on its state; `await log kind=program since=<log_seq> \
+         ep=<log_ep>`, both read from `status` before typing to it, answers on the program's \
+         own report (`program state=<w> [ask=<k>] [coalesced=<n>] src=engine conf=claim`). \
+         `await task [@<sel>[:<rev>[:<fact_rev>]][,...]] [any|all] [since=<rev>] [facts=1 \
          [fact_since=<fact_rev>]]`: a `task` `rev` past `since=` whose state is not `working` or \
          whose attention stands, with `facts=1` a fact word noted past `fact_since=` (by default \
          the `fact_rev` at the wait; a clear wakes nothing), or the session closing (`OK <n>`, or \
          `OK <n> status=timeout`, then `@<sid> rev=<n> \
-         state=<working|done|exited|stalled|-|closed> agent=<word> attention=<pct|-> \
-         result_bytes=<n> [fact=<word|-> fact_rev=<n>]` rows). `await wake [timeout=<ms>]`: \
+         state=<working|done|exited|stalled|-|closed> agent=<word> program_state=<word|-> \
+         attention=<pct|-> result_bytes=<n> [fact=<word|-> fact_rev=<n>] task_news=<0|1>` rows; \
+         `program_state=` is `status program_state=`, a claim that never wakes it). \
+         `await wake [timeout=<ms>]`: \
          the session's next ready wake (`wake`), its `need=` holding, a build slot reserved where \
          that names `slots` (`OK wake #<n> ready since=<ms>[ slots=<usable>/<n>]`), or its last \
          open wake's end (`EXPIRED wake #<n> why=<due|unless|agent|path|off|admit|rm|taken|told>`); \
@@ -3111,7 +3123,10 @@ pub const VERBS: &[VerbSpec] = &[
              person's Take Over / Hand Back in the window; `invoke TakeOver|HandBack` is `ERR \
              denied`), and `origin=remote` (a fleet drive's: that node's own `off`, the \
              person's Take Over, or the end of its grant lifts it; a local `off` lifts the local \
-             slot alone). While any slot stands, every PTY-reaching verb that resolves to the \
+             slot, and with none standing the remote one once its node's place disowns it \
+             (another fleet's secret or another key there), `OK hold=<0|1> lifted=remote`, while \
+             a place that answers as it, or does not answer, stands). While \
+             any slot stands, every PTY-reaching verb that resolves to the \
              session answers `ERR halted reason=<r> \
              origin=<person|remote|fleet|local>` from ANY scope — `send key ctrl feed feed-bin \
              paste paste-bin mouse pointer resize focus signal restart reset turn close invoke \
@@ -3212,8 +3227,11 @@ pub const VERBS: &[VerbSpec] = &[
          `--headless`), `active=<1|0|->`, `wfocus=<1|0|->` (most recently focused window), \
          `detail=<pct|->`, `path=<frozen|live>`, `program=<name|-> agent=<word|-> \
          agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|-> \
-         agent_fp=<hex16|->`, `human_ms=<ms|->`, `role=<pct|-> attention=<pct|-> \
-         user_title=<pct|->`, `supervisor=<pct|->`, `autopilot=<off|cruise|land|->`, \
+         agent_fp=<hex16|->`, `program_state=<idle|working|blocked|done|error>[:<permission|\
+         question|auth>]|-` (a codex's own report, as `status program_state=`: a claim beside \
+         `agent=`), `human_ms=<ms|->`, `role=<pct|-> attention=<pct|-> user_title=<pct|->`, \
+         `supervisor=<pct|-> supervisor_proven=<0|1>` (`1`: the live claim is a proven \
+         self-claim, as `status` prints it), `autopilot=<off|cruise|land|->`, \
          `path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->`, `copy=<managed|foreign|->`, \
          `upgrade=<-|<state>/<to>/<why>/<age>>`, `land_at=<unix-s|-> task=<open|landed|theirs|-> \
          pause=<unix-s|->`, and `task_state=<working|done|exited|stalled|-> task_rev=<n>`. \

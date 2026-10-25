@@ -145,17 +145,8 @@ pub fn verify_and_stage(
 ) -> Result<String, StageError> {
     check_signed_digest(artifact, archive)?;
 
-    crate::store::sweep_stage_scratch(build_dir);
-    let incoming = crate::store::incoming_dir(build_dir).ok_or_else(|| {
-        StageError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "build dir has no name",
-        ))
-    })?;
-    crate::store::make_build_parent(build_dir)
-        .and_then(|()| crate::platform::make_dir_born(&incoming, STAGING_SCRATCH_MODE))
-        .map_err(|e| io_step("create the staging scratch", e))?;
-    let (extracted_root, mut modes) =
+    let incoming = open_incoming(build_dir)?;
+    let (extracted_root, modes) =
         match stage_payload_modes(artifact, archive, &incoming, hooks.npm_package) {
             Ok(staged) => staged,
             Err(e) => {
@@ -183,24 +174,230 @@ pub fn verify_and_stage(
         }
         got
     };
+    finish_stage(artifact, build_dir, &incoming, root, modes, hooks)
+}
 
-    if let Err(e) = lay_aliases(&incoming, hooks.aliases, &mut modes) {
-        let _ = crate::store::remove_tree(&incoming);
+/// Sweep `build_dir`'s stage scratch and make a fresh, private `.incoming` beside it.
+fn open_incoming(build_dir: &Path) -> Result<PathBuf, StageError> {
+    crate::store::sweep_stage_scratch(build_dir);
+    let incoming = crate::store::incoming_dir(build_dir).ok_or_else(|| {
+        StageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "build dir has no name",
+        ))
+    })?;
+    crate::store::make_build_parent(build_dir)
+        .and_then(|()| crate::platform::make_dir_born(&incoming, STAGING_SCRATCH_MODE))
+        .map_err(|e| io_step("create the staging scratch", e))?;
+    Ok(incoming)
+}
+
+/// What [`stage_from_tree`] came to when no step of the stage refused.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FromTree {
+    /// The copy is the build now: the root the stage folded (its aliases' included).
+    Staged(String),
+    /// Nothing was laid at the build, for this reason (naming an entry by its path in the tree,
+    /// and a scratch copy by its own only when it could not be removed): the caller downloads.
+    Drift(String),
+}
+
+/// Stage at `build_dir`, in place of a download of `artifact`, a copy of `src`: another row's
+/// complete build of the same signed bytes, whose record folds its tree to `src_root`
+/// ([`crate::flow::land_from_tree`]). The copy is laid in a fresh `.incoming`, each file a clone
+/// ([`crate::clone::clone_file`]: no new blocks on APFS, a byte copy elsewhere, and its own
+/// inode either way, so nothing done to one tree reaches the other) of a file that carries
+/// nothing an extraction would not lay ([`lays_as_extracted`]), each directory made as
+/// extraction makes one, each symlink with its raw target. In place of the archive's digest
+/// check, the copy must fold to `src_root` and hold no executable a stage would demote
+/// ([`crate::macho::foreign_executables`]); `laid` runs once it does, and the stage goes on as
+/// [`verify_and_stage`]'s does from its aliases: `hooks`, the re-fold, the sidecars, the swap
+/// and the marker.
+///
+/// # Errors
+/// That tail's, as a download's stage returns them. Anything short of it is a
+/// [`FromTree::Drift`], with the scratch removed (or the reason saying it could not be) and
+/// nothing at `build_dir` touched; off Unix, where no clone is laid, it is always one.
+pub(crate) fn stage_from_tree(
+    src: &Path,
+    src_root: &str,
+    artifact: &Artifact,
+    build_dir: &Path,
+    hooks: &StageHooks<'_>,
+    laid: &dyn Fn(),
+) -> Result<FromTree, StageError> {
+    if !cfg!(unix) {
+        return Ok(FromTree::Drift(String::from(
+            "this platform lays no clone of a tree",
+        )));
+    }
+    let Ok(incoming) = open_incoming(build_dir) else {
+        return Ok(FromTree::Drift(String::from(
+            "no scratch for its copy could be made",
+        )));
+    };
+    let drift = |mut why: String| {
+        if let Err(e) = crate::store::remove_tree(&incoming) {
+            use std::fmt::Write as _;
+            let _ = write!(
+                why,
+                "; its scratch copy {} could not be removed ({e})",
+                incoming.display()
+            );
+        }
+        Ok(FromTree::Drift(why))
+    };
+    let modes = match crate::store::declared_modes(src) {
+        Ok(modes) => modes,
+        Err(e) => return drift(format!("its declared modes do not read ({})", e.kind())),
+    };
+    if let Err(why) = clone_tree(src, &incoming, Path::new("")) {
+        return drift(why);
+    }
+    let root = match tree_root_declared(&incoming, &modes) {
+        Ok(root) if root.eq_ignore_ascii_case(src_root) => root,
+        Ok(_) => {
+            return drift(String::from(
+                "its copy does not fold to the root its record names",
+            ));
+        }
+        Err(e) => return drift(format!("its copy could not be folded ({})", e.kind())),
+    };
+    match crate::macho::foreign_executables(&incoming) {
+        Ok(foreign) if foreign.is_empty() => {}
+        Ok(foreign) => {
+            let rel = foreign[0].strip_prefix(&incoming).unwrap_or(&foreign[0]);
+            return drift(format!(
+                "{} is executable and not a native executable",
+                rel.to_string_lossy()
+            ));
+        }
+        Err(_) => return drift(String::from("its copy's executables could not be read")),
+    }
+    laid();
+    finish_stage(artifact, build_dir, &incoming, root, modes, hooks).map(FromTree::Staged)
+}
+
+/// Lay under the empty directory `to` a copy of everything under `from` (at `rel` in the tree):
+/// each regular file a clone once [`lays_as_extracted`] passes it, each directory made at the
+/// mode extraction gives one, each symlink with its raw target (the stage that laid `from`
+/// admitted it). Anything else is refused. The error is why, naming the entry by its `rel`.
+#[cfg(unix)]
+fn clone_tree(from: &Path, to: &Path, rel: &Path) -> Result<(), String> {
+    let failed = |at: &Path, e: std::io::Error| {
+        if at.as_os_str().is_empty() {
+            format!("its tree could not be read ({})", e.kind())
+        } else {
+            format!("{} could not be copied ({})", at.display(), e.kind())
+        }
+    };
+    for entry in std::fs::read_dir(from).map_err(|e| failed(rel, e))? {
+        let entry = entry.map_err(|e| failed(rel, e))?;
+        let at = rel.join(entry.file_name());
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        let kind = entry.file_type().map_err(|e| failed(&at, e))?;
+        if kind.is_symlink() {
+            std::fs::read_link(&src)
+                .and_then(|target| crate::extract::create_symlink(&target, &dst))
+                .map_err(|e| failed(&at, e))?;
+        } else if kind.is_dir() {
+            std::fs::create_dir(&dst)
+                .and_then(|()| crate::platform::set_mode(&dst, crate::extract::safe_mode(0, true)))
+                .map_err(|e| failed(&at, e))?;
+            clone_tree(&src, &dst, &at)?;
+        } else if kind.is_file() {
+            lays_as_extracted(&src, &at)?;
+            crate::clone::clone_file(&src, &dst).map_err(|e| failed(&at, e))?;
+        } else {
+            return Err(format!(
+                "{} is neither a file, a directory nor a symlink",
+                at.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Off Unix no clone is laid ([`stage_from_tree`] never asks).
+#[cfg(not(unix))]
+fn clone_tree(_from: &Path, _to: &Path, _rel: &Path) -> Result<(), String> {
+    Err(String::from("this platform lays no clone of a tree"))
+}
+
+/// The extended attributes macOS itself puts on a file a stage's extraction writes: its
+/// provenance, a quarantine and a last-use date, none of which the Developer ID gate refuses.
+#[cfg(target_os = "macos")]
+const EXTRACTION_XATTRS: [&[u8]; 3] = [
+    b"com.apple.provenance",
+    b"com.apple.quarantine",
+    b"com.apple.lastuseddate#PS",
+];
+
+/// Refuse the file at `src` (`rel` in its tree) when a clone of it would not be what an
+/// extraction lays, for a clone keeps both a file's BSD flags and its extended attributes:
+/// flags that bind its owner ([`crate::platform::OWNER_BINDING_FLAGS`]: no cleanup could remove
+/// the copy, and a build is never laid locked), or an extended attribute outside
+/// [`EXTRACTION_XATTRS`] (Finder information or a resource fork fails the Developer ID gate's
+/// strict check although the tree's root, which folds neither, still matches). Nothing is
+/// written to either file: a lender that carries one is not copied, and its bytes are
+/// downloaded as they are for a row with no lender.
+#[cfg(target_os = "macos")]
+fn lays_as_extracted(src: &Path, rel: &Path) -> Result<(), String> {
+    use std::os::macos::fs::MetadataExt as _;
+    let unread = |e: std::io::Error| format!("{} could not be read ({})", rel.display(), e.kind());
+    let meta = std::fs::symlink_metadata(src).map_err(unread)?;
+    if meta.st_flags() & crate::platform::OWNER_BINDING_FLAGS != 0 {
+        return Err(format!("{} is locked against change", rel.display()));
+    }
+    let names = crate::platform::xattr_names(src).map_err(unread)?;
+    if let Some(name) = names
+        .iter()
+        .find(|name| !EXTRACTION_XATTRS.contains(&name.as_slice()))
+    {
+        return Err(format!(
+            "{} carries {}, which no extraction lays",
+            rel.display(),
+            String::from_utf8_lossy(name)
+        ));
+    }
+    Ok(())
+}
+
+/// Off macOS a clone is `std::fs::copy`'s, which keeps a file's permission bits and neither its
+/// flags nor its extended attributes: what an extraction lays.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn lays_as_extracted(_src: &Path, _rel: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// The rest of a stage once its verified tree is laid in `incoming` with `modes` and folds to
+/// `root`: the aliases, the pre-swap hook, the re-fold over what they joined, the sidecars, the
+/// build's mode, the flush, the swap into `build_dir`, the declared modes and the marker.
+fn finish_stage(
+    artifact: &Artifact,
+    build_dir: &Path,
+    incoming: &Path,
+    root: String,
+    mut modes: DeclaredModes,
+    hooks: &StageHooks<'_>,
+) -> Result<String, StageError> {
+    if let Err(e) = lay_aliases(incoming, hooks.aliases, &mut modes) {
+        let _ = crate::store::remove_tree(incoming);
         return Err(e);
     }
     if let Some(pre_swap) = hooks.pre_swap
-        && let Err(e) = pre_swap(&incoming)
+        && let Err(e) = pre_swap(incoming)
     {
-        let _ = crate::store::remove_tree(&incoming);
+        let _ = crate::store::remove_tree(incoming);
         return Err(e);
     }
     let root = if hooks.aliases.is_empty() {
         root
     } else {
-        match tree_root_declared(&incoming, &modes) {
+        match tree_root_declared(incoming, &modes) {
             Ok(root) => root,
             Err(e) => {
-                let _ = crate::store::remove_tree(&incoming);
+                let _ = crate::store::remove_tree(incoming);
                 return Err(io_step("fold the tree its aliases joined", e));
             }
         }
@@ -208,7 +405,7 @@ pub fn verify_and_stage(
     let sidecars = match hooks.sidecars.map(|render| render(&root)).transpose() {
         Ok(sidecars) => sidecars.unwrap_or_default(),
         Err(e) => {
-            let _ = crate::store::remove_tree(&incoming);
+            let _ = crate::store::remove_tree(incoming);
             return Err(e);
         }
     };
@@ -216,30 +413,30 @@ pub fn verify_and_stage(
         .iter()
         .find(|(suffix, _)| !crate::store::STAGE_SIDECAR_SUFFIXES.contains(suffix))
     {
-        let _ = crate::store::remove_tree(&incoming);
+        let _ = crate::store::remove_tree(incoming);
         return Err(payload2(
             "sidecar suffix the store does not reclaim: ",
             suffix,
         ));
     }
 
-    if let Err(e) = crate::platform::set_mode(&incoming, crate::extract::safe_mode(0, true)) {
-        let _ = crate::store::remove_tree(&incoming);
+    if let Err(e) = crate::platform::set_mode(incoming, crate::extract::safe_mode(0, true)) {
+        let _ = crate::store::remove_tree(incoming);
         return Err(io_step("give the staged tree the build's mode", e));
     }
     if crate::vendor::stages_one_binary(&artifact.payload)
-        && let Err(e) = crate::store::seal_bin(&incoming)
+        && let Err(e) = crate::store::seal_bin(incoming)
     {
-        let _ = crate::store::remove_tree(&incoming);
+        let _ = crate::store::remove_tree(incoming);
         return Err(io_step("seal the build's bin", e));
     }
-    if let Err(e) = crate::store::sync_tree(&incoming) {
-        let _ = crate::store::remove_tree(&incoming);
+    if let Err(e) = crate::store::sync_tree(incoming) {
+        let _ = crate::store::remove_tree(incoming);
         return Err(io_step("flush the staged tree", e));
     }
 
-    if let Err(e) = swap_into_place(build_dir, &incoming) {
-        let _ = crate::store::remove_tree(&incoming);
+    if let Err(e) = swap_into_place(build_dir, incoming) {
+        let _ = crate::store::remove_tree(incoming);
         return Err(io_step("swap the staged tree into place", e));
     }
 
@@ -3041,6 +3238,80 @@ image-alias     : /tmp/stage/bar.dmg
         assert_eq!(
             std::fs::read_to_string(&record).unwrap(),
             String::from_utf8(vendor_record(&root).remove(0).1).unwrap()
+        );
+    }
+
+    /// A copy of another build's tree is staged only when it folds to the root that build's
+    /// record names and holds nothing a stage would demote: anything else is a drift that lays
+    /// nothing, leaves no scratch, memoizes nothing and never touches the source.
+    #[cfg(unix)]
+    #[test]
+    fn stage_from_tree_lays_only_a_tree_that_folds_to_its_source_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tmp("from-tree");
+        let src = dir.join("store/codex/7");
+        std::fs::create_dir_all(src.join("bin")).unwrap();
+        let exe = crate::vendor_direct::lane::world::native_exe("codex");
+        let file = |rel: &str, bytes: &[u8], mode: u32| {
+            std::fs::write(src.join(rel), bytes).unwrap();
+            std::fs::set_permissions(src.join(rel), std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        file("bin/codex", &exe, 0o755);
+        file("NOTICE.md", b"# Notices\n", 0o644);
+        std::os::unix::fs::symlink("codex", src.join("bin/codex-link")).unwrap();
+        let root = tree_root(&src).unwrap();
+        let art = artifact(&"a".repeat(64), "");
+        let demote = |tree: &Path| crate::macho::demote_foreign_executables(tree).map(drop);
+        let hooks = StageHooks {
+            pre_swap: Some(&demote),
+            sidecars: None,
+            aliases: &[("codex-old", "codex")],
+            npm_package: None,
+        };
+        let laid = std::cell::Cell::new(0);
+        let count = || laid.set(laid.get() + 1);
+        let nothing_laid = |build: &Path| {
+            assert!(std::fs::symlink_metadata(build).is_err(), "no build");
+            assert!(scratch_beside(build).is_empty(), "no scratch");
+            assert!(crate::store::stage_refusal(build).is_none(), "no memo");
+        };
+
+        let build = dir.join("store/codex-old/7");
+        let wrong = stage_from_tree(&src, &"b".repeat(64), &art, &build, &hooks, &count).unwrap();
+        assert!(matches!(wrong, FromTree::Drift(_)), "{wrong:?}");
+        nothing_laid(&build);
+        assert_eq!(laid.get(), 0);
+
+        let staged = stage_from_tree(&src, &root, &art, &build, &hooks, &count).unwrap();
+        assert_eq!(laid.get(), 1);
+        assert_eq!(staged, FromTree::Staged(tree_root(&build).unwrap()));
+        assert!(crate::store::build_is_complete(&build));
+        assert!(crate::clone::is_clone_of(
+            &src.join("bin/codex"),
+            &build.join("bin/codex")
+        ));
+        assert_eq!(std::fs::read(build.join("bin/codex-old")).unwrap(), exe);
+        assert_eq!(
+            std::fs::read_link(build.join("bin/codex-link")).unwrap(),
+            Path::new("codex")
+        );
+        assert_eq!(tree_root(&src).unwrap(), root, "the source is untouched");
+
+        file("bin/helper", b"#!/bin/sh\nexec true\n", 0o755);
+        let root = tree_root(&src).unwrap();
+        let other = dir.join("store/codex-old/8");
+        let foreign = stage_from_tree(&src, &root, &art, &other, &hooks, &count).unwrap();
+        assert!(matches!(foreign, FromTree::Drift(_)), "{foreign:?}");
+        nothing_laid(&other);
+        assert_eq!(laid.get(), 1);
+        assert_eq!(
+            std::fs::metadata(src.join("bin/helper"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "the source keeps its mode"
         );
     }
 

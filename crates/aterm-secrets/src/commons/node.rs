@@ -23,6 +23,7 @@ pub const MAX_NODE: usize = MAX_PAYLOAD + 32 * 1024;
 const LEGACY_DOMAIN: &[u8] = b"aterm/commons/control-node/1\0";
 const RESTRICTION_DOMAIN: &[u8] = b"aterm/commons/control-node/2\0";
 const DOMAIN: &[u8] = b"aterm/commons/control-node/3\0";
+#[cfg(unix)]
 const MAGIC: &[u8] = b"ACN3";
 
 /// A control operation prepared by an authority. Persist the returned node and
@@ -68,6 +69,7 @@ pub struct Node {
     wire: Vec<u8>,
     id: Digest,
     legacy: bool,
+    #[cfg(unix)]
     binding_evidence: bool,
     facts: Vec<Fact>,
 }
@@ -219,6 +221,7 @@ impl Node {
             wire: bytes.to_vec(),
             id,
             legacy,
+            #[cfg(unix)]
             binding_evidence: binding_facts,
             facts,
         })
@@ -343,6 +346,7 @@ impl Node {
         self.authority
     }
 
+    #[cfg(unix)]
     pub(crate) const fn binding_evidence(&self) -> bool {
         self.binding_evidence
     }

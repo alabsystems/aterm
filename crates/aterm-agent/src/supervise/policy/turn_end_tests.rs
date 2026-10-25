@@ -125,6 +125,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         login_at_wall: None,
         login_method: None,
         login_shared: None,
+        login_moved: false,
         roster: None,
         wall_remembered: false,
         answered: None,
@@ -6689,6 +6690,52 @@ fn fresh_left(said: &str, now: Instant) -> TurnEndState {
     st
 }
 
+/// 2026-10-24 under cruise: the person's message was answered with a question to them, the
+/// harness then upgraded Claude Code and typed its restore notice ("Nothing else is asked."),
+/// and the 15 s reply to that notice was still read as the person's exchange: nothing was typed.
+#[test]
+fn the_hosts_turn_after_a_persons_exchange_is_the_hosts() {
+    let asked = "Should I go ahead on the new account? Or tell me how much quota to spend.";
+    let quick = Duration::from_secs(15);
+    let replies = [
+        "Restored nothing: no watch, monitor or loop was running.",
+        "Nothing needed restoring after the Claude Code upgrade. I'm holding the fixes until you \
+         say how much of the new account's quota to spend. My suggestion is still to land the \
+         two finished fixes after one check each.",
+    ];
+    for host in [HostTurn::Notice, HostTurn::CarryOn] {
+        for (i, reply) in replies.into_iter().enumerate() {
+            let mut now = t0();
+            let mut st = fresh_left(asked, now);
+            now += 3 * MIN;
+            st.host_typed(now, host);
+            now += quick;
+            let a = at(&mut st, &idle(reply, Some(quick)), now);
+            assert!(!st.left_to_person(), "{host:?}: {reply}");
+            if i == 0 {
+                assert_eq!(a, typed(RULE_CONTINUE), "{host:?}: {reply}");
+            } else {
+                assert!(
+                    matches!(a, TurnEndAction::Type { .. }),
+                    "{host:?}: {reply}: {a:?}"
+                );
+            }
+        }
+    }
+    // CONTROL: the same short reply to the person's own next message stays theirs.
+    for reply in replies {
+        let mut now = t0();
+        let mut st = fresh_left(asked, now);
+        now += 3 * MIN;
+        let theirs = TurnEndReading {
+            person: Some(quick + Duration::from_secs(3)),
+            ..idle(reply, Some(quick))
+        };
+        assert_eq!(at(&mut st, &theirs, now), TurnEndAction::Nothing, "{reply}");
+        assert!(st.left_to_person(), "{reply}");
+    }
+}
+
 #[test]
 fn a_persons_own_exchange_is_left_to_them_whatever_it_says() {
     let now = t0();
@@ -8759,6 +8806,220 @@ fn a_long_answer_at_a_read_wall_is_no_work_whether_or_not_its_reader_reads_tool_
             "the control, {program:?}: a tool run is work"
         );
     }
+}
+
+/// A session limit tried until it holds (the same reply again): the state, the limit's reading
+/// and the point it holds at.
+fn held_limit() -> (TurnEndState, TurnEndReading, Instant) {
+    let mut st = TurnEndState::default();
+    let mut r = walled(WallKind::UsageSession, "Usage limit reached", Some(3 * MIN));
+    r.reset_at = None;
+    let mut now = t0();
+    loop {
+        let a = at(&mut st, &r, now);
+        let TurnEndAction::WaitUntil { until, .. } = a else {
+            assert!(a == TurnEndAction::Nothing && st.repeats(&r), "{a:?}");
+            return (st, r, now);
+        };
+        now = until;
+        let a = at(&mut st, &r, now);
+        assert_eq!(a, typed(RULE_LIMIT_RESUME));
+        st.acted(&a, &r, now);
+        st.took();
+        now += MIN_WORK;
+        st.observe(
+            &TurnEndReading {
+                worked: Some(MIN_WORK),
+                ..r.clone()
+            },
+            now,
+        );
+        r.worked = None;
+    }
+}
+
+/// A limit held after its spent tries (the same reply again) is an old login's: a login moved
+/// off its account owes one resume, typed at once over the hold and over the limit's reset; the
+/// resume taken, the hold stands again. Without the move the hold stands.
+#[test]
+fn a_login_moved_off_a_held_limit_resumes_it_once() {
+    let (mut st, r, now) = held_limit();
+    assert_eq!(at(&mut st, &r, now), TurnEndAction::Nothing, "the control");
+    let (mut st, r, now) = held_limit();
+    let moved = TurnEndReading {
+        login_moved: true,
+        reset_at: Some(now + 180 * MIN),
+        ..r.clone()
+    };
+    let a = at(&mut st, &moved, now);
+    assert_eq!(a, typed(RULE_LIMIT_RESUME));
+    st.acted(&a, &moved, now);
+    assert!(!st.login_resume_owed());
+    st.took();
+    let now = now + MIN_WORK;
+    st.observe(
+        &TurnEndReading {
+            worked: Some(MIN_WORK),
+            ..r.clone()
+        },
+        now,
+    );
+    let r = TurnEndReading { worked: None, ..r };
+    let a = at(&mut st, &r, now);
+    assert!(
+        a == TurnEndAction::Nothing && st.repeats(&r),
+        "one resume a move: {a:?}"
+    );
+}
+
+/// A held limit off the screen (scrolled away, its spent tries kept on its track) is the old
+/// login's all the same: a login moved off its account owes the one resume. Without the move
+/// nothing resumes it.
+#[test]
+fn a_login_moved_off_a_held_limit_the_screen_left_resumes_it() {
+    let off = |r: &TurnEndReading, login_moved: bool| TurnEndReading {
+        wall: None,
+        wall_message: String::new(),
+        login_moved,
+        ..r.clone()
+    };
+    let (mut st, r, now) = held_limit();
+    assert_ne!(
+        at(&mut st, &off(&r, false), now),
+        typed(RULE_LIMIT_RESUME),
+        "the control"
+    );
+    let (mut st, r, now) = held_limit();
+    assert_eq!(at(&mut st, &off(&r, true), now), typed(RULE_LIMIT_RESUME));
+}
+
+/// A moved login's resume left untyped (a person typing, their own draft standing) is owed no
+/// more once a turn is served: a limit that turn ends at is the new login's, waited on or held
+/// as any limit is. Without the turn the resume stays owed.
+#[test]
+fn a_turn_served_since_a_moved_login_owes_its_resume_no_more() {
+    let (mut st, r, now) = held_limit();
+    st.observe(
+        &TurnEndReading {
+            login_moved: true,
+            ..r.clone()
+        },
+        now,
+    );
+    assert!(st.login_resume_owed());
+    let later = now + MIN_WORK;
+    let again = TurnEndReading {
+        reset_at: Some(later + 120 * MIN),
+        ..r.clone()
+    };
+    let mut owed = st.clone();
+    assert_eq!(
+        at(&mut owed, &again, later),
+        typed(RULE_LIMIT_RESUME),
+        "the control: no turn since, still owed"
+    );
+    let a = at(
+        &mut st,
+        &TurnEndReading {
+            worked: Some(MIN_WORK),
+            ..again
+        },
+        later,
+    );
+    assert!(!st.login_resume_owed());
+    assert_ne!(
+        a,
+        typed(RULE_LIMIT_RESUME),
+        "the new login's limit is waited on or held"
+    );
+}
+
+/// A moved login's resume left untyped is owed no more once a person's prompt is answered since,
+/// even with no busy spell seen (the new login's limit answered it at once). The same answer
+/// again keeps it owed.
+#[test]
+fn a_prompt_answered_since_a_moved_login_owes_its_resume_no_more() {
+    let answered = |prompt: u64, r: &TurnEndReading| TurnEndReading {
+        answered: Some(ScreenAnswer { prompt, work: None }),
+        ..r.clone()
+    };
+    let (mut st, r, now) = held_limit();
+    st.observe(&answered(1, &r), now);
+    st.observe(
+        &TurnEndReading {
+            login_moved: true,
+            ..answered(1, &r)
+        },
+        now,
+    );
+    assert!(st.login_resume_owed());
+    let mut kept = st.clone();
+    assert_eq!(
+        at(&mut kept, &answered(1, &r), now),
+        typed(RULE_LIMIT_RESUME),
+        "the control: the same answer"
+    );
+    let a = at(&mut st, &answered(2, &r), now);
+    assert!(!st.login_resume_owed());
+    assert_ne!(a, typed(RULE_LIMIT_RESUME), "{a:?}");
+}
+
+/// A moved login's resume is the limit's: owed no more once another wall takes the limit's place
+/// (the vendor overloaded, with no turn served). The limit again keeps it owed.
+#[test]
+fn a_moved_logins_resume_ends_with_the_limits_track() {
+    let (mut st, r, now) = held_limit();
+    st.observe(
+        &TurnEndReading {
+            login_moved: true,
+            ..r.clone()
+        },
+        now,
+    );
+    let mut kept = st.clone();
+    kept.observe(&r, now);
+    assert!(kept.login_resume_owed(), "the control: the limit again");
+    st.observe(
+        &TurnEndReading {
+            wall: Some(WallKind::Overloaded),
+            wall_message: "529 Overloaded".to_string(),
+            ..r
+        },
+        now,
+    );
+    assert!(!st.login_resume_owed());
+}
+
+/// A resume owed to a moved login stands over the same reply a wall's track stands for, once
+/// the limit's notice is off the screen: a later reading put the reset back on the track, then
+/// the notice left. Without the move the hold stands.
+#[test]
+fn a_resume_owed_to_a_moved_login_stands_over_a_track_held_off_the_screen() {
+    let run = |login_moved: bool| {
+        let (mut st, r, now) = held_limit();
+        st.observe(
+            &TurnEndReading {
+                login_moved,
+                ..r.clone()
+            },
+            now,
+        );
+        st.observe(
+            &TurnEndReading {
+                reset_at: Some(now + 180 * MIN),
+                ..r.clone()
+            },
+            now,
+        );
+        let off = TurnEndReading {
+            wall: None,
+            wall_message: String::new(),
+            ..r
+        };
+        at(&mut st, &off, now)
+    };
+    assert_eq!(run(true), typed(RULE_LIMIT_RESUME));
+    assert_ne!(run(false), typed(RULE_LIMIT_RESUME), "the control");
 }
 
 #[test]
@@ -16755,6 +17016,7 @@ fn a_login_another_tab_signs_in_is_waited_on_and_delivered_again_once() {
     );
     let with = |shared: LoginShared| TurnEndReading {
         login_shared: Some(shared),
+        login_moved: false,
         ..wall.clone()
     };
     let carried = with(LoginShared::Carried {

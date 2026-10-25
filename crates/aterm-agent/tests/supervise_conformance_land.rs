@@ -121,6 +121,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
         login_at_wall: None,
         login_method: None,
         login_shared: None,
+        login_moved: false,
         roster: None,
         wall_remembered: false,
         answered: None,

@@ -388,15 +388,15 @@ impl EffectsPipeline {
     /// The frame's free sprites (peeking cats, their gaze dots, companions).
     #[inline]
     #[must_use]
-    pub fn free_sprites(&self) -> &[FreeSprite] {
-        &self.free_scratch
+    pub const fn free_sprites(&self) -> &[FreeSprite] {
+        self.free_scratch.as_slice()
     }
 
     /// The frame's additive nova light (the supernovae, then prism wake).
     #[inline]
     #[must_use]
-    pub fn nova(&self) -> &[GlowQuad] {
-        &self.nova_scratch
+    pub const fn nova(&self) -> &[GlowQuad] {
+        self.nova_scratch.as_slice()
     }
 
     /// The rain driver's session-keyed edges.
@@ -1435,7 +1435,7 @@ mod flying_head_tests {
     const FROM: (u16, u16) = (3, 0);
     const LANDING: (u16, u16) = (3, 40);
 
-    fn glow_geom() -> Geom {
+    const fn glow_geom() -> Geom {
         Geom {
             cw: 8,
             ch: 16,
@@ -1449,7 +1449,7 @@ mod flying_head_tests {
         }
     }
 
-    fn rainbow_kitty() -> GlowConfig {
+    const fn rainbow_kitty() -> GlowConfig {
         GlowConfig {
             classic_mono: false,
             ribbon_tall: true,
@@ -1497,7 +1497,7 @@ mod flying_head_tests {
         fx
     }
 
-    fn layout(cursor: (u16, u16), frame: &CatFrame) -> KittyCursorLayout {
+    const fn layout(cursor: (u16, u16), frame: &CatFrame) -> KittyCursorLayout {
         KittyCursorLayout {
             geom: GEOM,
             cursor,

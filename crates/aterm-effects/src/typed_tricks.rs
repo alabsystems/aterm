@@ -3155,12 +3155,13 @@ cjk   = true
     struct Dice(u64);
 
     impl Dice {
-        fn roll(&mut self, sides: usize) -> usize {
+        const fn roll(&mut self, sides: usize) -> usize {
             self.0 ^= self.0 >> 12;
             self.0 ^= self.0 << 25;
             self.0 ^= self.0 >> 27;
             let mixed = self.0.wrapping_mul(0x2545_F491_4F6C_DD1D);
-            (mixed >> 33) as usize % sides.max(1)
+            let denom = if sides > 1 { sides } else { 1 };
+            (mixed >> 33) as usize % denom
         }
     }
 

@@ -1325,6 +1325,7 @@ fn watched_board() -> (Shelf, VolumeKey) {
                 bytes: 212 * GB,
                 bytes_partial: false,
                 why: "a live checkout's build directory".to_owned(),
+                serves: None,
             }],
             ended_at_unix: Some(1_792_000_000),
         });

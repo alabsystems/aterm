@@ -337,16 +337,6 @@ pub(crate) fn lan_target(interfaces: &[LanInterface]) -> Option<Ipv4Addr> {
     pick(|address| address.is_private()).or_else(|| pick(|address| address.is_link_local()))
 }
 
-/// Whether System State manages `subject` under `selection`: its setting is
-/// selected and, for an access row, the selection needs it.
-fn managed(subject: Subject, selection: Selection) -> bool {
-    selection.contains(subject.setting())
-        && match subject {
-            Subject::Access(access) => access.needed_for(selection),
-            Subject::Setting(_) => true,
-        }
-}
-
 /// The one quiet signal (§3.6, pure): `System State: <row> needs you`, from the managed rows
 /// that wait for a person plus a verified Full Disk Access grant that reads off. A failed row,
 /// or a step the last run could not finish, reads `System State: <row> failed` (`1 step
@@ -363,7 +353,8 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
         status
             .observations_for(status.plan.as_ref().map(|plan| plan.vault_url.as_str()))
             .filter(move |observation| {
-                observation.standing == standing && managed(observation.subject, selection)
+                observation.standing == standing
+                    && crate::system_state::manages(selection, observation.subject)
             })
             .map(|observation| observation.subject)
     };
@@ -1114,6 +1105,32 @@ impl App {
             access.name(),
             if opened { "opened" } else { "failed" }
         );
+    }
+
+    /// While System State offers the Debugger row's `Turn On…`, keep this window's own reading
+    /// of debugger access in hand. The page offers the row from the setup worker's reading; the
+    /// window reads its own, and aterm's hardening with it, only when asked, and a press that
+    /// finds none (the first after a launch, such as Full Disk Access's Quit & Reopen) is
+    /// refused: only a reading tells a press that the build is hardened and the right is off.
+    pub(crate) fn warm_debugger_reading(&mut self) {
+        if self.headless || !cfg!(target_os = "macos") {
+            return;
+        }
+        let gate = self.config.privacy_probe_gate();
+        if !gate.permits() || self.consent.debugger_cached(gate).is_some() {
+            return;
+        }
+        let offered = self
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::SystemState)
+            .is_some_and(|instance| {
+                matches!(self.native_runtime.app(instance),
+                    Some(crate::native_app::NativeApp::SystemState(state)) if state.can_open_access(Access::Debugger))
+            });
+        if offered {
+            // Dispatches the reading; its wake observes it ([`App::on_debugger_probe_ready`]).
+            let _ = self.consent.debugger(gate);
+        }
     }
 
     /// A new access revision approved while aterm runs (Permissions off and on, or Set up)

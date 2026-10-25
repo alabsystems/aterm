@@ -7,7 +7,7 @@
 use super::{
     binding::{BINDING_LEN, Binding, Possession},
     constraints::{Constraints, Fact, key_commitment},
-    journal::{Journal, State, Trust},
+    journal::{Current, Journal, State, Trust},
     membership::{Certificate, Eligibility},
     node::{Edit, Node},
 };
@@ -292,6 +292,10 @@ impl Access {
     pub const fn head(&self) -> &[u8; 32] {
         &self.head
     }
+    /// Exact data node supplying the roster; a recovery head has no payload.
+    pub const fn basis(&self) -> &[u8; 32] {
+        &self.basis
+    }
     pub const fn generation(&self) -> u64 {
         self.generation
     }
@@ -332,6 +336,143 @@ impl Access {
             ));
         }
         Ok(use_key(self.key.as_slice().try_into().unwrap()))
+    }
+
+    /// Open an older selected roster using the same recipient. This validates
+    /// past authorship and releases an old read key, never a current write grant.
+    /// New members need an explicit historical-key handoff; it is not inferred.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbHistoricalAccess",
+            action = "Current",
+            project = "aterm_secrets::commons::roster::tests::historical::historical_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbHistoricalAccess",
+            action = "Rotated",
+            project = "aterm_secrets::commons::roster::tests::historical::historical_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbHistoricalAccess",
+            action = "Stale",
+            project = "aterm_secrets::commons::roster::tests::historical::historical_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbHistoricalAccess",
+            action = "Missing",
+            project = "aterm_secrets::commons::roster::tests::historical::historical_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbHistoricalAccess",
+            action = "ForeignRecipient",
+            project = "aterm_secrets::commons::roster::tests::historical::historical_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbHistoricalAccess",
+            action = "Forked",
+            project = "aterm_secrets::commons::roster::tests::historical::historical_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbHistoricalAccess",
+            action = "RetiredLocal",
+            project = "aterm_secrets::commons::roster::tests::historical::historical_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbHistoricalAccess",
+            action = "Selected",
+            project = "aterm_secrets::commons::roster::tests::historical::historical_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbHistoricalAccess",
+            action = "Discarded",
+            project = "aterm_secrets::commons::roster::tests::historical::historical_transition"
+        )
+    )]
+    pub fn historical(
+        &self,
+        journal: &Journal,
+        identity: &Identity,
+        basis: [u8; 32],
+    ) -> Result<Historical> {
+        if !self.is_current(journal) || self.local().binding.recipient() != identity.recipient() {
+            return Err(Error::new(
+                "historical access requires the current local membership",
+            ));
+        }
+        let snapshot = journal.historical(basis, identity)?;
+        let past = validate(journal, identity, snapshot, false)?;
+        Ok(Historical {
+            trust: self.trust,
+            head: self.head,
+            basis: self.basis,
+            past,
+        })
+    }
+}
+
+/// A historical read key and signed roster, bound to a current local observation.
+/// Callers must apply current table cutoffs before projecting old operations.
+/// Neither old writer roles nor a copied key establish permission to write now.
+#[derive(Debug)]
+pub struct Historical {
+    trust: Trust,
+    head: [u8; 32],
+    basis: [u8; 32],
+    past: Access,
+}
+impl Historical {
+    pub const fn source(&self) -> &[u8; 32] {
+        &self.past.basis
+    }
+    pub const fn generation(&self) -> u64 {
+        self.past.generation
+    }
+    pub fn members(&self) -> &[Member] {
+        &self.past.members
+    }
+    /// A changed, forked, pending or uncertain journal invalidates this handle.
+    pub fn with_key<T>(
+        &self,
+        journal: &Journal,
+        use_key: impl FnOnce(&[u8; 32]) -> T,
+    ) -> Result<T> {
+        if journal.trust() != self.trust
+            || journal.state()
+                != (State::Ready {
+                    head: self.head,
+                    basis: self.basis,
+                })
+        {
+            return Err(Error::new(
+                "historical key observation is no longer current",
+            ));
+        }
+        Ok(use_key(self.past.key.as_slice().try_into().unwrap()))
     }
 }
 
@@ -422,6 +563,15 @@ pub fn current(journal: &Journal, identity: &Identity) -> Result<Option<Access>>
     let Some(current) = journal.current(identity)? else {
         return Ok(None);
     };
+    validate(journal, identity, current, true).map(Some)
+}
+
+fn validate(
+    journal: &Journal,
+    identity: &Identity,
+    current: Current,
+    latest: bool,
+) -> Result<Access> {
     let roster = decode(current.payload.as_slice())?;
     let trust = journal.trust();
     if roster.network != trust.network || roster.authority != trust.authority {
@@ -478,18 +628,19 @@ pub fn current(journal: &Journal, identity: &Identity) -> Result<Option<Access>>
         .is_ok()
         && key_commitment(trust.network, key) == roster.commitment
         && journal.single_key_publication(roster.generation, roster.commitment);
-    let same_head = !journal.payload_superseded(current.basis)
-        && journal.state()
-            == (State::Ready {
-                head: current.head,
-                basis: current.basis,
-            });
+    let same_head = !latest
+        || (!journal.payload_superseded(current.basis)
+            && journal.state()
+                == (State::Ready {
+                    head: current.head,
+                    basis: current.basis,
+                }));
     if !aterm_db_core::roster_access(same_head, members_valid, epoch_valid) {
         return Err(Error::new(
             "Commons roster or key is not currently authorized",
         ));
     }
-    Ok(Some(Access {
+    Ok(Access {
         trust,
         head: current.head,
         basis: current.basis,
@@ -497,7 +648,7 @@ pub fn current(journal: &Journal, identity: &Identity) -> Result<Option<Access>>
         members,
         local,
         key: SecretBytes::from(key.as_slice()),
-    }))
+    })
 }
 
 fn authority(seed: &[u8; 32]) -> Result<[u8; 32]> {

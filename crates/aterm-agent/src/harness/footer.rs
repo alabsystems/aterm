@@ -28,12 +28,18 @@ pub const MODEL_MARK: char = '\u{25C6}';
 pub const PATH_MARK: char = '\u{2302}';
 /// The mark before the branch.
 pub const BRANCH_MARK: char = '\u{2387}';
-/// The mark before the account the process runs on.
+/// The mark before the account the process runs on, which leads the account unit (its plan and
+/// weekly quota joined on, [`Segment::joined`]).
 pub const ACCOUNT_MARK: char = '\u{2386}';
-/// The mark before the selected account's subscription plan.
+/// Names the account unit's subscription plan ([`Segment::joined`]); the rule draws a
+/// [`JOIN_MARK`] before it.
 pub const PLAN_MARK: char = '\u{25c7}';
-/// The mark before the selected account's weekly quota.
+/// Names the account unit's weekly quota ([`Segment::joined`]); the rule draws a [`JOIN_MARK`]
+/// before it. The Accounts menu a click on the unit opens leads its weekly row with this mark.
 pub const WEEKLY_MARK: char = '\u{25f7}';
+/// The mark the rule draws before a part joined to the account unit
+/// (`⎆ me@example.com · Max 20x · weekly 61% left`).
+pub const JOIN_MARK: char = '\u{b7}';
 /// The mark before a limit wall the session hit.
 pub const WALL_MARK: char = '\u{29D7}';
 /// The mark before the session's context window indicator.
@@ -53,6 +59,9 @@ pub const FACT_PITCH: f32 = 0.8;
 
 /// The space between two facts, in pitches.
 pub const GAP: f32 = 3.0;
+
+/// The space before a part joined to the segment before it ([`Segment::joined`]), in pitches.
+pub const JOIN_GAP: f32 = 1.0;
 
 /// The steps a cell is divided into for a fact glyph's sideways move ([`SetGlyph::nudge`]).
 pub const NUDGES_PER_CELL: i8 = 16;
@@ -145,6 +154,9 @@ pub enum FactKind {
     Context,
     /// The session's usage (`Σ 6m33s ↑20M ↓82k`); never hidden by a click.
     Usage,
+    /// The account unit: the account, and its plan and weekly quota where the profile told them
+    /// (`⎆ me@example.com · Max 20x · weekly 61% left`); never hidden by a click.
+    Account,
 }
 
 impl FactKind {
@@ -155,7 +167,7 @@ impl FactKind {
             Self::Path => 4,
             Self::Branch => 8,
             Self::Context => 16,
-            Self::Usage => 0,
+            Self::Usage | Self::Account => 0,
         }
     }
 
@@ -169,6 +181,7 @@ impl FactKind {
             Self::Branch => Some(BRANCH_MARK),
             Self::Context => Some(CONTEXT_MARK),
             Self::Usage => Some(USAGE_MARK),
+            Self::Account => Some(ACCOUNT_MARK),
         }
     }
 }
@@ -189,13 +202,14 @@ impl FactMask {
     /// The context window's indicator hidden.
     pub const CONTEXT: Self = Self(FactKind::Context.bit());
 
-    /// Whether `kind` is in the set (never [`FactKind::Usage`]).
+    /// Whether `kind` is in the set (never [`FactKind::Usage`] or [`FactKind::Account`]).
     #[must_use]
     pub const fn has(self, kind: FactKind) -> bool {
         kind.bit() != 0 && self.0 & kind.bit() != 0
     }
 
-    /// The set with `kind` in it (`on`) or out of it; [`FactKind::Usage`] changes nothing.
+    /// The set with `kind` in it (`on`) or out of it; [`FactKind::Usage`] and
+    /// [`FactKind::Account`] change nothing.
     #[must_use]
     pub const fn with(self, kind: FactKind, on: bool) -> Self {
         if on {
@@ -322,6 +336,10 @@ pub struct Segment {
     pub split: Option<usize>,
     /// Whether the head and the tail (`split`) are a hidden fact's stub.
     pub quiet: (bool, bool),
+    /// Whether it continues the segment before it as one unit: set [`JOIN_GAP`] after that one,
+    /// behind a [`JOIN_MARK`] rather than its own mark (which then only names it), and one fact
+    /// with it ([`fact_spans`]).
+    pub joined: bool,
 }
 
 impl Segment {
@@ -333,6 +351,22 @@ impl Segment {
             text: text.into(),
             ..Self::default()
         }
+    }
+
+    /// A part of the unit the segment before it leads (`· Max 20x`), with no split: `mark` names
+    /// it, and the rule draws a [`JOIN_MARK`] before it.
+    #[must_use]
+    pub fn joined(mark: char, text: impl Into<String>) -> Self {
+        Self {
+            joined: true,
+            ..Self::plain(mark, text)
+        }
+    }
+
+    /// The mark the rule draws before its text: its own, or a [`JOIN_MARK`] where it is joined.
+    #[must_use]
+    pub const fn drawn_mark(&self) -> char {
+        if self.joined { JOIN_MARK } else { self.mark }
     }
 
     fn shown_part(&self) -> (char, &str) {
@@ -2981,10 +3015,9 @@ fn model_effort_segment(facts: &FooterFacts, stubs: bool) -> Option<Segment> {
     let hide_model = model.is_some() && off.has(FactKind::Model);
     let hide_effort = effort.is_some() && off.has(FactKind::Effort);
     let segment = |text: String, split: Option<usize>, quiet: (bool, bool)| Segment {
-        mark: MODEL_MARK,
-        text,
         split,
         quiet,
+        ..Segment::plain(MODEL_MARK, text)
     };
     match (model, effort) {
         (None, None) => None,
@@ -3044,6 +3077,7 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
         })
     };
     let plain = |mark: char, text: Option<String>| text.map(|text| Segment::plain(mark, text));
+    let joined = |mark: char, text: Option<String>| text.map(|text| Segment::joined(mark, text));
     [
         plain(
             WALL_MARK,
@@ -3059,11 +3093,11 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
                     .unwrap_or_else(|| "account unavailable".into())
             }),
         ),
-        plain(
+        joined(
             PLAN_MARK,
             facts.subscription.as_ref().and_then(|s| s.plan.clone()),
         ),
-        plain(
+        joined(
             WEEKLY_MARK,
             facts.subscription.as_ref().map(|s| {
                 s.weekly.clone().unwrap_or_else(|| {
@@ -3166,7 +3200,7 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
     let mut line = 0.0f32;
     for (i, segment) in segments.iter().enumerate() {
         if i > 0 {
-            line += GAP;
+            line += if segment.joined { JOIN_GAP } else { GAP };
         }
         let quiet = |tail: bool| {
             if tail {
@@ -3180,7 +3214,7 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
             (tail, own && quiet(tail))
         };
         let mut mark_buf = [0; 4];
-        let mark_text = segment.mark.encode_utf8(&mut mark_buf);
+        let mark_text = segment.drawn_mark().encode_utf8(&mut mark_buf);
         for (text, mark, own) in [
             (mark_text as &str, true, false),
             (" ", false, false),
@@ -3342,7 +3376,7 @@ pub struct FactSpan {
 }
 
 /// Every fact of one rule's facts, in reading order ([`fact_spans`]).
-pub type FactSpans = [Option<FactSpan>; 6];
+pub type FactSpans = [Option<FactSpan>; 7];
 
 fn glyph_fact(segment: &Segment, tail: bool, quiet: bool) -> Option<(FactKind, FactMask)> {
     let kind = if tail {
@@ -3354,6 +3388,7 @@ fn glyph_fact(segment: &Segment, tail: bool, quiet: bool) -> Option<(FactKind, F
             BRANCH_MARK => FactKind::Branch,
             CONTEXT_MARK => FactKind::Context,
             USAGE_MARK => FactKind::Usage,
+            ACCOUNT_MARK | PLAN_MARK | WEEKLY_MARK => FactKind::Account,
             _ => return None,
         }
     };
@@ -3365,10 +3400,11 @@ fn glyph_fact(segment: &Segment, tail: bool, quiet: bool) -> Option<(FactKind, F
     Some((kind, restores))
 }
 
-/// Where each fact of `segments`, as [`set_facts`] set them (`set`), lies.
+/// Where each fact of `segments`, as [`set_facts`] set them (`set`), lies: a joined segment
+/// ([`Segment::joined`]) lies in the span of the fact it continues, its mark included.
 #[must_use]
 pub fn fact_spans(set: &SetFacts, segments: &[Segment]) -> FactSpans {
-    let mut spans: FactSpans = [None; 6];
+    let mut spans = FactSpans::default();
     let room = spans.len();
     let mut n = 0usize;
     let mut segment: Option<&Segment> = None;
@@ -3389,8 +3425,9 @@ pub fn fact_spans(set: &SetFacts, segments: &[Segment]) -> FactSpans {
         };
         let start = mark_at.take().unwrap_or(glyph.cell);
         let end = glyph.cell + glyph.cols;
+        let joins = start == glyph.cell || segment.is_some_and(|s| s.joined);
         match n.checked_sub(1).and_then(|last| spans[last].as_mut()) {
-            Some(span) if span.kind == kind && span.restores == restores && start == glyph.cell => {
+            Some(span) if span.kind == kind && span.restores == restores && joins => {
                 span.cells.1 = cell(end);
             }
             _ if n < room => {
@@ -3405,37 +3442,6 @@ pub fn fact_spans(set: &SetFacts, segments: &[Segment]) -> FactSpans {
         }
     }
     spans
-}
-
-/// Where the subscription/account group (`⎆`, `◇`, `◷`) of `segments`, as [`set_facts`] set them (`set`), lies.
-#[must_use]
-pub fn account_span(set: &SetFacts, segments: &[Segment]) -> Option<(u16, u16)> {
-    let mut segment: Option<&Segment> = None;
-    let mut next = 0usize;
-    let mut mark_at: Option<usize> = None;
-    let mut span: Option<(u16, u16)> = None;
-    let cell = |at: usize| u16::try_from(at).unwrap_or(u16::MAX);
-    for glyph in &set.glyphs {
-        if glyph.mark {
-            segment = segments.get(next);
-            next += 1;
-            mark_at = Some(glyph.cell);
-            continue;
-        }
-        let is_acct =
-            segment.is_some_and(|s| matches!(s.mark, ACCOUNT_MARK | PLAN_MARK | WEEKLY_MARK));
-        if !is_acct {
-            mark_at = None;
-            continue;
-        }
-        let start = mark_at.take().unwrap_or(glyph.cell);
-        let end = glyph.cell + glyph.cols;
-        span = Some(match span {
-            Some((s, _)) => (s, cell(end)),
-            None => (cell(start), cell(end)),
-        });
-    }
-    span
 }
 
 /// The cells of the set run ([`SetFacts::cells`]) an underline under `span`'s fact takes.
@@ -3594,13 +3600,27 @@ fn top_of(rung: &[Segment]) -> impl Iterator<Item = &Segment> {
     })
 }
 
+/// Whether two rungs show the same top ([`top_of`]). The account counts by its email's name
+/// alone: the domain is the unit's first part to give way, before the plan
+/// ([`subscription_ladder`]), so an upgrade note or a reason may take the room of both, and of
+/// no more of the unit.
 fn same_top(a: &[Segment], b: &[Segment]) -> bool {
     let shown = |rung| {
         top_of(rung)
-            .map(Segment::shown_part)
+            .map(|segment| match segment.shown_part() {
+                (ACCOUNT_MARK, text) => (ACCOUNT_MARK, email_name(text).unwrap_or(text)),
+                shown => shown,
+            })
             .filter(|(_, text)| !text.is_empty())
     };
     shown(a).eq(shown(b))
+}
+
+/// The name before the `@` of an email `text`, where there is text on both sides of its `@`.
+fn email_name(text: &str) -> Option<&str> {
+    text.rsplit_once('@')
+        .filter(|(name, domain)| !name.is_empty() && !domain.is_empty())
+        .map(|(name, _)| name)
 }
 
 fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
@@ -3711,21 +3731,24 @@ fn bare_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     out
 }
 
+/// The rungs of a rule with a subscription, widest first: the other facts give way, then the
+/// account unit narrows as one (the email's domain, the plan, the email cut, the weekly words
+/// narrowed), never shown in part: no rung has the plan or the week without the account.
 fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     let mut rung = fact_segments(facts, false);
     let mut out = vec![rung.clone()];
-    for mark in [
-        CONTEXT_MARK,
-        USAGE_MARK,
-        BRANCH_MARK,
-        PATH_MARK,
-        MODEL_MARK,
-        PLAN_MARK,
-    ] {
+    for mark in [CONTEXT_MARK, USAGE_MARK, BRANCH_MARK, PATH_MARK, MODEL_MARK] {
         rung.retain(|segment| segment.mark != mark);
         if out.last() != Some(&rung) {
             out.push(rung.clone());
         }
+    }
+    if elide_subscription_domain(&mut rung) && out.last() != Some(&rung) {
+        out.push(rung.clone());
+    }
+    rung.retain(|segment| segment.mark != PLAN_MARK);
+    if out.last() != Some(&rung) {
+        out.push(rung.clone());
     }
     for limit in [24, 18, 12, 8] {
         let mut short = rung.clone();
@@ -3749,6 +3772,19 @@ fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     out
 }
 
+/// Elide the account's email domain (`me@example.com` to `me@…`), where its text has an `@` with
+/// text on both sides (never `account unavailable`).
+fn elide_subscription_domain(segments: &mut [Segment]) -> bool {
+    let Some(account) = segments.iter_mut().find(|s| s.mark == ACCOUNT_MARK) else {
+        return false;
+    };
+    let Some(name) = email_name(&account.text) else {
+        return false;
+    };
+    account.text = format!("{name}@\u{2026}");
+    true
+}
+
 fn shorten_subscription_account(segments: &mut [Segment], limit: usize) -> bool {
     let Some(account) = segments.iter_mut().find(|s| s.mark == ACCOUNT_MARK) else {
         return false;
@@ -3765,7 +3801,7 @@ fn shorten_subscription_account(segments: &mut [Segment], limit: usize) -> bool 
 }
 
 /// Narrow the weekly segment to its narrow form ([`super::profile::narrow_weekly`]: an aged
-/// figure keeps its age, a reason its `weekly ?`), where it has one.
+/// figure keeps its `weekly` and its age, a reason its `weekly ?`), where it has one.
 fn narrow_subscription_weekly(segments: &mut [Segment]) -> bool {
     let Some(weekly) = segments.iter_mut().find(|s| s.mark == WEEKLY_MARK) else {
         return false;
@@ -3784,6 +3820,7 @@ fn subscription_reservation(facts: &FooterFacts, room: usize) -> usize {
         .into_iter()
         .filter(|s| matches!(s.mark, ACCOUNT_MARK | WEEKLY_MARK))
         .collect();
+    elide_subscription_domain(&mut essentials);
     shorten_subscription_account(&mut essentials, 8);
     narrow_subscription_weekly(&mut essentials);
     let with_wall: Vec<_> = wall.iter().cloned().chain(essentials.clone()).collect();

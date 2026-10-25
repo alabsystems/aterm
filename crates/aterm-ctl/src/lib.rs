@@ -249,8 +249,9 @@ CLIENT VERBS (answered by aterm-ctl itself; not in the protocol table):
                   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->
                   path=<frozen|live> program=<name|-> agent=<word|->
                   agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|->
-                  agent_fp=<hex16|-> human_ms=<ms|-> role=<pct|-> attention=<pct|->
-                  user_title=<pct|-> supervisor=<holder|->
+                  agent_fp=<hex16|-> program_state=<word[:kind]|-> human_ms=<ms|->
+                  role=<pct|-> attention=<pct|-> user_title=<pct|->
+                  supervisor=<holder|-> supervisor_proven=<0|1>
                   autopilot=<off|cruise|land|->
                   path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->
                   copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>>
@@ -260,7 +261,8 @@ CLIENT VERBS (answered by aterm-ctl itself; not in the protocol table):
                   `help sessions` explains each field. detail=, program= and
                   agent= say whether a peer is another agent: a tab whose
                   foreground is an agent reads what you type as its prompt,
-                  not as a shell line.
+                  not as a shell line. A codex's agent= stays unknown;
+                  program_state= is its own report (a claim, - elsewhere).
     instances     one line per live same-user instance:
                   <pid> <session-count> <sock>[ self]
                   (self = the instance hosting the calling terminal).

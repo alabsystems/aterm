@@ -39,6 +39,45 @@ pub(crate) struct RingExtras {
 }
 
 impl RingExtras {
+    /// Whether a ring-history row holds an image accepted by `selected`.
+    pub(crate) fn any_image(
+        &self,
+        selected: &dyn Fn(&aterm_scrollback::ImageSpan) -> bool,
+    ) -> bool {
+        self.slots.iter().any(|slot| {
+            slot.as_deref()
+                .is_some_and(|extras| extras.images.iter().any(selected))
+        })
+    }
+
+    /// Retains accepted image spans, preserving the running retained-byte count.
+    pub(crate) fn retain_images(
+        &mut self,
+        keep: &mut dyn FnMut(&aterm_scrollback::ImageSpan) -> bool,
+    ) -> bool {
+        let mut changed = false;
+        for slot in &mut self.slots {
+            let Some(extras) = slot.as_deref_mut() else {
+                continue;
+            };
+            let before = extras.retained_memory_used();
+            let count = extras.images.len();
+            extras.images.retain(|span| keep(span));
+            if count == extras.images.len() {
+                continue;
+            }
+            let after = if extras.is_empty() {
+                *slot = None;
+                0
+            } else {
+                extras.retained_memory_used()
+            };
+            self.retained = self.retained.saturating_sub(before).saturating_add(after);
+            changed = true;
+        }
+        changed
+    }
+
     /// Creates an empty [`RingExtras`].
     #[inline]
     pub(crate) fn new() -> Self {

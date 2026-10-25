@@ -945,7 +945,7 @@ mod tests {
     /// `cw · KITTY_LEAD_NUM / KITTY_LEAD_DEN` at `cw = 9`.
     const LEAD_PX: i32 = CW * 3 / 4;
 
-    fn geom_cols(cols: usize) -> Geom {
+    const fn geom_cols(cols: usize) -> Geom {
         Geom {
             cw: CW as usize,
             ch: CH as usize,
@@ -961,15 +961,23 @@ mod tests {
 
     /// The shipped seat as a fixture: `kitty_cursor_footprint`'s ¾-cell lead,
     /// right-margin clamp and boundary rise, bob 0.
-    fn footprint(caret: (u16, u16), cols: u16) -> CatFootprint {
-        let grid_w = i32::from(cols) * CW;
-        let cursor_right = (i32::from(caret.1) + 1) * CW;
-        let x = (cursor_right + LEAD_PX).min(grid_w - i32::from(BODY_W));
+    const fn footprint(caret: (u16, u16), cols: u16) -> CatFootprint {
+        let grid_w = cols as i32 * CW;
+        let cursor_right = (caret.1 as i32 + 1) * CW;
+        let x_cand = cursor_right + LEAD_PX;
+        let x_max = grid_w - BODY_W as i32;
+        let x = if x_cand < x_max { x_cand } else { x_max };
         assert!(x >= 0, "fixture: the grid is narrower than the cat");
-        let rest_top = i32::from(caret.0) * CH + CH / 2 - i32::from(BODY_H) / 2;
+        let rest_top = caret.0 as i32 * CH + CH / 2 - BODY_H as i32 / 2;
         let intrusion = cursor_right - x;
         let rise = if intrusion > 0 {
-            intrusion.min(CH / 2).min(rest_top.max(0))
+            let cap1 = if intrusion < CH / 2 {
+                intrusion
+            } else {
+                CH / 2
+            };
+            let cap2 = if rest_top > 0 { rest_top } else { 0 };
+            if cap1 < cap2 { cap1 } else { cap2 }
         } else {
             0
         };
@@ -1112,7 +1120,7 @@ mod tests {
         }
     }
 
-    fn admitted(duty: CompanionDuty) -> CompanionAdmission {
+    const fn admitted(duty: CompanionDuty) -> CompanionAdmission {
         CompanionAdmission {
             duty,
             body_claimed: false,
@@ -1120,13 +1128,13 @@ mod tests {
     }
 
     /// Blank glass everywhere.
-    fn blank(_row: u16, _col: u16) -> Option<bool> {
+    const fn blank(_row: u16, _col: u16) -> Option<bool> {
         Some(false)
     }
 
     /// The inclusive cells a seat covers, from its final `x`.
-    fn covered(s: &Seat) -> (u16, u16) {
-        cell_span(s.x, i32::from(s.w), CW, 120)
+    const fn covered(s: &Seat) -> (u16, u16) {
+        cell_span(s.x, s.w as i32, CW, 120)
     }
 
     /// The router names one body, the host duty's, and a frame whose body is

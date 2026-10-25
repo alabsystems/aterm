@@ -3,7 +3,7 @@
 
 //! Hot tier: uncompressed lines in a `VecDeque`, no decompression on access.
 
-use super::line::Line;
+use super::line::{ImageSpan, Line};
 use std::collections::VecDeque;
 
 /// Hot tier: uncompressed lines in RAM.
@@ -53,6 +53,32 @@ impl HotTier {
     #[inline]
     pub(crate) fn get(&self, idx: usize) -> Option<&Line> {
         self.lines.get(idx)
+    }
+
+    /// Whether an uncompressed line holds an image accepted by `selected`.
+    pub(crate) fn any_image(&self, selected: &dyn Fn(&ImageSpan) -> bool) -> bool {
+        self.lines.iter().any(|line| {
+            line.images()
+                .is_some_and(|images| images.iter().any(selected))
+        })
+    }
+
+    /// Retain selected image spans and reconcile both running byte counts.
+    pub(crate) fn retain_images(&mut self, keep: &mut dyn FnMut(&ImageSpan) -> bool) -> bool {
+        let mut changed = false;
+        for line in &mut self.lines {
+            let before = line.memory_used();
+            if line.retain_images(keep) {
+                let after = line.memory_used();
+                self.bytes_used = self.bytes_used.saturating_sub(before).saturating_add(after);
+                self.budgeted_bytes = self
+                    .budgeted_bytes
+                    .saturating_sub(before)
+                    .saturating_add(after);
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Take n lines from the front.

@@ -109,6 +109,7 @@ impl DeckContext {
                 platform: Platform::MacOs,
                 utc_offset_s: 0,
             },
+            live: crate::stats_live::DeckLive::STILL,
             needs: self.deck_needs(snap),
         }
     }

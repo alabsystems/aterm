@@ -3,13 +3,31 @@
 
 #[test]
 fn a_volume_short_while_cleanup_is_off_is_not_the_passes_line() {
-    let passes = super::disk_low_entry(3, 17, &["~/a 9 GiB (a)".to_string()]);
+    let passes = super::disk_low_entry(3, 17, &["~/a 9 GiB (a)".to_string()], None);
     let off = super::disk_low_cleanup_off_entry(3, 17);
     let settings = super::disk_settings_entry(&["disk.apply is not read".to_string()]);
     assert_ne!(off.key(), passes.key());
     assert!(passes.mover().is_none());
     assert!(off.mover().is_some());
     assert_eq!(off.mover(), settings.mover());
+}
+
+#[test]
+fn the_disk_line_keeps_what_the_ask_did_beside_its_largest_holder() {
+    let hogs: Vec<String> = ["~/a 9 GiB (a)", "~/b 5 GiB (b)", "~/c 1 GiB (c)"]
+        .iter()
+        .map(|h| (*h).to_string())
+        .collect();
+    let asked = "aterm asked @s-a at 2026-10-24T10:00:00Z to free space";
+    let (_, _, _, lines) = entry_words(&super::disk_low_entry(3, 17, &hogs, Some(asked)));
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(
+        lines[1].contains("~/a") && lines[1].contains("; 2 more"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[2], asked);
+    let (_, _, _, plain) = entry_words(&super::disk_low_entry(3, 17, &hogs, None));
+    assert!(plain.iter().any(|l| l.contains("~/b")), "{plain:?}");
 }
 
 fn entry_words(entry: &Entry) -> (String, String, String, Vec<String>) {

@@ -2347,7 +2347,7 @@ const fn exclusion_span(rect: PetRect, row: usize, limit: usize) -> Option<(usiz
 }
 
 #[cfg(test)]
-fn intersects_cell(rect: PetRect, row: usize, col: usize) -> bool {
+const fn intersects_cell(rect: PetRect, row: usize, col: usize) -> bool {
     rect.row < row as f32 + 1.0
         && rect.row + rect.rows > row as f32
         && rect.col < col as f32 + 1.0

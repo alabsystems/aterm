@@ -2164,6 +2164,11 @@ impl StatusObserver {
             .and_then(crate::program_state::ProgramStateGate::shown)
     }
 
+    /// `session`'s `status program_state= program_state_ms=` fields, from its gate alone.
+    pub(crate) fn program_state_fields(&self, session: u64) -> String {
+        crate::program_state::status_fields(self.program_states.get(&session))
+    }
+
     /// Returns the number of OSC 7501 turn completions observed for `session`'s current foreground program.
     pub(crate) fn program_turn_ends(&self, session: u64) -> u64 {
         self.program_states
@@ -2420,7 +2425,7 @@ impl crate::App {
                 timeline.slog_mut().observe_status(facts, at);
                 timeline.record(STATUS_CHANGE);
             }
-            let (previous_group, wake) = {
+            let (previous_group, wake, program_honoured) = {
                 let mut timeline = session
                     .ctx
                     .timeline
@@ -2432,7 +2437,11 @@ impl crate::App {
                 timeline.slog_mut().observe_engine(&engine, at);
                 timeline.slog_mut().program_tick(at);
                 timeline.slog_mut().shown_tick(at);
-                (previous, timeline.slog_wake())
+                // The claim is judged by the program in front once this sweep's foreground move
+                // is noted (unnamed right after one), never by the name read before it.
+                let honoured =
+                    crate::program_state::honoured_for(timeline.agent().program.as_deref());
+                (previous, timeline.slog_wake(), honoured)
             };
             self.session_status.slog_wakes.note(id, wake);
             let group_changed = previous_group.is_some();
@@ -2449,7 +2458,7 @@ impl crate::App {
             let program_state_moved = self.session_status.observe_program_state(
                 id,
                 program_report,
-                crate::program_state::honoured_for(program.as_deref()),
+                program_honoured,
                 group_changed,
                 now,
             );
@@ -3140,7 +3149,7 @@ impl crate::App {
             crate::harness_host::admitted_as(&pooled.ctx, supervised_agent, group);
         let autopilot =
             crate::autopilot::wire_field(self.harness_posture(), word, supervised_agent);
-        let program_state = crate::program_state::wire(self.session_status.program_state(session));
+        let program_state = self.session_status.program_state_fields(session);
         let land_at =
             crate::autopilot::land_at_field(land_at.filter(|_| supervised_agent.is_some()));
         let task = crate::autopilot::task_field(face, claimed_here || proven, supervised_agent);
@@ -3233,7 +3242,7 @@ impl crate::App {
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
                  revision=0 enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
                  fabric={fabric} {fabric_tail} fleet={fleet} \
-                 {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} program_state={program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
+                 {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
                  {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
                  human_seq={human_seq} {launch} {owner} \
                  history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
@@ -3267,7 +3276,7 @@ impl crate::App {
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
              conflict={} revision={} enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
              fabric={fabric} {fabric_tail} fleet={fleet} \
-             {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} program_state={program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
+             {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
              {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
              human_seq={human_seq} {launch} {owner} \
              history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \

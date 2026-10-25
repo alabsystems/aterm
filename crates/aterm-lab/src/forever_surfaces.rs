@@ -821,9 +821,11 @@ fn no_footer(c: &Chip) -> bool {
     c.face == "-" && c.drawn.is_none() && c.why.as_deref() == Some("no-footer")
 }
 
-/// Whether harness `program` leaves `c`'s footer bare: agy on an off face with a switch (`claude_footer::bare_while_off`).
+/// Whether harness `program` leaves `c`'s footer bare: agy with its harness switch off, under
+/// the master's or its agent's switch (`claude_footer::bare_while_off`); Autopilot Off keeps the
+/// harness on, and its footer.
 fn bare_under_switch(program: &str, c: &Chip) -> bool {
-    program == "agy" && matches!(c.face.as_str(), "off" | "agent-off" | "master-off")
+    program == "agy" && matches!(c.face.as_str(), "agent-off" | "master-off")
 }
 
 /// Whether `c` is `chrome`'s `drawn=- why=switch-only` line.

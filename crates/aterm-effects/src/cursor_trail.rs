@@ -322,17 +322,17 @@ impl CursorTrail {
 
     /// Host key hint for one plain typed-glyph or Backspace echo keypress.
     #[inline]
-    pub fn note_typed(&mut self, now: Instant) {
+    pub const fn note_typed(&mut self, now: Instant) {
         self.type_hint.stamp(now);
     }
 
     /// Host coalesced typing across batched key events between two render callbacks.
     #[inline]
-    pub fn note_typed_batch(&mut self, now: Instant, keys: u32) {
+    pub const fn note_typed_batch(&mut self, now: Instant, keys: u32) {
         if keys == 0 {
             return;
         }
-        if keys <= u32::from(HIDE_BRIDGE_MAX_DIST) {
+        if keys <= HIDE_BRIDGE_MAX_DIST as u32 {
             self.note_typed(now);
         } else {
             self.note_move(now);
@@ -417,7 +417,7 @@ impl CursorTrail {
     /// Scripted typed-move twin for previews, examples, and benchmarks.
     #[doc(hidden)]
     #[inline]
-    pub fn note_synthetic_typed(&mut self, now: Instant) {
+    pub const fn note_synthetic_typed(&mut self, now: Instant) {
         self.note_typed(now);
     }
 
@@ -480,6 +480,7 @@ impl CursorTrail {
     }
 
     /// Whether any spark is still alive (the host keeps the animation timer armed).
+    #[must_use]
     #[inline]
     pub const fn is_active(&self) -> bool {
         !self.sparks.is_empty()
@@ -913,7 +914,7 @@ fn line_cells(r0: i32, c0: i32, r1: i32, c1: i32) -> Vec<(i32, i32)> {
 mod tests {
     use super::*;
 
-    fn cfg(enabled: bool) -> TrailConfig {
+    const fn cfg(enabled: bool) -> TrailConfig {
         TrailConfig {
             enabled,
             duration: Duration::from_millis(200),
@@ -1729,7 +1730,7 @@ mod tests {
         );
     }
 
-    fn cfg_q(q: f32) -> TrailConfig {
+    const fn cfg_q(q: f32) -> TrailConfig {
         TrailConfig {
             intensity: q,
             ..cfg(true)

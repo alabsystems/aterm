@@ -41,12 +41,13 @@ pub(crate) fn drawn_for(program: Option<&str>) -> bool {
 }
 
 /// Whether `program`'s composer is left bare but for the top rule's switch under `switch` (agy
-/// while its switch is not on).
+/// while its switch holds the harness off, [`crate::autopilot::HarnessSwitch::is_off`]).
 pub(crate) fn bare_while_off(
     program: Option<aterm_phase::Program>,
     switch: Option<crate::autopilot::HarnessSwitch>,
 ) -> bool {
-    program == Some(aterm_phase::Program::Agy) && switch.is_some_and(|s| !s.is_on())
+    program == Some(aterm_phase::Program::Agy)
+        && switch.is_some_and(crate::autopilot::HarnessSwitch::is_off)
 }
 
 /// One pane's painted light block.
@@ -1309,7 +1310,6 @@ struct RulePaint {
     /// Where the facts' cells start in `cells` ([`FactWrite`]).
     facts_at: usize,
     spans: footer::FactSpans,
-    account: Option<(u16, u16)>,
     /// The facts' native emoji clusters and combining marks at their columns in `cells`
     /// ([`FooterUndo::publish_text`]).
     clusters: Vec<(usize, Box<str>)>,
@@ -1552,7 +1552,6 @@ impl PaneFooter {
             glass: composed.paint.glass.clone(),
             facts_at: composed.paint.facts_at,
             spans: composed.paint.spans,
-            account: composed.paint.account,
         }
     }
 }
@@ -1567,7 +1566,6 @@ struct Composed {
     glass: std::ops::Range<usize>,
     facts_at: usize,
     spans: footer::FactSpans,
-    account: Option<(u16, u16)>,
 }
 
 /// Whether `text` reads as `cells`' chars.
@@ -3754,8 +3752,7 @@ fn compose_rule_spans(
         out.push(blank);
     }
     let mut facts: Vec<RenderCell> = Vec::new();
-    let mut spans: footer::FactSpans = [None; 6];
-    let mut account: Option<(u16, u16)> = None;
+    let mut spans = footer::FactSpans::default();
     let mut clusters = Vec::new();
     let mut combining = Vec::new();
     if !fit.segments.is_empty() {
@@ -3776,7 +3773,6 @@ fn compose_rule_spans(
         let lifted = |cell: RenderCell, fg: [u8; 3]| RenderCell { fg, ..cell };
         let set = footer::set_facts(&fit.segments);
         spans = footer::fact_spans(&set, &fit.segments);
-        account = footer::account_span(&set, &fit.segments);
         let lit_span = lit.and_then(|kind| {
             spans
                 .iter()
@@ -3785,12 +3781,20 @@ fn compose_rule_spans(
                 .copied()
         });
         let lit_cells = lit_span.map(|span| usize::from(span.cells.0)..usize::from(span.cells.1));
+        // Every `·` of the account unit, its weekly words' own among them, reads as a join.
+        let unit = spans
+            .iter()
+            .flatten()
+            .find(|span| span.kind == FactKind::Account)
+            .map(|span| usize::from(span.cells.0)..usize::from(span.cells.1));
         let mut lit_inks: Vec<(isize, [u8; 3])> = Vec::new();
         facts = vec![blank; set.cells + 2];
         for glyph in &set.glyphs {
             let lit = lit_cells.as_ref().is_some_and(|c| c.contains(&glyph.cell));
+            let joins = glyph.ch == footer::JOIN_MARK
+                && unit.as_ref().is_some_and(|c| c.contains(&glyph.cell));
             let ink = match (
-                glyph.mark || glyph.ch == footer::RESET_MARK,
+                glyph.mark || glyph.ch == footer::RESET_MARK || joins,
                 glyph.quiet,
                 lit,
             ) {
@@ -3859,7 +3863,6 @@ fn compose_rule_spans(
         glass,
         facts_at,
         spans,
-        account,
         clusters,
         combining,
     }
@@ -5537,7 +5540,6 @@ impl App {
                 glass,
                 facts_at,
                 spans,
-                account,
             }) = composed.filter(|c| c.cells > 0)
             else {
                 if let Some(block) = block {
@@ -5566,17 +5568,6 @@ impl App {
                     fact: crate::claude_lights::Fact::of(span.kind),
                     restores: span.restores,
                 }));
-            if let Some((start, end)) = account {
-                lists.facts.push(FactWrite {
-                    frame_row: pane.frame_row,
-                    term_row: pane.term_row,
-                    edit_col,
-                    session: pane.session,
-                    cols: (at + usize::from(start), at + usize::from(end)),
-                    fact: crate::claude_lights::Fact::Account,
-                    restores: FactMask::default(),
-                });
-            }
             match (block, lights_at) {
                 (Some(block), Some(at)) => lists.lit.push(Lit {
                     session: pane.session,
@@ -6147,7 +6138,8 @@ enum SwitchInk {
     Button,
     /// A cap of the button (`▐`, `▌`).
     Cap,
-    /// `◐ turning on`: the accent, quieted and floored to 4.5:1 ([`turning_ink`]).
+    /// `◐ turning on` or `◐ turning off`: the accent, quieted and floored to 4.5:1
+    /// ([`turning_ink`]).
     Turning,
 }
 
@@ -6186,7 +6178,8 @@ impl SwitchFace {
     }
 
     /// The face on a line that wears a theme ([`SwitchInk::Arc`], [`compose_top`]):
-    /// the arc runs through its words, a lit pill's caps and fill keeping their inks.
+    /// the arc runs through its words, a lit pill's caps and fill keeping their inks (the
+    /// accent, or the white line's white, [`switch_cell`]).
     fn on_arc(&mut self) {
         let span = self.switch.clone();
         let arcs = |&(ch, ink): &(char, SwitchInk)| {
@@ -6281,19 +6274,17 @@ fn switch_face(paint: SwitchPaint, tier: usize) -> Option<SwitchFace> {
             }
             f.push(" ", SwitchInk::Label);
         }
-        HarnessSwitch::Turning => {
+        HarnessSwitch::Turning | HarnessSwitch::TurningOff => {
             let words = [2, 1, 0, 0].get(tier).copied()?;
             f.push(" ", SwitchInk::Label);
             f.switch.start = f.len;
             label(&mut f, words);
-            f.push(
-                if tier < 3 {
-                    "\u{25d0} turning on"
-                } else {
-                    "\u{25d0} on"
-                },
-                SwitchInk::Turning,
-            );
+            let (wide, narrow) = if paint.face == HarnessSwitch::Turning {
+                ("\u{25d0} turning on", "\u{25d0} on")
+            } else {
+                ("\u{25d0} turning off", "\u{25d0} off")
+            };
+            f.push(if tier < 3 { wide } else { narrow }, SwitchInk::Turning);
             f.switch.end = f.len;
             f.push(" ", SwitchInk::Label);
         }
@@ -6330,12 +6321,22 @@ fn switch_cell(
     let accent = || legible_on(mark_fg, blank.bg);
     let quiet = || legible_on(mix(blank.fg, blank.bg, 0.3), blank.bg);
     let agent = || legible_on(mix(accent(), blank.fg, 0.35), blank.bg);
+    // On Autopilot Off's white line (`CardPalette::Off`) a lit pill wears the moonbow's white,
+    // as its words do; elsewhere a lit pill and an off face's `on` button wear the accent.
+    let pill = || match palette {
+        Some(white @ aterm_effects::harness_card::CardPalette::Off)
+            if paint.face == HarnessSwitch::On =>
+        {
+            brand_letter_fg(white, 0.0, blank)
+        }
+        _ => accent(),
+    };
     let fill = || {
-        let accent = accent();
+        let pill = pill();
         if paint.hover {
-            legible_on(mix(accent, blank.fg, 0.25), blank.bg)
+            legible_on(mix(pill, blank.fg, 0.25), blank.bg)
         } else {
-            accent
+            pill
         }
     };
     let on = paint.face.is_on();
@@ -6353,7 +6354,9 @@ fn switch_cell(
                     cell.bold = true;
                 }
                 HarnessSwitch::Off(_) => cell.fg = letter,
-                HarnessSwitch::Turning => cell.fg = turning_ink(letter, blank.bg),
+                HarnessSwitch::Turning | HarnessSwitch::TurningOff => {
+                    cell.fg = turning_ink(letter, blank.bg);
+                }
             }
         }
         SwitchInk::Label => {
@@ -6387,8 +6390,8 @@ fn switch_cell(
     cell
 }
 
-/// The settling switch's ink (`◐ turning on`, [`switch_cell`]): `ink` quieted 30% toward the
-/// ground, then floored back to 4.5:1 against it.
+/// The settling switch's ink (`◐ turning on` or `off`, [`switch_cell`]): `ink` quieted 30%
+/// toward the ground, then floored back to 4.5:1 against it.
 fn turning_ink(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
     legible_on(mix(ink, ground, 0.3), ground)
 }
@@ -8863,7 +8866,6 @@ mod tests {
             ]
         );
         for off in [
-            SwitchOff::Session,
             SwitchOff::Master,
             SwitchOff::Agent(aterm_phase::Program::Claude),
         ] {
@@ -8893,6 +8895,15 @@ mod tests {
                 " \u{25d0} on ",
             ]
         );
+        assert_eq!(
+            texts(paint(HarnessSwitch::TurningOff)),
+            [
+                " alab harness \u{25d0} turning off ",
+                " alab \u{25d0} turning off ",
+                " \u{25d0} turning off ",
+                " \u{25d0} off ",
+            ]
+        );
         let versions = std::iter::once(None).chain(
             aterm_phase::Program::ALL
                 .into_iter()
@@ -8901,8 +8912,9 @@ mod tests {
         for version in versions {
             for face in [
                 HarnessSwitch::On,
-                HarnessSwitch::Off(SwitchOff::Session),
+                HarnessSwitch::Off(SwitchOff::Master),
                 HarnessSwitch::Turning,
+                HarnessSwitch::TurningOff,
             ] {
                 let p = SwitchPaint {
                     face,
@@ -8914,7 +8926,7 @@ mod tests {
                 }
             }
         }
-        let off = paint(HarnessSwitch::Off(SwitchOff::Session));
+        let off = paint(HarnessSwitch::Off(SwitchOff::Master));
         for (tier, face) in faces(off).into_iter().enumerate() {
             let room = face.len + 4;
             assert_eq!(
@@ -8975,7 +8987,7 @@ mod tests {
             (Some(&SwitchInk::Arc(0)), Some(&SwitchInk::Arc(u8::MAX))),
             "the arc runs through the words"
         );
-        let off = paint(HarnessSwitch::Off(SwitchOff::Session));
+        let off = paint(HarnessSwitch::Off(SwitchOff::Master));
         for f in (0..SWITCH_TIERS).filter_map(|t| switch_face(off, t)) {
             let button = f.button.clone().expect("CONTROL: every off form's button");
             assert!(f.switch.end <= button.start, "CONTROL: {:?}", f.text());
@@ -9683,7 +9695,7 @@ mod tests {
         let fit = footer::RuleFit {
             segments: vec![
                 footer::Segment::plain(footer::ACCOUNT_MARK, "account unavailable"),
-                footer::Segment::plain(footer::WEEKLY_MARK, "weekly unavailable"),
+                footer::Segment::joined(footer::WEEKLY_MARK, "weekly unavailable"),
                 footer::Segment {
                     split: Some("Opus 5.5 ".len()),
                     ..footer::Segment::plain(footer::MODEL_MARK, "Opus 5.5 xhigh")
@@ -9704,6 +9716,7 @@ mod tests {
         );
         let step = 1.0 / f32::from(Script::NUDGES_PER_CELL);
         for kind in [
+            FactKind::Account,
             FactKind::Model,
             FactKind::Effort,
             FactKind::Path,
@@ -9773,6 +9786,121 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// THE ACCOUNT, ITS PLAN AND ITS WEEK READ AS ONE UNIT ON THE GLASS, `⎆ <email> · <plan> ·
+    /// <week>`, every `·` of it in the marks' ink (the week's own too), and the next fact the
+    /// facts' gap away; lit, every glyph of it is lifted under one underline and the next fact
+    /// stays as at rest.
+    #[test]
+    fn the_account_unit_reads_and_lights_as_one() {
+        use aterm_agent::harness::profile::{SubscriptionDisplay, WeeklyGap};
+        use aterm_core::terminal::UnderlineStyle;
+        let blank = cell(' ', [200, 200, 200]);
+        let rule = cell('\u{2500}', [60, 60, 60]);
+        let mark_fg = [0, 128, 255];
+        let facts = FooterFacts {
+            subscription: Some(SubscriptionDisplay {
+                email: Some("owner@example.com".into()),
+                plan: Some("Max 20x".into()),
+                weekly_gap: Some(WeeklyGap::Untapped),
+                ..Default::default()
+            }),
+            ..facts()
+        };
+        let room = 120;
+        let fit = footer::fit_rule(&facts, room, None);
+        let rest = compose_rule_spans(&fit, None, rule, blank, mark_fg, room, None);
+        assert_eq!(
+            text_of(&rest.cells),
+            format!(
+                " \u{2386} owner@example.com \u{b7} Max 20x \u{b7} {}   \
+                 \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main ",
+                WeeklyGap::Untapped.words()
+            )
+        );
+        let unit = rest
+            .spans
+            .iter()
+            .flatten()
+            .find(|span| span.kind == FactKind::Account)
+            .copied()
+            .expect("the unit's span");
+        assert_eq!(
+            rest.spans
+                .iter()
+                .flatten()
+                .filter(|s| s.kind == FactKind::Account)
+                .count(),
+            1,
+            "one span"
+        );
+        let at = rest.facts_at + 1;
+        let own = at + usize::from(unit.cells.0)..at + usize::from(unit.cells.1);
+        let mark = rest.cells[own.start];
+        assert_eq!(mark.ch, footer::ACCOUNT_MARK);
+        let joins: Vec<&RenderCell> = rest.cells[own.clone()]
+            .iter()
+            .filter(|c| c.ch == footer::JOIN_MARK)
+            .collect();
+        assert_eq!(joins.len(), 3, "two joins and the week's own");
+        assert!(
+            joins.iter().all(|c| c.fg == mark.fg),
+            "every join in the marks' ink"
+        );
+        let word = rest.cells[own.clone()]
+            .iter()
+            .find(|c| c.ch == 'M')
+            .expect("the plan");
+        assert_ne!(word.fg, mark.fg, "CONTROL: a word is in the values' ink");
+        let lit = compose_rule_spans(
+            &fit,
+            None,
+            rule,
+            blank,
+            mark_fg,
+            room,
+            Some(FactKind::Account),
+        );
+        for (c, cell) in lit.cells.iter().enumerate() {
+            if own.contains(&c) {
+                if cell.ch != ' ' {
+                    assert_ne!(
+                        cell.fg, rest.cells[c].fg,
+                        "cell {c} ({:?}) is lifted",
+                        cell.ch
+                    );
+                }
+            } else if cell.underline == UnderlineStyle::None {
+                assert_eq!(
+                    (cell.ch, cell.fg),
+                    (rest.cells[c].ch, rest.cells[c].fg),
+                    "cell {c} is as at rest"
+                );
+            }
+        }
+        let under: Vec<usize> = (0..lit.cells.len())
+            .filter(|&c| lit.cells[c].underline == UnderlineStyle::Single)
+            .collect();
+        assert!(
+            under.windows(2).all(|w| w[1] == w[0] + 1),
+            "one underline: {under:?}"
+        );
+        let inked: Vec<usize> = own.clone().filter(|&c| lit.cells[c].ch != ' ').collect();
+        assert!(
+            under.len() + 2 >= inked.last().unwrap() - inked.first().unwrap(),
+            "under the whole unit: {under:?}, its ink {inked:?}"
+        );
+        let model = lit
+            .spans
+            .iter()
+            .flatten()
+            .find(|span| span.kind == FactKind::Model)
+            .expect("the model's span");
+        assert!(
+            under.iter().all(|&c| c < at + usize::from(model.cells.0)),
+            "the model is not lit"
+        );
     }
 
     #[test]
@@ -12765,8 +12893,7 @@ mod tests {
         let strip = strip(&app, wid);
         let card_line = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
         assert!(
-            card_line.contains("enhanced by aterm harness")
-                && card_line.contains("\u{00B7} agy v0.1")
+            card_line.contains("enhanced by aterm harness v0.1 \u{00B7} agy")
                 && !card_line.contains("autopilot"),
             "agy card line on row top+4: {card_line:?}"
         );
@@ -12959,8 +13086,7 @@ mod tests {
         let strip = strip(&app, wid);
         let card_line = text_of(&app.windows[&wid].input_scratch.cells[strip + 2]);
         assert!(
-            card_line.contains("enhanced by aterm harness")
-                && card_line.contains("\u{00B7} muse v0.1 \u{00B7}")
+            card_line.contains("enhanced by aterm harness v0.1 \u{00B7} muse \u{00B7}")
                 && card_line.contains("autopilot"),
             "muse card line on row top+1: {card_line:?}"
         );
@@ -13720,7 +13846,7 @@ mod tests {
     }
 
     #[test]
-    fn single_toggle_turns_the_harness_white_and_back_for_claude_agy_and_muse() {
+    fn autopilot_off_keeps_the_harness_lit_in_white_for_claude_agy_and_muse() {
         let rule = "\u{2500}".repeat(160);
         let claude_fixture = vec![
             String::new(),
@@ -13841,7 +13967,7 @@ mod tests {
                 text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row + 2]);
             assert!(
                 bottom_on.contains("\u{2386} ")
-                    && bottom_on.contains("\u{25f7} weekly ")
+                    && bottom_on.contains(" \u{b7} weekly ")
                     && bottom_on.contains("\u{25D0} ctx 84% left"),
                 "{prog}: standardized bottom rule carries account email, weekly budget, and context: {bottom_on:?}"
             );
@@ -13874,14 +14000,14 @@ mod tests {
             if prog == "agy" {
                 assert!(
                     card_on.contains("enhanced by aterm harness")
-                        && card_on.contains("\u{00B7} agy v0.1"),
+                        && card_on.contains("harness v0.1 \u{00B7} agy"),
                     "agy: active harness draws launch card banner: {card_on:?}"
                 );
             } else {
                 assert!(
                     card_on.contains("enhanced by aterm harness")
                         && card_on.contains("autopilot")
-                        && (prog != "muse" || card_on.contains("\u{00B7} muse v0.1")),
+                        && (prog != "muse" || card_on.contains("harness v0.1 \u{00B7} muse")),
                     "{prog}: active harness draws launch card banner: {card_on:?}"
                 );
             }
@@ -13895,78 +14021,55 @@ mod tests {
                 "{prog}: active harness draws rainbow kitty"
             );
 
-            let off_view = app.toggle_session_harness(session);
-            assert_eq!(
-                off_view.mode(),
+            assert!(app.set_session_autopilot(
+                session,
                 Some(aterm_agent::supervise::Autopilot::Off),
-                "{prog}: single toggle switches harness to Off"
+                crate::autopilot::Surface::Chip
+            ));
+            assert_eq!(
+                app.session_autopilot(session).1.mode(),
+                Some(aterm_agent::supervise::Autopilot::Off),
+                "{prog}: the session's word is written Off"
             );
             frame(&mut app, wid);
 
             let top_off = text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
             let card_off = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);
             let line_off = chip_line(&app);
+            assert!(
+                line_off.contains(" face=off drawn=\"\u{25CB} off\" "),
+                "{prog}: the off chip is drawn: {line_off}"
+            );
+            assert!(
+                top_off.contains(expected_switch)
+                    && top_off.starts_with(&expected_lockup)
+                    && !top_off.contains("alab kitty"),
+                "{prog}: Autopilot Off keeps the harness's switch lit on the white top rule, the \
+                 lockup still at its left and no wordmark: {top_off:?}"
+            );
+            assert!(
+                card_off.contains("enhanced by aterm harness")
+                    && (prog == "agy" || card_off.contains("autopilot \u{25CB} off")),
+                "{prog}: Autopilot Off wears the white card: {card_off:?}"
+            );
             if prog == "agy" {
-                let field = |key: &str| {
-                    line_off
-                        .split_whitespace()
-                        .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
-                };
-                assert_eq!(
-                    ["face", "drawn", "why", "spoken", "description"].map(field),
-                    [
-                        Some("off"),
-                        Some("-"),
-                        Some("switch-only"),
-                        Some("-"),
-                        Some("-")
-                    ],
-                    "agy: chrome names the footer left bare on purpose, not a tab behind: \
-                     {line_off}"
-                );
-            } else {
-                assert!(
-                    line_off.contains(" face=off drawn=\"\u{25CB} off\" "),
-                    "{prog}: the off chip is drawn: {line_off}"
-                );
-            }
-            if prog == "agy" {
-                assert!(
-                    top_off
-                        .contains(" alab harness v0.1 \u{25CB} off \u{2590} \u{25CF} on \u{258C} ")
-                        && !top_off.starts_with(&expected_lockup),
-                    "agy: toggled-off harness leaves only the off switch button on the top rule: {top_off:?}"
-                );
-                assert!(
-                    !card_off.contains("enhanced by aterm harness"),
-                    "agy: toggled-off harness disables launch card banner: {card_off:?}"
-                );
                 let raw_md = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
                 assert_eq!(
                     raw_md.trim_end(),
                     "\u{25CF} # Heading",
-                    "agy: toggled-off harness restores raw transcript row"
-                );
-            } else {
-                assert!(
-                    top_off.contains(" alab harness \u{25CB} off \u{2590} on \u{258C} ")
-                        && top_off.starts_with(&expected_lockup)
-                        && !top_off.contains("alab kitty"),
-                    "{prog}: toggled-off harness draws its off switch, `on` its button, on the \
-                     white top rule, the lockup still at its left and no wordmark: {top_off:?}"
-                );
-                assert!(
-                    card_off.contains("enhanced by aterm harness")
-                        && card_off.contains("autopilot \u{25CB} off"),
-                    "{prog}: toggled-off harness wears the white card: {card_off:?}"
+                    "agy: Autopilot Off restores raw transcript row"
                 );
             }
 
-            let on_view = app.toggle_session_harness(session);
-            assert_eq!(
-                on_view.mode(),
+            assert!(app.set_session_autopilot(
+                session,
                 Some(aterm_agent::supervise::Autopilot::Cruise),
-                "{prog}: second single toggle seamlessly re-enables Cruise"
+                crate::autopilot::Surface::Chip
+            ));
+            assert_eq!(
+                app.session_autopilot(session).1.mode(),
+                Some(aterm_agent::supervise::Autopilot::Cruise),
+                "{prog}: the session's word is written Cruise again"
             );
             frame(&mut app, wid);
 
@@ -13986,11 +14089,15 @@ mod tests {
                 !app.windows[&wid].claude_lights.border_toggles.is_empty(),
                 "{prog}: border_toggles registered when On"
             );
-            app.toggle_session_harness(session);
+            assert!(app.set_session_autopilot(
+                session,
+                Some(aterm_agent::supervise::Autopilot::Off),
+                crate::autopilot::Surface::Chip
+            ));
             frame(&mut app, wid);
             assert!(
                 !app.windows[&wid].claude_lights.border_toggles.is_empty(),
-                "{prog}: border_toggles still registered when Off, so its `on` turns it back on"
+                "{prog}: border_toggles still registered under Autopilot Off: the harness's switch"
             );
 
             host.shutdown_and_join();
@@ -14161,9 +14268,8 @@ mod tests {
 
         let (off, text) = under(&mut app, Autopilot::Off);
         assert!(
-            text.contains(" alab harness \u{25CB} off \u{2590} on \u{258C} ")
-                && !text.contains("alab kitty"),
-            "Off's switch says off, `on` its button, no wordmark: {text:?}"
+            text.contains(" alab harness \u{25CF} on ") && !text.contains("alab kitty"),
+            "Autopilot Off's switch says the harness is on, no wordmark: {text:?}"
         );
         for c in &off {
             let spread = c.iter().max().unwrap() - c.iter().min().unwrap();
@@ -14174,7 +14280,7 @@ mod tests {
         assert!(!app.session_autopilot(session).2, "the claim is given back");
         let (released, text) = under(&mut app, Autopilot::Off);
         assert!(
-            text.contains("alab harness \u{25CB} off"),
+            text.contains("alab harness \u{25CF} on"),
             "no claim: {text:?}"
         );
         assert_eq!(released, off, "white with no claim");
@@ -14196,8 +14302,19 @@ mod tests {
         assert!(app.press_claude_light(wid), "the switch takes the press");
         assert_eq!(
             app.session_autopilot(session).0,
-            Some(Autopilot::Cruise),
-            "Off's switch turns the harness back on"
+            Some(Autopilot::Off),
+            "the lit switch writes no Autopilot word"
+        );
+        let wrote = app
+            .messages
+            .log()
+            .records()
+            .rfind(|r| r.key.as_deref() == Some("harness.switch-save.harness.enabled"))
+            .map(|r| r.detail.join(" "))
+            .expect("the master switch's write was made");
+        assert!(
+            wrote.contains("harness.enabled = false"),
+            "the lit switch turns the whole harness off: {wrote:?}"
         );
 
         claim();
@@ -14220,9 +14337,6 @@ mod tests {
                     !text.contains('\u{2726}'),
                     "Off wears no wordmark: {text:?}"
                 );
-                let off = cells.iter().position(|c| c.ch == '\u{25CB}').unwrap();
-                assert!(contrast(cells[off].fg) >= 4.5, "Off's state on paper");
-                continue;
             }
             let face: Vec<char> = "alab harness \u{25CF} on".chars().collect();
             let at = (0..cells.len().saturating_sub(face.len()))

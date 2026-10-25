@@ -37,7 +37,14 @@ impl fmt::Display for PrivateFileError {
 
 impl std::error::Error for PrivateFileError {}
 
-const ACL_OPEN: &str = "an access list (ACL) grants other users access; `chmod -N` removes it";
+/// Why a file or directory with an access list for other users is not private.
+pub const ACL_OPEN: &str = "an access list (ACL) grants other users access; `chmod -N` removes it";
+/// Why a file others may read is not private.
+pub const FILE_OPEN: &str = "it is open to other users (want 0600)";
+/// Why a directory others may enter is not private.
+pub const DIR_OPEN: &str = "the directory is open to other users (want 0700)";
+/// Why a file with a second hard link is not private: that link is another copy of it.
+pub const ANOTHER_LINK: &str = "it has another link";
 
 fn file_verdict(file: &std::fs::File) -> Result<std::fs::Metadata, PrivateFileError> {
     use astream_sys::NotPrivate;
@@ -46,9 +53,7 @@ fn file_verdict(file: &std::fs::File) -> Result<std::fs::Metadata, PrivateFileEr
         Err(NotPrivate::Kind(_)) => Err(PrivateFileError::Malformed("not a regular file")),
         Err(NotPrivate::Owner(_)) => Err(PrivateFileError::NotPrivate("it is another user's")),
         Err(NotPrivate::Acl) => Err(PrivateFileError::NotPrivate(ACL_OPEN)),
-        Err(NotPrivate::Mode(_)) => Err(PrivateFileError::NotPrivate(
-            "it is open to other users (want 0600)",
-        )),
+        Err(NotPrivate::Mode(_)) => Err(PrivateFileError::NotPrivate(FILE_OPEN)),
     }
 }
 
@@ -160,9 +165,7 @@ pub fn open_private(
         }
         DirIs::Acl => return Err(PrivateFileError::NotPrivate(ACL_OPEN)),
         DirIs::Open(_) => {
-            return Err(PrivateFileError::NotPrivate(
-                "the directory is open to other users (want 0700)",
-            ));
+            return Err(PrivateFileError::NotPrivate(DIR_OPEN));
         }
         _ => {}
     }
@@ -176,7 +179,7 @@ pub fn open_private(
     };
     let meta = file_verdict(&file)?;
     if meta.nlink() != 1 {
-        return Err(PrivateFileError::NotPrivate("it has another link"));
+        return Err(PrivateFileError::NotPrivate(ANOTHER_LINK));
     }
     Ok((file, meta))
 }

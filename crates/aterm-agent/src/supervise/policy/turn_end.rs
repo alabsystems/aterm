@@ -9905,6 +9905,11 @@ pub struct TurnEndReading {
     pub login_at_wall: Option<aterm_phase::LoginAtWall>,
     pub login_method: Option<aterm_phase::LoginMethod>,
     pub login_shared: Option<super::login::LoginShared>,
+    /// THE LOGIN MOVED OFF THE LIMIT'S ACCOUNT: the session's Claude Code
+    /// profile names another account than the one its standing limit was
+    /// read under (`IdleHost::login_account`), on the one reading that
+    /// first sees it ([`TurnEndState::login_resume`]).
+    pub login_moved: bool,
     pub roster: Option<RosterWord>,
     pub answered: Option<ScreenAnswer>,
     pub record_turn: Option<RecordTurn>,
@@ -10218,6 +10223,7 @@ impl TurnEndReading {
             login_at_wall: claude.then(|| aterm_phase::login_at_wall(rows)).flatten(),
             login_method: None,
             login_shared: None,
+            login_moved: false,
             roster: None,
             answered: claude.then(|| ScreenAnswer::of(rows)).flatten(),
             record_turn: None,
@@ -10547,6 +10553,12 @@ pub struct WaitedLimit {
 }
 
 impl WaitedLimit {
+    /// The limit's kind.
+    #[must_use]
+    pub const fn kind(&self) -> WallKind {
+        self.kind
+    }
+
     /// Whether a limit notice of `kind` whose words name the reset `reset` names THIS limit's reset: of its class, the same clock.
     #[must_use]
     pub fn named_by(&self, kind: WallKind, reset: Option<&str>) -> bool {
@@ -10826,6 +10838,14 @@ pub struct TurnEndState {
     account_startup: bool,
     account_resume: bool,
     account_resume_seed: bool,
+    /// A LIMIT'S RESUME OWED TO A LOGIN MOVED ELSEWHERE
+    /// ([`TurnEndReading::login_moved`]): a usage limit or model bucket
+    /// stood when the session's login moved off its account, so its reset
+    /// binds no longer — the reset dropped and one resume owed, as after a
+    /// move this session's host made ([`Self::account_resume`]), until an
+    /// act is taken, a turn is served or a prompt answered, or the limit's
+    /// track ends or gives way to another wall.
+    login_resume: bool,
     account_resumed: Option<i64>,
     limit_try: Option<LimitTry>,
     limit_ended: bool,
@@ -10978,6 +10998,7 @@ impl TurnEndState {
             account_startup: false,
             account_resume: false,
             account_resume_seed: false,
+            login_resume: false,
             account_resumed: None,
             limit_try: None,
             limit_ended: false,
@@ -12960,6 +12981,12 @@ impl TurnEndState {
         self.account_ahead_unmade = None;
     }
 
+    /// Whether a limit's resume is owed to a login moved elsewhere ([`Self::login_resume`]).
+    #[must_use]
+    pub const fn login_resume_owed(&self) -> bool {
+        self.login_resume
+    }
+
     /// Whether the wall's resume is owed after a move this session's host made at a wall ([`Self::account_resume`]).
     #[must_use]
     pub const fn account_resume_owed(&self) -> bool {
@@ -13748,11 +13775,10 @@ impl TurnEndState {
                 .is_some_and(|t| t.class == WallClass::Auth && t.login.hand);
         let hand = self.hand(reading, now);
         let theirs = !carried && !reading.interrupted && (hand || redelivers);
-        let prompted = !went_on
-            && (hand
-                || reading
-                    .answered
-                    .is_some_and(|a| Some(a.prompt) != self.last_prompt));
+        let answered_anew = reading
+            .answered
+            .is_some_and(|a| Some(a.prompt) != self.last_prompt);
+        let prompted = !went_on && (hand || answered_anew);
         let seed_was_armed = seeded.is_some();
         let off_landing = self.off_landing.take();
         let ok_to_leave = reading.wall.is_none() && !reading.pending_input;
@@ -13786,6 +13812,14 @@ impl TurnEndState {
             (Some(RULE_HOST_TURN), worked) => {
                 let d = worked.unwrap_or_default();
                 let carry_on = host == Some(HostTurn::CarryOn);
+                if act_taken && self.left_to_person() {
+                    // A PERSON'S EXCHANGE LEFT TO THEM ENDS WHERE THE HOST'S
+                    // TURN IS TAKEN (an upgrade's restore notice, a carry-on):
+                    // the reply answers the host, not them, so the task is
+                    // open again and this point is judged as the host's.
+                    self.exchange = false;
+                    self.done = 0;
+                }
                 if d >= min && (!done || carry_on) {
                     self.followed = Some(RULE_HOST_TURN);
                     self.point_worked = d;
@@ -14270,6 +14304,7 @@ impl TurnEndState {
                         t.class == WallClass::Auth || (named_class(t.class) && t.login.back_typed)
                     });
                     self.wall = None;
+                    self.login_resume = false;
                     self.fallback_unmade = false;
                 } else if interrupted && let Some(t) = self.wall.as_mut() {
                     t.login.cancelled = true;
@@ -14322,6 +14357,21 @@ impl TurnEndState {
                     n.jitter = reading.jitter;
                 }
             }
+        }
+        // A turn served since the move, a prompt answered since (by the new login's limit,
+        // no busy spell seen), or a limit's track that ended or gave way to another wall,
+        // owes the move nothing: a limit read after it is the new login's.
+        if reading.worked.is_some()
+            || answered_anew
+            || !self.wall.as_ref().is_some_and(|t| named_class(t.class))
+        {
+            self.login_resume = false;
+        }
+        if reading.login_moved
+            && let Some(t) = self.wall.as_mut().filter(|t| named_class(t.class))
+        {
+            t.named = None;
+            self.login_resume = true;
         }
         let startup = std::mem::take(&mut self.account_startup);
         if std::mem::take(&mut self.account_resume_seed)
@@ -14698,6 +14748,7 @@ impl TurnEndState {
         self.account_asked |= self.account.is_some();
         self.account_startup = false;
         self.account_resume = false;
+        self.login_resume = false;
         self.reset_resume = None;
         let in_limits_place = self.in_limits_place(rule);
         if (rule == RULE_LIMIT_RESUME || in_limits_place)
@@ -14974,7 +15025,7 @@ impl TurnEndState {
         self.countdown_gone(n.first) || self.written_before_start(n.written)
     }
 
-    /// Records a turn the host typed (upgrade notice, carry-on; [`RULE_HOST_TURN`]), awaited like this policy's acts.
+    /// Records a turn the host typed (upgrade notice, carry-on; [`RULE_HOST_TURN`]), awaited like this policy's acts; once the agent takes it, a person's exchange left to them ([`Self::left_to_person`]) is over.
     pub fn host_typed(&mut self, now: Instant, kind: HostTurn) {
         self.keyed_by_harness();
         self.fallback_unasked = false;
@@ -14991,6 +15042,7 @@ impl TurnEndState {
         self.account_asked |= self.account.is_some();
         self.account_startup = false;
         self.account_resume = false;
+        self.login_resume = false;
         self.reset_resume = None;
         self.awaiting = Some(Awaited {
             rule: RULE_HOST_TURN,
@@ -16225,8 +16277,9 @@ fn act_at_point(
         );
     }
     if let Some(kind) = reading.wall {
-        // THE SAME REPLY AGAIN ([`TurnEndState::repeats`]): the wall answered its spent tries the same.
-        if state.repeats(reading) {
+        // THE SAME REPLY AGAIN ([`TurnEndState::repeats`]): the wall answered its spent tries the same
+        // — an old login's answers, where the login moved since ([`TurnEndState::login_resume`]).
+        if !state.login_resume && state.repeats(reading) {
             return ended_at(trace, SAME_REPLY, TurnEndAction::Nothing);
         }
         let act = wall_action(
@@ -16312,13 +16365,15 @@ fn act_past_walls(
     continue_as: &dyn Fn(&'static str) -> TurnEndAction,
     type_as: &dyn Fn(&'static str, &str) -> TurnEndAction,
 ) -> TurnEndAction {
-    // THE SAME REPLY AGAIN ([`TurnEndState::repeats`]), the screen's or the one a wall's track stands for: no act answers it.
-    if state.repeats(reading)
-        || state
-            .wall
-            .as_ref()
-            .and_then(|t| still_shown(t, reading).or_else(|| left_retry(t, reading)))
-            .is_some_and(|(_, shown)| state.repeats(&shown))
+    // THE SAME REPLY AGAIN ([`TurnEndState::repeats`]), the screen's or the one a wall's track stands for: no act answers it
+    // — an old login's answers, where the login moved since ([`TurnEndState::login_resume`]).
+    if !state.login_resume
+        && (state.repeats(reading)
+            || state
+                .wall
+                .as_ref()
+                .and_then(|t| still_shown(t, reading).or_else(|| left_retry(t, reading)))
+                .is_some_and(|(_, shown)| state.repeats(&shown)))
     {
         return ended_at(trace, SAME_REPLY, TurnEndAction::Nothing);
     }
@@ -16390,6 +16445,9 @@ fn act_past_walls(
     }
     if state.account_resume && cfg.resume_limits {
         return ended_at(trace, "account-resume", resume_limit(continue_as));
+    }
+    if state.login_resume && cfg.resume_limits {
+        return ended_at(trace, "login-resume", resume_limit(continue_as));
     }
     let cont = continue_policy(state, reading, cfg, now, budgeted);
     if let Some(to) = move_ahead(state, reading, cfg, now)
@@ -17288,7 +17346,7 @@ fn wall_action(
     );
     match kind {
         WallKind::UsageSession | WallKind::UsageWeekly | WallKind::ModelBucket { .. }
-            if state.account_resume && cfg.resume_limits =>
+            if (state.account_resume || state.login_resume) && cfg.resume_limits =>
         {
             resume_limit(continue_as)
         }

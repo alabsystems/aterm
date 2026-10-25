@@ -13,13 +13,11 @@ use std::time::Duration;
 use aterm_sysprobe::{GpuDriver, GpuReading};
 use aterm_uds::spawnfd::Stdio;
 
-use crate::aos_workers_bench::{
-    digest_file, load_average, median, required_valid, span_ratio, williams,
-};
+use crate::aos_workers_bench::{load_average, median, required_valid, span_ratio, williams};
 use crate::instance::take_value;
 use crate::paths::{from_caller, paths};
 use crate::stop::{self, Stopped};
-use crate::sys;
+use crate::sys::{self, digest_file};
 use crate::{Fail, Res};
 
 /// The verb's own help (`aos-gpu-bench --help`).
@@ -2323,7 +2321,7 @@ fn drain<R: std::io::Read + Send + 'static>(r: Option<R>) -> mpsc::Receiver<Stri
 
 /// What ended the deadline thread's wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Watch {
+pub(crate) enum Watch {
     /// The run exited on its own.
     Exited,
     /// The deadline passed, and the run was killed.
@@ -2332,8 +2330,10 @@ enum Watch {
     Stopped(Stopped),
 }
 
-fn watch(pid: u32, done: &AtomicBool) -> Watch {
-    let ended = stop::sleep_unless(DEADLINE, done);
+/// Waits until `done` is set or `deadline` passes, and kills `pid` with `SIGKILL` at the deadline or
+/// on an interrupt (the M6 runner's watcher too, at its own deadline).
+pub(crate) fn watch(pid: u32, deadline: Duration, done: &AtomicBool) -> Watch {
+    let ended = stop::sleep_unless(deadline, done);
     let kill = |w: Watch| {
         if let Ok(pid) = i32::try_from(pid) {
             let _ = sys::kill(pid, libc::SIGKILL);
@@ -2374,7 +2374,7 @@ fn measure(harness: &Path, arm: Arm, id: &str, summary: &Path) -> Result<Measure
     let done = Arc::new(AtomicBool::new(false));
     let watcher = {
         let done = Arc::clone(&done);
-        std::thread::spawn(move || watch(pid, &done))
+        std::thread::spawn(move || watch(pid, DEADLINE, &done))
     };
     let exited = sys::await_exit(pid);
     let exit_ticks = sys::mach_ticks();

@@ -759,20 +759,57 @@ impl PetBrain {
         }
     }
 
-    fn content_ride(&self, rect: PetRect) -> Option<f32> {
-        let (cur, prev) = (&self.console.row_sig, &self.console.row_sig_prev);
+    const fn content_ride(&self, rect: PetRect) -> Option<f32> {
+        let (cur, prev) = (
+            self.console.row_sig.as_slice(),
+            self.console.row_sig_prev.as_slice(),
+        );
         if prev.is_empty() || prev.len() != cur.len() || !rect.valid() {
             return None;
         }
-        let top = (rect.row.floor() as i64 - 1).max(0) as usize;
-        let bottom = ((rect.row + rect.rows).ceil() as i64 - 1).max(0) as usize;
-        let prev_rows = prev.get(top..=bottom)?;
-        if prev_rows == &cur[top..=bottom] || !prev_rows.iter().any(|&s| s != 0) {
+        let top_i = rect.row.floor() as i64 - 1;
+        let top = (if top_i > 0 { top_i } else { 0 }) as usize;
+        let bot_i = (rect.row + rect.rows).ceil() as i64 - 1;
+        let bottom = (if bot_i > 0 { bot_i } else { 0 }) as usize;
+        if bottom >= prev.len() {
             return None;
         }
-        (1..=RIDE_ROWS_MAX).find_map(|k| {
-            (bottom + k < cur.len() && prev_rows == &cur[top + k..=bottom + k]).then_some(k as f32)
-        })
+        let len = bottom - top + 1;
+        let mut same = true;
+        let mut has_nonzero = false;
+        let mut i = 0;
+        while i < len {
+            let p = prev[top + i];
+            if p != cur[top + i] {
+                same = false;
+            }
+            if p != 0 {
+                has_nonzero = true;
+            }
+            i += 1;
+        }
+        if same || !has_nonzero {
+            return None;
+        }
+        let mut k = 1;
+        while k <= RIDE_ROWS_MAX {
+            if bottom + k < cur.len() {
+                let mut matches = true;
+                let mut j = 0;
+                while j < len {
+                    if prev[top + j] != cur[top + k + j] {
+                        matches = false;
+                        break;
+                    }
+                    j += 1;
+                }
+                if matches {
+                    return Some(k as f32);
+                }
+            }
+            k += 1;
+        }
+        None
     }
 
     /// Whether the console's last observation holds a command still running
@@ -865,12 +902,12 @@ impl PetBrain {
 
     /// Ownership/custody is independent of whether a live caret exists.
     #[inline]
-    pub fn set_console_presentable(&mut self, presentable: bool) {
+    pub const fn set_console_presentable(&mut self, presentable: bool) {
         if self.console.presentable != presentable {
-            self.console.hold = VisibilityHold::default();
-            self.console.z = ZHold::default();
-            self.console.rest_seat.set(None);
-            self.console.rest_seated.set(false);
+            self.console.hold = VisibilityHold::DEFAULT;
+            self.console.z = ZHold::EMPTY;
+            self.console.rest_seat = std::cell::Cell::new(None);
+            self.console.rest_seated = std::cell::Cell::new(false);
         }
         self.console.presentable = presentable;
     }
@@ -2705,7 +2742,7 @@ impl PetBrain {
     }
 
     /// Move the drawn body to `to` and every motion coordinate with it, or the next tick's lerp would restore the body to where it was.
-    pub(super) fn carry_console_body(
+    pub(super) const fn carry_console_body(
         &mut self,
         frame: &mut PetFrame,
         to: PetFrame,
@@ -2719,50 +2756,55 @@ impl PetBrain {
         self.home += dx;
         self.col_at_tick += dx;
         self.skid_from += dx;
-        if let Some(over) = self.brake_over.as_mut() {
+        if let Some(over) = &mut self.brake_over {
             *over += dx;
         }
-        if let Some((tc, tr)) = self.play_to.as_mut()
+        if let Some((tc, tr)) = &mut self.play_to
             && (*tc - old_seat.0).abs() <= 1e-4
             && (*tr - old_seat.1).abs() <= 1e-4
         {
             *tc += dx;
             *tr += ground_dy;
         }
-        if let Some(look) = self.adopted_look.as_mut() {
+        if let Some(look) = &mut self.adopted_look {
             look.seat.0 += dx;
             look.seat.1 += ground_dy;
         }
-        for (record, drawn) in self.departures.iter_mut().zip(frame.departures.iter_mut()) {
-            if let Some(record) = record.as_mut().filter(|d| d.still && !d.resight) {
+        let mut i = 0;
+        while i < self.departures.len() {
+            if let Some(record) = &mut self.departures[i]
+                && record.still
+                && !record.resight
+            {
                 record.from_col += dx;
                 record.edge += dx;
                 record.row += ground_dy;
-                if let Some(drawn) = drawn.as_mut() {
+                if let Some(drawn) = &mut frame.departures[i] {
                     drawn.col += dx;
                     drawn.row += dy;
                 }
             }
+            i += 1;
         }
-        if let Some(flight) = self.flight.as_mut() {
+        if let Some(flight) = &mut self.flight {
             flight.from_col += dx;
             flight.to_col += dx;
             flight.from_row += ground_dy;
             flight.to_row += ground_dy;
         }
-        if let Some((col, row, _)) = self.bound2.as_mut() {
+        if let Some((col, row, _)) = &mut self.bound2 {
             *col += dx;
             *row += ground_dy;
         }
-        if let Some((col, row)) = self.deferred_hidden_landing.as_mut() {
+        if let Some((col, row)) = &mut self.deferred_hidden_landing {
             *col += dx;
             *row += ground_dy;
         }
-        if let Some(target) = self.console.target.as_mut() {
+        if let Some(target) = &mut self.console.target {
             target.col += dx;
             target.row += ground_dy;
         }
-        if let Some(trip) = self.console.trip.as_mut() {
+        if let Some(trip) = &mut self.console.trip {
             trip.from.0 += dx;
             trip.to.0 += dx;
             trip.from.1 += ground_dy;
@@ -4589,10 +4631,11 @@ mod tests {
             cell: (15, 28),
         };
 
-        fn chrome(self) -> [PetRect; 2] {
-            let card = f32::from(self.cols.min(38));
+        const fn chrome(self) -> [PetRect; 2] {
+            let min_cols = if self.cols < 38 { self.cols } else { 38 };
+            let card = min_cols as f32;
             [
-                PetRect::new(12.0, f32::from(self.cols) - card, 1.0, card),
+                PetRect::new(12.0, self.cols as f32 - card, 1.0, card),
                 PetRect::new(14.0, 0.0, 1.0, 16.0),
             ]
         }

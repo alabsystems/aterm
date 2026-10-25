@@ -116,108 +116,256 @@ fn not_saved(app: &App, key: &str) -> Option<String> {
 
 const OFF_FACE: &str = " alab harness \u{25cb} off \u{2590} on \u{258c} ";
 
+const MASTER_OFF: &str = "[harness]\nenabled = false\n";
+
+/// AUTOPILOT OFF IS NOT THE HARNESS OFF: a session whose Autopilot is Off keeps the harness's
+/// switch lit, `alab harness ● on`, in the white the rest of its glass wears (the moonbow, bold,
+/// never the bare switch's accent), and a press on it turns the WHOLE harness off: it writes
+/// `harness.enabled = false`, arms `◐ turning off` (the refused write here lets it go), and
+/// writes no Autopilot word. CONTROL: the rule beside the switch is no button.
 #[test]
-fn an_off_sessions_on_button_turns_it_on() {
+fn an_autopilot_off_session_reads_on_in_white_and_its_press_turns_the_harness_off() {
     let (mut app, wid, session, mut reader, _host) = claude_pane(120);
     let lit = switch(&app, wid).expect("a hosted Claude Code pane draws the switch");
     assert_eq!((lit.face, lit.button.clone()), (HarnessSwitch::On, None));
-    assert!(
-        top_rule(&app, wid).contains(" alab harness \u{25cf} on "),
-        "{:?}",
-        top_rule(&app, wid)
-    );
+    let row =
+        |app: &App, b: &BorderSwitch| app.windows[&wid].input_scratch.cells[b.frame_row].clone();
+    let cruise_ink: Vec<[u8; 3]> = row(&app, &lit)[lit.switch.clone()]
+        .iter()
+        .filter(|c| c.ch != ' ')
+        .map(|c| c.fg)
+        .collect();
     assert!(app.set_session_autopilot(
         session,
         Some(Autopilot::Off),
         crate::autopilot::Surface::Chip
     ));
     frame(&mut app, wid);
-    let off = switch(&app, wid).expect("Off draws the switch");
-    assert_eq!(off.face, HarnessSwitch::Off(SwitchOff::Session));
-    let rule = top_rule(&app, wid);
-    assert!(
-        rule.contains(OFF_FACE) && !rule.contains("alab kitty"),
-        "{rule:?}"
-    );
-    assert_eq!(
-        painted(&app, wid, &off, off.button.clone().unwrap()),
-        "\u{2590} on \u{258c}"
-    );
-    click_at(&mut app, wid, (off.frame_row, off.cols.start - 2));
-    assert_eq!(
-        autopilot(&app, session),
-        (Some(Autopilot::Off), AutopilotView::Off),
-        "control: the rule beside the switch is no button"
-    );
-    let at = on_button(&app, wid);
-    click_at(&mut app, wid, at);
-    assert_eq!(
-        autopilot(&app, session),
-        (Some(Autopilot::Cruise), AutopilotView::Cruise),
-        "on: the session's word is cruise"
-    );
-    assert!(!settings_open(&app), "nothing opens");
-    frame(&mut app, wid);
-    let lit = switch(&app, wid).expect("the switch, lit");
-    assert_eq!(lit.face, HarnessSwitch::On);
-    later(&mut app, wid, session);
-    click_at(&mut app, wid, (lit.frame_row, lit.switch.start + 2));
     assert_eq!(
         autopilot(&app, session),
         (Some(Autopilot::Off), AutopilotView::Off)
     );
+    let on = switch(&app, wid).expect("Autopilot Off draws the switch");
+    assert_eq!(
+        (on.face, on.button.clone()),
+        (HarnessSwitch::On, None),
+        "the harness is on: lit, no `on` button"
+    );
+    let rule = top_rule(&app, wid);
+    assert!(
+        rule.contains(" alab harness \u{25cf} on ") && !rule.contains("alab kitty"),
+        "{rule:?}"
+    );
+    let cells = row(&app, &on);
+    let glyphs: Vec<_> = cells[on.switch.clone()]
+        .iter()
+        .filter(|c| c.ch != ' ')
+        .copied()
+        .collect();
+    assert_eq!(glyphs.len(), "alabharness\u{25cf}on".chars().count());
+    for c in &glyphs {
+        let spread = c.fg.iter().max().unwrap() - c.fg.iter().min().unwrap();
+        assert!(
+            c.bold && spread <= 24,
+            "{:?}: white and bold, the moonbow: {:?}",
+            c.ch,
+            c.fg
+        );
+    }
+    let mark_fg = crate::chrome_band::band_colors(app.theme).accent;
+    let lit_state = glyphs.iter().find(|c| c.ch == '\u{25cf}').expect("`●`");
+    assert_ne!(lit_state.fg, mark_fg, "CONTROL: `●` is not the bare accent");
+    assert_ne!(
+        glyphs.iter().map(|c| c.fg).collect::<Vec<_>>(),
+        cruise_ink,
+        "CONTROL: not Cruise's arc"
+    );
+    super::SWITCHES_LET_GO.with(|n| n.set(0));
+    click_at(&mut app, wid, (on.frame_row, on.cols.start - 2));
+    assert_eq!(
+        not_saved(&app, "harness.enabled"),
+        None,
+        "CONTROL: the rule beside the switch is no button"
+    );
+    click_at(&mut app, wid, (on.frame_row, on.switch.start + 2));
+    let said = not_saved(&app, "harness.enabled").expect("the master switch's write was made");
+    assert!(said.contains("harness.enabled = false"), "{said:?}");
+    let title = app
+        .messages
+        .log()
+        .records()
+        .rfind(|r| r.key.as_deref() == Some("harness.switch-save.harness.enabled"))
+        .map(|r| r.title.clone());
+    assert_eq!(title.as_deref(), Some("Couldn't turn the harness off"));
+    assert_eq!(
+        super::SWITCHES_LET_GO.with(std::cell::Cell::get),
+        1,
+        "the press armed `◐ turning off`, and the refusal let it go"
+    );
+    assert_eq!(
+        autopilot(&app, session),
+        (Some(Autopilot::Off), AutopilotView::Off),
+        "the switch writes no Autopilot word"
+    );
+    assert!(!settings_open(&app), "nothing opens");
     assert!(
         pty(&mut reader, 0).is_empty(),
         "nothing reached the program"
     );
 }
 
+/// THE OFF FACE'S `on` TURNS ON THE SWITCHES ALONE: under the master switch off, a session whose
+/// own word is Off presses `on`, and the press writes `harness.enabled = true` and never the
+/// Autopilot word `cruise` (the chip writes words); once the policy reads it back the switch is
+/// lit over Autopilot Off.
 #[test]
-fn a_double_click_on_on_leaves_the_harness_on() {
+fn the_on_button_writes_the_switch_and_never_cruise() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
     assert!(app.set_session_autopilot(
         session,
         Some(Autopilot::Off),
         crate::autopilot::Surface::Chip
     ));
+    policy(&mut app, MASTER_OFF);
     frame(&mut app, wid);
+    let off = switch(&app, wid).expect("the master switch off draws the switch");
+    assert_eq!(off.face, HarnessSwitch::Off(SwitchOff::Master));
+    assert_eq!(
+        painted(&app, wid, &off, off.button.clone().unwrap()),
+        "\u{2590} on \u{258c}"
+    );
     let at = on_button(&app, wid);
     click_at(&mut app, wid, at);
+    let said = not_saved(&app, "harness.enabled").expect("the master switch's write was made");
+    assert!(said.contains("harness.enabled = true"), "{said:?}");
     assert_eq!(
-        autopilot(&app, session).1,
-        AutopilotView::Cruise,
-        "first click"
+        autopilot(&app, session),
+        (Some(Autopilot::Off), AutopilotView::MasterOff),
+        "no word written: the word stays Off"
     );
+    policy(&mut app, "[harness]\n");
     frame(&mut app, wid);
+    assert_eq!(autopilot(&app, session).1, AutopilotView::Off);
     assert_eq!(
         switch(&app, wid).map(|b| b.face),
         Some(HarnessSwitch::On),
-        "the frame between lit the switch under the pointer"
+        "read back: lit over Autopilot Off"
     );
-    click_at(&mut app, wid, at);
-    assert_eq!(
-        autopilot(&app, session),
-        (Some(Autopilot::Cruise), AutopilotView::Cruise),
-        "the second click of the double click turned nothing back"
+}
+
+/// A SWITCH TURNING OFF SAYS SO AND TAKES NO CLICK: while the master switch's off-write has not
+/// read back, the lit switch reads `◐ turning off` (`◐ off` at its narrowest), the side it
+/// turns to is in the repaint key, and a click on it writes nothing; the read-back lets it go.
+#[test]
+fn a_switch_turning_off_says_so_and_takes_no_click() {
+    let (mut app, wid, session, _reader, _host) = claude_pane(120);
+    let at_rest = footer_fp(&app, wid);
+    let arm = |app: &mut App, on: bool| {
+        app.windows
+            .get_mut(&wid)
+            .expect("window")
+            .claude_lights
+            .sessions
+            .entry(session)
+            .or_default()
+            .switch_turning = Some((on, Instant::now() + Duration::from_secs(60)));
+    };
+    arm(&mut app, false);
+    let turning_off = footer_fp(&app, wid);
+    assert_ne!(turning_off, at_rest, "turning off moves the key");
+    arm(&mut app, true);
+    assert_ne!(
+        footer_fp(&app, wid),
+        turning_off,
+        "the side it turns to is in the key"
     );
-    later(&mut app, wid, session);
+    arm(&mut app, false);
     frame(&mut app, wid);
+    let turning = switch(&app, wid).expect("the switch, turning off");
+    assert_eq!(
+        (turning.face, turning.button.clone()),
+        (HarnessSwitch::TurningOff, None)
+    );
+    assert!(
+        top_rule(&app, wid).contains(" alab harness \u{25d0} turning off "),
+        "{:?}",
+        top_rule(&app, wid)
+    );
+    click_at(&mut app, wid, (turning.frame_row, turning.switch.start + 2));
+    assert_eq!(not_saved(&app, "harness.enabled"), None, "no write");
+    assert!(!settings_open(&app));
+    let mut narrowest = None;
+    for width in (6..=40u16).rev() {
+        assert!(app.apply_term_resize(wid, 24, width));
+        draw_claude(&app, session, BYPASS);
+        frame(&mut app, wid);
+        if let Some(b) = switch(&app, wid).filter(|b| b.tier == 3) {
+            assert_eq!(b.face, HarnessSwitch::TurningOff, "{width}");
+            narrowest = Some(painted(&app, wid, &b, b.switch.clone()));
+        }
+    }
+    assert_eq!(
+        narrowest.as_deref(),
+        Some("\u{25d0} off"),
+        "the narrowest form is met"
+    );
+    assert!(app.apply_term_resize(wid, 24, 120));
+    draw_claude(&app, session, BYPASS);
+    policy(&mut app, MASTER_OFF);
+    frame(&mut app, wid);
+    assert_eq!(
+        switch(&app, wid).map(|b| b.face),
+        Some(HarnessSwitch::Off(SwitchOff::Master)),
+        "the read-back lets `turning off` go"
+    );
+    assert!(
+        app.windows[&wid].claude_lights.sessions[&session]
+            .switch_turning
+            .is_none()
+    );
+}
+
+#[test]
+fn a_double_click_on_on_leaves_the_harness_on() {
+    let (mut app, wid, session, _reader, _host) = claude_pane(120);
     let lit = switch(&app, wid).expect("lit");
     let at = (lit.frame_row, lit.switch.start + 2);
+    super::SWITCHES_LET_GO.with(|n| n.set(0));
     click_at(&mut app, wid, at);
-    assert_eq!(
-        autopilot(&app, session).1,
-        AutopilotView::Off,
-        "a later click"
-    );
+    let said = not_saved(&app, "harness.enabled").expect("first click: the off-write");
+    assert!(said.contains("harness.enabled = false"), "{said:?}");
+    policy(&mut app, MASTER_OFF);
     frame(&mut app, wid);
+    let off = switch(&app, wid).expect("read back: off");
+    assert_eq!(
+        off.face,
+        HarnessSwitch::Off(SwitchOff::Master),
+        "the frame between put the off face under the pointer"
+    );
+    assert!(
+        off.cols.contains(&at.1),
+        "the second click lands on the off face"
+    );
+    click_at(&mut app, wid, at);
+    let said = not_saved(&app, "harness.enabled").expect("the off-write's record");
+    assert!(
+        said.contains("harness.enabled = false"),
+        "the second click of the double click turned nothing back on: {said:?}"
+    );
+    assert_eq!(
+        super::SWITCHES_LET_GO.with(std::cell::Cell::get),
+        1,
+        "one write for a double click"
+    );
+    later(&mut app, wid, session);
     let at = on_button(&app, wid);
     click_at(&mut app, wid, at);
-    assert_eq!(
-        autopilot(&app, session),
-        (Some(Autopilot::Off), AutopilotView::Off),
-        "the double click's second click on the off switch turned nothing on"
+    let said = not_saved(&app, "harness.enabled").expect("a later click's write");
+    assert!(
+        said.contains("harness.enabled = true"),
+        "a later click: {said:?}"
     );
+    assert_eq!(autopilot(&app, session), (None, AutopilotView::MasterOff));
 
     for off in [
         "[harness]\nenabled = false\n",
@@ -355,7 +503,7 @@ fn a_switch_turning_on_says_so_and_takes_no_click() {
         .sessions
         .entry(session)
         .or_default()
-        .switch_turning = Some(Instant::now() + Duration::from_secs(60));
+        .switch_turning = Some((true, Instant::now() + Duration::from_secs(60)));
     assert_ne!(footer_fp(&app, wid), at_rest, "turning moves the key");
     frame(&mut app, wid);
     let turning = switch(&app, wid).expect("the switch, turning");
@@ -416,16 +564,28 @@ fn the_switch_draws_its_mark_as_one_set_in_every_state() {
         crate::autopilot::Surface::Chip
     ));
     frame(&mut app, wid);
-    drawn(&app, BandIcon::Ring, "off");
+    drawn(&app, BandIcon::Disc, "Autopilot off: the harness on");
+    let arm = |app: &mut App, on: bool| {
+        app.windows
+            .get_mut(&wid)
+            .expect("window")
+            .claude_lights
+            .sessions
+            .entry(session)
+            .or_default()
+            .switch_turning = Some((on, Instant::now() + Duration::from_secs(60)));
+    };
+    arm(&mut app, false);
+    frame(&mut app, wid);
+    assert_eq!(
+        switch(&app, wid).map(|b| b.face),
+        Some(HarnessSwitch::TurningOff)
+    );
+    drawn(&app, BandIcon::HalfDisc, "turning off");
     policy(&mut app, "[harness]\nenabled = false\n");
-    app.windows
-        .get_mut(&wid)
-        .expect("window")
-        .claude_lights
-        .sessions
-        .entry(session)
-        .or_default()
-        .switch_turning = Some(Instant::now() + Duration::from_secs(60));
+    frame(&mut app, wid);
+    drawn(&app, BandIcon::Ring, "off");
+    arm(&mut app, true);
     frame(&mut app, wid);
     assert_eq!(
         switch(&app, wid).map(|b| b.face),
@@ -679,12 +839,8 @@ fn a_menu_over_the_top_rule_keeps_the_switch_mark_beside_it() {
 
 #[test]
 fn hovering_on_moves_the_key_and_leaving_puts_it_back() {
-    let (mut app, wid, session, _reader, _host) = claude_pane(120);
-    assert!(app.set_session_autopilot(
-        session,
-        Some(Autopilot::Off),
-        crate::autopilot::Surface::Chip
-    ));
+    let (mut app, wid, _session, _reader, _host) = claude_pane(120);
+    policy(&mut app, MASTER_OFF);
     frame(&mut app, wid);
     let at_rest = footer_fp(&app, wid);
     let row = footer_row(&app, wid) - 2;
@@ -724,7 +880,7 @@ fn the_switch_stands_in_every_hosted_state_and_on_no_other_pane() {
     let cases: [Case; 5] = [
         ("cruise", |_| {}, HarnessSwitch::On),
         ("land", |_| {}, HarnessSwitch::On),
-        ("off", |_| {}, HarnessSwitch::Off(SwitchOff::Session)),
+        ("off", |_| {}, HarnessSwitch::On),
         (
             "master off",
             |app| policy(app, "[harness]\nenabled = false\n"),
@@ -788,11 +944,7 @@ fn the_switch_stands_in_every_hosted_state_and_on_no_other_pane() {
 #[test]
 fn a_narrow_pane_keeps_the_on_button_to_the_last() {
     let (mut app, wid, session, _reader, _host) = claude_pane(121);
-    assert!(app.set_session_autopilot(
-        session,
-        Some(Autopilot::Off),
-        crate::autopilot::Surface::Chip
-    ));
+    policy(&mut app, MASTER_OFF);
     let mut seen: Vec<(u16, Option<usize>)> = Vec::new();
     for width in (6..=120u16).rev() {
         assert!(app.apply_term_resize(wid, 24, width));
@@ -867,12 +1019,21 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
         "{visual:?} in {:?}",
         lit[0].label
     );
+    let said = lit[0]
+        .description
+        .clone()
+        .expect("the lit switch says what it is");
+    assert!(
+        said.starts_with("The aterm harness is on (Supervise coding agents).")
+            && said.contains("off for every session"),
+        "{said:?}"
+    );
     let before = autopilot(&app, session);
     assert_eq!(before.1, AutopilotView::Cruise);
     app.press_claude_chip_for_reader(wid, session, HarnessChip::SwitchOn);
     assert_eq!(
-        autopilot(&app, session),
-        before,
+        (autopilot(&app, session), not_saved(&app, "harness.enabled")),
+        (before, None),
         "`on` on a lit switch is no press"
     );
     assert!(app.set_session_autopilot(
@@ -880,6 +1041,26 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
         Some(Autopilot::Off),
         crate::autopilot::Surface::Chip
     ));
+    frame(&mut app, wid);
+    let under_off = nodes(&app);
+    assert_eq!(
+        under_off
+            .iter()
+            .map(|n| (n.chip, n.toggled))
+            .collect::<Vec<_>>(),
+        [(HarnessChip::Switch, Some(Toggled::True))],
+        "Autopilot Off: the harness is on, one switch toggled on and no `on` button"
+    );
+    app.press_claude_chip_for_reader(wid, session, HarnessChip::Switch);
+    let wrote = not_saved(&app, "harness.enabled").expect("the reader's press wrote the master");
+    assert!(wrote.contains("harness.enabled = false"), "{wrote:?}");
+    assert_eq!(
+        autopilot(&app, session),
+        (Some(Autopilot::Off), AutopilotView::Off),
+        "the press turned the harness off, not the word"
+    );
+    later(&mut app, wid, session);
+    policy(&mut app, MASTER_OFF);
     frame(&mut app, wid);
     let off = nodes(&app);
     let b = switch(&app, wid).expect("off");
@@ -902,23 +1083,77 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
         );
         assert!(node.description.is_some(), "{node:?}");
     }
-    assert_eq!(off[1].label, "on: turn the Claude Code harness on");
+    assert_eq!(
+        off[1].label, "on: turn the harness on (Supervise coding agents)",
+        "the master switch's `on` turns on the whole harness"
+    );
     assert!(app.apply_term_resize(wid, 24, 8));
     draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
     assert!(nodes(&app).is_empty(), "no switch on the glass");
     app.press_claude_chip_for_reader(wid, session, HarnessChip::SwitchOn);
-    assert_eq!(
-        autopilot(&app, session),
-        (Some(Autopilot::Off), AutopilotView::Off)
+    assert!(
+        not_saved(&app, "harness.enabled").is_some_and(|said| said.contains("= false")),
+        "no switch, no press"
     );
     assert!(app.apply_term_resize(wid, 24, 120));
     draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
     app.press_claude_chip_for_reader(wid, session, HarnessChip::SwitchOn);
+    let wrote = not_saved(&app, "harness.enabled").expect("the master switch's write");
+    assert!(wrote.contains("harness.enabled = true"), "{wrote:?}");
     assert_eq!(
         autopilot(&app, session),
-        (Some(Autopilot::Cruise), AutopilotView::Cruise)
+        (Some(Autopilot::Off), AutopilotView::MasterOff),
+        "`on` writes the switch, never `cruise`"
+    );
+}
+
+/// THE SWITCH NAMES THE HARNESS IT SWITCHES: lit, or held off by the master switch, the
+/// `Switch` and the off face's `on` name the whole harness and no product (`alab harness on`,
+/// `on: turn the harness on (Supervise coding agents)`), since a press there turns every agent's
+/// harness. NEGATIVE CONTROL: under the agent's own switch off they name the agent's harness.
+#[cfg(a11y_tree)]
+#[test]
+fn the_switch_names_the_harness_it_switches() {
+    use crate::a11y_tree::HarnessChip;
+    let (mut app, wid, _session, _reader, _host) = claude_pane(120);
+    let labels = |app: &App| -> Vec<(HarnessChip, String)> {
+        app.claude_chips_a11y(wid)
+            .into_iter()
+            .filter(|c| matches!(c.chip, HarnessChip::Switch | HarnessChip::SwitchOn))
+            .map(|c| (c.chip, c.label))
+            .collect()
+    };
+    let named = |pairs: &[(HarnessChip, &str)]| -> Vec<(HarnessChip, String)> {
+        pairs.iter().map(|&(c, l)| (c, l.to_owned())).collect()
+    };
+    assert_eq!(
+        labels(&app),
+        named(&[(HarnessChip::Switch, "alab harness on")])
+    );
+    policy(&mut app, MASTER_OFF);
+    frame(&mut app, wid);
+    assert_eq!(
+        labels(&app),
+        named(&[
+            (HarnessChip::Switch, "alab harness off"),
+            (
+                HarnessChip::SwitchOn,
+                "on: turn the harness on (Supervise coding agents)"
+            ),
+        ]),
+        "the master switch off"
+    );
+    policy(&mut app, "[harness.claude]\nenabled = false\n");
+    frame(&mut app, wid);
+    assert_eq!(
+        labels(&app),
+        named(&[
+            (HarnessChip::Switch, "alab harness off: Claude Code"),
+            (HarnessChip::SwitchOn, "on: turn the Claude Code harness on"),
+        ]),
+        "NEGATIVE CONTROL: the agent's own switch off"
     );
 }
 
@@ -936,19 +1171,20 @@ fn decoration_has_no_node() {
     assert_eq!(cols, 2..13, "two `\u{2500}` in: {rule:?}");
     let product = b.program.product();
     let (words, _) = crate::claude_footer::switch_words(&b);
-    let names = |label: &str| {
-        crate::native_ui::visible_label_in_name(&words, label) && label.ends_with(product)
-    };
+    let names = |label: &str| crate::native_ui::visible_label_in_name(&words, label);
     let chips = app.claude_chips_a11y(wid);
     let switches: Vec<_> = chips
         .iter()
         .filter(|c| c.session == session && c.chip == HarnessChip::Switch)
         .collect();
     assert_eq!(switches.len(), 1, "{chips:?}");
-    assert_eq!(switches[0].label, "alab harness on: Claude Code");
+    assert_eq!(
+        switches[0].label, "alab harness on",
+        "the whole harness, no product"
+    );
     assert!(names(&switches[0].label), "{:?}", switches[0].label);
     assert_eq!(
-        crate::claude_lights::switch_label(&words, product),
+        crate::claude_lights::switch_label(&words, b.face, product),
         switches[0].label
     );
     let over: Vec<_> = chips
@@ -970,18 +1206,9 @@ fn decoration_has_no_node() {
         .map(|(_, n)| n.role())
         .collect();
     assert!(held.is_empty(), "no node names the lockup: {held:?}");
-    let hb_int = |words: &str, product: &str| {
-        if words.contains("harness") {
-            words.to_owned()
-        } else {
-            format!("{words}: {product} harness")
-        }
-    };
-    let old = hb_int(&words, product);
-    assert_eq!(old, "alab harness on", "CONTROL: hb-int's name");
     assert!(
-        !names(&old),
-        "CONTROL: a name without the product is refused"
+        !names("Claude Code harness: on."),
+        "CONTROL: the old badge's name, which leaves out the words drawn, is refused"
     );
 }
 
@@ -1334,7 +1561,8 @@ fn the_facts_words_read_on_a_tab_theme_of_its_own() {
 /// THE KEYBOARD REACHES THE HARNESS SWITCH (review 13): ctrl+shift+tab
 /// walks a pane's chips and facts and then its top rule's switch, lit as
 /// the pointer lights it, and Return there presses it as a click does: the
-/// harness turns off and nothing is typed. A Gemini pane, whose rule draws
+/// whole harness turns off (`harness.enabled = false` is written, no
+/// Autopilot word) and nothing is typed. A Gemini pane, whose rule draws
 /// the switch and no chip or fact, reaches it too. NEGATIVE CONTROL: Escape
 /// on the switch lets it go and turns nothing; a shell's pane, no switch,
 /// selects nothing.
@@ -1392,13 +1620,18 @@ fn the_keyboard_walks_to_the_switch_and_return_presses_it() {
         "NEGATIVE CONTROL: nothing turned"
     );
     frame(&mut app, wid);
+    assert_eq!(
+        not_saved(&app, "harness.enabled"),
+        None,
+        "NEGATIVE CONTROL: nothing written"
+    );
     walk(&mut app, wid, session);
     tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
-    assert_eq!(
-        autopilot(&app, session).1,
-        AutopilotView::Off,
+    assert!(
+        not_saved(&app, "harness.enabled").is_some_and(|said| said.contains("= false")),
         "Return is its click"
     );
+    assert_eq!(autopilot(&app, session), before, "no word written");
     assert_eq!(selected(&app, wid), None);
     assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
 
@@ -1429,13 +1662,14 @@ fn the_keyboard_walks_to_the_switch_and_return_presses_it() {
         (aterm_phase::Program::Gemini, HarnessSwitch::On),
         "CONTROL"
     );
+    let before = autopilot(&app, session);
     walk(&mut app, wid, session);
     tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
-    assert_eq!(
-        autopilot(&app, session).1,
-        AutopilotView::Off,
+    assert!(
+        not_saved(&app, "harness.enabled").is_some_and(|said| said.contains("= false")),
         "Gemini: its click"
     );
+    assert_eq!(autopilot(&app, session), before, "Gemini: no word written");
     assert!(pty(&mut reader, 0).is_empty(), "Gemini: nothing typed");
 
     set_program(&app, session, None);

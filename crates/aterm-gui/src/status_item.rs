@@ -172,6 +172,10 @@ pub(crate) struct SessionRow {
     pub held: Option<HoldWord>,
     /// The published agent word (`busy`, `idle`, `prompt`, …); empty or `-` for no identified agent.
     pub agent: &'static str,
+    /// Where the reader names no state (`agent=unknown`, codex's), the survey's word for what the
+    /// program in front says of itself (`program_state::survey_word` of its shown OSC 7501
+    /// report), as `survey` reads it at render; `None` under any other word or with no report.
+    pub program: Option<&'static str>,
     /// The task record, for a worker.
     pub task: Option<TaskRow>,
     /// When the need was first published (unix seconds, [`Herald::observe`]).
@@ -195,6 +199,13 @@ pub(crate) struct SessionRow {
 }
 
 impl SessionRow {
+    /// The word the glance buckets the row by: the reader's own word, or, where it names no state,
+    /// the program's (`program`).
+    #[must_use]
+    pub(crate) fn glance_word(&self) -> &'static str {
+        self.program.unwrap_or(self.agent)
+    }
+
     /// The session as a row names it: its label, and where it is when another row shares the label (`Claude Code in tab 2`).
     #[must_use]
     pub(crate) fn named(&self) -> String {
@@ -558,7 +569,7 @@ struct Since {
 }
 
 fn shown_key(row: &SessionRow) -> u64 {
-    let class = match row.agent {
+    let class = match row.glance_word() {
         "" | "-" => 0_u8,
         "idle" => 1,
         _ => 2,
@@ -1455,7 +1466,7 @@ impl Glance {
             let landed = |t: &TaskRow| {
                 t.state == TaskState::Done && t.why == Some(crate::task_record::WHY_LANDED)
             };
-            match (&row.task, row.agent) {
+            match (&row.task, row.glance_word()) {
                 _ if row.landed => g.here.landed += 1,
                 (Some(t), _) if landed(t) => g.here.landed += 1,
                 (Some(t), _) if t.state == TaskState::Done => g.here.done += 1,

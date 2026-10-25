@@ -8,6 +8,8 @@
 use crate::{SecretBytes, age::Recipient};
 
 pub mod binding;
+#[cfg(unix)]
+pub mod bootstrap;
 pub mod constraints;
 #[cfg(unix)]
 pub mod journal;

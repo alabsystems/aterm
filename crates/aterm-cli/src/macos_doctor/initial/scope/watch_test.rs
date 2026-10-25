@@ -44,6 +44,50 @@ impl<'a> ProvisionalSetupWatchTest<'a> {
         }
     }
 
+    pub fn widens_from(&self) -> Option<u64> {
+        self.upgrade.widens_from()
+    }
+
+    pub fn upgrade_pending(&self) -> bool {
+        self.upgrade.pending()
+    }
+
+    pub fn published_upgrade(&self) -> Result<Option<SetupUpgrade>, String> {
+        self.upgrade.published_at(self.root)
+    }
+
+    pub fn forget_upgrade(&mut self) {
+        self.upgrade.forget();
+    }
+
+    pub fn published_upgrade_after_failed_read(&self) -> Result<Option<SetupUpgrade>, String> {
+        let path = self.root.join("initial-setup.json");
+        let before = std::fs::read(&path).map_err(|error| error.to_string())?;
+        std::fs::write(&path, b"{\"profile\":").map_err(|error| error.to_string())?;
+        let result = self.published_upgrade();
+        std::fs::write(&path, before).map_err(|error| error.to_string())?;
+        result
+    }
+
+    pub fn lose_upgrade_publication(&mut self) -> Result<Option<SetupUpgrade>, String> {
+        self.lose_upgrade_publication_at(0, true)
+    }
+
+    /// Lose publication identity before or after one real ordered write. Earlier
+    /// successful checkpoints retain their own Stop evidence, never write authority.
+    pub fn lose_upgrade_publication_at(
+        &mut self,
+        at: usize,
+        published: bool,
+    ) -> Result<Option<SetupUpgrade>, String> {
+        self.upgrade.persist_with(
+            self.root,
+            || true,
+            || Ok(None),
+            |ticket, plan| ticket.lose_publication_for_watch_test(self.root, plan, at, published),
+        )
+    }
+
     /// A failed eligibility read repaired before control returns to the watch. This is
     /// a real parse failure; it neither changes admission nor contacts any external port.
     pub fn widens_after_failed_read(&self) -> Result<bool, String> {
@@ -61,14 +105,21 @@ impl<'a> ProvisionalSetupWatchTest<'a> {
     /// Upgrade under the real profile lock, optionally failing before or after one actual
     /// record publication. The indexes are the writer's existing ordered admission steps.
     pub fn upgrade(&mut self, fault: Option<(usize, bool)>) -> Result<Option<u64>, String> {
-        self.upgrade
-            .persist_with(
-                self.root,
-                || true,
-                || Ok(None),
-                |ticket, plan| ticket.persist_for_watch_test(self.root, plan, true, fault),
-            )
+        self.upgrade_outcome(fault)
             .map(|upgrade| upgrade.map(|upgrade| upgrade.to))
+    }
+
+    /// The exact predecessor and target produced by the real admission.
+    pub fn upgrade_outcome(
+        &mut self,
+        fault: Option<(usize, bool)>,
+    ) -> Result<Option<SetupUpgrade>, String> {
+        self.upgrade.persist_with(
+            self.root,
+            || true,
+            || Ok(None),
+            |ticket, plan| ticket.persist_for_watch_test(self.root, plan, true, fault),
+        )
     }
 
     /// The backend branches startup uses after capture: resume a confirmed admission, or

@@ -44,16 +44,17 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use aterm_aos::Digest;
 use aterm_effects::aos_momentum::bundle::UncheckedBundle;
 use aterm_effects::aos_momentum::search::Mode;
 use aterm_uds::spawnfd::Stdio;
 
-use crate::aos_search::{MAX_BUNDLE_BYTES, check_build, read_bounded, word};
+use crate::aos_search::{MAX_BUNDLE_BYTES, read_bounded, word};
 use crate::aos_workers::{EXECUTABLE_DOMAIN, available};
 use crate::instance::{take_flag, take_value};
+use crate::lab_build::check_build;
 use crate::paths::{from_caller, paths};
 use crate::stop::{self, Stopped};
+use crate::sys::digest_file;
 use crate::{Fail, Res};
 
 /// The verb's own help (`aos-workers-bench --help`).
@@ -3368,12 +3369,6 @@ fn read_bundle(path: &Path) -> Result<UncheckedBundle, String> {
     }
     let bytes = read_bounded(&path.display().to_string(), MAX_BUNDLE_BYTES)?;
     UncheckedBundle::decode(&bytes).map_err(|r| format!("does not decode: {r}"))
-}
-
-/// The digest of the file at `path` in `domain` (the workers' executable identity's, here).
-pub(crate) fn digest_file(path: &Path, domain: &[u8]) -> Result<Digest, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    Ok(Digest::of(domain, &[&bytes]))
 }
 
 /// The regular file `given` names, made absolute and physical.

@@ -811,7 +811,8 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
     );
     let agy = title_seen(
         Some(
-            "window=2 program=agy face=off drawn=- why=switch-only spoken=- description=- title=-"
+            "window=2 program=agy face=master-off drawn=- why=switch-only spoken=- description=- \
+             title=-"
                 .into(),
         ),
         None,

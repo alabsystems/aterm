@@ -180,7 +180,7 @@ fn still_drives(
 }
 
 /// Lift every remote hold of a node `grants` lets drive no more ([`still_drives`]), as its own
-/// `hold off` would: it can no longer lift it, and a local `hold off` lifts the local slot alone.
+/// `hold off` would: it can no longer lift it.
 #[cfg(unix)]
 fn lift_undriving_holds(grants: &[aterm_net::fleet::DriveGrant]) {
     let keys = std::cell::OnceCell::new();
@@ -199,6 +199,76 @@ fn lift_undriving_holds(grants: &[aterm_net::fleet::DriveGrant]) {
             &format!("fleet: {lifted} remote hold(s) lifted: their nodes may drive no more"),
             false,
         );
+    }
+}
+
+/// How long a local `hold off` waits for a remote hold's node to prove itself.
+const HOLDER_WITHIN: Duration = Duration::from_secs(3);
+
+/// What this Mac finds of `hold`'s node now, for a local `hold off`: its grant here gone, or its
+/// place in the book disowning it under the key the grant binds within [`HOLDER_WITHIN`]
+/// ([`aterm_net::fleet_member::Unreached::disowns`]), ends it; a place that does not answer never.
+#[cfg(unix)]
+fn remote_holder(hold: &crate::fabric::RemoteHold) -> crate::fabric::Holder {
+    use crate::fabric::Holder;
+    use aterm_net::fleet_member::{Keyring, Target, peer_of, proves_itself, target_of};
+    let node = hold.node.as_str();
+    let gone = |why: &str| Holder::Gone(why.to_owned());
+    let Some(state) = aterm_types::dirs::state_dir() else {
+        return gone("this Mac has no state directory");
+    };
+    let serving = grants_of(FLEET_DESK.lock_or_recover().wanted.as_ref());
+    let keys = Keyring::read(&state);
+    let Some(grant) = granted_now(&serving, config_now().as_deref())
+        .into_iter()
+        .find(|grant| grant.node == node && keys.bound(node) == Some(grant.key))
+    else {
+        return gone("it may drive this Mac no more");
+    };
+    let Ok(secret) = read_fleet_key() else {
+        return gone("this Mac holds no fleet key it can use, so no node drives it");
+    };
+    let Some(me) = read_node_key() else {
+        return gone("this Mac proves no node, so no node drives it");
+    };
+    let Some(peer) = peer_of(&state, node) else {
+        return gone("no book here records where it is");
+    };
+    let target = Target {
+        node: Some(node.to_owned()),
+        key: Some(grant.key),
+        ..target_of(&peer)
+    };
+    match proves_itself(&target, &keys, (&secret, &me), HOLDER_WITHIN) {
+        Ok(_) => Holder::Drives,
+        Err(why) if why.disowns() => Holder::Gone(why.to_string()),
+        Err(why) => Holder::Again(why.to_string()),
+    }
+}
+
+/// A local `hold <sid> off` that meets a remote hold alone: it lifts it once that node may drive
+/// this Mac no more ([`remote_holder`]), else the refusal naming what lifts it; `None` where it
+/// meets no such hold.
+#[cfg(unix)]
+pub(crate) fn local_off_of_remote(
+    store: &crate::session_store::Store,
+    sid: &str,
+    wake: &dyn Fn(&aterm_session::SessionId),
+) -> Option<String> {
+    match crate::fabric::owner_off_remote(store, sid, &remote_holder, wake)? {
+        crate::fabric::RemoteOff::Lifted { hold, why, reply } => {
+            note_fleet(
+                &format!(
+                    "fleet: the remote hold of {} on {sid} lifted by a local hold off: that node \
+                     may drive this Mac no more ({})",
+                    aterm_log::sanitize_record(&hold.host),
+                    aterm_log::sanitize_record(&why)
+                ),
+                false,
+            );
+            Some(reply)
+        }
+        crate::fabric::RemoteOff::Stands(reply) => Some(reply),
     }
 }
 

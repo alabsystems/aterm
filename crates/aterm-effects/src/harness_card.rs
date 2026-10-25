@@ -782,7 +782,7 @@ pub enum CardPalette {
 
 impl CardPalette {
     #[inline]
-    fn at(self, t: f32) -> u32 {
+    const fn at(self, t: f32) -> u32 {
         match self {
             Self::Cruise => spectrum(t),
             Self::Land => sunset(t),
@@ -791,7 +791,7 @@ impl CardPalette {
     }
 
     #[inline]
-    fn art_at(self, t: f32, dark: bool) -> u32 {
+    const fn art_at(self, t: f32, dark: bool) -> u32 {
         match (self, dark) {
             (_, true) => self.at(t),
             (Self::Cruise, false) => knot_ramp(&PRINT_CRUISE_RAMP, t),
@@ -803,7 +803,7 @@ impl CardPalette {
     /// Returns the card art color at normalized position `t` (`0.0..=1.0`) for `dark` ground.
     #[must_use]
     #[inline]
-    pub fn art(self, t: f32, dark: bool) -> u32 {
+    pub const fn art(self, t: f32, dark: bool) -> u32 {
         self.art_at(t, dark)
     }
 
@@ -836,7 +836,7 @@ impl CardPalette {
     /// Returns the normalized palette position for trail stripe `k` (`0..6`).
     #[must_use]
     #[inline]
-    pub fn stripe_t(self, k: usize) -> f32 {
+    pub const fn stripe_t(self, k: usize) -> f32 {
         let k = k % TRAIL_STOPS.len();
         match self {
             Self::Cruise => stripe_at(k) as f32 / (SPECTRUM_LUT_LEN - 1) as f32,
@@ -845,7 +845,7 @@ impl CardPalette {
     }
 
     #[inline]
-    fn stripe(self, k: usize, dark: bool) -> u32 {
+    const fn stripe(self, k: usize, dark: bool) -> u32 {
         let k = k % TRAIL_STOPS.len();
         let even = k as f32 / (TRAIL_STOPS.len() - 1) as f32;
         match (self, dark) {
@@ -877,7 +877,7 @@ impl CardPalette {
     }
 
     #[inline]
-    fn star_ink(self, k: usize) -> u32 {
+    const fn star_ink(self, k: usize) -> u32 {
         print_line(self.stripe(k, false))
     }
 
@@ -928,47 +928,55 @@ fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
 }
 
 #[inline]
-fn sunset(t: f32) -> u32 {
+const fn sunset(t: f32) -> u32 {
     even_ramp(&SUNSET, t)
 }
 
 #[inline]
-fn moonbow(t: f32) -> u32 {
+const fn moonbow(t: f32) -> u32 {
     even_ramp(&MOONBOW, t)
 }
 
 #[inline]
-fn even_ramp(stops: &[u32], t: f32) -> u32 {
+const fn even_ramp(stops: &[u32], t: f32) -> u32 {
     let t = if t.is_finite() {
         t.clamp(0.0, 1.0)
     } else {
         0.0
     };
     let x = t * (stops.len() - 1) as f32;
-    let i = (x as usize).min(stops.len() - 2);
+    let u = x as usize;
+    let i = if u < stops.len() - 2 {
+        u
+    } else {
+        stops.len() - 2
+    };
     mix_rgb(stops[i], stops[i + 1], x - i as f32)
 }
 
 #[inline]
-fn knot_ramp(knots: &[(usize, u32)], t: f32) -> u32 {
+const fn knot_ramp(knots: &[(usize, u32)], t: f32) -> u32 {
     let t = if t.is_finite() {
         t.clamp(0.0, 1.0)
     } else {
         0.0
     };
     let x = t * (SPECTRUM_LUT_LEN - 1) as f32;
-    let i = (1..knots.len())
-        .find(|&i| x <= knots[i].0 as f32)
-        .unwrap_or(knots.len() - 1);
+    let mut i = 1;
+    while i + 1 < knots.len() && x > knots[i].0 as f32 {
+        i += 1;
+    }
     let ((a, ca), (b, cb)) = (knots[i - 1], knots[i]);
     mix_rgb(ca, cb, (x - a as f32) / (b - a) as f32)
 }
 
 /// Darkens `rgb` toward black until its Rec. 709 luma is at most [`LIGHT_LINE_MAX_LUMA`].
 #[inline]
-pub(crate) fn print_line(rgb: u32) -> u32 {
-    let ch = |sh: u32| ((rgb >> sh) & 0xff) as f32;
-    let y = 0.2126 * ch(16) + 0.7152 * ch(8) + 0.0722 * ch(0);
+pub(crate) const fn print_line(rgb: u32) -> u32 {
+    let r = ((rgb >> 16) & 0xff) as f32;
+    let g = ((rgb >> 8) & 0xff) as f32;
+    let b = (rgb & 0xff) as f32;
+    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
     if y <= LIGHT_LINE_MAX_LUMA {
         rgb
     } else {
@@ -1027,25 +1035,30 @@ pub struct CardScene {
 }
 
 #[inline]
-fn stroke_px(ch: u16) -> u16 {
-    (ch / 14).max(1)
+const fn stroke_px(ch: u16) -> u16 {
+    let s = ch / 14;
+    if s > 1 { s } else { 1 }
 }
 
 #[inline]
-fn kitty_px(ch: u16) -> u16 {
+const fn kitty_px(ch: u16) -> u16 {
     ch.saturating_sub(stroke_px(ch)) / KITTY_HALF as u16
 }
 
 /// Returns the kitty width in whole cells at cell size `cw × ch`, or `0` if cells are too small.
 #[must_use]
 #[inline]
-pub fn kitty_cols(cw: u16, ch: u16) -> u16 {
-    let p = u32::from(kitty_px(ch));
+pub const fn kitty_cols(cw: u16, ch: u16) -> u16 {
+    let p = kitty_px(ch) as u32;
     if p == 0 || cw == 0 {
         return 0;
     }
-    let w = KITTY_W as u32 * p;
-    u16::try_from(w.div_ceil(u32::from(cw))).unwrap_or(u16::MAX)
+    let w = (KITTY_W as u32 * p).div_ceil(cw as u32);
+    if w > u16::MAX as u32 {
+        u16::MAX
+    } else {
+        w as u16
+    }
 }
 
 /// State machine tracking the harness card's intro episode, ride-in, and continuous ripple flow.
@@ -1232,12 +1245,12 @@ struct Rect {
 
 impl Rect {
     #[inline]
-    fn meet(self, o: Self) -> Self {
+    const fn meet(self, o: Self) -> Self {
         Self {
-            x0: self.x0.max(o.x0),
-            y0: self.y0.max(o.y0),
-            x1: self.x1.min(o.x1),
-            y1: self.y1.min(o.y1),
+            x0: if self.x0 > o.x0 { self.x0 } else { o.x0 },
+            y0: if self.y0 > o.y0 { self.y0 } else { o.y0 },
+            x1: if self.x1 < o.x1 { self.x1 } else { o.x1 },
+            y1: if self.y1 < o.y1 { self.y1 } else { o.y1 },
         }
     }
 
@@ -1247,8 +1260,8 @@ impl Rect {
     }
 
     #[inline]
-    fn contains(self, x: i64, y: i64) -> bool {
-        (self.x0..self.x1).contains(&x) && (self.y0..self.y1).contains(&y)
+    const fn contains(self, x: i64, y: i64) -> bool {
+        x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
     }
 
     #[cfg(test)]
@@ -1280,49 +1293,53 @@ struct Geo {
 }
 
 impl Geo {
-    fn new(s: &CardScene) -> Option<Self> {
+    const fn new(s: &CardScene) -> Option<Self> {
+        const fn air(pad: u16, ch: i64) -> i64 {
+            let p = pad as i64;
+            let half = ch / 2;
+            if p < half { p } else { half }
+        }
         if s.cw == 0 || s.ch == 0 || s.rows == 0 || s.cols == 0 {
             return None;
         }
-        let (cw, ch) = (i64::from(s.cw), i64::from(s.ch));
-        let (ox, oy) = (i64::from(s.origin_x), i64::from(s.origin_y));
-        let top = i64::from(s.top);
-        let rows = i64::from(s.rows);
-        let pad = i64::from(s.pad_left).min(cw / 2);
+        let (cw, ch) = (s.cw as i64, s.ch as i64);
+        let (ox, oy) = (s.origin_x as i64, s.origin_y as i64);
+        let top = s.top as i64;
+        let rows = s.rows as i64;
+        let pad = air(s.pad_left, cw);
         let core = Rect {
             x0: ox - pad,
             y0: oy + top * ch,
-            x1: ox + (i64::from(s.cols) + 1) * cw,
+            x1: ox + (s.cols as i64 + 1) * cw,
             y1: oy + (top + rows) * ch,
         };
-        let air = |pad: u16| i64::from(pad).min(ch / 2);
         let outer = Rect {
-            y0: core.y0 - if top > 0 { air(s.pad_above) } else { 0 },
-            y1: core.y1 + air(s.pad_below),
+            y0: core.y0 - if top > 0 { air(s.pad_above, ch) } else { 0 },
+            y1: core.y1 + air(s.pad_below, ch),
             ..core
         };
         let space = Rect {
             x0: 0,
             y0: 0,
-            x1: i64::from(u16::MAX),
-            y1: i64::from(u16::MAX),
+            x1: u16::MAX as i64,
+            y1: u16::MAX as i64,
         };
         let (cx0, cy0, cx1, cy1) = s.clip;
         let pane = Rect {
-            x0: i64::from(cx0),
-            y0: i64::from(cy0),
-            x1: i64::from(cx1),
-            y1: i64::from(cy1),
+            x0: cx0 as i64,
+            y0: cy0 as i64,
+            x1: cx1 as i64,
+            y1: cy1 as i64,
         };
         let clip = outer.meet(space).meet(pane);
         if clip.is_empty() {
             return None;
         }
-        let t = i64::from(stroke_px(s.ch));
+        let t = stroke_px(s.ch) as i64;
         let wand = match s.wand {
             Some((c, r)) => (
-                (ox + i64::from(c) * cw) as f32 + 0.5 * cw as f32,
-                (oy + i64::from(r) * ch) as f32 + 0.5 * ch as f32,
+                (ox + c as i64 * cw) as f32 + 0.5 * cw as f32,
+                (oy + r as i64 * ch) as f32 + 0.5 * ch as f32,
             ),
             None => ((core.x0 + t) as f32, (core.y0 + t) as f32),
         };
@@ -1334,7 +1351,7 @@ impl Geo {
             top,
             rows,
             #[cfg(test)]
-            row_base: i64::from(s.row_base),
+            row_base: s.row_base as i64,
             core,
             outer,
             t,
@@ -1377,32 +1394,36 @@ trait Ramps {
 }
 
 #[inline]
-fn clip_ramp(r: Rect, c: Rect, l: Paint, rt: Paint) -> (Paint, Paint) {
-    if (c.x0, c.x1) == (r.x0, r.x1) {
+const fn clip_ramp(r: Rect, c: Rect, l: Paint, rt: Paint) -> (Paint, Paint) {
+    if c.x0 == r.x0 && c.x1 == r.x1 {
         (l, rt)
     } else {
         let span = (r.x1 - r.x0) as f32;
-        let at = |x: i64| ramp(l, rt, (x - r.x0) as f32 / span);
-        (at(c.x0), at(c.x1))
+        (
+            ramp(l, rt, (c.x0 - r.x0) as f32 / span),
+            ramp(l, rt, (c.x1 - r.x0) as f32 / span),
+        )
     }
 }
 
 #[inline]
-fn ramp(a: Paint, b: Paint, f: f32) -> Paint {
+const fn ramp(a: Paint, b: Paint, f: f32) -> Paint {
+    const fn ch(x: u32, y: u32, f: f32) -> u32 {
+        let v = (x as f32 + (y as f32 - x as f32) * f).round() as u32;
+        if v < 255 { v } else { 255 }
+    }
     let f = f.clamp(0.0, 1.0);
-    let ch = |x: u32, y: u32| ((x as f32 + (y as f32 - x as f32) * f).round() as u32).min(255);
-    let rgb = |x: u32, y: u32| {
-        (ch((x >> 16) & 0xff, (y >> 16) & 0xff) << 16)
-            | (ch((x >> 8) & 0xff, (y >> 8) & 0xff) << 8)
-            | ch(x & 0xff, y & 0xff)
-    };
+    let r = ch((a.color >> 16) & 0xff, (b.color >> 16) & 0xff, f);
+    let g = ch((a.color >> 8) & 0xff, (b.color >> 8) & 0xff, f);
+    let bl = ch(a.color & 0xff, b.color & 0xff, f);
     let alpha = if a.alpha == 0 {
         0
     } else {
-        ch(u32::from(a.alpha), u32::from(b.alpha)).max(1) as u8
+        let al = ch(a.alpha as u32, b.alpha as u32, f);
+        if al > 1 { al as u8 } else { 1 }
     };
     Paint {
-        color: rgb(a.color, b.color),
+        color: (r << 16) | (g << 8) | bl,
         alpha,
     }
 }
@@ -1471,7 +1492,10 @@ impl KittyInk {
 }
 
 #[inline]
-fn kitty_frame(clock: Clock) -> KittyPose {
+const fn kitty_frame(clock: Clock) -> KittyPose {
+    const fn in_window(t: u64, at: u64, period: u64, len: u64) -> bool {
+        t >= at && (t - at) % period < len
+    }
     let Some(t) = clock.t_ms else {
         return match clock.flow {
             Some(f)
@@ -1483,10 +1507,9 @@ fn kitty_frame(clock: Clock) -> KittyPose {
             _ => KittyPose::Open,
         };
     };
-    let in_window = |at: u64, period: u64, len: u64| t >= at && (t - at) % period < len;
-    if in_window(BLINK_AT_MS, BLINK_PERIOD_MS, BLINK_MS) {
+    if in_window(t, BLINK_AT_MS, BLINK_PERIOD_MS, BLINK_MS) {
         KittyPose::Blink
-    } else if in_window(FLICK_AT_MS, FLICK_PERIOD_MS, FLICK_MS) {
+    } else if in_window(t, FLICK_AT_MS, FLICK_PERIOD_MS, FLICK_MS) {
         KittyPose::Flick
     } else {
         KittyPose::Open
@@ -1494,7 +1517,7 @@ fn kitty_frame(clock: Clock) -> KittyPose {
 }
 
 #[inline]
-fn unit(seed: u64, salt: u64) -> f32 {
+const fn unit(seed: u64, salt: u64) -> f32 {
     (mix(seed ^ mix(salt)) >> 40) as f32 / (1u64 << 24) as f32
 }
 
@@ -1508,30 +1531,37 @@ struct StarSpot {
 }
 
 #[inline]
-fn star_region(g: &Geo, s: &CardScene) -> Option<Rect> {
+const fn star_region(g: &Geo, s: &CardScene) -> Option<Rect> {
     if g.rows < 2 {
         return None;
     }
     let start = match (s.trail, s.kitty_col) {
-        (Some((t0, _)), Some(k)) => t0.min(k),
+        (Some((t0, _)), Some(k)) => {
+            if t0 < k {
+                t0
+            } else {
+                k
+            }
+        }
         (Some((t0, _)), None) => t0,
         (None, Some(k)) => k,
         (None, None) => return None,
     };
     let inner = g.inner();
+    let cols_x = g.col(s.cols);
     let r = Rect {
         x0: g.col(start),
         y0: g.band(g.top),
-        x1: if s.dark {
+        x1: if s.dark || inner.x1 < cols_x {
             inner.x1
         } else {
-            inner.x1.min(g.col(s.cols))
+            cols_x
         },
         y1: g.band(g.top + 2),
     }
     .meet(inner)
     .meet(g.clip);
-    (!r.is_empty()).then_some(r)
+    if r.is_empty() { None } else { Some(r) }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1556,22 +1586,26 @@ impl KittyAt {
 }
 
 #[inline]
-fn rim_px(p: i64, t: i64) -> i64 {
-    t.min(p / 2)
+const fn rim_px(p: i64, t: i64) -> i64 {
+    let half = p / 2;
+    if t < half { t } else { half }
 }
 
 #[inline]
-fn art_at(frame: &[&str], r: i64, c: i64) -> bool {
-    usize::try_from(r)
-        .ok()
-        .and_then(|r| frame.get(r))
-        .zip(usize::try_from(c).ok())
-        .and_then(|(row, c)| row.as_bytes().get(c))
-        .is_some_and(|&b| b != b'.')
+const fn art_at(frame: &[&str], r: i64, c: i64) -> bool {
+    if r < 0 || c < 0 {
+        return false;
+    }
+    let (r, c) = (r as usize, c as usize);
+    if r >= frame.len() {
+        return false;
+    }
+    let row = frame[r].as_bytes();
+    c < row.len() && row[c] != b'.'
 }
 
 #[inline]
-fn rim_solid(frame: &[&str], r: i64, c: i64) -> bool {
+const fn rim_solid(frame: &[&str], r: i64, c: i64) -> bool {
     art_at(frame, r, c) || (art_at(frame, r, c - 1) && art_at(frame, r, c + 1))
 }
 
@@ -1636,7 +1670,7 @@ fn kitty_rect(g: &Geo, s: &CardScene) -> Option<KittyAt> {
 }
 
 #[inline]
-fn ride(clock: Clock) -> f32 {
+const fn ride(clock: Clock) -> f32 {
     match clock.ride_ms {
         Some(t) if t < RIDE_MS => {
             let v = 1.0 - t as f32 / RIDE_MS as f32;
@@ -1652,15 +1686,24 @@ fn ride_at(f: f32) -> f32 {
 }
 
 #[inline]
-fn ride_span(g: &Geo, s: &CardScene, seat: &KittyAt) -> Option<(i64, i64)> {
-    let (c0, _) = s.trail?;
-    let from = g.col(c0).max(g.inner().x0).max(g.clip.x0);
+const fn ride_span(g: &Geo, s: &CardScene, seat: &KittyAt) -> Option<(i64, i64)> {
+    let Some((c0, _)) = s.trail else {
+        return None;
+    };
+    let mut from = g.col(c0);
+    let inner_x0 = g.inner().x0;
+    if inner_x0 > from {
+        from = inner_x0;
+    }
+    if g.clip.x0 > from {
+        from = g.clip.x0;
+    }
     let dist = seat.rect.x0 - from;
-    (dist > 0).then_some((from, dist))
+    if dist > 0 { Some((from, dist)) } else { None }
 }
 
 #[inline]
-fn ridden(g: &Geo, s: &CardScene, seat: KittyAt, clock: Clock) -> KittyAt {
+const fn ridden(g: &Geo, s: &CardScene, seat: KittyAt, clock: Clock) -> KittyAt {
     let f = ride(clock);
     match ride_span(g, s, &seat) {
         Some((from, dist)) if f < 1.0 => {
@@ -1710,7 +1753,7 @@ fn trail_rect(g: &Geo, s: &CardScene, seat: Option<KittyAt>) -> Option<(Rect, i6
 }
 
 #[inline]
-fn across_trail(b: Rect, (t, amp): (Rect, i64)) -> bool {
+const fn across_trail(b: Rect, (t, amp): (Rect, i64)) -> bool {
     let outer = Rect {
         y0: t.y0 - amp,
         y1: t.y1 + amp,
@@ -3447,7 +3490,7 @@ mod tests {
     use crate::effect_util::{STAR_GLINT, push_twinkle_star, star_core_px, star_waist_px};
     use aterm_render::GlowQuad;
 
-    pub(super) fn scene() -> CardScene {
+    pub(super) const fn scene() -> CardScene {
         CardScene {
             origin_x: 10,
             origin_y: 46,
@@ -3493,7 +3536,7 @@ mod tests {
 
     const WHOLE_STREAM: (i32, i32, i32, i32) = (i32::MIN, i32::MIN, i32::MAX, i32::MAX);
 
-    pub(super) fn widest() -> CardScene {
+    pub(super) const fn widest() -> CardScene {
         CardScene {
             cols: 120,
             trail: Some((8, 100)),
@@ -3502,15 +3545,15 @@ mod tests {
         }
     }
 
-    pub(super) fn clipped() -> CardScene {
+    pub(super) const fn clipped() -> CardScene {
         let s = scene();
-        let (cw, ch) = (i32::from(s.cw), i32::from(s.ch));
+        let (cw, ch) = (s.cw as i32, s.ch as i32);
         CardScene {
             clip: (
                 s.origin_x,
                 0,
                 s.origin_x + 50 * cw,
-                s.origin_y + i32::from(s.top + 3) * ch + ch / 2,
+                s.origin_y + (s.top + 3) as i32 * ch + ch / 2,
             ),
             ..s
         }
@@ -3619,7 +3662,7 @@ mod tests {
         v
     }
 
-    pub(super) fn aired(s: CardScene) -> CardScene {
+    pub(super) const fn aired(s: CardScene) -> CardScene {
         CardScene {
             pad_above: s.ch,
             pad_below: s.ch,
@@ -3638,7 +3681,7 @@ mod tests {
         (under, over, fp)
     }
 
-    fn ms(n: u64) -> Duration {
+    const fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
     }
 
@@ -8603,19 +8646,19 @@ mod tests {
         seen
     }
 
-    fn covers(q: &GlowQuad, (x, y): (i64, i64)) -> bool {
-        let (x0, y0) = (i64::from(q.x), i64::from(q.y));
-        (x0..x0 + i64::from(q.w)).contains(&x) && (y0..y0 + i64::from(q.h)).contains(&y)
+    const fn covers(q: &GlowQuad, (x, y): (i64, i64)) -> bool {
+        let (x0, y0) = (q.x as i64, q.y as i64);
+        x >= x0 && x < x0 + q.w as i64 && y >= y0 && y < y0 + q.h as i64
     }
 
-    fn overlap(a: &GlowQuad, b: &GlowQuad) -> bool {
-        let meet = |p0: u16, n0: u16, p1: u16, n1: u16| {
-            let (lo, hi) = (
-                p0.max(p1),
-                (u32::from(p0) + u32::from(n0)).min(u32::from(p1) + u32::from(n1)),
-            );
-            u32::from(lo) < hi
-        };
+    const fn overlap(a: &GlowQuad, b: &GlowQuad) -> bool {
+        const fn meet(p0: u16, n0: u16, p1: u16, n1: u16) -> bool {
+            let lo = if p0 > p1 { p0 } else { p1 };
+            let end0 = p0 as u32 + n0 as u32;
+            let end1 = p1 as u32 + n1 as u32;
+            let hi = if end0 < end1 { end0 } else { end1 };
+            (lo as u32) < hi
+        }
         meet(a.x, a.w, b.x, b.w) && meet(a.y, a.h, b.y, b.h)
     }
 

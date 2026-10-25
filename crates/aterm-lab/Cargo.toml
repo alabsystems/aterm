@@ -86,7 +86,9 @@ aterm-toolchain = { workspace = true }
 # proposers, the evaluator and the provenance bundle exist in a release build only
 # under `aos-candidates`. aterm-lab is the one crate that enables it (design §10.8):
 # never aterm-bench or aterm-verify, whose builds unify features with the shipped app.
-aterm-effects = { workspace = true, features = ["aos-candidates"] }
+# `aos-learn` compiles Aos M6's learner (m4's labels and m6) into the lab's `aos-learn` and
+# `aos-learn-bench` (design §13.7); aterm-lab is the one crate that enables it too.
+aterm-effects = { workspace = true, features = ["aos-candidates", "aos-learn"] }
 # `aos-repair --publish` and its `--control` replay a window's exported momentum trace in the
 # lab (`aos_phase`): the replay, the code seam and the wire encoder are the Aos crate's own.
 # Not a new edge in the build graph: aterm-effects above already depends on it.

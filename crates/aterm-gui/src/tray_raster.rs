@@ -3097,6 +3097,17 @@ impl Canvas {
         Self::with_origin(0, 0, w, h, backdrop)
     }
 
+    /// A `w × h` canvas holding `px` (transparent wherever `px` falls short of it).
+    fn over(mut px: Vec<u8>, w: u32, h: u32) -> Self {
+        px.resize((w * h * 4) as usize, 0);
+        Self {
+            w,
+            h,
+            px,
+            ..Self::with_origin(0, 0, 0, 0, [0, 0, 0, 0])
+        }
+    }
+
     fn with_origin(origin_x: i32, origin_y: i32, w: u32, h: u32, backdrop: [u8; 4]) -> Self {
         let mut px = vec![0u8; (w * h * 4) as usize];
         if backdrop != [0, 0, 0, 0] {
@@ -4460,6 +4471,19 @@ pub(crate) fn rasterize_tray(
     (rasterize_tray_on_canvas(prims, scale, cv), pw, ph)
 }
 
+/// Rasterize `prims` over `pixels`, the RGBA8 `w × h` raster of the prims a list draws before
+/// them: the bytes one [`rasterize_tray`] of the whole list gives, while those leave no clip or
+/// fade open.
+pub(crate) fn rasterize_tray_over(
+    prims: &[DrawPrim],
+    scale: f32,
+    pixels: Vec<u8>,
+    w: u32,
+    h: u32,
+) -> Vec<u8> {
+    rasterize_tray_on_canvas(prims, scale, Canvas::over(pixels, w, h))
+}
+
 /// Rasterize into an exact device-pixel extent.
 pub(crate) fn rasterize_tray_pixels(
     prims: &[DrawPrim],
@@ -4511,24 +4535,41 @@ pub(crate) fn composite_rgba_surface(
         glyph_remap: (u32::MAX, u32::MAX, [f32::NAN; 256]),
         fade: Vec::new(),
     };
+    // Row by row over the source pixels that land on the destination, as `Canvas::blend` at full
+    // cover takes each: a clear pixel leaves it, an opaque run is copied, the rest composite.
     let (source_width, source_height) = source_size;
-    let source_x = source_origin.0.min(i32::MAX as u32) as i32;
-    let source_y = source_origin.1.min(i32::MAX as u32) as i32;
-    for row in 0..source_height {
-        for col in 0..source_width {
-            let index =
-                usize::try_from((u64::from(row) * u64::from(source_width) + u64::from(col)) * 4)
-                    .unwrap_or(usize::MAX);
-            let Some(pixel) = source.get(index..index.saturating_add(4)) else {
-                *destination = canvas.px;
-                return false;
-            };
-            canvas.blend(
-                source_x.saturating_add(col.min(i32::MAX as u32) as i32),
-                source_y.saturating_add(row.min(i32::MAX as u32) as i32),
-                [pixel[0], pixel[1], pixel[2], pixel[3]],
-                1.0,
-            );
+    let (w, h) = (i64::from(destination_width), i64::from(destination_height));
+    let dx = i64::from(source_origin.0) - i64::from(canvas.origin_x);
+    let dy = i64::from(source_origin.1) - i64::from(canvas.origin_y);
+    let landing = |d: i64, n: u32, room: i64| {
+        let n = i64::from(n);
+        (-d).clamp(0, n)..(room - d).clamp(0, n)
+    };
+    let cols = landing(dx, source_width, w);
+    let stride = source_width as usize * 4;
+    for row in landing(dy, source_height, h) {
+        let line = &source[row as usize * stride..][..stride];
+        let at = |col: i64| (((dy + row) * w + dx + col) * 4) as usize;
+        let mut col = cols.start;
+        while col < cols.end {
+            let s = col as usize * 4;
+            match line[s + 3] {
+                0 => col += 1,
+                u8::MAX => {
+                    let mut end = col + 1;
+                    while end < cols.end && line[end as usize * 4 + 3] == u8::MAX {
+                        end += 1;
+                    }
+                    let (i, e) = (at(col), end as usize * 4);
+                    canvas.px[i..i + (e - s)].copy_from_slice(&line[s..e]);
+                    col = end;
+                }
+                alpha => {
+                    let c = [line[s], line[s + 1], line[s + 2], alpha];
+                    canvas.composite_at(at(col), c, 1.0, f32::from(alpha) / 255.0);
+                    col += 1;
+                }
+            }
         }
     }
     *destination = canvas.px;
@@ -5105,6 +5146,54 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_surface_composites_byte_for_byte_as_each_of_its_pixels() {
+        let surface = |w: u32, h: u32, seed: u32| {
+            let mut px = Vec::with_capacity((w * h * 4) as usize);
+            for i in 0..w * h {
+                let k = i.wrapping_mul(2_654_435_761).wrapping_add(seed);
+                px.extend_from_slice(&match (i / 5 + seed) % 6 {
+                    0 => [0, 0, 0, 0],
+                    1 | 2 => [30, 40, 50, 255],
+                    3 => [(k % 251) as u8, (k >> 8) as u8, (k >> 16) as u8, 255],
+                    4 => [(k % 251) as u8, 9, (k >> 3) as u8, (k >> 11) as u8],
+                    _ => [255, 255, 255, 64],
+                });
+            }
+            px
+        };
+        let (dw, dh, sw, sh) = (40_u32, 9_u32, 23_u32, 6_u32);
+        for (d_origin, s_origin) in [
+            ((0, 0), (0, 0)),
+            ((10, 4), (3, 1)),
+            ((0, 0), (30, 6)),
+            ((5, 5), (44, 2)),
+            ((100, 100), (0, 0)),
+        ] {
+            let mut composed = surface(dw, dh, 1);
+            assert!(composite_rgba_surface(
+                &mut composed,
+                (dw, dh),
+                d_origin,
+                &surface(sw, sh, 2),
+                (sw, sh),
+                s_origin,
+            ));
+            let mut each =
+                Canvas::with_origin(d_origin.0 as i32, d_origin.1 as i32, dw, dh, [0; 4]);
+            each.px = surface(dw, dh, 1);
+            let source = surface(sw, sh, 2);
+            for row in 0..sh {
+                for col in 0..sw {
+                    let i = ((row * sw + col) * 4) as usize;
+                    let p = [source[i], source[i + 1], source[i + 2], source[i + 3]];
+                    each.blend((s_origin.0 + col) as i32, (s_origin.1 + row) as i32, p, 1.0);
+                }
+            }
+            assert!(composed == each.px, "{d_origin:?} under {s_origin:?}");
         }
     }
 

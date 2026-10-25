@@ -1939,6 +1939,7 @@ fn a_disk_setting_aterm_cannot_read_is_said_and_a_short_volume_still_opens_its_l
         Some(HostNote::DiskLowCleanupOff {
             free_gib: 2,
             floor_gib: floor,
+            asked: None,
         }),
         "short two looks running while removal is off: the owner is told no pass ran"
     );
@@ -2013,6 +2014,7 @@ fn the_disk_watch_says_each_end_once_a_change() {
         free_gib: 2,
         floor_gib: 20,
         hogs: Vec::new(),
+        asked: None,
     };
     let at = t0 + minute * 11;
     assert!(said.owed(&low, at));
@@ -6709,6 +6711,7 @@ impl Acting {
                         })
                 }),
                 disk_resume: Arc::new(|_, _| "wait:inert".to_string()),
+                disk_free: Acts::inert().disk_free,
                 disk_board: Acts::inert().disk_board,
                 jobs_board: Acts::inert().jobs_board,
                 leader_lives: Acts::inert().leader_lives,
@@ -9107,6 +9110,65 @@ fn with_no_roster_nothing_is_advised_read_or_made() {
             .map(|row| row.account.as_str()),
         Some("main"),
         "the session's row, for the report"
+    );
+}
+
+/// THE DOOR A MOVED LOGIN IS READ BY ([`WorkerIdle::login_account`]), with no roster: the
+/// account the tab's Claude Code profile is signed in to, read afresh at each ask, off the
+/// profile the process's own environment names; none for a process whose environment or
+/// settings take its stored login away, nor for another program.
+#[test]
+fn the_login_a_tab_is_signed_in_to_is_read_off_its_own_profile_at_each_ask() {
+    use aterm_agent::supervise::IdleHost;
+    let a = Accts::new();
+    std::fs::remove_file(a.roster_path()).unwrap();
+    let sign_in = |dir: &Path, id: &str| {
+        std::fs::write(
+            dir.join(".claude.json"),
+            format!(r#"{{"oauthAccount":{{"accountUuid":"{id}"}}}}"#),
+        )
+        .unwrap();
+    };
+    let home = a.tmp.path().join("home");
+    let snap = a.spawn("s-login", ACCT_TALK_A, "main");
+    let idle = a.worker("s-login", &on());
+    assert_eq!(idle.login_account(), None, "no profile yet");
+    sign_in(&home, "u-first");
+    assert_eq!(idle.login_account(), profile::AccountKey::claude("u-first"));
+    sign_in(&home, "u-second");
+    assert_eq!(
+        idle.login_account(),
+        profile::AccountKey::claude("u-second"),
+        "signed in elsewhere since"
+    );
+    let own = a.tmp.path().join("own");
+    std::fs::create_dir_all(&own).unwrap();
+    sign_in(&own, "u-own");
+    let with = |var: String| {
+        a.procs
+            .lock()
+            .unwrap()
+            .get_mut(&snap.pid)
+            .unwrap()
+            .push(var);
+        a.worker("s-login", &on())
+    };
+    let in_own = with(format!("{}={}", accounts::HOME_ENV, own.display()));
+    assert_eq!(in_own.login_account(), profile::AccountKey::claude("u-own"));
+    let keyed = with("ANTHROPIC_API_KEY=sk-invented".to_string());
+    assert_eq!(keyed.login_account(), None, "an API key is no stored login");
+    a.procs.lock().unwrap().get_mut(&snap.pid).unwrap().pop();
+    a.unsettled.store(true, Ordering::SeqCst);
+    let unsettled = a.worker("s-login", &on());
+    assert_eq!(unsettled.login_account(), None, "its settings take it away");
+    a.unsettled.store(false, Ordering::SeqCst);
+    let mut other = a.worker("s-login", &on());
+    other.agent = Program::Codex;
+    assert_eq!(other.login_account(), None, "another program");
+    assert_eq!(
+        a.worker("s-login", &on()).login_account(),
+        profile::AccountKey::claude("u-own"),
+        "the control"
     );
 }
 
@@ -32543,6 +32605,122 @@ fn the_disk_resume_keeps_a_continuations_gates() {
     assert!(
         tabs.iter().all(|sid| disk_owed(&BOARD, sid).is_none()),
         "spent, typed or not"
+    );
+}
+
+#[test]
+fn the_disk_free_line_goes_only_to_the_tab_it_is_owed_at_its_turn_break_and_keeps_its_gates() {
+    static BOARD: Shelf = Shelf::new();
+    let world = Arc::new(World::default());
+    /// Each act's tab and why it was unfit.
+    type Calls = Vec<(String, Option<&'static str>)>;
+    let calls: Arc<Mutex<Calls>> = Arc::default();
+    let answer = Arc::new(Mutex::new("wait:busy".to_string()));
+    let (c, a) = (Arc::clone(&calls), Arc::clone(&answer));
+    let mut hooks = hooks(&world, parking_body(&world));
+    hooks.acts = Acts {
+        due: Arc::new(|_| Due::No),
+        disk_free: Arc::new(move |sid, owed, unfit| {
+            assert!(owed.text.ends_with("(rule disk-free@v1)"), "{}", owed.text);
+            c.lock().unwrap().push((sid.to_string(), unfit));
+            unfit.map_or_else(
+                || a.lock().unwrap().clone(),
+                |why| format!("released:{why}"),
+            )
+        }),
+        finished: Arc::new(|sid, _, _| Some(sid == "s-df-finished")),
+        tasked: Arc::new(|sid, _, _| Some(sid != "s-df-taskless")),
+        disk_board: &BOARD,
+        ..Acts::inert()
+    };
+    hooks.autopilot =
+        Arc::new(|| std::collections::HashMap::from([("s-df-land".to_string(), Autopilot::Land)]));
+    let tabs = [
+        "s-df-open",
+        "s-df-land",
+        "s-df-finished",
+        "s-df-taskless",
+        "s-df-other",
+    ];
+    let idles: Vec<WorkerIdle> = tabs
+        .iter()
+        .map(|sid| {
+            let mut idle = idle_of(
+                hooks.clone(),
+                Program::Claude,
+                Some("0badf00d-1111-2222-3333-444455556666".to_string()),
+            );
+            idle.sid = (*sid).to_string();
+            idle
+        })
+        .collect();
+    BOARD.publish(|b| {
+        for sid in &tabs[..4] {
+            b.asks.insert(
+                (*sid).to_string(),
+                crate::disk_board::AskOwed {
+                    key: "dev:1".to_string(),
+                    text: "[aterm harness] aterm: the volume is full. (rule disk-free@v1)"
+                        .to_string(),
+                },
+            );
+        }
+    });
+    assert!(
+        idles[0].wants(),
+        "an owed line asks for the next turn break"
+    );
+    assert_eq!(
+        idles[0].at_idle().map(|s| s.line),
+        None,
+        "the fence refused"
+    );
+    assert!(
+        disk_ask_owed(&BOARD, "s-df-open").is_some(),
+        "a wait keeps the line for the next turn break"
+    );
+    *answer.lock().unwrap() = "typed".to_string();
+    let step = idles[0].at_idle().expect("typed");
+    assert_eq!(step.line, "disk-free@v1 step=typed");
+    assert_eq!(
+        step.typed,
+        Some(aterm_agent::supervise::policy::turn_end::HostTurn::Fact),
+        "its answer is no done report"
+    );
+    assert_eq!(idles[0].at_idle().map(|s| s.line), None, "typed once");
+    let steps: Vec<Option<String>> = idles[1..]
+        .iter()
+        .map(|idle| idle.at_idle().map(|step| step.line))
+        .collect();
+    assert_eq!(
+        steps[0].as_deref(),
+        Some("disk-free@v1 step=typed"),
+        "{steps:?}"
+    );
+    assert_eq!(steps[1..], [None, None, None], "{steps:?}");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            ("s-df-open".to_string(), None),
+            ("s-df-open".to_string(), None),
+            ("s-df-land".to_string(), None),
+            ("s-df-finished".to_string(), Some("finished")),
+            ("s-df-taskless".to_string(), Some("taskless")),
+        ],
+        "landing is no bar; a finished or taskless tab is released, and a tab owed nothing is \
+         never stepped"
+    );
+    assert!(
+        tabs.iter().all(|sid| disk_ask_owed(&BOARD, sid).is_none()),
+        "typed or released, nothing stays owed"
+    );
+    assert_eq!(
+        BOARD.board_lock().unfit,
+        BTreeMap::from([
+            ("s-df-finished".to_string(), "finished"),
+            ("s-df-taskless".to_string(), "taskless"),
+        ]),
+        "every turn break tells the look's seats which tabs may not be asked, owed or not"
     );
 }
 

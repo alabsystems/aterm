@@ -400,14 +400,24 @@ fn the_reply_event_and_status_spellings() {
     assert_eq!(status_tokens(Some(&record)), "task_state=done task_rev=3");
     assert_eq!(status_tokens(None), "task_state=- task_rev=0");
     assert_eq!(
-        await_row(SID, Some(&record), "idle", "-", false),
-        format!("@{SID} rev=3 state=done agent=idle attention=- result_bytes=120")
+        await_row(SID, Some(&record), "idle", "-", "-", false),
+        format!("@{SID} rev=3 state=done agent=idle program_state=- attention=- result_bytes=120")
     );
     assert_eq!(
-        await_row(SID, None, "-", "stuck%20on%20CI", false),
-        format!("@{SID} rev=0 state=- agent=- attention=stuck%20on%20CI result_bytes=0")
+        await_row(
+            SID,
+            None,
+            "unknown",
+            "blocked:permission",
+            "stuck%20on%20CI",
+            false
+        ),
+        format!(
+            "@{SID} rev=0 state=- agent=unknown program_state=blocked:permission \
+             attention=stuck%20on%20CI result_bytes=0"
+        )
     );
-    assert!(await_row(SID, Some(&record), "-", "-", true).contains(" state=closed "));
+    assert!(await_row(SID, Some(&record), "-", "-", "-", true).contains(" state=closed "));
 }
 
 fn words(line: &str) -> Vec<&str> {
@@ -689,7 +699,7 @@ fn the_task_verb_reads_marks_and_refuses_an_edge_the_mark() {
         "{marked}"
     );
     assert!(
-        marked.ends_with(" result_bytes=0 agent=- attention=- changed=1\n"),
+        marked.ends_with(" result_bytes=0 agent=- program_state=- attention=- changed=1\n"),
         "{marked}"
     );
     let again = cmd_task(ctx, 5, Scope::Owner, "mark working");
@@ -706,7 +716,9 @@ fn the_task_verb_reads_marks_and_refuses_an_edge_the_mark() {
     let read = cmd_task(ctx, 5, edge, "");
     assert!(read.starts_with("OK task rev=2 state=done from="), "{read}");
     assert!(
-        read.ends_with(" result_bytes=7 why=landed agent=- attention=stuck%20on%20CI\n"),
+        read.ends_with(
+            " result_bytes=7 why=landed agent=- program_state=- attention=stuck%20on%20CI\n"
+        ),
         "{read}"
     );
 }
@@ -1276,14 +1288,14 @@ fn the_fact_word_round_trips_on_task_await_and_its_event() {
     );
     assert_eq!(crate::presence::take_task_wakes(), [11]);
     assert!(
-        reply().ends_with(" fact=hold-room@v1#1 fact_rev=1 agent=- attention=-\n"),
+        reply().ends_with(" fact=hold-room@v1#1 fact_rev=1 agent=- program_state=- attention=-\n"),
         "{}",
         reply()
     );
     assert_eq!(
-        await_row(SID, Some(&record()), "-", "-", false),
+        await_row(SID, Some(&record()), "-", "-", "-", false),
         format!(
-            "@{SID} rev=1 state=working agent=- attention=- result_bytes=0 \
+            "@{SID} rev=1 state=working agent=- program_state=- attention=- result_bytes=0 \
              fact=hold-room@v1#1 fact_rev=1"
         )
     );
@@ -1652,10 +1664,10 @@ fn a_planted_attention_or_title_never_reaches_fact() {
     };
     let rows = || {
         let record = ctx.timeline.lock().unwrap().task().cloned();
-        let (agent, attention) = agent_and_attention(ctx);
+        let (agent, program, attention) = agent_program_and_attention(ctx);
         [
             cmd_task(ctx, 15, Scope::Owner, ""),
-            await_row(SID, record.as_ref(), agent, &attention, false),
+            await_row(SID, record.as_ref(), agent, &program, &attention, false),
         ]
     };
     for row in rows() {

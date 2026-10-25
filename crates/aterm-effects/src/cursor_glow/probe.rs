@@ -124,13 +124,19 @@ impl CursorGlow {
 
     /// Test seam: how many lettered cells this frame's text reads.
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     #[must_use]
-    pub fn frame_text_letters(&self) -> usize {
-        self.frame_text
-            .pairs
-            .iter()
-            .filter(|p| matches!(p, Some((Some(_), _))))
-            .count()
+    pub const fn frame_text_letters(&self) -> usize {
+        let pairs = self.frame_text.pairs.as_slice();
+        let mut n = 0;
+        let mut i = 0;
+        while i < pairs.len() {
+            if matches!(pairs[i], Some((Some(_), _))) {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
     }
 
     /// Host observation: the cells of the frame about to be presented,
